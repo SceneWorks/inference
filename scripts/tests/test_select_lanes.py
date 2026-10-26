@@ -1,6 +1,8 @@
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -370,6 +372,30 @@ class SelectLanesTests(unittest.TestCase):
         for bad in ([], ["windows-cuda"], ["windows_cuda", "nope"]):
             with self.subTest(selection=bad), self.assertRaises(ValueError):
                 only_lanes(bad)
+
+    def run_selector(self, *args: str) -> dict[str, str]:
+        with tempfile.TemporaryDirectory() as scratch:
+            output = Path(scratch) / "out"
+            subprocess.run(
+                [sys.executable, "scripts/ci/select_lanes.py", *args, "--github-output", str(output)],
+                cwd=Path(__file__).resolve().parents[2], check=True, capture_output=True,
+            )
+            return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").split())
+
+    def test_moss_cuda_unit_profile_is_selected_only_by_its_own_flag(self) -> None:
+        self.assertNotIn("moss_cuda_unit", LANES)
+        only = self.run_selector("--moss-cuda-unit")
+        self.assertEqual({k for k, v in only.items() if v == "true"}, {"moss_cuda_unit"})
+        self.assertEqual(set(only), set(LANES) | {"moss_cuda_unit"})
+        for args in (("--all",), ("--only", "windows_cuda"), ("--paths", "crates/media/candle-gen/x.rs")):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_selector(*args)["moss_cuda_unit"], "false")
+
+    def test_all_and_windows_cuda_selection_is_unchanged_by_the_profile(self) -> None:
+        everything = self.run_selector("--all")
+        self.assertTrue(all(v == "true" for k, v in everything.items() if k != "moss_cuda_unit"))
+        cuda = self.run_selector("--only", "windows_cuda")
+        self.assertEqual({k for k, v in cuda.items() if v == "true"}, {"windows_cuda"})
 
 
 if __name__ == "__main__":

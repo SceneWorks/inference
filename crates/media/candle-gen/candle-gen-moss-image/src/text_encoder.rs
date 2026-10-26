@@ -27,14 +27,7 @@ pub(crate) fn digest_f32(values: &[f32], mask: Option<&[u8]>) -> String {
     }
     format!("{:x}", d.finalize())
 }
-pub(crate) fn strings(
-    sources: &Sources,
-    encoder: &Qwen35Model,
-    prompts: &[String],
-    limit: u32,
-    device: &Device,
-    cancel: &CancelFlag,
-) -> Result<Conditioning> {
+fn tokenizer(sources: &Sources, limit: u32) -> Result<TextTokenizer> {
     let bytes = sources.tokenizer.authenticated_bytes()?;
     let json =
         std::str::from_utf8(&bytes).map_err(|e| candle_gen::CandleError::Msg(e.to_string()))?;
@@ -47,6 +40,42 @@ pub(crate) fn strings(
             pad_to_max_length: false,
         },
     )?;
+    Ok(tokenizer)
+}
+pub(crate) fn token_bound(
+    sources: &Sources,
+    req: &candle_gen::gen_core::TrainingRequest,
+    host_budget: u64,
+) -> Result<u64> {
+    candle_gen::gen_core::moss_image_training::recovery::admit_conditioning_preprocess(
+        req,
+        host_budget,
+        0,
+    )?;
+    let tokenizer = tokenizer(sources, 4096)?;
+    let mut bound = 0usize;
+    for prompt in
+        candle_gen::gen_core::moss_image_training::recovery::conditioning_prompts_iter(req)
+    {
+        check_cancel(&req.cancel)?;
+        bound = bound.max(tokenizer.encode_chat_ids(&prompt, true)?.len().min(4096));
+    }
+    if bound == 0 {
+        return Err(candle_gen::CandleError::Msg(
+            "MOSS captions produce no tokens".into(),
+        ));
+    }
+    Ok(bound as u64)
+}
+pub(crate) fn strings(
+    sources: &Sources,
+    encoder: &Qwen35Model,
+    prompts: &[String],
+    limit: u32,
+    device: &Device,
+    cancel: &CancelFlag,
+) -> Result<Conditioning> {
+    let tokenizer = tokenizer(sources, limit)?;
     let mut rows = Vec::new();
     let mut receipts = Vec::new();
     for text in prompts {

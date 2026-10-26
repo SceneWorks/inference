@@ -278989,5 +278989,107 @@
     "expected_devices": [
       "mlx-cpu"
     ]
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "mlx",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "fqn": "models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native",
+    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native; committed frozen HF CPU-oracle fixture and original numerical assertions",
+    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native",
+    "required_environment": [],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native",
+      "requirements": []
+    },
+    "expected_devices": [
+      "mlx-cpu"
+    ]
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "mlx",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "fqn": "models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace",
+    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace; committed frozen HF CPU-oracle fixture and original numerical assertions",
+    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace",
+    "required_environment": [],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace",
+      "requirements": []
+    },
+    "expected_devices": [
+      "mlx-cpu"
+    ]
+  },
+  {
+    "package": "candle-gen-moss-image",
+    "target": "candle_gen_moss_image",
+    "target_kind": "lib",
+    "fqn": "tests::training_contract_tests::cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload",
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_moss_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs::tests::training_contract_tests::cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload; committed MOSS tiny-author production-graph fixture and original checkpoint/gradient/update/reload assertions",
+    "configuration_source": "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs::tests::training_contract_tests::cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload",
+    "required_environment": [],
+    "device_witness": "Successful learned Transformer edit output observed in forward_edit",
+    "output_contract": "original CUDA production-graph assertions; exact context UUID and end-only body marker; explicit MOSS/model-proof workflow",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs::tests::training_contract_tests::cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload",
+      "requirements": []
+    },
+    "required_cuda_physical_index": 1
   }
 ]

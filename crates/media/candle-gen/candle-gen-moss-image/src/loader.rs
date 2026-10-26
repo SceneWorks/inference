@@ -21,6 +21,8 @@ pub(crate) struct Asset {
     pub repo: &'static str,
     pub revision: &'static str,
     pub relative: String,
+    #[cfg(feature = "test-support")]
+    pub fixture_digest: Option<[u8; 32]>,
 }
 impl Asset {
     pub(crate) fn new(
@@ -57,6 +59,8 @@ impl Asset {
         }
         verify_moss_image_asset(&pin, repo, revision, relative)?;
         Ok(Self {
+            #[cfg(feature = "test-support")]
+            fixture_digest: None,
             pin,
             role,
             repo,
@@ -65,6 +69,17 @@ impl Asset {
         })
     }
     pub fn receipt(&self) -> gen_core::Result<MossImageAssetReceipt> {
+        #[cfg(feature = "test-support")]
+        if self.fixture_digest.is_some() {
+            self.pin.verify_unchanged()?;
+            return Ok(MossImageAssetReceipt {
+                role: self.role,
+                repository: self.repo.into(),
+                revision: self.revision.into(),
+                relative_path: self.relative.clone(),
+                sha256: format!("{:x}", Sha256::digest(self.authenticated_bytes()?)),
+            });
+        }
         MossImageAssetReceipt::from_pin(
             self.role,
             self.repo,
@@ -87,6 +102,16 @@ impl Asset {
         })
     }
     pub(crate) fn verify_owned_bytes(&self, bytes: &[u8]) -> gen_core::Result<()> {
+        #[cfg(feature = "test-support")]
+        if let Some(expected) = self.fixture_digest {
+            let actual = Sha256::digest(bytes);
+            if actual[..] != expected[..] || actual[..] != self.pin.content_sha256()[..] {
+                return Err(gen_core::Error::Unsupported(
+                    "synthetic fixture consumed bytes changed".into(),
+                ));
+            }
+            return Ok(());
+        }
         let expected =
             moss_image_asset(self.repo, self.revision, &self.relative).ok_or_else(|| {
                 gen_core::Error::Unsupported("MOSS file outside frozen manifest".into())
@@ -106,6 +131,8 @@ impl Asset {
 }
 #[derive(Clone)]
 pub(crate) struct Sources {
+    pub variant: MossImageVariant,
+    pub adapter_pins: Vec<PinnedWeightsFile>,
     pub selection: Option<MossImageAcceleration>,
     pub ordinary: Vec<Asset>,
     pub mixed: Option<Vec<Asset>>,
@@ -194,6 +221,41 @@ fn snapshot_files(selection: Option<MossImageAcceleration>) -> impl Iterator<Ite
     })
 }
 impl Sources {
+    pub(crate) fn is_fixture(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        {
+            !self.ordinary.is_empty()
+                && self
+                    .ordinary
+                    .iter()
+                    .all(|asset| asset.fixture_digest.is_some())
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            false
+        }
+    }
+    pub(crate) fn source_identity(&self, variant: MossImageVariant) -> String {
+        if self.is_fixture() {
+            let mut hash = Sha256::new();
+            for asset in &self.ordinary {
+                hash.update(asset.relative.as_bytes());
+                hash.update(asset.pin.content_sha256());
+            }
+            format!(
+                "synthetic-moss-full-pipeline-v1:{}:{:x}",
+                variant.provider_id(),
+                hash.finalize()
+            )
+        } else {
+            format!(
+                "{}@{};shared@{}",
+                variant.repository(),
+                variant.revision(),
+                SFT_REVISION
+            )
+        }
+    }
     pub fn new(variant: MossImageVariant, spec: &LoadSpec) -> gen_core::Result<Self> {
         Self::prepare(variant, spec, None, None)
     }
@@ -242,7 +304,6 @@ impl Sources {
         }
         if spec.precision != gen_core::Precision::Bf16
             || spec.quantize.is_some()
-            || !spec.adapters.is_empty()
             || spec.control.is_some()
             || !spec.extra_controls.is_empty()
             || spec.ip_adapter.is_some()
@@ -468,7 +529,14 @@ impl Sources {
             .find(|a| a.relative == "tokenizer/tokenizer.json")
             .expect("static path")
             .clone();
+        let adapter_pins = spec
+            .adapters
+            .iter()
+            .map(|a| spec.file_pin_for(&a.path))
+            .collect::<gen_core::Result<Vec<_>>>()?;
         Ok(Self {
+            variant,
+            adapter_pins,
             selection,
             ordinary,
             mixed,
@@ -480,7 +548,63 @@ impl Sources {
             headers,
         })
     }
+    pub fn ensure_unchanged(&self) -> gen_core::Result<()> {
+        // Optional DMD closures are authenticated only when selected by assets(mode).
+        for a in &self.ordinary {
+            a.pin.verify_unchanged()?;
+        }
+        for pin in &self.adapter_pins {
+            pin.verify_unchanged()?;
+        }
+        Ok(())
+    }
+    pub fn training_vae_cancellable(
+        &self,
+        device: &Device,
+        cancel: &CancelFlag,
+    ) -> Result<Flux2Vae> {
+        let weights = load_weights_cancellable(
+            &self.ordinary,
+            MossImageAssetRole::Vae,
+            device,
+            DType::F32,
+            &[
+                "encoder.",
+                "decoder.",
+                "quant_conv.",
+                "post_quant_conv.",
+                "bn.running_mean",
+                "bn.running_var",
+            ],
+            cancel,
+        )?;
+        let map = weights
+            .keys()
+            .map(|k| Ok((k.clone(), weights.require(k)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            return Ok(Flux2Vae::from_fixture_widths(
+                VarBuilder::from_tensors(map, DType::F32, device),
+                [32; 4],
+                &Flux2VaeDecoderConfig {
+                    block_out_channels: [32; 4],
+                },
+            )?);
+        }
+        Ok(Flux2Vae::new_with_encoder_and_decoder_config(
+            VarBuilder::from_tensors(map, DType::F32, device),
+            &Flux2VaeDecoderConfig {
+                block_out_channels: if self.is_fixture() {
+                    [32; 4]
+                } else {
+                    MOSS_VAE_DECODER_CHANNELS
+                },
+            },
+        )?)
+    }
     pub fn assets(&self, mode: MossImageAcceleration) -> gen_core::Result<Vec<Asset>> {
+        self.ensure_unchanged()?;
         let mut a = self.ordinary.clone();
         match mode {
             MossImageAcceleration::Off=>(),
@@ -493,17 +617,21 @@ impl Sources {
         Ok(a)
     }
     pub fn text(&self, device: &Device) -> Result<Qwen35Model> {
+        self.text_cancellable(device, &CancelFlag::new())
+    }
+    pub fn text_cancellable(&self, device: &Device, cancel: &CancelFlag) -> Result<Qwen35Model> {
         let dtype = if device.is_cpu() {
             DType::F32
         } else {
             DType::BF16
         };
-        let w = load_weights(
+        let w = load_weights_cancellable(
             &self.ordinary,
             MossImageAssetRole::TextEncoder,
             device,
             dtype,
             &["language_model."],
+            cancel,
         )?;
         let map = w
             .keys()
@@ -536,7 +664,11 @@ impl Sources {
         Ok(Flux2Vae::new_with_decoder_config(
             VarBuilder::from_tensors(map, DType::F32, device),
             &Flux2VaeDecoderConfig {
-                block_out_channels: MOSS_VAE_DECODER_CHANNELS,
+                block_out_channels: if self.is_fixture() {
+                    [32; 4]
+                } else {
+                    MOSS_VAE_DECODER_CHANNELS
+                },
             },
         )?)
     }
@@ -846,14 +978,27 @@ pub(crate) fn load_weights(
     dtype: DType,
     prefixes: &[&str],
 ) -> Result<Weights> {
+    load_weights_cancellable(assets, role, device, dtype, prefixes, &CancelFlag::new())
+}
+pub(crate) fn load_weights_cancellable(
+    assets: &[Asset],
+    role: MossImageAssetRole,
+    device: &Device,
+    dtype: DType,
+    prefixes: &[&str],
+    cancel: &CancelFlag,
+) -> Result<Weights> {
     let mut map = HashMap::new();
     for a in assets
         .iter()
         .filter(|a| a.role == role && a.relative.ends_with(".safetensors"))
     {
+        crate::transformer::check_cancel(cancel)?;
         let bytes = a.authenticated_bytes()?;
+        crate::transformer::check_cancel(cancel)?;
         let safetensors = candle_gen::candle_core::safetensors::SliceSafetensors::new(&bytes)?;
         for (k, _) in safetensors.tensors() {
+            crate::transformer::check_cancel(cancel)?;
             if !prefixes.iter().any(|p| k.starts_with(p)) {
                 continue;
             }
@@ -871,6 +1016,7 @@ pub(crate) fn load_weights(
             }
         }
     }
+    crate::transformer::check_cancel(cancel)?;
     Ok(Weights::from_map(map))
 }
 pub(crate) fn tensor_f32(t: &Tensor) -> Result<Vec<f32>> {
@@ -1092,6 +1238,8 @@ mod constructor_tests {
         let bad = tmp.path().join("ordinary-config");
         std::fs::write(&bad, b"unselected ordinary config must not be consumed").unwrap();
         let ordinary = vec![Asset {
+            #[cfg(feature = "test-support")]
+            fixture_digest: None,
             pin: PinnedWeightsFile::pin(bad).unwrap(),
             role: MossImageAssetRole::Transformer,
             repo: SFT_REPO,

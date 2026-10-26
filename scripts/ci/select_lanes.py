@@ -23,6 +23,11 @@ LANES = (
 )
 
 
+# A manual-only profile, not a path-selected lane: it is never part of LANES, so `--all`, path
+# selection and `--only` can never turn it on. Only `--moss-cuda-unit` selects it (and nothing else).
+MANUAL_PROFILE = "moss_cuda_unit"
+
+
 def _under(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}/")
 
@@ -282,23 +287,34 @@ def main() -> int:
         metavar="LANE",
         help="select exactly these lanes (a manual dispatch scoped to them)",
     )
+    source.add_argument(
+        "--moss-cuda-unit",
+        action="store_true",
+        help="select only the manual MOSS CUDA unit profile; every path-selected lane is off",
+    )
     parser.add_argument("--base", help="base Git revision")
     parser.add_argument("--head", default="HEAD", help="head Git revision")
     parser.add_argument("--github-output", help="append key=value outputs to this file")
     args = parser.parse_args()
 
     paths = args.paths
-    if paths is None and not args.all and not args.only:
+    if paths is None and not args.all and not args.only and not args.moss_cuda_unit:
         if not args.base:
             parser.error("provide --paths, --base, --all or --only")
         paths = changed_paths(args.base, args.head)
 
-    lanes = only_lanes(args.only) if args.only else select_lanes(paths or [], force_all=args.all)
+    if args.moss_cuda_unit:
+        lanes = {lane: False for lane in LANES}
+    elif args.only:
+        lanes = only_lanes(args.only)
+    else:
+        lanes = select_lanes(paths or [], force_all=args.all)
     print(json.dumps(lanes, sort_keys=True))
     if args.github_output:
         with open(args.github_output, "a", encoding="utf-8") as output:
             for lane, selected in lanes.items():
                 output.write(f"{lane}={'true' if selected else 'false'}\n")
+            output.write(f"{MANUAL_PROFILE}={'true' if args.moss_cuda_unit else 'false'}\n")
     return 0
 
 

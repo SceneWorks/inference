@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -687,6 +688,23 @@ class RunGraph:
             return
         if not path.is_file():
             self.finding('unknown', chain, 'unresolved script: ' + name)
+            return
+        # The exact reviewed suite runner may execute the literal routine partition in
+        # ordinary CI. Its executable argv is built from Cargo compiler-artifact records,
+        # which this graph cannot resolve statically; bind the entire source body and CLI
+        # mode instead of blessing arbitrary dynamic subprocess calls.
+        if relative == 'scripts/ci/test_suites.py':
+            reviewed_sha = '688450dc2b0debbcb017a4460a3c425580667b3ee4319e29131d1be539a51d7f'
+            command_at = args.index('--') if '--' in args else -1
+            command = args[command_at + 1:] if command_at >= 0 else []
+            if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha
+                    or args[:command_at].count('routine') != 1
+                    or any(mode in args[:command_at] for mode in ('exhaustive', 'check'))
+                    or command[:2] != ['cargo', 'test']
+                    or any(flag in command for flag in ('--ignored', '--include-ignored', '--run-ignored'))):
+                self.finding('unknown', chain, 'unreviewed suite source, mode, or Cargo command')
+            else:
+                self.finding('ordinary', chain, 'exact-source routine suite over ordinary ignored-model Cargo tests')
             return
         key = (relative, tuple(args))
         if key in self.active:

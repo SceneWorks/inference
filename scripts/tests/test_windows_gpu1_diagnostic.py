@@ -34,6 +34,10 @@ def selected_jobs(workflow, event, lane, *, selected=True, fork=False, tag=False
         'github.event_name': event,
         'github.run_attempt': 1,
         'github.ref': 'refs/tags/runtime-test' if tag else 'refs/heads/story/test',
+        # Longer than `github.ref`, so the length-sorted replacement below rewrites it intact;
+        # without it `startsWith(github.ref, ...)` mangling turns `github.ref_type` into invalid
+        # Python. The MOSS CUDA unit lane gates on both.
+        'github.ref_type': 'branch',
         'inputs.lanes': lane,
     }
     result = set()
@@ -197,13 +201,18 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic_isolation_errors(self.workflow), [])
         self.assertGreater(len(self.workflow['jobs']), 15)
 
-    def test_isolation_detects_each_missing_sibling_guard(self):
+    def test_isolation_detects_each_removed_sibling_barrier(self):
         guard = "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')"
         for name, job in self.workflow['jobs'].items():
             if name == LANE:
                 continue
             with self.subTest(job=name):
-                self.assertTrue(job['if'].startswith(guard))
+                condition = job['if']
+                selector = f"inputs.lanes == '{name}'"
+                # Exact positive selectors and negative sibling guards both isolate jobs.
+                self.assertTrue(condition.startswith(guard) or selector in condition, name)
+                condition = condition.removeprefix(guard).removeprefix(' && ')
+                condition = condition.replace(selector, f"inputs.lanes == '{LANE}'")
                 mutated = copy.deepcopy(self.workflow)
                 tail = job['if'][len(guard):].removeprefix(' && ')
                 mutated['jobs'][name]['if'] = tail or 'True'

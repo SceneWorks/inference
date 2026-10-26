@@ -787,21 +787,22 @@ fn copy_dir(from: &Path, to: &Path) {
 
 /// On a CUDA build, a rank whose `cuda:<local_rank>` does not exist is a typed `InvalidMesh`
 /// refusal — never silently folded onto another rank's card — unless the run opts into
-/// `dist.world.share_device`. Each rank process sees exactly one card (`CUDA_VISIBLE_DEVICES=0`),
-/// so rank 1's `cuda:1` is absent whatever the box holds. (A CPU build has no per-rank device:
-/// nothing to refuse, the case is vacuous there and says so.)
+/// `dist.world.share_device`. Each rank process inherits exactly the lane's bound card,
+/// so rank 1's `cuda:1` is absent whatever the box holds. CPU builds omit this device-only case.
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore = "model inference; explicit model workflow only"]
 fn a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in() {
-    if !trainer_device_is_cuda() {
-        eprintln!("CPU build: ranks share the CPU by construction; the refusal is CUDA-only");
-        #[cfg(feature = "model-inference-proof")]
-        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs:749 (a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
-        return;
-    }
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+    let visible = inherited_single_cuda_device(visible.as_deref())
+        .expect("the rank fixture requires the lane's single physical GPU1 binding");
+    assert!(candle_gen::candle_core::Device::new_cuda(0)
+        .expect("the bound CUDA device is required")
+        .is_cuda());
     let (data, scratch, out) = (tmp(), tmp(), tmp());
     write_dataset(data.path());
-    let one_card = json!({"CUDA_VISIBLE_DEVICES": "0"});
+    // A literal "0" would override the outer UUID and expose physical GPU0 to children.
+    let one_card = json!({"CUDA_VISIBLE_DEVICES": visible});
     for share in [false, true] {
         let mut world = tcp_world(2, 1);
         world["share_device"] = json!(share);
@@ -850,11 +851,48 @@ fn a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in() {
     }
 }
 
-fn trainer_device_is_cuda() -> bool {
-    cfg!(feature = "cuda")
-        && candle_gen::candle_core::Device::new_cuda(0)
-            .map(|d| d.is_cuda())
-            .unwrap_or(false)
+fn inherited_single_cuda_device(value: Option<&str>) -> Result<&str, &'static str> {
+    let value = value.ok_or("CUDA_VISIBLE_DEVICES must retain the lane's GPU1 binding")?;
+    if value == "1" {
+        return Ok(value);
+    }
+    let error = "expected one full GPU UUID or physical index 1, without remapping or discovery";
+    let uuid = value.strip_prefix("GPU-").ok_or(error)?;
+    let mut groups = uuid.split('-');
+    for width in [8, 4, 4, 4, 12] {
+        let group = groups.next().ok_or(error)?;
+        if group.len() != width || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(error);
+        }
+    }
+    if groups.next().is_some() {
+        return Err(error);
+    }
+    Ok(value)
+}
+
+#[test]
+fn rank_children_preserve_only_the_single_bound_gpu1_mapping() {
+    for value in ["1", "GPU-01234567-89ab-cdef-0123-456789abcdef"] {
+        assert_eq!(inherited_single_cuda_device(Some(value)), Ok(value));
+    }
+    for value in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("2"),
+        Some("01"),
+        Some(" 1"),
+        Some("1 "),
+        Some("1,0"),
+        Some("GPU-01234567-89ab-cdef-0123-456789abcdef,1"),
+        Some("GPU-"),
+        Some("GPU-01234567-89ab-cdef-0123-456789abcdeg"),
+        Some("GPU-01234567-89ab-cdef-0123-456789abcdef-0000"),
+        Some("MIG-GPU-01234567-89ab-cdef-0123-456789abcdef/1/0"),
+    ] {
+        assert!(inherited_single_cuda_device(value).is_err(), "{value:?}");
+    }
 }
 
 fn lost_rank_case(field: &str) {

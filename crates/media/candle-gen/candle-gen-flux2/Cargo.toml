@@ -41,6 +41,8 @@ model-inference-proof = ["candle-gen-pid/model-inference-proof", "candle-gen/mod
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider selects the matching candle backend everywhere.
 default = []
+# Explicit development fixtures only; never selected by runtime bundles.
+test-support = []
 metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-pid/metal", "candle-llm/metal"]
 cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda", "candle-llm/cuda"]
 

@@ -46,6 +46,8 @@ struct LowRank {
 struct Linear {
     base: candle_nn::Linear,
     low_rank: Option<LowRank>,
+    residuals: Vec<crate::adapters::Residual>,
+    residuals_frozen: bool,
     edit_adapter: bool,
     edit_fused_bias: bool,
 }
@@ -108,6 +110,8 @@ impl Linear {
         Ok(Self {
             base: candle_nn::Linear::new(weight, b),
             low_rank,
+            residuals: Vec::new(),
+            residuals_frozen: false,
             edit_adapter: false,
             edit_fused_bias: false,
         })
@@ -138,6 +142,22 @@ impl Linear {
         }
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut output = self.forward_dmd(x)?;
+        for residual in &self.residuals {
+            let frozen;
+            let residual = if self.residuals_frozen {
+                frozen = residual.detached();
+                &frozen
+            } else {
+                residual
+            };
+            if let Some(value) = residual.forward(x)? {
+                output = output.to_dtype(DType::F32)?.add(&value)?;
+            }
+        }
+        Ok(output)
+    }
+    fn forward_dmd(&self, x: &Tensor) -> Result<Tensor> {
         if let Some(a) = &self.low_rank {
             if self.edit_adapter {
                 let base = self.base_forward(&x.to_dtype(self.dtype())?)?;
@@ -163,7 +183,7 @@ impl Linear {
             let low = candle_nn::Linear::new(a.up.clone(), None).forward(&low)?;
             Ok(base.add(&(low * a.scale)?)?)
         } else {
-            self.base_forward(x)
+            self.base_forward(&x.to_dtype(self.dtype())?)
         }
     }
 }
@@ -294,7 +314,13 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor, r: &Tensor, heads: usize) -> Re
         let (q, kt) = attention_qk_operands(q, k, output_dtype, r, heads)?;
         (q.matmul(&kt)? / ((d / heads) as f64).sqrt())?
     };
-    let p = candle_nn::ops::softmax_last_dim(&scores)?;
+    // The optimized inference kernel uses apply_op1_no_bwd and severs every Q/K adapter
+    // gradient. Recorded training/recomputation graphs must use differentiable FP32 softmax.
+    let p = if scores.track_op() {
+        candle_nn::ops::softmax(&scores, candle_gen::candle_core::D::Minus1)?
+    } else {
+        candle_nn::ops::softmax_last_dim(&scores)?
+    };
     Ok(p.matmul(&attention_value_operand(v, heads)?)?
         .to_dtype(output_dtype)?
         .transpose(1, 2)?
@@ -452,15 +478,28 @@ impl Block {
                     .reshape((b, s, self.heads, d / self.heads))?,
             )?
             .reshape((b, s, d))?;
-        let residual = self
+        let projected = self
             .o
-            .forward(&attention(&q, &k, &self.v.forward(&y)?, r, self.heads)?)?
-            .broadcast_mul(&part(2)?.to_dtype(q.dtype())?)?;
-        let dtype = residual.dtype();
-        let x = x.to_dtype(dtype)?.add(&residual)?;
-        let y = self
-            .n2
-            .forward(&x)?
+            .forward(&attention(&q, &k, &self.v.forward(&y)?, r, self.heads)?)?;
+        // Selective custom targets can widen Q without widening O (or vice versa). Promote
+        // the actual multiplication/addition operands, never infer O's dtype from Q.
+        let promoted = |a: DType, b: DType| {
+            if a == DType::F32 || b == DType::F32 {
+                DType::F32
+            } else {
+                a
+            }
+        };
+        let dtype = promoted(projected.dtype(), m.dtype());
+        let residual = projected
+            .to_dtype(dtype)?
+            .broadcast_mul(&part(2)?.to_dtype(dtype)?)?;
+        let dtype = promoted(x.dtype(), residual.dtype());
+        let x = x.to_dtype(dtype)?.add(&residual.to_dtype(dtype)?)?;
+        let normalized = self.n2.forward(&x)?;
+        let dtype = promoted(normalized.dtype(), m.dtype());
+        let y = normalized
+            .to_dtype(dtype)?
             .broadcast_mul(&(part(4)?.to_dtype(dtype)? + 1.0)?)?
             .broadcast_add(&part(3)?.to_dtype(dtype)?)?
             .to_dtype(self.q.dtype())?;
@@ -469,8 +508,12 @@ impl Block {
         let residual = self
             .down
             .forward(&situ(&hg.narrow(2, 0, f)?, &hg.narrow(2, f, f)?)?)?;
-        Ok(x.to_dtype(residual.dtype())?
-            .add(&residual.broadcast_mul(&part(5)?.to_dtype(residual.dtype())?)?)?)
+        let dtype = promoted(residual.dtype(), m.dtype());
+        let residual = residual
+            .to_dtype(dtype)?
+            .broadcast_mul(&part(5)?.to_dtype(dtype)?)?;
+        let dtype = promoted(x.dtype(), residual.dtype());
+        Ok(x.to_dtype(dtype)?.add(&residual.to_dtype(dtype)?)?)
     }
 }
 
@@ -497,6 +540,17 @@ impl Transformer {
     }
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.resident_bytes
+            + self
+                .layers
+                .iter()
+                .map(|b| {
+                    [&b.q, &b.k, &b.v, &b.o, &b.up_gate, &b.down]
+                        .iter()
+                        .flat_map(|l| &l.residuals)
+                        .map(crate::adapters::Residual::bytes)
+                        .sum::<u64>()
+                })
+                .sum::<u64>()
     }
     pub(crate) fn load(w: &Weights, g: Geometry, adapter: Option<&Weights>) -> Result<Self> {
         let mut keys = BTreeSet::new();
@@ -576,6 +630,346 @@ impl Transformer {
                 "MOSS unconsumed transformer tensors {extra:?}"
             )));
         }
+        Ok(result)
+    }
+    #[cfg(test)]
+    pub(crate) fn block_stream_dtype(&self) -> Result<DType> {
+        let x = Tensor::ones((1, 2, self.g.dim), self.video.dtype(), self.device())?;
+        let modulation = Tensor::ones((1, 6, self.g.dim), self.video.dtype(), self.device())?;
+        let rotations = rope(
+            1,
+            1,
+            1,
+            self.g.dim / self.g.heads,
+            self.video.dtype(),
+            self.device(),
+        )?;
+        Ok(self.layers[0].forward(&x, &rotations, &modulation)?.dtype())
+    }
+    #[cfg(test)]
+    pub(crate) fn adapter_scales(&self) -> Vec<f64> {
+        self.layers
+            .iter()
+            .flat_map(|b| [&b.q, &b.k, &b.v, &b.o, &b.up_gate, &b.down])
+            .flat_map(|l| &l.residuals)
+            .map(crate::adapters::Residual::scale)
+            .collect()
+    }
+    pub(crate) fn projection_shapes(&self) -> std::collections::BTreeMap<String, (usize, usize)> {
+        let mut shapes = std::collections::BTreeMap::new();
+        for (i, b) in self.layers.iter().enumerate() {
+            for (name, l) in [
+                ("q", &b.q),
+                ("k", &b.k),
+                ("v", &b.v),
+                ("o", &b.o),
+                ("ffn_up_gate", &b.up_gate),
+                ("ffn_down", &b.down),
+            ] {
+                shapes.insert(
+                    format!("layers.{i}.proj.{name}"),
+                    (l.base.weight().dims()[0], l.base.weight().dims()[1]),
+                );
+            }
+        }
+        shapes
+    }
+    pub(crate) fn push_residual(
+        &mut self,
+        path: &str,
+        residual: crate::adapters::Residual,
+    ) -> Result<()> {
+        for (i, b) in self.layers.iter_mut().enumerate() {
+            for (name, l) in [
+                ("q", &mut b.q),
+                ("k", &mut b.k),
+                ("v", &mut b.v),
+                ("o", &mut b.o),
+                ("ffn_up_gate", &mut b.up_gate),
+                ("ffn_down", &mut b.down),
+            ] {
+                if path == format!("layers.{i}.proj.{name}") {
+                    l.residuals.push(residual);
+                    return Ok(());
+                }
+            }
+        }
+        Err(CandleError::Msg(format!(
+            "unknown MOSS transformer projection {path}"
+        )))
+    }
+    pub(crate) fn validate_residuals(&self) -> Result<()> {
+        for block in &self.layers {
+            for linear in [
+                &block.q,
+                &block.k,
+                &block.v,
+                &block.o,
+                &block.up_gate,
+                &block.down,
+            ] {
+                for residual in &linear.residuals {
+                    residual.validate()?;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn freeze_residuals(&mut self, freeze: bool) {
+        for block in &mut self.layers {
+            for linear in [
+                &mut block.q,
+                &mut block.k,
+                &mut block.v,
+                &mut block.o,
+                &mut block.up_gate,
+                &mut block.down,
+            ] {
+                linear.residuals_frozen = freeze;
+            }
+        }
+    }
+    pub(crate) fn clear_residuals(&mut self) {
+        for b in &mut self.layers {
+            for l in [
+                &mut b.q,
+                &mut b.k,
+                &mut b.v,
+                &mut b.o,
+                &mut b.up_gate,
+                &mut b.down,
+            ] {
+                l.residuals.clear();
+            }
+        }
+    }
+    /// Reuse the shared seeded factor initializer and lossless serializer without using its
+    /// activation-dtype residual. The short-lived host proxies share frozen base handles only;
+    /// the executable MOSS stack below retains raw FP32 master factors from the resulting set.
+    pub(crate) fn training_adapter(
+        &mut self,
+        c: &candle_gen::gen_core::TrainingConfig,
+    ) -> Result<candle_gen::train::lora::LoraSet> {
+        use candle_gen::train::lora::{
+            build_adapt_lokr_targets_peft, build_adapt_lora_targets, AdaptLoraHost,
+        };
+        struct InitHost(Vec<(String, candle_gen::quant::AdaptLinear)>);
+        impl AdaptLoraHost for InitHost {
+            fn visit_adapt_lora_mut(
+                &mut self,
+                f: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+            ) -> Result<()> {
+                for (name, l) in &mut self.0 {
+                    f(name, l)?;
+                }
+                Ok(())
+            }
+        }
+        let mut entries = Vec::new();
+        for (i, b) in self.layers.iter().enumerate() {
+            for (name, l) in [
+                ("q", &b.q),
+                ("k", &b.k),
+                ("v", &b.v),
+                ("o", &b.o),
+                ("ffn_up_gate", &b.up_gate),
+                ("ffn_down", &b.down),
+            ] {
+                entries.push((
+                    format!("layers.{i}.proj.{name}"),
+                    candle_gen::quant::AdaptLinear::from_dense(
+                        l.base.clone(),
+                        l.base.weight().dims()[1],
+                        l.base.weight().dims()[0],
+                    ),
+                ));
+            }
+        }
+        let paths = candle_gen::gen_core::moss_image_training::target_paths(
+            self.g.layers,
+            &c.lora_target_modules,
+        )?;
+        let mut host = InitHost(entries);
+        let set = match c.network_type {
+            candle_gen::gen_core::NetworkType::Lora => {
+                build_adapt_lora_targets(&mut host, &paths, c.rank, c.alpha, c.seed, self.device())?
+            }
+            candle_gen::gen_core::NetworkType::Lokr => build_adapt_lokr_targets_peft(
+                &mut host,
+                &paths,
+                c.rank,
+                c.alpha,
+                c.decompose_factor,
+                c.seed,
+                self.device(),
+            )?,
+        };
+        let lokr = set.kind == candle_gen::train::lora::AdapterKind::Lokr;
+        let mut groups =
+            std::collections::BTreeMap::<String, std::collections::BTreeMap<String, Tensor>>::new();
+        let suffixes: &[&str] = if lokr {
+            &candle_gen::gen_core::weightsmeta::LOKR_SUFFIXES
+        } else {
+            &[".lora_A.weight", ".lora_B.weight"]
+        };
+        for (name, var) in set.named_vars() {
+            let (path, suffix) =
+                candle_gen::gen_core::weightsmeta::split_factor_key(&name, suffixes)
+                    .ok_or_else(|| CandleError::Msg("invalid MOSS factor key".into()))?;
+            groups
+                .entry(path.into())
+                .or_default()
+                .insert(suffix.into(), var.as_tensor().clone());
+        }
+        self.clear_residuals();
+        let shapes = self.projection_shapes();
+        // Portable MLX/import scaling divides in FP32, including non-binary alpha/rank.
+        // Widen only the rounded scalar for Candle's affine API, not the division itself.
+        let scale = f64::from(set.alpha / set.rank as f32);
+        for (path, group) in groups {
+            let (out, input) = shapes[&path];
+            self.push_residual(
+                &path,
+                crate::adapters::Residual::from_group(&group, out, input, lokr, scale)?,
+            )?;
+        }
+        Ok(set)
+    }
+    /// Full production training graph. Recomputed boundary leaves preserve the derivatives of
+    /// frozen backbone operations to earlier adapter factors, not just the last adapted block.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loss_and_grads(
+        &self,
+        x: &Tensor,
+        time: f32,
+        context: &Tensor,
+        target: &Tensor,
+        mask: Option<&Tensor>,
+        mae: bool,
+        checkpoint: bool,
+        vars: &[candle_gen::candle_core::Var],
+        cancel: &CancelFlag,
+    ) -> Result<(f32, candle_gen::candle_core::backprop::GradStore)> {
+        use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
+        check_cancel(cancel)?;
+        let (batch, c, h, w) = x.dims4()?;
+        let (cb, tokens, td) = context.dims3()?;
+        if batch != 1
+            || cb != 1
+            || tokens == 0
+            || td != self.g.text
+            || c != self.g.channels
+            || target.dims() != x.dims()
+        {
+            return Err(CandleError::Msg(
+                "MOSS training latent/context/target geometry".into(),
+            ));
+        }
+        let half = self.g.freq / 2;
+        let features = if self.g.freq == 256 {
+            candle_gen::gen_core::moss_image::moss_time_features(time)?.to_vec()
+        } else {
+            let phase: Vec<_> = (0..half)
+                .map(|i| f64::from(time) * 10000_f64.powf(-(i as f64) / half as f64))
+                .collect();
+            phase
+                .iter()
+                .map(|p| p.cos() as f32)
+                .chain(phase.iter().map(|p| p.sin() as f32))
+                .collect()
+        };
+        let t = Tensor::from_vec(features, (1, self.g.freq), x.device())?
+            .to_dtype(self.time1.dtype())?;
+        let t = self
+            .time2
+            .forward(&candle_nn::ops::silu(&self.time1.forward(&t)?)?)?
+            .to_dtype(DType::F32)?;
+        let m = self
+            .shared
+            .forward(&t.to_dtype(self.shared.dtype())?)?
+            .reshape((1, 6, self.g.dim))?;
+        let head = self
+            .head
+            .forward(&t.to_dtype(self.head.dtype())?)?
+            .reshape((1, 2, self.g.dim))?;
+        let video = x
+            .reshape((1, c, h * w))?
+            .transpose(1, 2)?
+            .to_dtype(self.video.dtype())?
+            .contiguous()?;
+        let video = self.video.forward(&video)?;
+        let r = rope(
+            h,
+            w,
+            tokens,
+            self.g.dim / self.g.heads,
+            video.dtype(),
+            x.device(),
+        )?;
+        let mut text = self.project_context(context)?;
+        for block in &self.text_blocks {
+            text = block.forward(&text, &r.narrow(1, h * w, tokens)?)?;
+        }
+        let y = Tensor::cat(&[video, text], 1)?.detach();
+        let finish = |y: &Tensor| -> Result<Tensor> {
+            let y = self
+                .norm
+                .forward(&y.narrow(1, 0, h * w)?.to_dtype(self.norm.0.dtype())?)?;
+            let dtype = if y.dtype() == DType::F32 || head.dtype() == DType::F32 {
+                DType::F32
+            } else {
+                y.dtype()
+            };
+            let y = y
+                .to_dtype(dtype)?
+                .broadcast_mul(&(head.i((.., 1, ..))?.unsqueeze(1)?.to_dtype(dtype)? + 1.)?)?
+                .broadcast_add(&head.i((.., 0, ..))?.unsqueeze(1)?.to_dtype(dtype)?)?;
+            let pred = self
+                .final_linear
+                .forward(&y.to_dtype(self.final_linear.dtype())?)?
+                .transpose(1, 2)?
+                .reshape((1, c, h, w))?;
+            Ok(candle_gen::train::flow_match::weighted_velocity_loss(
+                &pred, target, mask, mae,
+            )?)
+        };
+        let result = if checkpoint {
+            let mut segments: Vec<Segment<'_>> = Vec::new();
+            for block in &self.layers {
+                let r = &r;
+                let m = &m;
+                segments.push(Box::new(move |state| {
+                    check_cancel(cancel)
+                        .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
+                    Ok(vec![block.forward(&state[0], r, m).map_err(|e| {
+                        candle_gen::candle_core::Error::Msg(e.to_string())
+                    })?])
+                }));
+            }
+            segments.push(Box::new(|state| {
+                Ok(vec![finish(&state[0]).map_err(|e| {
+                    candle_gen::candle_core::Error::Msg(e.to_string())
+                })?])
+            }));
+            checkpointed_backward(&segments, &[y], vars)?
+        } else {
+            let mut y = y;
+            for block in &self.layers {
+                check_cancel(cancel)?;
+                y = block.forward(&y, &r, &m)?;
+            }
+            let loss = finish(&y)?;
+            (loss.to_scalar::<f32>()?, loss.backward()?)
+        };
+        if !result.0.is_finite() {
+            return Err(CandleError::Msg("MOSS nonfinite loss".into()));
+        }
+        for var in vars {
+            if let Some(g) = result.1.get(var.as_tensor()) {
+                crate::adapters::finite(g, "training gradient")?;
+            }
+        }
+        check_cancel(cancel)?;
         Ok(result)
     }
     pub(crate) fn project_context(&self, context: &Tensor) -> Result<Tensor> {

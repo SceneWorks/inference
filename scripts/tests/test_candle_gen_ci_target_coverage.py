@@ -537,12 +537,14 @@ class CandleGenCiTargetCoverageTests(unittest.TestCase):
             f"{OWNING_JOB} is no longer gated on {JOB_CONDITION!r}; an `if:` that cannot be true "
             "for a candle change (`if: false`, a renamed output) silently disables this step.",
         )
-        self.assertNotRegex(
-            step_block(self.workflow),
-            r"^\s*if:",
-            f"the {STEP_NAME!r} step gained its own `if:`. This step must run whenever its job "
-            "does; a step-level condition is a second, unpinned off switch.",
-        )
+        import yaml
+
+        job = yaml.safe_load(self.workflow)["jobs"][OWNING_JOB]
+        self.assertEqual(job["strategy"], {"fail-fast": False, "matrix": {"group": ["base", "gen"]}})
+        step = next(step for step in job["steps"] if step.get("name") == STEP_NAME)
+        self.assertEqual(step["if"], "matrix.group == 'gen'")
+        self.assertNotIn("continue-on-error", job)
+        self.assertNotIn("continue-on-error", step)
         self.assertIn(
             OWNING_JOB,
             job_needs(self.workflow, GATE_JOB),

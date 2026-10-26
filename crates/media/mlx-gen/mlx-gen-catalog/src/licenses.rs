@@ -1090,8 +1090,21 @@ mod tests {
         // row (its training-only resources — VGG16, LPIPS, OpenCLIP ConvNeXt-XXL — carry their
         // licences on `gen_core::iris::restoration_train::TRAINING_RESOURCES` and never ship in an
         // export). sc-26240 adds the `flux3_klein_base` trainer, which reuses the sc-26239
-        // generator row.
-        assert_eq!(trainers.len(), 21);
+        // generator row. The epic's MOSS trainers (`moss_image_base`, `moss_image_sft`) reuse
+        // their generator rows, so they add two registrations without adding two rows.
+        let unique: BTreeSet<_> = trainers.iter().collect();
+        assert_eq!(
+            unique.len(),
+            trainers.len(),
+            "duplicate native trainer registrations"
+        );
+        assert_eq!(trainers.len(), 23);
+        for id in ["moss_image_base", "moss_image_sft"] {
+            assert!(
+                trainers.iter().any(|trainer| trainer == id),
+                "missing exact-checkpoint MOSS trainer {id}"
+            );
+        }
         let transforms: BTreeSet<String> = registry
             .transforms()
             .map(|r| (r.descriptor)().id.to_string())

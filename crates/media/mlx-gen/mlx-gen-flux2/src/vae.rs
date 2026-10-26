@@ -666,6 +666,87 @@ pub struct Flux2Vae {
 }
 
 impl Flux2Vae {
+    /// Actual loaded frozen tensors, shallow handles only; no full-model host clones.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn frozen_training_arrays(&self) -> Result<Vec<Array>> {
+        fn pair(pair: &(Array, Array), values: &mut Vec<Array>) {
+            values.extend([pair.0.clone(), pair.1.clone()]);
+        }
+        fn resnet(r: &ResnetBlock2D, values: &mut Vec<Array>) {
+            values.extend([
+                r.norm1_w.clone(),
+                r.norm1_b.clone(),
+                r.conv1_w.clone(),
+                r.conv1_b.clone(),
+                r.norm2_w.clone(),
+                r.norm2_b.clone(),
+                r.conv2_w.clone(),
+                r.conv2_b.clone(),
+            ]);
+            if let Some(shortcut) = &r.shortcut {
+                pair(shortcut, values);
+            }
+        }
+        fn attention(a: &VaeAttention, values: &mut Vec<Array>) -> Result<()> {
+            values.extend([a.gn_w.clone(), a.gn_b.clone()]);
+            for p in [&a.q, &a.k, &a.v, &a.o] {
+                let (w, b) = p.dense_weight().ok_or_else(|| {
+                    mlx_gen::Error::Unsupported(
+                        "frozen MOSS VAE audit requires dense attention".into(),
+                    )
+                })?;
+                values.push(w.clone());
+                values.extend(b.cloned());
+            }
+            Ok(())
+        }
+        fn blocks(blocks: &[SampleBlock], values: &mut Vec<Array>) {
+            for block in blocks {
+                for r in &block.resnets {
+                    resnet(r, values);
+                }
+                if let Some(d) = &block.downsample {
+                    pair(d, values);
+                }
+                if let Some(u) = &block.upsample {
+                    pair(u, values);
+                }
+            }
+        }
+        let mut values = vec![self.bn_mean.clone(), self.bn_std.clone()];
+        pair(&self.post_quant, &mut values);
+        let d = &self.decoder;
+        values.extend([
+            d.conv_in_w.clone(),
+            d.conv_in_b.clone(),
+            d.norm_out_w.clone(),
+            d.norm_out_b.clone(),
+            d.conv_out_w.clone(),
+            d.conv_out_b.clone(),
+        ]);
+        resnet(&d.mid_resnet0, &mut values);
+        attention(&d.mid_attn, &mut values)?;
+        resnet(&d.mid_resnet1, &mut values);
+        blocks(&d.up_blocks, &mut values);
+        if let Some((e, quant)) = &self.encoder {
+            pair(quant, &mut values);
+            values.extend([
+                e.conv_in_w.clone(),
+                e.conv_in_b.clone(),
+                e.norm_out_w.clone(),
+                e.norm_out_b.clone(),
+                e.conv_out_w.clone(),
+                e.conv_out_b.clone(),
+            ]);
+            blocks(&e.down_blocks, &mut values);
+            resnet(&e.mid_resnet0, &mut values);
+            attention(&e.mid_attn, &mut values)?;
+            resnet(&e.mid_resnet1, &mut values);
+        }
+        Ok(values)
+    }
+
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let bn_mean = f32w(w, "bn.running_mean")?;
         let bn_var = f32w(w, "bn.running_var")?;

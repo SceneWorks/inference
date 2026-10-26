@@ -19,7 +19,9 @@
 
 use std::cell::Cell;
 
-use mlx_rs::ops::{add, concatenate_axis, multiply, rsqrt, sigmoid, split_sections, sum_axis};
+use mlx_rs::ops::{
+    add, concatenate_axis, mean_axis, multiply, rsqrt, sigmoid, split_sections, sum_axis,
+};
 use mlx_rs::transforms::async_eval;
 use mlx_rs::{Array, Dtype};
 
@@ -27,7 +29,8 @@ use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
-    causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache,
+    causal_depthwise_conv_traced, causal_depthwise_conv_traced_f32_accum, compute_g,
+    rms_norm_gated, ConvTrace, DeltaNetCache,
 };
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
@@ -86,6 +89,42 @@ impl PrecisionProfile {
             scale(&normalized.as_dtype(Dtype::Float32)?, inverse_head_dim)
         } else {
             scale(normalized, inverse_head_dim)
+        }
+    }
+
+    fn gated_norm(self, x: &Array, weight: &Array, gate: &Array, eps: f32) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            // Frozen Qwen3_5RMSNormGated differs from its zero-centered RMSNorm:
+            // narrow the normalized values BEFORE the direct weight multiplication,
+            // then apply the F32 SiLU gate before the final narrowing.
+            let x32 = x.as_dtype(Dtype::Float32)?;
+            let variance = mean_axis(&multiply(&x32, &x32)?, -1, true)?;
+            let normalized = multiply(&x32, &rsqrt(&add(&variance, Array::from_f32(eps))?)?)?
+                .as_dtype(x.dtype())?;
+            let weighted = multiply(weight, &normalized)?;
+            Ok(multiply(
+                &weighted.as_dtype(Dtype::Float32)?,
+                &silu(&gate.as_dtype(Dtype::Float32)?)?,
+            )?
+            .as_dtype(x.dtype())?)
+        } else {
+            rms_norm_gated(x, weight, gate, eps)
+        }
+    }
+
+    fn convolve(self, x: &Array, weight: &Array, state: &Array) -> Result<(Array, ConvTrace)> {
+        if self == Self::MossFrozenHf {
+            causal_depthwise_conv_traced_f32_accum(x, weight, state)
+        } else {
+            causal_depthwise_conv_traced(x, weight, state)
+        }
+    }
+
+    fn silu(self, x: &Array) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            Ok(silu(&x.as_dtype(Dtype::Float32)?)?.as_dtype(x.dtype())?)
+        } else {
+            silu(x)
         }
     }
 
@@ -435,6 +474,11 @@ struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
+    fn normalize_output(&self, x: &Array, gate: &Array) -> Result<Array> {
+        self.precision
+            .gated_norm(x, &self.norm_weight, gate, self.eps)
+    }
+
     fn push_arrays(&self, out: &mut Vec<Array>) {
         for p in [
             &self.in_proj_qkv,
@@ -474,7 +518,8 @@ impl GatedDeltaNet {
             None => zeros3(b, self.conv_kernel - 1, self.conv_dim, dt)?,
         };
         let (conv_out, conv_trace) =
-            causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
+            self.precision
+                .convolve(&mixed, &self.conv_weight, &conv_state)?;
         let cp = split_sections(&conv_out, &[self.key_dim, 2 * self.key_dim], 2)?;
         let qc = cp[0].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
         let kc = cp[1].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
@@ -502,7 +547,7 @@ impl GatedDeltaNet {
         )?;
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
-        let out = rms_norm_gated(&y.as_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
+        let out = self.normalize_output(&y.as_dtype(dt)?, &z)?;
         self.out_proj
             .forward(&out.reshape(&[b, s, self.value_dim])?)
     }
@@ -589,8 +634,8 @@ impl Mlp {
         }
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let gate = silu(&self.gate.forward(x)?)?;
+    fn forward(&self, x: &Array, precision: PrecisionProfile) -> Result<Array> {
+        let gate = precision.silu(&self.gate.forward(x)?)?;
         let up = self.up.forward(x)?;
         self.down.forward(&multiply(&gate, &up)?)
     }
@@ -615,9 +660,9 @@ impl Ffn {
         }
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Array, precision: PrecisionProfile) -> Result<Array> {
         match self {
-            Ffn::Dense(m) => m.forward(x),
+            Ffn::Dense(m) => m.forward(x, precision),
             Ffn::Moe(m) => m.forward(x),
         }
     }
@@ -665,9 +710,10 @@ impl DecoderLayer {
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
         let h = add(x, &r)?;
-        let m = self
-            .ffn
-            .forward(&self.precision.norm(&h, &self.post_ln, self.eps)?)?;
+        let m = self.ffn.forward(
+            &self.precision.norm(&h, &self.post_ln, self.eps)?,
+            self.precision,
+        )?;
         Ok(add(&h, &m)?)
     }
 }
@@ -1750,9 +1796,10 @@ impl Qwen35Model {
     }
 
     /// Headless dense BF16 decoder with the frozen MOSS Transformers precision boundaries.
-    /// Only zero-centered norm multipliers, normalized-Q scaling and delta decay intermediates
-    /// use F32; weights/projections and hidden outputs remain BF16. Shared constructors retain
-    /// their native arithmetic. This profile does not support quantized, MoE or Prism decoders.
+    /// Norms, normalized-Q scaling, delta decay and depthwise convolution follow the frozen HF
+    /// intermediate casts; weights/projections and hidden outputs remain BF16.
+    /// Shared constructors retain their native arithmetic. This profile does not support
+    /// quantized, MoE or Prism decoders.
     pub fn from_weights_headless_moss_frozen_hf(
         w: &Weights,
         prefix: &str,
@@ -2829,6 +2876,178 @@ pub(crate) mod tests {
                 host(&rms_norm(&x, &old_multiplier, 1e-6).unwrap())
             );
         });
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native() {
+        on_cpu(|| {
+            let fixture: serde_json::Value =
+                serde_json::from_str(include_str!("testdata/moss_qwen_gated_norm.json")).unwrap();
+            let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+            let prefix = "language_model";
+            let weights = Weights::from_map(synthetic_tensors_with_prefix(&cfg, prefix));
+            let mut model = Qwen35Model::from_weights_layout(
+                &weights,
+                prefix,
+                cfg,
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf,
+            )
+            .unwrap();
+            let delta = model
+                .layers
+                .iter_mut()
+                .find_map(|layer| {
+                    if let Mixer::Delta(delta) = &mut layer.mixer {
+                        Some(delta)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert_eq!(delta.precision, PrecisionProfile::MossFrozenHf);
+            let mut distinguished_native = false;
+            for case in fixture["cases"].as_array().unwrap() {
+                let values = |key: &str| -> Vec<f32> {
+                    case[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|value| {
+                            value.as_array().map_or_else(
+                                || vec![value.as_f64().unwrap() as f32],
+                                |row| row.iter().map(|x| x.as_f64().unwrap() as f32).collect(),
+                            )
+                        })
+                        .collect()
+                };
+                let bf = |key: &str, shape: &[i32]| {
+                    Array::from_slice(&values(key), shape)
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap()
+                };
+                let x = bf("x", &[1, 2]);
+                let gate = bf("gate", &[1, 2]);
+                delta.norm_weight = bf("weight", &[2]);
+                delta.eps = case["eps"].as_f64().unwrap() as f32;
+                let expected = values("expected");
+                assert_ne!(
+                    expected,
+                    values("wrong_fused_norm_early_gate"),
+                    "fixture must reject incorrect casts"
+                );
+                delta.precision = PrecisionProfile::MossFrozenHf;
+                let actual = delta.normalize_output(&x, &gate).unwrap();
+                assert_eq!(actual.dtype(), Dtype::Bfloat16);
+                assert_eq!(actual.shape(), x.shape());
+                assert_eq!(host(&actual), expected, "{}", case["name"]);
+                delta.precision = PrecisionProfile::Native;
+                let native = delta.normalize_output(&x, &gate).unwrap();
+                assert_eq!(
+                    host(&native),
+                    host(&rms_norm_gated(&x, &delta.norm_weight, &gate, delta.eps).unwrap()),
+                );
+                distinguished_native |= host(&native) != expected;
+                if case["name"] == "sigmoid_rounding_dense_ffn" {
+                    let identity = Array::from_slice(&[1f32, 0., 0., 1.], &[2, 2])
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap();
+                    let gates = values("gate");
+                    let gate_weight = Array::from_slice(&[gates[0], 0., 0., gates[1]], &[2, 2])
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap();
+                    let ffn = Ffn::Dense(Mlp {
+                        gate: Projection::load(gate_weight, None).unwrap(),
+                        up: Projection::load(identity.clone(), None).unwrap(),
+                        down: Projection::load(identity, None).unwrap(),
+                    });
+                    assert_eq!(
+                        host(&ffn.forward(&x, PrecisionProfile::MossFrozenHf).unwrap()),
+                        expected,
+                    );
+                    let native = ffn.forward(&x, PrecisionProfile::Native).unwrap();
+                    assert_eq!(host(&native), values("wrong_fused_norm_early_gate"));
+                }
+            }
+            assert!(
+                distinguished_native,
+                "fixtures must discriminate the unchanged Native path"
+            );
+        });
+        #[cfg(feature = "model-inference-proof")]
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native");
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace() {
+        on_cpu(|| {
+            let fixture: serde_json::Value =
+                serde_json::from_str(include_str!("testdata/moss_qwen_conv.json")).unwrap();
+            for case in fixture["cases"].as_array().unwrap() {
+                let values = |key: &str| -> Vec<f32> {
+                    case[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_f64().unwrap() as f32)
+                        .collect()
+                };
+                let bf = |key: &str, shape: &[i32]| {
+                    Array::from_slice(&values(key), shape)
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap()
+                };
+                let x = bf("x", &[1, 4, 1]);
+                let weight = bf("weight", &[1, 4]);
+                let state = bf("state", &[1, 3, 1]);
+                let (actual, trace) = PrecisionProfile::MossFrozenHf
+                    .convolve(&x, &weight, &state)
+                    .unwrap();
+                assert_eq!(actual.dtype(), Dtype::Bfloat16);
+                assert_eq!(actual.shape(), x.shape());
+                assert_eq!(host(&actual), values("expected"));
+                if case["name"] == "tap_rounding" {
+                    assert_ne!(host(&actual), values("old"));
+                } else {
+                    assert_ne!(host(&actual), values("wrong_post_silu_narrowing"));
+                }
+                let (native, native_trace) = PrecisionProfile::Native
+                    .convolve(&x, &weight, &state)
+                    .unwrap();
+                let (old, old_trace) = causal_depthwise_conv_traced(&x, &weight, &state).unwrap();
+                assert_eq!(host(&native), values("old"));
+                assert_eq!(host(&native), host(&old));
+                assert_eq!(trace.tokens(), 4);
+                assert_eq!(trace.tail_len(), 3);
+                for token in 0..4 {
+                    let tail = trace.tail_after(token).unwrap();
+                    assert_eq!(tail.dtype(), Dtype::Bfloat16);
+                    assert_eq!(tail.shape(), &[1, 3, 1]);
+                    assert_eq!(host(&tail), host(&native_trace.tail_after(token).unwrap()));
+                    assert_eq!(host(&tail), host(&old_trace.tail_after(token).unwrap()));
+                }
+                assert_eq!(host(&trace.tail_after(3).unwrap()), values("tail"));
+                let first = x.take_axis(Array::from_slice(&[0i32, 1], &[2]), 1).unwrap();
+                let second = x.take_axis(Array::from_slice(&[2i32, 3], &[2]), 1).unwrap();
+                let (head, head_trace) = PrecisionProfile::MossFrozenHf
+                    .convolve(&first, &weight, &state)
+                    .unwrap();
+                let (tail, tail_trace) = PrecisionProfile::MossFrozenHf
+                    .convolve(&second, &weight, &head_trace.tail_after(1).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    host(&concatenate_axis(&[head, tail], 1).unwrap()),
+                    values("expected")
+                );
+                assert_eq!(host(&tail_trace.tail_after(1).unwrap()), values("tail"));
+            }
+        });
+        #[cfg(feature = "model-inference-proof")]
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace");
     }
 
     #[test]
@@ -4634,8 +4853,11 @@ pub(crate) mod tests {
             let model = load_moe_mtp(&cfg, m);
             let ffn = &model.mtp.as_ref().unwrap().layers[0].ffn;
             let got = host_f32(
-                &ffn.forward(&Array::from_slice(&arr("x"), &[1, 1, h]))
-                    .unwrap(),
+                &ffn.forward(
+                    &Array::from_slice(&arr("x"), &[1, 1, h]),
+                    PrecisionProfile::Native,
+                )
+                .unwrap(),
             );
             let exp = arr("expected_output");
             let md = got

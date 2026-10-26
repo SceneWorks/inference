@@ -244,7 +244,7 @@ class FixtureWorkspace(unittest.TestCase):
             self.assertIsNone(self.affected("Cargo.toml"), edit)
 
     def test_build_and_ci_wiring_paths_run_everything(self) -> None:
-        for path in ("rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/ci.yml", "scripts/ci/test_scope.py"):
+        for path in ("rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/ci.yml", "scripts/ci/test_scope.py", "scripts/ci/test_suites.py", "scripts/ci/test_suites.json"):
             self.assertIsNone(self.affected("crates/core/src/lib.rs", path), path)
         self.assertIsNone(self.affected())
 
@@ -378,6 +378,10 @@ class WorkflowWiringTests(unittest.TestCase):
             for name in names:
                 with self.subTest(step=name):
                     step = steps[name]
+                    if job == "candle-cpu-test":
+                        group = "base" if name == "Test Candle packages" else "gen"
+                        self.assertIn(group, self.workflow["jobs"][job]["strategy"]["matrix"]["group"])
+                        self.assertEqual(step["if"], f"matrix.group == '{group}'")
                     self.assertEqual(step["env"]["TEST_SCOPE"], "${{ needs.changes.outputs.test_scope }}")
                     run = step["run"]
                     self.assertIn('scripts/ci/test_scope.py select --scope "$TEST_SCOPE"', run)

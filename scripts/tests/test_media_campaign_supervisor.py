@@ -30,13 +30,18 @@ class FixtureDeadlineClock:
         self.ready_at = self.now()
 
 
-def _published_pid(path):
+def published_fixture_pid(path):
+    """Read only the closed/renamed PID record, within bounded bootstrap polling."""
     try:
-        return int(path.read_text(encoding="ascii"))
+        published = path.read_text(encoding="ascii")
     except (FileNotFoundError, PermissionError):
-        # Windows may briefly deny a read while the child atomically replaces the
-        # publication file. Readiness remains bounded by FixtureDeadlineClock.admit.
+        # Atomic rename prevents partial publication, but a Windows sharing/access
+        # denial can still make the published name temporarily unreadable. This is
+        # not readiness; the caller's existing bootstrap deadline remains in force.
         return None
+    if not published.isdecimal() or int(published) <= 0:
+        raise AssertionError("malformed published fixture PID")
+    return int(published)
 
 
 class FixtureDeadlineClockTests(unittest.TestCase):
@@ -68,6 +73,70 @@ class FixtureDeadlineClockTests(unittest.TestCase):
         with patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
             with self.assertRaisesRegex(AssertionError, "fixture startup readiness deadline"):
                 clock.admit(lambda: _published_pid(Path("pid")) == 123, timeout=.05)
+
+
+class PublishedFixturePidTests(unittest.TestCase):
+    def clock(self):
+        now = [0.0]
+        return FixtureDeadlineClock(lambda: now[0], lambda delay: now.__setitem__(0, now[0] + delay))
+
+    def test_access_denial_is_not_ready_until_a_valid_record_is_read(self):
+        clock, observed = self.clock(), []
+        def ready():
+            pid = published_fixture_pid(Path("grandchild-pid"))
+            if pid is not None:
+                observed.append(pid)
+            return pid is not None
+        with patch.object(Path, "read_text", side_effect=[PermissionError(13, "sharing denial"), "1234"]) as read:
+            clock.admit(ready)
+        self.assertEqual(observed, [1234])
+        self.assertEqual(read.call_count, 2)
+        self.assertIsNotNone(clock.ready_at)
+
+    def test_permanent_access_denial_fails_at_the_existing_bootstrap_deadline(self):
+        clock = self.clock()
+        with patch.object(Path, "read_text", side_effect=PermissionError(13, "persistent denial")), \
+             self.assertRaisesRegex(AssertionError, "fixture startup readiness deadline"):
+            clock.admit(lambda: published_fixture_pid(Path("grandchild-pid")) is not None, timeout=.05)
+        self.assertIsNone(clock.ready_at)
+
+    def test_partial_temporary_record_is_never_used_as_published_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grandchild-pid"
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text("12", encoding="ascii")
+            self.assertIsNone(published_fixture_pid(path))
+            temporary.write_text("1234", encoding="ascii")
+            os.replace(temporary, path)
+            self.assertEqual(published_fixture_pid(path), 1234)
+
+    def test_malformed_published_records_and_unrelated_io_errors_remain_terminal(self):
+        for record in ("", "0", "-1", "123partial", "123\n"):
+            with self.subTest(record=record), patch.object(Path, "read_text", return_value=record), \
+                 self.assertRaisesRegex(AssertionError, "malformed published fixture PID"):
+                published_fixture_pid(Path("grandchild-pid"))
+        with patch.object(Path, "read_text", side_effect=OSError(5, "I/O failure")), self.assertRaises(OSError):
+            published_fixture_pid(Path("grandchild-pid"))
+
+    def test_reaping_assertions_use_only_the_validated_invocation_snapshot(self):
+        case = WindowsSupervisorTests()
+        case.root, case.sampled = Path("fixture"), [1]
+        case.data = {"deadlineSeconds": 3}
+        case._has_exited = lambda pid: pid == 1234
+        observed = []
+        case._assert_exited = observed.append
+        def run(script, *, on_spawn, clock):
+            # Simulate the real Probe's real-clock membership sampling: the supervisor observed the
+            # live grandchild as owned (the root is already gone) before the deadline fired.
+            case.supervision_start = 0.0
+            case.membership_samples = [(1.0, {5678})]
+            on_spawn(1234, None)
+            raise safety.SupervisionError("deadline", "fixture deadline")
+        case._run = run
+        with patch.object(Path, "read_text", side_effect=["1234", "5678", AssertionError("reopened PID publication")]) as read:
+            case._deadline_reaps_root_and_grandchild_after_root_exit()
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(observed, [1234, 5678])
 
 
 class Probe:
@@ -1496,6 +1565,8 @@ class WindowsSupervisorTests(unittest.TestCase):
             "gpuFreeReserveBytes": 1024, "childGpuCapBytes": 1024**2,
         }
         self.sampled = []
+        self.membership_samples = []
+        self.supervision_start = None
 
     def test_native_host_probe_and_trusted_cuda_probe_path(self):
         from scripts import media_campaign_windows as windows
@@ -1510,6 +1581,11 @@ class WindowsSupervisorTests(unittest.TestCase):
         path.write_text(json.dumps(policy_data), encoding="utf-8")
         policy = safety.load_policy(path)
         parent = self
+        def observed_real_clock():
+            now = time.monotonic()  # Observe, never pause/advance/substitute the real deadline clock.
+            if parent.supervision_start is None:
+                parent.supervision_start = now
+            return now
         class Probe:
             def host_free(self):
                 return 10**12
@@ -1520,6 +1596,8 @@ class WindowsSupervisorTests(unittest.TestCase):
             def tree_footprint(self, owner):
                 amount = owner.footprint_bytes()
                 parent.sampled.append(amount)
+                members = owner.members()
+                parent.membership_samples.append((observed_real_clock(), members))
                 return amount
             def gpu_free_and_tree_bytes(self, owner):
                 # GPU collection is separately fixture-tested; these children never touch CUDA.
@@ -1599,25 +1677,42 @@ class WindowsSupervisorTests(unittest.TestCase):
             f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}])"
         )
         clock = FixtureDeadlineClock()
+        ready_pids = None
+        # Membership observation is per attempt: each repeated run gets its own real-clock start.
+        self.membership_samples = []
+        self.supervision_start = None
         def fixture_ready(pid, _pgid):
             def ready():
-                root_pid = _published_pid(self.root / "root-pid")
-                if root_pid is None:
-                    return False
-                grandchild_pid = _published_pid(self.root / "grandchild-pid")
-                if grandchild_pid is None:
+                nonlocal ready_pids
+                root_pid = published_fixture_pid(self.root / "root-pid")
+                grandchild_pid = published_fixture_pid(self.root / "grandchild-pid")
+                if root_pid is None or grandchild_pid is None:
                     return False
                 self.assertEqual(root_pid, pid)
                 self.assertGreater(grandchild_pid, 0)
                 self.assertNotEqual(grandchild_pid, root_pid)
-                return self._has_exited(root_pid)
+                if not self._has_exited(root_pid):
+                    return False
+                ready_pids = (root_pid, grandchild_pid)
+                return True
             clock.admit(ready)  # Independent 30s bootstrap bound, not an extended teardown limit.
         with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
             self._run(script, on_spawn=fixture_ready, clock=clock)
         self.assertIsNotNone(clock.ready_at)
         self.assertTrue(any(amount > 0 for amount in self.sampled))
-        self._assert_exited(int((self.root / "root-pid").read_text(encoding="ascii")))
-        self._assert_exited(int((self.root / "grandchild-pid").read_text(encoding="ascii")))
+        self.assertIsNotNone(ready_pids)
+        root_pid, grandchild_pid = ready_pids
+        # The epic's ownership proof: the supervisor must have observed the live grandchild as
+        # owned while the root was already gone, and before the deadline fired.
+        self.assertIsNotNone(self.supervision_start)
+        self.assertTrue(
+            any(grandchild_pid in members and root_pid not in members
+                and at < self.supervision_start + self.data["deadlineSeconds"]
+                for at, members in self.membership_samples),
+            "deadline test never observed an owned live grandchild after root exit and before the deadline",
+        )
+        for pid in ready_pids:
+            self._assert_exited(pid)
 
     def test_repeated_reaping_case_rejects_skip_descendant_reap_mutant(self):
         from scripts import media_campaign_windows as windows

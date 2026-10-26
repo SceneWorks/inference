@@ -17,6 +17,17 @@ pub(crate) struct Renderer {
     pub transformer: Transformer,
     pub dataspace: Option<(Tensor, Vec<f32>)>,
     pub adapter_reports: Vec<AdapterApplyReport>,
+    pub dmd_report: Option<AdapterApplyReport>,
+}
+pub(crate) fn application_reports(
+    dmd_report: Option<&AdapterApplyReport>,
+    custom_reports: Vec<AdapterApplyReport>,
+) -> Vec<AdapterApplyReport> {
+    dmd_report
+        .into_iter()
+        .cloned()
+        .chain(custom_reports)
+        .collect()
 }
 impl Renderer {
     pub fn load(sources: &Sources, mode: MossImageAcceleration, device: &Device) -> Result<Self> {
@@ -59,7 +70,7 @@ impl Renderer {
         } else {
             base
         };
-        let transformer =
+        let mut transformer =
             Transformer::load(&base, Geometry::from(&sources.config), adapter.as_ref())?;
         let dataspace = if matches!(mode, MossImageAcceleration::Dmd(_)) {
             let w = load_weights(
@@ -76,8 +87,8 @@ impl Renderer {
         } else {
             None
         };
-        let adapter_reports = if mixed {
-            vec![AdapterApplyReport {
+        let dmd_report = if mixed {
+            Some(AdapterApplyReport {
                 adapter_path: assets
                     .iter()
                     .find(|a| a.role == MossImageAssetRole::DmdLora)
@@ -87,15 +98,24 @@ impl Renderer {
                     .into(),
                 applied: 252,
                 skipped: vec![],
-            }]
+            })
         } else {
-            vec![]
+            None
         };
+        let custom_reports = crate::adapters::apply(
+            &mut transformer,
+            sources.variant,
+            &sources.spec.adapters,
+            &sources.adapter_pins,
+        )?;
+        let adapter_reports = application_reports(dmd_report.as_ref(), custom_reports);
+        sources.ensure_unchanged()?;
         Ok(Self {
             mode,
             transformer,
             dataspace,
             adapter_reports,
+            dmd_report,
         })
     }
 }
@@ -113,17 +133,34 @@ pub(crate) fn sample(
     negative: Option<&Conditioning>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Sampling> {
-    let device = renderer.transformer.device();
-    let count = req.count as usize;
-    let images = positive.rows.len() * count;
-    let (z, samples) = initial_noise(
+    sample_graph(
+        &renderer.transformer,
+        renderer.dataspace.as_ref(),
         req,
+        resolved,
         inputs,
         positive,
-        renderer.transformer.channels(),
-        device,
-    )?;
-    let (times, sampling) = if let Some((q, codes)) = &renderer.dataspace {
+        negative,
+        on_progress,
+    )
+}
+/// The same sampling graph is used for generation and in-training previews.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sample_graph(
+    transformer: &Transformer,
+    dataspace: Option<&(Tensor, Vec<f32>)>,
+    req: &GenerationRequest,
+    resolved: &MossImageResolved,
+    inputs: MossImageAdvancedInputs<'_>,
+    positive: &Conditioning,
+    negative: Option<&Conditioning>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Sampling> {
+    let device = transformer.device();
+    let count = req.count as usize;
+    let images = positive.rows.len() * count;
+    let (z, samples) = initial_noise(req, inputs, positive, transformer.channels(), device)?;
+    let (times, sampling) = if let Some((q, codes)) = dataspace {
         let prefix = moss_dmd_step_codes(codes, resolved.steps)?.to_vec();
         let receipt = MossImageSamplingReceipt::Dmd {
             step_codes: prefix.clone(),
@@ -138,14 +175,14 @@ pub(crate) fn sample(
             .collect();
         (times, MossImageSamplingReceipt::Euler { sigmas })
     };
-    let mut x = if renderer.dataspace.is_some() {
+    let mut x = if dataspace.is_some() {
         Tensor::zeros(z.shape(), DType::F32, device)?
     } else {
         z.clone()
     };
     for (step, time) in times.iter().enumerate() {
         check_cancel(&req.cancel)?;
-        let input = if let Some((q, _)) = &renderer.dataspace {
+        let input = if let Some((q, _)) = dataspace {
             dmd_input(&z, q, &x)?
         } else {
             x.clone()
@@ -157,12 +194,11 @@ pub(crate) fn sample(
             let latent = input.narrow(0, image, 1)?;
             let ctx = &positive.rows[row];
             let mask = vec![1; ctx.dim(1)?];
-            let cond = renderer
-                .transformer
+            let cond = transformer
                 .forward(&latent, *time, ctx, &mask, &[], &req.cancel)?
                 .to_dtype(DType::F32)?;
             let mut v = cond.clone();
-            if renderer.dataspace.is_none() {
+            if dataspace.is_none() {
                 if resolved.guidance != 1.0 {
                     let neg = &negative.expect("validated CFG conditioning").rows[row];
                     let active = resolved.skipping_active(step, times.len());
@@ -171,8 +207,7 @@ pub(crate) fn sample(
                     } else {
                         &[]
                     };
-                    let uncond = renderer
-                        .transformer
+                    let uncond = transformer
                         .forward(
                             &latent,
                             *time,
@@ -189,8 +224,7 @@ pub(crate) fn sample(
                         && slg.scale > 0.0
                         && resolved.skipping_active(step, times.len())
                     {
-                        let skipped = renderer
-                            .transformer
+                        let skipped = transformer
                             .forward(&latent, *time, ctx, &mask, &slg.layers, &req.cancel)?
                             .to_dtype(DType::F32)?;
                         if resolved.guidance == 1.0 {

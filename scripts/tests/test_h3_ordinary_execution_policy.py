@@ -778,15 +778,15 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
     def test_hosted_pruned_precision_step_is_explicit_and_positive(self) -> None:
         block = jobs(real_weights_inline_text())["h3-pruned-hosted-metal"]
         matching = [step for step in steps(block)
-            if "- name: Check H3 precise pruned projection on hosted Metal (manual)" in step]
+            if "- name: Prove H3 pruned AdaLN complete model on Metal" in step]
         self.assertEqual(len(matching), 1)
         step = matching[0]
         self.assertIn("if: github.event_name == 'workflow_dispatch'", block)
         self.assertIn("inputs.profile == 'synthetic-w4a8-mlx'", block)
         self.assertIn("inputs.profile == 'synthetic-w4a8-both'", block)
         self.assertIn("set -euo pipefail", step)
-        self.assertIn("--ignored --exact --nocapture", step)
-        self.assertIn("test result: ok. 1 passed; 0 failed; 0 ignored", step)
+        self.assertIn("--ignored --nocapture", step)
+        self.assertIn("test result: ok. 4 passed; 0 failed; 0 ignored", step)
         self.assertIn("test pruned_adaln::native_pruned_adaln_matches_pinned_reference ...", step)
         self.assertIn("H3_PRUNED_ORACLE_DEVICE", step)
         self.assertIn("H3_PRUNED_ORACLE block 0 modulation: max_abs=", step)

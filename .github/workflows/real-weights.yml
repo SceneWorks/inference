@@ -157,7 +157,7 @@ on:
         default: ""
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: ["", synthetic-w4a8-mlx, synthetic-w4a8-cuda, synthetic-w4a8-both, moss-edit-cuda, moss-edit-metal, model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, ios-prequant, ios-simulator-sana, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2]
+        options: ["", synthetic-w4a8-mlx, synthetic-w4a8-cuda, synthetic-w4a8-both, moss-edit-cuda, moss-edit-metal, moss-cpu-fixture, moss-metal-fixture, llm-decoder-fixture, moss-cuda-unit, model-exhaustive-tests, model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, ios-prequant, ios-simulator-sana, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -351,7 +351,7 @@ permissions:
 concurrency:
   group: >-
     ${{ github.event_name == 'workflow_dispatch' &&
-        (inputs.profile == 'model-inference-proofs' || inputs.profile == 'ios-selected-captures' || inputs.profile == 'ios-prequant' || inputs.profile == 'ios-simulator-sana' || inputs.profile == 'synthetic-w4a8-mlx' || inputs.profile == 'synthetic-w4a8-cuda' || inputs.profile == 'synthetic-w4a8-both' || inputs.profile == 'moss-edit-cuda' || inputs.profile == 'moss-edit-metal') &&
+        (inputs.profile == 'model-inference-proofs' || inputs.profile == 'ios-selected-captures' || inputs.profile == 'ios-prequant' || inputs.profile == 'ios-simulator-sana' || inputs.profile == 'synthetic-w4a8-mlx' || inputs.profile == 'synthetic-w4a8-cuda' || inputs.profile == 'synthetic-w4a8-both' || inputs.profile == 'moss-edit-cuda' || inputs.profile == 'moss-edit-metal' || inputs.profile == 'moss-cpu-fixture' || inputs.profile == 'moss-metal-fixture' || inputs.profile == 'llm-decoder-fixture' || inputs.profile == 'moss-cuda-unit') &&
         format('inference-model-proof-{0}-{1}', github.run_id, github.run_attempt) ||
         github.event_name == 'workflow_dispatch' &&
         inputs.profile == 'qwen-image-2-1-lora-mlx' &&
@@ -480,6 +480,18 @@ jobs:
           name: ios-pricing-compile-${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}-${{ fromJSON(inputs.ios_pricing_compile_binding).host }}
           path: ${{ runner.temp }}/ios-pricing-compile-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
+
+  moss-fixture-bridge:
+    needs: validate-selection
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'moss-cpu-fixture' || inputs.profile == 'moss-metal-fixture' || inputs.profile == 'llm-decoder-fixture' || inputs.profile == 'moss-cuda-unit')
+    uses: ./.github/workflows/moss-model-fixtures.yml
+    with:
+      lanes: ${{ inputs.profile }}
+
+  model-exhaustive-tests:
+    needs: validate-selection
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'model-exhaustive-tests'
+    uses: ./.github/workflows/model-test-suites.yml
 
   # S3 simulator image: dispatch from the existing registered workflow before the new reusable
   # workflow file reaches default branch. The called workflow validates exact source and resources.
