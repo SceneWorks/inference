@@ -99,6 +99,7 @@ impl TextLlmProfile {
                 top_p: 1.0,
                 top_k: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },

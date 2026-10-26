@@ -506,6 +506,8 @@ impl Stage1Model for Stage1Lm {
                 repetition_penalty: d.repetition_penalty,
                 repetition_context: usize::MAX,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
             },
             min_new_tokens: d.min_new_tokens as usize,
             generated: 0,

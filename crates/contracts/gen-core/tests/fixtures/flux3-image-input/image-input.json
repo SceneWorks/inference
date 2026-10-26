@@ -1,0 +1,226 @@
+{
+  "upstream": "45e57c9fb06f9751cdced29a65c5d2171003be05",
+  "source_sha256": "33c323ebaeaf56790f3d0022a57827b5348446a8a4b372ab2bcc606d722e76a9",
+  "pup_source_sha256": "e3561ae3cbff1a080ad8854c0b89bd0687c1ea9d84c74f5203b44844cbd4684d",
+  "dtype": "RGB uint8",
+  "pillow": "12.3.0",
+  "numpy": "2.5.4",
+  "encoded_formats": [
+    {
+      "name": "mode-la8",
+      "file": "mode-la8.png",
+      "source_mode": "LA",
+      "bit_depth": 8,
+      "png_colour_type": 4,
+      "carrier": "rgba",
+      "size": [
+        4,
+        3
+      ],
+      "canvas": [
+        64,
+        64
+      ],
+      "policy1_size": [
+        32,
+        32
+      ],
+      "policy10_size": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "mode-palette-alpha",
+      "file": "mode-palette-alpha.png",
+      "source_mode": "P",
+      "bit_depth": 8,
+      "png_colour_type": 3,
+      "carrier": "rgba",
+      "size": [
+        4,
+        3
+      ],
+      "canvas": [
+        64,
+        64
+      ],
+      "policy1_size": [
+        32,
+        32
+      ],
+      "policy10_size": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "mode-palette-opaque",
+      "file": "mode-palette-opaque.png",
+      "source_mode": "P",
+      "bit_depth": 8,
+      "png_colour_type": 3,
+      "carrier": "rgb",
+      "size": [
+        4,
+        3
+      ],
+      "canvas": [
+        64,
+        64
+      ],
+      "policy1_size": [
+        32,
+        32
+      ],
+      "policy10_size": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "mode-rgb-trns",
+      "file": "mode-rgb-trns.png",
+      "source_mode": "RGB",
+      "bit_depth": 8,
+      "png_colour_type": 2,
+      "carrier": "rgb",
+      "size": [
+        4,
+        3
+      ],
+      "canvas": [
+        64,
+        64
+      ],
+      "policy1_size": [
+        32,
+        32
+      ],
+      "policy10_size": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "mode-luma-trns",
+      "file": "mode-luma-trns.png",
+      "source_mode": "L",
+      "bit_depth": 8,
+      "png_colour_type": 0,
+      "carrier": "rgb",
+      "size": [
+        4,
+        3
+      ],
+      "canvas": [
+        64,
+        64
+      ],
+      "policy1_size": [
+        32,
+        32
+      ],
+      "policy10_size": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "mode-luma16",
+      "file": "mode-luma16.png",
+      "source_mode": "I;16",
+      "bit_depth": 16,
+      "png_colour_type": 0,
+      "carrier": "rgb",
+      "size": [
+        4,
+        3
+      ],
+      "canvas": [
+        64,
+        64
+      ],
+      "policy1_size": [
+        32,
+        32
+      ],
+      "policy10_size": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "mode-rgb16",
+      "file": "mode-rgb16.png",
+      "source_mode": "RGB",
+      "bit_depth": 16,
+      "png_colour_type": 2,
+      "carrier": "rgb",
+      "size": [
+        4,
+        3
+      ],
+      "canvas": [
+        64,
+        64
+      ],
+      "policy1_size": [
+        32,
+        32
+      ],
+      "policy10_size": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "mode-la16",
+      "file": "mode-la16.png",
+      "source_mode": "RGBA",
+      "bit_depth": 16,
+      "png_colour_type": 4,
+      "carrier": "rgba",
+      "size": [
+        4,
+        3
+      ],
+      "canvas": [
+        64,
+        64
+      ],
+      "policy1_size": [
+        32,
+        32
+      ],
+      "policy10_size": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "mode-rgba16",
+      "file": "mode-rgba16.png",
+      "source_mode": "RGBA",
+      "bit_depth": 16,
+      "png_colour_type": 6,
+      "carrier": "rgba",
+      "size": [
+        4,
+        3
+      ],
+      "canvas": [
+        64,
+        64
+      ],
+      "policy1_size": [
+        32,
+        32
+      ],
+      "policy10_size": [
+        32,
+        32
+      ]
+    }
+  ]
+}

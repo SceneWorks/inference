@@ -1,0 +1,576 @@
+use super::*;
+use std::sync::{Arc, Mutex, Weak};
+
+struct Resource {
+    marker: Arc<()>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+impl Drop for Resource {
+    fn drop(&mut self) {
+        self.events.lock().unwrap().push("drop-owner");
+    }
+}
+fn resource(events: &Arc<Mutex<Vec<&'static str>>>) -> (Resource, Weak<()>) {
+    let marker = Arc::new(());
+    let weak = Arc::downgrade(&marker);
+    (
+        Resource {
+            marker,
+            events: events.clone(),
+        },
+        weak,
+    )
+}
+
+#[test]
+fn exclusive_work_fences_and_really_drops_before_the_next_phase() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let slot = PhaseResourceSlot::default();
+    let (owner, weak) = resource(&events);
+    let cancel = CancelFlag::new();
+    let value = slot
+        .with_request(
+            true,
+            true,
+            &cancel,
+            || {
+                events.lock().unwrap().push("load");
+                Ok(owner)
+            },
+            |model| {
+                assert!(model.is_some());
+                events.lock().unwrap().push("caption");
+                Ok("exact caption".to_owned())
+            },
+            |model| {
+                assert_eq!(Arc::strong_count(&model.marker), 1);
+                events.lock().unwrap().push("owned-fence");
+                Ok(())
+            },
+            || events.lock().unwrap().push("after-drop"),
+        )
+        .unwrap();
+    events.lock().unwrap().push("image-phase");
+    assert_eq!(value, "exact caption");
+    assert!(!slot.is_loaded().unwrap());
+    assert!(weak.upgrade().is_none());
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "load",
+            "caption",
+            "owned-fence",
+            "drop-owner",
+            "after-drop",
+            "image-phase"
+        ]
+    );
+}
+
+#[test]
+fn bypass_never_loads_and_evicts_a_prior_resident_owner() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let slot = PhaseResourceSlot::default();
+    let cancel = CancelFlag::new();
+    let (owner, weak) = resource(&events);
+    slot.with_request(
+        true,
+        false,
+        &cancel,
+        || Ok(owner),
+        |_| Ok(()),
+        |_| panic!("resident success must not add a release fence"),
+        || panic!("not released"),
+    )
+    .unwrap();
+    assert!(slot.is_loaded().unwrap());
+    assert!(weak.upgrade().is_some());
+    let original = "  unchanged\nsource prompt  ";
+    let value = slot
+        .with_request(
+            false,
+            false,
+            &cancel,
+            || panic!("bypass must never load"),
+            |owner| {
+                assert!(owner.is_none());
+                Ok(original)
+            },
+            |_| {
+                events.lock().unwrap().push("owned-fence");
+                Ok(())
+            },
+            || events.lock().unwrap().push("after-drop"),
+        )
+        .unwrap();
+    assert_eq!(value, original);
+    assert!(!slot.is_loaded().unwrap());
+    assert!(weak.upgrade().is_none());
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["owned-fence", "drop-owner", "after-drop"]
+    );
+}
+
+#[test]
+fn fence_failure_keeps_actual_owner_and_preserves_primary_cancel_or_error() {
+    for cancelled in [false, true] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let slot = PhaseResourceSlot::default();
+        let cancel = CancelFlag::new();
+        let (owner, weak) = resource(&events);
+        let result: Result<()> = slot.with_request(
+            true,
+            true,
+            &cancel,
+            || Ok(owner),
+            |_| {
+                if cancelled {
+                    Err(Error::Canceled)
+                } else {
+                    Err(Error::Msg("primary error".into()))
+                }
+            },
+            |_| {
+                events.lock().unwrap().push("failed-fence");
+                Err(Error::Unsupported("injected unfenced backend".into()))
+            },
+            || panic!("an unfenced owner must not be reported released"),
+        );
+        if cancelled {
+            assert!(matches!(result, Err(Error::Canceled)));
+        } else {
+            assert!(matches!(result,Err(Error::Msg(message))if message=="primary error"));
+        }
+        assert!(slot.is_loaded().unwrap());
+        assert!(weak.upgrade().is_some());
+        assert_eq!(*events.lock().unwrap(), vec!["failed-fence"]);
+        slot.release_cached(
+            |_| {
+                events.lock().unwrap().push("retry-fence");
+                Ok(())
+            },
+            || events.lock().unwrap().push("after-drop"),
+        )
+        .unwrap();
+        assert!(!slot.is_loaded().unwrap());
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["failed-fence", "retry-fence", "drop-owner", "after-drop"]
+        );
+    }
+}
+
+#[test]
+fn successful_work_with_unsupported_fence_is_not_successful_eviction() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let slot = PhaseResourceSlot::default();
+    let cancel = CancelFlag::new();
+    let (owner, weak) = resource(&events);
+    let result = slot.with_request(
+        true,
+        true,
+        &cancel,
+        || Ok(owner),
+        |_| Ok(17),
+        |_| Err(Error::Unsupported("no owned fence".into())),
+        || panic!("must retain"),
+    );
+    assert!(matches!(result, Err(Error::Unsupported(_))));
+    assert!(slot.is_loaded().unwrap());
+    assert!(weak.upgrade().is_some());
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn cancellation_during_load_fences_and_drops_without_caption_or_image_work() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let slot = PhaseResourceSlot::default();
+    let cancel = CancelFlag::new();
+    let (owner, weak) = resource(&events);
+    let result: Result<()> = slot.with_request(
+        true,
+        true,
+        &cancel,
+        || {
+            cancel.cancel();
+            Ok(owner)
+        },
+        |_| panic!("cancelled before caption"),
+        |_| {
+            events.lock().unwrap().push("owned-fence");
+            Ok(())
+        },
+        || events.lock().unwrap().push("after-drop"),
+    );
+    assert!(matches!(result, Err(Error::Canceled)));
+    assert!(weak.upgrade().is_none());
+    assert!(!slot.is_loaded().unwrap());
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["owned-fence", "drop-owner", "after-drop"]
+    );
+}
+
+#[test]
+fn cancellation_after_successful_caption_releases_even_resident_policy() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let slot = PhaseResourceSlot::default();
+    let cancel = CancelFlag::new();
+    let (owner, weak) = resource(&events);
+    let result = slot.with_request(
+        true,
+        false,
+        &cancel,
+        || Ok(owner),
+        |_| {
+            cancel.cancel();
+            Ok("must not publish")
+        },
+        |_| {
+            events.lock().unwrap().push("owned-fence");
+            Ok(())
+        },
+        || events.lock().unwrap().push("after-drop"),
+    );
+    assert!(matches!(result, Err(Error::Canceled)));
+    assert!(weak.upgrade().is_none());
+    assert!(!slot.is_loaded().unwrap());
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["owned-fence", "drop-owner", "after-drop"]
+    );
+}
+
+#[test]
+fn warm_resident_to_exclusive_drops_old_owner_before_new_load() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let slot = PhaseResourceSlot::default();
+    let cancel = CancelFlag::new();
+    let (old, old_weak) = resource(&events);
+    slot.with_request(
+        true,
+        false,
+        &cancel,
+        || Ok(old),
+        |_| Ok(()),
+        |_| panic!("resident kept"),
+        || panic!("resident kept"),
+    )
+    .unwrap();
+    let (new, new_weak) = resource(&events);
+    slot.with_request(
+        true,
+        true,
+        &cancel,
+        || {
+            assert!(old_weak.upgrade().is_none());
+            events.lock().unwrap().push("new-load");
+            Ok(new)
+        },
+        |_| {
+            events.lock().unwrap().push("caption");
+            Ok(())
+        },
+        |_| {
+            events.lock().unwrap().push("owned-fence");
+            Ok(())
+        },
+        || events.lock().unwrap().push("after-drop"),
+    )
+    .unwrap();
+    assert!(new_weak.upgrade().is_none());
+    assert!(!slot.is_loaded().unwrap());
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "owned-fence",
+            "drop-owner",
+            "after-drop",
+            "new-load",
+            "caption",
+            "owned-fence",
+            "drop-owner",
+            "after-drop"
+        ]
+    );
+}
+
+/// A panic inside the caption phase poisons the ownership lock; the slot recovers, and the owner
+/// the panicking phase left behind is fenced and dropped before the next request reuses anything.
+///
+/// *Mutations that red this:* surfacing the poison as a permanent error, or recovering without
+/// marking the surviving owner `pending_release`.
+#[test]
+fn a_panicking_phase_poisons_nothing_and_its_owner_is_released_first() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let slot = PhaseResourceSlot::default();
+    let (owner, weak) = resource(&events);
+    let cancel = CancelFlag::new();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = slot.with_request(
+            true,
+            false,
+            &cancel,
+            || Ok(owner),
+            |_| -> Result<()> { panic!("caption phase panicked") },
+            |_| Ok(()),
+            || {},
+        );
+    }));
+    assert!(panicked.is_err());
+    assert!(
+        slot.is_loaded().unwrap(),
+        "the panicking phase left its owner"
+    );
+    assert!(
+        slot.cleanup_pending().unwrap(),
+        "recovery marks it for release"
+    );
+    events.lock().unwrap().clear();
+    let (next, _) = resource(&events);
+    let value = slot
+        .with_request(
+            true,
+            false,
+            &cancel,
+            || {
+                events.lock().unwrap().push("load");
+                Ok(next)
+            },
+            |_| Ok(7),
+            |_| {
+                events.lock().unwrap().push("fence");
+                Ok(())
+            },
+            || {},
+        )
+        .unwrap();
+    assert_eq!(value, 7);
+    assert!(
+        weak.upgrade().is_none(),
+        "the surviving owner was really dropped"
+    );
+    assert_eq!(*events.lock().unwrap(), vec!["fence", "drop-owner", "load"]);
+}
+
+#[test]
+fn conditioning_boundary_follows_materialization_and_precedes_denoise_and_one_decode() {
+    let cancel = CancelFlag::new();
+    let order = std::cell::RefCell::new(Vec::new());
+    let events = std::cell::RefCell::new(Vec::new());
+    let mut progress = |event| {
+        order.borrow_mut().push("boundary");
+        events.borrow_mut().push(event);
+    };
+    conditioning_complete(
+        &cancel,
+        || {
+            order.borrow_mut().push("materialize");
+            order.borrow_mut().push("synchronize");
+            Ok(())
+        },
+        &mut progress,
+    )
+    .unwrap();
+    order.borrow_mut().push("first-forward");
+    events.borrow_mut().push(crate::Progress::Step {
+        current: 1,
+        total: 1,
+    });
+    events.borrow_mut().push(crate::Progress::Decoding);
+    assert_eq!(
+        *order.borrow(),
+        ["materialize", "synchronize", "boundary", "first-forward"]
+    );
+    assert_eq!(
+        *events.borrow(),
+        [
+            crate::Progress::ConditioningComplete,
+            crate::Progress::Step {
+                current: 1,
+                total: 1
+            },
+            crate::Progress::Decoding
+        ]
+    );
+}
+
+#[test]
+fn canceled_or_failed_conditioning_never_reports_a_false_boundary() {
+    for during in [false, true] {
+        let cancel = CancelFlag::new();
+        if !during {
+            cancel.cancel();
+        }
+        let mut events = Vec::new();
+        let result = conditioning_complete(
+            &cancel,
+            || {
+                cancel.cancel();
+                Ok(())
+            },
+            &mut |event| events.push(event),
+        );
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert!(events.is_empty());
+    }
+    let cancel = CancelFlag::new();
+    let mut events = Vec::new();
+    let error = conditioning_complete(
+        &cancel,
+        || Err(Error::Unsupported("fence failed".into())),
+        &mut |event| events.push(event),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("fence failed"));
+    assert!(events.is_empty());
+}
+
+#[test]
+fn cancellation_in_conditioning_callback_stops_before_denoise_without_terminal_progress() {
+    let cancel = CancelFlag::new();
+    let mut events = Vec::new();
+    let result = conditioning_complete(&cancel, || Ok(()), &mut |event| {
+        events.push(event);
+        cancel.cancel();
+    });
+    assert!(matches!(result, Err(Error::Canceled)));
+    assert_eq!(events, [crate::Progress::ConditioningComplete]);
+}
+
+#[test]
+fn prompt_upsampling_completion_follows_materialization_fence_and_owned_release() {
+    for staged in [false, true] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let slot = PhaseResourceSlot::default();
+        let (owner, weak) = resource(&events);
+        let cancel = CancelFlag::new();
+        let output = slot
+            .with_prompt_upsampling(
+                true,
+                staged,
+                &cancel,
+                || {
+                    events.lock().unwrap().push("load");
+                    Ok(owner)
+                },
+                |_, progress| {
+                    progress(crate::Progress::Upsampling {
+                        tokens: 1,
+                        max_tokens: 2,
+                    });
+                    events.lock().unwrap().push("host-caption");
+                    Ok("materialized caption")
+                },
+                |_| {
+                    events.lock().unwrap().push("owned-fence");
+                    Ok(())
+                },
+                || events.lock().unwrap().push("allocator-drained"),
+                &mut |event| match event {
+                    crate::Progress::Upsampling { .. } => events.lock().unwrap().push("token"),
+                    crate::Progress::PromptUpsamplingComplete => {
+                        assert_eq!(weak.upgrade().is_none(), staged);
+                        events.lock().unwrap().push("pup-complete");
+                    }
+                    other => panic!("unexpected progress: {other:?}"),
+                },
+            )
+            .unwrap();
+        assert_eq!(output, "materialized caption");
+        events.lock().unwrap().push("text-and-reference-encode");
+        let expected = if staged {
+            vec![
+                "load",
+                "token",
+                "host-caption",
+                "owned-fence",
+                "drop-owner",
+                "allocator-drained",
+                "pup-complete",
+                "text-and-reference-encode",
+            ]
+        } else {
+            vec![
+                "load",
+                "token",
+                "host-caption",
+                "owned-fence",
+                "pup-complete",
+                "text-and-reference-encode",
+            ]
+        };
+        let recorded = events.lock().unwrap().clone();
+        assert_eq!(recorded, expected);
+        assert_eq!(slot.is_loaded().unwrap(), !staged);
+    }
+}
+
+#[test]
+fn prompt_upsampling_failure_cancel_and_bypass_never_claim_completion() {
+    for staged in [false, true] {
+        for failure in [
+            "fence",
+            "token-cancel",
+            "fence-cancel",
+            "run-error",
+            "bypass",
+            "pre-cancel",
+            "boundary-cancel",
+        ] {
+            let slot = PhaseResourceSlot::default();
+            let cancel = CancelFlag::new();
+            if failure == "pre-cancel" {
+                cancel.cancel();
+            }
+            let mut events = Vec::new();
+            let result = slot.with_prompt_upsampling(
+                failure != "bypass",
+                staged,
+                &cancel,
+                || Ok(()),
+                |owner, progress| {
+                    assert_eq!(owner.is_none(), failure == "bypass");
+                    if failure == "token-cancel" {
+                        progress(crate::Progress::Upsampling {
+                            tokens: 1,
+                            max_tokens: 2,
+                        });
+                    }
+                    if failure == "run-error" {
+                        return Err(Error::Unsupported("run failed".into()));
+                    }
+                    Ok("caption")
+                },
+                |_| {
+                    if failure == "fence" {
+                        return Err(Error::Unsupported("fence failed".into()));
+                    }
+                    if failure == "fence-cancel" {
+                        cancel.cancel();
+                    }
+                    Ok(())
+                },
+                || {},
+                &mut |event| {
+                    events.push(event);
+                    if failure == "token-cancel" || failure == "boundary-cancel" {
+                        cancel.cancel();
+                    }
+                },
+            );
+            if failure == "bypass" {
+                assert_eq!(result.unwrap(), "caption");
+                assert!(events.is_empty());
+            } else if failure == "boundary-cancel" {
+                assert!(matches!(result, Err(Error::Canceled)));
+                assert_eq!(events, [crate::Progress::PromptUpsamplingComplete]);
+            } else {
+                assert!(result.is_err(), "{failure}, staged={staged}");
+                assert!(!events.contains(&crate::Progress::PromptUpsamplingComplete));
+            }
+        }
+    }
+}
