@@ -1,6 +1,9 @@
 """Source-only routing contracts; never dispatch, probe a device or execute a model."""
 from pathlib import Path
 import os
+import copy
+import posixpath
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +15,36 @@ WORKFLOWS = ROOT / '.github/workflows'
 
 def document(name):
     return yaml.safe_load((WORKFLOWS / name).read_text(encoding='utf-8'))
+
+
+def yue_metal_launcher_errors(job, expected_cwd, wait_seconds, names):
+    """Resolve the controller shell exactly as Actions does from each step's cwd."""
+    errors = []
+    seen = set()
+    checkouts = {step.get('with', {}).get('path'): step.get('with', {})
+                 for step in job['steps'] if 'checkout@' in step.get('uses', '')}
+    if not {'control', expected_cwd}.issubset(checkouts):
+        errors.append('missing controller/engine/app checkout paths')
+    if checkouts.get('engine', {}).get('ref') != '${{ inputs.expected_engine_sha }}':
+        errors.append('engine checkout must retain its exact frozen source ref')
+    if expected_cwd == 'app' and checkouts.get('app', {}).get('ref') != '${{ inputs.expected_app_sha }}':
+        errors.append('app checkout must retain its exact frozen source ref')
+    for step in job['steps']:
+        if step.get('name') not in names:
+            continue
+        seen.add(step['name'])
+        cwd = step.get('working-directory', job.get('defaults', {}).get('run', {}).get('working-directory', '.'))
+        command = shlex.split(step.get('shell', ''))
+        expected = ['python3.12', '-I', '../control/scripts/ci/inference_metal_launcher.py',
+                    '--wait-seconds', str(wait_seconds), '--', '/bin/bash',
+                    '--noprofile', '--norc', '-eo', 'pipefail', '{0}']
+        if command != expected or '${{' in step.get('shell', ''):
+            errors.append('launcher, admission budget or isolated Bash flags changed')
+        if cwd != expected_cwd or len(command) < 3 or posixpath.normpath(posixpath.join(cwd, command[2])) != 'control/scripts/ci/inference_metal_launcher.py':
+            errors.append('launcher does not resolve from the frozen working directory')
+    if seen != names:
+        errors.append('missing selected Metal proof step')
+    return errors
 
 
 class ModelWorkflowRoutes(unittest.TestCase):
@@ -124,19 +157,27 @@ class ModelWorkflowRoutes(unittest.TestCase):
         self.assertTrue(seen)
 
     def test_yue_precision_uses_controller_helper_without_changing_frozen_engine_workdir(self):
-        cases = (('yue2-precision-proof.yml', {'Run exactly one Metal precision test with external sampling'}),
-                 ('yue2-app-precision-profile.yml', {'Install pinned BF16 model and both decoders through the app, without acceptance cases',
-                                                   'Capture exactly seven Metal app precision profiles'}))
-        for filename, names in cases:
+        cases = (('yue2-precision-proof.yml', 'engine', 14400,
+                  {'Run exactly one Metal precision test with external sampling'}),
+                 ('yue2-app-precision-profile.yml', 'app', 28800,
+                  {'Install pinned BF16 model and both decoders through the app, without acceptance cases',
+                   'Capture exactly seven Metal app precision profiles'}))
+        for filename, cwd, budget, names in cases:
             job = document(filename)['jobs']['metal']
-            for step in job['steps']:
-                if step.get('name') not in names:
-                    continue
-                self.assertIn('${{ github.workspace }}/control/scripts/ci/inference_metal_launcher.py', step['shell'])
-                self.assertIn('python3.12 -I', step['shell'])
-                self.assertIn('--noprofile --norc -eo pipefail {0}', step['shell'])
-            self.assertTrue(any(step.get('with', {}).get('ref') == '${{ inputs.expected_engine_sha }}'
-                                for step in job['steps']))
+            self.assertEqual(yue_metal_launcher_errors(job, cwd, budget, names), [])
+            for field, value in (('shell', 'bash'),
+                                 ('shell', 'python3.12 -I "${{ github.workspace }}/control/scripts/ci/inference_metal_launcher.py" --wait-seconds 14400 -- /bin/bash -e {0}'),
+                                 ('working-directory', 'control')):
+                mutated = copy.deepcopy(job)
+                step = next(step for step in mutated['steps'] if step.get('name') in names)
+                step[field] = value
+                self.assertTrue(yue_metal_launcher_errors(mutated, cwd, budget, names))
+            for before, after in (('../control/', './control/'), ('-I ', ''),
+                                  (str(budget), '1'), ('--noprofile ', '')):
+                mutated = copy.deepcopy(job)
+                step = next(step for step in mutated['steps'] if step.get('name') in names)
+                step['shell'] = step['shell'].replace(before, after)
+                self.assertTrue(yue_metal_launcher_errors(mutated, cwd, budget, names))
         ci = document('ci.yml')['jobs']['macos-nax']
         self.assertIn('inference_metal_launcher.py', ci['defaults']['run']['shell'])
         self.assertTrue(ci['defaults']['run']['shell'].endswith('/bin/bash -e {0}'))

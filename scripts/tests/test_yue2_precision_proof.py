@@ -12,6 +12,9 @@ import time
 import sys
 import tempfile
 import unittest
+import yaml
+
+from scripts.tests.test_ci_workflow_policy import qwen21_primary_concurrency_errors
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -92,21 +95,25 @@ class PrecisionControlTests(unittest.TestCase):
                     self.assertEqual(self.concurrency_group(group, stage, run_id),
                                      "yue2-app-precision-nax-macos-2" if stage == "metal" else
                                      "inference-real-weights-physical-host")
-        # Keep all other workflow users of the accelerator lock byte-consistent.
+        # Evaluate real-weight profile routing; preserve other physical-host lock users.
         for name in ("real-weights.yml", "real-weights-yue.yml", "yue2-bf16-tile-diagnostic.yml",
                      "ltx25-quant-campaign.yml", "ltx25-quant-promotion.yml"):
             other = self.concurrency_settings(WORKFLOW.with_name(name).read_text(encoding="utf-8"))
             with self.subTest(workflow=name):
                 if name == "real-weights.yml":
-                    self.assertEqual(other["group"],
-                                     "${{ github.event_name == 'workflow_dispatch' && "
-                                     "(inputs.profile == 'model-inference-proofs' || inputs.profile == 'ios-selected-captures') && "
-                                     "format('inference-model-proof-{0}-{1}', github.run_id, github.run_attempt) || "
-                                     "github.event_name == 'workflow_dispatch' && "
-                                     "inputs.profile == 'qwen-image-2-1-lora-mlx' && "
-                                     "inputs.qwen_image_2_1_lora_runner == 'rw-starvector' && "
-                                     "'inference-real-weights-qwen21-primary-mac' || "
-                                     "'inference-real-weights-physical-host' }}")
+                    workflow = yaml.safe_load(WORKFLOW.with_name(name).read_text(encoding="utf-8"))
+                    self.assertEqual(qwen21_primary_concurrency_errors(workflow), [])
+                    for mutation in ("wrong profile", "cancel active", "physical host split"):
+                        changed = copy.deepcopy(workflow)
+                        if mutation == "wrong profile":
+                            changed["concurrency"]["group"] = changed["concurrency"]["group"].replace(
+                                "inputs.profile == 'ios-prequant'", "inputs.profile == 'not-ios-prequant'")
+                        elif mutation == "cancel active":
+                            changed["concurrency"]["cancel-in-progress"] = True
+                        else:
+                            changed["concurrency"]["group"] = changed["concurrency"]["group"].replace(
+                                "'inference-real-weights-physical-host'", "github.run_id")
+                        self.assertTrue(qwen21_primary_concurrency_errors(changed), mutation)
                 else:
                     self.assertEqual(other["group"],
                                      self.concurrency_group(group, "cuda", "101"))
