@@ -4942,6 +4942,8 @@ mod tests {
                 + contract.asset_facts.decoder_bytes,
             "the typed sub-stack is not a second additive charge"
         );
+        // Companions need only config probes for this metadata-only constructor; the selected
+        // DiT already has its source headers. A zero-byte shard is malformed, not a placeholder.
         for (component, document) in [
             (crate::model::REFERENCE_DIT_PARTITION, "config.json"),
             ("text_encoder", "config.json"),
@@ -4955,7 +4957,6 @@ mod tests {
             let directory = root.path().join(component);
             std::fs::create_dir_all(&directory).unwrap();
             std::fs::write(directory.join(document), "{}").unwrap();
-            std::fs::write(directory.join("empty.safetensors"), []).unwrap();
         }
         let loaded = crate::model::load(&spec).unwrap();
         let loaded = loaded
@@ -5118,6 +5119,7 @@ mod tests {
                 "{:?}",
                 contract.conformance_errors()
             );
+            // Keep companions config-only; the selected DiT's packed headers were written above.
             for (component, document) in [
                 (crate::model::REFERENCE_DIT_PARTITION, "config.json"),
                 ("text_encoder", "config.json"),
@@ -5131,7 +5133,6 @@ mod tests {
                 let directory = root.path().join(component);
                 std::fs::create_dir_all(&directory).unwrap();
                 std::fs::write(directory.join(document), "{}").unwrap();
-                std::fs::write(directory.join("empty.safetensors"), []).unwrap();
             }
             std::fs::write(
                 root.path()
