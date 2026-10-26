@@ -1054,7 +1054,7 @@ jobs:
   ios-build:
     name: runtime-ios cross-build (${{ matrix.target }})
     needs: changes
-    if: needs.changes.outputs.ios_build == 'true'
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.ios_build == 'true')
     runs-on: macos-15
     timeout-minutes: 120
     env:

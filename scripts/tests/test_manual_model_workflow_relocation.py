@@ -5,6 +5,7 @@ No Cargo, model, kernel, GPU, or platform process is executed by these tests.
 import copy
 import hashlib
 import json
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -29,6 +30,14 @@ STEP_DIGESTS = {
     'h3-pruned-hosted-metal': '3cb82643a6543b19344d94a73c0211948f11b0c463a733ce3e8064dfa6fc77a8',
 }
 
+
+# Original STEP_DIGESTS above remain the relocation receipt. The only later step
+# deltas add source-traced fixture module forwards and their exact names/counts.
+# Cross-backend Replay is an explicit non-NN skip; all original learned cases remain.
+REPAIRED_H3_STEP_DIGESTS = {
+    'synthetic-w4a8-mlx': '0a1d2ece9873b905af658a0fbaf89fb5a03a307f757b6dd8194b5c982ff417ab',
+    'synthetic-w4a8-cuda': '36713e1d72834a98a25671e02e949f893862d0722e8c58ea5e582a488ed1c105',
+}
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -78,7 +87,7 @@ class ManualModelWorkflowRelocationTests(unittest.TestCase):
                 # Same reviewed interpreter convention as every macOS real-weight job.
                 for step in steps:
                     if 'run' in step: step['run'] = step['run'].replace('python3.12 ', 'python3 ')
-            self.assertEqual(digest(steps), STEP_DIGESTS[name], name)
+            self.assertEqual(digest(steps), REPAIRED_H3_STEP_DIGESTS.get(name, STEP_DIGESTS[name]), name)
         hosted = self.manual['jobs']['h3-pruned-hosted-metal']
         step = next(step for step in hosted['steps'] if step.get('name', '').startswith('Check H3 precise'))
         self.assertEqual(digest(step), STEP_DIGESTS['h3-pruned-hosted-metal'])
@@ -86,6 +95,28 @@ class ManualModelWorkflowRelocationTests(unittest.TestCase):
         self.assertEqual(hosted['env']['MACOSX_DEPLOYMENT_TARGET'], '15.0')
         self.assertEqual(self.manual['jobs']['synthetic-w4a8-mlx']['runs-on'], ['self-hosted', 'macOS', 'ARM64', 'rw-llm'])
         self.assertEqual(self.manual['jobs']['synthetic-w4a8-mlx']['env']['MACOSX_DEPLOYMENT_TARGET'], '26.2')
+
+    def test_model_jobs_keep_the_dispatched_source_without_a_default_main_checkout(self):
+        def assert_dispatch_source(jobs):
+            for name in (*MOVED, 'h3-pruned-hosted-metal'):
+                steps = jobs[name]['steps']
+                checkouts = [step for step in steps if step.get('uses', '').startswith('actions/checkout@')]
+                self.assertEqual(len(checkouts), 1, name)
+                reference = checkouts[0].get('with', {}).get('ref')
+                self.assertIn(reference, (None, '', '${{ github.sha }}', '${{ github.ref }}'), name)
+                for step in steps:
+                    self.assertNotRegex(step.get('run', ''), r'\bgit\s+(?:checkout|switch)\s+(?:--\s+)?[\"\']?(?:refs/heads/)?main\b', name)
+        assert_dispatch_source(self.manual['jobs'])
+        for name in (*MOVED, 'h3-pruned-hosted-metal'):
+            mutant = copy.deepcopy(self.manual['jobs'])
+            checkout = next(step for step in mutant[name]['steps'] if step.get('uses', '').startswith('actions/checkout@'))
+            checkout.setdefault('with', {})['ref'] = 'main'
+            with self.subTest(job=name), self.assertRaises(AssertionError):
+                assert_dispatch_source(mutant)
+        mutant = copy.deepcopy(self.manual['jobs'])
+        mutant['synthetic-w4a8-mlx']['steps'].append({'run': 'git checkout main'})
+        with self.assertRaises(AssertionError):
+            assert_dispatch_source(mutant)
 
     def test_all_new_manual_roots_use_the_existing_intentional_selection_barrier(self):
         for name in (*MOVED, 'h3-pruned-hosted-metal', 'candle-supra2', 'mlx-supra2', 'mlx-flux3-klein', 'candle-flux3-klein'):
