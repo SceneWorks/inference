@@ -810,6 +810,7 @@ fn cached_renderer_invalidates_on_adapter_replacement_or_removal() {
             transformer: model,
             dataspace: None,
             adapter_reports: vec![],
+            dmd_report: None,
         });
         assert!(candle_gen::lock_recover(&generator.state)
             .renderer

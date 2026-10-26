@@ -27,6 +27,7 @@ fn incremental_peak(peak: u64, owned: u64, committed: u64) -> u64 {
 struct AttemptState<R, P> {
     renderer: Option<(MossImageAcceleration, R)>,
     report: Option<P>,
+    apply_reports: Vec<gen_core::AdapterApplyReport>,
 }
 impl<R, P> AttemptState<R, P> {
     fn begin_request<E>(
@@ -40,6 +41,7 @@ impl<R, P> AttemptState<R, P> {
     }
     fn begin(&mut self, pins: &[gen_core::PinnedWeightsFile]) -> Result<()> {
         self.report = None;
+        self.apply_reports.clear();
         for pin in pins {
             if let Err(error) = pin.verify_unchanged() {
                 self.renderer = None;
@@ -50,6 +52,7 @@ impl<R, P> AttemptState<R, P> {
     }
     fn failed(&mut self) {
         self.report = None;
+        self.apply_reports.clear();
         self.renderer = None;
     }
     fn release_for_request(&mut self, mode: MossImageAcceleration, edit: bool) -> bool {
@@ -235,6 +238,7 @@ impl MossImage {
             state: Mutex::new(State {
                 renderer: None,
                 report: None,
+                apply_reports: vec![],
             }),
         })
     }
@@ -665,7 +669,9 @@ impl MossImage {
             .into_iter()
             .map(|(k, v)| (k.into(), v))
             .collect();
-            let mut adapter_reports = renderer.custom_reports.clone();
+            let mut apply_reports = renderer.custom_reports.clone();
+            // This sealed source receipt records the published DMD installation only.
+            let mut adapter_reports = Vec::new();
             if resolved.acceleration != MossImageAcceleration::Off {
                 for key in [
                     "time_embedding",
@@ -694,11 +700,13 @@ impl MossImage {
             }
             sources.ensure_unchanged()?;
             check(&request.cancel)?;
+            apply_reports.extend(adapter_reports.iter().cloned());
             #[cfg(feature = "test-support")]
             if self.sources.is_fixture() {
                 check(&request.cancel)?;
                 // No sealed author receipt is manufactured for generated synthetic source bytes.
                 state.report = None;
+                state.apply_reports = apply_reports;
                 return Ok(output);
             }
             let report = MossImageExecutionReport::new(MossImageExecutionData {
@@ -742,9 +750,16 @@ impl MossImage {
                     .as_ref()
                     .expect("just published edit receipt")
                     .validate()?;
+                let receipt = edit_report.as_ref().expect("just validated edit receipt");
+                apply_reports.push(gen_core::AdapterApplyReport {
+                    adapter_path: receipt.adapter_path.clone(),
+                    applied: receipt.applied_projections,
+                    skipped: vec![],
+                });
             } else {
                 state.report = Some(report);
             }
+            state.apply_reports = apply_reports;
             Ok(output)
         })();
         if result.is_err() {
@@ -847,29 +862,9 @@ impl Generator for MossImage {
             .map(|state| self.cached_owned_weight_bytes(&state))
     }
     fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
-        #[cfg(feature = "test-support")]
-        if self.sources.is_fixture() {
-            let state = self
-                .state
-                .lock()
-                .expect("synthetic fixture lifecycle lock poisoned");
-            return state
-                .renderer
-                .as_ref()
-                .map_or_else(Vec::new, |(_, r)| r.custom_reports.clone());
-        }
-        if let Some(edit) = self.moss_image_edit_execution_report() {
-            let mut reports = edit.base.data().adapter_reports.clone();
-            reports.push(gen_core::AdapterApplyReport {
-                adapter_path: edit.adapter_path,
-                applied: edit.applied_projections,
-                skipped: vec![],
-            });
-            reports
-        } else {
-            self.moss_image_execution_report()
-                .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
-        }
+        self.state
+            .lock()
+            .map_or_else(|_| Vec::new(), |state| state.apply_reports.clone())
     }
 }
 fn request_branches(resolved: &MossImageResolved) -> u32 {
@@ -924,6 +919,7 @@ pub(crate) fn verify_numerical_renderer_transitions(
     let mut state: AttemptState<Transformer, ()> = AttemptState {
         renderer: None,
         report: None,
+        apply_reports: vec![],
     };
     let expected_edit = edit();
     // The same release/select boundary used by generate_inner: ordinary -> edit ->
@@ -970,11 +966,17 @@ mod cpu_tests {
         let mut state = AttemptState {
             renderer: Some((MossImageAcceleration::Off, ())),
             report: Some("completed ordinary"),
+            apply_reports: vec![gen_core::AdapterApplyReport {
+                adapter_path: "custom".into(),
+                applied: 1,
+                skipped: vec![],
+            }],
         };
         let mut edit_report = Some("completed edit");
         assert!(state.begin_request(&[pin], &mut edit_report).is_err());
         assert!(state.report.is_none());
         assert!(state.renderer.is_none());
+        assert!(state.apply_reports.is_empty());
         assert!(edit_report.is_none());
     }
     #[test]
@@ -989,6 +991,7 @@ mod cpu_tests {
         let mut state: AttemptState<(u32, u32), &str> = AttemptState {
             renderer: None,
             report: None,
+            apply_reports: vec![],
         };
         let off = MossImageAcceleration::Off;
         let on = MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16);
@@ -1083,6 +1086,7 @@ mod review_lifecycle_tests {
             let mut state: AttemptState<u8, ()> = AttemptState {
                 renderer: Some((MossImageAcceleration::Off, 7)),
                 report: Some(()),
+                apply_reports: vec![],
             };
             state.begin(&pins).unwrap();
             assert_eq!(

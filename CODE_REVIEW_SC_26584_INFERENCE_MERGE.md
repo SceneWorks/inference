@@ -4,8 +4,9 @@ Reviewed revision: `da54be262b56e809e90e65b351205a6c1d3371ea`.
 
 Scope: semantic conflict resolutions joining MOSS adapter training with main's
 MOSS edit support, provider/catalog unions and shared test seams. Existing epic
-and main reviews remain authoritative outside that merge delta. No native
-execution, build or CI dispatch was performed during this review/repair.
+and main reviews remain authoritative outside that merge delta. The initial
+review was source-only; subsequent focused native validation is recorded below.
+No learned execution or CI dispatch was performed locally during repair.
 
 #### [F-284] P1: MLX edit projections skip installed custom adapters
 
@@ -34,19 +35,41 @@ Repair: clear the edit receipt before the fallible attempt-start pin check on
 both ordinary and edit entry paths. A pure regression removes a pinned source
 and checks that both receipts and the owned renderer are cleared.
 
-#### [F-286] P2: edit application reports omit the custom adapter stack
+#### [F-286] P1: custom completion reports violate the sealed source receipt contract
 
-At the reviewed revision, MLX `model.rs:853-859` and Candle `lib.rs:570-576`
-return only the edit adapter when an edit receipt exists. The base execution
-receipt already carries the custom adapter reports, so this loses the consumer's
-per-file application evidence even on Candle where residual math composes.
+Correction after native verification: the original review incorrectly claimed
+that custom reports belonged in `edit.base.data().adapter_reports`. They do not.
+`gen-core/src/moss_image.rs:1398-1409` reserves that field for exactly one published
+unmerged DMD application, and requires it empty for ordinary/full-FP32 execution.
+The native Candle test at `d320acdf39ddfaf41ffc29ac4ec3f09a3c89cdd8` rejected the
+first repair's invalid fixture with `ordinary/full-FP32 receipt must not claim an
+unmerged adapter installation`. That failed repair and its assumed storage model
+are withdrawn; no validator restriction was relaxed.
 
-Repair: preserve the base receipt's custom reports and append the edit report in
-both providers. The existing Candle edit receipt test checks both entries.
+The source defect is broader than the original report omission: both generators
+fed user-trained adapter reports into the sealed source receipt, causing real
+custom ordinary/edit completion to fail validation. The synthetic graph fixtures
+returned before sealed receipt construction and did not expose that defect.
+
+Repair: keep completed provider application reports separately in lifecycle state.
+Only the built-in unmerged DMD report enters the sealed source receipt. Completed
+provider reports contain custom applications, the unmerged DMD application when
+present, and the edit application when present. Full-FP32 DMD remains folded and
+does not claim an unmerged application. Publish completion reports after successful
+validation and clear them on every new entry or failure, including pin failures.
+The pure Candle regression uses a valid ordinary/edit receipt, verifies that custom
+injection is still rejected by the real validator, checks independent custom/edit
+reports, DMD/custom composition, and failed-entry cleanup. The ignored learned
+Metal helper uses native adapter-loader reports directly, not sealed receipts.
 
 ## Validation state
 
-Source formatting and whitespace checks pass. Native compilation, the pure Rust
-regressions, and the affected dedicated Metal edit oracle remain pending on the
-assembled integration head. These repairs neither satisfy nor change the sealed
-eight-cell real-weight training campaign, which remains terminal work.
+After correcting F-286, strict combined all-targets/test-support Clippy passed for
+both MOSS providers. The exact Candle edit receipt/composition test passed through
+the real sealed receipt validator, and the exact MLX pin-failure lifecycle test
+passed with completed application reports included in cleanup. Both native test
+runs used the existing target directory, four build jobs, disabled incremental
+compilation, repository Rust 1.96.0, default debug profiles and strip-none including
+build overrides. Formatting and whitespace checks pass. The affected dedicated
+Metal edit oracle remains pending. These repairs neither satisfy nor change the
+sealed eight-cell real-weight training campaign, which remains terminal work.

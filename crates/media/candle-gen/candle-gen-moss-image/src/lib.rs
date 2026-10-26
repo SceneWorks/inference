@@ -33,6 +33,7 @@ struct State {
     vae: Option<Flux2Vae>,
     report: Option<MossImageExecutionReport>,
     edit_report: Option<MossImageEditExecutionReport>,
+    apply_reports: Vec<AdapterApplyReport>,
 }
 impl State {
     fn release_for_request(
@@ -212,6 +213,7 @@ impl MossImageGenerator {
         let mut state = candle_gen::lock_recover(&self.state);
         state.report = None;
         state.edit_report = None;
+        state.apply_reports.clear();
         let admission = candle_gen::lock_recover(&self.admission).take();
         let result = (|| {
             let normalized;
@@ -235,6 +237,7 @@ impl MossImageGenerator {
             if result.is_err() || sync.is_err() {
                 state.report = None;
                 state.edit_report = None;
+                state.apply_reports.clear();
             }
             sync.map_err(candle_gen::CandleError::from)?;
         }
@@ -408,12 +411,22 @@ impl MossImageGenerator {
                 on_progress,
             )?
         };
-        let adapter_reports = state
+        let mut apply_reports = state
             .renderer
             .as_ref()
             .expect("renderer loaded")
             .adapter_reports
             .clone();
+        // The sealed source receipt describes only the published unmerged DMD stack.
+        // User-trained adapters are reported separately through the provider completion API.
+        let adapter_reports = state
+            .renderer
+            .as_ref()
+            .expect("renderer loaded")
+            .dmd_report
+            .clone()
+            .into_iter()
+            .collect();
         if staged {
             release_then_sync(state.renderer.take(), || self.device.synchronize())
                 .map_err(candle_gen::CandleError::from)?;
@@ -456,6 +469,7 @@ impl MossImageGenerator {
         if self.sources.is_fixture() {
             // Synthetic CPU fixtures execute the actual graph but cannot attest published assets.
             state.report = None;
+            state.apply_reports = apply_reports;
             return Ok(output);
         }
         let conditioning = positive
@@ -511,10 +525,16 @@ impl MossImageGenerator {
             };
             receipt.validate()?;
             transformer::check_cancel(&req.cancel)?;
+            apply_reports.push(AdapterApplyReport {
+                adapter_path: receipt.adapter_path.clone(),
+                applied: receipt.applied_projections,
+                skipped: vec![],
+            });
             state.edit_report = Some(receipt);
         } else {
             state.report = Some(report);
         }
+        state.apply_reports = apply_reports;
         Ok(output)
     }
 }
@@ -560,24 +580,7 @@ impl Generator for MossImageGenerator {
             .and_then(|state| self.cached_resident_bytes(&state).ok())
     }
     fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        #[cfg(feature = "test-support")]
-        if self.sources.is_fixture() {
-            return candle_gen::lock_recover(&self.state)
-                .renderer
-                .as_ref()
-                .map_or_else(Vec::new, |r| r.adapter_reports.clone());
-        }
-        if let Some(edit) = self.moss_image_edit_execution_report() {
-            let mut reports = edit.base.data().adapter_reports.clone();
-            reports.push(AdapterApplyReport {
-                adapter_path: edit.adapter_path,
-                applied: edit.applied_projections,
-                skipped: vec![],
-            });
-            return reports;
-        }
-        self.moss_image_execution_report()
-            .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
+        candle_gen::lock_recover(&self.state).apply_reports.clone()
     }
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
         Some(&self.contract)
@@ -839,6 +842,7 @@ fn verify_numerical_renderer_transitions(
                         transformer: build(mode),
                         dataspace: None,
                         adapter_reports: vec![],
+                        dmd_report: None,
                     })
                 },
             )

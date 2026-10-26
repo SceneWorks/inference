@@ -17,6 +17,17 @@ pub(crate) struct Renderer {
     pub transformer: Transformer,
     pub dataspace: Option<(Tensor, Vec<f32>)>,
     pub adapter_reports: Vec<AdapterApplyReport>,
+    pub dmd_report: Option<AdapterApplyReport>,
+}
+pub(crate) fn application_reports(
+    dmd_report: Option<&AdapterApplyReport>,
+    custom_reports: Vec<AdapterApplyReport>,
+) -> Vec<AdapterApplyReport> {
+    dmd_report
+        .into_iter()
+        .cloned()
+        .chain(custom_reports)
+        .collect()
 }
 impl Renderer {
     pub fn load(sources: &Sources, mode: MossImageAcceleration, device: &Device) -> Result<Self> {
@@ -76,8 +87,8 @@ impl Renderer {
         } else {
             None
         };
-        let mut adapter_reports = if mixed {
-            vec![AdapterApplyReport {
+        let dmd_report = if mixed {
+            Some(AdapterApplyReport {
                 adapter_path: assets
                     .iter()
                     .find(|a| a.role == MossImageAssetRole::DmdLora)
@@ -87,22 +98,24 @@ impl Renderer {
                     .into(),
                 applied: 252,
                 skipped: vec![],
-            }]
+            })
         } else {
-            vec![]
+            None
         };
-        adapter_reports.extend(crate::adapters::apply(
+        let custom_reports = crate::adapters::apply(
             &mut transformer,
             sources.variant,
             &sources.spec.adapters,
             &sources.adapter_pins,
-        )?);
+        )?;
+        let adapter_reports = application_reports(dmd_report.as_ref(), custom_reports);
         sources.ensure_unchanged()?;
         Ok(Self {
             mode,
             transformer,
             dataspace,
             adapter_reports,
+            dmd_report,
         })
     }
 }

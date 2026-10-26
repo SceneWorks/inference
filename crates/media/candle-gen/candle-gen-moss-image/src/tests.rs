@@ -656,6 +656,7 @@ fn renderer_off_on_off_never_reuses_modified_backbone() {
             transformer: Transformer::load(&weights(&ordinary["weights"], dtype), g, None).unwrap(),
             dataspace: None,
             adapter_reports: vec![],
+            dmd_report: None,
         })
     };
     state
@@ -702,6 +703,7 @@ fn warm_admission_credits_only_actual_provider_weights() {
         transformer: model,
         dataspace: None,
         adapter_reports: vec![],
+        dmd_report: None,
     });
     let request = GenerationRequest::default();
     let peak = generator
@@ -742,6 +744,7 @@ fn ordinary_sampler_executes_cfg_zero_one_slg_interval_skips_and_expanded_batch(
             .unwrap(),
         dataspace: None,
         adapter_reports: vec![],
+        dmd_report: None,
     };
     let c = tensor(&d["inputs"]["encoder_hidden_states"], DType::F32);
     let rows = vec![
@@ -870,6 +873,7 @@ fn sampler_seed_receipts_progress_cancel_and_warm_reentry_are_actual() {
             .unwrap(),
         dataspace: None,
         adapter_reports: vec![],
+        dmd_report: None,
     };
     let c = tensor(&d["inputs"]["encoder_hidden_states"], DType::F32)
         .narrow(0, 0, 1)
@@ -981,6 +985,7 @@ fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
             transformer: model,
             dataspace: None,
             adapter_reports: vec![],
+            dmd_report: None,
         });
     }
     assert!(generator.moss_image_owned_weight_bytes().unwrap() > 0);
@@ -1041,7 +1046,6 @@ fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
         applied: 1,
         skipped: vec![],
     };
-    base.adapter_reports = vec![custom_report.clone()];
     let mut report = MossImageEditExecutionReport {
         base: MossImageExecutionReport::new(base).unwrap(),
         adapter_path: "synthetic-only".into(),
@@ -1080,7 +1084,43 @@ fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
     report.validate().unwrap();
     assert_eq!(report.references[0], slots[3]);
     let generator = synthetic_generator();
-    candle_gen::lock_recover(&generator.state).edit_report = Some(report.clone());
+    // A valid sealed ordinary receipt remains empty even with custom provider reports.
+    assert!(report.base.data().adapter_reports.is_empty());
+    let mut invalid_base = report.base.data().clone();
+    invalid_base.adapter_reports.push(custom_report.clone());
+    assert!(MossImageExecutionReport::new(invalid_base).is_err());
+    {
+        let mut state = candle_gen::lock_recover(&generator.state);
+        state.report = Some(report.base.clone());
+        state.apply_reports = pipeline::application_reports(None, vec![custom_report.clone()]);
+    }
+    assert_eq!(
+        generator.adapter_apply_reports(),
+        vec![custom_report.clone()]
+    );
+    let dmd = AdapterApplyReport {
+        adapter_path: "published-dmd.safetensors".into(),
+        applied: 252,
+        skipped: vec![],
+    };
+    assert_eq!(
+        pipeline::application_reports(Some(&dmd), vec![custom_report.clone()]),
+        vec![dmd, custom_report.clone()],
+        "unmerged DMD and custom applications must appear once each"
+    );
+    {
+        let mut state = candle_gen::lock_recover(&generator.state);
+        state.report = None;
+        state.edit_report = Some(report.clone());
+        state.apply_reports = vec![
+            custom_report.clone(),
+            AdapterApplyReport {
+                adapter_path: report.adapter_path.clone(),
+                applied: report.applied_projections,
+                skipped: vec![],
+            },
+        ];
+    }
     assert_eq!(
         generator.adapter_apply_reports(),
         vec![
@@ -1093,6 +1133,17 @@ fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
         ],
         "edit application reports must retain the custom adapter stack"
     );
+    // A failed subsequent entry cannot expose the previous completed application stack.
+    assert!(generator
+        .generate(
+            &GenerationRequest {
+                width: 17,
+                ..Default::default()
+            },
+            &mut |_| {}
+        )
+        .is_err());
+    assert!(generator.adapter_apply_reports().is_empty());
     report.references.push(slots[0].clone());
     assert!(report.validate().is_err());
     assert!(serde_json::from_value::<MossImageEditExecutionReport>(
