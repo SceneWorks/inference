@@ -1619,6 +1619,9 @@ mod tests {
     fn shared_cuda_profile_reuses_one_stable_idle_policy_and_validates_before_publish() {
         const SOURCE: &str = include_str!("pipeline.rs");
         const WORKFLOW: &str = include_str!("../../../../../.github/workflows/real-weights.yml");
+        const PROFILE_SCRIPT: &str = include_str!(
+            "../../../../../scripts/ci/real-weights/candle-scail2-shared/load-through-the-production-provider-minimally-render-and-measure-the-shared-package.sh"
+        );
         let profile_start = SOURCE
             .rfind("\n    fn shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak()")
             .expect("exact SCAIL profile declaration");
@@ -1658,12 +1661,34 @@ mod tests {
             .find("[[SCAIL2_CUDA_VRAM]]")
             .expect("validated publication marker");
         assert!(raw < validation && validation < validated);
+        let job = WORKFLOW
+            .split_once("\n  candle-scail2-shared:\n")
+            .expect("exact shared SCAIL workflow job")
+            .1
+            .split_once("\n  candle-media:\n")
+            .expect("shared SCAIL workflow job boundary")
+            .0;
         assert!(
-            WORKFLOW.contains("grep -Fq '[[SCAIL2_CUDA_VRAM]]'"),
+            job.contains(concat!(
+                "shell: bash\n        run: source ",
+                "scripts/ci/real-weights/candle-scail2-shared/",
+                "load-through-the-production-provider-minimally-render-and-measure-the-shared-package.sh"
+            )),
+            "the shared SCAIL job must source the checked-in publication guard through Bash"
+        );
+        let invocation = PROFILE_SCRIPT
+            .find("pipeline::tests::shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak")
+            .expect("exact shared CUDA profile invocation");
+        let publication = PROFILE_SCRIPT
+            .find("grep -Fq '[[SCAIL2_CUDA_VRAM]]'")
+            .expect("validated workflow publication guard");
+        assert!(invocation < publication);
+        assert!(
+            PROFILE_SCRIPT.contains("grep -Fq '[[SCAIL2_CUDA_VRAM]]' \"$evidence_log\" || {"),
             "workflow must accept only the final validated marker"
         );
         assert!(
-            !WORKFLOW.contains("grep -Fq '[[SCAIL2_CUDA_VRAM_RAW]]'"),
+            !PROFILE_SCRIPT.contains("grep -Fq '[[SCAIL2_CUDA_VRAM_RAW]]'"),
             "raw diagnostics must never satisfy publication"
         );
     }
