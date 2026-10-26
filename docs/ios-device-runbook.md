@@ -1,6 +1,6 @@
 # iOS device runbook
 
-Reconciled 2026-10-26 against candidate `2697693a981f` and the sc-26270
+Reconciled 2026-10-26 against the sc-26270
 ANCHOR campaign (two endpoint configurations per family, with two optimized
 repeats). Source repairs and terminal device evidence remain in progress. These
 are implemented harness commands, not a claim the epic
@@ -11,6 +11,14 @@ is on main or that all models render on the phone. See [strategy](architecture/i
 
 Target: **iPhone 16 Pro Max, 8 GB, iOS 26.6.2**. No successful target-device image
 has been recorded. Registration is not admission or demonstrated fit.
+
+Michael clarified this delivery's Iris scope on 2026-10-26: generation
+(`iris_3b`), including bf16/q8/q4 on MLX and Candle. Existing depth/restoration
+registrations remain, but new task tiers, desktop task-tier plumbing and task
+device certification are outside this closeout. Their unresolved catalog rows
+are not measured fits. Other generation architectures and their conditioning,
+reference and control modes remain in scope; the separate Supra2 exception is
+unchanged. See epic 16774 and sc-26266/sc-26270 for the recorded decision.
 
 | Model set | Feature status at this snapshot | Target-phone status |
 |---|---|---|
@@ -556,10 +564,12 @@ Exact native evidence identities still retain sampling-allocation classes. The
 approved engineering path derives other registered settings and optimization
 rungs by repricing their actual phase pressure, with no downward credit and the
 measured margin. It does not require a sampler/settings Cartesian capture grid.
-Retain SANA/Sprint, SDXL-family routes, Anima, Iris generation/restoration/depth,
+Retain SANA/Sprint, SDXL-family routes, Anima, Iris generation,
 Z-Image and distinct reference/control/init graphs. Header similarity alone
 does not permit foreign-route, artifact or graph reuse; only the source-owned
 representative mapping and compatible engineering evidence authorize derivation.
+Depth/restoration registrations remain available; their endpoint certification
+is excluded by the generation-only Iris scope above.
 
 **Validation cases (part of the campaign, not optional).** For the first optimized family in
 catalog order: `validation_steps` — the optimized anchor at the provider's full step count,
