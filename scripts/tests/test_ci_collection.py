@@ -1,4 +1,4 @@
-"""Failure collection uses fake subprocesses; these tests never invoke Cargo."""
+"""CI_IMPACT: one added source-only regression; fake subprocesses never invoke Cargo or models."""
 
 import contextlib
 import errno
@@ -23,6 +23,32 @@ SETUP = ("mlx_checkout", "mlx_versions", "mlx_metal", "mlx_rust", "mlx_prebuilt"
 GUARD = "${{ !cancelled() && " + " && ".join(
     f"steps.{name}.outcome == 'success'" for name in SETUP
 ) + " && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}"
+
+
+def collected_command(run):
+    """Read the collector's argv, separately from earlier compile/list preflight commands."""
+    commands = []
+    for line in run.replace("\\\n", " ").splitlines():
+        tokens = shlex.split(line, comments=True)
+        if not tokens or tokens[0] not in ("python3", "python3.12"):
+            continue
+        for index, token in enumerate(tokens):
+            if token == "scripts/ci/run_ci_collection.py":
+                if any(argument in ("--list", "--list-only") or argument.startswith("--list=")
+                       for argument in tokens[:index]):
+                    raise AssertionError("collected test body must execute tests, not only list them")
+                if tokens[index + 1:index + 2] != ["--"] or not tokens[index + 2:]:
+                    raise AssertionError("collector must forward a nonempty command after --")
+                commands.append(tokens[index + 2:])
+    if len(commands) != 1:
+        raise AssertionError("each collection step must execute exactly one collected command")
+    return commands[0]
+
+
+def assert_executes_test_body(run):
+    for argument in collected_command(run):
+        if argument in ("--list", "--list-only") or argument.startswith("--list="):
+            raise AssertionError("collected test body must execute tests, not only list them")
 
 
 class CollectionTests(unittest.TestCase):
@@ -145,6 +171,33 @@ class CollectionTests(unittest.TestCase):
             collection.main()
         self.assertEqual(error.exception.code, 2)
 
+    def test_listing_preflight_cannot_replace_execution_in_the_collected_body(self):
+        preflight = ("python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- "
+                     "cargo test --locked --lib -p fixture\n")
+        prefix = "python3 scripts/ci/run_ci_collection.py -- "
+        bodies = ("cargo test --locked --no-fail-fast --lib -p fixture",
+                  "python3 scripts/ci/test_suites.py routine -- cargo test --locked --lib -p fixture")
+        for body in bodies:
+            with self.subTest(body=body):
+                assert_executes_test_body(preflight + prefix + body)
+                self.assertEqual(collected_command(preflight + prefix + body), shlex.split(body))
+                for flag in ("--list", "'--list'", "--list-only", "--list=terse"):
+                    with self.subTest(flag=flag), self.assertRaisesRegex(AssertionError, "must execute tests"):
+                        assert_executes_test_body(preflight + prefix + body + " -- " + flag)
+        # The compiled-ignore wrapper is legitimate as a preflight, but placing
+        # its list-only mode inside the collector would make the real test body inert.
+        with self.assertRaisesRegex(AssertionError, "must execute tests"):
+            assert_executes_test_body(prefix + preflight.strip())
+        with self.assertRaisesRegex(AssertionError, "must execute tests"):
+            assert_executes_test_body(
+                "python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- " + prefix + bodies[0])
+        with self.assertRaisesRegex(AssertionError, "exactly one"):
+            assert_executes_test_body("echo " + prefix + bodies[0])
+        with self.assertRaisesRegex(AssertionError, "exactly one"):
+            assert_executes_test_body(preflight)
+        with self.assertRaisesRegex(AssertionError, "nonempty"):
+            assert_executes_test_body(prefix)
+
     def test_existing_lane_requires_all_setup_and_keeps_failing_steps_red(self):
         job = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]["macos-metal"]
         self.assertEqual(job["runs-on"], "macos-15")
@@ -157,23 +210,27 @@ class CollectionTests(unittest.TestCase):
             self.assertEqual(" ".join(step.get("if", "").split()), GUARD, step["name"])
             self.assertFalse(step.get("continue-on-error", False), step["name"])
             run = step["run"]
-            for forbidden in ("--per-package", "--ignored", "--list", "--all-features", "|| true"):
+            for forbidden in ("--per-package", "--ignored", "--all-features", "|| true"):
                 self.assertNotIn(forbidden, run)
-            if "cargo clippy " in run or " clippy --locked " in run:
-                self.assertIn("--keep-going", run)
-                self.assertTrue(run.rstrip().endswith("-- -D warnings"))
-            if "cargo test " in run or " test --locked " in run:
+            assert_executes_test_body(run)
+            body = shlex.join(collected_command(run))
+            if "cargo clippy " in body or " clippy --locked " in body:
+                self.assertIn("--keep-going", body)
+                self.assertTrue(body.rstrip().endswith("-- -D warnings"))
+            if "cargo test " in body or " test --locked " in body:
                 # Pinned Cargo 1.96 rejects --keep-going for test (including doctests).
                 # Runtime continuation is --no-fail-fast; compilation may still block binaries.
-                self.assertNotIn("--keep-going", run)
-                self.assertIn("--no-fail-fast", run)
+                self.assertNotIn("--keep-going", body)
+                self.assertIn("--no-fail-fast", body)
         broad = next(step["run"] for step in steps if step.get("name") == "Test MLX packages")
         for name in ("sceneworks-gen-core", "mlx-gen", "mlx-llm", "mlx-llm-server",
                      "runtime-ios", "runtime-macos"):
             self.assertIn("-p " + name, broad)
         self.assertIn("-p 'mlx-gen-*'", broad)
         self.assertIn("--no-fail-fast", broad)
-        self.assertEqual(broad.count("cargo test"), 1)
+        body = collected_command(broad)
+        self.assertEqual(sum(body[index:index + 2] == ["cargo", "test"]
+                             for index in range(len(body) - 1)), 1)
         self.assertFalse(any(step.get("name") in (
             "Compile affected iOS pricing test targets", "Test affected iOS pricing packages",
             "Collect affected iOS pricing package tests",
