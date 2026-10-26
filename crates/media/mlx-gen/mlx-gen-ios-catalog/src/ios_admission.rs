@@ -1512,7 +1512,7 @@ fn source_string_clone(value: &str, next: Option<KeyCapacity<'_>>) -> AdmissionR
     }
 }
 
-/// Full concrete context Clone law: only these four string owners allocate.
+/// Full concrete context Clone law: four strings and the ordered reference canvases allocate.
 /// Exhaustive destructuring/matching forces a source audit if a field/variant is
 /// added; selection, authority, geometry, budget and cache state are Copy data.
 fn source_context_clone(
@@ -1547,6 +1547,7 @@ fn source_context_clone(
         use_pid: _,
         has_phases: _,
         geometry: _,
+        reference_resources,
         overlay,
         budget: _,
         predicted_peak_bytes: _,
@@ -1557,11 +1558,27 @@ fn source_context_clone(
         MemoryMode::TextToImage | MemoryMode::ImageToImage | MemoryMode::Edit => 0,
         MemoryMode::Other(value) => value.len(),
     };
+    let reference_bytes = match reference_resources {
+        Some(mlx_gen::gen_core::MemoryReferenceResourceFacts {
+            conditioning_tokens,
+            prepared_canvases,
+        }) => {
+            require_copy(*conditioning_tokens);
+            prepared_canvases
+                .len()
+                .checked_mul(std::mem::size_of::<(u32, u32)>())
+                .ok_or_else(|| {
+                    no_evidence("reference canvas clone requested-layout overflow".into())
+                })?
+        }
+        None => 0,
+    };
     let bytes = [
         calibration_fingerprint.len(),
         mode_bytes,
         overlay.as_ref().map_or(0, String::len),
         evidence_revision.len(),
+        reference_bytes,
     ]
     .into_iter()
     .try_fold(0usize, usize::checked_add)
@@ -3142,6 +3159,10 @@ mod guarded_clone_tests {
         context.mode = MemoryMode::Other("mode".repeat(9));
         context.overlay = Some("overlay".repeat(7));
         context.evidence_revision = "previous".repeat(11);
+        context.reference_resources = Some(mlx_gen::gen_core::MemoryReferenceResourceFacts {
+            conditioning_tokens: 4096,
+            prepared_canvases: vec![(512, 512), (768, 512), (1024, 1024)],
+        });
         let bill = Cell::new(0);
         let mut next = |bytes| {
             bill.set(bytes);

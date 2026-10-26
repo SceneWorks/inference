@@ -62,13 +62,13 @@ mod bound;
 mod capture_config;
 pub use capture_config::capture_adapters;
 pub mod engineering;
-pub mod source_identity;
 pub mod evidence;
 pub mod ios_admission;
 mod layout;
 pub mod pricing;
 mod refusal;
 pub mod sampling;
+pub mod source_identity;
 pub use bound::{BoundDepth, BoundGenerator, BoundTransform, GeneratorAdmissionInfo};
 pub use ios_admission::{
     admit, admit_with_baseline, admit_with_boundary, admit_with_boundary_and_key_capacity,
