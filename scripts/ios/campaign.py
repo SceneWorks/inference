@@ -482,7 +482,9 @@ class DeviceSession:
                 row["harness_terminated"] = True
             # The app writes its report only after generate has returned, and then exits itself.
             # If cancellation cannot finish, do NOT signal Metal or launch/reinstall another case.
-            grace_end = time.monotonic() + 15
+            # A copy timeout says nothing about render completion. Keep the original
+            # cooperative deadline before applying the normal natural-exit grace.
+            grace_end = (end if report_copy_timed_out else time.monotonic()) + 15
             while not self.exited():
                 if time.monotonic() >= grace_end:
                     self.blocked = True

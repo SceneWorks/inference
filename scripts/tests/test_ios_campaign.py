@@ -342,7 +342,10 @@ class CampaignTests(unittest.TestCase):
         session.sha = "b" * 40
         nonce = "a" * 32
         calls = []
-        with mock.patch.object(campaign.uuid, "uuid4", return_value=mock.Mock(hex=nonce)):
+        session.exited.side_effect = [True, False, True]
+        with (mock.patch.object(campaign.uuid, "uuid4", return_value=mock.Mock(hex=nonce)),
+              mock.patch.object(campaign.time, "monotonic", side_effect=[0, 1, 30, 46]),
+              mock.patch.object(campaign.time, "sleep")):
             def copy(remote, local):
                 calls.append(remote)
                 if remote == "smoke-report.txt":
@@ -359,6 +362,7 @@ class CampaignTests(unittest.TestCase):
                 return subprocess.CompletedProcess([], 0, "", "")
             session.copy.side_effect = copy
             row = session.run_case(key)
+        self.assertEqual(session.exited.call_count, 3)
         self.assertEqual(calls.count("smoke-report.txt"), 2)
         self.assertEqual(calls.count("campaign-progress.txt"), 1)
         self.assertEqual(row["status"], "diagnostic_failure")
