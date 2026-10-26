@@ -1036,6 +1036,12 @@ fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
 fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
     let mut base = synthetic_report().data().clone();
     base.resolved.uncond_skip_layers.clear();
+    let custom_report = AdapterApplyReport {
+        adapter_path: "trained-custom.safetensors".into(),
+        applied: 1,
+        skipped: vec![],
+    };
+    base.adapter_reports = vec![custom_report.clone()];
     let mut report = MossImageEditExecutionReport {
         base: MossImageExecutionReport::new(base).unwrap(),
         adapter_path: "synthetic-only".into(),
@@ -1073,6 +1079,20 @@ fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
     report.references.reverse();
     report.validate().unwrap();
     assert_eq!(report.references[0], slots[3]);
+    let generator = synthetic_generator();
+    candle_gen::lock_recover(&generator.state).edit_report = Some(report.clone());
+    assert_eq!(
+        generator.adapter_apply_reports(),
+        vec![
+            custom_report,
+            AdapterApplyReport {
+                adapter_path: report.adapter_path.clone(),
+                applied: report.applied_projections,
+                skipped: vec![],
+            }
+        ],
+        "edit application reports must retain the custom adapter stack"
+    );
     report.references.push(slots[0].clone());
     assert!(report.validate().is_err());
     assert!(serde_json::from_value::<MossImageEditExecutionReport>(

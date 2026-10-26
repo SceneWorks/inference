@@ -568,11 +568,13 @@ impl Generator for MossImageGenerator {
                 .map_or_else(Vec::new, |r| r.adapter_reports.clone());
         }
         if let Some(edit) = self.moss_image_edit_execution_report() {
-            return vec![AdapterApplyReport {
+            let mut reports = edit.base.data().adapter_reports.clone();
+            reports.push(AdapterApplyReport {
                 adapter_path: edit.adapter_path,
                 applied: edit.applied_projections,
                 skipped: vec![],
-            }];
+            });
+            return reports;
         }
         self.moss_image_execution_report()
             .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())

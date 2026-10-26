@@ -154,17 +154,18 @@ impl Projection {
                 } else {
                     x.as_dtype(down.dtype())?.matmul(down.t())?.matmul(up.t())?
                 };
-                return Ok(add(
+                base = add(
                     &base,
                     self::scale(&residual, *scale)?.as_dtype(base.dtype())?,
-                )?);
+                )?;
+            } else {
+                // The original input's FP32 values feed the residual; only the backbone is narrowed.
+                let residual = linear_fp32(&linear_fp32(&x.as_dtype(Dtype::Float32)?, down)?, up)?;
+                base = add(
+                    base.as_dtype(Dtype::Float32)?,
+                    self::scale(&residual, *scale)?,
+                )?;
             }
-            // The original input's FP32 values feed the residual; only the backbone is narrowed.
-            let residual = linear_fp32(&linear_fp32(&x.as_dtype(Dtype::Float32)?, down)?, up)?;
-            base = add(
-                base.as_dtype(Dtype::Float32)?,
-                self::scale(&residual, *scale)?,
-            )?;
         }
         for adapter in self.custom.adapters() {
             if adapter.is_disabled() {
@@ -2040,7 +2041,199 @@ mod edit_fixture_tests {
             std::env::var("MOSS_NATIVE_TEST_ADMITTED").as_deref(),
             Ok("1")
         );
-        mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || run_oracle(false));
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+            run_oracle(false);
+            trained_custom_adapters_compose_with_edit();
+        });
+    }
+    // Reached only through the existing ignored Metal edit oracle. Exercise actual learning,
+    // portable export and the production custom-before-edit installation order for both methods.
+    fn trained_custom_adapters_compose_with_edit() {
+        use mlx_gen::gen_core::{moss_image::MossImageVariant, moss_image_training as contract};
+        use mlx_gen::train::lora::{build_lokr_targets, build_lora_targets, TrainAdapter};
+        use mlx_gen::{NetworkType, TrainingConfig};
+        let f: Value = serde_json::from_str(include_str!(
+            "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v2/fixture.json"
+        ))
+        .unwrap();
+        let backbone = |fp32| {
+            let weights = Weights::from_map(
+                f["weights"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = array(value);
+                        (
+                            key.clone(),
+                            if fp32 {
+                                value.as_dtype(Dtype::Float32).unwrap()
+                            } else {
+                                value
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            Transformer::load(
+                &weights,
+                Geometry {
+                    dim: 16,
+                    ffn: 24,
+                    heads: 2,
+                    layers: 2,
+                    text: 12,
+                    freq: 8,
+                    channels: 4,
+                },
+            )
+            .unwrap()
+        };
+        let edit_weights = || {
+            Weights::from_map(
+                f["adapter"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), array(value)))
+                    .collect(),
+            )
+        };
+        let input = &f["inputs"];
+        let x = array(&input["hidden_states"]);
+        let context = masked(&input["positive"], &input["positive_mask"]);
+        let references: Vec<_> = input["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(array)
+            .collect();
+        let noise = add(&x, Array::from_f32(0.37)).unwrap();
+        let cancel = CancelFlag::new();
+        let predict = |model: &Transformer, cached: bool| {
+            let cache =
+                cached.then(|| model.prepare_edit_cache(&references[..1], &cancel).unwrap());
+            logical_f32_readback(
+                &model
+                    .forward_edit(
+                        &x,
+                        0.37,
+                        EditConditioning {
+                            context: &context,
+                            references: &references[..1],
+                            cache: cache.as_ref(),
+                        },
+                        &cancel,
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut edit_only = backbone(false);
+        edit_only.install_edit(&edit_weights(), 2).unwrap();
+        let baseline = predict(&edit_only, true);
+        let paths = vec!["layers.0.proj.o".to_owned()];
+        for network in [NetworkType::Lora, NetworkType::Lokr] {
+            let mut trained = backbone(true);
+            let (adapter, mut params) = match network {
+                NetworkType::Lora => {
+                    let (targets, params) =
+                        build_lora_targets(&mut trained, &paths, 2, 17).unwrap();
+                    (TrainAdapter::Lora { targets }, params)
+                }
+                NetworkType::Lokr => {
+                    let (targets, params) =
+                        build_lokr_targets(&mut trained, &paths, 2, 2, 17).unwrap();
+                    (TrainAdapter::Lokr { targets }, params)
+                }
+            };
+            let config = TrainingConfig {
+                rank: 2,
+                alpha: 3.,
+                network_type: network,
+                decompose_factor: 2,
+                ..Default::default()
+            };
+            let mut optimizer = mlx_gen::TrainOptimizer::from_config("adamw", 0.1, 0.0).unwrap();
+            for update in 0..3 {
+                let (loss, gradient) = crate::training::loss_grads(
+                    &mut trained,
+                    &params,
+                    &adapter,
+                    &config,
+                    &x,
+                    &context,
+                    &noise,
+                    0.37,
+                    None,
+                    &cancel,
+                )
+                .unwrap();
+                assert!(loss.is_finite());
+                assert!(gradient
+                    .values()
+                    .flat_map(|array| logical_f32_readback(array).unwrap())
+                    .any(|value| value != 0.));
+                mlx_gen::train::lora::adapter_optimizer_update(
+                    &mut optimizer,
+                    &mut params,
+                    &gradient,
+                    &config,
+                    update,
+                    17,
+                )
+                .unwrap();
+            }
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("trained.safetensors");
+            let metadata = contract::metadata(MossImageVariant::Sft, contract::SAMPLER);
+            let extra: Vec<_> = metadata
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            crate::adapters::save_validated(
+                &mut trained,
+                &adapter,
+                &params,
+                &config,
+                &extra,
+                &path,
+            )
+            .unwrap();
+            let kind = match network {
+                NetworkType::Lora => mlx_gen::runtime::AdapterKind::Lora,
+                NetworkType::Lokr => mlx_gen::runtime::AdapterKind::Lokr,
+            };
+            for strength in [0., 1., -1.] {
+                let mut model = backbone(false);
+                let spec = mlx_gen::runtime::AdapterSpec::new(path.clone(), strength, kind);
+                let pin = mlx_gen::gen_core::PinnedWeightsFile::pin(&path).unwrap();
+                let reports = crate::adapters::apply_pinned(
+                    &mut model,
+                    MossImageVariant::Sft,
+                    &[spec],
+                    &[pin],
+                )
+                .unwrap();
+                assert_eq!(reports[0].applied, 1);
+                model.install_edit(&edit_weights(), 2).unwrap();
+                let output = predict(&model, true);
+                assert!(output.iter().all(|value| value.is_finite()));
+                assert_eq!(
+                    output,
+                    predict(&model, false),
+                    "custom adapters changed cached/uncached edit equivalence"
+                );
+                if strength == 0. {
+                    assert_eq!(
+                        output, baseline,
+                        "disabled custom adapter changed edit arithmetic"
+                    );
+                } else {
+                    assert_ne!(output, baseline, "trained {network:?} residual disappeared during edit at strength {strength}");
+                }
+            }
+        }
     }
     fn fixture_model(f: &Value, fp32: bool) -> Transformer {
         let weights = Weights::from_map(

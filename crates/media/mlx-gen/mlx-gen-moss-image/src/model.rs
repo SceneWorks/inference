@@ -29,6 +29,15 @@ struct AttemptState<R, P> {
     report: Option<P>,
 }
 impl<R, P> AttemptState<R, P> {
+    fn begin_request<E>(
+        &mut self,
+        pins: &[gen_core::PinnedWeightsFile],
+        edit_report: &mut Option<E>,
+    ) -> Result<()> {
+        // Pin authentication can fail before execution enters its cleanup scope.
+        *edit_report = None;
+        self.begin(pins)
+    }
     fn begin(&mut self, pins: &[gen_core::PinnedWeightsFile]) -> Result<()> {
         self.report = None;
         for pin in pins {
@@ -380,12 +389,11 @@ impl MossImage {
             .state
             .lock()
             .map_err(|_| Error::Msg("MOSS lifecycle lock poisoned".into()))?;
-        state.begin(&self.custom_pins)?;
         let mut edit_report = self
             .edit_report
             .lock()
             .map_err(|_| Error::Msg("MOSS edit receipt lock poisoned".into()))?;
-        *edit_report = None;
+        state.begin_request(&self.custom_pins, &mut edit_report)?;
         let result = (|| {
             check(&request.cancel)?;
             self.sources.ensure_unchanged()?;
@@ -773,12 +781,12 @@ impl Generator for MossImage {
                 .state
                 .lock()
                 .map_err(|_| gen_core::Error::Unsupported("MOSS lifecycle lock poisoned".into()))?;
-            state
-                .begin(&self.custom_pins)
-                .map_err(gen_core::Error::from)?;
-            *self.edit_report.lock().map_err(|_| {
+            let mut edit_report = self.edit_report.lock().map_err(|_| {
                 gen_core::Error::Unsupported("MOSS edit receipt lock poisoned".into())
-            })? = None;
+            })?;
+            state
+                .begin_request(&self.custom_pins, &mut edit_report)
+                .map_err(gen_core::Error::from)?;
         }
         inputs.validate()?;
         let request = edit_request(request)?;
@@ -851,11 +859,13 @@ impl Generator for MossImage {
                 .map_or_else(Vec::new, |(_, r)| r.custom_reports.clone());
         }
         if let Some(edit) = self.moss_image_edit_execution_report() {
-            vec![gen_core::AdapterApplyReport {
+            let mut reports = edit.base.data().adapter_reports.clone();
+            reports.push(gen_core::AdapterApplyReport {
                 adapter_path: edit.adapter_path,
                 applied: edit.applied_projections,
                 skipped: vec![],
-            }]
+            });
+            reports
         } else {
             self.moss_image_execution_report()
                 .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
@@ -950,6 +960,23 @@ pub(crate) fn verify_numerical_renderer_transitions(
 #[cfg(test)]
 mod cpu_tests {
     use super::*;
+    #[test]
+    fn pin_failure_clears_ordinary_and_edit_receipts_before_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("custom-adapter");
+        std::fs::write(&path, b"original").unwrap();
+        let pin = gen_core::PinnedWeightsFile::pin(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mut state = AttemptState {
+            renderer: Some((MossImageAcceleration::Off, ())),
+            report: Some("completed ordinary"),
+        };
+        let mut edit_report = Some("completed edit");
+        assert!(state.begin_request(&[pin], &mut edit_report).is_err());
+        assert!(state.report.is_none());
+        assert!(state.renderer.is_none());
+        assert!(edit_report.is_none());
+    }
     #[test]
     fn warm_admission_only_credits_owned_committed_buffers() {
         assert_eq!(incremental_peak(1000, 400, 0), 1000);
