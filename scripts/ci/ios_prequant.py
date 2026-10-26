@@ -217,7 +217,7 @@ def verify_native_artifact(repo, target, mode, env):
         raise ValueError("mlx-rs source revision differs from the frozen native key")
     candidates = []
     for build_output in (target / "debug/build").glob("pmetal-mlx-sys-*/output"):
-        text = build_output.read_text(errors="replace")
+        text = build_output.read_text(errors="replace", encoding='utf-8')
         link = re.search(r"^cargo:rustc-link-search=native=(.+)$", text, re.M)
         metal = re.search(r"^cargo:metallib=(.+)$", text, re.M)
         if link and metal and Path(metal.group(1)) == Path(link.group(1)) / "mlx.metallib":
@@ -231,7 +231,7 @@ def verify_native_artifact(repo, target, mode, env):
     elif not native.resolve().is_relative_to(target.resolve()):
         raise ValueError("source build did not link its owned Cargo target")
     manifest_path = native / "pmetal-mlx-prebuilt.txt"
-    manifest = dict(line.split("=", 1) for line in manifest_path.read_text().splitlines() if "=" in line)
+    manifest = dict(line.split("=", 1) for line in manifest_path.read_text(encoding='utf-8').splitlines() if "=" in line)
     expected = {"schema": "1", "target": "aarch64-apple-darwin", "build_type": "Debug",
                 "deployment_target": "26.2", "features": "accelerate,metal",
                 "fingerprint": MLX_FINGERPRINT}
@@ -321,7 +321,7 @@ def main():
     receipt = {"state": "STARTING", "complete": False, "device": "CPU",
                "metal_trap_required": True, "outputs_uploaded": False}
     def save():
-        receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding='utf-8')
     save()
     try:
         binding = parse_binding(os.environ["IOS_PREQUANT_BINDING"])
@@ -422,7 +422,7 @@ def main():
         binary = target / "debug/examples" / example
         if not binary.is_file():
             raise ValueError("compiled converter missing")
-        startup = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+        startup = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10, encoding="utf-8")
         if startup.returncode == 0 or "usage:" not in startup.stderr:
             raise ValueError("converter startup did not reject missing arguments")
         receipt["startup"] = {"exit": startup.returncode, "expected_usage_refusal": True,

@@ -2056,12 +2056,12 @@ class IosHostSharedWorkspaceTests(unittest.TestCase):
     def write(self, root, *, member=True, excluded=False, nested=False, own_lock=False):
         (root / "Cargo.toml").write_text(
             '[workspace]\nmembers = ' + ('["ios-host/smoke"]' if member else '[]') + '\nexclude = '
-            + ('["ios-host/smoke"]' if excluded else '[]') + '\n')
+            + ('["ios-host/smoke"]' if excluded else '[]') + '\n', encoding='utf-8')
         harness = root / "ios-host/smoke"
         harness.mkdir(parents=True)
-        (harness / "Cargo.toml").write_text('[package]\nname = "ios-smoke"\n' + ('[workspace]\n' if nested else ''))
+        (harness / "Cargo.toml").write_text('[package]\nname = "ios-smoke"\n' + ('[workspace]\n' if nested else ''), encoding='utf-8')
         if own_lock:
-            (harness / "Cargo.lock").write_text('version = 4\n')
+            (harness / "Cargo.lock").write_text('version = 4\n', encoding='utf-8')
 
     def test_shared_workspace_passes_and_each_drift_refuses(self):
         with tempfile.TemporaryDirectory() as directory:

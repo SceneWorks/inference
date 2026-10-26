@@ -361,7 +361,7 @@ class CampaignTests(unittest.TestCase):
         return row
 
     def test_admitted_campaign_guards_reviewed_preparation_before_prelude(self):
-        source = (MODULE.parents[1].parent / "ios-host/smoke/src/campaign_media.rs").read_text()
+        source = (MODULE.parents[1].parent / "ios-host/smoke/src/campaign_media.rs").read_text(encoding='utf-8')
         body = source[source.index("impl Provider for DeviceProvider"):]
         prelude = body.index("self.prepare_for_programme(c, diagnostic)?")
         guarded = body[:prelude]

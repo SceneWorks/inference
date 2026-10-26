@@ -46,7 +46,7 @@ def digest(value):
 class ManualModelWorkflowRelocationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.ordinary = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
+        cls.ordinary = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'))
         cls.manual_text = inline_text()
         cls.manual = yaml.safe_load(cls.manual_text)
 
@@ -136,11 +136,11 @@ class ManualModelWorkflowRelocationTests(unittest.TestCase):
         self.assertIn("format('inference-model-proof-{0}-{1}', github.run_id, github.run_attempt)", expression)
 
     def test_new_script_indirections_have_exact_inline_round_trip_and_safe_bash_syntax(self):
-        text = (ROOT / '.github/workflows/real-weights.yml').read_text()
+        text = (ROOT / '.github/workflows/real-weights.yml').read_text(encoding='utf-8')
         for name in script_references(text):
             path = ROOT / name
             self.assertTrue(path.is_file(), name)
-            body = path.read_text()
+            body = path.read_text(encoding='utf-8')
             self.assertTrue(body.endswith('\n') and not body.endswith('\n\n'), name)
             if name.split('/')[-2] in (*MOVED, 'h3-pruned-hosted-metal') and path.suffix == '.sh':
                 subprocess.run(['/bin/bash', '-n', str(path)], check=True, capture_output=True)
@@ -149,7 +149,7 @@ class ManualModelWorkflowRelocationTests(unittest.TestCase):
     def test_manual_cuda_membership_and_override_include_each_ignored_case(self):
         for _, _, _, expected, expected_ignored in moss_edit_cuda.ARMS:
             self.assertEqual(expected_ignored, expected)
-        source = (ROOT / 'scripts/ci/moss_edit_cuda.py').read_text()
+        source = (ROOT / 'scripts/ci/moss_edit_cuda.py').read_text(encoding='utf-8')
         self.assertIn("execution_flags = ['--ignored']", source)
         self.assertNotIn("execution_flags = ['--include-ignored']", source)
 

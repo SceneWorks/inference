@@ -730,7 +730,7 @@ class Analyzer:
         if exe.endswith('.ps1'):
             path = (self.base / exe).resolve() if not Path(exe).is_absolute() else Path(exe).resolve()
             if path.is_file() and path.is_relative_to(self.graph.root):
-                self.generated_script(str(path), path.read_text(), args); return
+                self.generated_script(str(path), path.read_text(encoding='utf-8'), args); return
         self.graph.command([exe, *args], self.chain, self.base)
 
     def generated_script(self, path, text, args):

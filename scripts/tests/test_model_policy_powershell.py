@@ -275,7 +275,7 @@ $folder=Split-Path $exe
         self.assert_rejected(source.replace('stdout.Write(block, 0, block.Length);', 'Model.Forward();'), kind='unknown')
 
     def test_repository_script_uses_source_and_switch_arguments(self):
-        (self.root / 'entry.ps1').write_text('param([switch]$Metadata)\nif ($Metadata) { echo ok;exit 0 };python model_inference_proofs.py')
+        (self.root / 'entry.ps1').write_text('param([switch]$Metadata)\nif ($Metadata) { echo ok;exit 0 };python model_inference_proofs.py', encoding='utf-8')
         self.assert_safe('& powershell -File ./entry.ps1 -Metadata')
         self.assert_rejected('& powershell -File ./entry.ps1', kind='proof')
 
