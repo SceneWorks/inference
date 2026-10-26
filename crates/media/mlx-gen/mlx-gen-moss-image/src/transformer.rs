@@ -2134,6 +2134,7 @@ mod edit_fixture_tests {
         let baseline = predict(&edit_only, true);
         let paths = vec!["layers.0.proj.o".to_owned()];
         for network in [NetworkType::Lora, NetworkType::Lokr] {
+            eprintln!("custom edit {network:?}: native training");
             let mut trained = backbone(true);
             let (adapter, mut params) = match network {
                 NetworkType::Lora => {
@@ -2185,6 +2186,73 @@ mod edit_fixture_tests {
                 .unwrap();
             }
             let root = tempfile::tempdir().unwrap();
+            eprintln!("custom edit {network:?}: factor/optimizer save and CPU-backed reload");
+            let snapshot = root.path().join("resume-factors.safetensors");
+            Array::save_safetensors(
+                params.iter().map(|(key, value)| (key.as_ref(), value)),
+                None,
+                &snapshot,
+            )
+            .unwrap();
+            let (restored, _) = mlx_gen::weights::load_safetensors_on_cpu(&snapshot).unwrap();
+            mlx_rs::transforms::eval_pending_loads(restored.values()).unwrap();
+            let mut restored: mlx_gen::train::lora::LoraParams = restored
+                .into_iter()
+                .map(|(key, value)| (key.into(), value))
+                .collect();
+            let optimizer_snapshot = root.path().join("optimizer.safetensors");
+            optimizer.save_state(&optimizer_snapshot).unwrap();
+            let mut resumed_optimizer =
+                mlx_gen::TrainOptimizer::from_config("adamw", 0.1, 0.0).unwrap();
+            resumed_optimizer
+                .load_state_checked(&optimizer_snapshot, &restored, 3)
+                .unwrap();
+            for (key, value) in &params {
+                assert_eq!(
+                    logical_f32_readback(value).unwrap(),
+                    logical_f32_readback(&restored[key]).unwrap(),
+                    "resumed raw factor bytes differ"
+                );
+            }
+            let (_, gradient) = crate::training::loss_grads(
+                &mut trained,
+                &params,
+                &adapter,
+                &config,
+                &x,
+                &context,
+                &noise,
+                0.37,
+                None,
+                &cancel,
+            )
+            .unwrap();
+            mlx_gen::train::lora::adapter_optimizer_update(
+                &mut optimizer,
+                &mut params,
+                &gradient,
+                &config,
+                3,
+                17,
+            )
+            .unwrap();
+            mlx_gen::train::lora::adapter_optimizer_update(
+                &mut resumed_optimizer,
+                &mut restored,
+                &gradient,
+                &config,
+                3,
+                17,
+            )
+            .unwrap();
+            for (key, value) in &params {
+                assert_eq!(
+                    logical_f32_readback(value).unwrap(),
+                    logical_f32_readback(&restored[key]).unwrap(),
+                    "resumed optimizer update differs"
+                );
+            }
+            eprintln!("custom edit {network:?}: portable export");
             let path = root.path().join("trained.safetensors");
             let metadata = contract::metadata(MossImageVariant::Sft, contract::SAMPLER);
             let extra: Vec<_> = metadata
@@ -2205,6 +2273,7 @@ mod edit_fixture_tests {
                 NetworkType::Lokr => mlx_gen::runtime::AdapterKind::Lokr,
             };
             for strength in [0., 1., -1.] {
+                eprintln!("custom edit {network:?}: pinned custom load, strength={strength}");
                 let mut model = backbone(false);
                 let spec = mlx_gen::runtime::AdapterSpec::new(path.clone(), strength, kind);
                 let pin = mlx_gen::gen_core::PinnedWeightsFile::pin(&path).unwrap();
@@ -2216,6 +2285,7 @@ mod edit_fixture_tests {
                 )
                 .unwrap();
                 assert_eq!(reports[0].applied, 1);
+                eprintln!("custom edit {network:?}: edit prediction, strength={strength}");
                 model.install_edit(&edit_weights(), 2).unwrap();
                 let output = predict(&model, true);
                 assert!(output.iter().all(|value| value.is_finite()));

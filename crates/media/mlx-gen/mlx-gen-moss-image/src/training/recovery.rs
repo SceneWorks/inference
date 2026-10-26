@@ -51,7 +51,8 @@ pub(super) fn load_complete(
     let state = bundle::read(&path)?;
     state.validate(req, plan, identity)?;
     let (tensors, metadata) =
-        Array::load_safetensors_with_metadata(path.join("tensors.safetensors"))?;
+        mlx_gen::weights::load_safetensors_on_cpu(path.join("tensors.safetensors"))?;
+    mlx_rs::transforms::eval_pending_loads(tensors.values())?;
     if metadata.get("optimizer").map(String::as_str) != Some(opt.kind_tag()) {
         return Err(Error::Unsupported("MOSS optimizer kind differs".into()));
     }

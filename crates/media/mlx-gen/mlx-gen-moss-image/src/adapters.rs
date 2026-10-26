@@ -361,6 +361,8 @@ pub(crate) fn apply(
     let mut reports = Vec::new();
     for (spec, (groups, scale, metadata_alpha)) in specs.iter().zip(validated) {
         let weights = mlx_gen::weights::Weights::from_file(&spec.path)?;
+        // Consume CPU-only lazy file reads before finite checks or residual math enter Metal.
+        weights.materialize()?;
         for key in weights.keys() {
             finite(weights.require(key)?, &format!("source tensor {key}"))?;
         }

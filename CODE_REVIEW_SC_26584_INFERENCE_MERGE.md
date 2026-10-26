@@ -62,6 +62,47 @@ injection is still rejected by the real validator, checks independent custom/edi
 reports, DMD/custom composition, and failed-entry cleanup. The ignored learned
 Metal helper uses native adapter-loader reports directly, not sealed receipts.
 
+#### [F-287] P1: scoped GPU defaults create unsupported file-backed GPU loads
+
+Dedicated Metal run `40376234025` at `29a8043b` passed the prior edit oracles and
+then failed in the new learned adapter helper with `[Load::eval_gpu] Not
+implemented`, surfaced by mlx-rs `Array::item` (`array/mod.rs:310`). No backtrace
+was captured, so the exact failed tensor key is unknown.
+
+The source path is discriminating: the helper creates all training tensors from
+JSON-backed arrays and only writes files before calling production `apply_pinned`.
+That calls `Weights::from_file` and then `finite(...).item()`. The pinned mlx-rs
+default safetensors wrapper chooses `Stream::task_local_or_cpu()`, which prefers
+the helper's ambient GPU stream over CPU. Metal's `Load::eval_gpu` throws the
+observed error. This affects production GPU-scoped custom loading too, not just
+the test fixture. LoRA and LoKR share this loader. MOSS's frozen ordinary, DMD
+and edit package loaders instead copy authenticated owned buffers and do not
+construct file-backed `Load` primitives. Portable exports write existing tensors
+and create no file-backed loads.
+
+The same default wrapper was present in MOSS complete-factor recovery and the
+shared optimizer readers used by it, including AdamW's library state loader and
+Prodigy's scalar/moment reader. The batch places file-backed loads explicitly on
+CPU in shared single/shard loading and related checkpoint readers. Generic weight
+construction remains lazy; admitted MOSS adapter/recovery and optimizer consume
+boundaries drain pending file reads before GPU validation or transfer. This does
+not change the global device or default stream, source tokens, adapter arithmetic,
+recovery identities, serializer bytes or memory admission.
+
+The existing ignored Metal helper retains all edit assertions and now records
+phase labels, saves/reloads raw factors and optimizer state through these readers,
+and checks an exact resumed optimizer update before export/apply for both adapter
+methods. CPU-only regressions cover lazy single/shard file ingestion and nonempty
+optimizer-state serialization/restoration without executing an optimizer update
+or model graph. Actual GPU ingestion/resume remains for the dedicated Actions lane.
+
+Local F-287 verification: strict shared `mlx-gen` plus `mlx-gen-moss-image`
+all-targets/test-support Clippy passed. The exact CPU single/shard ingestion test
+passed (payloads remained lazy until explicit I/O consumption), and the exact
+CPU optimizer I/O test passed for nonempty AdamW/Prodigy state plus stateless Rose,
+with serialized tensors preserved across restore and no optimizer update executed.
+No local learned graph or GPU execution was used to verify this repair.
+
 ## Validation state
 
 After correcting F-286, strict combined all-targets/test-support Clippy passed for
