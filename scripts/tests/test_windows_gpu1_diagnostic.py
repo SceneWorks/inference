@@ -194,23 +194,21 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic_isolation_errors(self.workflow), [])
         self.assertGreater(len(self.workflow['jobs']), 15)
 
-    def test_isolation_detects_each_missing_sibling_guard(self):
+    def test_isolation_detects_each_removed_sibling_barrier(self):
         guard = "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')"
         for name, job in self.workflow['jobs'].items():
-            if name in (LANE, 'moss-edit-cuda'):
+            if name == LANE:
                 continue
             with self.subTest(job=name):
-                self.assertTrue(job['if'].startswith(guard))
+                condition = job['if']
+                selector = f"inputs.lanes == '{name}'"
+                # Exact positive selectors and negative sibling guards both isolate jobs.
+                self.assertTrue(condition.startswith(guard) or selector in condition, name)
+                condition = condition.removeprefix(guard).removeprefix(' && ')
+                condition = condition.replace(selector, f"inputs.lanes == '{LANE}'")
                 mutated = copy.deepcopy(self.workflow)
-                tail = job['if'][len(guard):].removeprefix(' && ')
-                if name == 'moss-edit-metal':
-                    # Exact manual selectors provide a second independent barrier.
-                    # Mutate both barriers to demonstrate actual diagnostic leakage.
-                    selector = f"inputs.lanes == '{name}'"
-                    self.assertIn(selector, tail)
-                    tail = tail.replace(selector, f"inputs.lanes == '{LANE}'")
-                mutated['jobs'][name]['if'] = tail or 'True'
-                self.assertNotEqual(diagnostic_isolation_errors(mutated), [])
+                mutated['jobs'][name]['if'] = condition or 'True'
+                self.assertNotEqual(diagnostic_isolation_errors(mutated), [], name)
 
     def test_h3_synthetic_selectors_never_run_broad_manual_lanes(self):
         for synthetic, lane, expected in (

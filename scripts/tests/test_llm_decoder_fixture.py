@@ -32,7 +32,11 @@ class DecoderRoutingTests(unittest.TestCase):
             self.assertTrue(names)
             self.assertEqual(len(names), len(set(names)))
             self.assertTrue(all(name.startswith("models::qwen35::tests::") for name in names))
-        self.assertEqual(set(decoder.DISPATCH_CHOICES), set(self.workflow()["on"]["workflow_dispatch"]["inputs"]["lanes"]["options"]))
+        declared = self.workflow()["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(set(declared), set(decoder.DISPATCH_INPUT_CHOICES))
+        for name, choices in decoder.DISPATCH_INPUT_CHOICES.items():
+            self.assertEqual(tuple(declared[name]["options"]), choices)
+            self.assertEqual(declared[name]["default"], choices[0])
 
     def test_mixed_or_unknown_dispatch_selectors_are_rejected_before_compilation(self):
         for choice in decoder.DISPATCH_CHOICES:
@@ -46,6 +50,19 @@ class DecoderRoutingTests(unittest.TestCase):
         ]:
             with self.subTest(event=event), self.assertRaisesRegex(UnitFailure, "selector|select"):
                 decoder.validate_dispatch("workflow_dispatch", event)
+        for lane in decoder.DISPATCH_CHOICES:
+            self.assertEqual(decoder.validate_dispatch("workflow_dispatch", {"inputs": {
+                "lanes": lane, "test_suite": "routine", "synthetic_w4a8": "none"}}), lane)
+        for suite in decoder.DISPATCH_INPUT_CHOICES["test_suite"]:
+            for synthetic in decoder.DISPATCH_INPUT_CHOICES["synthetic_w4a8"]:
+                for lane in ("all", "windows-cuda"):
+                    self.assertEqual(decoder.validate_dispatch("workflow_dispatch", {"inputs": {
+                        "lanes": lane, "test_suite": suite, "synthetic_w4a8": synthetic}}), lane)
+        for inputs in ({"test_suite": "unknown"}, {"synthetic_w4a8": ["mlx", "cuda"]},
+                       {"lanes": decoder.LANE, "synthetic_w4a8": "mlx"},
+                       {"lanes": "moss-cpu-fixture", "test_suite": "exhaustive"}):
+            with self.subTest(inputs=inputs), self.assertRaisesRegex(UnitFailure, "selector|select"):
+                decoder.validate_dispatch("workflow_dispatch", {"inputs": inputs})
         self.assertIsNone(decoder.validate_dispatch("pull_request", {"inputs": {"lanes": "invalid"}}))
 
     def test_only_narrow_hosted_rows_activate_and_guards_precede_toolchain(self):

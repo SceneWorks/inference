@@ -21,7 +21,10 @@ from scripts.ci import moss_fixture_cpu as shared
 from scripts.ci.moss_cuda_unit import UnitFailure, supervise
 
 LANE = "llm-decoder-fixture"
-DISPATCH_CHOICES = ("all", "windows-cuda", "moss-cuda-unit", "moss-cpu-fixture", "moss-metal-fixture", LANE)
+DISPATCH_CHOICES = ("all", "windows-cuda", "windows-gpu-diagnostic", "moss-edit-cuda", "moss-edit-metal",
+                    "moss-cuda-unit", "moss-cpu-fixture", "moss-metal-fixture", LANE)
+DISPATCH_INPUT_CHOICES = {"lanes": DISPATCH_CHOICES, "test_suite": ("routine", "exhaustive"),
+                          "synthetic_w4a8": ("none", "cuda", "mlx", "both")}
 IGNORE_REASON = "real model decoder execution; requires explicit manual CI lanes=llm-decoder-fixture"
 CASES = {
     "candle": (
@@ -41,11 +44,16 @@ def validate_dispatch(event_name: str, event: dict) -> str | None:
     if event_name != "workflow_dispatch":
         return None
     inputs = event.get("inputs", {})
-    if not isinstance(inputs, dict) or set(inputs) - {"lanes"}:
+    if not isinstance(inputs, dict) or set(inputs) - DISPATCH_INPUT_CHOICES.keys():
         raise UnitFailure("select only one lanes choice; unexpected/conflicting dispatch selectors")
+    for name, options in DISPATCH_INPUT_CHOICES.items():
+        value = inputs.get(name, options[0])
+        if not isinstance(value, str) or value not in options:
+            raise UnitFailure(f"select exactly one declared {name} choice; mixed or unknown selectors are forbidden")
     choice = inputs.get("lanes", "all")
-    if not isinstance(choice, str) or choice not in DISPATCH_CHOICES:
-        raise UnitFailure("select exactly one declared lanes choice; mixed or unknown selectors are forbidden")
+    if choice not in ("all", "windows-cuda") and (
+            inputs.get("test_suite", "routine") != "routine" or inputs.get("synthetic_w4a8", "none") != "none"):
+        raise UnitFailure("select only one dedicated profile; conflicting dispatch selectors")
     return choice
 
 

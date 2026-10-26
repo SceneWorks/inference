@@ -13,6 +13,7 @@ from unittest import mock
 import yaml
 from scripts.ci import moss_fixture_cpu as fixture
 from scripts.ci import moss_fixture_cpu_profile as profile
+from scripts.ci import llm_decoder_fixture as decoder
 from scripts.ci.moss_cuda_unit import UnitFailure
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -71,8 +72,8 @@ class HostedCpuRoutingTests(unittest.TestCase):
     def test_exact_manual_choice_and_only_two_fixed_hosted_rows(self):
         workflow = self.workflow()
         self.assertEqual(workflow["on"]["workflow_dispatch"]["inputs"]["lanes"]["options"],
-                         ["all", "windows-cuda", "moss-cuda-unit", "moss-cpu-fixture", "moss-metal-fixture", "llm-decoder-fixture"])
-        self.assertEqual(set(workflow["on"]["workflow_dispatch"]["inputs"]), {"lanes"})
+                         list(decoder.DISPATCH_CHOICES))
+        self.assertEqual(set(workflow["on"]["workflow_dispatch"]["inputs"]), set(decoder.DISPATCH_INPUT_CHOICES))
         job = workflow["jobs"]["moss-cpu-fixture"]
         self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cpu-fixture'")
         self.assertEqual(job["strategy"]["matrix"], {"include": [
@@ -153,22 +154,31 @@ class HostedCpuRoutingTests(unittest.TestCase):
             run = subprocess.run(["bash", "-c", gate], env=env, capture_output=True)
             self.assertEqual(run.returncode == 0, success)
 
-    def test_literal_story_push_assumption_and_changed_trigger_refusal(self):
+    def test_literal_story_push_transport_route_and_changed_trigger_refusal(self):
         proof = profile.push_route_proof()
-        self.assertFalse(proof["matches_push_trigger"])
+        self.assertTrue(proof["matches_push_trigger"])
+        self.assertEqual(proof["matching_workflows"], ["moss-transport-cpu.yml"])
         self.assertEqual(proof["literal_branch"], "story/sc-26588-moss-recovery")
         self.assertEqual(self.workflow()["on"]["push"], {"branches": ["main"], "tags": ["runtime-*"]})
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             destination = root / ".github/workflows"
             destination.mkdir(parents=True)
-            for name in ("ci.yml", "kv-poc-campaign.yml"):
+            for name in ("ci.yml", "kv-poc-campaign.yml", "moss-transport-cpu.yml"):
                 (destination / name).write_text((WORKFLOW.parent / name).read_text(encoding="utf-8"), encoding="utf-8")
-            self.assertFalse(profile.push_route_proof(root)["matches_push_trigger"])
+            self.assertTrue(profile.push_route_proof(root)["matches_push_trigger"])
             path = destination / "ci.yml"
             path.write_text(path.read_text(encoding="utf-8").replace("\n    branches: [main]", "\n    branches: ['**']", 1), encoding="utf-8")
             with self.assertRaisesRegex(UnitFailure, "re-admit"):
                 profile.push_route_proof(root)
+            path.write_bytes(WORKFLOW.read_bytes())
+            transport = destination / "moss-transport-cpu.yml"
+            original = transport.read_text(encoding="utf-8")
+            for changed in (original.replace("    paths:", "    paths-ignore:"),
+                            original.replace("      - scripts/ci/moss-native-terminal.ps1", "      - '**'")):
+                transport.write_text(changed, encoding="utf-8")
+                with self.assertRaisesRegex(UnitFailure, "re-admit"):
+                    profile.push_route_proof(root)
 
 
 class CpuReviewProtocolTests(unittest.TestCase):

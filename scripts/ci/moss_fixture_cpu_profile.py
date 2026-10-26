@@ -96,7 +96,7 @@ MLX_MEMORY = "crates/media/mlx-gen/mlx-gen-moss-image/src/training_memory.rs"
 
 
 def push_route_proof(root: Path = ROOT) -> dict:
-    """Fail closed if checked-in triggers invalidate the literal branch-only push assumption."""
+    """Recognize only the reviewed push roster; a story push can run transport checks."""
     proof = {}
     for path in sorted((root / ".github/workflows").glob("*.yml")):
         source = path.read_text(encoding="utf-8")
@@ -111,15 +111,21 @@ def push_route_proof(root: Path = ROOT) -> dict:
             expected = "\n    branches: [main]\n    tags: [\"runtime-*\"]"
         elif path.name == "kv-poc-campaign.yml":
             expected = '\n    branches: ["kv-poc-run/**"]'
+        elif path.name == "moss-transport-cpu.yml":
+            expected = ("\n    branches: ['**']\n    paths:"
+                        "\n      - .github/workflows/moss-transport-cpu.yml"
+                        "\n      - scripts/ci/moss-native-terminal.ps1")
         else:
             expected = None
         if (expected is None and pushes) or (expected is not None and pushes != [expected]):
             raise UnitFailure(f"push triggers changed; re-admit publication before proceeding: {path.name}")
         proof[path.name] = {"trigger_sha256": hashlib.sha256(trigger.encode()).hexdigest(),
                             "push_trigger": pushes or None}
-    if "ci.yml" not in proof or "kv-poc-campaign.yml" not in proof:
+    if not {"ci.yml", "kv-poc-campaign.yml", "moss-transport-cpu.yml"} <= proof.keys():
         raise UnitFailure("expected push workflow disappeared")
-    return {"literal_branch": "story/sc-26588-moss-recovery", "matches_push_trigger": False,
+    return {"literal_branch": "story/sc-26588-moss-recovery", "matches_push_trigger": True,
+            "matching_workflows": ["moss-transport-cpu.yml"],
+            "path_requirement": "transport workflow or scripts/ci/moss-native-terminal.ps1 must change",
             "scope": "checked-in repository workflows, not external integrations", "workflows": proof}
 
 

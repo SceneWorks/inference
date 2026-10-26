@@ -280,22 +280,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('MOSS_CUDA_ADMISSION', run.get('env', {}))
         self.assertNotIn('${{ inputs.moss_cuda_admission }}', commands)
 
-    def test_new_selector_isolates_job_with_explicit_sibling_guards(self):
+    def test_new_selector_isolates_job_with_semantic_sibling_barriers(self):
         from scripts.tests.test_windows_gpu1_diagnostic import selected_jobs
         workflow = yaml.safe_load((gate.ROOT/'.github/workflows/ci.yml').read_text(encoding='utf-8'))
         for selected in (True, False):
             for fork in (True, False):
                 for tag in (True, False):
-                    self.assertEqual(selected_jobs(workflow, 'workflow_dispatch', 'moss-edit-cuda', selected=selected, fork=fork, tag=tag), {'moss-edit-cuda'})
+                    for synthetic in ('none', 'cuda', 'mlx', 'both'):
+                        self.assertEqual(selected_jobs(workflow, 'workflow_dispatch', 'moss-edit-cuda', selected=selected, fork=fork, tag=tag, synthetic=synthetic), {'moss-edit-cuda'})
         for event in ('push', 'pull_request', 'schedule', 'merge_group'):
             self.assertNotIn('moss-edit-cuda', selected_jobs(workflow, event, 'moss-edit-cuda'))
         for lane in ('all', 'windows-cuda', 'windows-gpu-diagnostic', 'moss-edit-cuda-extra'):
             self.assertNotIn('moss-edit-cuda', selected_jobs(workflow, 'workflow_dispatch', lane))
         guard = "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda')"
         for name, job in workflow['jobs'].items():
-            if name in ('moss-edit-cuda', 'windows-gpu-diagnostic'):
+            if name == 'moss-edit-cuda':
                 continue
-            self.assertIn(guard, job['if'], name)
+            condition = job['if']
+            selector = f"inputs.lanes == '{name}'"
+            self.assertTrue(guard in condition or selector in condition, name)
+            condition = condition.replace(guard + ' && ', '').replace(guard, 'True')
+            condition = condition.replace(selector, "inputs.lanes == 'moss-edit-cuda'")
+            mutant = copy.deepcopy(workflow)
+            mutant['jobs'][name]['if'] = condition
+            self.assertTrue(any(name in selected_jobs(mutant, 'workflow_dispatch', 'moss-edit-cuda', synthetic=synthetic, tag=tag)
+                                for synthetic in ('none', 'cuda', 'mlx', 'both') for tag in (False, True)), name)
         mutant = copy.deepcopy(workflow)
         mutant['jobs']['moss-edit-cuda']['if'] = mutant['jobs']['moss-edit-cuda']['if'].replace("inputs.lanes == 'moss-edit-cuda'", 'True')
         self.assertIn('moss-edit-cuda', selected_jobs(mutant, 'workflow_dispatch', 'windows-gpu-diagnostic'))

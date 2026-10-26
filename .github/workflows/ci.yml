@@ -1038,26 +1038,8 @@ jobs:
           fi
           echo "Testing: $args"
           python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test --locked --lib --tests "${packages[@]}"
-      - name: Check H3 precise pruned projection on hosted Metal (manual)
-        if: github.event_name == 'workflow_dispatch' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both')
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-pruned-hosted-metal.log"
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 1
-          grep -Fxq "pruned_adaln::native_pruned_adaln_matches_pinned_reference: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test pruned_adaln::native_pruned_adaln_matches_pinned_reference ..." "$log"
-          grep -Fq "H3_PRUNED_ORACLE_DEVICE" "$log"
-          grep -Fq "H3_PRUNED_ORACLE block 0 modulation: max_abs=" "$log"
-      # H3 complete-model/model-stack tests are `#[ignore]`d on both backends: ordinary PR/main
-      # CI compiles them but never executes a complete DiT, block stack, or native projection.
-      # Device suites and the hosted precision margin above run only on explicit workflow_dispatch.
-      # Every such step has positive exact count/name guards; no ignored H3 model step may run
-      # on an ordinary PR/main event.
+      # H3 learned projection/model proofs run only in the dedicated manual
+      # synthetic-w4a8-mlx job below; ordinary CI only compiles ignored cases.
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -1452,6 +1434,8 @@ jobs:
           grep -Fq "test pruned_adaln::full_model_live_coordinates_match_cache_and_refuse_foreign_basis ..." "$log"
           grep -Fq "test pruned_adaln::full_model_detects_pruned_and_checks_pruning_identity ..." "$log"
           grep -Fq "test pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control ..." "$log"
+          grep -Fq "H3_PRUNED_ORACLE_DEVICE" "$log"
+          grep -Fq "H3_PRUNED_ORACLE block 0 modulation: max_abs=" "$log"
           grep -Fq "H3_GEOMETRY_AUDIO_FULL_FORWARD backend=metal cases=11" "$log"
       - name: Prove H3 turbo adapter fold complete model on Metal
         env:
