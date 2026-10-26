@@ -47,7 +47,8 @@ OPTIMIZED_REPEATS = 2
 # Mirrors evidence::ANCHOR_MARGIN_FLOOR_BYTES: the low-end margin's floor.
 ANCHOR_MARGIN_FLOOR_BYTES = 32 << 20
 # Structural observation bounds mirror evidence::{MAX_SAMPLING_MARKS,MAX_SAMPLING_FIELDS}.
-SAMPLING_MARKS_MAX = 1024
+# Base marks + three native retirement marks per quantum check + three root marks.
+SAMPLING_MARKS_MAX = 1024 + 3 * 4096 + 3
 SAMPLING_FIELDS_MAX = 64
 SAMPLING_NAME_BYTES_MAX = 128
 STATUSES = {"successful", "admitted_refused", "diagnostic_success", "diagnostic_failure", "capture_refused", "skipped"}

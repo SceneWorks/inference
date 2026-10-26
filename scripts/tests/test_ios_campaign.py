@@ -616,6 +616,18 @@ class CampaignTests(unittest.TestCase):
                 "counts": {"curated": {"solver_primary": 1, "solve_complete": 1}, "ios_capture": {"conditioning-roles": 1}},
                 "total_marks": 3, "dropped_marks": 0, "malformed_marks": 0, "truncated": False}
 
+    def test_capture_accepts_native_sampling_mark_bound_without_accepting_overflow(self):
+        # evidence.rs MAX_SAMPLING_MARKS = 1024 base + 3 * 4096 native checks + 3 roots.
+        self.assertEqual(campaign.SAMPLING_MARKS_MAX, 13315)
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        for count in (1880, 13315, 13316):
+            coverage = self.observed_fixture()
+            coverage["marks"] += [coverage["marks"][0]] * (count - 3)
+            coverage["counts"]["curated"]["solver_primary"] = count - 2
+            coverage["total_marks"] = count
+            row["sampling_coverage"] = coverage
+            self.assertEqual(campaign.capture_of(row) is not None, count <= 13315, count)
+
     def test_anchor_import_preserves_complete_sampling_recipe_and_execution_identity(self):
         recipe = {"version": 1, "sampler": "euler", "scheduler": "normal", "steps": 3,
                   "guidance": 7.0, "guidance_method": "cfg", "cfg_batching": "batched",
