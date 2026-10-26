@@ -84,7 +84,8 @@ fn numerical_oracle_rejects_nan_truncation_and_shape_mismatch_sc26325() {
 #[test]
 fn descriptors_keep_acceleration_explicit() {
     for descriptor in [descriptor_base(), descriptor_sft()] {
-        assert!(!descriptor.capabilities.supports_lora);
+        assert!(descriptor.capabilities.supports_lora);
+        assert!(descriptor.capabilities.supports_lokr);
         assert!(descriptor.capabilities.supports_prompt_batch);
     }
     let request = GenerationRequest {
@@ -100,6 +101,7 @@ fn descriptors_keep_acceleration_explicit() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn exact_author_graph_fp32_bf16_and_ragged_masks() {
     let d = fixture("fixture.json");
     let g = geometry(&d);
@@ -144,6 +146,7 @@ fn exact_author_graph_fp32_bf16_and_ragged_masks() {
     }
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn exact_author_leaf_functions() {
     let d = fixture("fixture.json");
     let l = &d["leaf_ops"];
@@ -209,6 +212,7 @@ fn same_owned_buffer_auth_rejects_substitution_even_while_original_pin_is_stable
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn exact_unmerged_fp32_residual_and_fixed_noise_recurrence() {
     let d = fixture("dmd_fixture.json");
     let base = weights(&d["base_weights"], DType::BF16);
@@ -282,6 +286,7 @@ fn exact_unmerged_fp32_residual_and_fixed_noise_recurrence() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn mask_and_cancellation_refuse_before_blocks() {
     let d = fixture("fixture.json");
     let model = Transformer::load(&weights(&d["weights"], DType::F32), geometry(&d), None).unwrap();
@@ -299,9 +304,9 @@ fn mask_and_cancellation_refuse_before_blocks() {
 }
 
 pub(crate) fn synthetic_sources() -> Sources {
-    Sources{selection:Some(MossImageAcceleration::Off),ordinary:vec![],mixed:None,full:None,headers:BTreeMap::new(),config:MossImageConfig::default(),
+    Sources{variant:MossImageVariant::Sft,adapter_pins:vec![],selection:Some(MossImageAcceleration::Off),ordinary:vec![],mixed:None,full:None,headers:BTreeMap::new(),config:MossImageConfig::default(),
         text_config:candle_llm::models::qwen35::Qwen35Config::from_json(&serde_json::json!({"hidden_size":4096,"num_hidden_layers":2,"intermediate_size":24,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":32,"linear_num_value_heads":2,"linear_num_key_heads":1,"linear_key_head_dim":8,"linear_value_head_dim":8})).unwrap(),
-        tokenizer:{let path=std::env::current_exe().unwrap();loader::Asset{pin:PinnedWeightsFile::pin(path).unwrap(),role:MossImageAssetRole::Tokenizer,repo:SFT_REPO,revision:SFT_REVISION,relative:"tokenizer/tokenizer.json".into()}},
+        tokenizer:{let path=std::env::current_exe().unwrap();loader::Asset{#[cfg(feature="test-support")] fixture_digest:None,pin:PinnedWeightsFile::pin(path).unwrap(),role:MossImageAssetRole::Tokenizer,repo:SFT_REPO,revision:SFT_REVISION,relative:"tokenizer/tokenizer.json".into()}},
         spec:LoadSpec::new(WeightsSource::Dir("synthetic-unloaded-only".into()))}
 }
 fn synthetic_generator() -> MossImageGenerator {
@@ -432,6 +437,7 @@ fn supplied_embeddings_compact_noncontiguous_masks_and_hash_exact_inputs() {
     assert_eq!(&actual[4096..], &values[8192..12288]);
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn supplied_fp32_conditioning_preserves_precision_until_selected_projection_sc26324() {
     // sc-26324 (F-276): the same ingestion path runs on CUDA and CPU. Deliberately
     // non-BF16 values plus a ragged mask expose narrowing before a full-FP32 consumer.
@@ -582,6 +588,8 @@ fn dmd_header_validation_checks_finite_values_coverage_dtype_and_mutation() {
     };
     save(1.0);
     let mut a = loader::Asset {
+        #[cfg(feature = "test-support")]
+        fixture_digest: None,
         pin: PinnedWeightsFile::pin(&p).unwrap(),
         role: MossImageAssetRole::DmdTime,
         repo: DMD_REPO,
@@ -636,6 +644,7 @@ fn architecture_facts_and_structural_cost_scale_batch_context_and_guidance() {
         .all(|s| s.support == MemoryStrategySupport::Missing));
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn renderer_off_on_off_never_reuses_modified_backbone() {
     let ordinary = fixture("fixture.json");
     let g = geometry(&ordinary);
@@ -647,6 +656,7 @@ fn renderer_off_on_off_never_reuses_modified_backbone() {
             transformer: Transformer::load(&weights(&ordinary["weights"], dtype), g, None).unwrap(),
             dataspace: None,
             adapter_reports: vec![],
+            dmd_report: None,
         })
     };
     state
@@ -679,6 +689,7 @@ fn renderer_off_on_off_never_reuses_modified_backbone() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn warm_admission_credits_only_actual_provider_weights() {
     let d = fixture("fixture.json");
     let generator = synthetic_generator();
@@ -692,6 +703,7 @@ fn warm_admission_credits_only_actual_provider_weights() {
         transformer: model,
         dataspace: None,
         adapter_reports: vec![],
+        dmd_report: None,
     });
     let request = GenerationRequest::default();
     let peak = generator
@@ -723,6 +735,7 @@ fn warm_admission_credits_only_actual_provider_weights() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn ordinary_sampler_executes_cfg_zero_one_slg_interval_skips_and_expanded_batch() {
     let d = fixture("fixture.json");
     let renderer = pipeline::Renderer {
@@ -731,6 +744,7 @@ fn ordinary_sampler_executes_cfg_zero_one_slg_interval_skips_and_expanded_batch(
             .unwrap(),
         dataspace: None,
         adapter_reports: vec![],
+        dmd_report: None,
     };
     let c = tensor(&d["inputs"]["encoder_hidden_states"], DType::F32);
     let rows = vec![
@@ -850,6 +864,7 @@ fn ordinary_sampler_executes_cfg_zero_one_slg_interval_skips_and_expanded_batch(
     }
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn sampler_seed_receipts_progress_cancel_and_warm_reentry_are_actual() {
     let d = fixture("fixture.json");
     let renderer = pipeline::Renderer {
@@ -858,6 +873,7 @@ fn sampler_seed_receipts_progress_cancel_and_warm_reentry_are_actual() {
             .unwrap(),
         dataspace: None,
         adapter_reports: vec![],
+        dmd_report: None,
     };
     let c = tensor(&d["inputs"]["encoder_hidden_states"], DType::F32)
         .narrow(0, 0, 1)
@@ -935,6 +951,8 @@ fn selected_pin_authentication_ignores_unconsumed_optional_pin_mutation_sc26325(
     assert_eq!(selected.authenticated_bytes().unwrap(), source);
 }
 
+mod training_contract_tests;
+
 #[test]
 fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
     let generator = synthetic_generator();
@@ -967,6 +985,7 @@ fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
             transformer: model,
             dataspace: None,
             adapter_reports: vec![],
+            dmd_report: None,
         });
     }
     assert!(generator.moss_image_owned_weight_bytes().unwrap() > 0);
@@ -1022,6 +1041,11 @@ fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
 fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
     let mut base = synthetic_report().data().clone();
     base.resolved.uncond_skip_layers.clear();
+    let custom_report = AdapterApplyReport {
+        adapter_path: "trained-custom.safetensors".into(),
+        applied: 1,
+        skipped: vec![],
+    };
     let mut report = MossImageEditExecutionReport {
         base: MossImageExecutionReport::new(base).unwrap(),
         adapter_path: "synthetic-only".into(),
@@ -1059,6 +1083,67 @@ fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
     report.references.reverse();
     report.validate().unwrap();
     assert_eq!(report.references[0], slots[3]);
+    let generator = synthetic_generator();
+    // A valid sealed ordinary receipt remains empty even with custom provider reports.
+    assert!(report.base.data().adapter_reports.is_empty());
+    let mut invalid_base = report.base.data().clone();
+    invalid_base.adapter_reports.push(custom_report.clone());
+    assert!(MossImageExecutionReport::new(invalid_base).is_err());
+    {
+        let mut state = candle_gen::lock_recover(&generator.state);
+        state.report = Some(report.base.clone());
+        state.apply_reports = pipeline::application_reports(None, vec![custom_report.clone()]);
+    }
+    assert_eq!(
+        generator.adapter_apply_reports(),
+        vec![custom_report.clone()]
+    );
+    let dmd = AdapterApplyReport {
+        adapter_path: "published-dmd.safetensors".into(),
+        applied: 252,
+        skipped: vec![],
+    };
+    assert_eq!(
+        pipeline::application_reports(Some(&dmd), vec![custom_report.clone()]),
+        vec![dmd, custom_report.clone()],
+        "unmerged DMD and custom applications must appear once each"
+    );
+    {
+        let mut state = candle_gen::lock_recover(&generator.state);
+        state.report = None;
+        state.edit_report = Some(report.clone());
+        state.apply_reports = vec![
+            custom_report.clone(),
+            AdapterApplyReport {
+                adapter_path: report.adapter_path.clone(),
+                applied: report.applied_projections,
+                skipped: vec![],
+            },
+        ];
+    }
+    assert_eq!(
+        generator.adapter_apply_reports(),
+        vec![
+            custom_report,
+            AdapterApplyReport {
+                adapter_path: report.adapter_path.clone(),
+                applied: report.applied_projections,
+                skipped: vec![],
+            }
+        ],
+        "edit application reports must retain the custom adapter stack"
+    );
+    // A failed subsequent entry cannot expose the previous completed application stack.
+    assert!(generator
+        .generate(
+            &GenerationRequest {
+                width: 17,
+                ..Default::default()
+            },
+            &mut |_| {}
+        )
+        .is_err());
+    assert!(generator.adapter_apply_reports().is_empty());
     report.references.push(slots[0].clone());
     assert!(report.validate().is_err());
     assert!(serde_json::from_value::<MossImageEditExecutionReport>(

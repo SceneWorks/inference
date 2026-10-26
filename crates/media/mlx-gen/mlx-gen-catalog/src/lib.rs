@@ -1992,6 +1992,8 @@ mod tests {
                 "ltx_2_3",
                 "ltx_2_5",
                 "mage_flow_base",
+                "moss_image_base",
+                "moss_image_sft",
                 "qwen_image_2_1",
                 "sd3_5_large",
                 "sd3_5_medium",

@@ -111,10 +111,15 @@ class PublishedFixturePidTests(unittest.TestCase):
     def test_reaping_assertions_use_only_the_validated_invocation_snapshot(self):
         case = WindowsSupervisorTests()
         case.root, case.sampled = Path("fixture"), [1]
+        case.data = {"deadlineSeconds": 3}
         case._has_exited = lambda pid: pid == 1234
         observed = []
         case._assert_exited = observed.append
         def run(script, *, on_spawn, clock):
+            # Simulate the real Probe's real-clock membership sampling: the supervisor observed the
+            # live grandchild as owned (the root is already gone) before the deadline fired.
+            case.supervision_start = 0.0
+            case.membership_samples = [(1.0, {5678})]
             on_spawn(1234, None)
             raise safety.SupervisionError("deadline", "fixture deadline")
         case._run = run
@@ -1484,6 +1489,8 @@ class WindowsSupervisorTests(unittest.TestCase):
             "gpuFreeReserveBytes": 1024, "childGpuCapBytes": 1024**2,
         }
         self.sampled = []
+        self.membership_samples = []
+        self.supervision_start = None
 
     def test_native_host_probe_and_trusted_cuda_probe_path(self):
         from scripts import media_campaign_windows as windows
@@ -1498,6 +1505,11 @@ class WindowsSupervisorTests(unittest.TestCase):
         path.write_text(json.dumps(policy_data), encoding="utf-8")
         policy = safety.load_policy(path)
         parent = self
+        def observed_real_clock():
+            now = time.monotonic()  # Observe, never pause/advance/substitute the real deadline clock.
+            if parent.supervision_start is None:
+                parent.supervision_start = now
+            return now
         class Probe:
             def host_free(self):
                 return 10**12
@@ -1508,6 +1520,8 @@ class WindowsSupervisorTests(unittest.TestCase):
             def tree_footprint(self, owner):
                 amount = owner.footprint_bytes()
                 parent.sampled.append(amount)
+                members = owner.members()
+                parent.membership_samples.append((observed_real_clock(), members))
                 return amount
             def gpu_free_and_tree_bytes(self, owner):
                 # GPU collection is separately fixture-tested; these children never touch CUDA.
@@ -1588,6 +1602,9 @@ class WindowsSupervisorTests(unittest.TestCase):
         )
         clock = FixtureDeadlineClock()
         ready_pids = None
+        # Membership observation is per attempt: each repeated run gets its own real-clock start.
+        self.membership_samples = []
+        self.supervision_start = None
         def fixture_ready(pid, _pgid):
             def ready():
                 nonlocal ready_pids
@@ -1608,6 +1625,16 @@ class WindowsSupervisorTests(unittest.TestCase):
         self.assertIsNotNone(clock.ready_at)
         self.assertTrue(any(amount > 0 for amount in self.sampled))
         self.assertIsNotNone(ready_pids)
+        root_pid, grandchild_pid = ready_pids
+        # The epic's ownership proof: the supervisor must have observed the live grandchild as
+        # owned while the root was already gone, and before the deadline fired.
+        self.assertIsNotNone(self.supervision_start)
+        self.assertTrue(
+            any(grandchild_pid in members and root_pid not in members
+                and at < self.supervision_start + self.data["deadlineSeconds"]
+                for at, members in self.membership_samples),
+            "deadline test never observed an owned live grandchild after root exit and before the deadline",
+        )
         for pid in ready_pids:
             self._assert_exited(pid)
 

@@ -52,6 +52,7 @@ pub mod memory_strategy;
 pub mod moss_image;
 mod moss_image_assets;
 pub mod moss_image_edit;
+pub mod moss_image_training;
 pub mod pruned_adaln;
 pub mod pth;
 pub mod registry;
@@ -294,11 +295,11 @@ pub use ::core_llm;
 // NOTE: `TrainOptimizer` is intentionally NOT re-exported here — it wraps an mlx-rs optimizer and
 // lives in mlx-gen (`mlx_gen::train::optim`). `LrSchedule` is pure policy and lives here.
 pub use train::{
-    AuxLossSchedule, BodyLossesConfig, BucketSchedule, DepthAnchoringConfig, DepthModelSize,
-    FaceLandmarkLossConfig, IdentityLossConfig, IdentityReferenceMode, LatentLpipsConfig,
-    LatentLpipsFamily, LrSchedule, NetworkType, ResolutionBucket, SubjectMaskLoss, Trainer,
-    TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress,
-    TrainingRequest, TrainingTechniques, VaeAnchorConfig, BODY_SURFACE_SCHEDULE,
+    AspectRatioBucket, AuxLossSchedule, BodyLossesConfig, BucketSchedule, DepthAnchoringConfig,
+    DepthModelSize, FaceLandmarkLossConfig, IdentityLossConfig, IdentityReferenceMode,
+    LatentLpipsConfig, LatentLpipsFamily, LrSchedule, NetworkType, ResolutionBucket,
+    SubjectMaskLoss, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput,
+    TrainingProgress, TrainingRequest, TrainingTechniques, VaeAnchorConfig, BODY_SURFACE_SCHEDULE,
     LATENT_PERCEPTUAL_SCHEDULE, MAX_RESOLUTION_BUCKETS, PIXEL_PERCEPTUAL_SCHEDULE,
     RESOLUTION_BUCKET_STRIDE,
 };

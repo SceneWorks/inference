@@ -9,12 +9,51 @@ use mlx_gen::{CancelFlag, Error, Result};
 use mlx_llm::models::qwen35::{Qwen35Config, Qwen35Model};
 use mlx_rs::Array;
 use sha2::{Digest, Sha256};
+fn tokenizer(s: &Sources) -> Result<TextTokenizer> {
+    let json = String::from_utf8(s.find("tokenizer/tokenizer.json")?.bytes()?)
+        .map_err(|e| Error::Msg(e.to_string()))?;
+    let tokenizer = TextTokenizer::from_json_str(
+        &json,
+        TokenizerConfig {
+            chat_template: ChatTemplate::MossImageQwen35,
+            max_length: 4096,
+            pad_token_id: 0,
+            pad_to_max_length: false,
+        },
+    )?;
+    Ok(tokenizer)
+}
+pub(crate) fn token_bound(
+    sources: &Sources,
+    req: &mlx_gen::TrainingRequest,
+    host_budget: u64,
+) -> Result<u64> {
+    mlx_gen::gen_core::moss_image_training::recovery::admit_conditioning_preprocess(
+        req,
+        host_budget,
+        0,
+    )?;
+    let tokenizer = tokenizer(sources)?;
+    let mut bound = 0usize;
+    for prompt in mlx_gen::gen_core::moss_image_training::recovery::conditioning_prompts_iter(req) {
+        crate::transformer::check(&req.cancel)?;
+        bound = bound.max(tokenizer.encode_chat_ids(&prompt, false)?.len().min(4096));
+    }
+    if bound == 0 {
+        return Err(Error::Msg("MOSS captions produce no tokens".into()));
+    }
+    Ok(bound as u64)
+}
 pub(crate) struct Encoder {
     model: Qwen35Model,
     tokenizer: TextTokenizer,
     owned_weight_bytes: u64,
 }
 impl Encoder {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn frozen_training_arrays(&self) -> Vec<Array> {
+        self.model.param_groups().into_iter().flatten().collect()
+    }
     pub(crate) fn load(s: &Sources, cancel: &CancelFlag) -> Result<Self> {
         let config = Qwen35Config::from_json(&s.find("text_encoder/config.json")?.json()?)
             .map_err(|e| Error::Msg(e.to_string()))?;
@@ -38,17 +77,7 @@ impl Encoder {
                 weights.unused_keys()
             )));
         }
-        let json = String::from_utf8(s.find("tokenizer/tokenizer.json")?.bytes()?)
-            .map_err(|e| Error::Msg(e.to_string()))?;
-        let tokenizer = TextTokenizer::from_json_str(
-            &json,
-            TokenizerConfig {
-                chat_template: ChatTemplate::MossImageQwen35,
-                max_length: 4096,
-                pad_token_id: 0,
-                pad_to_max_length: false,
-            },
-        )?;
+        let tokenizer = tokenizer(s)?;
         let mut owned_weight_bytes = 0u64;
         for array in model.param_groups().into_iter().flatten() {
             crate::transformer::check(cancel)?;

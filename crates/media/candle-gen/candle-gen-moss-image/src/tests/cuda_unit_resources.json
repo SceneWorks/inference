@@ -1,0 +1,19 @@
+{
+  "author_fixture_root": "../../../contracts/gen-core/tests/fixtures/moss_image/tiny_author",
+  "batch": 1,
+  "rank": 3,
+  "decompose_factor": 2,
+  "target_modules": [
+    "q",
+    "ffn_up_gate",
+    "ffn_down"
+  ],
+  "accounting": {
+    "intermediates_per_block": 64,
+    "retained_passes": 8,
+    "value_adjoint_slots": 8,
+    "case_cache_allowance": 8,
+    "persistent_copies": 8,
+    "vendor_reserve_bytes": 1073741824
+  }
+}

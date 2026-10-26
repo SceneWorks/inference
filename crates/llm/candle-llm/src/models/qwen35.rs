@@ -2335,6 +2335,78 @@ impl Qwen35Model {
         census
     }
 
+    /// Shallow handles to the actual loaded dense headless tensors for development-only
+    /// frozen-encoder audits. No payload clones or device probes; packed/MoE paths refuse.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn frozen_training_tensors(&self) -> Result<Vec<Tensor>> {
+        fn projection(p: &Projection, values: &mut Vec<Tensor>) -> Result<()> {
+            match p {
+                Projection::Dense(linear) => {
+                    values.push(linear.weight().clone());
+                    values.extend(linear.bias().cloned());
+                    Ok(())
+                }
+                _ => Err(Error::Msg(
+                    "frozen dense encoder audit cannot inspect a packed projection".into(),
+                )),
+            }
+        }
+        let mut values = vec![self.norm.clone()];
+        match &self.embed_tokens {
+            QwenEmbedding::Dense(t) => values.push(t.clone()),
+            _ => {
+                return Err(Error::Msg(
+                    "frozen encoder audit requires dense embeddings".into(),
+                ))
+            }
+        }
+        if let Some(head) = &self.lm_head {
+            projection(head, &mut values)?;
+        }
+        for layer in &self.layers {
+            values.extend([layer.input_ln.clone(), layer.post_ln.clone()]);
+            match &layer.mixer {
+                Mixer::Attn(a) => {
+                    for p in [&a.q_proj, &a.k_proj, &a.v_proj, &a.o_proj] {
+                        projection(p, &mut values)?;
+                    }
+                    values.extend([a.q_norm.clone(), a.k_norm.clone()]);
+                }
+                Mixer::Delta(d) => {
+                    for p in [
+                        &d.in_proj_qkv,
+                        &d.in_proj_z,
+                        &d.in_proj_a,
+                        &d.in_proj_b,
+                        &d.out_proj,
+                    ] {
+                        projection(p, &mut values)?;
+                    }
+                    values.extend([
+                        d.conv_weight.clone(),
+                        d.a_log.clone(),
+                        d.dt_bias.clone(),
+                        d.norm_weight.clone(),
+                    ]);
+                }
+            }
+            match &layer.ffn {
+                Ffn::Dense(m) => {
+                    for p in [&m.gate, &m.up, &m.down] {
+                        projection(p, &mut values)?;
+                    }
+                }
+                _ => {
+                    return Err(Error::Msg(
+                        "frozen MOSS encoder audit requires dense FFN".into(),
+                    ))
+                }
+            }
+        }
+        Ok(values)
+    }
+
     /// Whether the large projections were quantized on load.
     pub fn is_quantized(&self) -> bool {
         self.quantized
@@ -3932,6 +4004,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "real model decoder execution; requires explicit manual CI lanes=llm-decoder-fixture"]
     fn headless_decoder_preserves_normalized_hidden_and_hybrid_cache() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         // Frozen text encoders may wrap the decoder under language_model.model or language_model.
@@ -3975,6 +4048,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "real model decoder execution; requires explicit manual CI lanes=llm-decoder-fixture"]
     fn headless_checked_callback_cancels_between_layers_and_resets_cache() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let weights = synthetic_weights_with_prefix(&cfg, "language_model");

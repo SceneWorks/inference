@@ -1,11 +1,17 @@
 //! Native MOSS-Image Base/SFT, including both explicit published DMD precision policies.
 //! Caller-provisioned exact assets only. No acquisition or Python production execution.
+mod adapters;
 mod edit;
 mod loader;
 pub mod memory_strategy;
 mod pipeline;
 mod release;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 mod text_encoder;
+pub mod training;
+mod training_memory;
 mod transformer;
 
 /// The exact canvas grid of the frozen packed-latent model.
@@ -27,6 +33,7 @@ struct State {
     vae: Option<Flux2Vae>,
     report: Option<MossImageExecutionReport>,
     edit_report: Option<MossImageEditExecutionReport>,
+    apply_reports: Vec<AdapterApplyReport>,
 }
 impl State {
     fn release_for_request(
@@ -77,6 +84,13 @@ impl MossImageGenerator {
         device: Device,
     ) -> gen_core::Result<Self> {
         let sources = Sources::new(variant, spec)?;
+        Self::from_sources(variant, sources, device)
+    }
+    pub(crate) fn from_sources(
+        variant: MossImageVariant,
+        sources: Sources,
+        device: Device,
+    ) -> gen_core::Result<Self> {
         let contract = memory_strategy::contract_sources(variant, &sources)?;
         Ok(Self {
             descriptor: descriptor(variant),
@@ -164,6 +178,7 @@ impl MossImageGenerator {
         if cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
+        self.sources.ensure_unchanged()?;
         if self.sources.selection == Some(mode) {
             Ok(std::borrow::Cow::Borrowed(&self.sources))
         } else {
@@ -198,6 +213,7 @@ impl MossImageGenerator {
         let mut state = candle_gen::lock_recover(&self.state);
         state.report = None;
         state.edit_report = None;
+        state.apply_reports.clear();
         let admission = candle_gen::lock_recover(&self.admission).take();
         let result = (|| {
             let normalized;
@@ -221,6 +237,7 @@ impl MossImageGenerator {
             if result.is_err() || sync.is_err() {
                 state.report = None;
                 state.edit_report = None;
+                state.apply_reports.clear();
             }
             sync.map_err(candle_gen::CandleError::from)?;
         }
@@ -394,12 +411,22 @@ impl MossImageGenerator {
                 on_progress,
             )?
         };
-        let adapter_reports = state
+        let mut apply_reports = state
             .renderer
             .as_ref()
             .expect("renderer loaded")
             .adapter_reports
             .clone();
+        // The sealed source receipt describes only the published unmerged DMD stack.
+        // User-trained adapters are reported separately through the provider completion API.
+        let adapter_reports = state
+            .renderer
+            .as_ref()
+            .expect("renderer loaded")
+            .dmd_report
+            .clone()
+            .into_iter()
+            .collect();
         if staged {
             release_then_sync(state.renderer.take(), || self.device.synchronize())
                 .map_err(candle_gen::CandleError::from)?;
@@ -438,6 +465,13 @@ impl MossImageGenerator {
             .synchronize()
             .map_err(candle_gen::CandleError::from)?;
         transformer::check_cancel(&req.cancel)?;
+        #[cfg(feature = "test-support")]
+        if self.sources.is_fixture() {
+            // Synthetic CPU fixtures execute the actual graph but cannot attest published assets.
+            state.report = None;
+            state.apply_reports = apply_reports;
+            return Ok(output);
+        }
         let conditioning = positive
             .receipts
             .into_iter()
@@ -491,10 +525,16 @@ impl MossImageGenerator {
             };
             receipt.validate()?;
             transformer::check_cancel(&req.cancel)?;
+            apply_reports.push(AdapterApplyReport {
+                adapter_path: receipt.adapter_path.clone(),
+                applied: receipt.applied_projections,
+                skipped: vec![],
+            });
             state.edit_report = Some(receipt);
         } else {
             state.report = Some(report);
         }
+        state.apply_reports = apply_reports;
         Ok(output)
     }
 }
@@ -540,15 +580,7 @@ impl Generator for MossImageGenerator {
             .and_then(|state| self.cached_resident_bytes(&state).ok())
     }
     fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
-        if let Some(edit) = self.moss_image_edit_execution_report() {
-            return vec![AdapterApplyReport {
-                adapter_path: edit.adapter_path,
-                applied: edit.applied_projections,
-                skipped: vec![],
-            }];
-        }
-        self.moss_image_execution_report()
-            .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
+        candle_gen::lock_recover(&self.state).apply_reports.clone()
     }
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
         Some(&self.contract)
@@ -658,6 +690,8 @@ fn descriptor(v: MossImageVariant) -> ModelDescriptor {
             &[]
         },
         capabilities: Capabilities {
+            supports_lora: true,
+            supports_lokr: true,
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_prompt_batch: true,
@@ -724,6 +758,8 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     registry
         .register_generator(BASE_REGISTRATION)
         .register_generator(SFT_REGISTRATION)
+        .register_trainer(training::BASE_REGISTRATION)
+        .register_trainer(training::SFT_REGISTRATION)
         .register_memory_strategy(MemoryRegistration {
             provider_id: "moss_image_base",
             contract: contract_base,
@@ -806,6 +842,7 @@ fn verify_numerical_renderer_transitions(
                         transformer: build(mode),
                         dataspace: None,
                         adapter_reports: vec![],
+                        dmd_report: None,
                     })
                 },
             )

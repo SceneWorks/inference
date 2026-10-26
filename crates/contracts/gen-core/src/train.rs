@@ -15,6 +15,8 @@
 
 // The pure LR-schedule policy lives here (gen-core); the MLX training kernels
 // (checkpoint/dataset/lora/optim, incl. `TrainOptimizer`) stay in mlx-gen's `train` module.
+pub mod aspect_ratio;
+pub use aspect_ratio::AspectRatioBucket;
 pub mod aux_schedule;
 pub mod body;
 pub mod face_loss;
@@ -220,6 +222,20 @@ pub struct TrainingConfig {
     /// refused by [`validate_training_techniques`]. Memory pre-flights size for
     /// [`max_training_resolution`](Self::max_training_resolution) (E7).
     pub resolution_buckets: Vec<ResolutionBucket>,
+    /// Aspect-assigned rectangular buckets. Mutually exclusive with the legacy square list.
+    pub aspect_ratio_buckets: Vec<AspectRatioBucket>,
+    /// Keep frozen VAE outputs in run-owned RAM; false encodes samples on demand.
+    pub cache_latents: bool,
+    /// Keep frozen caption embeddings in run-owned RAM; false encodes captions on demand.
+    pub cache_text_embeddings: bool,
+    /// Caller-selected GPU/unified-memory ceiling. None uses the physical device budget;
+    /// Some(0) refuses. A caller cap can lower discovery, never replace or raise it.
+    pub memory_limit_bytes: Option<u64>,
+    /// Operational ceiling as a fraction of the actual selected device's physical TOTAL bytes,
+    /// not its free memory, safety allowance or recommended working set. None is off; a present
+    /// value must be finite and 0 < fraction <= 1. Intersects both byte cap and live admission.
+    /// MOSS consumes this field; it is not part of numerical resume identity.
+    pub memory_limit_fraction: Option<f32>,
     /// **Depth anchoring** (epic 2123, sc-2125) — an auxiliary perceptual loss that keeps the
     /// adapter's predicted geometry consistent with the training image: the model's x0 prediction
     /// is decoded with the family's small differentiable decoder, run through a frozen
@@ -769,6 +785,11 @@ impl Default for TrainingConfig {
             // Resolution buckets are OFF by default (epic 2123 E1): one bucket at `resolution`,
             // walked round-robin exactly as before.
             resolution_buckets: Vec::new(),
+            aspect_ratio_buckets: Vec::new(),
+            cache_latents: true,
+            cache_text_embeddings: true,
+            memory_limit_bytes: None,
+            memory_limit_fraction: None,
             // Subject-masked loss is OFF by default (epic 2123 E1): no mask is read and the loss is
             // the plain unweighted mean.
             subject_mask_loss: None,
@@ -785,6 +806,132 @@ impl Default for TrainingConfig {
             // No training adapter by default (sc-25213): the trainer trains on the bare base.
             training_adapter: None,
         }
+    }
+}
+
+/// Intersect a caller ceiling with actual device discovery; zero is never a guard bypass.
+pub fn effective_memory_budget(physical: u64, cap: Option<u64>) -> crate::Result<u64> {
+    if physical == 0 || cap == Some(0) {
+        return Err(crate::Error::Unsupported(
+            "training memory budget must be positive".into(),
+        ));
+    }
+    Ok(cap.map_or(physical, |limit| physical.min(limit)))
+}
+
+/// Resolve an operational fraction against the selected device's TOTAL physical bytes, then
+/// intersect its independent live/safety budget and optional absolute cap. Integer IEEE-754
+/// arithmetic floors exactly, including large u64 totals, rather than rounding a cap upward.
+pub fn effective_memory_budget_with_fraction(
+    available_budget: u64,
+    physical_total: Option<u64>,
+    byte_cap: Option<u64>,
+    fraction: Option<f32>,
+) -> crate::Result<u64> {
+    let budget = effective_memory_budget(available_budget, byte_cap)?;
+    let Some(fraction) = fraction else {
+        return Ok(budget);
+    };
+    validate_memory_limit_fraction(Some(fraction))?;
+    let total = physical_total.filter(|n| *n > 0).ok_or_else(|| {
+        crate::Error::Unsupported(
+            "training memory fraction requires the actual selected physical total".into(),
+        )
+    })?;
+    let bits = fraction.to_bits();
+    let exponent = (bits >> 23) & 0xff;
+    let mantissa = if exponent == 0 {
+        bits & 0x7fffff
+    } else {
+        (bits & 0x7fffff) | (1 << 23)
+    };
+    let shift = if exponent == 0 { 149 } else { 150 - exponent };
+    let cap = if shift >= 128 {
+        0
+    } else {
+        (u128::from(total) * u128::from(mantissa)) >> shift
+    };
+    let cap = u64::try_from(cap)
+        .map_err(|_| crate::Error::Unsupported("training memory fraction overflow".into()))?;
+    effective_memory_budget(budget, Some(cap))
+}
+
+fn validate_memory_limit_fraction(fraction: Option<f32>) -> crate::Result<()> {
+    if fraction.is_some_and(|f| !f.is_finite() || f <= 0.0 || f > 1.0) {
+        return Err(crate::Error::Unsupported(
+            "training memory fraction must be finite and 0 < fraction <= 1; None means off".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::*;
+    #[test]
+    fn fraction_uses_selected_total_not_free_or_safety_and_intersects_bytes() {
+        assert_eq!(TrainingConfig::default().memory_limit_fraction, None);
+        let resolve = effective_memory_budget_with_fraction;
+        assert_eq!(resolve(800, Some(1000), None, Some(0.5)).unwrap(), 500);
+        assert_eq!(resolve(600, Some(1000), None, Some(0.5)).unwrap(), 500);
+        assert_eq!(resolve(300, Some(1000), None, Some(0.5)).unwrap(), 300);
+        assert_eq!(resolve(800, Some(2000), None, Some(0.5)).unwrap(), 800);
+        assert_eq!(resolve(800, Some(1000), Some(173), Some(0.5)).unwrap(), 173);
+        assert_eq!(resolve(800, Some(1000), Some(900), Some(0.5)).unwrap(), 500);
+        assert_eq!(resolve(800, None, None, None).unwrap(), 800);
+        assert_eq!(resolve(800, None, Some(173), None).unwrap(), 173);
+        assert_eq!(resolve(800, Some(1000), None, Some(1.0)).unwrap(), 800);
+        assert!(resolve(800, None, None, Some(0.5)).is_err());
+        assert!(resolve(800, Some(0), None, Some(0.5)).is_err());
+    }
+    #[test]
+    fn fraction_invalid_values_and_sub_byte_caps_refuse_without_fallback() {
+        for fraction in [
+            0.0,
+            -0.0,
+            -0.5,
+            1.01,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            assert!(matches!(
+                effective_memory_budget_with_fraction(800, Some(1000), None, Some(fraction)),
+                Err(crate::Error::Unsupported(_))
+            ));
+        }
+        assert!(effective_memory_budget_with_fraction(800, Some(1000), Some(0), None).is_err());
+        assert!(effective_memory_budget_with_fraction(0, Some(1000), None, None).is_err());
+        assert!(effective_memory_budget_with_fraction(
+            800,
+            Some(1000),
+            None,
+            Some(f32::from_bits(1))
+        )
+        .is_err());
+    }
+    #[test]
+    fn fraction_cap_rounds_down_exactly_even_at_u64_max() {
+        let resolve = effective_memory_budget_with_fraction;
+        assert_eq!(resolve(1000, Some(1001), None, Some(0.5)).unwrap(), 500);
+        assert_eq!(
+            resolve(u64::MAX, Some(u64::MAX), None, Some(1.0)).unwrap(),
+            u64::MAX
+        );
+        assert_eq!(
+            resolve(u64::MAX, Some(u64::MAX), None, Some(0.5)).unwrap(),
+            u64::MAX / 2
+        );
+        assert_eq!(
+            resolve(
+                u64::MAX,
+                Some(u64::MAX),
+                None,
+                Some(f32::from_bits(0x3f7fffff))
+            )
+            .unwrap(),
+            u64::MAX - (1_u64 << 40)
+        );
     }
 }
 
@@ -865,6 +1012,18 @@ pub struct BucketSchedule {
 type ShuffledEpoch = (usize, Vec<(usize, usize)>);
 
 impl BucketSchedule {
+    /// Shared Fisher–Yates engine for versioned, domain-separated rectangular schedules.
+    /// The legacy square shuffle keeps its historical seed construction unchanged.
+    pub(crate) fn shuffle_items<T>(items: &mut [T], seed: u64, epoch: u64, domain: u64) {
+        let mut state = seed
+            .wrapping_add(epoch.wrapping_mul(0xD6E8_FEB8_6659_FD93))
+            .wrapping_add(domain.wrapping_mul(0xA076_1D64_78BD_642F));
+        for i in (1..items.len()).rev() {
+            let j = (splitmix64_next(&mut state) % (i as u64 + 1)) as usize;
+            items.swap(i, j);
+        }
+    }
+
     /// Build the schedule for `n_items` cached items over `buckets` (from
     /// [`TrainingConfig::training_buckets`]).
     pub fn new(n_items: usize, buckets: &[ResolutionBucket], seed: u64) -> Self {
@@ -1367,6 +1526,24 @@ pub fn validate_training_techniques(
     req: &TrainingRequest,
 ) -> crate::Result<()> {
     let cfg = &req.config;
+    validate_memory_limit_fraction(cfg.memory_limit_fraction)?;
+    if cfg.memory_limit_fraction.is_some() && desc.family != "moss_image" {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: training memory fraction is not routed by this trainer",
+            desc.id
+        )));
+    }
+    if cfg.memory_limit_bytes == Some(0) {
+        return Err(crate::Error::Unsupported(
+            "training memory cap must be positive; None means no caller cap".into(),
+        ));
+    }
+    if cfg.memory_limit_bytes.is_some() && desc.family != "moss_image" {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: training memory byte cap is not routed by this trainer",
+            desc.id
+        )));
+    }
     for (name, value) in [
         ("weight_noise_sigma", cfg.weight_noise_sigma),
         ("gradient_noise_eta", cfg.gradient_noise_eta),
@@ -1462,6 +1639,15 @@ pub fn validate_training_techniques(
     }
     validate_body_losses(desc, req)?;
     validate_resolution_buckets(desc, &cfg.resolution_buckets)?;
+    aspect_ratio::validate(cfg)?;
+    if !cfg.aspect_ratio_buckets.is_empty()
+        && (!desc.techniques.resolution_buckets || desc.family != "moss_image")
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: rectangular aspect-assigned training is not supported by this trainer",
+            desc.id
+        )));
+    }
     if let Some(adapter) = &cfg.training_adapter {
         if cfg.full_finetune {
             return Err(crate::Error::Unsupported(format!(
@@ -2950,6 +3136,33 @@ mod tests {
             let err = validate_training_techniques(&desc, &r).unwrap_err();
             assert!(matches!(err, crate::Error::Msg(_)), "{bg}/{subj}: {err:?}");
         }
+    }
+
+    #[test]
+    fn sd3_refuses_unimplemented_caller_byte_cap_before_preflight() {
+        let mut desc = trainer_desc(false);
+        desc.family = "sd3";
+        let mut req = TrainingRequest {
+            items: vec![],
+            output_dir: PathBuf::from("unused"),
+            file_name: "unused".into(),
+            trigger_words: vec![],
+            config: TrainingConfig::default(),
+            cancel: crate::CancelFlag::new(),
+        };
+        validate_training_techniques(&desc, &req).unwrap();
+        for bytes in [1, u64::MAX] {
+            req.config.memory_limit_bytes = Some(bytes);
+            assert!(matches!(validate_training_techniques(&desc, &req),
+                Err(crate::Error::Unsupported(message)) if message.contains("byte cap is not routed")));
+        }
+        req.config.memory_limit_bytes = None;
+        req.config.memory_limit_fraction = Some(0.5);
+        assert!(matches!(validate_training_techniques(&desc, &req),
+            Err(crate::Error::Unsupported(message)) if message.contains("memory fraction is not routed")));
+        desc.family = "moss_image";
+        req.config.memory_limit_bytes = Some(1);
+        validate_training_techniques(&desc, &req).unwrap();
     }
 
     fn trainer_desc(supports_control: bool) -> TrainerDescriptor {
