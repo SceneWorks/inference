@@ -32,6 +32,11 @@ on:
         type: choice
         options: [all, windows-cuda, windows-gpu-diagnostic, moss-edit-cuda, moss-edit-metal]
         default: all
+      test_suite:
+        description: "routine = bounded regressions; exhaustive = every registered synthetic training/numerical case (real weights and dedicated H3/MOSS lanes stay separate)"
+        type: choice
+        options: [routine, exhaustive]
+        default: routine
       # sc-26685: explicit operator route for the synthetic H3 native suites (the W4A8
       # external-fixture cases plus the pruned-AdaLN / adapter-topology complete-model cases). A
       # bare dispatch (`lanes: all`) does not run them, and `lanes: windows-cuda` would drag in the
@@ -72,11 +77,12 @@ permissions:
 concurrency:
   # Preserve every explicit numerical run's queue entry for BOTH H3 and MOSS edit.
   # Ordinary PR/main/tag groups and cancellation policy remain unchanged.
-  group: inference-ci-${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.synthetic_w4a8 == 'cuda' || github.event.inputs.synthetic_w4a8 == 'mlx' || github.event.inputs.synthetic_w4a8 == 'both') && format('w4a8-{0}', github.run_id) || github.event_name == 'workflow_dispatch' && (inputs.lanes == 'moss-edit-metal' || inputs.lanes == 'moss-edit-cuda') && format('moss-{0}', github.run_id) || (github.event_name == 'pull_request' && github.ref || github.sha) }}
+  group: inference-ci-${{ github.event_name == 'workflow_dispatch' && inputs.test_suite == 'exhaustive' && format('exhaustive-{0}', github.run_id) || github.event_name == 'workflow_dispatch' && (github.event.inputs.synthetic_w4a8 == 'cuda' || github.event.inputs.synthetic_w4a8 == 'mlx' || github.event.inputs.synthetic_w4a8 == 'both') && format('w4a8-{0}', github.run_id) || github.event_name == 'workflow_dispatch' && (inputs.lanes == 'moss-edit-metal' || inputs.lanes == 'moss-edit-cuda') && format('moss-{0}', github.run_id) || (github.event_name == 'pull_request' && github.ref || github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
+    timeout-minutes: 10
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: select affected lanes
     runs-on: ubuntu-latest
@@ -169,6 +175,7 @@ jobs:
   # --all` all failed hard on main until it was found by hand. `--no-deps` keeps this to a
   # fast manifest parse (no dependency resolution, no compile).
   resolve:
+    timeout-minutes: 10
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: workspace manifest resolution
     runs-on: ubuntu-latest
@@ -189,6 +196,7 @@ jobs:
   # formatting can drift in any .rs file. `cargo fmt --all` also invokes `cargo metadata`, so
   # this doubles as a second resolution tripwire — no compile, so it stays fast.
   format:
+    timeout-minutes: 10
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: workspace formatting
     runs-on: ubuntu-latest
@@ -202,6 +210,7 @@ jobs:
         run: cargo fmt --all --check
 
   workspace:
+    timeout-minutes: 20
     name: workspace graph invariants
     needs: changes
     if: >-
@@ -262,6 +271,7 @@ jobs:
         run: python3 scripts/release/provision_mage_oracles.py --self-test
 
   contracts:
+    timeout-minutes: 30
     name: contracts + conformance testkits (Linux)
     needs: changes
     if: >-
@@ -308,6 +318,7 @@ jobs:
   # Keep it that way: moving this to a self-hosted label would cost a whole lane on the scarcest
   # resource in this repo to run a test that needs nothing but a filesystem.
   contracts-windows:
+    timeout-minutes: 30
     name: contracts testkit (Windows)
     needs: changes
     if: >-
@@ -358,6 +369,7 @@ jobs:
   # the `workspace` job's cache step.
 
   candle-cpu-lint:
+    timeout-minutes: 60
     name: Candle CPU lint + docs (Linux)
     needs: changes
     if: >-
@@ -414,6 +426,7 @@ jobs:
         run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh candle-gen
 
   candle-cpu-test:
+    timeout-minutes: ${{ inputs.test_suite == 'exhaustive' && 150 || 60 }}
     name: Candle CPU package tests (Linux)
     needs: changes
     if: >-
@@ -446,6 +459,7 @@ jobs:
         # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
         # tests"); push: main, tags and dispatches run the whole set.
         env:
+          TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
           args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu)
@@ -455,7 +469,7 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
-          cargo test --locked --lib -j 1 "${packages[@]}"
+          python3 scripts/ci/test_suites.py "$TEST_SUITE" -- cargo test --locked --lib -j 1 "${packages[@]}"
       # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
       # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
       # under all-target Clippy without running them, `windows-cuda-check` compiles them
@@ -538,6 +552,7 @@ jobs:
         # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
         # tests"); push: main, tags and dispatches run the whole set.
         env:
+          TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
           args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p 'candle-gen*')
@@ -547,9 +562,10 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
-          cargo test --locked --lib --tests -j 1 "${packages[@]}"
+          python3 scripts/ci/test_suites.py "$TEST_SUITE" -- cargo test --locked --lib --tests -j 1 "${packages[@]}"
 
   candle-cpu-conformance:
+    timeout-minutes: 45
     name: Candle CPU conformance + SA3 gates (Linux)
     needs: changes
     if: >-
@@ -580,6 +596,7 @@ jobs:
           -- --nocapture
 
   candle-cpu-bundles:
+    timeout-minutes: 45
     name: Candle CPU bundle profiles (Linux)
     needs: changes
     if: >-
@@ -609,6 +626,7 @@ jobs:
         run: cargo test --locked --no-default-features --features media --lib -p runtime-cpu
 
   macos-metal:
+    timeout-minutes: ${{ inputs.test_suite == 'exhaustive' && 180 || 75 }}
     name: MLX + Candle Metal packages (macOS)
     needs: changes
     if: >-
@@ -795,6 +813,7 @@ jobs:
         # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
         # tests"); push: main, tags and dispatches run the whole set.
         env:
+          TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
           args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos)
@@ -804,7 +823,7 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
-          cargo test --locked --lib --tests "${packages[@]}"
+          python3 scripts/ci/test_suites.py "$TEST_SUITE" -- cargo test --locked --lib --tests "${packages[@]}"
       - name: Check H3 precise pruned projection on hosted Metal (manual)
         if: github.event_name == 'workflow_dispatch' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both')
         run: |
@@ -893,6 +912,7 @@ jobs:
           --test integration -- metal_strided_reduce:: metal_reference_latents::
 
   macos-nax:
+    timeout-minutes: 180
     name: runtime-macos NAX (macOS 26.2, manual)
     needs: changes
     # A `synthetic_w4a8` dispatch replaces the heavy manual lanes with the synthetic suite; see
@@ -941,7 +961,9 @@ jobs:
           # until something reinstalls rustup. Harmless on ephemeral runners; not here.
           cache-bin: "false"
       - name: Exercise MLX engine and complete runtime catalog on NAX
-        run: cargo test --locked --lib -p mlx-llm -p runtime-macos
+        env:
+          TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
+        run: python3 scripts/ci/test_suites.py "$TEST_SUITE" -- cargo test --locked --lib -p mlx-llm -p runtime-macos
       # SC-18318 acceptance is correctness-only: exercise the focused synthetic
       # request-scoped exact-epilogue equality/receipt suite on a live Metal
       # device. The p3_ filter is intentionally narrow and invokes no timing,
@@ -970,6 +992,7 @@ jobs:
   # plus each printed test-name prefix. A renamed, deleted, or filtered-away case changes the
   # count and reds the route, so a "0 tests ran" run can never pass.
   synthetic-w4a8-mlx:
+    timeout-minutes: 180
     name: Synthetic H3 native suites (MLX/Metal, manual)
     needs: changes
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both'))
@@ -1335,6 +1358,7 @@ jobs:
   # below because it needs the CUDA-gated registration graph but never touches a device; executing the
   # rest of the CUDA tests stays in the manual `windows-cuda` lane.
   windows-cuda-check:
+    timeout-minutes: 90
     name: Candle CUDA compile check (Windows)
     needs: changes
     # This persistent runner may execute repository build scripts, so a public-fork PR must never
@@ -1476,6 +1500,7 @@ jobs:
           cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
 
   windows-cuda:
+    timeout-minutes: 180
     name: Candle CUDA packages (Windows, manual)
     needs: changes
     # A `synthetic_w4a8` dispatch replaces the heavy manual lanes with the synthetic suite; see
@@ -1565,13 +1590,14 @@ jobs:
         # The runner is sm_120: an sm_120 test (NVFP4, the indexed NVFP4 MoE kernel) must run
         # here, so `skip_without_sm120` fails instead of skipping silently (sc-24440 review).
         env:
+          TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
           REQUIRE_SM120: "1"
           # Iris' multi-process fixtures explicitly opt into sharing this lane's one visible card.
           # Without it rank 1 asks for cuda:1, exits InvalidMesh, and peers time out in rendezvous.
           IRIS_DIST_SHARE_DEVICE: "1"
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
+          python scripts/ci/test_suites.py "%TEST_SUITE%" -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
       - name: Test LLM-only CUDA bundle
         shell: cmd
         run: |
@@ -1591,6 +1617,7 @@ jobs:
   # Exact positive counts/names and backend completion markers prevent filtered or CPU evidence
   # from masquerading as current CUDA execution.
   synthetic-w4a8-cuda:
+    timeout-minutes: 180
     name: Synthetic H3 native suites (CUDA, manual)
     needs: changes
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true' && (inputs.synthetic_w4a8 == 'cuda' || inputs.synthetic_w4a8 == 'both'))
@@ -1981,6 +2008,7 @@ jobs:
           findstr /C:"test dit_parity::weight_mapping_is_exhaustive_over_the_block_stack ..." "%LOG%" >nul || exit /b 1
 
   supply-chain:
+    timeout-minutes: 20
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: dependency policy + advisories
     runs-on: ubuntu-latest
@@ -2005,6 +2033,7 @@ jobs:
         run: cargo deny --locked check advisories bans licenses sources
 
   docs:
+    timeout-minutes: 30
     name: repository documentation
     needs: changes
     if: >-
@@ -2016,6 +2045,7 @@ jobs:
         run: python3 scripts/check_docs.py
 
   release-metadata:
+    timeout-minutes: 20
     name: runtime manifest + SPDX SBOM
     needs: changes
     if: >-
@@ -2036,6 +2066,7 @@ jobs:
         run: python3 scripts/release/verify_release.py dist/release --skip-smoke
 
   release-artifacts:
+    timeout-minutes: 30
     name: tagged source archive + external smoke
     needs: [changes, release-metadata]
     if: >-
@@ -2078,6 +2109,7 @@ jobs:
   # dispatch- and tag-only lanes are included deliberately, since `skipped` is tolerated and that
   # keeps them covered on the events where they do run. Add new jobs here, or they go ungated.
   gate:
+    timeout-minutes: 10
     name: CI gate
     needs:
       - changes

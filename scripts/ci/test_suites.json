@@ -1,0 +1,2011 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "package": "candle-gen-flux3",
+      "kind": "test",
+      "target": "integration",
+      "test": "ae_training_precision::frozen_training_encoder_selected_precision_cpu_emulation",
+      "source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_training_precision.rs",
+      "reason": "Tiny frozen training AE executes F32/BF16/F16 on strided nonsquare image; complete tokens compared to precision goldens.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-flux3",
+      "kind": "test",
+      "target": "integration",
+      "test": "text_training::explicit_f32_teacher_is_not_bf16_output_upcast_and_honors_training_window",
+      "source": "crates/media/candle-gen/candle-gen-flux3/tests/text_training.rs",
+      "reason": "Tiny frozen teacher source oracle compares short/exact/long/empty, matched/capped windows and rotary positions; MLX repeats at F32/BF16/F16.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-flux3",
+      "kind": "test",
+      "target": "integration",
+      "test": "training_parity::all_six_projection_families_and_earlier_blocks_match_two_adamw_steps",
+      "source": "crates/media/candle-gen/candle-gen-flux3/tests/training_parity.rs",
+      "reason": "Tiny source-derived FLUX3 fixture: two model backward/update steps across six projection families/108 factors; full loss/prediction/gradient PyTorch golden and updated scalar-Adam comparison.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-flux3",
+      "kind": "test",
+      "target": "integration",
+      "test": "training_parity::shared_adamw_matches_torch_on_identical_source_gradients",
+      "source": "crates/media/candle-gen/candle-gen-flux3/tests/training_parity.rs",
+      "reason": "Two optimizer updates replay PyTorch source gradients for all FLUX3 factors; every updated factor compared to golden.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "adapter_parity::lora_and_lokr_deltas_and_forwards_match_upstream",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/adapter_parity.rs",
+      "reason": "Checks every adapter target for LoRA/LoKr, then three complete learned forwards for LoRA/LoKr/both overlays.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "controls_contract::every_advertised_control_changes_the_render",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/controls_contract.rs",
+      "reason": "Repeated renders across step/cfg/seed/caption/sampler settings plus non-square sizes; a control capability matrix.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "controls_parity::every_control_matches_upstream_on_the_miniature",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/controls_parity.rs",
+      "reason": "Fixture-defined control matrix executes complete multistep denoising/pixel model for every advertised control case.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_lifecycle::a_pre_curricula_checkpoint_resumes_exactly",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/curricula_lifecycle.rs",
+      "reason": "Full 4-step reference compared with legacy-checkpoint cancel/resume replay.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_lifecycle::area_shape_batches_train_per_shape_and_resume_exactly",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/curricula_lifecycle.rs",
+      "reason": "4-step shape-bucket training compared with interrupted/resumed trajectory.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_lifecycle::resume_optimizer_core_starts_a_new_projector_cold",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/curricula_lifecycle.rs",
+      "reason": "Multi-phase resume/REPA projector comparison extending training to step 4.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_lifecycle::stage_presets_chain_256_to_512_with_repa_and_a_new_phase",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/curricula_lifecycle.rs",
+      "reason": "Multiple stage training runs with a learned REPA teacher/projector; later phases extend to 4 and 6 steps.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_parity::activation_checkpointing_gradients_equal_the_plain_graph",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/curricula_parity.rs",
+      "reason": "Five backward evaluations: plain reference twice plus Full/SelectiveOp/SelectiveLayer policies, comparing every trainable gradient.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_parity::activation_checkpointing_is_exact_in_f32_and_within_rounding_noise_in_bf16",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/curricula_parity.rs",
+      "reason": "Four dtype x checkpoint policy arms, each backward plus AdamW update plus next-loss backward.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_parity::repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/curricula_parity.rs",
+      "reason": "Three REPA/iREPA cases run learned teacher/model backward; selected case additionally sweeps Full/SelectiveLayer checkpoint policies.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_parity::depth_matches_upstream_stage_by_stage",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_parity.rs",
+      "reason": "Fixture shape/resolution case sweep; runs model.forward and full estimator path separately for every case.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_lifecycle.rs",
+      "reason": "Runs the complete default 4-step depth training trajectory twice, plain and checkpointed, and compares exported tensors.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_lifecycle.rs",
+      "reason": "Full 8-step uninterrupted trajectory compared with cancelled/resumed run including optimizer/EMA checkpoint tensors.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_train_lifecycle::overfit_export_and_load_in_the_estimator",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_lifecycle.rs",
+      "reason": "80 optimization steps, periodic previews, export/reload, and depth estimation of trained examples.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_train_parity::activation_checkpointing_gradients_equal_the_plain_graph",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_parity.rs",
+      "reason": "Four full depth loss/backward graphs across f32/bf16 times plain/checkpointed.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_parity::restoration_matches_upstream_end_to_end_in_fp32",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_parity.rs",
+      "reason": "Fixture case sweep across dimensions/scales/budget/color-fix and tiled learned restoration.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_train_lifecycle::activation_checkpointing_gradients_equal_the_plain_graph",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "Four learned generator/LPIPS/critic gradient graphs across f32/bf16 times plain/checkpointed.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "16-step uninterrupted restoration trajectory compared with cancellation/checkpoint/resume.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_train_lifecycle::every_published_loss_term_moves_the_generator_update",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "Computes all-loss gradient, then isolated and removed gradients for each of three L2/LPIPS/GAN terms: seven model backward evaluations.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_train_lifecycle::overfitting_a_few_pairs_improves_psnr_and_lpips",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "80 restoration training steps, with learned restoration and LPIPS evaluation before and after.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "text_parity::windows_masks_and_layer_states_match_upstream",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/text_parity.rs",
+      "reason": "PROMPTS matrix executes the 36-block text encoder for each caption/window/mask case.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs",
+      "reason": "Two training ranks cancel at step 2; injected checkpoint writer delay of 2500 ms exceeds one-second grace.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs",
+      "reason": "Starts two training children and deliberately loses rank; survivor uses transport timeout and bounded reap.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs",
+      "reason": "Starts two training children and stalls rank; includes configured five-second timeout (120-second reap limit).",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs",
+      "reason": "CUDA-dependent multi-rank launches sweep device-sharing refusal and opt-in training; ordinary CPU branch skips it.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs",
+      "reason": "Multiple multi-rank training/resume launches exercise DCP checkpoint resharding and compare exports.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::ddp_runs_reproduce_bit_for_bit",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs",
+      "reason": "Two two-rank DDP training launches, four steps each, with optimizer/EMA/export comparison.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs",
+      "reason": "Nested optimizer x sharding matrix; multiple two-rank four-step DDP/FSDP jobs plus bf16 gathered-copy arm.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::hybrid_sharding_over_four_ranks_reproduces_ddp",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs",
+      "reason": "Two four-rank four-step training jobs compare DDP with 2x2 hybrid sharding.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::ranks_that_see_different_checkpoints_refuse_to_resume",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs",
+      "reason": "Trains initial checkpoint then launches ranks against different checkpoint states; includes real multi-process collectives.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lifecycle::cached_and_on_the_fly_conditioning_train_identically",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_lifecycle.rs",
+      "reason": "Repeated training arms for cached/live conditioning and microbatch semantics, comparing all produced tensors.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lifecycle::full_muon_cancel_and_resume_reproduce_the_uninterrupted_run",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_lifecycle.rs",
+      "reason": "Compares full 4-step uninterrupted training with cancelled/resumed training and checkpoint/export tensors.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lifecycle::lokr_adamw_cancel_and_resume_reproduce_the_uninterrupted_run",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_lifecycle.rs",
+      "reason": "4-step LoKr AdamW uninterrupted trajectory compared with cancelled/resumed run and all persisted tensors.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lifecycle::lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_lifecycle.rs",
+      "reason": "Accumulated LoRA trajectory uses 8 microsteps, repeats through cancel/resume, and compares saved state.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lifecycle::resume_identity_retention_and_new_phase",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_lifecycle.rs",
+      "reason": "4-step training then resume to 6 steps plus failed identity variants and retained/milestone checkpoint comparisons.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lineage::a_cancel_at_a_new_epochs_first_batch_after_a_resume_resumes_exactly",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_lineage.rs",
+      "reason": "Repeated six-step trajectories through epoch-boundary cancellation and resume, with exact checkpoint comparisons.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lineage::a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_lineage.rs",
+      "reason": "Multiple complete default training runs share checkpoint root; compares independent lineage and checkpoint ownership.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-krea",
+      "kind": "lib",
+      "target": "candle_gen_krea",
+      "test": "control::tests::backward_reaches_branch_and_descends",
+      "source": "crates/media/candle-gen/candle-gen-krea/src/control.rs",
+      "reason": "tiny_dit_seeded/tiny_batch_seeded: real synthetic base plus control branch; 60 updates gate substantial fixed-batch descent.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-krea",
+      "kind": "lib",
+      "target": "candle_gen_krea",
+      "test": "control::tests::dense_and_checkpoint_grads_match_control",
+      "source": "crates/media/candle-gen/candle-gen-krea/src/control.rs",
+      "reason": "tiny_dit/tiny_batch plus nudged control branch: dense vs segmented control VJP loss and every branch gradient.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-krea",
+      "kind": "lib",
+      "target": "candle_gen_krea",
+      "test": "control_train::tests::control_trainer_descends",
+      "source": "crates/media/candle-gen/candle-gen-krea/src/control_train.rs",
+      "reason": "tiny_dit_seeded/tiny_batch_seeded construct real ControlTrainer; max_steps=60 consumed by run, before/after fixed-batch loss gate.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-krea",
+      "kind": "lib",
+      "target": "candle_gen_krea",
+      "test": "training::tests::dense_and_checkpoint_grads_match",
+      "source": "crates/media/candle-gen/candle-gen-krea/src/training.rs",
+      "reason": "tiny provider DiT with nonzero factors; executes dense and checkpointed full backward, compares loss and every factor gradient.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-krea",
+      "kind": "lib",
+      "target": "candle_gen_krea",
+      "test": "training::tests::optimizer_steps_descend",
+      "source": "crates/media/candle-gen/candle-gen-krea/src/training.rs",
+      "reason": "60 real loss/backward/clip/optimizer updates on tiny synthetic provider DiT; gates fixed-batch loss decrease. Function names understate repeated work.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-lens",
+      "kind": "lib",
+      "target": "candle_gen_lens",
+      "test": "training::tests::dense_and_checkpoint_grads_match",
+      "source": "crates/media/candle-gen/candle-gen-lens/src/training.rs",
+      "reason": "tiny provider DiT with nonzero factors; executes dense and checkpointed full backward, compares loss and every factor gradient.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-lens",
+      "kind": "lib",
+      "target": "candle_gen_lens",
+      "test": "training::tests::one_optimizer_step_descends",
+      "source": "crates/media/candle-gen/candle-gen-lens/src/training.rs",
+      "reason": "5 real loss/backward/clip/optimizer updates on tiny synthetic provider DiT; gates fixed-batch loss decrease. Function names understate repeated work.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-qwen-image-2-1",
+      "kind": "lib",
+      "target": "candle_gen_qwen_image_2_1",
+      "test": "training::tests::checkpointed_edit_grads_match_dense",
+      "source": "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs",
+      "reason": "dit_at/install/fixed_edit_batch: LoRA/LoKr x default/global target surfaces; dense/checkpoint joint forward/backward gradient comparisons.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-qwen-image-2-1",
+      "kind": "lib",
+      "target": "candle_gen_qwen_image_2_1",
+      "test": "training::tests::checkpointed_grads_match_dense_for_lora_and_lokr",
+      "source": "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs",
+      "reason": "dit_at/install/perturb: three network/rank choices x two target surfaces; dense/checkpoint full loss and every gradient.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-qwen-image-2-1",
+      "kind": "lib",
+      "target": "candle_gen_qwen_image_2_1",
+      "test": "training::tests::edit_loss_decreases_over_steps_and_depends_on_the_references",
+      "source": "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs",
+      "reason": "dit_at/install/fixed_edit_batch: dense/checkpoint edit cells, each 120 varying-noise/timestep updates plus reference sensitivity.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-qwen-image-2-1",
+      "kind": "lib",
+      "target": "candle_gen_qwen_image_2_1",
+      "test": "training::tests::loss_decreases_over_steps_on_a_fixed_batch",
+      "source": "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs",
+      "reason": "dit_at/install/fixed_batch: four LoRA/LoKr x dense/checkpoint cells, each 25 actual optimizer updates.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-sdxl",
+      "kind": "lib",
+      "target": "candle_gen_sdxl",
+      "test": "training::tests::dense_and_checkpoint_grads_match",
+      "source": "crates/media/candle-gen/candle-gen-sdxl/src/training.rs",
+      "reason": "tiny synthetic SDXL UNet with live factors; retained and segmented backward compared on every factor.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-wan",
+      "kind": "lib",
+      "target": "candle_gen_wan",
+      "test": "training::tests::dense_and_checkpoint_grads_match",
+      "source": "crates/media/candle-gen/candle-gen-wan/src/training.rs",
+      "reason": "tiny provider DiT with nonzero factors; executes dense and checkpointed full backward, compares loss and every factor gradient.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-wan",
+      "kind": "lib",
+      "target": "candle_gen_wan",
+      "test": "training::tests::one_optimizer_step_descends",
+      "source": "crates/media/candle-gen/candle-gen-wan/src/training.rs",
+      "reason": "5 real loss/backward/clip/optimizer updates on tiny synthetic provider DiT; gates fixed-batch loss decrease. Function names understate repeated work.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-z-image",
+      "kind": "lib",
+      "target": "candle_gen_z_image",
+      "test": "training::tests::dense_and_checkpoint_grads_match",
+      "source": "crates/media/candle-gen/candle-gen-z-image/src/training.rs",
+      "reason": "tiny provider DiT with nonzero factors; executes dense and checkpointed full backward, compares loss and every factor gradient.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-z-image",
+      "kind": "lib",
+      "target": "candle_gen_z_image",
+      "test": "training::tests::one_optimizer_step_descends",
+      "source": "crates/media/candle-gen/candle-gen-z-image/src/training.rs",
+      "reason": "5 real loss/backward/clip/optimizer updates on tiny synthetic provider DiT; gates fixed-batch loss decrease. Function names understate repeated work.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::attention::tests::chunked_eager_matches_unchunked_across_masks_softcap_and_strides",
+      "source": "crates/llm/candle-llm/src/primitives/attention.rs",
+      "reason": "Six mask/softcap combinations compare chunked versus unchunked eager paths over noncontiguous q/k/v/mask; equivalent to MLX tile/mask numerical sweep.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::attention::tests::gqa_additive_matches_repeat_kv_sdpa_without_materializing",
+      "source": "crates/llm/candle-llm/src/primitives/attention.rs",
+      "reason": "CPU additive-mask numerical sweep: four q/k lengths x broadcast/per-head masks, narrowed mask stride, unmasked and causal oracle checks.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::attention::tests::gqa_causal_matches_repeat_kv_sdpa_on_cuda_bf16_27b_shape",
+      "source": "crates/llm/candle-llm/src/primitives/attention.rs",
+      "reason": "CUDA-only numerical attention sweep at 24 query/4 KV heads x 256 dim, four decode/verify/prefill contexts, narrowed static cache versus repeat_kv/eager oracle. cfg(cuda), new_cuda_for_test().expect; no skip.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::attention::tests::gqa_causal_matches_repeat_kv_sdpa_without_materializing",
+      "source": "crates/llm/candle-llm/src/primitives/attention.rs",
+      "reason": "Cross-backend attention geometry sweep: five q/k shapes plus query-chunk boundary and MHA, independent repeat_kv/eager numerical and no-materialization comparisons on CPU.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::a_captured_boundary_equals_a_prefill_split_there",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "CPU boundary/state numerical sweep of eight (prefix,capture,total) combinations up to 700 tokens, checks captured versus split state plus outputs/final state versus uncaptured run.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::a_chunkwise_capture_holds_at_batch_two_with_gqa_and_a_carried_state",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "CPU 700-token batch-two/GQA numerical campaign at four boundary positions (17/64/530/640), each against per-token prefix oracle and uncaptured whole recurrence.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::a_prefill_rings_only_its_final_state_whatever_the_ring_depth",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "CPU ring-depth numerical sweep at 150-token prefill over three ring depths, outputs/final state compared to complete recurrence oracle.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::a_verify_step_after_a_prefill_rolls_back_to_every_position",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "CPU 150-token prefill then three-token verify, sweeps all four rollback positions against freshly prefilling and token-by-token reference caches.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::chunked_prefill_matches_per_token_reference",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "Three 512/2048/ragged300-token shapes x three dtypes x zero/carried state (18 cases), full per-token reference at 128x128 Qwen state geometry; CPU numerical sweep.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::prefill_runs_its_head_chunkwise_and_sinks_the_tail_per_token",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "Five sink boundaries over 200-token chunked recurrence compare every emitted checkpoint and outputs with per-token reference; additional BF16 carried/zero dtype checks. model_inputs selects compiled available GPU, else CPU.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::ring_prefill_with_a_chunked_head_restores_the_per_token_states",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "150-token chunked-head numerical checkpoint oracle, restores each of four ring positions and recomputes independent token-at-time state. test_device chooses compiled available GPU else CPU.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::gated_delta::tests::ring_restores_every_position_of_a_verify_step_exactly",
+      "source": "crates/llm/candle-llm/src/primitives/gated_delta.rs",
+      "reason": "CPU checkpoint rollback sweep over five draft widths and every position for each width; compares conv/SSM state against fresh token-at-time oracle and retry.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::prism::tests::cuda_gguf_decode_is_bit_exact_for_every_packed_byte",
+      "source": "crates/llm/candle-llm/src/primitives/prism.rs",
+      "reason": "Exhaustive packed-byte decode oracle: PQ2/PTQ1 x 256 rows x 128 lanes, every data position visits every byte value; preserves small decoded-row operator tests as smoke.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "lib",
+      "target": "candle_llm",
+      "test": "primitives::prism::tests::the_fused_rotation_is_bit_identical_to_the_op_chain",
+      "source": "crates/llm/candle-llm/src/primitives/prism.rs",
+      "reason": "CUDA numerical matrix: six width/block/GDN layouts x three dtypes x forward/inverse comparisons, plus whole packed Prism forward versus unfused chain.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "test",
+      "target": "device_sampler",
+      "test": "ac1_host_reference_passes_its_own_chi_square",
+      "source": "crates/llm/candle-llm/tests/device_sampler.rs",
+      "reason": "100,000 CPU host draws for each sampling/tie case from cases(64), chi-square distribution campaign.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "test",
+      "target": "device_sampler",
+      "test": "ac1_portable_selection_rule_matches_the_host_distribution",
+      "source": "crates/llm/candle-llm/tests/device_sampler.rs",
+      "reason": "100,000 CPU portable device-selection draws for each sampling/tie case from cases(64), chi-square distribution campaign.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "test",
+      "target": "device_sampler",
+      "test": "chi_square_rejects_a_wrong_distribution",
+      "source": "crates/llm/candle-llm/tests/device_sampler.rs",
+      "reason": "100,000 seeded host draws to calibrate that chi-square rejects a deliberately wrong temperature distribution.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "test",
+      "target": "device_sampler",
+      "test": "cuda::ac1_device_sampler_matches_on_the_qwen38_vocabulary_width",
+      "source": "crates/llm/candle-llm/tests/device_sampler.rs",
+      "reason": "Real-vocabulary stress: 248,320 logits, 100,000 sequential per-token draws for temperature/top-k/top-p plus 100,000 temperature-only draws.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "test",
+      "target": "device_sampler",
+      "test": "cuda::ac1_device_sampler_matches_the_host_distribution",
+      "source": "crates/llm/candle-llm/tests/device_sampler.rs",
+      "reason": "CUDA distribution campaign across vocabularies 64/5000 and every sampling/tie case; helper allocates 100,000 broadcast sample rows per case.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "test",
+      "target": "device_sampler",
+      "test": "cuda::nucleus_boundary_divergence_is_at_most_one_token",
+      "source": "crates/llm/candle-llm/tests/device_sampler.rs",
+      "reason": "Boundary statistical sweep: exact and +/-1ULP prefix-mass thresholds each infer support using 20,000 CUDA sampled rows at V=2000.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "candle-llm",
+      "kind": "test",
+      "target": "device_sampler",
+      "test": "cuda::seeded_device_draws_are_deterministic_and_track_the_portable_rule",
+      "source": "crates/llm/candle-llm/tests/device_sampler.rs",
+      "reason": "Hidden device_draws_batched uses 100,000 rows at V=5000 twice, then compares every draw to CPU portable rule for >=99.9% parity.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "features": [
+        "cuda"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "lora_train_probe::lora_functional_autograd_converges",
+      "source": "crates/media/mlx-gen/tests/lora_train_probe.rs",
+      "reason": "300 updates: functional autograd, global-norm clip and AdamW LoRA factors; gates convergence.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "attention::tests::at_the_production_shape_sdpa_streams_the_scores_and_chunking_is_exact",
+      "source": "crates/media/mlx-gen/src/attention.rs",
+      "reason": "Actual [1,30,4128,128] Q/K/V allocations (~250 MB), unbounded and 8-chunk SDPA launches; peak-memory assertion and full-output numerical comparison.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "nn::tests::p3_exact_activations_cover_all_supported_dtypes_and_layouts",
+      "source": "crates/media/mlx-gen/src/nn.rs",
+      "reason": "3 dtypes x contiguous/noncontiguous x SiLU/GELU eager-vs-exact numerical and receipt checks.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "nn::tests::p3_exact_convolution_and_group_norm_cover_supported_dispatches",
+      "source": "crates/media/mlx-gen/src/nn.rs",
+      "reason": "3 dtypes x four conv2d dispatch geometries, conv3d, three group-norm layout/size classes; eager/exact outputs compared bit-for-bit.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "nn::tests::p3_q4_q8_bias_is_exact_across_standard_and_nax_eligible_dtypes",
+      "source": "crates/media/mlx-gen/src/nn.rs",
+      "reason": "3 dtypes x Q4/Q8 x gs32/64/128 across standard, odd/strided, broadcast-batched geometries plus small-M fallback; eager/exact QMM output comparisons.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::tests::a_live_lora_survives_fusion_at_every_adopted_family_geometry",
+      "source": "crates/media/mlx-gen/src/qkv/tests.rs",
+      "reason": "ADOPTED ten production geometries x F32/BF16; constructs unadapted and LoRA-active fused/split projections and compares numerical effects.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::tests::every_adopted_family_is_bit_exact_at_production_geometry_in_both_dtypes",
+      "source": "crates/media/mlx-gen/src/qkv/tests.rs",
+      "reason": "ADOPTED ten production projection geometries (1024..3072) x F32/BF16; constructs fused/separate projections and compares Q/K/V.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen",
+      "kind": "lib",
+      "target": "mlx_gen",
+      "test": "qkv::tests::every_adopted_family_is_bit_exact_when_quantized_at_its_own_group_size",
+      "source": "crates/media/mlx-gen/src/qkv/tests.rs",
+      "reason": "ADOPTED excluding dense conditioner: nine production geometries x Q4/Q8; constructs quantized fused/separate projections and compares Q/K/V.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-anima",
+      "kind": "lib",
+      "target": "mlx_gen_anima",
+      "test": "training::tests::checkpointed_grads_match_dense_dit_and_conditioner",
+      "source": "crates/media/mlx-gen/mlx-gen-anima/src/training.rs",
+      "reason": "tiny_model_and_adapter builds DiT+conditioner; compares every factor from dense vs whole-block backward and live conditioner gradient.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-anima",
+      "kind": "lib",
+      "target": "mlx_gen_anima",
+      "test": "training::tests::production_combined_config_grads_match_dense",
+      "source": "crates/media/mlx-gen/mlx-gen-anima/src/training.rs",
+      "reason": "tiny_model_and_adapter builds DiT+conditioner; compares all gradients for retained reference vs production combined whole-block/segment checkpoints.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-anima",
+      "kind": "lib",
+      "target": "mlx_gen_anima",
+      "test": "training::tests::sdpa_segment_checkpoint_grads_match_retained",
+      "source": "crates/media/mlx-gen/mlx-gen-anima/src/training.rs",
+      "reason": "tiny_model_and_adapter builds DiT+conditioner; retained/recomputed SDPA backward and all-factor relative gradient comparison.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-flux3",
+      "kind": "test",
+      "target": "integration",
+      "test": "ae_training_precision::frozen_training_encoder_selected_precision",
+      "source": "crates/media/mlx-gen/mlx-gen-flux3/tests/ae_training_precision.rs",
+      "reason": "Tiny frozen training AE executes F32/BF16/F16 on strided nonsquare image; complete tokens compared to precision goldens.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-flux3",
+      "kind": "test",
+      "target": "integration",
+      "test": "text_training::training_teacher_real_precision_frequency_profile_and_window_match_hf_reference",
+      "source": "crates/media/mlx-gen/mlx-gen-flux3/tests/text_training.rs",
+      "reason": "Tiny frozen teacher source oracle compares short/exact/long/empty, matched/capped windows and rotary positions; MLX repeats at F32/BF16/F16.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-flux3",
+      "kind": "test",
+      "target": "integration",
+      "test": "training_parity::all_six_projection_families_match_two_adamw_steps",
+      "source": "crates/media/mlx-gen/mlx-gen-flux3/tests/training_parity.rs",
+      "reason": "Tiny source-derived FLUX3 fixture: two model backward/update steps across six projection families/108 factors; full loss/prediction/gradient PyTorch golden and updated scalar-Adam comparison.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-flux3",
+      "kind": "test",
+      "target": "integration",
+      "test": "training_parity::corrected_adamw_matches_identical_torch_gradients",
+      "source": "crates/media/mlx-gen/mlx-gen-flux3/tests/training_parity.rs",
+      "reason": "Two optimizer updates replay PyTorch source gradients for all FLUX3 factors; every updated factor compared to golden.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "adapter_parity::lora_and_lokr_match_upstream_merged_weights",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/adapter_parity.rs",
+      "reason": "Complete learned forward parity for LoRA/LoKr/both adapter combinations plus merged-target verification.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "controls_contract::every_advertised_control_changes_the_render",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/controls_contract.rs",
+      "reason": "Repeated renders across step/cfg/seed/caption/sampler settings plus non-square sizes; a control capability matrix.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "controls_parity::every_control_matches_upstream_on_the_miniature",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/controls_parity.rs",
+      "reason": "Fixture-defined control matrix executes complete multistep denoising/pixel model for every advertised control case.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_lifecycle::a_pre_curricula_checkpoint_resumes_exactly",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_lifecycle.rs",
+      "reason": "Full 4-step reference compared with legacy-checkpoint cancel/resume replay.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_lifecycle::area_shape_batches_train_per_shape_and_resume_exactly",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_lifecycle.rs",
+      "reason": "4-step shape-bucket training compared with interrupted/resumed trajectory.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_lifecycle::resume_optimizer_core_starts_a_new_projector_cold",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_lifecycle.rs",
+      "reason": "Multi-phase resume/REPA projector comparison extending training to step 4.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_lifecycle::stage_presets_chain_256_to_512_with_repa_and_a_new_phase",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_lifecycle.rs",
+      "reason": "Multiple stage training runs with a learned REPA teacher/projector; later phases extend to 4 and 6 steps.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_parity::activation_checkpointing_bf16_gradients_add_no_error_of_their_own",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_parity.rs",
+      "reason": "Plain f32, plain bf16, checkpointed bf16 full generation backward graphs and every-gradient comparisons.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_parity::activation_checkpointing_gradients_equal_the_plain_graph",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_parity.rs",
+      "reason": "Five backward evaluations: plain reference twice plus Full/SelectiveOp/SelectiveLayer policies, comparing every trainable gradient.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "curricula_parity::repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_parity.rs",
+      "reason": "Three REPA/iREPA cases run learned teacher/model backward; selected case additionally sweeps Full/SelectiveLayer checkpoint policies.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_parity::depth_matches_upstream_stage_by_stage",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_parity.rs",
+      "reason": "Fixture shape/resolution case sweep; runs model.forward and full estimator path separately for every case.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_lifecycle.rs",
+      "reason": "Runs the complete default 4-step depth training trajectory twice, plain and checkpointed, and compares exported tensors.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_lifecycle.rs",
+      "reason": "Full 8-step uninterrupted trajectory compared with cancelled/resumed run including optimizer/EMA checkpoint tensors.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_lifecycle.rs",
+      "reason": "Repeats 8-step uninterrupted/cancelled/resumed depth training under activation checkpointing.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_train_lifecycle::overfit_export_and_load_in_the_estimator",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_lifecycle.rs",
+      "reason": "80 optimization steps, periodic previews, export/reload, and depth estimation of trained examples.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "depth_train_parity::activation_checkpointing_gradients_equal_the_plain_graph",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_parity.rs",
+      "reason": "Four full depth loss/backward graphs across f32/bf16 times plain/checkpointed.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_parity::restoration_matches_upstream_end_to_end_in_fp32",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_parity.rs",
+      "reason": "Fixture case sweep across dimensions/scales/budget/color-fix and tiled learned restoration.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_train_lifecycle::activation_checkpointing_adapter_gradients_equal_the_plain_graph",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "LoRA x LoKr times f32/bf16 times plain/checkpointed: eight complete restoration generator backward graphs.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_train_lifecycle::activation_checkpointing_gradients_equal_the_plain_graph",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "Four learned generator/LPIPS/critic gradient graphs across f32/bf16 times plain/checkpointed.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "16-step uninterrupted restoration trajectory compared with cancellation/checkpoint/resume.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "Repeats 16-step restoration training and checkpoint replay under activation checkpointing.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_train_lifecycle::every_published_loss_term_moves_the_generator_update",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "Computes all-loss gradient, then isolated and removed gradients for each of three L2/LPIPS/GAN terms: seven model backward evaluations.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "restoration_train_lifecycle::overfitting_a_few_pairs_improves_psnr_and_lpips",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "80 restoration training steps, with learned restoration and LPIPS evaluation before and after.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "text_parity::windows_masks_and_layer_states_match_upstream",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/text_parity.rs",
+      "reason": "PROMPTS matrix executes the 36-block text encoder for each caption/window/mask case.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Two training ranks cancel at step 2; injected checkpoint writer delay of 2500 ms exceeds one-second grace.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_rank_that_exits_inside_an_mlx_collective_fails_the_survivor_typed",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Starts MLX ring children and injects process loss inside collective; timeout/failure campaign.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Starts two training children and deliberately loses rank; survivor uses transport timeout and bounded reap.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_rank_that_stalls_inside_an_mlx_collective_fails_the_survivor_typed",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Starts MLX ring children and injects a collective stall; timeout/failure campaign.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Starts two training children and stalls rank; includes configured five-second timeout (120-second reap limit).",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Multiple multi-rank training/resume launches exercise DCP checkpoint resharding and compare exports.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Repeated multi-rank training launches comparing TCP and MLX ring transports.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Nested optimizer x sharding matrix; multiple two-rank four-step DDP/FSDP jobs plus bf16 gathered-copy arm.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::hybrid_sharding_over_four_ranks_reproduces_ddp",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Two four-rank four-step training jobs compare DDP with 2x2 hybrid sharding.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::hybrid_sharding_over_the_mlx_ring_reduces_odd_row_shards",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Multi-rank MLX ring hybrid training scenario with odd row sharding.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::ranks_that_see_different_checkpoints_refuse_to_resume",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Trains initial checkpoint then launches ranks against different checkpoint states; includes real multi-process collectives.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_distributed::the_mlx_ring_gather_returns_unequal_contributions_exactly",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_distributed.rs",
+      "reason": "Starts MLX ring child ranks to exercise variable row gather rather than a bounded local operator smoke.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lifecycle::cached_and_on_the_fly_conditioning_train_identically",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_lifecycle.rs",
+      "reason": "Repeated training arms for cached/live conditioning and microbatch semantics, comparing all produced tensors.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lifecycle::full_muon_cancel_and_resume_reproduce_the_uninterrupted_run",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_lifecycle.rs",
+      "reason": "Compares full 4-step uninterrupted training with cancelled/resumed training and checkpoint/export tensors.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lifecycle::lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_lifecycle.rs",
+      "reason": "Accumulated LoRA trajectory uses 8 microsteps, repeats through cancel/resume, and compares saved state.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lifecycle::resume_identity_retention_and_new_phase",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_lifecycle.rs",
+      "reason": "4-step training then resume to 6 steps plus failed identity variants and retained/milestone checkpoint comparisons.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lineage::a_cancel_at_a_new_epochs_first_batch_after_a_resume_resumes_exactly",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_lineage.rs",
+      "reason": "Repeated six-step trajectories through epoch-boundary cancellation and resume, with exact checkpoint comparisons.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
+      "test": "train_lineage::a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/train_lineage.rs",
+      "reason": "Multiple complete default training runs share checkpoint root; compares independent lineage and checkpoint ownership.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-qwen-image-2-1",
+      "kind": "lib",
+      "target": "mlx_gen_qwen_image_2_1",
+      "test": "training::tests::checkpointed_edit_grads_match_dense",
+      "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs",
+      "reason": "fixed_edit_batch has multiple image/text/reference segments; dense/checkpointed joint model backward and all gradients.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-qwen-image-2-1",
+      "kind": "lib",
+      "target": "mlx_gen_qwen_image_2_1",
+      "test": "training::tests::checkpointed_grads_match_dense_for_lora_and_lokr",
+      "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs",
+      "reason": "tiny_dit/build perturb factors; full dense/checkpointed model backward across LoRA/LoKr and all gradients.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-qwen-image-2-1",
+      "kind": "lib",
+      "target": "mlx_gen_qwen_image_2_1",
+      "test": "training::tests::edit_loss_decreases_over_steps_and_depends_on_the_references",
+      "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs",
+      "reason": "tiny_dit/build/fixed_edit_batch; 120 varying-noise/timestep updates plus reference-conditioning sensitivity.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-qwen-image-2-1",
+      "kind": "lib",
+      "target": "mlx_gen_qwen_image_2_1",
+      "test": "training::tests::fully_packed_trained_factors_preserve_direct_delta_through_export",
+      "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs",
+      "reason": "fully_packable_dit/build: LoRA/LoKr x edit/T2I x 3 real updates, then packed Q4/Q8 direct-delta export checks.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-qwen-image-2-1",
+      "kind": "lib",
+      "target": "mlx_gen_qwen_image_2_1",
+      "test": "training::tests::loss_decreases_over_steps_on_a_fixed_batch",
+      "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs",
+      "reason": "tiny_dit/build/fixed_batch create real synthetic DiT; 30 backward/clip/AdamW updates gate loss decrease.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-qwen-image-2-1",
+      "kind": "lib",
+      "target": "mlx_gen_qwen_image_2_1",
+      "test": "training::tests::trained_factors_preserve_velocity_through_save_and_reload",
+      "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs",
+      "reason": "tiny_dit/build: LoRA/LoKr x edit/T2I x 3 updates, then BF16 velocity and saved/reloaded Q4/Q8 comparisons.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::attention::tests::fused_full_kernel_matches_host_across_dtypes",
+      "source": "crates/llm/mlx-llm/src/primitives/attention.rs",
+      "reason": "Full fused-kernel numerical matrix: three dtypes x three head dims x six q/k lengths x two masks (108 cells), including 2048-token context, each checked against independent f64 host rows.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::attention::tests::sc7430_fused_sdpa_matches_host_at_long_qlen",
+      "source": "crates/llm/mlx-llm/src/primitives/attention.rs",
+      "reason": "Three query lengths x two head dims x GQA/MHA x two masks (24 cells), asserts fused output strides and f64-host numerical agreement.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::attention::tests::sdpa_long_bf16_causal_gqa_prefill_matches_host",
+      "source": "crates/llm/mlx-llm/src/primitives/attention.rs",
+      "reason": "Long-prefill numerical stress: 4101 query rows and 4133 keys crossing two 2048-row blocks, bf16 GQA plus f64 host edge-row reference.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::attention::tests::sdpa_prefill_matches_host_for_long_qlen",
+      "source": "crates/llm/mlx-llm/src/primitives/attention.rs",
+      "reason": "Eleven prefill/head/GQA geometries x two masks compared against host attention; covers full/vector/unfused kernel routes and cached prefixes.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::attention::tests::sdpa_sliding_window_tiles_match_host",
+      "source": "crates/llm/mlx-llm/src/primitives/attention.rs",
+      "reason": "Three kernel-family head geometries x four windows x whole/tiled execution, each compared to independent host visibility oracle.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::attention::tests::sdpa_tiled_matches_host",
+      "source": "crates/llm/mlx-llm/src/primitives/attention.rs",
+      "reason": "Six vector-kernel geometry/ragged-tail/cached-prefix combinations x two masks; kernel numerical sweep distinct from single-shape SDPA smoke.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::attention::tests::sdpa_tiled_prefill_matches_host_at_small_tiles",
+      "source": "crates/llm/mlx-llm/src/primitives/attention.rs",
+      "reason": "Five tile/eval-group configurations x three masks at 203x250 GQA, full host row comparison; exhaustive tile/mask numerical bookkeeping matrix.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::attention::tests::sdpa_unfused_budget_tiles_match_host",
+      "source": "crates/llm/mlx-llm/src/primitives/attention.rs",
+      "reason": "Large-budget attention stress: 65,536 cached keys, 48 query rows, 90 MiB score tiles; causal and unmasked comparisons to independent host edge rows.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::gated_delta::tests::checkpoint_kernel_per_token_states_match_ops_reference",
+      "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
+      "reason": "Five verify/batch/tiny geometries x three dtypes x two carried-state modes, comparing every per-token checkpoint as well as output/final state.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::gated_delta::tests::chunked_prefill_matches_ops_reference",
+      "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
+      "reason": "Helper expands 512/2048/ragged300-token shapes x three dtypes x zero/carried states on CPU stream; 18 full prefill/reference comparisons.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::gated_delta::tests::metal_kernel_matches_ops_reference",
+      "source": "crates/llm/mlx-llm/src/primitives/gated_delta.rs",
+      "reason": "Helper assert_matches_reference expands six shapes x three dtypes x zero/carried state; includes 512/2048-token prefill with 128x128 state compared to per-token ops reference.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::paged_packed_kv::tests::paged_reader_matches_the_independent_fp32_oracle_across_paths_and_page_orders",
+      "source": "crates/llm/mlx-llm/src/primitives/paged_packed_kv.rs",
+      "reason": "Six dtype/head/page/query/mask geometries x PackedCodeBits::ALL. Helper builds three fragmented/recycled sequences with uneven appends, compares fused kernels and independent fp32 paged oracles across paths.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::paged_packed_kv::tests::speculative_rollback_is_byte_and_position_exact",
+      "source": "crates/llm/mlx-llm/src/primitives/paged_packed_kv.rs",
+      "reason": "Two dtypes x four retained positions, each followed by 1/33/1-token continuations, compares storage and numerical output to independent cache reference.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::prism::tests::fused_rotation_is_bit_identical_to_the_unfused_chain",
+      "source": "crates/llm/mlx-llm/src/primitives/prism.rs",
+      "reason": "Hidden helper expands 15 width/block pairs x three row counts x three dtypes x forward/inverse (270 bitwise comparisons); includes 5120/6144/17408-wide model projections.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::sampler::tests::device_draws_match_the_host_distribution_chi_square",
+      "source": "crates/llm/mlx-llm/src/primitives/sampler.rs",
+      "reason": "Statistical distribution campaign: five knob sets x 6,000 seeded per-token device samples (30,000 draws), reference chi-square check.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::sampler::tests::the_device_draw_is_the_index_order_walk_over_the_reference_weights",
+      "source": "crates/llm/mlx-llm/src/primitives/sampler.rs",
+      "reason": "Exhaustive inverse-CDF uniform sweep: five knob sets x 200 uniforms, each device_draw evaluates and resolves a device token; keep small fixed-seed/greedy/routing unit tests.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "primitives::sampler::tests::the_host_path_draws_the_device_token_for_the_same_uniform",
+      "source": "crates/llm/mlx-llm/src/primitives/sampler.rs",
+      "reason": "Host/device differential sweep: five knob sets x 100 uniforms, host shaping and device_draw for each margin-safe point; not the one-token smoke its comment opening suggests.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "provider::tests::a_one_token_request_working_set_is_priced_under_either_activation_dtype",
+      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "reason": "Allocator/physical-footprint campaign despite one-token name: Llama/Gemma x dense/Q4 65,536-vocabulary snapshots, warmup and repeated second_run_peak measurements, plus pinned-f32 Gemma forwards.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "provider::tests::admission_estimates_cover_the_measured_peak_compressed_and_dense",
+      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "reason": "Measured allocator stress, not arithmetic estimation: 28-layer KV-dominant model, family-qualified prompt, warm both routes, then 600 generated tokens per compressed/dense arm with measured peak memory.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "provider::tests::llama_compressed_kv_matches_dense_at_its_qualified_context",
+      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "reason": "Hidden assert_compressed_matches_dense performs family-qualified long-context dense/compressed/control generations of 24 tokens, teacher-forced per-position parity, and short dense fallback runs.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "provider::tests::no_dense_kv_copy_survives_a_paged_compressed_attention_call",
+      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "reason": "Paged memory-retention/peak campaign: 1536-token warmup and measured prefill then 40 decode steps, resets peak memory each step, validates page-pool growth and absence of transient dense gather.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "provider::tests::no_dense_kv_mirror_survives_a_compressed_attention_call",
+      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "reason": "Memory-retention numerical campaign: 1536-token GQA prefill warmup, repeat prefill, 40 evaluated decode steps with active-memory and per-layer dense-mirror accounting.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "provider::tests::paged_compressed_kv_logits_match_contiguous_compressed_and_dense_paged",
+      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "reason": "Three-arm teacher-forced numerical comparison: 150-token prompt and 60 decode tokens through paged compressed, contiguous compressed, and dense paged caches.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "provider::tests::paged_compressed_requests_share_a_fragmented_pool_and_cancellation_frees_pages",
+      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "reason": "Long interleaved numerical lifecycle comparison: requests decode 30/50/50 tokens, cancellation and fragmented page reuse, plus standalone reference reruns for every stream.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "provider::tests::qwen3_compressed_kv_matches_dense_at_its_qualified_context",
+      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "reason": "Hidden assert_compressed_matches_dense performs family-qualified long-context dense/compressed/control generations of 24 tokens, teacher-forced per-position parity, and short dense fallback runs.",
+      "platforms": [
+        "darwin"
+      ]
+    }
+  ]
+}

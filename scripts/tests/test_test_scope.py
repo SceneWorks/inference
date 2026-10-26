@@ -221,7 +221,7 @@ class FixtureWorkspace(unittest.TestCase):
             self.assertIsNone(self.affected("Cargo.toml"), edit)
 
     def test_build_and_ci_wiring_paths_run_everything(self) -> None:
-        for path in ("rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/ci.yml", "scripts/ci/test_scope.py"):
+        for path in ("rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/ci.yml", "scripts/ci/test_scope.py", "scripts/ci/test_suites.py", "scripts/ci/test_suites.json"):
             self.assertIsNone(self.affected("crates/core/src/lib.rs", path), path)
         self.assertIsNone(self.affected())
 
