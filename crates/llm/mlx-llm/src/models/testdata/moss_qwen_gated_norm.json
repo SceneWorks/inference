@@ -1,0 +1,73 @@
+{
+  "source": "Exact frozen Transformers Qwen3_5RMSNormGated class extracted with AST; synthetic CPU tensors only",
+  "sourceSha256": "aee59d55ee4e8ce0e50bf0e279796b85c2c66a28dfae55c3fcbb62fa9bcba048",
+  "torch": "2.9.1",
+  "device": "cpu",
+  "dtype": "bfloat16",
+  "cases": [
+    {
+      "name": "normalization_rounding",
+      "x": [
+        [
+          1.0,
+          3.0
+        ]
+      ],
+      "weight": [
+        1.0078125,
+        0.9921875
+      ],
+      "gate": [
+        [
+          -1.296875,
+          0.69921875
+        ]
+      ],
+      "eps": 1e-06,
+      "expected": [
+        [
+          -0.1259765625,
+          0.625
+        ]
+      ],
+      "wrong_fused_norm_early_gate": [
+        [
+          -0.1259765625,
+          0.62109375
+        ]
+      ]
+    },
+    {
+      "name": "sigmoid_rounding_dense_ffn",
+      "x": [
+        [
+          1.0,
+          1.0
+        ]
+      ],
+      "weight": [
+        1.0,
+        1.0
+      ],
+      "gate": [
+        [
+          1.90625,
+          1.90625
+        ]
+      ],
+      "eps": 1e-06,
+      "expected": [
+        [
+          1.65625,
+          1.65625
+        ]
+      ],
+      "wrong_fused_norm_early_gate": [
+        [
+          1.6640625,
+          1.6640625
+        ]
+      ]
+    }
+  ]
+}
