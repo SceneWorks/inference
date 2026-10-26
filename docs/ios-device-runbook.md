@@ -410,13 +410,15 @@ contract surface at the campaign's load shape): `s` (optional phase eviction),
 when the rung declares no parameter. `steps` is the denoise step count the case
 runs (`0` = the provider's own default). A case is executed exactly as selected (a
 token outside the artifact's declared space is a typed `strategy` refusal) and
-recorded in the evidence key's execution levers. The listing (schema 2) names each
+recorded in the evidence key's execution levers. The listing (schema 3) names each
 case's `purpose` (`resident`, `optimized`, `validation_steps`,
 `validation_geometry`) and `repeats`, plus every route/tier the provider does not
-serve (`unserved`, never silently dropped). Control-required routes
-(`CONTROL_REQUIRED_ROUTES`: `z_image_turbo_control`) have one family per accepted
-control kind (`control_pose`, `control_canny`, `control_depth`, `reference_pose`,
-...) and no plain text mode.
+serve (`unserved`, never silently dropped). `recipe_coverage` maps every accepted
+registered recipe to its measured representative. Control-required routes
+(`CONTROL_REQUIRED_ROUTES`: `z_image_turbo_control`) retain every accepted control
+kind (`control_pose`, `control_canny`, `control_depth`, `reference_pose`, ...),
+with no plain text mode. Aliases share captures only when their source-resolved
+mode and configured role graph are identical.
 
 ### Anchors and derivation: the recorded memory-anchor rule (epic 16774)
 
@@ -541,17 +543,23 @@ phase is `exact` when the lifetime peak rose inside it, else an upper bound (mas
 phase). An unattributed phase is priced at the whole-run peak.
 
 **Campaign size.** `campaign.py list --snapshots <dir of the route/tier slots that will be pushed>`
-(the runner's own catalog, never a hand list) groups the catalog into anchor FAMILIES by the
-slots' architecture digests and plans <!-- COUNT --> Without `--snapshots` the listing is
-weights-free and conservative: every route is its own family. The 20,000-case budget is gone by
-construction (`--max-cases` is an optional cap).
+uses the runner's actual catalog, never a hand-filtered case list. It selects one
+accepted recipe per provider, route, architecture, tier and source-resolved
+mode/configured role graph, then plans one resident and two optimized captures
+per representative. The schema-3 `recipe_coverage` records every discovered
+accepted recipe and allocation class beside its representative. Unresolved
+settings and unserved routes remain explicit. The controller rejects stale or
+incomplete coverage mappings. `--max-cases` is an optional execution cap, not
+permission to claim completion from partial coverage.
 
-Use the current catalog's family keys over the actual provisioned snapshots.
-Header similarity alone does not authorize borrowing between text, reference,
-control or init graphs. Retain architecture, tier, sampling-allocation class and
-accepted mode distinctions, including the SANA/Sprint, SDXL-family, Anima, Iris
-generation/restoration/depth and Z-Image variants. Share endpoint captures only
-where the source-owned catalog establishes the same family.
+Exact native evidence identities still retain sampling-allocation classes. The
+approved engineering path derives other registered settings and optimization
+rungs by repricing their actual phase pressure, with no downward credit and the
+measured margin. It does not require a sampler/settings Cartesian capture grid.
+Retain SANA/Sprint, SDXL-family routes, Anima, Iris generation/restoration/depth,
+Z-Image and distinct reference/control/init graphs. Header similarity alone
+does not permit foreign-route, artifact or graph reuse; only the source-owned
+representative mapping and compatible engineering evidence authorize derivation.
 
 **Validation cases (part of the campaign, not optional).** For the first optimized family in
 catalog order: `validation_steps` — the optimized anchor at the provider's full step count,
