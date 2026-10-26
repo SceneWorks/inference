@@ -9,13 +9,25 @@ import subprocess
 import tempfile
 import unittest
 import yaml
+from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / '.github/workflows'
 
 
 def document(name):
-    return yaml.safe_load((WORKFLOWS / name).read_text(encoding='utf-8'))
+    source = (WORKFLOWS / name).read_text(encoding='utf-8')
+    if name == 'real-weights.yml':
+        source = real_weights_inline_text(source, ROOT)
+    value = yaml.safe_load(source)
+    if name == 'model-inference-proofs.yml':
+        for step in value['jobs']['prove']['steps']:
+            command = step.get('run', '')
+            if command.startswith(('. ./scripts/ci/real-weights/model-proof-execute/',
+                                   'source scripts/ci/real-weights/model-proof-execute/')):
+                path = command.split(' ', 1)[1].removeprefix('./')
+                step['run'] = (ROOT / path).read_text(encoding='utf-8')
+    return value
 
 
 def yue_metal_launcher_errors(job, expected_cwd, wait_seconds, names):
@@ -84,6 +96,15 @@ class ModelWorkflowRoutes(unittest.TestCase):
 
     def test_proof_endpoints_select_rustup_before_reporting_or_building(self):
         selected = []
+        bridge_raw = yaml.safe_load((WORKFLOWS / 'real-weights.yml').read_text(encoding='utf-8'))
+        dedicated_raw = yaml.safe_load((WORKFLOWS / 'model-inference-proofs.yml').read_text(encoding='utf-8'))
+        for name in ('Select real pinned Rust toolchain on Windows',
+                     'Report actual host and pinned toolchain (no model execution)'):
+            bridge_step = next(step for step in bridge_raw['jobs']['model-proof-execute']['steps']
+                               if step.get('name') == name)
+            dedicated_step = next(step for step in dedicated_raw['jobs']['prove']['steps']
+                                  if step.get('name') == name)
+            self.assertEqual(bridge_step['run'], dedicated_step['run'])
         for filename, name in (('model-inference-proofs.yml', 'prove'), ('real-weights.yml', 'model-proof-execute')):
             steps = document(filename)['jobs'][name]['steps']
             posix = next(step for step in steps if step.get('name') == 'Select Rustup proxies on Linux and macOS')

@@ -131,32 +131,10 @@ jobs:
       - name: Select real pinned Rust toolchain on Windows
         if: runner.os == 'Windows'
         shell: powershell
-        run: |
-          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"([^"]+)"$' | Select-Object -First 1).Matches.Groups[1].Value
-          if (-not $channel) { throw 'Repository Rust toolchain pin is missing' }
-          $proofRustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
-          $bin = Join-Path $proofRustupHome "toolchains\${channel}-x86_64-pc-windows-msvc\bin"
-          foreach ($tool in @('cargo', 'rustc')) {
-            if (-not (Test-Path -LiteralPath (Join-Path $bin "$tool.exe") -PathType Leaf)) {
-              throw "Real pinned Windows toolchain is missing $tool.exe under $bin"
-            }
-          }
-          Add-Content -Path $env:GITHUB_ENV -Value "MODEL_PROOF_RUST_BIN=$bin"
-          Add-Content -Path $env:GITHUB_PATH -Value $bin
+        run: . ./scripts/ci/real-weights/model-proof-execute/windows-rust.ps1
       - name: Report actual host and pinned toolchain (no model execution)
         shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == Windows ]]; then
-            printf 'Rust bin: %s\nCargo cache: %s\n' "$MODEL_PROOF_RUST_BIN" "$CARGO_HOME"
-            command -v cargo
-            command -v rustc
-          else
-            rustup show
-          fi
-          cargo --version --verbose
-          rustc -vV
-          hostname
-          df -h .
+        run: source scripts/ci/real-weights/model-proof-execute/host.sh
       - name: Require Python 3.12 on macOS
         if: runner.os == 'macOS'
         shell: bash

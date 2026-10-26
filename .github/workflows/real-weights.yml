@@ -6554,20 +6554,12 @@ jobs:
       - name: Install managed CPython 3.12 on Linux
         if: runner.os == 'Linux'
         shell: bash
-        run: |
-          uv python install 3.12.10 --managed-python --no-bin --no-config
-          PYTHON="$(uv python find 3.12.10 --managed-python --no-project --no-config)"
-          "$PYTHON" -c 'import sys; assert sys.version_info[:3] == (3,12,10), sys.version'
-          printf 'REVIEWED_PYTHON=%s\n' "$PYTHON" >> "$GITHUB_ENV"
+        run: source scripts/ci/real-weights/model-proof-plan/plan-python.sh
       - name: Validate registered cases and explicit resource policy
         id: plan
         env:
           MODEL_PROOF_BINDING: ${{ inputs.ios_pricing_compile_binding }}
-        run: |
-          "$REVIEWED_PYTHON" -I scripts/ci/model_inference_proofs.py --plan \
-            --binding-env MODEL_PROOF_BINDING \
-            --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
-          "$REVIEWED_PYTHON" -I -c 'import json,os; p=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"model-proof-plan.json"),encoding="utf-8")); matrix={"include":[{"runner":p["runner"],"asset_setup":p["asset_setup"]}]}; open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8").write("matrix="+json.dumps(matrix,separators=(",",":"))+"\nbackend="+p["backend"]+"\nrequest="+json.dumps(p["request"],separators=(",",":"))+"\n")'
+        run: source scripts/ci/real-weights/model-proof-plan/plan.sh
 
   model-proof-execute:
     name: Explicit ${{ needs.model-proof-plan.outputs.backend }} model tests
@@ -6621,55 +6613,24 @@ jobs:
       - name: Install managed CPython 3.12 on Linux
         if: runner.os == 'Linux'
         shell: bash
-        run: |
-          uv python install 3.12.10 --managed-python --no-bin --no-config
-          PYTHON="$(uv python find 3.12.10 --managed-python --no-project --no-config)"
-          "$PYTHON" -c 'import sys; assert sys.version_info[:3] == (3,12,10), sys.version'
-          printf 'REVIEWED_PYTHON=%s\n' "$PYTHON" >> "$GITHUB_ENV"
+        run: source scripts/ci/real-weights/model-proof-execute/linux-python.sh
       - name: Set owned proof paths and actual runner environment
         shell: bash
         env:
           OWNED_PROOF_EVIDENCE: ${{ runner.temp }}/model-proof-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           ACTUAL_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        run: |
-          printf 'MODEL_PROOF_EVIDENCE=%s\n' "$OWNED_PROOF_EVIDENCE" >> "$GITHUB_ENV"
-          printf 'MODEL_PROOF_RUNNER_ENVIRONMENT=%s\n' "$ACTUAL_RUNNER_ENVIRONMENT" >> "$GITHUB_ENV"
+        run: source scripts/ci/real-weights/model-proof-execute/paths.sh
       - name: Select Rustup proxies on Linux and macOS
         if: runner.os != 'Windows'
         shell: bash
-        run: |
-          RUSTUP_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
-          for tool in cargo rustc rustup; do test -x "$RUSTUP_BIN/$tool"; done
-          printf '%s\n' "$RUSTUP_BIN" >> "$GITHUB_PATH"
+        run: source scripts/ci/real-weights/model-proof-execute/posix-rust.sh
       - name: Select real pinned Rust toolchain on Windows
         if: runner.os == 'Windows'
         shell: powershell
-        run: |
-          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"([^"]+)"$' | Select-Object -First 1).Matches.Groups[1].Value
-          if (-not $channel) { throw 'Repository Rust toolchain pin is missing' }
-          $proofRustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
-          $bin = Join-Path $proofRustupHome "toolchains\${channel}-x86_64-pc-windows-msvc\bin"
-          foreach ($tool in @('cargo', 'rustc')) {
-            if (-not (Test-Path -LiteralPath (Join-Path $bin "$tool.exe") -PathType Leaf)) {
-              throw "Real pinned Windows toolchain is missing $tool.exe under $bin"
-            }
-          }
-          Add-Content -Path $env:GITHUB_ENV -Value "MODEL_PROOF_RUST_BIN=$bin"
-          Add-Content -Path $env:GITHUB_PATH -Value $bin
+        run: . ./scripts/ci/real-weights/model-proof-execute/windows-rust.ps1
       - name: Report actual host and pinned toolchain (no model execution)
         shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == Windows ]]; then
-            printf 'Rust bin: %s\nCargo cache: %s\n' "$MODEL_PROOF_RUST_BIN" "$CARGO_HOME"
-            command -v cargo
-            command -v rustc
-          else
-            rustup show
-          fi
-          cargo --version --verbose
-          rustc -vV
-          hostname
-          df -h .
+        run: source scripts/ci/real-weights/model-proof-execute/host.sh
       - name: Require Python 3.12 on macOS
         if: runner.os == 'macOS'
         shell: bash
@@ -6687,32 +6648,16 @@ jobs:
       - name: Run exact registered model tests under external guards (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; else PYTHON="$REVIEWED_PYTHON"; fi
-          "$PYTHON" -I scripts/ci/model_inference_proofs.py \
-            --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
-            --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
+        run: source scripts/ci/real-weights/model-proof-execute/run-posix.sh
       - name: Run exact registered model tests under external guards (Windows CUDA)
         if: runner.os == 'Windows'
         shell: cmd
-        run: |
-          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-          if errorlevel 1 exit /b %ERRORLEVEL%
-          if not defined REVIEWED_PYTHON (
-            echo A reviewed absolute Python 3.12 interpreter must be provisioned.
-            exit /b 1
-          )
-          set "RUSTC_WRAPPER="
-          "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%MODEL_PROOF_EVIDENCE%"
+        run: call scripts\ci\real-weights\model-proof-execute\run-windows.cmd
       - name: Validate owned evidence tree before any upload
         id: evidence
         if: always()
         shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; elif [[ "$RUNNER_OS" == Windows ]]; then PYTHON="$REVIEWED_PYTHON"; else PYTHON="$REVIEWED_PYTHON"; fi
-          "$PYTHON" -I scripts/ci/model_inference_proofs.py --verify-artifacts \
-            --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
-            --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
+        run: source scripts/ci/real-weights/model-proof-execute/evidence.sh
       - name: Upload exact case evidence, safe generated outputs, logs and summary
         if: always() && steps.evidence.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
