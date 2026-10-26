@@ -435,10 +435,11 @@ class DeviceSession:
         row = failure(key, "case did not produce a report")
         started = time.time()
         end = time.monotonic() + self.args.timeout_seconds
-        artifact = self.args.output.parent / (self.args.output.stem + ".artifacts") / (artifact_stem(key) + ("-probe" if refusal_only else ""))
         launcher_code = None
         run_id = uuid.uuid4().hex
         self.run_id = run_id
+        artifact_name = artifact_stem(key) + ("-probe" if refusal_only else "") + "-" + run_id
+        artifact = self.args.output.parent / (self.args.output.stem + ".artifacts") / artifact_name
         exit_verified = False
         report_received = False
         report_copy_timed_out = False

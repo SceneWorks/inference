@@ -1,6 +1,6 @@
 """CPU-only campaign tests. Every subprocess is globally trapped: mutations cannot launch tools.
 
-CI_IMPACT: four bounded mock/receipt checks (<0.1 s); no device, Metal, or model execution.
+CI_IMPACT: five bounded mock/receipt checks (<0.1 s); no device, Metal, or model execution.
 """
 import contextlib
 import importlib.util
@@ -195,7 +195,7 @@ class CampaignTests(unittest.TestCase):
         result = session.run_case(key)
         self.assertEqual(result["case"], key)
         self.assertEqual(result["status"], "successful", result)
-        files = list((self.root / "run.artifacts" / stem).glob("*.png"))
+        files = list((self.root / "run.artifacts" / (stem + "-fixture-run")).glob("*.png"))
         self.assertEqual(len(files), 1)
         self.assertLess(len(files[0].name), 255)
         for invalid in (key + "/extra", key + "/", key + "."):
@@ -315,7 +315,7 @@ class CampaignTests(unittest.TestCase):
 
     def test_device_deadline_exit_code_entitlement_and_artifact_copy(self):
         session = self.fake_session(self.success())
-        attempt_path = self.root / "run.artifacts" / campaign.artifact_stem(self.keys[0]) / "attempt.json"
+        attempt_path = self.root / "run.artifacts" / (campaign.artifact_stem(self.keys[0]) + "-fixture-run") / "attempt.json"
         def launch(_):
             self.assertTrue(attempt_path.is_file(), "host nonce must persist before devicectl launch")
             return subprocess.CompletedProcess([], 0, "", "")
@@ -335,6 +335,35 @@ class CampaignTests(unittest.TestCase):
         session = self.fake_session(self.success(), entitlement="NO")
         session.args.output = self.root / "wrong-entitlement.jsonl"
         self.assertEqual(session.run_case(self.keys[0])["status"], "diagnostic_failure")
+
+    def test_repeat_attempts_preserve_each_nonce_bound_receipt_and_report(self):
+        key = self.keys[0]
+        nonces = ["a" * 32, "b" * 32, "c" * 32]
+        report = self.success(key)
+        session = self.fake_session(report)
+        with mock.patch.object(campaign.uuid, "uuid4", side_effect=[mock.Mock(hex=n) for n in nonces]):
+            report["run_id"] = nonces[0]
+            first = session.run_case(key)
+            report["run_id"] = nonces[1]
+            second = session.run_case(key)
+            report["run_id"] = nonces[0]  # A stale third report must fail without erasing either repeat.
+            failed = session.run_case(key)
+        self.assertEqual([first["status"], second["status"], failed["status"]],
+                         ["successful", "successful", "diagnostic_failure"])
+        self.assertIn("different case launch", failed["reason"])
+        self.assertEqual(failed["run_id"], nonces[2])
+        paths = [Path(row["host_artifact_directory"]) for row in (first, second, failed)]
+        self.assertEqual(len(set(paths)), 3)
+        for path, nonce in zip(paths, nonces):
+            self.assertEqual(path.name, campaign.artifact_stem(key) + "-" + nonce)
+            attempt = json.loads((path / "attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual((attempt["run_id"], attempt["case"], attempt["case_stem"]),
+                             (nonce, key, campaign.artifact_stem(key)))
+            self.assertTrue((path / "report.txt").is_file())
+        self.assertEqual([campaign.parse_report((path / "report.txt").read_text(encoding="utf-8"), key)["run_id"]
+                          for path in paths], [nonces[0], nonces[1], nonces[0]])
+        self.assertTrue(all((path / ("campaign-" + campaign.artifact_stem(key) + "-0.png")).is_file()
+                            for path in paths[:2]))
 
     def test_report_copy_timeout_reads_once_after_exit_and_retains_matched_diagnostic(self):
         key = self.keys[0]
