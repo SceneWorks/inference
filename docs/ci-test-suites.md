@@ -87,10 +87,39 @@ Healthy retained Candle CPU artifact/memory targets took 411s (`candle-gen-flux2
 40240078690. Routine target execution has a 900s ceiling, above those observations;
 exhaustive cases have a 600s ceiling each. Listing and metadata calls are bounded
 to 60s/120s, compilation to 2400s, and whole suite invocations to 2700s routine or
-7200s exhaustive. A timeout terminates the child process tree, including rank
-fixtures. All CI jobs also have explicit deadlines; the ordinary Candle CPU and
-hosted Metal jobs are bounded to 60 and 75 minutes, with larger explicit
-exhaustive budgets of 150 and 180 minutes.
+7200s exhaustive by default. The two Candle CPU matrix members explicitly allow
+3600s routine per invocation for their full package graphs. A timeout terminates
+the child process tree, including rank fixtures. All CI jobs also have explicit
+deadlines; ordinary Candle CPU members and hosted Metal are bounded to 75 minutes,
+with larger explicit exhaustive budgets of 150 and 180 minutes respectively.
+
+The CPU split preserves the existing full graph: 20 base native targets and 76 gen
+native targets, with the original package selectors, `--lib`/`--tests` flags and
+`-j 1` linker limit. They run independently on hosted runners under the existing
+`candle-cpu-test` job ID. Matrix fail-fast is disabled, and either member's failure
+fails that required dependency of `CI gate`; neither member masks failures.
+
+In run 40310828863, the former serial job's base group took 15m05s (9m11s
+compilation, 5m53s execution). The gen group's compilation took another 11m27s;
+the 60-minute job limit canceled it while its healthy Qwen Image target had run
+for 4m32s. Compared with completed baseline run 40240078690, 63 of 76 gen targets
+had finished and 13 remained or were active; those 13 baseline runtimes sum to
+337.90s. The matched completed targets ran at 1.509 times the baseline aggregate
+duration. Applying that observed ratio to the remaining work estimates about
+64 minutes for the serial job and 48 minutes for gen's invocation. These are
+estimates, not completion measurements. The independent 60-minute invocation
+budgets and 75-minute job bounds allow headroom above that gen estimate, including
+setup and cache restoration, while retaining the 900s target watchdog. Metal and
+explicit exhaustive budgets are unchanged.
+
+The pinned `Swatinem/rust-cache` action includes `key: ${{ matrix.group }}` in
+both primary and restore prefixes, alongside the job, platform and Rust environment.
+Base and gen therefore save distinct main-only dependency caches: a fast base run
+cannot fill gen's immutable key with only base dependencies. This changes the
+previous cache prefix, so the first runs will be cold until main saves each group;
+PR runs still only restore. Gen also loses dependencies compiled by the old prior
+base step. The first split run must measure that extra compilation and confirm the
+bounds; no cache-hit or exact wall-clock reduction is claimed in advance.
 
 These bounds prevent an accidental campaign/hang from consuming the former
 six-hour job default. They are not performance claims. Run 40249723473 recorded

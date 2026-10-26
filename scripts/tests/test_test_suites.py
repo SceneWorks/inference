@@ -182,6 +182,43 @@ class TestSuites(unittest.TestCase):
         self.assertEqual(cases[mlx]["platforms"], ["darwin"])
         self.assertNotIn(("candle-gen-iris", "test", "integration", name), cases)
 
+    def test_cpu_matrix_preserves_both_groups_budgets_caches_and_failure_propagation(self):
+        import yaml
+
+        jobs = yaml.safe_load((suites.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]
+        cpu = jobs["candle-cpu-test"]
+        self.assertEqual(cpu["timeout-minutes"], "${{ inputs.test_suite == 'exhaustive' && 150 || 75 }}")
+        self.assertEqual(cpu["env"]["TEST_SUITE_DEADLINE_SECONDS"], "${{ inputs.test_suite == 'exhaustive' && '7200' || '3600' }}")
+        steps = [step for step in cpu["steps"] if "test_suites.py" in step.get("run", "")]
+        self.assertEqual(cpu["strategy"], {"fail-fast": False, "matrix": {"group": ["base", "gen"]}})
+        self.assertNotIn("continue-on-error", cpu)
+        self.assertEqual(cpu["runs-on"], "ubuntu-latest")
+        cache = next(step for step in cpu["steps"] if step.get("name") == "Cache Cargo")
+        self.assertEqual(cache["with"]["key"], "${{ matrix.group }}")
+        self.assertNotIn("shared-key", cache["with"])
+        self.assertEqual(cache["with"]["save-if"], "${{ github.ref == 'refs/heads/main' }}")
+        self.assertEqual(len(steps), 2)
+        self.assertEqual([step["if"] for step in steps], ["matrix.group == 'base'", "matrix.group == 'gen'"])
+        selectors = [
+            "-p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu",
+            "-p 'candle-gen*'",
+        ]
+        targets = ["--lib", "--lib --tests"]
+        for step, selector, target in zip(steps, selectors, targets):
+            self.assertIn(f'select --scope "$TEST_SCOPE" {selector})', step["run"])
+            self.assertIn(f'cargo test --locked {target} -j 1 "${{packages[@]}}"', step["run"])
+        self.assertIn("candle-cpu-test", jobs["gate"]["needs"])
+        self.assertIn("always()", jobs["gate"]["if"])
+        gate = jobs["gate"]["steps"][0]
+        self.assertEqual(gate["env"]["RESULTS"], "${{ join(needs.*.result, ' ') }}")
+        self.assertIn("success|skipped) ;;", gate["run"])
+        self.assertIn("exit 1", gate["run"])
+        for step in steps:
+            self.assertNotIn("continue-on-error", step)
+            self.assertIn("-j 1", step["run"])
+            self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test', step["run"])
+        self.assertEqual(jobs["macos-metal"]["timeout-minutes"], "${{ inputs.test_suite == 'exhaustive' && 180 || 75 }}")
+
     def test_cuda_rank_fixture_preserves_the_parent_device_binding(self):
         source = (suites.ROOT / "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs").read_text(encoding="utf-8")
         start = source.index("fn a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in()")

@@ -344,8 +344,8 @@ jobs:
   # `changes.outputs.candle_cpu` and listed in the `gate` job's `needs:`.
   #
   # (sc-19447 later split `candle-cpu-test`'s single invocation in two and gave the `candle-gen*`
-  # half `--tests`, so that job now carries two steps rather than one. Nothing was dropped there
-  # either; see the notes on those steps.)
+  # half `--tests`. sc-27011 runs those unchanged groups in separate matrix members;
+  # nothing was dropped in either split. See the notes on those steps.)
   #
   # Why split rather than trim: the serial ordering was never a correctness requirement. Measured
   # over nine successful PR runs on 2026-08-15, the steps were independent and the job was bounded
@@ -363,10 +363,10 @@ jobs:
   # second policy test caps that step's comment block at four lines — so the note explaining the
   # move lives here rather than on the step.
   #
-  # Cache note: rust-cache derives its key from the job, so these four save four separate baselines
-  # instead of one. That is affordable only because `save-if` below restricts saving to `main` —
-  # without it, four jobs would write four PR-scoped caches per open PR. See the `save-if` note on
-  # the `workspace` job's cache step.
+  # Cache note: rust-cache derives its key from the job, plus the explicit matrix group for
+  # package tests, so these lanes save five separate baselines instead of one. This is affordable
+  # because `save-if` below restricts saving to `main`; PRs only restore these baselines.
+  # See the `save-if` note on the `workspace` job's cache step.
 
   candle-cpu-lint:
     timeout-minutes: 60
@@ -426,12 +426,20 @@ jobs:
         run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh candle-gen
 
   candle-cpu-test:
-    timeout-minutes: ${{ inputs.test_suite == 'exhaustive' && 150 || 60 }}
-    name: Candle CPU package tests (Linux)
+    timeout-minutes: ${{ inputs.test_suite == 'exhaustive' && 150 || 75 }}
+    name: Candle CPU package tests (Linux, ${{ matrix.group }})
     needs: changes
     if: >-
       (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [base, gen]
+    env:
+      # Run 40310828863 projects ~48m for gen alone. Independent groups retain
+      # 60m invocation budgets plus setup/cache headroom; see docs/ci-test-suites.md.
+      TEST_SUITE_DEADLINE_SECONDS: ${{ inputs.test_suite == 'exhaustive' && '7200' || '3600' }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install pinned Rust toolchain
@@ -439,8 +447,12 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          # rust-cache includes this in both save and restore prefixes: a fast base
+          # member cannot occupy gen's immutable main cache key with fewer dependencies.
+          key: ${{ matrix.group }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test Candle packages
+        if: matrix.group == 'base'
         # All-target Clippy in `candle-cpu-lint` checks every integration and real-weight target.
         # Execute the package unit/catalog suites one linker at a time: concurrently linking several
         # provider test binaries exceeds the hosted runner's memory-backed linker capacity and
@@ -469,7 +481,7 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
-          python3 scripts/ci/test_suites.py "$TEST_SUITE" -- cargo test --locked --lib -j 1 "${packages[@]}"
+          python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test --locked --lib -j 1 "${packages[@]}"
       # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
       # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
       # under all-target Clippy without running them, `windows-cuda-check` compiles them
@@ -549,6 +561,7 @@ jobs:
       #     That is the real price, it is paid per push, and it is the first thing to re-measure
       #     (or to split across runners) if the candle lane's cost is ever questioned.
       - name: Test Candle gen packages and integration targets
+        if: matrix.group == 'gen'
         # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
         # tests"); push: main, tags and dispatches run the whole set.
         env:
@@ -562,7 +575,7 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
-          python3 scripts/ci/test_suites.py "$TEST_SUITE" -- cargo test --locked --lib --tests -j 1 "${packages[@]}"
+          python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test --locked --lib --tests -j 1 "${packages[@]}"
 
   candle-cpu-conformance:
     timeout-minutes: 45

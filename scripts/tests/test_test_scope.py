@@ -331,6 +331,10 @@ class WorkflowWiringTests(unittest.TestCase):
             for name in names:
                 with self.subTest(step=name):
                     step = steps[name]
+                    if job == "candle-cpu-test":
+                        group = "base" if name == "Test Candle packages" else "gen"
+                        self.assertIn(group, self.workflow["jobs"][job]["strategy"]["matrix"]["group"])
+                        self.assertEqual(step["if"], f"matrix.group == '{group}'")
                     self.assertEqual(step["env"]["TEST_SCOPE"], "${{ needs.changes.outputs.test_scope }}")
                     run = step["run"]
                     self.assertIn('scripts/ci/test_scope.py select --scope "$TEST_SCOPE"', run)
