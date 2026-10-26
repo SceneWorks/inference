@@ -96,6 +96,14 @@ pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
 pub use models::CausalLm;
 pub use provider::LlamaProvider;
 pub use residency::{EncoderResidency, StreamObservation};
+
+/// Header-only conservative load bound for a caller-provisioned LLM snapshot. Includes source,
+/// conversion/derived arrays and loader staging/host allocations under the same policy used by
+/// the LLM provider's load admission. It is not an activation/KV-cache peak or a measurement.
+/// Media consumers can conservatively reserve this separately for a resident companion VLM.
+pub fn load_memory_required_bytes(spec: &core_llm::LoadSpec) -> core_llm::Result<u64> {
+    load_memory::required_bytes(spec)
+}
 pub use snapshot::{
     write_hf_snapshot, write_hf_snapshot_without_native_mtp, write_snapshot, SnapshotReport,
     SnapshotTokenizer,

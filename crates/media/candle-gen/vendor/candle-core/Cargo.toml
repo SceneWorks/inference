@@ -57,7 +57,10 @@ rayon = "1.7.0"
 safetensors = "0.7.0"
 thiserror = "2"
 yoke = { version = "0.8.1", features = ["derive"] }
-zip = { version = "9", default-features = false }
+# ZIP 9's `deflate` selects zlib-rs (and zopfli). Use miniz for archive I/O without
+# changing the flate2 encoder backend of downstream consumers (e.g. PNG writers).
+zip = { version = "9.0.0", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokenizers = { version = "0.22.0", default-features = false, features = ["onig"] }
 

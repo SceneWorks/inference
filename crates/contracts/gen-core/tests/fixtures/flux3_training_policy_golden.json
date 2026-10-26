@@ -1,0 +1,178 @@
+{
+  "accumulation_evidence": "Accelerate1.12.0 authoritative source backward/default-plugin contract audited; NOT a dependency pin or installed Accelerate execution",
+  "clips": [
+    {
+      "clipped": [
+        0.5999999046325684,
+        0.7999998331069946
+      ],
+      "coefficient": 0.19999995827674866,
+      "gradient": [
+        3.0,
+        4.0
+      ],
+      "max_norm": 1.0,
+      "norm": 5.0
+    },
+    {
+      "clipped": [
+        2.9999992847442627,
+        3.9999990463256836
+      ],
+      "coefficient": 0.9999997615814209,
+      "gradient": [
+        3.0,
+        4.0
+      ],
+      "max_norm": 5.0,
+      "norm": 5.0
+    },
+    {
+      "clipped": [
+        0.0,
+        0.0
+      ],
+      "coefficient": 0.0,
+      "gradient": [
+        0.0,
+        0.0
+      ],
+      "max_norm": 0.0,
+      "norm": 0.0
+    }
+  ],
+  "optimization_sha256": "e9cd7c846beec6c4e0f55a74c8a07b55c2d192200a0f7ece9022a3c40846930e",
+  "reference_environment": {
+    "Pillow": "12.3.0",
+    "accelerate": "not-installed",
+    "datasets": "not-installed",
+    "diffusers": "not-installed",
+    "python": "3.12.11 (main, Aug 18 2025, 19:17:54) [MSC v.1944 64 bit (AMD64)]",
+    "torch": "2.14.1+cpu",
+    "transformers": "5.20.0"
+  },
+  "schedules": [
+    {
+      "base_lr": 0.0003,
+      "cycles": 2,
+      "multipliers": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "name": "constant",
+      "power": 2.0,
+      "total_updates": 6,
+      "warmup": 2
+    },
+    {
+      "base_lr": 0.0003,
+      "cycles": 2,
+      "multipliers": [
+        0.0,
+        0.5,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "name": "constant_with_warmup",
+      "power": 2.0,
+      "total_updates": 6,
+      "warmup": 2
+    },
+    {
+      "base_lr": 0.0003,
+      "cycles": 2,
+      "multipliers": [
+        0.0,
+        0.5,
+        1.0,
+        0.75,
+        0.5,
+        0.25,
+        0.0,
+        0.0
+      ],
+      "name": "linear",
+      "power": 2.0,
+      "total_updates": 6,
+      "warmup": 2
+    },
+    {
+      "base_lr": 0.0003,
+      "cycles": 2,
+      "multipliers": [
+        0.0,
+        0.5,
+        1.0,
+        0.8535533905932736,
+        0.5,
+        0.14644660940672627,
+        0.0,
+        0.14644660940672616
+      ],
+      "name": "cosine",
+      "power": 2.0,
+      "total_updates": 6,
+      "warmup": 2
+    },
+    {
+      "base_lr": 0.0003,
+      "cycles": 2,
+      "multipliers": [
+        0.0,
+        0.5,
+        1.0,
+        0.5,
+        1.0,
+        0.5,
+        0.0,
+        0.0
+      ],
+      "name": "cosine_with_restarts",
+      "power": 2.0,
+      "total_updates": 6,
+      "warmup": 2
+    },
+    {
+      "base_lr": 0.0003,
+      "cycles": 2,
+      "multipliers": [
+        0.0,
+        0.5,
+        1.0,
+        0.5626458333333334,
+        0.25025000000000003,
+        0.0628125,
+        0.0003333333333333333,
+        0.0003333333333333333
+      ],
+      "name": "polynomial",
+      "power": 2.0,
+      "total_updates": 6,
+      "warmup": 2
+    }
+  ],
+  "schema": 1,
+  "three_micro_accumulation_two": [
+    {
+      "accumulated_gradient": 2.0,
+      "micro_step": 2,
+      "parameter": 0.9900000095367432
+    },
+    {
+      "accumulated_gradient": 4.5,
+      "micro_step": 3,
+      "parameter": 0.9804792404174805
+    }
+  ],
+  "training_reference": "7ecb1e1b4fe500be7fb7381a7bb79a24d7fa3941"
+}

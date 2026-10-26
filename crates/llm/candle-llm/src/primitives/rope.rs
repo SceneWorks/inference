@@ -28,6 +28,31 @@ pub struct Rope {
 }
 
 impl Rope {
+    /// Explicit HF TRAINING buffer policy: Module.to(selected dtype) rounds the
+    /// stored inverse frequencies, then forward widens those VALUES to F32 for
+    /// phase/trig. Inference constructors retain their unrounded F32 schedule.
+    /// Only frozen configuration constants cross this host conversion boundary.
+    pub fn with_training_frequency_storage(&self, dtype: DType) -> Result<Self> {
+        if !matches!(dtype, DType::F32 | DType::BF16 | DType::F16) {
+            return Err(Error::Unsupported(
+                "training RoPE frequency storage requires F32/F16/BF16".into(),
+            ));
+        }
+        if dtype == DType::F32 {
+            return Ok(self.clone());
+        }
+        let inv_freq =
+            Tensor::from_vec(self.inv_freq.clone(), (self.inv_freq.len(),), &Device::Cpu)?
+                .to_dtype(dtype)?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?;
+        Ok(Self {
+            inv_freq,
+            dim: self.dim,
+            interleaved: self.interleaved,
+        })
+    }
+
     /// Standard RoPE: `inv_freq[i] = theta^(-2i / head_dim)`.
     ///
     /// This also covers **Qwen3** (Qwen3 uses standard RoPE — its distinctive per-head q/k norm
@@ -403,6 +428,10 @@ pub fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, interleaved: bool) -> 
         Ok(rotated)
     }
 }
+
+#[cfg(test)]
+#[path = "rope/training_precision_tests.rs"]
+mod training_precision_tests;
 
 #[cfg(test)]
 mod tests {

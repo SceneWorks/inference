@@ -323,6 +323,22 @@ pub struct T5TextEncoder {
 /// [`T5TextEncoder::from_weights_with_group_size`] loads.
 pub const T5_BLOCKS: usize = 24;
 
+/// Encoder depth and attention-head count of a T5 v1.1 encoder. The head width is the model width
+/// divided by `heads` (T5-XXL 4096 / 64, Flan-T5-Base 768 / 12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct T5Geometry {
+    pub blocks: usize,
+    pub heads: i32,
+}
+
+impl T5Geometry {
+    /// T5-v1.1-XXL — the FLUX / Chroma / SD3 / Mochi encoder.
+    pub const XXL: Self = Self {
+        blocks: T5_BLOCKS,
+        heads: 64,
+    };
+}
+
 /// A reopenable description of a T5 encoder's 24 blocks, for rung 4's **text-encoder** scope.
 ///
 /// ## Why this exists, given that it did not win where it was first measured
@@ -394,7 +410,7 @@ impl T5BlockStream {
             )));
         }
         let prefix = join(&self.prefix, &format!("encoder.block.{index}"));
-        let block = T5Block::from_weights(view, &prefix, self.group_size)?;
+        let block = T5Block::from_weights(view, &prefix, self.group_size, T5Geometry::XXL.heads)?;
         // Read this block's bytes on the CPU stream now, before its forward is encoded; left lazy,
         // the window's `eval` makes Metal command buffers wait on the disk read — past the GPU
         // watchdog on a cold page cache (sc-24245).
@@ -440,14 +456,29 @@ impl T5TextEncoder {
         prefix: &str,
         group_size: i32,
     ) -> Result<Self> {
+        Self::from_weights_with_geometry(w, prefix, group_size, T5Geometry::XXL)
+    }
+
+    /// Load a T5 v1.1 encoder of any depth / head count (sc-24213: Flan-T5-Base for Supra2 is 12
+    /// blocks × 12 heads; the same gated-GELU block structure as T5-XXL's 24 × 64).
+    pub fn from_weights_with_geometry(
+        w: &Weights,
+        prefix: &str,
+        group_size: i32,
+        geometry: T5Geometry,
+    ) -> Result<Self> {
         validate_t5_group_size(group_size)?;
+        if geometry.blocks == 0 || geometry.heads <= 0 {
+            return Err(Error::Msg(format!("t5: invalid geometry {geometry:?}")));
+        }
         let p = |suffix: &str| join(prefix, suffix);
-        let mut blocks = Vec::with_capacity(T5_BLOCKS);
-        for i in 0..T5_BLOCKS {
+        let mut blocks = Vec::with_capacity(geometry.blocks);
+        for i in 0..geometry.blocks {
             blocks.push(T5Block::from_weights(
                 w,
                 &p(&format!("encoder.block.{i}")),
                 group_size,
+                geometry.heads,
             )?);
         }
         Ok(Self {
@@ -624,9 +655,9 @@ struct T5Block {
 }
 
 impl T5Block {
-    fn from_weights(w: &Weights, prefix: &str, group_size: i32) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, group_size: i32, heads: i32) -> Result<Self> {
         Ok(Self {
-            attn: T5Attention::from_weights(w, &join(prefix, "layer.0"), group_size)?,
+            attn: T5Attention::from_weights(w, &join(prefix, "layer.0"), group_size, heads)?,
             ff: T5FeedForward::from_weights(w, &join(prefix, "layer.1"), group_size)?,
         })
     }
@@ -650,10 +681,11 @@ struct T5Attention {
     v: AdaptableLinear,
     o: AdaptableLinear,
     rel_bias: TokenEmbedding,
+    heads: i32,
 }
 
 impl T5Attention {
-    fn from_weights(w: &Weights, prefix: &str, group_size: i32) -> Result<Self> {
+    fn from_weights(w: &Weights, prefix: &str, group_size: i32, heads: i32) -> Result<Self> {
         // Packed-detect (sc-8669): loads Q4/Q8 packed when `.scales` is present, else dense.
         let linear = |name: &str| {
             mlx_gen::quant::lin(
@@ -681,6 +713,7 @@ impl T5Attention {
                 };
                 TokenEmbedding::from_weights(w, &base, group_size)?
             },
+            heads,
         })
     }
 
@@ -688,9 +721,9 @@ impl T5Attention {
     /// [`T5TextEncoder::forward_masked`] (it is identical across all blocks — F-099).
     fn forward(&self, hidden: &Array, mask: Option<&Array>, bias: &Array) -> Result<Array> {
         let normed = t5_rms_norm(hidden, &self.ln_w, 1e-6)?;
-        let q = shape_t5(&self.q.forward(&normed)?)?;
-        let k = shape_t5(&self.k.forward(&normed)?)?;
-        let v = shape_t5(&self.v.forward(&normed)?)?;
+        let q = shape_t5(&self.q.forward(&normed)?, self.heads)?;
+        let k = shape_t5(&self.k.forward(&normed)?, self.heads)?;
+        let v = shape_t5(&self.v.forward(&normed)?, self.heads)?;
         let scores = matmul(&q, &k.transpose_axes(&[0, 1, 3, 2])?)?;
         // Chroma key-padding mask (epic 3531): additive, broadcast over query/heads. `None` for FLUX.
         let biased = match mask {
@@ -788,12 +821,18 @@ fn t5_rms_norm(x: &Array, weight: &Array, eps: f32) -> Result<Array> {
     Ok(multiply(weight, &normed)?)
 }
 
-fn shape_t5(x: &Array) -> Result<Array> {
-    Ok(x.reshape(&[1, -1, 64, 64])?.transpose_axes(&[0, 2, 1, 3])?)
+/// `[1, L, heads·d_kv]` → `[1, heads, L, d_kv]`.
+fn shape_t5(x: &Array, heads: i32) -> Result<Array> {
+    let width = x.shape()[2];
+    Ok(x.reshape(&[1, -1, heads, width / heads])?
+        .transpose_axes(&[0, 2, 1, 3])?)
 }
 
+/// `[1, heads, L, d_kv]` → `[1, L, heads·d_kv]`.
 fn unshape_t5(x: &Array) -> Result<Array> {
-    Ok(x.transpose_axes(&[0, 2, 1, 3])?.reshape(&[1, -1, 4096])?)
+    let sh = x.shape();
+    Ok(x.transpose_axes(&[0, 2, 1, 3])?
+        .reshape(&[1, -1, sh[1] * sh[3]])?)
 }
 
 fn relative_position_buckets(seq_len: i32) -> Vec<i32> {

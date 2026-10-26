@@ -77,6 +77,9 @@ jobs:
       # Informational only: ordinary CI has no job that consumes this output because privileged
       # real-weight runners remain dispatch/schedule-only in real-weights.yml.
       real_weights: ${{ steps.select.outputs.real_weights }}
+      # `all`, or the space-separated packages this change can affect. Only pull_request and
+      # merge_group runs are narrowed; see `scripts/ci/test_scope.py`.
+      test_scope: ${{ steps.scope.outputs.test_scope }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -115,6 +118,25 @@ jobs:
           else
             python3 scripts/ci/select_lanes.py --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
           fi
+      # Narrows the three package test steps to the crates a PR can affect: the changed crates,
+      # crates that read the changed files, crates whose Cargo.lock resolution changed, and their
+      # dependents. A model crate (`mlx-gen-*`, `candle-gen-*`, `candle-audio-*`, not `*-catalog`)
+      # is NOT reached through a shared crate: a `gen-core` / `mlx-gen` / `candle-gen` / engine
+      # edit tests the shared crates, catalogs and bundles here, and leaves the ~80 models behind
+      # them to the post-merge `push: main` run, which is never narrowed. Those models still
+      # COMPILE on the PR (the all-target Clippy steps are not narrowed), so a contract break
+      # still fails the PR; what moves to post-merge is a behavioural regression in an untouched
+      # model. Before this, path-based lane selection ran every `mlx-gen-*` / `candle-gen*` crate
+      # for a one-model change, which put both test jobs past an hour.
+      - name: Scope package tests to affected crates
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ steps.topology.outputs.effective_base_sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: >-
+          python3 scripts/ci/test_scope.py scope --event "$EVENT_NAME"
+          --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
       - name: Report privileged real-weight impact
         run: |
           {
@@ -399,9 +421,19 @@ jobs:
         #   * runtime-cpu has no `tests/` directory at all.
         # `candle-gen*` moved to its own invocation below because it was the group that had no
         # `--tests` runner anywhere.
-        run: >-
-          cargo test --locked --lib -j 1
-          -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu
+        # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
+        # tests"); push: main, tags and dispatches run the whole set.
+        env:
+          TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
+        run: |
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu)
+          read -r -a packages <<< "$args"
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "No package in this step's set is affected by the change; nothing to test."
+            exit 0
+          fi
+          echo "Testing: $args"
+          cargo test --locked --lib -j 1 "${packages[@]}"
       # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
       # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
       # under all-target Clippy without running them, `windows-cuda-check` compiles them
@@ -481,9 +513,19 @@ jobs:
       #     That is the real price, it is paid per push, and it is the first thing to re-measure
       #     (or to split across runners) if the candle lane's cost is ever questioned.
       - name: Test Candle gen packages and integration targets
-        run: >-
-          cargo test --locked --lib --tests -j 1
-          -p 'candle-gen*'
+        # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
+        # tests"); push: main, tags and dispatches run the whole set.
+        env:
+          TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
+        run: |
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p 'candle-gen*')
+          read -r -a packages <<< "$args"
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "No package in this step's set is affected by the change; nothing to test."
+            exit 0
+          fi
+          echo "Testing: $args"
+          cargo test --locked --lib --tests -j 1 "${packages[@]}"
 
   candle-cpu-conformance:
     name: Candle CPU conformance + SA3 gates (Linux)
@@ -725,9 +767,19 @@ jobs:
       # is safe only because no hardcoded fixture path remains in the crates it runs (mlx-llm,
       # runtime-macos). Keep it that way if that lane's package set ever grows.
       - name: Test MLX packages
-        run: >-
-          cargo test --locked --lib --tests
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
+        # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
+        # tests"); push: main, tags and dispatches run the whole set.
+        env:
+          TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
+        run: |
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos)
+          read -r -a packages <<< "$args"
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "No package in this step's set is affected by the change; nothing to test."
+            exit 0
+          fi
+          echo "Testing: $args"
+          cargo test --locked --lib --tests "${packages[@]}"
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()

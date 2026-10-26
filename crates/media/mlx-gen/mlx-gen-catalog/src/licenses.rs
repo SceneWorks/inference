@@ -216,6 +216,29 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "flux2_dev_control",
         components: &["flux2_dev", "nvidia_pid_students"],
     },
+    // --- flux3 -------------------------------------------------------------------------------
+    // The distilled FLUX 3 Image Klein package (DiT + autoencoder under the FLUX Kommunity
+    // License) and its bundled `text_encoder/`, which is byte-identical (LFS sha256 of both
+    // shards) to the pinned Qwen/Qwen3-VL-4B-Instruct snapshot, so that row is loaded too.
+    // The prompt upsampler (sc-26238; `black-forest-labs/flux-3-image-klein-pup`, Apache-2.0)
+    // is an OPTIONAL co-requisite the provider loads only when the `prompt_upsampler`
+    // component names it — rowed here because a request with `enhance_prompt` runs it.
+    ProviderComponents {
+        provider_id: "flux3_klein",
+        components: &[
+            "flux3_image_klein",
+            "qwen3_vl_4b_instruct",
+            "flux3_image_klein_pup",
+        ],
+    },
+    ProviderComponents {
+        provider_id: "flux3_klein_base",
+        components: &[
+            "flux3_image_klein_base",
+            "qwen3_vl_4b_instruct",
+            "flux3_image_klein_pup",
+        ],
+    },
     // --- ideogram ----------------------------------------------------------------------------
     // `ideogram_4_turbo` is the same base weights plus the bundled TurboTime LoRA and no
     // unconditional DiT (`mlx-gen-ideogram/src/config.rs:15`).
@@ -540,6 +563,12 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "sensenova_u1_8b_fast",
         components: &["sensenova_u1_8b_mot", "sensenova_u1_8b_mot_loras"],
+    },
+    // --- supra2 ------------------------------------------------------------------------------
+    // The locally converted denoiser bundle plus the pinned Flan-T5-Base encoder and SD VAE.
+    ProviderComponents {
+        provider_id: "supra2_img",
+        components: &["supra2_img", "flan_t5_base", "sd_vae_ft_mse"],
     },
     // --- svd ---------------------------------------------------------------------------------
     // UNet, temporal-decoder VAE and ViT-H image encoder, all in one ungated snapshot.
@@ -945,8 +974,12 @@ mod tests {
         // sc-25683: the `iris_3b_restore` transform registers with its own complete row (73 / 63).
         // sc-25687: the `iris_3b_depth` trainer registers with its own complete row (74 / 64).
         // sc-25900: `qwen_image_2_1_turbo` registers with its own complete row (75 / 65).
-        assert_eq!(registered.len(), 77, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 67);
+        // sc-26234: `flux3_klein` registers with its own complete row (76 / 66).
+        // sc-26239: `flux3_klein_base` registers with its own complete row (77 / 67).
+        // sc-26323: both MOSS providers join the union (79 / 69).
+        // sc-24213: `supra2_img` registers with its own complete row (80 / 70).
+        assert_eq!(registered.len(), 80, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 70);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -1013,11 +1046,12 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            28,
+            31,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
              (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
              iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
-             sc-25900; MOSS Base/SFT in sc-26323)"
+             sc-25900, flux3_klein in sc-26234, flux3_klein_base in sc-26239; MOSS Base/SFT in sc-26323; \
+             supra2_img in sc-24213)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
@@ -1052,8 +1086,9 @@ mod tests {
         // sc-25688 adds the `iris_3b_restore` trainer, which reuses the iris_3b_restore TRANSFORM
         // row (its training-only resources — VGG16, LPIPS, OpenCLIP ConvNeXt-XXL — carry their
         // licences on `gen_core::iris::restoration_train::TRAINING_RESOURCES` and never ship in an
-        // export).
-        assert_eq!(trainers.len(), 20);
+        // export). sc-26240 adds the `flux3_klein_base` trainer, which reuses the sc-26239
+        // generator row.
+        assert_eq!(trainers.len(), 21);
         let transforms: BTreeSet<String> = registry
             .transforms()
             .map(|r| (r.descriptor)().id.to_string())
@@ -1205,7 +1240,48 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 67);
+        // The census is pinned separately; this test verifies that serialization preserves
+        // the complete mapping rather than duplicating a provider count that can go stale.
+        let providers = value["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), MLX_MEDIA_PROVIDER_COMPONENTS.len());
+        let serialized_ids: BTreeSet<_> = providers
+            .iter()
+            .map(|provider| provider["provider_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(serialized_ids, mapped_ids());
+        let flux3 = value["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider_id"] == "flux3_klein")
+            .expect("the new FLUX 3 provider is serialized, not just counted");
+        let components = flux3["components"].as_array().unwrap();
+        assert_eq!(components.len(), 3);
+        let component_ids: BTreeSet<_> = components
+            .iter()
+            .map(|entry| entry.as_str().expect("component ids are strings"))
+            .collect();
+        assert_eq!(
+            component_ids,
+            BTreeSet::from([
+                "flux3_image_klein",
+                "qwen3_vl_4b_instruct",
+                "flux3_image_klein_pup",
+            ])
+        );
+        let pup = resolve_component(component_licenses(), "flux3_image_klein_pup")
+            .expect("the optional PUP identity resolves to its own license row");
+        assert_eq!(
+            pup.source_url,
+            "https://huggingface.co/black-forest-labs/flux-3-image-klein-pup"
+        );
+        assert_eq!(pup.declared, "apache-2.0");
+        assert_eq!(pup.family, "apache-2-0");
+        assert!(!pup.gated);
+        assert_eq!(
+            gen_core::flux3::pup::UPSAMPLER_REVISION,
+            "8b069751eb5dcab23829d9c5eccb470eb8b8a4ed"
+        );
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]

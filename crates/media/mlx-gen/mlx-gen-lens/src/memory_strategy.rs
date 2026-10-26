@@ -204,6 +204,7 @@ fn static_behavior_identity(provider_id: &str, spec: &LoadSpec) -> MemoryCalibra
         Some(mlx_gen::Quant::Q4) => "q4",
         Some(mlx_gen::Quant::Q8) => "q8",
         Some(mlx_gen::Quant::Nvfp4) => "nvfp4",
+        Some(mlx_gen::Quant::Fp8Rowwise) => "fp8r",
     };
     let policy = match spec.offload_policy {
         OffloadPolicy::Resident => "resident",
@@ -1629,6 +1630,7 @@ mod tests {
 
     fn rung_four_context() -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,

@@ -1383,6 +1383,7 @@ mod tests {
         quant: Option<Quant>,
     ) -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             selection: mlx_gen::gen_core::MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: Default::default(),

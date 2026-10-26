@@ -18,7 +18,7 @@ use candle_gen::gen_core::{
 };
 use sha2::{Digest, Sha256};
 
-pub const REQUEST_EVIDENCE_REVISION: &str = "sdxl-candle-request-contract-v1";
+pub const REQUEST_EVIDENCE_REVISION: &str = "sdxl-candle-request-contract-v2";
 const DECODE_TILE_EDGE: u32 = 512;
 const DECODE_OVERLAP: u32 = 64;
 const ATTENTION_CHUNK_SIZE: u32 = gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
@@ -127,7 +127,7 @@ fn route_identity_tokens(route: SdxlRoute) -> String {
 /// character modes the lightning route's own row refuses.
 fn route_fingerprint(route: SdxlRoute) -> String {
     format!(
-        "sdxl-candle-{}-staged-decode-attention-v1",
+        "sdxl-candle-{}-staged-decode-attention-v2",
         route_identity_tokens(route)
     )
 }
@@ -1978,25 +1978,25 @@ mod tests {
         // none of them catch a change to the format literal in `route_fingerprint` or to
         // `route_identity_tokens`'s token rendering.
         //
-        // *Mutation that reds this:* changing the `"sdxl-candle-{}-staged-decode-attention-v1"`
+        // *Mutation that reds this:* changing the `"sdxl-candle-{}-staged-decode-attention-v2"`
         // format literal in `route_fingerprint` (e.g. to `"…-staged-decode-attn-v1"`).
         const SHIPPED_ROUTE_FINGERPRINTS: &[(&str, &str)] = &[
-            ("sdxl", "sdxl-candle-sdxl-staged-decode-attention-v1"),
+            ("sdxl", "sdxl-candle-sdxl-staged-decode-attention-v2"),
             (
                 "realvisxl",
-                "sdxl-candle-realvisxl-staged-decode-attention-v1",
+                "sdxl-candle-realvisxl-staged-decode-attention-v2",
             ),
             (
                 "realvisxl_lightning",
-                "sdxl-candle-realvisxl-lightning-staged-decode-attention-v1",
+                "sdxl-candle-realvisxl-lightning-staged-decode-attention-v2",
             ),
             (
                 "illustrious_xl_v1",
-                "sdxl-candle-illustrious-xl-rev1-staged-decode-attention-v1",
+                "sdxl-candle-illustrious-xl-rev1-staged-decode-attention-v2",
             ),
             (
                 "illustrious_xl_v2",
-                "sdxl-candle-illustrious-xl-rev2-staged-decode-attention-v1",
+                "sdxl-candle-illustrious-xl-rev2-staged-decode-attention-v2",
             ),
         ];
         assert_eq!(SDXL_ROUTES.len(), SHIPPED_ROUTE_FINGERPRINTS.len());
