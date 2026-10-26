@@ -20,12 +20,53 @@ use mlx_gen::vae_tiling::{tiled_conv2d_3x3_nhwc, GlobalGroupNorm};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+// N=1 dispatch retains FP32 accumulation on NAX; ordinary matrix multiplication
+// may use TF32 despite FP32 storage. The precise encoder opts into this policy.
+fn precise_linear(x: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array> {
+    let output = weight.matmul(&x.expand_dims(-1)?)?.squeeze_axes(&[-1])?;
+    Ok(match bias {
+        Some(bias) => add(&output, bias)?,
+        None => output,
+    })
+}
+
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-6;
 const BN_EPS: f32 = 1e-4;
 const LATENT_CHANNELS: i32 = 32;
 const BLOCK_OUT: [i32; 4] = [128, 256, 512, 512];
 const LAYERS_PER_BLOCK: i32 = 2;
+/// Decoder widths in encoder stage order (the decoder visits them in reverse).
+/// The encoder remains the standard FLUX.2 `[128, 256, 512, 512]` architecture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Flux2VaeDecoderConfig {
+    pub block_out_channels: [i32; 4],
+}
+
+impl Default for Flux2VaeDecoderConfig {
+    fn default() -> Self {
+        Self {
+            block_out_channels: BLOCK_OUT,
+        }
+    }
+}
+
+impl Flux2VaeDecoderConfig {
+    /// Four stages retain FLUX.2's 8× spatial scale. Every width must support 32-group norm.
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .block_out_channels
+            .iter()
+            .any(|&width| width == 0 || width % GN_GROUPS != 0 || width < 0)
+        {
+            return Err(mlx_gen::Error::Msg(
+                "FLUX.2 decoder widths must be positive multiples of 32".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 const FLUX2_TILING: mlx_gen::tiling::VaeTiling = mlx_gen::tiling::VaeTiling {
     spatial_scale: 8,
     temporal_scale: 1,
@@ -36,6 +77,42 @@ const FLUX2_TILING: mlx_gen::tiling::VaeTiling = mlx_gen::tiling::VaeTiling {
 #[cfg(test)]
 mod tiling_tests {
     use super::*;
+
+    #[test]
+    fn decoder_config_defaults_and_asymmetric_shape_validation() {
+        assert_eq!(
+            Flux2VaeDecoderConfig::default().block_out_channels,
+            BLOCK_OUT
+        );
+        let config = Flux2VaeDecoderConfig {
+            block_out_channels: [96, 192, 384, 384],
+        };
+        config.validate().unwrap();
+        for widths in [[0, 32, 32, 32], [-32, 32, 32, 32], [16, 32, 32, 32]] {
+            assert!(Flux2VaeDecoderConfig {
+                block_out_channels: widths
+            }
+            .validate()
+            .is_err());
+        }
+        // Check checkpoint geometry without tensor evaluation or accelerator allocation.
+        let mut visited = false;
+        let error = validate_decoder_shapes(&config, |key| {
+            Ok(match key {
+                "post_quant_conv.weight" => vec![32, 32, 1, 1],
+                "post_quant_conv.bias" => vec![32],
+                "decoder.conv_in.weight" => {
+                    visited = true;
+                    vec![512, 32, 3, 3]
+                }
+                _ => panic!("unexpected key {key}"),
+            })
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(visited);
+        assert!(error.contains("384") && error.contains("512"), "{error}");
+    }
 
     #[test]
     fn lens_decode_candidate_physically_splits_the_1024_tail_and_edge_is_load_bearing() {
@@ -51,6 +128,85 @@ mod tiling_tests {
             mlx_gen::tiling::TilingConfig::spatial_only(1024, 128).plan(FLUX2_TILING, 1, 128, 128);
         assert_eq!((mutated.h.len(), mutated.w.len()), (1, 1));
     }
+}
+
+// Validate checkpoint (OIHW) shapes before transposition or lazy graph construction.
+fn validate_decoder_weights(w: &Weights, config: &Flux2VaeDecoderConfig) -> Result<()> {
+    validate_decoder_shapes(config, |key| Ok(w.require(key)?.shape().to_vec()))
+}
+
+fn validate_decoder_shapes(
+    config: &Flux2VaeDecoderConfig,
+    mut shape: impl FnMut(&str) -> Result<Vec<i32>>,
+) -> Result<()> {
+    let mut check = |key: &str, expected: &[i32]| -> Result<()> {
+        let actual = shape(key)?;
+        if actual != expected {
+            return Err(mlx_gen::Error::Msg(format!(
+                "FLUX.2 decoder tensor {key}: expected {expected:?}, got {actual:?}"
+            )));
+        }
+        Ok(())
+    };
+    let mut parameter = |name: &str, weight: &[i32], bias: i32| -> Result<()> {
+        check(&format!("{name}.weight"), weight)?;
+        check(&format!("{name}.bias"), &[bias])
+    };
+    parameter("post_quant_conv", &[32, 32, 1, 1], 32)?;
+    let top = config.block_out_channels[3];
+    parameter("decoder.conv_in", &[top, 32, 3, 3], top)?;
+    type ParameterCheck<'a> = dyn FnMut(&str, &[i32], i32) -> Result<()> + 'a;
+    let resnet =
+        |parameter: &mut ParameterCheck<'_>, prefix: &str, input: i32, output: i32| -> Result<()> {
+            parameter(&format!("{prefix}.norm1"), &[input], input)?;
+            parameter(&format!("{prefix}.norm2"), &[output], output)?;
+            parameter(&format!("{prefix}.conv1"), &[output, input, 3, 3], output)?;
+            parameter(&format!("{prefix}.conv2"), &[output, output, 3, 3], output)?;
+            if input != output {
+                parameter(
+                    &format!("{prefix}.conv_shortcut"),
+                    &[output, input, 1, 1],
+                    output,
+                )?;
+            }
+            Ok(())
+        };
+    for index in 0..2 {
+        resnet(
+            &mut parameter,
+            &format!("decoder.mid_block.resnets.{index}"),
+            top,
+            top,
+        )?;
+    }
+    let attention = "decoder.mid_block.attentions.0";
+    parameter(&format!("{attention}.group_norm"), &[top], top)?;
+    for projection in ["to_q", "to_k", "to_v", "to_out.0"] {
+        parameter(&format!("{attention}.{projection}"), &[top, top], top)?;
+    }
+    let mut input = top;
+    for (index, &output) in config.block_out_channels.iter().rev().enumerate() {
+        for layer in 0..LAYERS_PER_BLOCK + 1 {
+            resnet(
+                &mut parameter,
+                &format!("decoder.up_blocks.{index}.resnets.{layer}"),
+                input,
+                output,
+            )?;
+            input = output;
+        }
+        if index < 3 {
+            parameter(
+                &format!("decoder.up_blocks.{index}.upsamplers.0.conv"),
+                &[output, output, 3, 3],
+                output,
+            )?;
+        }
+    }
+    parameter("decoder.conv_norm_out", &[input], input)?;
+    parameter("decoder.conv_out", &[3, input, 3, 3], 3)?;
+    check("bn.running_mean", &[128])?;
+    check("bn.running_var", &[128])
 }
 
 /// `[O, I, H, W]` (PyTorch) → `[O, H, W, I]` (mlx conv2d), cast to f32.
@@ -209,16 +365,32 @@ impl VaeAttention {
 
     /// `x`: NHWC `[B, H, W, C]`. Single-head attention over the H·W positions, residual.
     fn forward(&self, x: &Array) -> Result<Array> {
+        self.forward_with_precision(x, false)
+    }
+
+    fn forward_with_precision(&self, x: &Array, precise: bool) -> Result<Array> {
+        let project = |layer: &AdaptableLinear, input: &Array| -> Result<Array> {
+            if precise {
+                let (weight, bias) = layer.dense_weight().ok_or_else(|| {
+                    mlx_gen::Error::Msg(
+                        "precise VAE encoding requires dense encoder weights".into(),
+                    )
+                })?;
+                precise_linear(input, weight, bias)
+            } else {
+                layer.forward(input)
+            }
+        };
         let sh = x.shape();
         let (b, h, w_, c) = (sh[0], sh[1], sh[2], sh[3]);
         let y = group_norm(x, &self.gn_w, &self.gn_b, GN_GROUPS, GN_EPS)?;
         let to_seq = |a: Array| -> Result<Array> { Ok(a.reshape(&[b, 1, h * w_, c])?) };
-        let q = to_seq(self.q.forward(&y)?)?;
-        let k = to_seq(self.k.forward(&y)?)?;
-        let v = to_seq(self.v.forward(&y)?)?;
+        let q = to_seq(project(&self.q, &y)?)?;
+        let k = to_seq(project(&self.k, &y)?)?;
+        let v = to_seq(project(&self.v, &y)?)?;
         let scale = (c as f32).powf(-0.5);
         let o = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
-        let o = self.o.forward(&o.reshape(&[b, h, w_, c])?)?;
+        let o = project(&self.o, &o.reshape(&[b, h, w_, c])?)?;
         Ok(add(x, &o)?)
     }
 }
@@ -350,13 +522,13 @@ impl Encoder {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Array, precise: bool) -> Result<Array> {
         let mut x = conv2d(x, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)?;
         for db in &self.down_blocks {
             x = db.forward(&x)?;
         }
         x = self.mid_resnet0.forward(&x)?;
-        x = self.mid_attn.forward(&x)?;
+        x = self.mid_attn.forward_with_precision(&x, precise)?;
         x = self.mid_resnet1.forward(&x)?;
         let x = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
         conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
@@ -486,9 +658,8 @@ impl Decoder {
 
 /// The FLUX.2 autoencoder. All tensors NHWC, f32.
 pub struct Flux2Vae {
-    encoder: Encoder,
+    encoder: Option<(Encoder, (Array, Array))>,
     decoder: Decoder,
-    quant: (Array, Array),
     post_quant: (Array, Array),
     bn_mean: Array,
     bn_std: Array,
@@ -500,9 +671,35 @@ impl Flux2Vae {
         let bn_var = f32w(w, "bn.running_var")?;
         let bn_std = sqrt(&add(&bn_var, scalar(BN_EPS))?)?;
         Ok(Self {
-            encoder: Encoder::from_weights(w)?,
+            encoder: Some((Encoder::from_weights(w)?, squeeze_linear(w, "quant_conv")?)),
             decoder: Decoder::from_weights(w)?,
-            quant: squeeze_linear(w, "quant_conv")?,
+            post_quant: squeeze_linear(w, "post_quant_conv")?,
+            bn_mean,
+            bn_std,
+        })
+    }
+
+    /// Load the standard encoder and an independently configured, shape-checked decoder.
+    pub fn from_weights_with_decoder_config(
+        w: &Weights,
+        config: &Flux2VaeDecoderConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        validate_decoder_weights(w, config)?;
+        Self::from_weights(w)
+    }
+
+    /// Load a configured decoder without requiring `encoder.*` or `quant_conv` tensors.
+    /// Shapes are checked against the explicit decoder config before building any layers.
+    pub fn from_weights_decode_only(w: &Weights, config: &Flux2VaeDecoderConfig) -> Result<Self> {
+        config.validate()?;
+        validate_decoder_weights(w, config)?;
+        let bn_mean = f32w(w, "bn.running_mean")?;
+        let bn_var = f32w(w, "bn.running_var")?;
+        let bn_std = sqrt(&add(&bn_var, scalar(BN_EPS))?)?;
+        Ok(Self {
+            encoder: None,
+            decoder: Decoder::from_weights(w)?,
             post_quant: squeeze_linear(w, "post_quant_conv")?,
             bn_mean,
             bn_std,
@@ -514,7 +711,9 @@ impl Flux2Vae {
     /// (q/k/v/out). Every Conv2d (incl. `quant_conv`/`post_quant_conv`), GroupNorm, and the
     /// BatchNorm stats are not Linears, so they stay full precision — matching the fork.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.encoder.mid_attn.quantize(bits)?;
+        if let Some((encoder, _)) = &mut self.encoder {
+            encoder.mid_attn.quantize(bits)?;
+        }
         self.decoder.mid_attn.quantize(bits)?;
         Ok(())
     }
@@ -532,7 +731,7 @@ impl Flux2Vae {
     /// (the rest of the VAE is Conv/GroupNorm, never quantized). `None` if the VAE is still dense.
     #[doc(hidden)]
     pub fn probe_quant_enc_q(&self) -> Option<(&Array, &Array, &Array, i32, i32)> {
-        let (wq, sc, bi, _bias, gs, b) = self.encoder.mid_attn.q.quantized_params()?;
+        let (wq, sc, bi, _bias, gs, b) = self.encoder.as_ref()?.0.mid_attn.q.quantized_params()?;
         Some((wq, sc, bi, gs, b))
     }
 
@@ -635,8 +834,28 @@ impl Flux2Vae {
     /// Encode an image `[B, H, W, 3]` (NHWC, ~`[-1, 1]`) → latent **mean** `[B, H/8, W/8, 32]`.
     /// Mirrors the fork's `encode` (returns the mean; `scaling_factor=1.0, shift_factor=0.0`).
     pub fn encode_mean(&self, x: &Array) -> Result<Array> {
+        self.encode_mean_with_precision(x, false)
+    }
+
+    /// Encode the posterior mean with strict FP32 linear accumulation, avoiding
+    /// NAX TF32 rounding in encoder attention projections and `quant_conv`.
+    /// This opt-in path requires a dense encoder; decoding is unaffected.
+    pub fn encode_mean_precise(&self, x: &Array) -> Result<Array> {
+        self.encode_mean_with_precision(x, true)
+    }
+
+    fn encode_mean_with_precision(&self, x: &Array, precise: bool) -> Result<Array> {
         let x = x.as_dtype(Dtype::Float32)?;
-        let moments = linear(&self.encoder.forward(&x)?, &self.quant.0, &self.quant.1)?;
+        let (encoder, quant) = self
+            .encoder
+            .as_ref()
+            .ok_or_else(|| mlx_gen::Error::Msg("FLUX.2 VAE was loaded decode-only".into()))?;
+        let encoded = encoder.forward(&x, precise)?;
+        let moments = if precise {
+            precise_linear(&encoded, &quant.0, Some(&quant.1))?
+        } else {
+            linear(&encoded, &quant.0, &quant.1)?
+        };
         // split (mean, logvar) along channels; keep the mean.
         let c = moments.shape()[3];
         let half = c / 2;
@@ -858,6 +1077,64 @@ pub mod tiling_fixture {
 mod tiled_decode_tests {
     use super::tiling_fixture::{max_abs_delta, packed_latents, weights as fixture};
     use super::*;
+
+    #[test]
+    fn decoder_config_decode_only_loads_without_encoder_on_cpu() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            let mut weights = fixture();
+            weights.remove_prefix("encoder.");
+            weights.remove_prefix("quant_conv.");
+            let config = Flux2VaeDecoderConfig {
+                block_out_channels: [32; 4],
+            };
+            assert!(Flux2Vae::from_weights_decode_only(
+                &weights,
+                &Flux2VaeDecoderConfig::default()
+            )
+            .is_err());
+            let decoder = Flux2Vae::from_weights_decode_only(&weights, &config).unwrap();
+            assert!(decoder.encoder.is_none());
+            assert_eq!(decoder.decoder.conv_in_w.shape(), &[32, 3, 3, 32]);
+            assert_eq!(decoder.decoder.conv_out_w.shape(), &[3, 3, 3, 32]);
+            assert!(decoder.encode_mean(&packed_latents(1, 1)).is_err());
+            // Shape/load coverage only: evaluating the existing VAE's GroupNorm invokes the
+            // pinned MLX LayerNorm CPU fallback, which contains a process-default-stream op.
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an admitted Metal window; the pinned VAE LayerNorm CPU fallback leaks to the default GPU stream"]
+    fn decoder_config_decode_only_matches_full_decode_on_metal() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+            let weights = fixture();
+            let full = Flux2Vae::from_weights(&weights).unwrap();
+            let decode_weights = Weights::from_map(
+                weights
+                    .into_tensors()
+                    .into_iter()
+                    .filter(|(key, _)| {
+                        !key.starts_with("encoder.") && !key.starts_with("quant_conv.")
+                    })
+                    .collect(),
+            );
+            let config = Flux2VaeDecoderConfig {
+                block_out_channels: [32; 4],
+            };
+            assert!(Flux2Vae::from_weights_decode_only(
+                &decode_weights,
+                &Flux2VaeDecoderConfig::default()
+            )
+            .is_err());
+            let decoder = Flux2Vae::from_weights_decode_only(&decode_weights, &config).unwrap();
+            assert!(decoder.encoder.is_none());
+            let packed = packed_latents(1, 1);
+            let expected = full.decode_packed_latents(&packed).unwrap();
+            let actual = decoder.decode_packed_latents(&packed).unwrap();
+            assert_eq!(actual.shape(), &[1, 16, 16, 3]);
+            assert!(max_abs_delta(&actual, &expected) < 1e-6);
+            assert!(decoder.encode_mean(&actual).is_err());
+        });
+    }
 
     /// The **executed** defect control for the bound below (sc-19753).
     ///

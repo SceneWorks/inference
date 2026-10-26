@@ -633,6 +633,9 @@ fn run(req: &GenerationRequest, expected_chunks: usize, label: &str) -> RunResul
                 phase_peaks.push(("after the AR denoise loop", a, t));
             }
             Progress::Loading(phase) => println!("  {label}: loading {phase:?}"),
+            Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .unwrap_or_else(|e| panic!("{label}: generate must succeed: {e}"));
     let total = t0.elapsed();

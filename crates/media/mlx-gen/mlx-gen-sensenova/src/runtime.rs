@@ -98,6 +98,8 @@ impl Sampler {
                     repetition_penalty: 1.0,
                     repetition_context: 0,
                     presence_penalty: 0.0,
+                    presence_penalty_generated_only: false,
+                    presence_penalty_prompt_len: 0,
                 };
                 mll_sample(&row, &[], &params, rng, None).map_err(mll)
             }
@@ -628,6 +630,8 @@ impl UndSampler {
                 repetition_penalty: 1.0,
                 repetition_context: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
             },
         };
         Self {

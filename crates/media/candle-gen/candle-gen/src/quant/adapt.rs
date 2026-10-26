@@ -48,6 +48,14 @@ enum Base {
     Dense(Linear),
     Packed(QLinear),
     Nvfp4(std::sync::Arc<super::Nvfp4Linear>),
+    ConvRot(Arc<super::convrot_int8::ConvRotLinear>),
+    W4A8(Arc<super::w4a8_int8::W4A8Linear>),
+    /// Metadata ONLY for a caller-owned strict packed GEMM. This wrapper owns no
+    /// base tensor and can apply residuals only to an externally computed output.
+    External {
+        compute: DType,
+        device: Device,
+    },
 }
 
 /// The one refusal every fold entry point returns on an **NVFP4** base (sc-21483, epic 11037 E2).
@@ -62,12 +70,21 @@ fn nvfp4_refold_refusal(quant: Quant) -> candle_core::Error {
     ))
 }
 
+fn external_base_refusal(action: &str) -> candle_core::Error {
+    candle_core::Error::wrap(CandleError::Unsupported(format!(
+        "external packed base: cannot {action}; the caller owns the strict packed kernel and weight; use apply_residuals on its computed output"
+    )))
+}
+
 impl Base {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Base::Dense(l) => l.forward(x),
             Base::Packed(q) => q.forward(x),
             Base::Nvfp4(q) => q.forward(x),
+            Base::ConvRot(q) => q.forward(x),
+            Base::W4A8(q) => q.forward(x),
+            Base::External { .. } => Err(external_base_refusal("compute the base forward")),
         }
     }
 
@@ -89,11 +106,14 @@ impl Base {
             // NVFP4 already produces its output in the activation dtype (the packed weight is never
             // stored at the activation dtype in the first place), so there is nothing to upcast.
             Base::Nvfp4(q) => q.forward(x),
+            Base::ConvRot(q) => q.forward(x),
+            Base::W4A8(q) => q.forward(x),
+            Base::External { .. } => Err(external_base_refusal("compute the base forward")),
         }
     }
 
     fn is_packed(&self) -> bool {
-        matches!(self, Base::Packed(_))
+        matches!(self, Base::Packed(_) | Base::ConvRot(_) | Base::W4A8(_))
     }
 
     fn is_nvfp4(&self) -> bool {
@@ -109,6 +129,9 @@ impl Base {
             Base::Dense(l) => Some(l.weight().device().clone()),
             Base::Packed(_) => None,
             Base::Nvfp4(q) => Some(q.device().clone()),
+            Base::ConvRot(q) => Some(q.device().clone()),
+            Base::W4A8(q) => Some(q.device().clone()),
+            Base::External { device, .. } => Some(device.clone()),
         }
     }
 }
@@ -743,6 +766,42 @@ impl std::fmt::Debug for AdaptLinear {
 }
 
 impl AdaptLinear {
+    /// Checked residual storage for a caller-owned PACKED base. No dummy tensor,
+    /// dense weight, quantization, or additional kernel handle is allocated here.
+    /// Call [`Self::apply_residuals`] after the caller's strict packed GEMM;
+    /// [`Self::forward`] and every folding/requantization entry point refuse it.
+    pub fn for_external_base(
+        in_dim: usize,
+        out_dim: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        if in_dim == 0
+            || out_dim == 0
+            || in_dim.checked_mul(out_dim).is_none()
+            || !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64)
+        {
+            return Err(CandleError::Unsupported("external packed base requires nonzero checked dimensions and a float compute dtype".into()));
+        }
+        Ok(Self {
+            base: Base::External {
+                compute: dtype,
+                device: device.clone(),
+            },
+            in_features: in_dim,
+            out_features: out_dim,
+            adapters: Vec::new(),
+        })
+    }
+
+    /// Compute metadata only. The packed payload remains exclusively caller-owned.
+    pub fn external_base_compute_dtype(&self) -> Option<DType> {
+        match &self.base {
+            Base::External { compute, .. } => Some(*compute),
+            _ => None,
+        }
+    }
+
     /// Wrap an already-built dense `candle_nn::Linear` with its logical `[out, in]` dims — the seam a
     /// caller uses when it holds a `Linear` directly (e.g. a folded-delta reference, or a test grid).
     pub fn from_dense(l: Linear, in_dim: usize, out_dim: usize) -> Self {
@@ -787,6 +846,37 @@ impl AdaptLinear {
             in_features: in_dim,
             adapters: Vec::new(),
         }
+    }
+    /// Native symmetric INT8 base with shared adapter residual semantics.
+    pub fn from_convrot(base: super::convrot_int8::ConvRotLinear) -> Self {
+        let d = base.descriptor;
+        Self {
+            base: Base::ConvRot(Arc::new(base)),
+            in_features: d.in_features,
+            out_features: d.out_features,
+            adapters: Vec::new(),
+        }
+    }
+
+    /// Distinguish descriptor-driven integer execution from affine packed Q8.
+    pub fn is_convrot_int8(&self) -> bool {
+        matches!(self.base, Base::ConvRot(_))
+    }
+
+    /// Packed W4A8 base; residuals remain additive in the original, unrotated input basis.
+    pub fn from_w4a8(base: super::w4a8_int8::W4A8Linear) -> Self {
+        let d = base.descriptor();
+        Self {
+            base: Base::W4A8(Arc::new(base)),
+            in_features: d.in_features,
+            out_features: d.out_features,
+            adapters: Vec::new(),
+        }
+    }
+
+    /// Distinguish native codebook W4A8 from affine Q4 and symmetric ConvRot INT8.
+    pub fn is_w4a8(&self) -> bool {
+        matches!(self.base, Base::W4A8(_))
     }
 
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`), shape-
@@ -925,7 +1015,13 @@ impl AdaptLinear {
     /// cast only at the hand-off to the host output dtype before addition. With no live adapter this
     /// is byte-identical to the bare base forward.
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let mut y = self.base.forward(x)?;
+        self.apply_residuals(x, self.base.forward(x)?)
+    }
+
+    /// Add this layer's existing residual stack to an already computed base output. Providers
+    /// with an explicit base precision policy (FLUX3's autocast/opmath boundary) use the same
+    /// adapter math without recomputing or changing that base. No adapters returns `y` untouched.
+    pub fn apply_residuals(&self, x: &Tensor, mut y: Tensor) -> candle_core::Result<Tensor> {
         for ad in &self.adapters {
             if ad.is_zero() {
                 continue;
@@ -972,19 +1068,27 @@ impl AdaptLinear {
 
     /// Whether the base weight is held in *any* quantized regime — MLX-packed or NVFP4.
     pub fn is_quantized(&self) -> bool {
-        self.is_packed() || self.is_nvfp4()
+        self.is_packed() || self.is_nvfp4() || matches!(self.base, Base::External { .. })
     }
 
     pub fn matmul_strategy(&self) -> Option<super::MatmulStrategy> {
         match &self.base {
-            Base::Dense(_) | Base::Nvfp4(_) => None,
+            Base::Dense(_)
+            | Base::Nvfp4(_)
+            | Base::ConvRot(_)
+            | Base::W4A8(_)
+            | Base::External { .. } => None,
             Base::Packed(linear) => linear.matmul_strategy(),
         }
     }
 
     pub fn quant_dtype(&self) -> Option<candle_core::quantized::GgmlDType> {
         match &self.base {
-            Base::Dense(_) | Base::Nvfp4(_) => None,
+            Base::Dense(_)
+            | Base::Nvfp4(_)
+            | Base::ConvRot(_)
+            | Base::W4A8(_)
+            | Base::External { .. } => None,
             Base::Packed(linear) => linear.quant_dtype(),
         }
     }
@@ -1000,7 +1104,11 @@ impl AdaptLinear {
     pub fn base_qlinear(&self) -> Option<&QLinear> {
         match &self.base {
             Base::Packed(q) => Some(q),
-            Base::Dense(_) | Base::Nvfp4(_) => None,
+            Base::Dense(_)
+            | Base::Nvfp4(_)
+            | Base::ConvRot(_)
+            | Base::W4A8(_)
+            | Base::External { .. } => None,
         }
     }
 
@@ -1009,7 +1117,19 @@ impl AdaptLinear {
     pub fn base_nvfp4(&self) -> Option<&super::Nvfp4Linear> {
         match &self.base {
             Base::Nvfp4(q) => Some(q),
-            Base::Dense(_) | Base::Packed(_) => None,
+            Base::Dense(_)
+            | Base::Packed(_)
+            | Base::ConvRot(_)
+            | Base::W4A8(_)
+            | Base::External { .. } => None,
+        }
+    }
+
+    /// The native W4A8 base, including its packed residency and transient weight-scratch bound.
+    pub fn base_w4a8(&self) -> Option<&super::w4a8_int8::W4A8Linear> {
+        match &self.base {
+            Base::W4A8(q) => Some(q),
+            _ => None,
         }
     }
 
@@ -1052,6 +1172,7 @@ impl AdaptLinear {
                 *l = Linear::new(merged, bias);
                 Ok(())
             }
+            Base::External { .. } => Err(CandleError::Unsupported("dense fold: an external packed base has no owned dense weight; install an additive residual instead".into())),
             Base::Packed(_) => Err(CandleError::Unsupported(
                 "dense fold: the base is MLX-packed (q4/q8); a delta cannot be folded into \
                  quantized codes"
@@ -1060,6 +1181,10 @@ impl AdaptLinear {
             Base::Nvfp4(_) => Err(CandleError::Unsupported(
                 "dense fold: the base is NVFP4; a delta cannot be folded into packed E2M1 codes"
                     .into(),
+            )),
+            Base::ConvRot(_) => Err(CandleError::Unsupported("ConvRot INT8 base is immutable; install an additive residual instead".into())),
+            Base::W4A8(_) => Err(CandleError::Unsupported(
+                "W4A8 base is immutable; install an additive residual instead".into(),
             )),
         }
     }
@@ -1100,7 +1225,7 @@ impl AdaptLinear {
     /// Dense/MLX-packed bases keep the historical unchecked behaviour (their installers carry
     /// their own shape screening) and always return `Ok`.
     pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
-        if matches!(self.base, Base::Nvfp4(_)) {
+        if matches!(self.base, Base::Nvfp4(_) | Base::External { .. }) {
             return self.push_lora_checked(a, b, scale);
         }
         self.adapters.push(Adapter::Lora {
@@ -1180,6 +1305,9 @@ impl AdaptLinear {
             Base::Dense(_) => "dense base",
             Base::Packed(_) => "MLX-packed base",
             Base::Nvfp4(_) => "NVFP4 base",
+            Base::ConvRot(_) => "ConvRot INT8 base",
+            Base::W4A8(_) => "W4A8 base",
+            Base::External { .. } => "external packed base",
         }
     }
 
@@ -1293,7 +1421,7 @@ impl AdaptLinear {
     /// **On an NVFP4 base this delegates to [`Self::push_lokr_structured_checked`]** — same
     /// structural closure as [`Self::push_lora`] (sc-11045 fix round, MAJOR 7).
     pub fn push_lokr_structured(&mut self, factors: LokrFactors) -> Result<()> {
-        if matches!(self.base, Base::Nvfp4(_)) {
+        if matches!(self.base, Base::Nvfp4(_) | Base::External { .. }) {
             return self.push_lokr_structured_checked(factors);
         }
         self.adapters.push(Adapter::LokrStructured { factors });
@@ -1326,10 +1454,16 @@ impl AdaptLinear {
     /// refused too: NVFP4 is packed from the bf16 master, so "re-NVFP4ing" an NVFP4 base could only
     /// mean a double quantization.
     pub fn quantize(&mut self, quant: Quant) -> candle_core::Result<()> {
+        super::reject_rowwise_as_legacy_quant(quant)?;
         match &mut self.base {
             // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
+            Base::ConvRot(_) => {
+                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
+            }
+            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
+            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
                 q.quantize(quant)?;
@@ -1349,9 +1483,15 @@ impl AdaptLinear {
         quant: Quant,
         device: &Device,
     ) -> candle_core::Result<()> {
+        super::reject_rowwise_as_legacy_quant(quant)?;
         match &mut self.base {
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
+            Base::ConvRot(_) => {
+                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
+            }
+            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
+            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
                 q.quantize_dequant_onto(quant, device)?;
@@ -1364,9 +1504,15 @@ impl AdaptLinear {
     /// Quantize the base projection with [`QLinear::quantize_onto`] while preserving all attached
     /// forward-time residuals.
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
+        super::reject_rowwise_as_legacy_quant(quant)?;
         match &mut self.base {
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
+            Base::ConvRot(_) => {
+                candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
+            }
+            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
+            Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
                 q.quantize_onto(quant, device)?;
@@ -1392,6 +1538,13 @@ impl AdaptLinear {
                 };
                 *l = Linear::new(w, b);
             }
+            Base::External { device: owner, .. } => {
+                if !owner.same_device(device) {
+                    return Err(external_base_refusal(
+                        "migrate the caller-owned weight to another device",
+                    ));
+                }
+            }
             Base::Packed(q) => q.to_device(device)?,
             // The NVFP4 weight is staged on its device at construction and cannot be re-staged
             // without re-packing, so a cross-device move is refused rather than silently dropped
@@ -1405,6 +1558,18 @@ impl AdaptLinear {
                         q.device().location(),
                         device.location(),
                     )));
+                }
+            }
+            Base::ConvRot(q) => {
+                if !q.device().same_device(device) {
+                    candle_core::bail!(
+                        "ConvRot INT8 refuses cross-device migration of its staged base"
+                    );
+                }
+            }
+            Base::W4A8(q) => {
+                if !q.device().same_device(device) {
+                    candle_core::bail!("W4A8 refuses cross-device migration of its packed base");
                 }
             }
         }
@@ -1428,6 +1593,71 @@ mod tests {
     use candle_core::safetensors::MmapedSafetensors;
     use candle_core::{Device, Tensor};
     use std::collections::HashMap;
+
+    #[test]
+    fn external_base_reuses_checked_residuals_without_a_fake_weight_or_duplicate_cache() {
+        let dev = Device::Cpu;
+        let mut external = AdaptLinear::for_external_base(3, 2, DType::F32, &dev).unwrap();
+        assert!(external.is_quantized());
+        assert_eq!(external.external_base_compute_dtype(), Some(DType::F32));
+        assert_eq!(external.base_shape(), (2, 3));
+        let x = Tensor::new(&[[1f32, 2., 4.], [-1., 0., 2.]], &dev).unwrap();
+        let base = Tensor::new(&[[10f32, 20.], [30., 40.]], &dev).unwrap();
+        assert!(external.forward(&x).is_err());
+        let a = Tensor::new(&[[1f32], [-2.], [0.5]], &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let b = Tensor::new(&[[3f32, -5.]], &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        external.push_lora_checked(a, b, 0.25).unwrap();
+        assert_eq!(external.frozen_adapter_bytes(), 10);
+        let expected = [9.25f32, 21.25, 30., 40.];
+        for _ in 0..2 {
+            let output = external
+                .apply_residuals(&x, base.clone())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let errors: Vec<f32> = output
+                .iter()
+                .zip(expected)
+                .map(|(a, b)| (a - b).abs())
+                .collect();
+            assert_eq!(errors.iter().copied().fold(0f32, f32::max), 0.);
+            assert_eq!(errors.iter().sum::<f32>() / errors.len() as f32, 0.);
+            // BF16 source factors + exactly ONE FP32 prepared pair, reused on request 2.
+            assert_eq!(external.frozen_adapter_bytes(), 30);
+        }
+        external.clear_adapters();
+        let restored = external.apply_residuals(&x, base.clone()).unwrap();
+        assert_eq!(
+            restored.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            base.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        assert_eq!(external.frozen_adapter_bytes(), 0);
+    }
+
+    #[test]
+    fn external_packed_base_refuses_forward_folding_and_invalid_admission() {
+        let dev = Device::Cpu;
+        assert!(AdaptLinear::for_external_base(0, 2, DType::F32, &dev).is_err());
+        assert!(AdaptLinear::for_external_base(3, 2, DType::U8, &dev).is_err());
+        let mut external = AdaptLinear::for_external_base(3, 2, DType::F32, &dev).unwrap();
+        let delta = Tensor::zeros((2, 3), DType::F32, &dev).unwrap();
+        assert!(external.fold_dense_delta(&delta).is_err());
+        assert!(external.quantize(Quant::Q4).is_err());
+        assert!(external.quantize_onto(Quant::Q8, &dev).is_err());
+        assert!(external.quantize_dequant_onto(Quant::Q4, &dev).is_err());
+        let wrong_a = Tensor::zeros((4, 1), DType::F32, &dev).unwrap();
+        let b = Tensor::zeros((1, 2), DType::F32, &dev).unwrap();
+        assert!(external.push_lora(wrong_a, b, 1.).is_err());
+        assert!(!external.is_adapted());
+    }
 
     /// Test-side MLX Q4 packer (group 64): per-element 4-bit codes → u32 words (LSB-first nibbles).
     /// Returns `(wq [out, in/8] u32, scales [out, in/g], biases [out, in/g], affine grid [out, in])`.
@@ -1893,6 +2123,87 @@ mod tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::linear_detect_dense_and_packed_arms");
+    }
+
+    #[test]
+    fn precomputed_base_residual_seam_preserves_output_and_stack() {
+        let dev = Device::Cpu;
+        let weight = Tensor::new(&[[1f32, 2.], [-3., 4.]], &dev).unwrap();
+        let base = Linear::new(weight, None);
+        let x = Tensor::new(&[[0.5f32, -2.], [3., 0.25]], &dev).unwrap();
+        let bare = base.forward(&x).unwrap();
+        let mut linear = AdaptLinear::from_dense(base, 2, 2);
+        let bits = |t: Tensor| {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(linear.apply_residuals(&x, bare.clone()).unwrap()),
+            bits(bare.clone())
+        );
+        let a = Tensor::new(&[[0.25f32], [-0.5]], &dev).unwrap();
+        let b = Tensor::new(&[[2f32, -1.]], &dev).unwrap();
+        linear.push_lora(a, b, -0.7).unwrap();
+        let actual = linear
+            .apply_residuals(&x, bare.clone())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (got, want) in actual.iter().zip([-5.075f32, -8.7125, 2.625, -7.5625]) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "independent bottleneck arithmetic: {got} != {want}"
+            );
+        }
+        assert_eq!(
+            bits(linear.forward(&x).unwrap()),
+            bits(linear.apply_residuals(&x, bare.clone()).unwrap())
+        );
+        let w1 = Tensor::new(&[[0.5f32]], &dev).unwrap();
+        let w2 = Tensor::new(&[[1f32, 0.25], [-0.2, 0.7]], &dev).unwrap();
+        let factors = LokrFactors::build(
+            0.3,
+            (2, 2),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        linear.push_lokr_structured(factors).unwrap();
+        let actual = linear
+            .apply_residuals(&x, bare.clone())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (got, want) in actual
+            .iter()
+            .zip([-5.075f32, -8.9375, 3.084_375, -7.626_25])
+        {
+            assert!(
+                (got - want).abs() < 2e-6,
+                "independent LoKr arithmetic: {got} != {want}"
+            );
+        }
+        assert_eq!(
+            bits(linear.forward(&x).unwrap()),
+            bits(linear.apply_residuals(&x, bare).unwrap())
+        );
+        let wrong = Tensor::zeros((3, 3), DType::F32, &dev).unwrap();
+        assert!(linear.apply_residuals(&wrong, wrong.clone()).is_err());
     }
 
     /// The additive LoRA residual `scale·((x·a)·b)` reproduces the **folded** `x·(W + δ)ᵀ` with

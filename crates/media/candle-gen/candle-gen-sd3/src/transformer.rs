@@ -1814,7 +1814,9 @@ mod tests {
                         Quant::Q8 => GgmlDType::Q8_0,
                         // The loop above only exercises Q4/Q8; NVFP4 is not a GGUF fold target (it is
                         // served by Nvfp4Linear, sc-11042) so this arm is never reached here.
-                        Quant::Nvfp4 => unreachable!("SD3.5 GGUF fold does not exercise NVFP4"),
+                        Quant::Nvfp4 | Quant::Fp8Rowwise => {
+                            unreachable!("SD3.5 GGUF fold does not exercise NVFP4")
+                        }
                     };
                     assert_eq!(qt.dtype(), expected, "wrong GGUF block dtype");
                 }

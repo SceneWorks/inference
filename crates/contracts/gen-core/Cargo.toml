@@ -26,6 +26,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 safetensors = { workspace = true }
 # JSON parse for the PEFT/diffusers `lora_adapter_metadata` header blob in weightsmeta (sc-5513).
 serde_json = { workspace = true }
+serde = { workspace = true }
 # Canonical production-latent tiled-decode quality receipts (SC-18325). This hashes semantic
 # fixture/output bytes only and does not introduce tensor, timing, or memory-measurement code.
 # Canonical semantic fingerprints bind complete alternate snapshots to the retained tokenizer.
@@ -42,6 +43,9 @@ exr = { workspace = true }
 # holds; already in the lock (every backend kit links it).
 image = { workspace = true }
 libc = { workspace = true }
+# The tensor-free torch `.pth`/`.pt` reader (`pth`, moved from mlx-gen in sc-24213 so the Supra2
+# converter runs on both backends): STORED zip entries only, no inflater compiled in.
+zip = { version = "9", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # Stable std does not expose durable Windows file IDs/change time. Prepared File identities use the

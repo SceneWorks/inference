@@ -113,15 +113,12 @@ impl VoicePack {
             AudioError::Msg(format!("voice {}: not a torch zip: {e}", path.display()))
         })?;
 
-        let names: Vec<String> = zip
+        let names = zip
             .file_names()
             .map(|name| name.map(|name| name.into_owned()))
-            .collect::<std::result::Result<_, _>>()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
-                AudioError::Msg(format!(
-                    "voice {}: invalid zip entry name: {e}",
-                    path.display()
-                ))
+                AudioError::Msg(format!("voice {}: zip entry name: {e}", path.display()))
             })?;
         if let Some(byteorder) = names.iter().find(|n| n.ends_with("/byteorder")) {
             let mut s = String::new();
@@ -209,6 +206,194 @@ pub fn last_dim(t: &Tensor) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn write_archive(path: &Path, method: zip::CompressionMethod, entries: &[(&str, &[u8])]) {
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default().compression_method(method);
+        for (name, bytes) in entries {
+            archive.start_file(*name, options).unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn voice_archive_storage_and_deflate_preserve_style_rows_and_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let values: Vec<f32> = (0..512).map(|i| i as f32 / 8.0).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let path = root.path().join("voice.pt");
+            write_archive(
+                &path,
+                method,
+                &[("voice/byteorder", b"little"), ("voice/data/0", &bytes)],
+            );
+            let voice = VoicePack::from_file(&path).unwrap();
+            assert_eq!((voice.rows, voice.dim), (2, 256));
+            assert_eq!(voice.data, values);
+            assert_eq!(voice.ref_s(0), &values[..256]);
+            assert_eq!(voice.ref_s(usize::MAX), &values[256..]);
+            write_archive(
+                &path,
+                method,
+                &[("voice/byteorder", b"big"), ("voice/data/0", &bytes)],
+            );
+            assert!(VoicePack::from_file(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("byteorder"));
+            write_archive(
+                &path,
+                method,
+                &[("voice/data/0", &bytes[..bytes.len() - 1])],
+            );
+            assert!(VoicePack::from_file(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("does not divide"));
+        }
+    }
+
+    #[test]
+    fn vendored_npz_stored_roundtrip_and_deflated_reads_preserve_tensors() {
+        use candle_audio::candle_core::npy::NpzTensors;
+        let root = tempfile::tempdir().unwrap();
+        let tensor =
+            Tensor::from_slice(&[1.0f32, -2.0, 3.5, 4.0, 0.0, 8.0], (2, 3), &Device::Cpu).unwrap();
+        let stored = root.path().join("stored.npz");
+        Tensor::write_npz(&[("weights", &tensor)], &stored).unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&stored).unwrap()).unwrap();
+        let mut entry = archive.by_name("weights.npy").unwrap();
+        assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+        let mut npy = Vec::new();
+        entry.read_to_end(&mut npy).unwrap();
+        drop(entry);
+        drop(archive);
+        let compressed = root.path().join("compressed.npz");
+        write_archive(
+            &compressed,
+            zip::CompressionMethod::Deflated,
+            &[("weights.npy", &npy)],
+        );
+        for path in [&stored, &compressed] {
+            let all = Tensor::read_npz(path).unwrap();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].0, "weights");
+            let named = Tensor::read_npz_by_name(path, &["weights"]).unwrap();
+            let lazy = NpzTensors::new(path).unwrap();
+            assert_eq!(
+                lazy.get_shape_and_dtype("weights").unwrap(),
+                ((2, 3).into(), DType::F32)
+            );
+            let lazy_tensor = lazy.get("weights").unwrap().unwrap();
+            for loaded in [&all[0].1, &named[0], &lazy_tensor] {
+                assert_eq!(loaded.dims(), tensor.dims());
+                assert_eq!(
+                    loaded.to_vec2::<f32>().unwrap(),
+                    tensor.to_vec2::<f32>().unwrap()
+                );
+            }
+            assert!(lazy.get("missing").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn vendored_pickle_reads_stored_and_deflated_torch_state_dicts() {
+        use candle_audio::candle_core::pickle;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../contracts/gen-core/tests/fixtures/latent_perceptual/tiny_bn_state_dict.pth",
+        );
+        let expected: HashMap<_, _> = pickle::read_all(&source).unwrap().into_iter().collect();
+        assert_eq!(expected.len(), 7);
+        let root = tempfile::tempdir().unwrap();
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let mut source_zip =
+                zip::ZipArchive::new(std::fs::File::open(&source).unwrap()).unwrap();
+            let mut entries = Vec::new();
+            for index in 0..source_zip.len() {
+                let mut entry = source_zip.by_index(index).unwrap();
+                let name = entry.name().unwrap().into_owned();
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                entries.push((name, bytes));
+            }
+            let borrowed: Vec<_> = entries
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+                .collect();
+            let path = root.path().join("state.pth");
+            write_archive(&path, method, &borrowed);
+            let loaded: HashMap<_, _> = pickle::read_all(&path).unwrap().into_iter().collect();
+            assert_eq!(loaded.len(), expected.len());
+            for (name, tensor) in &expected {
+                assert_eq!(loaded[name].dims(), tensor.dims());
+                assert_eq!(loaded[name].dtype(), tensor.dtype());
+                assert_eq!(
+                    loaded[name]
+                        .to_dtype(DType::F64)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f64>()
+                        .unwrap(),
+                    tensor
+                        .to_dtype(DType::F64)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f64>()
+                        .unwrap(),
+                    "{name} / {method:?}",
+                );
+            }
+        }
+    }
+
+    fn voice_archive() -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("voice/byteorder", options).unwrap();
+        writer.write_all(b"little").unwrap();
+        writer.start_file("voice/data/0", options).unwrap();
+        for _ in 0..VoicePack::STYLE_WIDTH {
+            writer.write_all(&0.5f32.to_le_bytes()).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn voice_archive_preserves_style_values() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("voice.pt");
+        std::fs::write(&path, voice_archive()).unwrap();
+        let voice = VoicePack::from_file(&path).unwrap();
+        assert_eq!(voice.rows, 1);
+        assert_eq!(voice.dim, VoicePack::STYLE_WIDTH);
+        assert_eq!(voice.ref_s(1), vec![0.5; VoicePack::STYLE_WIDTH]);
+    }
+
+    #[test]
+    fn voice_archive_rejects_invalid_utf8_names() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("voice.pt");
+        let mut bytes = voice_archive();
+        let header = bytes.windows(4).position(|b| b == b"PK\x01\x02").unwrap();
+        // Mark the central entry as UTF-8, then supply an invalid first name byte.
+        let flags = u16::from_le_bytes(bytes[header + 8..header + 10].try_into().unwrap());
+        bytes[header + 8..header + 10].copy_from_slice(&(flags | 0x800).to_le_bytes());
+        bytes[header + 46] = 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(VoicePack::from_file(&path).is_err());
+    }
 
     #[test]
     fn weight_norm_resolution_matches_the_definition() {

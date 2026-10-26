@@ -2307,6 +2307,7 @@ mod tests {
 
     fn context(provider: &str, strategy: MemoryStrategy) -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             selection: MemorySelection {
                 strategy,
                 parameters: Default::default(),

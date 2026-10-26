@@ -373,6 +373,44 @@ impl PackedLayout {
         references: &[ReferenceLatentGeometry],
         device: &Device,
     ) -> Result<Self> {
+        Self::build_ref2va_with_audio_channels(
+            geometry,
+            patch_size,
+            text_token_tags,
+            audio_channels,
+            references,
+            &vec![audio_channels; references.len()],
+            device,
+        )
+    }
+
+    /// Channel counts belong to each encoded reference, not to the generated stereo track.
+    pub fn build_ref2va_with_audio_channels(
+        geometry: JointGeometry,
+        patch_size: [usize; 3],
+        text_token_tags: &[u32],
+        audio_channels: usize,
+        references: &[ReferenceLatentGeometry],
+        reference_audio_channels: &[usize],
+        device: &Device,
+    ) -> Result<Self> {
+        if reference_audio_channels.len() != references.len()
+            || references
+                .iter()
+                .zip(reference_audio_channels)
+                .any(|(r, &channels)| {
+                    if r.num_audio_latents > 0 {
+                        channels == 0
+                    } else {
+                        channels != 0 && channels != audio_channels
+                    }
+                })
+        {
+            return Err(CandleError::Msg(
+                "minimax-h3 packing: reference audio channel counts must match encoded references"
+                    .into(),
+            ));
+        }
         geometry.validate()?;
         let (patch_h, patch_w) = (patch_size[1], patch_size[2]);
         if patch_h == 0 || patch_w == 0 {
@@ -440,7 +478,7 @@ impl PackedLayout {
                 rotary_time,
                 patch_h,
                 patch_w,
-                audio_channels,
+                reference_audio_channels[i],
                 &target_width_grid,
             )
             .map_err(|e| CandleError::Msg(format!("{e} (reference {i})")))?;

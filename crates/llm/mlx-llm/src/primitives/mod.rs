@@ -81,6 +81,21 @@ pub use rope::{apply_rope, Rope};
 pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};
 pub use weights::{Materialized, Weights};
 
+/// Fence the EXACT native stream retained by a provider. mlx-rs does not expose
+/// this C API as a safe method; evaluating a fresh constant array is not a fence.
+pub fn synchronize_stream(stream: &mlx_rs::Stream) -> crate::Result<()> {
+    // SAFETY: the borrowed Rust Stream owns a live mlx_stream handle throughout
+    // this blocking call. mlx_synchronize only borrows it; no handle is freed or
+    // transferred. The pinned mlx-c stream.h declares the i32 status contract.
+    let status = unsafe { mlx_sys::mlx_synchronize(stream.as_ptr()) };
+    if status != 0 {
+        return Err(crate::Error::Msg(format!(
+            "mlx_synchronize failed on an owned execution stream (status {status}); no release fence or reclamation is claimed"
+        )));
+    }
+    Ok(())
+}
+
 /// Whether `stream` is a GPU stream — the only place a custom Metal kernel can run. Every fused
 /// kernel resolves [`Stream::task_local_or_default`](mlx_rs::Stream::task_local_or_default) once,
 /// gates on this, and dispatches on that same stream: the task-local stream need not be on the

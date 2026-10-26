@@ -756,6 +756,7 @@ fn phase_facts(spec: &LoadSpec) -> CoreResult<mlx_gen::gen_core::MemoryPhaseFact
         // sc-26268: a staged request sheds the U-Net (and control/IP) before the decode.
         staged_weights: StagedWeightSchedule::ThreeStage,
         transformer_stream: None,
+        native_quant: None,
         // `load_vae` casts to f32; the staged fp16-fix VAE runs f16 (sc-26268). The upsampling
         // constructor uses this same preset.
         decoder_workspace: Some(DecoderWorkspaceFacts {

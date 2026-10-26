@@ -212,8 +212,8 @@ fn a_bounded_plan_reaches_the_real_dit_attention_call() {
 /// test above and bound nothing in a render. Driven through both modulation arms — `Cached`, the
 /// shipped precompute-and-evict path, and `Temb`, the resident one — because a rung reachable on
 /// only one of them is selectable on a request routed to the other.
-#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_bounded_plan_threads_the_whole_block_stack() {
     use mlx_gen_minimax_h3::dit::DitBlock;
 

@@ -358,6 +358,11 @@ fn validate_packed_triple(
                 "{MODEL_ID}: NVFP4 is not a Wan affine-packed tier"
             )))
         }
+        Quant::Fp8Rowwise => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: FP8 rowwise is not a Wan affine-packed tier"
+            )))
+        }
     };
     (elements / 32).checked_mul(block_bytes).ok_or_else(|| {
         gen_core::Error::Msg(format!(
@@ -615,6 +620,7 @@ const fn tier_label(quant: Option<Quant>) -> &'static str {
         Some(Quant::Q4) => "q4",
         Some(Quant::Q8) => "q8",
         Some(Quant::Nvfp4) => "nvfp4",
+        Some(Quant::Fp8Rowwise) => "fp8r",
     }
 }
 
@@ -1328,7 +1334,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            Some(Quant::Nvfp4) => unreachable!(),
+            Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => unreachable!(),
         }
         temp
     }

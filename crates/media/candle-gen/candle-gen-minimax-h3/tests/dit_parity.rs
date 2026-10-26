@@ -357,7 +357,7 @@ fn the_keyframe_anchor_rows_match_the_reference() {
 /// chunked the `[T, 18·hidden]` projection directly produces six tensors of the same total size
 /// with different contents.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn adaln_modulation_matches_the_reference() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -390,7 +390,7 @@ fn adaln_modulation_matches_the_reference() {
 /// One `MiniMaxH3TransformerBlock`: pre-norm + AdaLN modulation, qk-normed MM-RoPE attention,
 /// gated residual, SwiGLU feed-forward, gated residual.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn transformer_block_matches_the_reference() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -653,7 +653,7 @@ fn qk_norm_runs_per_head_before_the_rotary() {
 /// knobs (`refiner.rs` deliberately reads `final_norm_eps` for `final_norm` and `norm_eps` for the
 /// block norms), so a variant checkpoint that diverged would otherwise run silently wrong.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn every_norm_epsilon_is_wired_through() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -792,7 +792,7 @@ fn published_ffn_projection_is_value_then_gate() {
 /// and the printed norms and cosine show why a magnitude, std or checksum assertion of any
 /// tolerance would not.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn reading_the_ffn_halves_gate_first_breaks_parity() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1029,7 +1029,7 @@ fn the_wrong_qkv_transform_breaks_parity() {
 /// **`adaln_indices = timestep_index · MODALITY_NUM + tag`.** The modality term must be present:
 /// dropping it (addressing by timestep alone) is a legal index vector that selects the wrong rows.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn the_modality_term_of_the_adaln_index_is_load_bearing() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1090,7 +1090,7 @@ fn the_modality_term_of_the_adaln_index_is_load_bearing() {
 /// different contents; this reconstructs that wrong reading from the fixture's own weights and
 /// shows the six tables differ.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn the_adaln_table_is_reshaped_before_it_is_chunked() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1135,7 +1135,7 @@ fn the_adaln_table_is_reshaped_before_it_is_chunked() {
 /// Every one of a block's 12 tensors must move the output. A tensor that can be changed without
 /// changing the result is not wired into the graph and the parity test is not covering it.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn every_block_weight_is_load_bearing() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1182,7 +1182,7 @@ fn every_block_weight_is_load_bearing() {
 /// It is also what justifies this lane's `1e-4` bound against MLX's `1e-2`: the printed ladder is
 /// the evidence that candle's residual is orders below Metal's reduced-precision one.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn parity_residuals_bound_the_mutation_floor() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1322,6 +1322,7 @@ fn fixture_is_not_degenerate() {
 /// The declared tensor names must be exactly the fixture's block + refiner tensor set. A silently
 /// unmapped tensor still produces plausible output.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn weight_mapping_is_exhaustive_over_the_block_stack() {
     let f = fixture();
     let cfg = dit_fixture_config();

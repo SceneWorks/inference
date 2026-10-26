@@ -281,6 +281,7 @@ dependencies = [
  "candle-nn",
  "cmudict-fast",
  "core-llm",
+ "flate2",
  "misaki-rs",
  "rand",
  "rand_distr",
@@ -453,6 +454,7 @@ dependencies = [
  "candle-metal-kernels",
  "candle-ug",
  "cudarc 0.19.8",
+ "flate2",
  "float8",
  "gemm 0.19.0",
  "half",
@@ -576,6 +578,7 @@ dependencies = [
  "candle-gen-face",
  "candle-gen-flux",
  "candle-gen-flux2",
+ "candle-gen-flux3",
  "candle-gen-ideogram",
  "candle-gen-instantid",
  "candle-gen-iris",
@@ -587,6 +590,7 @@ dependencies = [
  "candle-gen-mage",
  "candle-gen-minimax-h3",
  "candle-gen-mochi",
+ "candle-gen-moss-image",
  "candle-gen-pid",
  "candle-gen-pulid",
  "candle-gen-qwen-image",
@@ -598,6 +602,7 @@ dependencies = [
  "candle-gen-sdxl",
  "candle-gen-seedvr2",
  "candle-gen-sensenova",
+ "candle-gen-supra2",
  "candle-gen-svd",
  "candle-gen-wan",
  "candle-gen-z-image",
@@ -699,6 +704,22 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-flux3"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-llm",
+ "candle-quant-kernels",
+ "image",
+ "rand",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -886,6 +907,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-moss-image"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-flux2",
+ "candle-llm",
+ "image",
+ "rand",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "candle-gen-perceptual"
 version = "0.0.0"
 dependencies = [
@@ -1069,6 +1104,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-supra2"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-sdxl",
+ "candle-transformers",
+ "image",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2364,7 +2411,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
- "zip",
 ]
 
 [[package]]
@@ -2435,6 +2481,7 @@ dependencies = [
  "mlx-gen-face",
  "mlx-gen-flux",
  "mlx-gen-flux2",
+ "mlx-gen-flux3",
  "mlx-gen-ideogram",
  "mlx-gen-instantid",
  "mlx-gen-iris",
@@ -2447,6 +2494,7 @@ dependencies = [
  "mlx-gen-mage",
  "mlx-gen-minimax-h3",
  "mlx-gen-mochi",
+ "mlx-gen-moss-image",
  "mlx-gen-pid",
  "mlx-gen-pulid",
  "mlx-gen-qwen-image",
@@ -2459,6 +2507,7 @@ dependencies = [
  "mlx-gen-sdxl",
  "mlx-gen-seedvr2",
  "mlx-gen-sensenova",
+ "mlx-gen-supra2",
  "mlx-gen-svd",
  "mlx-gen-wan",
  "mlx-gen-z-image",
@@ -2537,6 +2586,21 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-flux3"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "safetensors 0.4.5",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
@@ -2742,6 +2806,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-moss-image"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-flux2",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "mlx-gen-perceptual"
 version = "0.0.0"
 dependencies = [
@@ -2910,6 +2989,19 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-supra2"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-flux",
+ "mlx-gen-sdxl",
+ "pmetal-mlx-rs",
+ "serde_json",
  "tempfile",
 ]
 
@@ -3699,12 +3791,14 @@ dependencies = [
  "image",
  "libc",
  "safetensors 0.4.5",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "windows-sys",
+ "zip",
 ]
 
 [[package]]
@@ -4399,6 +4493,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a954114b47a54df49f83d2722814e86b23d4bb1b54a1b90fb7d92b41619ddc22"
 dependencies = [
  "crc32fast",
+ "flate2",
  "indexmap",
  "memchr",
  "nix",

@@ -126,7 +126,10 @@ fn moss_sfx_wav_conformance() {
         .generate(&req, &mut |p| match p {
             Progress::Step { .. } => steps += 1,
             Progress::Decoding => decoding += 1,
-            Progress::Loading(_) => {}
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .expect("generate");
     assert_eq!(steps, STEPS);

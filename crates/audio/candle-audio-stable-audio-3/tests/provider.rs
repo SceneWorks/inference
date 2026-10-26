@@ -544,7 +544,10 @@ fn run_case(case: &Case) {
             &mut |progress| match progress {
                 Progress::Step { current, total } => seen_steps.push((current, total)),
                 Progress::Decoding => decoding += 1,
-                Progress::Loading(_) => {}
+                Progress::Loading(_)
+                | Progress::PromptUpsamplingComplete
+                | Progress::ConditioningComplete
+                | Progress::Upsampling { .. } => {}
             },
         )
         .expect("connected generation");
@@ -606,7 +609,10 @@ fn run_default_case(case: &Case) {
             &mut |progress| match progress {
                 Progress::Step { current, total } => seen_steps.push((current, total)),
                 Progress::Decoding => decoding += 1,
-                Progress::Loading(_) => {}
+                Progress::Loading(_)
+                | Progress::PromptUpsamplingComplete
+                | Progress::ConditioningComplete
+                | Progress::Upsampling { .. } => {}
             },
         )
         .expect("connected generation at the variant's own defaults");

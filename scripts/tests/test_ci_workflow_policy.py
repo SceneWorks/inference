@@ -260,12 +260,14 @@ def evaluate_policy(
     event_name: str,
     head_repository: str,
     repository: str = "SceneWorks/inference",
+    dispatch_lanes: str = "all",
 ) -> bool:
     values = {
         "needs.changes.outputs.windows_cuda": str(lanes_include_cuda).lower(),
         "github.event_name": event_name,
         "github.event.pull_request.head.repo.full_name": head_repository,
         "github.repository": repository,
+        "inputs.lanes": dispatch_lanes,
     }
     rendered = expression
     for name in sorted(values, key=len, reverse=True):
@@ -797,8 +799,12 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 38 since sc-25688 added the dispatch-only `mlx-iris-restore-train` job;
         # 39 since sc-25689 added the dispatch-only `mlx-iris-curricula-train` job;
         # 40 since sc-25690 added the dispatch-only `mlx-iris-memory-probe` job;
-        # 41 since sc-26214 added the dispatch-only `mlx-veda` job.
-        MACOS_HUB_LOCK: 41,
+        # 41 since sc-26214 added the dispatch-only `mlx-veda` job;
+        # 42 since sc-26234 added the dispatch-only `mlx-flux3-klein` job;
+        # 43 since sc-24217 added the dispatch-only `mlx-supra2` job.
+        MACOS_HUB_LOCK: 43,
+        # 20 since sc-24214 added the dispatch-only `candle-supra2` job;
+        # 19 since sc-26235 added the dispatch-only `candle-flux3-klein` job;
         # 18 since sc-25901 added the dispatch-only `candle-qwen-image-2-1-turbo` job;
         # 17 since sc-25690 added the dispatch-only `candle-iris-memory-probe` job;
         # 16 since the sc-25678 follow-up added the dispatch-only `candle-qwen-image-2-1-train` job;
@@ -807,7 +813,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 18,
+        WINDOWS_HUB_LOCK: 20,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -1029,6 +1035,56 @@ def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> li
 
 
 class CiWorkflowPolicyTests(unittest.TestCase):
+    def test_native_terminal_initializes_evidence_without_job_runner_context(self):
+        # Job env is evaluated before a runner exists. Step env may use runner context;
+        # parse the context boundary so a different path/name or wrapped expression fails too.
+        def runner_job_env(workflow):
+            return [
+                (job_name, name)
+                for job_name, job in workflow.get("jobs", {}).items()
+                for name, value in job.get("env", {}).items()
+                if any(
+                    re.search(r"\brunner\s*(?:\.|\[)", expression)
+                    for expression in re.findall(r"\$\{\{(.*?)\}\}", str(value), re.S)
+                )
+            ]
+
+        valid = {"jobs": {"native": {
+            "env": {"ID": "${{ github.run_id }}"},
+            "steps": [{"env": {"PATH": "${{ runner.temp }}"}}],
+        }}}
+        self.assertEqual(runner_job_env(valid), [])
+        for invalid in (
+            "${{ runner.temp }}/evidence",
+            "${{ runner['temp'] }}",
+            "${{ format('{0}', runner.os) }}",
+        ):
+            mutated = copy.deepcopy(valid)
+            mutated["jobs"]["native"]["env"]["ANY_NAME"] = invalid
+            self.assertEqual(runner_job_env(mutated), [("native", "ANY_NAME")])
+
+        native = yaml.safe_load(
+            WORKFLOW.with_name("moss-native-terminal-windows.yml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(runner_job_env(native), [])
+        job = native["jobs"]["native"]
+        steps = job["steps"]
+        first = steps[0]
+        self.assertEqual(first["shell"], "powershell")
+        self.assertNotIn("uses", first)
+        self.assertIn("$env:RUNNER_TEMP", first["run"])
+        self.assertIn("$env:GITHUB_ENV", first["run"])
+        self.assertIn("transport-initialization.json", first["run"])
+        self.assertNotIn("$env:GITHUB_WORKSPACE", first["run"])
+        upload = next(
+            step for step in steps
+            if step.get("uses", "").startswith("actions/upload-artifact@")
+        )
+        self.assertEqual(upload["if"], "always()")
+        self.assertIn(
+            "${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.json", upload["with"]["path"]
+        )
+
     def require_posix_shell(self) -> str:
         shell = posix_shell()
         if shell is None:
@@ -1038,6 +1094,160 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 "parsed a trivial script. Install Git for Windows, or a bash, to run this gate."
             )
         return shell
+
+    def test_native_terminal_uses_trusted_workflow_controller_with_pinned_engine(self):
+        native = yaml.safe_load(
+            WORKFLOW.with_name("moss-native-terminal-windows.yml").read_text(encoding="utf-8")
+        )
+        steps = native["jobs"]["native"]["steps"]
+        runs = [step.get("run", "") for step in steps]
+        guard = next(i for i, run in enumerate(runs) if "Pinned inference is not a main ancestor" in run)
+        controller = next(i for i, run in enumerate(runs) if "controller-source.json" in run)
+        selftest = runs.index("& $env:MOSS_NATIVE_CONTROLLER -SelfTest")
+        execution = runs.index("& $env:MOSS_NATIVE_CONTROLLER")
+        self.assertLess(guard, controller)
+        self.assertLess(controller, selftest)
+        self.assertLess(selftest, execution)
+        materialize = runs[controller]
+        for invariant in (
+            "$env:GITHUB_REF -cne 'refs/heads/main'",
+            "git merge-base --is-ancestor $env:GITHUB_SHA origin/main",
+            "$object=$env:GITHUB_SHA+':scripts/ci/moss-native-terminal.ps1'",
+            "$start.Arguments='cat-file blob '+$blob",
+            "[IO.FileMode]::CreateNew",
+            "$process.StandardOutput.BaseStream.CopyToAsync($file)",
+            "git hash-object --no-filters $path",
+            "$actual -cne $blob",
+            "controller_sha256=$sha256",
+            "MOSS_NATIVE_CONTROLLER=$path",
+        ):
+            self.assertIn(invariant, materialize)
+        self.assertNotIn("inputs.", materialize)
+        self.assertNotIn("control_json", materialize)
+        self.assertIn("$env:MOSS_TRANSPORT_ARTIFACT_ROOT", materialize)
+        checkouts = [step for step in steps if step.get("uses", "").startswith("actions/checkout@")]
+        self.assertEqual(checkouts[0]["with"]["ref"], "${{ fromJSON(inputs.control_json).inference_revision }}")
+        controller_source = (WORKFLOW.parents[2] / "scripts/ci/moss-native-terminal.ps1").read_text(encoding="utf-8")
+        self.assertIn("$source = (Get-Location).Path", controller_source)
+        self.assertIn("Join-Path $source 'scripts/ci/moss-native-terminal-protocol.json'", controller_source)
+        windows_selftest = [
+            step for step in yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["windows-cuda-check"]["steps"]
+            if "moss-native-terminal.ps1 -SelfTest" in step.get("run", "")
+        ]
+        self.assertEqual(len(windows_selftest), 1)
+        self.assertEqual(windows_selftest[0]["shell"], "powershell")
+
+    def assert_moss_exit_drain_guards(self, source: str) -> None:
+        # Source policy complements Windows behavioral fixtures; it never executes PowerShell.
+        owned = source.split("function Owned-Gpu-Identity(", 1)[1].split("function Capture-Owned(", 1)[0]
+        for guard in (
+            '$owned.ContainsKey($id)',
+            'Get-CimInstance Win32_Process -Filter "ProcessId=$id" -ErrorAction Stop',
+            'Same-Identity $entry.identity (Snapshot-Identity $row)',
+            '$entry.process.Id -eq $id -and $entry.identity.pid -eq $id',
+            "$entry.process.StartTime.ToUniversalTime().ToString('o') -ceq $entry.handle_created_utc",
+            'if ($entry.process.HasExited)',
+            '$entry.process.ExitTime.ToUniversalTime()',
+            '$age -ge 0 -and $age -le 30',
+            'Require ($null -ne $row)',
+        ):
+            self.assertIn(guard, owned)
+        self.assertNotIn('catch', owned)
+        device = source.split("function Check-Device(", 1)[1].split("function Evidence-Files(", 1)[0]
+        self.assertIn('Pid-Subset $pids @($allowed+$baseline+@($owned.Keys))', device)
+        self.assertIn('Owned-Gpu-Identity ([int]$_) $owned', device)
+        self.assertIn('$g[0].owned_pids.Count -eq 0 -and', device)
+        self.assertIn('$script:deviceIdleConfirmed=$false', device)
+        self.assertIn('$script:deviceIdleConfirmed=$true; return $g', device)
+        run = source.split('function Owned-Run(', 1)[1].split('function Check-Device(', 1)[0]
+        self.assertIn('& $drain $owned', run)
+        self.assertLess(run.index('Stop-Owned $owned'), run.index('& $drain $owned'))
+        self.assertLess(run.index('& $drain $owned'), run.index('$p.Dispose()'))
+        self.assertIn('Test-Device-Exit-Fixture $temp', source)
+        self.assertEqual(source.count('} {param($owned) Wait-DeviceIdle $owned | Out-Null}'), 2)
+        self.assertIn('if ($script:deviceIdleConfirmed -and (Test-Path -LiteralPath $leasePath)', source)
+
+    def test_moss_exit_drain_guards_and_omission_mutants(self) -> None:
+        source = (WORKFLOW.parents[2] / 'scripts/ci/moss-native-terminal.ps1').read_text(encoding='utf-8')
+        self.assert_moss_exit_drain_guards(source)
+        for guard in (
+            '$owned.ContainsKey($id)',
+            'Same-Identity $entry.identity (Snapshot-Identity $row)',
+            '$entry.process.Id -eq $id -and $entry.identity.pid -eq $id',
+            "$entry.process.StartTime.ToUniversalTime().ToString('o') -ceq $entry.handle_created_utc",
+            'if ($entry.process.HasExited)',
+            '$age -ge 0 -and $age -le 30',
+            'Require ($null -ne $row)',
+            '$g[0].owned_pids.Count -eq 0 -and',
+            '& $drain $owned',
+            'Test-Device-Exit-Fixture $temp',
+            '} {param($owned) Wait-DeviceIdle $owned | Out-Null}',
+            'if ($script:deviceIdleConfirmed -and (Test-Path -LiteralPath $leasePath)',
+        ):
+            with self.subTest(omitted=guard), self.assertRaises(AssertionError):
+                self.assert_moss_exit_drain_guards(source.replace(guard, ''))
+        with self.assertRaises(AssertionError):
+            self.assert_moss_exit_drain_guards(source.replace('-ErrorAction Stop', '-ErrorAction SilentlyContinue', 1))
+
+    def assert_moss_positive_transport_budget(self, source: str) -> None:
+        self.assertIn("[ValidateRange(10,60)][int]$SelfTestPositiveTimeoutSeconds=60", source)
+        run = source.split("function Owned-Run(", 1)[1].split("function Check-Device(", 1)[0]
+        self.assertNotIn("SelfTestPositiveTimeoutSeconds", run)
+        self.assertIn('Require ($watch.Elapsed.TotalSeconds -lt $seconds) "Owned child timeout: $name"', run)
+        self.assertLess(run.index("$p.StandardOutput.BaseStream.CopyToAsync"), run.index("$root=Capture-Owned $p"))
+        self.assertLess(run.index("$p.StandardError.BaseStream.CopyToAsync"), run.index("$root=Capture-Owned $p"))
+        self.assertLess(run.index("Stop-Owned $owned"), run.index("[Threading.Tasks.Task]::WaitAll"))
+        # The two formerly 10-second positive smokes share the existing 60s helper watchdog.
+        for name in ("root-exits-before-pipe-child", "streamed-io"):
+            self.assertIn(f"'{name}' $SelfTestPositiveTimeoutSeconds {{", source)
+        for invariant in (
+            "var deadline = DateTime.UtcNow.AddSeconds(60);",
+            "'fake-timeout' 1 {",
+            "'never-release-owned'",
+            "'never-release-foreign'",
+            "'Timed-out owned process survived cleanup'",
+            "'Foreign same-name process was terminated'",
+            "[IO.File]::WriteAllText($script:fixtureIoRelease,'release')",
+            "Require $script:fixtureIoObserved 'Owned stream was never authenticated/released'",
+            "'O'*131072",
+            "'E'*131072",
+            "'Owned stdout lost or changed bytes'",
+            "'Owned stderr lost or changed bytes'",
+            "'Owned stream byte-identical EOF: '",
+        ):
+            self.assertIn(invariant, source)
+        # Only SelfTest owns this budget. Product compile/campaign deadlines remain untouched.
+        product = source.split("Exact-Fields $c @('campaign'", 1)[1]
+        self.assertNotIn("SelfTestPositiveTimeoutSeconds", product)
+        self.assertIn("'build' 10800", product)
+
+    def test_moss_positive_transport_budget_and_omission_mutants(self) -> None:
+        source = (WORKFLOW.parents[2] / "scripts/ci/moss-native-terminal.ps1").read_text(encoding="utf-8")
+        self.assert_moss_positive_transport_budget(source)
+        guards = (
+            "[ValidateRange(10,60)][int]$SelfTestPositiveTimeoutSeconds=60",
+            "'root-exits-before-pipe-child' $SelfTestPositiveTimeoutSeconds {",
+            "'streamed-io' $SelfTestPositiveTimeoutSeconds {",
+            "'fake-timeout' 1 {",
+            "'never-release-owned'",
+            "'never-release-foreign'",
+            "'Timed-out owned process survived cleanup'",
+            "'Foreign same-name process was terminated'",
+            "[IO.File]::WriteAllText($script:fixtureIoRelease,'release')",
+            "Require $script:fixtureIoObserved 'Owned stream was never authenticated/released'",
+            "'O'*131072",
+            "'E'*131072",
+            "'Owned stdout lost or changed bytes'",
+            "'Owned stderr lost or changed bytes'",
+            "'Owned stream byte-identical EOF: '",
+        )
+        for guard in guards:
+            with self.subTest(omitted=guard), self.assertRaises(AssertionError):
+                self.assert_moss_positive_transport_budget(source.replace(guard, ""))
+        with self.assertRaises(AssertionError):
+            self.assert_moss_positive_transport_budget(source.replace("'fake-timeout' 1 {", "'fake-timeout' $SelfTestPositiveTimeoutSeconds {"))
+        with self.assertRaises(AssertionError):
+            self.assert_moss_positive_transport_budget(source.replace("'streamed-io' $SelfTestPositiveTimeoutSeconds {", "'streamed-io' 10 {"))
 
     # The Candle Metal pins of the vendored candle-metal-kernels fix (its VENDORED.md): the crate
     # each libtest filter must select an integration module of. libtest passes on zero matches,
@@ -1116,6 +1326,34 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertLess(names.index(reclaim), names.index("Cache Cargo and MLX native build"))
         self.assertIn("nohup", steps[names.index(reclaim)]["run"])
 
+    def test_flux3_cuda_profile_stays_dispatch_only_without_new_inputs(self) -> None:
+        workflow = yaml.load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+        self.assertLessEqual(len(inputs), 25, "GitHub rejects workflows above the dispatch input cap")
+        self.assertIn("flux3-klein-cuda", inputs["profile"]["options"])
+        self.assertNotIn("flux3_mlx_size", inputs)
+        self.assertNotIn("flux3_mlx_steps", inputs)
+        job = workflow["jobs"]["candle-flux3-klein"]
+        self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.profile == 'flux3-klein-cuda'")
+        self.assertEqual(job["env"]["FLUX3_REAL_SIZE"], "1024")
+        self.assertEqual(job["env"]["FLUX3_REAL_STEPS"], "16")
+
+    def test_flux3_image_and_optional_upsampler_manifest_rows_both_survive(self) -> None:
+        manifest = tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))
+        models = {row["key"]: row for row in manifest["models"]}
+        image = models["flux3-image-klein-cuda"]
+        self.assertEqual(image["repository"], "black-forest-labs/flux-3-image-klein")
+        self.assertEqual(image["revision"], "8454017f9ebaada30c998fccd9f67a80c7580f68")
+        self.assertTrue(image["requires_auth"])
+        self.assertEqual(image["profiles"], ["flux3-klein-cuda"])
+        self.assertIn("ae.safetensors", image["expected_files"])
+        self.assertIn("text_encoder/model-00002-of-00002.safetensors", image["expected_files"])
+        upsampler = models["flux3-image-klein-pup-mlx"]
+        self.assertEqual(upsampler["repository"], "black-forest-labs/flux-3-image-klein-pup")
+        self.assertEqual(upsampler["revision"], "8b069751eb5dcab23829d9c5eccb470eb8b8a4ed")
+        self.assertEqual(upsampler["profiles"], ["flux3-klein-mlx"])
+        self.assertIn("system_prompts.json", upsampler["expected_files"])
+
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = real_weights_inline_text()
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
@@ -1126,13 +1364,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # `mlx-iris-curricula-train` and `candle-iris-curricula`; 16 Windows after the sc-25678
         # follow-up added `candle-qwen-image-2-1-train`; 40 macOS / 17 Windows after sc-25690 added
         # `mlx-iris-memory-probe` and `candle-iris-memory-probe`; 18 Windows after sc-25901 added
-        # `candle-qwen-image-2-1-turbo`; 41 macOS after sc-26214 added `mlx-veda`.
+        # `candle-qwen-image-2-1-turbo`; 41 macOS after sc-26214 added `mlx-veda`; 42 macOS after
+        # sc-26234 added `mlx-flux3-klein`; 19 Windows after sc-26235 added `candle-flux3-klein`;
+        # 20 Windows after sc-24214 added `candle-supra2`; 43 macOS after sc-24217 added `mlx-supra2`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 41)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 18)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 43)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 20)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1553,18 +1793,24 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         shell = self.require_posix_shell()
         native_run = subprocess.run
         script = "for bits in 4 8; do\n  :\ndone\n"
-        def windows_stdin(command, **kwargs):
-            payload = kwargs["input"]
-            if isinstance(payload, str):
-                payload = payload.replace("\n", "\r\n").encode("utf-8")
-            return native_run(command, input=payload, text=False, capture_output=True, check=False)
-        with patch.object(subprocess, "run", side_effect=windows_stdin):
+
+        def binary_transport(command, **kwargs):
+            # Check the real helper's subprocess boundary, not whether this host's Bash
+            # rejects CRLF: some Git for Windows builds accept it even with igncr off.
+            self.assertIsInstance(kwargs["input"], bytes, "syntax input must be binary")
+            self.assertEqual(kwargs["input"], script.encode("utf-8"))
+            self.assertFalse(kwargs.get("text", False), "text mode translates LF on Windows")
+            self.assertNotIn(b"\r", kwargs["input"])
+            return native_run(command, **kwargs)
+
+        with patch.object(subprocess, "run", side_effect=binary_transport):
             actual = bash_syntax_check(shell, script)
             self.assertEqual(actual.returncode, 0, actual.stderr)
-            # The previous text-mode implementation must fail the same discriminator.
-            mutant = subprocess.run([shell, "-n"], input=script, text=True, encoding="utf-8",
-                                    capture_output=True, check=False)
-            self.assertNotEqual(mutant.returncode, 0, "text stdin mutation escaped Windows-equivalent gate")
+            # The old text-stdin implementation must fail the same transport assertion,
+            # independently of the selected shell's carriage-return parsing policy.
+            with self.assertRaisesRegex(AssertionError, "syntax input must be binary"):
+                subprocess.run([shell, "-n"], input=script, text=True, encoding="utf-8",
+                               capture_output=True, check=False)
 
     def test_bash_syntax_check_rejects_a_malformed_build_script(self) -> None:
         # The positive case alone cannot tell "the script parses" from "the checker never fails".
@@ -3981,7 +4227,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         parsed = yaml.safe_load(workflow)
         lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
         self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
-        self.assertEqual(lanes_input["options"], ["all", "windows-cuda"])
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "windows-gpu-diagnostic", "moss-edit-cuda", "moss-edit-metal"])
         select = next(
             step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
         )
@@ -4016,12 +4262,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # that the windows-cuda dispatch leaves unselected.
         macos_lanes = {"macos_metal", "ios_build"}
         self.assertFalse(macos_lanes & {lane for lane, value in selected.items() if value == "true"})
+        from scripts.tests.test_windows_gpu1_diagnostic import selected_jobs
         for name in macos_jobs:
             with self.subTest(job=name):
-                condition = parsed["jobs"][name].get("if", "")
+                if name == "moss-edit-metal":
+                    self.assertIn("inputs.lanes == 'moss-edit-metal'", parsed["jobs"][name]["if"])
+                    for selected_override in (False, True):
+                        self.assertNotIn(name, selected_jobs(parsed, 'workflow_dispatch', 'windows-cuda', selected=selected_override))
+                    continue
                 self.assertTrue(
-                    any(f"needs.changes.outputs.{lane} == 'true'" in condition for lane in macos_lanes),
-                    f"{name} could be scheduled by a dispatch that did not select a macOS lane",
+                    any(f"needs.changes.outputs.{lane} == 'true'" in parsed["jobs"][name].get("if", "") for lane in macos_lanes),
+                    f"{name} could be scheduled by a dispatch that did not select the macOS lane",
                 )
 
     def test_ios_build_metallib_triples_follow_the_cargo_config_deployment_floor(self) -> None:
@@ -4106,6 +4357,34 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(command=expected):
                 self.assertTrue(any(expected in run for run in ios), expected)
 
+    def test_manual_cuda_binds_gpu1_without_exclusive_occupancy_admission(self) -> None:
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        job = jobs["windows-cuda"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Bind physical GPU1 and isolate synthetic test caches"
+        )
+        run = step["run"]
+        for required in (
+            "nvidia-smi -i 1 --query-gpu=index,uuid,name,pci.bus_id",
+            "$identity.Count -ne 1",
+            "$fields[0] -ne '1'",
+            "$fields[1] -notmatch '^GPU-[0-9a-fA-F-]+$'",
+            'CUDA_VISIBLE_DEVICES=$gpuUuid',
+            'CUDA_DEVICE_ORDER=PCI_BUS_ID',
+            'SCENEWORKS_GPU_ID=1',
+            '$env:RUNNER_TEMP',
+            '[guid]::NewGuid()',
+            'HF_HOME=$cacheRoot',
+            'HF_HUB_CACHE=$hubRoot',
+            'HUGGINGFACE_HUB_CACHE=$hubRoot',
+            'HF_HUB_OFFLINE=1',
+        ):
+            self.assertIn(required, run)
+        commands = "\n".join(step.get("run", "") for step in job["steps"])
+        for prerequisite in ("--query-compute-apps", "lease", "admission", "occupied"):
+            self.assertNotIn(prerequisite, commands.lower())
+
     def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
         jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
         job = jobs["windows-cuda"]
@@ -4128,6 +4407,101 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     "both Windows CUDA listeners share one 48-thread host; an uncapped Cargo "
                     "process on each listener can overwhelm Windows with rustc launches",
                 )
+
+    def test_heavy_windows_cuda_jobs_clear_only_the_sccache_wrapper(self) -> None:
+        """native-12219: the shared Windows box exports RUSTC_WRAPPER=sccache runner-globally.
+
+        Its daemon resets mid-build on heavy Candle/CUDA graphs (os error 10054) with ZERO rustc
+        diagnostics. The two heavy Candle jobs must clear the wrapper for the job only; every
+        sibling job keeps it, and no job may isolate/purge CARGO_HOME or a cache. See
+        memory `heavy_candle_cuda_lanes_must_disable_sccache.md`.
+        """
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        jobs = workflow["jobs"]
+        heavy = ("windows-cuda-check", "synthetic-w4a8-cuda")
+        step_name = "Disable unstable sccache wrapper for the heavy Candle lane"
+        clear_env = "Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='"
+        clear_process = "Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue"
+
+        self.assertNotIn(
+            "RUSTC_WRAPPER",
+            workflow.get("env") or {},
+            "the runner-global wrapper must not be replaced workflow-wide",
+        )
+
+        for name in ("windows-cuda-check", "synthetic-w4a8-cuda"):
+            self.assertIn(name, jobs)
+            with self.subTest(job=name):
+                job = jobs[name]
+                wrappers = [
+                    step
+                    for step in job["steps"]
+                    if step.get("name") == "Disable unstable sccache wrapper for the heavy Candle lane"
+                ]
+                self.assertEqual(
+                    1, len(wrappers), f"{name} needs exactly one job-local sccache clear"
+                )
+                wrapper = wrappers[0]
+                self.assertEqual(
+                    "powershell",
+                    wrapper.get("shell"),
+                    f"{name}: the canonical windows-candle step uses powershell",
+                )
+                run = wrapper.get("run", "")
+                self.assertIn(clear_env, run, f"{name} must write an empty RUSTC_WRAPPER to GITHUB_ENV")
+                self.assertIn(
+                    clear_process,
+                    run,
+                    f"{name} must also remove the already-exported process value",
+                )
+                self.assertNotIn(
+                    "RUSTC_WRAPPER",
+                    job.get("env") or {},
+                    f"{name}: the clear is per-step GITHUB_ENV, never a job env override",
+                )
+                self.assertNotIn(
+                    "CARGO_HOME",
+                    json.dumps(job),
+                    f"{name}: do not copy the STALE CARGO_HOME-isolation premise (70-min re-download)",
+                )
+                commands = "\n".join(str(step.get("run", "")) for step in job["steps"])
+                self.assertNotRegex(
+                    commands,
+                    r"(?i)(?:cargo\s+clean|rm\s+-rf|Remove-Item[^\n]*(?:cargo|target))",
+                    f"{name}: caches must stay intact, no purge",
+                )
+                self.assertTrue(
+                    any(
+                        "Swatinem/rust-cache" in str(step.get("uses", ""))
+                        for step in job["steps"]
+                    ),
+                    f"{name}: the registry/git/target cache restore must remain",
+                )
+
+        for name, job in jobs.items():
+            if name in heavy:
+                continue
+            with self.subTest(sibling=name):
+                self.assertNotIn(
+                    "Disable unstable sccache wrapper for the heavy Candle lane",
+                    [step.get("name") for step in job.get("steps", [])],
+                    f"{name} is a sibling job and must keep the runner-global wrapper",
+                )
+                self.assertNotIn(
+                    "RUSTC_WRAPPER",
+                    json.dumps(job),
+                    f"{name} must not disable the wrapper outside the two heavy lanes",
+                )
+
+        # GPU0 binding and the physical-UUID device order are part of the contract this repair
+        # must not disturb.
+        gpu = next(
+            step
+            for step in jobs["synthetic-w4a8-cuda"]["steps"]
+            if step.get("name") == "Bind H3 synthetic proof to physical GPU0 by UUID"
+        )
+        self.assertIn("CUDA_VISIBLE_DEVICES=$gpuUuid", gpu["run"])
+        self.assertIn("CUDA_DEVICE_ORDER=PCI_BUS_ID", gpu["run"])
 
     def test_merge_queue_speculative_ref_can_reach_the_workflow(self) -> None:
         triggers = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))[True]
@@ -4183,11 +4557,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             policy_steps[0],
             "event or path gating the policy would let an invalid topology omit its verdict",
         )
-        self.assertNotIn(
-            "if",
-            changes,
-            "the changes job is the always-run trust boundary for feature-epic topology",
+        self.assertEqual(
+            changes.get("if"),
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')",
+            "topology remains unconditional except explicitly isolated manual dispatches",
         )
+        for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
+            for lane in ("all", "windows-cuda", ""):
+                self.assertTrue(evaluate_policy(
+                    changes["if"], lanes_include_cuda=False, event_name=event,
+                    head_repository="foreign/repo", dispatch_lanes=lane,
+                ))
         self.assertIn(
             "changes",
             workflow["jobs"]["gate"]["needs"],
@@ -4232,7 +4612,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # `if: always()` is the load-bearing half. The default `success()` would skip the gate
         # precisely when an upstream lane failed, and a skipped job satisfies a required status
         # check -- so the gate would report green on exactly the runs it exists to block.
-        self.assertEqual(gate["if"], "always()")
+        self.assertEqual(
+            gate["if"],
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (always())",
+        )
 
         ungated = sorted(set(jobs) - {"gate"} - set(gate["needs"]))
         self.assertEqual(

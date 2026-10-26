@@ -30,8 +30,52 @@ pub trait Generator {
     /// Identity + capabilities + modality (drives `validate` and consumer UI introspection).
     fn descriptor(&self) -> &ModelDescriptor;
 
+    /// Native MOSS edit entry point available through catalog-loaded trait objects.
+    fn generate_moss_image_edit(
+        &self,
+        _request: &GenerationRequest,
+        _inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
+        _progress: &mut dyn FnMut(Progress),
+    ) -> Result<crate::moss_image::MossImageAdvancedOutput> {
+        Err(Error::Unsupported(
+            "provider has no native MOSS edit path".into(),
+        ))
+    }
+    /// Complete structural edit peak, including reference encoding and request-local K/V.
+    fn moss_image_edit_request_peak(
+        &self,
+        _request: &GenerationRequest,
+        _inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
+    ) -> Result<u64> {
+        Err(Error::Unsupported(
+            "provider has no native MOSS edit admission".into(),
+        ))
+    }
+    /// Last completed edit; cleared on every attempt, including failures and cancellation.
+    fn moss_image_edit_execution_report(
+        &self,
+    ) -> Option<crate::moss_image_edit::MossImageEditExecutionReport> {
+        None
+    }
+
     /// Observed sparse-attention outcome of the most recent request, when adopted.
     fn veda_execution_report(&self) -> Option<crate::VedaExecutionReport> {
+        None
+    }
+
+    /// Actual last successful MOSS execution. Providers clear this under their lifecycle lock
+    /// before every attempt and publish only after all outputs and a final cancellation check.
+    /// Callers must serialize generation and receipt retrieval together; concurrent attempts may
+    /// clear/replace the last-completed receipt. None never implies successful MOSS execution.
+    fn moss_image_execution_report(&self) -> Option<crate::moss_image::MossImageExecutionReport> {
+        None
+    }
+
+    /// MOSS-owned materialized weight buffers retained by this provider, excluding workspace,
+    /// allocator slack, source payloads and other providers. This metadata-only getter never
+    /// evaluates tensors. Call within the serialized cache transaction; warm admission may credit
+    /// at most this value bounded by the current committed snapshot. None grants no extra credit.
+    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
         None
     }
 
@@ -444,6 +488,8 @@ impl HdrRequest {
 pub struct GenerationRequest {
     // --- Core ---
     pub prompt: String,
+    /// Frozen MOSS controls. None means ordinary inference with acceleration OFF.
+    pub moss_image: Option<crate::moss_image::MossImageOptions>,
     pub negative_prompt: Option<String>,
     pub width: u32,
     pub height: u32,
@@ -505,6 +551,20 @@ pub struct GenerationRequest {
 
     // --- Conditioning ---
     pub conditioning: Vec<Conditioning>,
+    /// FLUX 3 reference-output intent before API defaults are inserted (sc-26236).
+    /// `None` preserves legacy explicit `width`/`height`; `Some` preserves whether neither,
+    /// one, or both dimensions were supplied. Auto size is the first prepared reference canvas;
+    /// a padded single-reference output is cropped only when neither dimension was supplied.
+    /// Consumers must resolve this intent and reference token count BEFORE memory admission.
+    /// This is not img2img strength and is unsupported on other model families.
+    pub flux3_reference_output: Option<crate::flux3::references::ReferenceOutputSize>,
+    /// Lossless FLUX 3 placement/edit controls (sc-26237). Caption-only spatial guidance,
+    /// not masks or img2img strength. Resolve against authorized reference geometry before
+    /// admission/PUP/seed/text encoding; retain the original document in saved settings.
+    pub flux3_layout: Option<crate::flux3::layouts::Layout>,
+    /// Caller-resolved attachment identities and decoded geometry in conditioning order.
+    /// Required for stable-ID or original-pixel layout coordinates; never inferred from a label.
+    pub flux3_layout_bindings: Vec<crate::flux3::layouts::ReferenceBinding>,
     /// img2img strength when a single `Reference` is supplied without its own strength.
     pub strength: Option<f32>,
     /// Wan-VACE control strength — the diffusers `conditioning_scale` / per-vace-layer
@@ -1312,6 +1372,7 @@ impl Default for GenerationRequest {
     fn default() -> Self {
         Self {
             prompt: String::new(),
+            moss_image: None,
             negative_prompt: None,
             width: 1024,
             height: 1024,
@@ -1332,6 +1393,9 @@ impl Default for GenerationRequest {
             prompt_batch: Vec::new(),
             caption_overflow: None,
             conditioning: Vec::new(),
+            flux3_reference_output: None,
+            flux3_layout: None,
+            flux3_layout_bindings: Vec::new(),
             strength: None,
             control_scale: None,
             text_style_gain: None,
@@ -1600,6 +1664,8 @@ impl GenerationRequest {
             // Non-float fields: explicitly ignored, but named (no `..`) so a newly-added field breaks
             // the build here and the author must classify it.
             prompt: _,
+            // MOSS sub-block floats join the floor through its exhaustive helper below.
+            moss_image,
             negative_prompt: _,
             width: _,
             height: _,
@@ -1614,6 +1680,11 @@ impl GenerationRequest {
             // bounds join the float floor below.
             prompt_batch: _,
             caption_overflow: _,
+            // Optional integer output dimensions, not floating controls.
+            flux3_reference_output: _,
+            // Layout construction validates f64 coordinates, before conversion to native rows.
+            flux3_layout: _,
+            flux3_layout_bindings: _,
             cfg_interval,
             conditioning,
             frames: _,
@@ -1677,6 +1748,9 @@ impl GenerationRequest {
             pid_capture_sigma,
             text_style_gain,
         } = self;
+        if let Some(nonfinite) = moss_image.as_ref().and_then(|v| v.first_nonfinite_float()) {
+            return Some(nonfinite);
+        }
         let floats: [(&'static str, Option<f32>); 16] = [
             ("guidance", *guidance),
             ("true_cfg", *true_cfg),
@@ -2865,7 +2939,10 @@ impl ComponentPrecisionFloor {
     pub const fn applies_to(self, selected: Quant) -> bool {
         matches!(
             (self.selected_tier, selected),
-            (Quant::Q4, Quant::Q4) | (Quant::Q8, Quant::Q8) | (Quant::Nvfp4, Quant::Nvfp4)
+            (Quant::Q4, Quant::Q4)
+                | (Quant::Q8, Quant::Q8)
+                | (Quant::Nvfp4, Quant::Nvfp4)
+                | (Quant::Fp8Rowwise, Quant::Fp8Rowwise)
         )
     }
 }
@@ -3183,6 +3260,15 @@ pub struct Capabilities {
     /// Whether this model honours [`GenerationRequest::caption_overflow`] (epic sc-25678). `Default`
     /// is `false`; the shared floor refuses a `Some` policy otherwise.
     pub supports_caption_overflow_policy: bool,
+    /// The longest prompt, in the model's own text-encoder tokens, that this model conditions on
+    /// (sc-24217). `None` (the `Default`) advertises no limit.
+    ///
+    /// Advisory, like [`supports_preview`](Self::supports_preview): the shared floor does not read
+    /// it and a longer prompt is not refused. The provider truncates it to this many tokens and
+    /// reports that through [`Generator::generate_with_report`] as a [`GenerationWarning`]
+    /// (Supra2-IMG: code `prompt_truncated`, 128 Flan-T5 tokens). The field exists so a consumer can
+    /// size a prompt control or warn before dispatch without a per-model table of its own.
+    pub max_prompt_tokens: Option<u32>,
     /// Whether this model can emit **RGBA** images with a straight alpha channel through
     /// [`GenerationRequest::output_channels`] = [`OutputChannels::Rgba`] (sc-24111).
     ///
@@ -3359,8 +3445,13 @@ pub struct Capabilities {
     /// conversation+seed; the `gen-core-testkit` `check_multi_turn` check enforces it. A model may
     /// advertise either path independently.
     pub supports_conversation_session: bool,
-    /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
-    /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
+    /// Exact native quantization formats this engine can load (empty slice = none),
+    /// whether from a pre-converted/publisher artifact or an explicitly supported
+    /// on-the-fly conversion. This is NOT a list of interchangeable bit widths:
+    /// FP8R does not inherit Q8 support. A loader must reject incompatible artifacts
+    /// and must not claim on-the-fly conversion where only a packaged tier exists.
+    /// Read by the worker's capability advertisement instead of a hardcoded per-row flag.
+    /// `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
     /// Component-local numeric floors applied above the selected model tier. Empty means that a q4
     /// load is uniformly q4 across every packable component. This is a binding provider contract:
@@ -3469,8 +3560,18 @@ const MAX_STEPS: u32 = 100_000;
 const MAX_FRAMES: u32 = 1_000_000;
 const MAX_FPS: u32 = 100_000;
 const MAX_DURATION_SECS: f32 = 1_000_000.0;
-/// Shared hard ceiling for autoregressive prompt enhancement. Providers may choose a lower cap.
+/// Legacy prompt-enhancement token ceiling. Unrelated providers must not inherit FLUX 3's cap.
 pub const MAX_ENHANCE_TOKENS: u32 = 2_048;
+
+/// Resolve the provider's token ceiling, distinct from the effective-caption character bound.
+/// Only the two canonical FLUX 3 ids opt into the frozen PUP source's 3584-token budget.
+/// Unknown ids and every legacy enhancer retain their existing 2048-token limit.
+pub fn max_enhance_tokens_for_model(model_id: &str) -> u32 {
+    match model_id {
+        "flux3_klein" | "flux3_klein_base" => crate::flux3::pup::MAX_TOKENS,
+        _ => MAX_ENHANCE_TOKENS,
+    }
+}
 /// Shared temperature range for prompt enhancement sampling.
 pub const MAX_ENHANCE_TEMPERATURE: f32 = 2.0;
 
@@ -3633,6 +3734,26 @@ impl Capabilities {
         req: &GenerationRequest,
         check_size: bool,
     ) -> Result<()> {
+        if (req.flux3_layout.is_some() || !req.flux3_layout_bindings.is_empty())
+            && !matches!(
+                id,
+                crate::flux3::DISTILLED_MODEL_ID | crate::flux3::BASE_MODEL_ID
+            )
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: flux3_layout is supported only by FLUX 3; remove the layout controls"
+            )));
+        }
+        if req.flux3_reference_output.is_some()
+            && !matches!(
+                id,
+                crate::flux3::DISTILLED_MODEL_ID | crate::flux3::BASE_MODEL_ID
+            )
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: flux3_reference_output is supported only by FLUX 3 reference editing; remove it"
+            )));
+        }
         // Footgun guard (F-084): a descriptor that enables a capability but leaves max_count/max_size
         // at the `Default` 0 would reject EVERY request with a confusing "out of range 0..=0". A real
         // model always sets non-zero bounds, so catch the descriptor mistake in debug/test builds.
@@ -3644,6 +3765,13 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        if req.moss_image.is_some()
+            && crate::moss_image::MossImageVariant::from_provider_id(id).is_none()
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: MOSS controls require a MOSS-Image provider"
+            )));
+        }
         if req.veda.as_ref().is_some_and(|v| v.enabled) && id != "minimax_h3" {
             return Err(Error::Unsupported(format!(
                 "{id}: Veda attention requires MiniMax-H3"
@@ -4108,9 +4236,10 @@ impl Capabilities {
                     "{id}: enhance_max_tokens requires enhance_prompt=true"
                 )));
             }
-            if tokens == 0 || tokens > MAX_ENHANCE_TOKENS {
+            let max_tokens = max_enhance_tokens_for_model(id);
+            if tokens == 0 || tokens > max_tokens {
                 return Err(Error::Msg(format!(
-                    "{id}: enhance_max_tokens {tokens} outside supported range 1..={MAX_ENHANCE_TOKENS}"
+                    "{id}: enhance_max_tokens {tokens} outside supported range 1..={max_tokens}"
                 )));
             }
         }
@@ -5012,6 +5141,50 @@ mod tests {
                 }
             )
             .is_ok());
+    }
+
+    #[test]
+    fn enhancement_token_limits_are_canonical_model_scoped_without_changing_defaults() {
+        let supported = Capabilities {
+            supports_prompt_enhancement: true,
+            ..caps()
+        };
+        for (id, limit) in [
+            ("flux2_dev", 2_048),
+            ("ltx_2_3", 2_048),
+            ("unknown", 2_048),
+            ("flux3_klein_alias", 2_048),
+            ("flux3_klein", 3_584),
+            ("flux3_klein_base", 3_584),
+        ] {
+            assert_eq!(max_enhance_tokens_for_model(id), limit, "{id}");
+            for tokens in [0, 2_048, 2_049, 3_584, 3_585] {
+                let request = GenerationRequest {
+                    enhance_prompt: true,
+                    enhance_max_tokens: Some(tokens),
+                    ..base_req()
+                };
+                assert_eq!(
+                    supported.validate_request(id, &request).is_ok(),
+                    tokens > 0 && tokens <= limit,
+                    "{id}: {tokens} tokens"
+                );
+            }
+            for enabled in [false, true] {
+                let request = GenerationRequest {
+                    enhance_prompt: enabled,
+                    ..base_req()
+                };
+                assert!(supported.validate_request(id, &request).is_ok(), "{id}");
+                assert!(request.enhance_max_tokens.is_none());
+            }
+            let disabled_tuning = GenerationRequest {
+                enhance_max_tokens: Some(limit),
+                ..base_req()
+            };
+            assert!(supported.validate_request(id, &disabled_tuning).is_err());
+        }
+        assert_eq!(MAX_ENHANCE_TOKENS, 2_048);
     }
 
     fn base_req() -> GenerationRequest {
@@ -6424,6 +6597,7 @@ mod tests {
                 ..Default::default()
             },
         });
+        assert_eq!(generator.moss_image_owned_weight_bytes(), None);
         let mut progress = Vec::new();
         let report = generator
             .generate_with_report(&GenerationRequest::default(), &mut |p| progress.push(p))

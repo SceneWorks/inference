@@ -598,6 +598,8 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         top_p: s.top_p,
         top_k: s.top_k,
         presence_penalty: s.presence_penalty,
+        presence_penalty_generated_only: s.presence_penalty_generated_only,
+        presence_penalty_prompt_len: 0,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
     }
@@ -983,6 +985,8 @@ mod tests {
             repetition_penalty: 1.3,
             repetition_context: 16,
             presence_penalty: 0.2,
+            presence_penalty_generated_only: false,
+            presence_penalty_prompt_len: 0,
             ..greedy
         };
         let stochastic = SamplingParams {

@@ -331,6 +331,7 @@ fn probe_residual(cfg: &MiniMaxH3DitConfig, lora: &Path, scale: f32, x: &Tensor)
 /// real DiT and calls the real `adaptable_mut`, so it cannot pass on a path that only exists in the
 /// list.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn every_enumerated_target_resolves_through_the_model_tree() {
     let cfg = dit_fixture_config();
     let mut dit = tiny_dit(&cfg);
@@ -372,6 +373,7 @@ fn every_enumerated_target_resolves_through_the_model_tree() {
 /// the projection, so an adaptable `adaln_proj` would make one checkpoint behave as two models
 /// depending on whether the eviction had already run.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn adaln_and_the_norms_are_not_addressable() {
     let cfg = dit_fixture_config();
     let mut dit = tiny_dit(&cfg);
@@ -473,7 +475,7 @@ fn rank_comes_from_the_factor_shapes() {
 /// spellings **relative to it**, so an error shared by the fold formula and the reference cannot
 /// cancel out of both.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_install_folds_at_the_published_strength() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
@@ -564,6 +566,7 @@ fn the_install_folds_at_the_published_strength() {
 /// It reads the dtype of the tensor `apply_minimax_h3_adapters` actually installed, through the real
 /// entry point — not a reimplementation of the multiply.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_installed_fold_keeps_the_factor_dtype() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
@@ -604,6 +607,7 @@ fn the_installed_fold_keeps_the_factor_dtype() {
 /// bug and fixed it in review; this pins the candle lane against it, with junk BOTH after and before
 /// the good file so an order-dependent check cannot pass.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_file_that_folds_nothing_is_refused_per_spec_not_in_aggregate() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
@@ -647,6 +651,7 @@ fn a_file_that_folds_nothing_is_refused_per_spec_not_in_aggregate() {
 
 /// A target that resolves to no module is surfaced by NAME, never silently dropped.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn an_unmatched_target_is_surfaced_by_name() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
@@ -689,7 +694,7 @@ fn an_unmatched_target_is_surfaced_by_name() {
 /// constructed dense reference. Asymmetric factors and a non-unit `alpha/rank·strength` make the
 /// assertion discriminate the plausible factor transpose, factor swap, and dropped-scale mutants.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn lokr_matches_an_independent_dense_kron_and_rejects_mutant_results() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
@@ -764,7 +769,7 @@ fn lokr_matches_an_independent_dense_kron_and_rejects_mutant_results() {
 /// projections. It expands to the six runtime leaves without dense adapter materialization; FC1's
 /// `[gate|value]` source ordering is swapped to the runtime's `[value|gate]` ordering.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
@@ -856,6 +861,7 @@ fn fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically() {
 }
 
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn lokr_rejects_unknown_partial_unmatched_and_false_kind_claims() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
@@ -880,12 +886,15 @@ fn lokr_rejects_unknown_partial_unmatched_and_false_kind_claims() {
             "unknown tensor key",
         ),
         (
+            // A recognized target that matches no module classifies as the `NoSuchModule` generic
+            // strict-install miss — naming the path — NOT the file-level zero-match error (that
+            // one is reserved for files with no recognized targets at all).
             "unmatched.safetensors",
             vec![
                 ("transformer_blocks.99.attn.to_q.lokr_w1".into(), w1.clone()),
                 ("transformer_blocks.99.attn.to_q.lokr_w2".into(), w2.clone()),
             ],
-            "no target modules matched",
+            "matched no module",
         ),
     ] {
         let path = write_lokr(dir.path(), name, arrays, "1", "1");
@@ -907,6 +916,7 @@ fn lokr_rejects_unknown_partial_unmatched_and_false_kind_claims() {
 }
 
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn direct_lokr_reaches_every_trunk_and_token_refiner_adapter_target() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
@@ -1059,7 +1069,7 @@ fn manual_cuda_fabricated_lokr_install_receipt() {
 /// exists to close, arriving through a different door. PEFT writes `r` equal to the factor rank, so
 /// the consistent arm shows the check rejects nothing legitimate.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
@@ -1860,6 +1870,7 @@ fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
 /// The conversion renames every ComfyUI module, and the installer re-checks that — a conversion that
 /// left a fused module behind must fail rather than half-fold.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_conversion_leaves_no_comfyui_module_behind() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
@@ -2641,6 +2652,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
 
 /// Exact public Clay header geometry, with deterministic factors and no downloaded tensor bytes.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknowns() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),

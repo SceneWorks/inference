@@ -37,19 +37,20 @@ use std::path::Path;
 
 use mlx_rs::{Array, Dtype};
 
+use crate::block_stream::DitBlockStream;
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{AttentionBudget, AttentionChunkAxis, AttentionPlan, BoundedAttention};
 use mlx_gen::block_residency::{run_windowed, BlockPlan};
+use mlx_gen::gen_core::pruned_adaln::PruningIdentity;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
-
-use crate::block_stream::DitBlockStream;
 
 use crate::denoise::{JointStep, JointVelocity, PackedLayout};
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
 use crate::dit::block::DitBlock;
 use crate::dit::config::{MiniMaxH3DitConfig, MODALITY_NUM};
 use crate::dit::heads::{AdaLayerNormOut, DitProjections, NormOutModulation};
+use crate::dit::pruned_adaln::PrunedAdaLnRuntime;
 use crate::dit::refiner::TokenRefiner;
 use crate::dit::rope::{MmRope, MmRopeTables};
 
@@ -125,6 +126,9 @@ pub struct MiniMaxH3Dit {
     /// Source tensors not yet GPU-verified (sc-23402). Empty once [`JointDit`] has consumed the
     /// model; a deferred load only ever holds the `head` group here, its blocks being verified
     /// per window by [`DitBlockStream::materialize`].
+    /// The reduced coordinate-table topology, when this checkpoint is modulation-pruned. `None`
+    /// is the full timestep-MLP path.
+    pruned: Option<PrunedAdaLnRuntime>,
     unverified: UnverifiedSources,
 }
 
@@ -135,11 +139,39 @@ impl MiniMaxH3Dit {
     /// own published dtypes instead — twelve of them ship float32 — see [`crate::dit::heads`].
     pub fn from_weights(w: &mut Weights, cfg: &MiniMaxH3DitConfig, dtype: Dtype) -> Result<Self> {
         cfg.validate()?;
-        let projections = DitProjections::from_weights(w, cfg)?;
-        let refiner = TokenRefiner::from_weights(w, "token_refiner", cfg, dtype)?;
-        let blocks = (0..cfg.num_layers)
-            .map(|i| DitBlock::from_weights(w, &format!("transformer_blocks.{i}"), cfg, dtype))
-            .collect::<Result<Vec<_>>>()?;
+        let pruned = match crate::dit::pruned_adaln::inspect(&*w, cfg)? {
+            None => None,
+            Some(topology) => Some(PrunedAdaLnRuntime::from_weights(&*w, &topology, cfg)?),
+        };
+        let (projections, refiner, blocks) = match pruned.is_some() {
+            false => {
+                let projections = DitProjections::from_weights(w, cfg)?;
+                let refiner = TokenRefiner::from_weights(w, "token_refiner", cfg, dtype)?;
+                let blocks = (0..cfg.num_layers)
+                    .map(|i| {
+                        DitBlock::from_weights(w, &format!("transformer_blocks.{i}"), cfg, dtype)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (projections, refiner, blocks)
+            }
+            true => {
+                let projections = DitProjections::from_weights_pruned(w, cfg)?;
+                let refiner = TokenRefiner::from_weights(w, "token_refiner", cfg, dtype)?;
+                // Pruned blocks are body-only: the reduced projection lives in `pruned`, not on the
+                // block, and is projected from coordinates (no SiLU).
+                let blocks = (0..cfg.num_layers)
+                    .map(|i| {
+                        DitBlock::from_weights_body_only(
+                            w,
+                            &format!("transformer_blocks.{i}"),
+                            cfg,
+                            dtype,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (projections, refiner, blocks)
+            }
+        };
         Ok(Self {
             cfg: cfg.clone(),
             projections,
@@ -148,6 +180,7 @@ impl MiniMaxH3Dit {
             stream: None,
             rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
             dtype,
+            pruned,
             // Every tensor read above, still lazy — verified group by group from `JointDit::new`.
             unverified: UnverifiedSources::partition(w.accessed_entries()),
         })
@@ -211,13 +244,22 @@ impl MiniMaxH3Dit {
         cfg.validate()?;
         let stream = DitBlockStream::new(dir, dtype, cfg.clone())?;
 
-        let (projections, refiner, unverified) = {
+        let (projections, refiner, pruned, unverified) = {
             let mut w = Weights::from_dir(dir)?;
-            let projections = DitProjections::from_weights(&mut w, &cfg)?;
+            let pruned = match crate::dit::pruned_adaln::inspect(&w, &cfg)? {
+                None => None,
+                Some(topology) => Some(PrunedAdaLnRuntime::from_weights(&w, &topology, &cfg)?),
+            };
+            let projections = if pruned.is_some() {
+                DitProjections::from_weights_pruned(&mut w, &cfg)?
+            } else {
+                DitProjections::from_weights(&mut w, &cfg)?
+            };
             let refiner = TokenRefiner::from_weights(&mut w, "token_refiner", &cfg, dtype)?;
-            // The 38 head tensors only: nothing under `transformer_blocks.` was read.
+            // The head tensors only: nothing under `transformer_blocks.` was read (the pruned
+            // reduced projections are tiny and load eagerly alongside the head).
             let unverified = UnverifiedSources::partition(w.accessed_entries());
-            (projections, refiner, unverified)
+            (projections, refiner, pruned, unverified)
         };
 
         Ok(Self {
@@ -228,6 +270,7 @@ impl MiniMaxH3Dit {
             stream: Some(stream),
             rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
             dtype,
+            pruned,
             unverified,
         })
     }
@@ -362,9 +405,44 @@ impl MiniMaxH3Dit {
         self.refiner.forward(&embedded.as_dtype(self.dtype)?)
     }
 
-    /// The timestep MLP, as the closure [`AdaLnCache::precompute`] consumes.
+    /// The timestep embedding, as the closure [`AdaLnCache::precompute`] consumes — the full MLP on
+    /// the unpruned path, interpolated table coordinates on a pruned one.
     pub fn embed_timesteps(&self, timesteps: &[f32]) -> Result<Array> {
-        self.projections.time_embedder.forward(timesteps)
+        match (&self.projections.time_embedder, &self.pruned) {
+            (Some(embedder), _) => embedder.forward(timesteps),
+            (None, Some(pruned)) => pruned.coords(timesteps),
+            (None, None) => Err(Error::Msg(
+                "minimax-h3 dit: no timestep embedding is present".into(),
+            )),
+        }
+    }
+
+    /// The content identity of this checkpoint's pruning operands, or `None` on the unpruned path.
+    pub fn pruning_identity(&self) -> Option<PruningIdentity> {
+        self.pruned.as_ref().map(PrunedAdaLnRuntime::identity)
+    }
+
+    /// Which AdaLN modulation topology this checkpoint presents — the axis the strict adapter
+    /// install ([`crate::adapters`]) classifies unmatched targets against.
+    pub fn adapter_surface(&self) -> crate::adapters::AdaLnSurface {
+        match self.pruned {
+            Some(_) => crate::adapters::AdaLnSurface::PrunedCurve,
+            None => crate::adapters::AdaLnSurface::FullTimestepMlp,
+        }
+    }
+
+    /// Refuse a compatibility mismatch: `Err` when this DiT is not pruned, or when its pruning
+    /// identity differs from `expected`.
+    pub fn ensure_pruning_identity(&self, expected: &PruningIdentity) -> Result<()> {
+        match self.pruning_identity() {
+            Some(identity) if &identity == expected => Ok(()),
+            Some(identity) => Err(Error::Msg(format!(
+                "minimax-h3 dit: pruning identity mismatch (got {identity:?}, expected {expected:?})"
+            ))),
+            None => Err(Error::Msg(
+                "minimax-h3 dit: this DiT is not a pruned topology".into(),
+            )),
+        }
     }
 
     /// **One whole model evaluation**, in the reference's own argument shape.
@@ -437,6 +515,13 @@ impl MiniMaxH3Dit {
         window: Option<(&BlockPlan, &CancelFlag)>,
         veda: Option<(&crate::veda::VedaRuntime, usize)>,
     ) -> Result<(Array, Array)> {
+        if let BlockModulation::Cached(cache) = blocks {
+            if cache.pruning_identity() != self.pruning_identity() {
+                return Err(Error::Msg(
+                    "minimax-h3: cached modulation pruning identity mismatch".into(),
+                ));
+            }
+        }
         // 1. Per-modality input projections. The two patch projections are float32 in the published
         //    checkpoint; the text stream sets the packed sequence's dtype, as in the reference.
         let stream = packed.text_rows.dtype();
@@ -519,7 +604,11 @@ impl MiniMaxH3Dit {
                 veda.map(|(v, step)| (v, layer, step)),
             ),
             BlockModulation::Temb(temb) => {
-                let modulation = block.modulation(temb)?;
+                let modulation = if let Some(pruned) = &self.pruned {
+                    pruned.block_modulation(layer, temb)?
+                } else {
+                    block.modulation(temb)?
+                };
                 block.forward_bounded_veda(
                     &x,
                     &modulation,
@@ -662,7 +751,7 @@ pub struct PackedForward<'a> {
 pub enum BlockModulation<'a> {
     /// The precomputed table sc-17145's eviction leaves behind.
     Cached(&'a AdaLnCache),
-    /// A live timestep embedding, projected per block — the resident path.
+    /// A live timestep embedding or pruned coordinates, projected per block — the resident path.
     Temb(&'a Array),
 }
 
@@ -836,62 +925,94 @@ impl JointDit {
         // resident sampler reads it per step. Verify it here, once, before either.
         dit.verify_adaln_sources()?;
         let (modulation, norm_out_modulation, resident_adaln_indices, released_bytes, unverified) =
-            match residency {
-                AdaLnResidency::PrecomputeAndEvict => {
-                    // Read INSIDE the branch, before the eviction: `unverified.adaln` holds
-                    // refcounted handles on the very buffers `precompute_and_evict` is about to
-                    // release, so verifying them afterwards would force 26 GB the eviction had just
-                    // freed back into residency. The ordering is the invariant, not the call.
-                    let unverified = dit.unverified_source_counts()[1];
-                    // The timestep embedding is captured out of the closure so `norm_out`'s own
-                    // table is projected from the SAME `temb` the block stack's was — a second
-                    // `embed_timesteps` call would be a second chance to bind the wrong timesteps.
-                    let mut captured: Option<Array> = None;
-                    let embedder = dit.projections.time_embedder.clone();
-                    let (cache, released) = AdaLnCache::precompute_and_evict(
-                        &mut dit.blocks,
-                        schedule,
-                        residency,
-                        |timesteps| {
-                            let temb = embedder.forward(timesteps)?;
-                            captured = Some(temb.clone());
-                            Ok(temb)
-                        },
-                    )?;
-                    let temb = captured.ok_or_else(|| {
-                        Error::Msg(
-                            "minimax-h3 dit: the AdaLN precompute did not evaluate the timestep \
-                             embedding"
-                                .into(),
+            if let Some(pruned) = dit
+                .pruned
+                .as_ref()
+                .filter(|_| residency == AdaLnResidency::PrecomputeAndEvict)
+            {
+                // Preserve the requested residency: state-dependent samplers still use the
+                // Resident arm below and interpolate their actual per-evaluation timesteps.
+                let unverified = dit.unverified_source_counts()[1];
+                let coords = pruned.coords(schedule.distinct_timesteps())?;
+                let norm_out = pruned.final_projection().modulation(&coords)?;
+                // Force it before the first step; the same lazy-eval discipline as the full path.
+                mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
+                let cache = pruned.precompute(schedule, dit.num_layers())?;
+                (
+                    Modulation::Cached(Box::new(cache)),
+                    Some(norm_out),
+                    None,
+                    0,
+                    unverified,
+                )
+            } else {
+                match residency {
+                    AdaLnResidency::PrecomputeAndEvict => {
+                        // Read INSIDE the branch, before the eviction: `unverified.adaln` holds
+                        // refcounted handles on the very buffers `precompute_and_evict` is about to
+                        // release, so verifying them afterwards would force 26 GB the eviction had
+                        // just freed back into residency. The ordering is the invariant, not the
+                        // call.
+                        let unverified = dit.unverified_source_counts()[1];
+                        // The timestep embedding is captured out of the closure so `norm_out`'s own
+                        // table is projected from the SAME `temb` the block stack's was — a second
+                        // `embed_timesteps` call would be a second chance to bind the wrong
+                        // timesteps.
+                        let mut captured: Option<Array> = None;
+                        let embedder = dit.projections.time_embedder.clone();
+                        let (cache, released) = AdaLnCache::precompute_and_evict(
+                            &mut dit.blocks,
+                            schedule,
+                            residency,
+                            |timesteps| {
+                                let temb = embedder
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        Error::Msg(
+                                            "minimax-h3 dit: the precompute needs the timestep MLP"
+                                                .into(),
+                                        )
+                                    })?
+                                    .forward(timesteps)?;
+                                captured = Some(temb.clone());
+                                Ok(temb)
+                            },
+                        )?;
+                        let temb = captured.ok_or_else(|| {
+                            Error::Msg(
+                                "minimax-h3 dit: the AdaLN precompute did not evaluate the \
+                                 timestep embedding"
+                                    .into(),
+                            )
+                        })?;
+                        let norm_out = dit.projections.norm_out.modulation(&temb)?;
+                        // Force it, for the same reason the AdaLN precompute forces its own tables:
+                        // an unevaluated node would defer this work into the first step's timing and
+                        // hold `temb` alive for the whole run.
+                        mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
+                        (
+                            Modulation::Cached(Box::new(cache)),
+                            Some(norm_out),
+                            None,
+                            released,
+                            unverified,
                         )
-                    })?;
-                    let norm_out = dit.projections.norm_out.modulation(&temb)?;
-                    // Force it, for the same reason the AdaLN precompute forces its own tables: an
-                    // unevaluated node would defer this work into the first step's timing and hold
-                    // `temb` alive for the whole run.
-                    mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
-                    (
-                        Modulation::Cached(Box::new(cache)),
-                        Some(norm_out),
-                        None,
-                        released,
-                        unverified,
-                    )
-                }
-                AdaLnResidency::Resident => {
-                    // The same reading, on the branch that never evicts: the resident sampler reads
-                    // `adaln_proj` per step, so it too must be verified before this point.
-                    let unverified = dit.unverified_source_counts()[1];
-                    // One temb row per ROW CLASS, rebuilt per step; the index tensors are therefore
-                    // the local `row_class · MODALITY_NUM + tag`, which is constant across steps
-                    // because neither the class nor the tag of a row ever moves.
-                    let classes = layout.row_classes().as_dtype(Dtype::Int32)?;
-                    let tags = layout.token_tags().as_dtype(Dtype::Int32)?;
-                    let local = mlx_rs::ops::add(
-                        &mlx_rs::ops::multiply(&classes, Array::from_int(MODALITY_NUM))?,
-                        &tags,
-                    )?;
-                    (Modulation::Resident, None, Some(local), 0, unverified)
+                    }
+                    AdaLnResidency::Resident => {
+                        // The same reading, on the branch that never evicts: the resident sampler
+                        // reads `adaln_proj` per step, so it too must be verified before this point.
+                        let unverified = dit.unverified_source_counts()[1];
+                        // One temb row per ROW CLASS, rebuilt per step; the index tensors are
+                        // therefore the local `row_class · MODALITY_NUM + tag`, which is constant
+                        // across steps because neither the class nor the tag of a row ever moves.
+                        let classes = layout.row_classes().as_dtype(Dtype::Int32)?;
+                        let tags = layout.token_tags().as_dtype(Dtype::Int32)?;
+                        let local = mlx_rs::ops::add(
+                            &mlx_rs::ops::multiply(&classes, Array::from_int(MODALITY_NUM))?,
+                            &tags,
+                        )?;
+                        (Modulation::Resident, None, Some(local), 0, unverified)
+                    }
                 }
             };
         // After the eviction: the bodies are now exactly what step 1 will hold, so forcing and
@@ -972,15 +1093,27 @@ impl JointDit {
             )));
         }
         let tables = dit.rope.tables(layout.position_ids())?;
+        if dit.pruned.is_some() {
+            dit.verify_adaln_sources()?;
+        }
 
-        // One `temb` for both tables, captured rather than re-embedded — a second
-        // `embed_timesteps` call would be a second chance to bind the wrong timesteps.
-        let temb = dit.embed_timesteps(schedule.distinct_timesteps())?;
-        let cache = crate::block_stream::precompute_adaln_windowed(
-            &stream, &plan, &cancel, schedule, &temb,
-        )?;
-        let norm_out = dit.projections.norm_out.modulation(&temb)?;
-        mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
+        // One modulation + norm_out per run. The full path captures a single `temb` for both; the
+        // pruned path projects its (eager) reduced weights from one coordinate table.
+        let (cache, norm_out) = if let Some(pruned) = dit.pruned.as_ref() {
+            let coords = pruned.coords(schedule.distinct_timesteps())?;
+            let norm_out = pruned.final_projection().modulation(&coords)?;
+            mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
+            let cache = pruned.precompute(schedule, dit.num_layers())?;
+            (cache, norm_out)
+        } else {
+            let temb = dit.embed_timesteps(schedule.distinct_timesteps())?;
+            let cache = crate::block_stream::precompute_adaln_windowed(
+                &stream, &plan, &cancel, schedule, &temb,
+            )?;
+            let norm_out = dit.projections.norm_out.modulation(&temb)?;
+            mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
+            (cache, norm_out)
+        };
 
         Ok(Self {
             veda: None,
@@ -1153,7 +1286,13 @@ impl JointVelocity for JointDit {
         // `norm_out`'s table is per-timestep, so under the resident residency it moves every step
         // and is rebuilt from that step's own four row-class timesteps.
         let norm_out = match (&resident_temb, &self.norm_out_modulation) {
-            (Some(temb), _) => self.dit.projections.norm_out.modulation(temb)?,
+            (Some(temb), _) => {
+                if let Some(pruned) = &self.dit.pruned {
+                    pruned.final_projection().modulation(temb)?
+                } else {
+                    self.dit.projections.norm_out.modulation(temb)?
+                }
+            }
             (None, Some(cached)) => cached.clone(),
             (None, None) => {
                 return Err(Error::Msg(

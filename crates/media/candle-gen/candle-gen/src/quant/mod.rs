@@ -62,6 +62,8 @@ pub mod adapters;
 // a community INT8-ConvRot checkpoint needs before the int8 IGEMM (its stored weight is `W·R`). Pure
 // candle ops — builds everywhere (CPU tests + CUDA).
 pub mod convrot;
+pub mod convrot_int8;
+pub mod w4a8_int8;
 
 // The cuBLASLt 8-bit GEMM compute leg (sc-9299 spike, epic 9083's 8-bit pivot): fp8 E4M3 + int8
 // IGEMM matmul over cudarc's raw cublasLt sys bindings, plus the `Fp8Linear`/`Int8Linear` linear
@@ -85,7 +87,7 @@ pub mod eight_bit_linear;
 
 pub use adapt::{AdaptLinear, LokrFactors};
 pub use adapters::{install_dotted_adapters, AdditiveAdapterReport};
-pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
+pub use convrot::{convrot_fht_f32, convrot_rotate, is_power_of_four, regular_hadamard};
 pub use nvfp4::{
     e2m1_from_f32, e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor, E2M1_LUT, E2M1_MAX, E4M3_MAX,
     NVFP4_BLOCK,
@@ -96,6 +98,7 @@ pub use repack::{
     repack_mlx_q4_to_q4_1_gs, MLX_GROUP_SIZE,
 };
 pub use sidecar::PackedWeightSidecars;
+pub use w4a8_int8::W4A8Linear;
 
 pub use cublaslt::{
     compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor, quantize_activation_fp8,
@@ -105,7 +108,7 @@ pub use cublaslt::{
     NVFP4_N_ALIGN,
 };
 #[cfg(feature = "cuda")]
-pub use cublaslt::{CublasLt, DevNvfp4};
+pub use cublaslt::{CublasLt, DevNvfp4, W4A8DecodeTile};
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
@@ -125,6 +128,17 @@ use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};
 use gen_core::Quant;
 
+// Reject the NEW format before a legacy quantizer can no-op over an already
+// packed base or allocate a dense CPU staging matrix. All old quant semantics stay unchanged.
+pub(crate) fn reject_rowwise_as_legacy_quant(quant: Quant) -> Result<()> {
+    if quant == Quant::Fp8Rowwise {
+        return Err(candle_core::Error::wrap(crate::CandleError::Unsupported(
+            "fp8r is source rowwise W8A8, not an affine/GGML tier; use the explicit fp8r provider kernel".into(),
+        )));
+    }
+    Ok(())
+}
+
 /// The GGUF block type a load-time [`Quant`] level maps to when quantizing a *dense* weight in place
 /// — `Q4_0` / `Q8_0` (block size 32). Shared with the per-crate seams (Lens sc-5117, FLUX.2 sc-5917):
 /// the single source of truth for the family's `Quant → GgmlDType` mapping. The **packed** path uses
@@ -139,6 +153,9 @@ pub fn ggml_dtype(quant: Quant) -> Result<GgmlDType> {
     match quant {
         Quant::Q4 => Ok(GgmlDType::Q4_0),
         Quant::Q8 => Ok(GgmlDType::Q8_0),
+        Quant::Fp8Rowwise => candle_core::bail!(
+            "Quant::Fp8Rowwise is source rowwise W8A8, not affine Q8 or a GGUF block type; use a provider with the explicit fp8r packed kernel"
+        ),
         Quant::Nvfp4 => candle_core::bail!(
             "Quant::Nvfp4 has no GGUF block type; NVFP4 is served by Nvfp4Linear from a packed \
              Nvfp4Tensor (sc-11041), not the in-place GGUF fold"
@@ -479,6 +496,8 @@ pub struct QuantForward {
 #[derive(Clone)]
 pub enum QLinear {
     Dense(DenseLinear),
+    /// Native packed codebook W4A8; never folded into a GGUF or dense weight.
+    W4A8(std::sync::Arc<W4A8Linear>),
     Quantized {
         /// The GGUF-quantized weight (`Q4_1` from a packed tier, or `Q4_0`/`Q8_0` from a load-time
         /// quantize), stored in the form its [`MatmulStrategy`] needs ([`QuantWeight`]).
@@ -496,6 +515,7 @@ impl std::fmt::Debug for QLinear {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Dense(_) => f.write_str("QLinear::Dense"),
+            Self::W4A8(q) => f.debug_tuple("QLinear::W4A8").field(q).finish(),
             Self::Quantized { weight, bias, .. } => f
                 .debug_struct("QLinear::Quantized")
                 .field("dtype", &weight.dtype())
@@ -524,6 +544,15 @@ impl QLinear {
     /// pre-transposed `[in, out]` layout (SAM3 / SeedVR2, sc-8997/F-017) and for tests.
     pub fn from_dense(dense: DenseLinear) -> Self {
         Self::Dense(dense)
+    }
+
+    /// Wrap an immutable packed W4A8 projection without decoding its resident weight.
+    pub fn from_w4a8(base: W4A8Linear) -> Self {
+        Self::W4A8(std::sync::Arc::new(base))
+    }
+
+    pub fn is_w4a8(&self) -> bool {
+        matches!(self, Self::W4A8(_))
     }
 
     /// **Packed-detecting** `[out, in]` loader: if `{base}.scales` is present in `vb` (a pre-quantized
@@ -626,6 +655,7 @@ impl QLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => __model_proof_output!(l.forward(x)),
+            Self::W4A8(q) => __model_proof_output!(q.forward(x)),
             Self::Quantized {
                 weight: QuantWeight::Dequant(weight),
                 bias,
@@ -690,7 +720,7 @@ impl QLinear {
     pub fn forward_upcast(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward_upcast(x),
-            Self::Quantized { .. } => self.forward(x),
+            Self::Quantized { .. } | Self::W4A8(_) => self.forward(x),
         }
     }
 
@@ -789,6 +819,10 @@ impl QLinear {
         fwd: QuantForward,
         skip_indivisible: bool,
     ) -> Result<()> {
+        reject_rowwise_as_legacy_quant(quant)?;
+        if matches!(self, Self::W4A8(_)) {
+            candle_core::bail!("W4A8 refuses re-quantization to {quant:?}");
+        }
         let Self::Dense(dense) = self else {
             return Ok(());
         };
@@ -857,6 +891,12 @@ impl QLinear {
     /// for the leaves it must keep dense — e.g. FLUX.2's control branch `control_img_in` (260
     /// in-features is not a multiple of the block 32, so it can't quantize) (sc-7460).
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if let Self::W4A8(q) = self {
+            if !q.device().same_device(device) {
+                candle_core::bail!("W4A8 refuses cross-device migration of its packed base");
+            }
+            return Ok(());
+        }
         if let Self::Dense(dense) = self {
             match dense {
                 DenseLinear::Linear(l) => {
@@ -885,7 +925,7 @@ impl QLinear {
 
     /// Whether this projection loaded (or was folded) to a quantized weight.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Self::Quantized { .. })
+        matches!(self, Self::Quantized { .. } | Self::W4A8(_))
     }
 
     /// The GGUF block type of a quantized projection's resident weight (`None` when dense) — lets a
@@ -894,7 +934,7 @@ impl QLinear {
     pub fn quant_dtype(&self) -> Option<GgmlDType> {
         match self {
             Self::Quantized { weight, .. } => Some(weight.dtype()),
-            Self::Dense(_) => None,
+            Self::Dense(_) | Self::W4A8(_) => None,
         }
     }
 
@@ -910,7 +950,7 @@ impl QLinear {
                 weight: QuantWeight::Matmul(_),
                 ..
             } => Some(MatmulStrategy::Int8Fast),
-            Self::Dense(_) => None,
+            Self::Dense(_) | Self::W4A8(_) => None,
         }
     }
 }

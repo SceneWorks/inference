@@ -27,6 +27,9 @@ mod adaln_evict_memory;
 #[path = "adaln_evict_real_weights.rs"]
 mod adaln_evict_real_weights;
 
+#[path = "adapter_topology.rs"]
+mod adapter_topology;
+
 #[path = "audio_vae_encode_parity.rs"]
 mod audio_vae_encode_parity;
 
@@ -44,6 +47,9 @@ mod bounded_attention;
 
 #[path = "bounded_attention_real.rs"]
 mod bounded_attention_real;
+
+#[path = "convrot_int8.rs"]
+mod convrot_int8;
 
 #[path = "cross_backend_record.rs"]
 mod cross_backend_record;
@@ -74,6 +80,9 @@ mod joint_denoise;
 
 #[path = "pipeline.rs"]
 mod pipeline;
+
+#[path = "pruned_adaln.rs"]
+mod pruned_adaln;
 
 #[path = "quant_policy.rs"]
 mod quant_policy;
@@ -125,3 +134,6 @@ mod video_vae_encode_parity;
 
 #[path = "video_vae_parity.rs"]
 mod video_vae_parity;
+
+#[path = "w4a8_compare.rs"]
+mod w4a8_compare;

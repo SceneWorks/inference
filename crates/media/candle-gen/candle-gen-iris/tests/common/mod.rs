@@ -129,9 +129,10 @@ pub fn assert_close(name: &str, got: &Tensor, want: &Tensor, tol: f32) {
 }
 
 /// The declared bound of the bf16 policy's activation-checkpointed gradients (sc-25690). Under bf16
-/// a checkpointed step rounds differently from the plain one (a region's cotangent crosses its
-/// boundary once per reader), so equality is not available; what is asserted is that
-/// checkpointing adds no error of its own: per trained tensor its distance from the f32 gradient
+/// a checkpointed step can round differently from the plain one at a region boundary; shared
+/// conditioning cotangents are accumulated before their producer's backward, never cast separately
+/// per reader. What is asserted is that checkpointing adds no error of its own: per trained tensor
+/// its distance from the f32 gradient
 /// stays within `AC_BF16_NOISE_FACTOR` of the plain bf16 gradient's own distance (plus
 /// `AC_BF16_NOISE_FLOOR` of the tensor's norm), and the two bf16 gradients point the same way.
 pub const AC_BF16_NOISE_FACTOR: f64 = 2.0;

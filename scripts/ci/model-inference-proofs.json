@@ -278476,5 +278476,137 @@
       "source_identity": "crates/llm/mlx-llm/src/starvector_8b.rs::starvector_8b::tests::the_provider_reports_its_decode_and_the_auto_fallback@f25879e8bcd8bc450b79c7a083cd57ac260400b8fc0d076a1daa0587353e3905",
       "requirements": []
     }
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "fqn": "models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache",
+    "source": "crates/llm/candle-llm/src/models/qwen35.rs",
+    "fixture_identity": "crates/llm/candle-llm/src/models/qwen35.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache; source-defined synthetic decoder weights and original assertions",
+    "configuration_source": "crates/llm/candle-llm/src/models/qwen35.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache",
+    "required_environment": [],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/models/qwen35.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache",
+      "requirements": []
+    },
+    "expected_devices": [
+      "candle-cpu"
+    ]
+  },
+  {
+    "package": "candle-llm",
+    "target": "candle_llm",
+    "target_kind": "lib",
+    "cargo_target_metadata": {
+      "name": "candle_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "fqn": "models::qwen35::tests::headless_checked_callback_cancels_between_layers_and_resets_cache",
+    "source": "crates/llm/candle-llm/src/models/qwen35.rs",
+    "fixture_identity": "crates/llm/candle-llm/src/models/qwen35.rs::models::qwen35::tests::headless_checked_callback_cancels_between_layers_and_resets_cache; source-defined synthetic decoder weights and original assertions",
+    "configuration_source": "crates/llm/candle-llm/src/models/qwen35.rs::models::qwen35::tests::headless_checked_callback_cancels_between_layers_and_resets_cache",
+    "required_environment": [],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/candle-llm/src/models/qwen35.rs::models::qwen35::tests::headless_checked_callback_cancels_between_layers_and_resets_cache",
+      "requirements": []
+    },
+    "expected_devices": [
+      "candle-cpu"
+    ]
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "mlx",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "fqn": "models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu",
+    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu; source-defined synthetic decoder weights and original assertions",
+    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu",
+    "required_environment": [],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu",
+      "requirements": []
+    },
+    "expected_devices": [
+      "mlx-cpu"
+    ]
+  },
+  {
+    "package": "mlx-llm",
+    "target": "mlx_llm",
+    "target_kind": "lib",
+    "cargo_target_metadata": {
+      "name": "mlx_llm",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "mlx",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "fqn": "models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays",
+    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays; source-defined synthetic decoder weights and original assertions",
+    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays",
+    "required_environment": [],
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays",
+      "requirements": []
+    },
+    "expected_devices": [
+      "mlx-cpu"
+    ]
   }
 ]

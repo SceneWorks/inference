@@ -31,7 +31,10 @@ rand_distr = { workspace = true }
 # Voice style-vector `.pt` files are torch zip containers holding ONE bare tensor — a shape the
 # pinned candle pickle reader does not expose (it reads state-dict zips only), so the raw
 # little-endian f32 storage entry is read directly. Same zip version candle-core itself uses.
-zip = { version = "9.0.0", default-features = false }
+# Select miniz explicitly: ZIP 9's `deflate` also enables zlib-rs, which changes
+# downstream flate2 output (including PNGs) through Cargo feature unification.
+zip = { version = "9.0.0", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 # CMU Pronouncing Dictionary parser (MIT/Apache-2.0) for the G2P out-of-vocabulary fallback tier
 # (sc-13038): misaki lexicon → cmudict → letter spell-out. This crate ships ONLY the ARPAbet
 # parser + typed `Symbol` enum — the dictionary DATA is vendored under `resources/cmudict.dict`

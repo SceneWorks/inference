@@ -26,6 +26,129 @@ fn config() -> MiniMaxH3DitConfig {
         ..Default::default()
     }
 }
+/// Header-only source scaffold for the actual Generator's selected-partition probe.
+/// Values come from the SAME config object the in-memory DiT uses, never stock defaults or
+/// a second geometry literal. Keep the TempDir guard alive across the whole generation test.
+fn source_root(cfg: &MiniMaxH3DitConfig) -> tempfile::TempDir {
+    let root = tempfile::Builder::new()
+        .prefix("h3-veda-source-")
+        .tempdir()
+        .unwrap();
+    let mut header = serde_json::Map::new();
+    macro_rules! config_fields {
+        ($($field:ident),+ $(,)?) => {
+            $(header.insert(stringify!($field).to_owned(), serde_json::json!(cfg.$field));)+
+        };
+    }
+    config_fields!(
+        num_attention_heads,
+        attention_head_dim,
+        hidden_size,
+        num_layers,
+        num_refiner_layers,
+        ffn_dim,
+        in_channels,
+        audio_in_channels,
+        patch_size,
+        text_dim,
+        freq_dim,
+        time_embed_hidden_dim,
+        time_embed_dim,
+        rope_freq_dim,
+        rope_theta,
+        norm_eps,
+        qk_norm_eps,
+        final_norm_eps
+    );
+    let encoded = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+    for partition in [
+        crate::model::BASE_DIT_PARTITION,
+        crate::model::REFERENCE_DIT_PARTITION,
+    ] {
+        let directory = root.path().join(partition);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("config.json"), &encoded).unwrap();
+    }
+    root
+}
+
+#[test]
+fn generator_fixture_headers_match_the_in_memory_config_and_refuse_missing_headers() {
+    use crate::model::{MiniMaxH3Task, BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION};
+    // The actual model test must consume this scaffold too; a correct isolated helper with
+    // the old hardcoded generator root would recreate the very integration failure being fixed.
+    let source = include_str!("veda_fixture.rs");
+    let (_, native) = source
+        .split_once(concat!(
+            "fn native_generator_",
+            "learned_sparse_off_and_failure_paths()"
+        ))
+        .unwrap();
+    let native = native.split("\n#[test]").next().unwrap();
+    let compact: String = native.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("letroot=source_root(&config());"));
+    assert!(compact
+        .contains("generator_with(partition.to_str().unwrap(),LoadShape::EagerMaterialization"));
+    assert!(!native.contains("\"/fixture/transformer\""));
+    let expected = config();
+    let root = source_root(&expected);
+    let other = source_root(&expected);
+    assert_ne!(
+        root.path(),
+        other.path(),
+        "concurrent fixtures must never share a source root"
+    );
+    let base = root.path().join(BASE_DIT_PARTITION);
+    let generator = crate::model::tests::generator_with(
+        base.to_str().unwrap(),
+        LoadShape::EagerMaterialization,
+    );
+    for task in [
+        MiniMaxH3Task::T2va,
+        MiniMaxH3Task::Fl2va,
+        MiniMaxH3Task::Ref2va,
+    ] {
+        assert_eq!(
+            generator.task_dit_config(task).unwrap(),
+            expected,
+            "the selected header must describe the exact in-memory DiT"
+        );
+    }
+    for partition in [BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION] {
+        let names: Vec<_> = std::fs::read_dir(root.path().join(partition))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("config.json")],
+            "this CPU fixture must not contain or map tensor payloads"
+        );
+    }
+    std::fs::remove_file(base.join("config.json")).unwrap();
+    let error = generator
+        .task_dit_config(MiniMaxH3Task::T2va)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(base.join("config.json").to_str().unwrap()),
+        "{error}"
+    );
+
+    assert!(
+        error.contains("no task config")
+            && error.contains(BASE_DIT_PARTITION)
+            && error.contains("reimport")
+            && error.contains("select a partition"),
+        "{error}"
+    );
+    assert_eq!(
+        generator.task_dit_config(MiniMaxH3Task::Ref2va).unwrap(),
+        expected,
+        "a missing base header must not change the selected reference source"
+    );
+}
+
 pub(crate) fn dit() -> Result<MiniMaxH3Dit> {
     let mut w = Weights::from_file(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -170,8 +293,10 @@ pub(crate) fn predictor() -> crate::veda::contract::Bundle {
 #[test]
 #[ignore = "requires the exclusive local Metal token"]
 fn native_generator_learned_sparse_off_and_failure_paths() {
+    let root = source_root(&config());
+    let partition = root.path().join(crate::model::BASE_DIT_PARTITION);
     let mut generator = crate::model::tests::generator_with(
-        "/fixture/transformer",
+        partition.to_str().unwrap(),
         LoadShape::EagerMaterialization,
     );
     generator.fixture = Some(Fixture {
@@ -198,9 +323,9 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
         frames
     };
     // A configured but missing optional component must not be touched by omitted/off settings.
-    generator.veda_component = Some(std::path::PathBuf::from(
-        "/missing/veda-predictor.safetensors",
-    ));
+    let missing_predictor = root.path().join("missing-veda-predictor.safetensors");
+    assert!(!missing_predictor.exists());
+    generator.veda_component = Some(missing_predictor);
     let dense = run(&generator, &request);
     let off_report = generator.veda_execution_report().unwrap();
     assert!(!off_report.requested);

@@ -13,6 +13,44 @@ from unittest.mock import patch
 from scripts import media_campaign_supervisor as safety
 
 
+class FixtureDeadlineClock:
+    """Test-only: arm the teardown budget after bounded positive fixture readiness."""
+    def __init__(self, now=time.monotonic, pause=time.sleep):
+        self.now, self.pause, self.ready_at = now, pause, None
+
+    def __call__(self):
+        return 0.0 if self.ready_at is None else self.now() - self.ready_at
+
+    def admit(self, ready, timeout=30.0):
+        until = self.now() + timeout
+        while not ready():
+            if self.now() >= until:
+                raise AssertionError("fixture startup readiness deadline exceeded")
+            self.pause(.01)
+        self.ready_at = self.now()
+
+
+class FixtureDeadlineClockTests(unittest.TestCase):
+    def test_bootstrap_is_bounded_separately_from_three_second_teardown_budget(self):
+        now = [0.0]
+        clock = FixtureDeadlineClock(lambda: now[0], lambda delay: now.__setitem__(0, now[0] + delay))
+        self.assertEqual(clock(), 0)
+        now[0] = 7
+        self.assertEqual(clock(), 0)  # Slow bootstrap has not armed the teardown clock.
+        clock.admit(lambda: now[0] >= 10)
+        self.assertEqual(clock(), 0)
+        now[0] += 3
+        self.assertAlmostEqual(clock(), 3)
+
+    def test_missing_readiness_fails_closed_without_arming_teardown_clock(self):
+        now = [0.0]
+        clock = FixtureDeadlineClock(lambda: now[0], lambda delay: now.__setitem__(0, now[0] + delay))
+        with self.assertRaisesRegex(AssertionError, "fixture startup readiness deadline"):
+            clock.admit(lambda: False, timeout=.05)
+        self.assertIsNone(clock.ready_at)
+        self.assertLess(now[0], .1)
+
+
 class Probe:
     def __init__(self, *, free=10**12, footprint=1024, gpu_free=10**12):
         self.free = free
@@ -322,6 +360,21 @@ class SupervisorTests(unittest.TestCase):
         (self.root / "stderr").unlink()
         with self.assertRaisesRegex(safety.SupervisionError, "child-exit"):
             self.run_child("import sys; sys.exit(7)")
+
+    def test_production_deadline_still_includes_on_spawn_bootstrap(self):
+        now, owned = [0.0], []
+        def bootstrap(pid, pgid):
+            owned.append(pgid)
+            now[0] = 2.0  # The ordinary one-second policy is already expired.
+        with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
+            safety.run_guarded(
+                [sys.executable, "-c", "import threading; threading.Event().wait()"],
+                cwd=self.root, env=os.environ.copy(), policy=self.policy, probe=Probe(),
+                stdout_path=self.root / "stdout", stderr_path=self.root / "stderr",
+                clock=lambda: now[0], on_spawn=bootstrap,
+            )
+        self.assertEqual(len(owned), 1)
+        self.assertFalse(safety._group_pids(owned[0]))
 
     def test_on_spawn_persists_owned_identity_before_sampling(self):
         status_path = self.root / "spawn-status.json"
@@ -1122,6 +1175,225 @@ class OperatorStopTests(unittest.TestCase):
                 safety.check_operator_stop(blocked, logs, kind="k", before="row-a", index=0, total=2)
 
 
+class WindowsJobCleanupTests(unittest.TestCase):
+    """Injected WinAPI lifecycle: no Windows runtime, child process, model or GPU required."""
+
+    def exercise(self, mode="success", implementation=None):
+        from scripts import media_campaign_windows as windows
+        events = []
+        state = {"total": 4, "active": 2, "live": {22, 33}, "terminated": False}
+        class Kernel:
+            def OpenProcess(self, access, inherit, pid):
+                events.append(("open", pid, access, inherit))
+                return 0 if mode.startswith("open-failure") and pid == 22 else pid + 1000
+            def IsProcessInJob(self, process, job, owned):
+                events.append(("owned", process, job))
+                owned._obj.value = mode != "foreign"
+                return mode != "membership-failure"
+            def TerminateJobObject(self, job, code):
+                events.append(("terminate", job, code))
+                if not state["terminated"]:
+                    state["terminated"] = True
+                    state.update(active=0, live=set())
+                    if mode in ("late-listed", "late-vanished"):
+                        state["total"] += 1
+                        if mode == "late-listed":
+                            state.update(active=1, live={44})
+                    if mode == "remaining-member":
+                        state.update(active=1, live={22})
+                if mode == "success":
+                    # Job accounting/list is EMPTY before either retained handle signals.
+                    events.append(("empty-before-signals", members()))
+                return mode != "terminate-failure"
+            def WaitForSingleObject(self, process, milliseconds):
+                events.append(("wait", process, milliseconds))
+                if mode == "wait-timeout":
+                    return 258
+                if mode == "wait-failure":
+                    return 0xffffffff
+                if process == 1044:
+                    state.update(active=0, live=set())
+                return 0
+            def CloseHandle(self, process):
+                events.append(("close", process))
+                if mode == "birth-after-handle-release" and process == 1022:
+                    # Exact late window: the child's retained handle has been released,
+                    # then it creates a grandchild. Teardown must NOT silently succeed.
+                    state.update(total=5, active=1, live={44})
+                return not (mode == "close-failure" and process == 1022)
+        class Child:
+            def wait(self, timeout):
+                events.append(("root-wait", timeout))
+                if mode == "root-timeout":
+                    raise windows.subprocess.TimeoutExpired("fixture", timeout)
+                return 0  # Root already exited; descendants still need their own signals.
+        job = windows.WindowsJob.__new__(windows.WindowsJob)
+        job.kernel = Kernel()
+        job.handle = 900
+        snapshots = 0
+        def members():
+            nonlocal snapshots
+            snapshots += 1
+            events.append(("members", snapshots))
+            if snapshots == 1:
+                return {22, 33}
+            if mode == "open-failure-live":
+                return {22}
+            if mode == "open-failure-exited":
+                return set()
+            return set(state["live"])
+        job.members = members
+        accounting_calls = 0
+        def accounting():
+            nonlocal accounting_calls
+            accounting_calls += 1
+            if (mode == "initial-accounting-failure" and accounting_calls == 1) or (mode == "final-accounting-failure" and accounting_calls > 1):
+                raise windows.WindowsJobError("fixture accounting failure")
+            result = {key: state[key] for key in ("total", "active")}
+            events.append(("accounting", result.copy()))
+            return result
+        job._accounting = accounting
+        ticks = iter([0.0, 0.03125, 0.0625, 0.09375, 0.1015625, 0.109375])
+        invoke = implementation or windows.WindowsJob.terminate_and_reap
+        errors = {
+            "foreign": windows.WindowsJobError,
+            "membership-failure": windows.WindowsJobError,
+            "open-failure-live": windows.WindowsJobError,
+            "open-failure-exited": windows.WindowsJobError,
+            "terminate-failure": windows.WindowsJobError,
+            "wait-timeout": windows.WindowsJobError,
+            "wait-failure": windows.WindowsJobError,
+            "remaining-member": windows.WindowsJobError,
+            "late-vanished": windows.WindowsJobError,
+            "birth-after-handle-release": windows.WindowsJobError,
+            "root-timeout": windows.WindowsJobError,
+            "initial-accounting-failure": windows.WindowsJobError,
+            "final-accounting-failure": windows.WindowsJobError,
+            "close-failure": windows.WindowsJobError,
+        }
+        with patch.object(windows.time, "monotonic", side_effect=lambda: next(ticks, 0.125)), \
+             patch.object(windows, "_failed", side_effect=lambda operation: windows.WindowsJobError(operation)):
+            if mode in errors:
+                with self.assertRaises(errors[mode]) as caught:
+                    invoke(job, Child(), 0.125)
+                if mode in ("late-vanished", "birth-after-handle-release"):
+                    message = str(caught.exception)
+                    self.assertIn("accounted=2 expected=3", message)
+                    self.assertIn("assigned_total=5 initial_total=4", message)
+                    self.assertIn("job_live=1" if mode == "birth-after-handle-release" else "job_live=0", message)
+                    self.assertIn("check=after-handle-release" if mode == "birth-after-handle-release" else "check=after-retained-waits", message)
+            else:
+                invoke(job, Child(), 0.125)
+        opened = [event[1] + 1000 for event in events if event[0] == "open" and not (mode.startswith("open-failure") and event[1] == 22)]
+        self.assertEqual([event[1] for event in events if event[0] == "close"], opened)
+        for event in events:
+            if event[0] == "open":
+                self.assertEqual(event[2:], (0x00100000 | 0x1000, False))
+        if mode in ("foreign", "membership-failure"):
+            self.assertFalse(any(event[0] == "wait" for event in events))
+        if mode in ("open-failure-live", "open-failure-exited"):
+            self.assertEqual([event[1] for event in events if event[0] == "wait"], [1033])
+        if mode in ("wait-timeout", "wait-failure", "root-timeout", "late-vanished", "initial-accounting-failure", "final-accounting-failure"):
+            self.assertEqual([event[1] for event in events if event[0] == "wait"], [1022, 1033])
+        if mode == "success":
+            self.assertIn(("empty-before-signals", set()), events)
+            self.assertEqual(events[0][0], "accounting", "the assignment fence must precede the first PID snapshot")
+            waits = [event for event in events if event[0] == "wait"]
+            self.assertEqual([event[1] for event in waits], [1022, 1033])
+            self.assertEqual([event[2] for event in waits], [63, 32])
+            self.assertLess(next(i for i, event in enumerate(events) if event[0] == "owned"), next(i for i, event in enumerate(events) if event[0] == "terminate"))
+            self.assertLess(next(i for i, event in enumerate(events) if event[0] == "root-wait"), next(i for i, event in enumerate(events) if event[0] == "wait"))
+        if mode == "late-listed":
+            self.assertEqual([event[1] for event in events if event[0] == "wait"], [1022, 1033, 1044])
+            self.assertEqual(len([event for event in events if event[0] == "terminate"]), 2)
+        return events
+
+    def test_empty_job_list_and_exited_root_do_not_replace_descendant_exit_waits(self):
+        self.exercise()
+
+    def test_wait_membership_and_acquisition_failures_are_closed_and_handles_are_released(self):
+        for mode in ("foreign", "membership-failure", "open-failure-live", "open-failure-exited", "terminate-failure", "wait-timeout", "wait-failure", "remaining-member", "root-timeout", "initial-accounting-failure", "final-accounting-failure", "close-failure"):
+            with self.subTest(mode=mode):
+                self.exercise(mode)
+
+    def test_late_births_are_waited_or_reported_unproven_even_after_handle_release(self):
+        for mode in ("late-listed", "late-vanished", "birth-after-handle-release"):
+            with self.subTest(mode=mode):
+                self.exercise(mode)
+
+    def test_accounting_reads_job_assignment_and_live_counts_fail_closed(self):
+        from scripts import media_campaign_windows as windows
+        job = windows.WindowsJob.__new__(windows.WindowsJob)
+        class Kernel:
+            def QueryInformationJobObject(self, handle, info, output, size, returned):
+                self.asserted = (handle, info)
+                output._obj.TotalProcesses = 7
+                output._obj.ActiveProcesses = 3
+                return True
+        job.kernel = Kernel()
+        job.handle = 900
+        self.assertEqual(job._accounting(), {"total": 7, "active": 3})
+        self.assertEqual(job.kernel.asserted, (900, 1))
+        with patch.object(job.kernel, "QueryInformationJobObject", return_value=False), \
+             patch.object(windows, "_failed", return_value=windows.WindowsJobError("accounting failed")):
+            with self.assertRaisesRegex(windows.WindowsJobError, "accounting failed"):
+                job._accounting()
+
+    def test_cleanup_regressions_are_discriminated_by_injected_lifecycle(self):
+        import inspect
+        import textwrap
+        from scripts import media_campaign_windows as windows
+        source = textwrap.dedent(inspect.getsource(windows.WindowsJob.terminate_and_reap))
+        mutants = (
+            ("status = self.kernel.WaitForSingleObject(process, remaining_ms)", "status = 0", "success"),
+            ("if not owned.value:", "if False:", "foreign"),
+            ("if not self.kernel.CloseHandle(process):", "if False:", "success"),
+            ("math.ceil(max(0.0, until - time.monotonic()) * 1000)", "math.ceil(grace * 1000)", "success"),
+            ('fence("after-handle-release")', "pass", "birth-after-handle-release"),
+            ("expected != len(handles)", "False", "late-vanished"),
+            ("child.wait(timeout=max(0.0, until - time.monotonic()))", "pass", "root-timeout"),
+        )
+        for original, replacement, mode in mutants:
+            with self.subTest(mutation=original):
+                self.assertIn(original, source)
+                namespace = dict(vars(windows))
+                exec(compile(source.replace(original, replacement), "<injected cleanup mutant>", "exec"), namespace)
+                with self.assertRaises(AssertionError):
+                    self.exercise(mode, namespace["terminate_and_reap"])
+
+
+    def test_negative_repeat_control_propagates_assertions_without_subtest_suppression(self):
+        import inspect
+        # Run an actual unittest outcome context. Merely calling a fresh TestCase's subTest
+        # directly would not reproduce unittest's suppression of an assertion during .run().
+        class Control(unittest.TestCase):
+            _repeat_deadline_reaping = WindowsSupervisorTests._repeat_deadline_reaping
+            calls = 0
+            def _deadline_reaps_root_and_grandchild_after_root_exit(self):
+                self.calls += 1
+                raise AssertionError("fixture descendant is still alive")
+            def runTest(self):
+                with tempfile.TemporaryDirectory() as directory:
+                    self.root = Path(directory)
+                    original = self.root
+                    with self.assertRaisesRegex(AssertionError, "fixture descendant is still alive"):
+                        self._repeat_deadline_reaping(subtests=False)
+                    self.assertEqual(self.calls, 1)
+                    self.assertEqual(self.root, original)
+        result = unittest.TestResult()
+        Control().run(result)
+        self.assertEqual(result.testsRun, 1)
+        self.assertTrue(result.wasSuccessful(), (result.failures, result.errors))
+        def suppressing_mutant(case, *, subtests):
+            return WindowsSupervisorTests._repeat_deadline_reaping(case, subtests=True)
+        mutant_result = unittest.TestResult()
+        with patch.object(Control, "_repeat_deadline_reaping", suppressing_mutant):
+            Control().run(mutant_result)
+        self.assertFalse(mutant_result.wasSuccessful(), "subTest assertion suppression mutant escaped")
+        source = inspect.getsource(WindowsSupervisorTests.test_repeated_reaping_case_rejects_skip_descendant_reap_mutant)
+        self.assertIn("self._repeat_deadline_reaping(subtests=False)", source)
+
+
 @unittest.skipUnless(os.name == "nt", "real Job Object smoke requires Windows")
 class WindowsSupervisorTests(unittest.TestCase):
     """Real owned child/grandchild, real Windows memory APIs; no GPU/model use."""
@@ -1145,7 +1417,7 @@ class WindowsSupervisorTests(unittest.TestCase):
         self.assertGreater(windows.host_free_bytes(), 0)
         self.assertTrue(Path(windows.trusted_nvidia_smi()).is_absolute())
 
-    def _run(self, script, *, cap=None, on_spawn=None):
+    def _run(self, script, *, cap=None, on_spawn=None, clock=time.monotonic):
         policy_data = dict(self.data)
         if cap is not None:
             policy_data["childFootprintCapBytes"] = cap
@@ -1171,7 +1443,7 @@ class WindowsSupervisorTests(unittest.TestCase):
             [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
             policy=policy, stdout_path=self.root / "stdout", stderr_path=self.root / "stderr",
             probe=Probe(),
-            on_spawn=on_spawn,
+            on_spawn=on_spawn, clock=clock,
         )
 
     def test_on_spawn_reports_job_owned_root_without_posix_group(self):
@@ -1180,33 +1452,225 @@ class WindowsSupervisorTests(unittest.TestCase):
                            on_spawn=lambda pid, pgid: calls.append((pid, pgid)))
         self.assertEqual(calls, [(result.pid, None)])
 
-    def _assert_exited(self, pid):
+    def _has_exited(self, pid):
         import ctypes
         from scripts import media_campaign_windows as windows
         kernel, _ = windows._apis()
         handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
         if not handle:
             self.assertEqual(ctypes.get_last_error(), 87)  # PID no longer exists.
-            return
+            return True
         try:
             kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
             kernel.WaitForSingleObject.restype = ctypes.c_uint32
-            self.assertEqual(kernel.WaitForSingleObject(handle, 0), 0)
+            return kernel.WaitForSingleObject(handle, 0) == 0
         finally:
             kernel.CloseHandle(handle)
 
+    def _assert_exited(self, pid):
+        self.assertTrue(self._has_exited(pid), f"owned process {pid} is still alive")
+
+    def test_missing_readiness_reaps_owned_root(self):
+        clock, owned = FixtureDeadlineClock(), []
+        def never_ready(pid, _pgid):
+            owned.append(pid)
+            clock.admit(lambda: False, timeout=.05)
+        with self.assertRaisesRegex(AssertionError, "fixture startup readiness deadline"):
+            self._run("import threading; threading.Event().wait()", on_spawn=never_ready, clock=clock)
+        self.assertEqual(len(owned), 1)
+        self._assert_exited(owned[0])
+
     def test_deadline_reaps_root_and_grandchild_after_root_exit(self):
-        grandchild = "import os,time; b=bytearray(4*1024*1024); open('grandchild-pid','w').write(str(os.getpid())); time.sleep(10)"
-        script = (
-            "import os,subprocess,sys,time; "
-            f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}]); "
-            "open('root-pid','w').write(str(os.getpid())); time.sleep(.5)"
+        self._deadline_reaps_root_and_grandchild_after_root_exit()
+
+    def test_repeated_deadline_reaps_root_and_grandchild_after_root_exit(self):
+        self._repeat_deadline_reaping(subtests=True)
+
+    def _repeat_deadline_reaping(self, *, subtests):
+        from contextlib import nullcontext
+        original_root = self.root
+        try:
+            # Twenty independent post-readiness 3s deadlines exercise root-exit ordering;
+            # bootstrap has its own bound, never a Python-startup speed assertion.
+            for attempt in range(20):
+                context = self.subTest(attempt=attempt) if subtests else nullcontext()
+                with context, tempfile.TemporaryDirectory(dir=original_root) as directory:
+                    self.root = Path(directory)
+                    self._deadline_reaps_root_and_grandchild_after_root_exit()
+        finally:
+            self.root = original_root
+
+    def _deadline_reaps_root_and_grandchild_after_root_exit(self):
+        # Atomic PID publication avoids observing a newly-created but unflushed file.
+        grandchild = (
+            "import os,pathlib,threading; b=bytearray(4*1024*1024); "
+            "pathlib.Path('grandchild-pid.tmp').write_text(str(os.getpid()),encoding='ascii'); "
+            "os.replace('grandchild-pid.tmp','grandchild-pid'); threading.Event().wait()"
         )
+        script = (
+            "import os,pathlib,subprocess,sys; "
+            "pathlib.Path('root-pid.tmp').write_text(str(os.getpid()),encoding='ascii'); "
+            "os.replace('root-pid.tmp','root-pid'); "
+            f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}])"
+        )
+        clock = FixtureDeadlineClock()
+        def fixture_ready(pid, _pgid):
+            def ready():
+                try:
+                    root_pid = int((self.root / "root-pid").read_text(encoding="ascii"))
+                    grandchild_pid = int((self.root / "grandchild-pid").read_text(encoding="ascii"))
+                except FileNotFoundError:
+                    return False
+                self.assertEqual(root_pid, pid)
+                self.assertGreater(grandchild_pid, 0)
+                self.assertNotEqual(grandchild_pid, root_pid)
+                return self._has_exited(root_pid)
+            clock.admit(ready)  # Independent 30s bootstrap bound, not an extended teardown limit.
         with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
-            self._run(script)
+            self._run(script, on_spawn=fixture_ready, clock=clock)
+        self.assertIsNotNone(clock.ready_at)
         self.assertTrue(any(amount > 0 for amount in self.sampled))
         self._assert_exited(int((self.root / "root-pid").read_text(encoding="ascii")))
         self._assert_exited(int((self.root / "grandchild-pid").read_text(encoding="ascii")))
+
+    def test_repeated_reaping_case_rejects_skip_descendant_reap_mutant(self):
+        from scripts import media_campaign_windows as windows
+        original_factory = windows.WindowsJob
+        original_assert = self._assert_exited
+        jobs = []
+        def factory():
+            job = original_factory()
+            kernel = job.kernel
+            kernel.GetCurrentProcess.argtypes = []
+            kernel.GetCurrentProcess.restype = windows.wintypes.HANDLE
+            kernel.DuplicateHandle.argtypes = [windows.wintypes.HANDLE, windows.wintypes.HANDLE,
+                windows.wintypes.HANDLE, windows.ctypes.POINTER(windows.wintypes.HANDLE),
+                windows.wintypes.DWORD, windows.wintypes.BOOL, windows.wintypes.DWORD]
+            kernel.DuplicateHandle.restype = windows.wintypes.BOOL
+            duplicate = windows.wintypes.HANDLE()
+            current = kernel.GetCurrentProcess()
+            try:
+                self.assertTrue(kernel.DuplicateHandle(current, job.handle, current,
+                    windows.ctypes.byref(duplicate), 0, False, 2))  # DUPLICATE_SAME_ACCESS
+            except BaseException:
+                job.close()
+                raise
+            # A TEST-owned Job reference keeps ordinary production close fully intact, while
+            # preventing last-handle kill from hiding the omitted explicit descendant reap.
+            drain_job = original_factory.__new__(original_factory)
+            drain_job.kernel, drain_job.psapi, drain_job.handle = kernel, job.psapi, duplicate.value
+            entry = {"job": drain_job, "root_job": job, "child": None, "drained": False}
+            jobs.append(entry)
+            assign = job.assign_and_resume
+            def assign_child(child):
+                entry["child"] = child
+                assign(child)
+            job.assign_and_resume = assign_child
+            job.terminate_and_reap = lambda child, grace: child.wait(timeout=grace)
+            return job
+        def drain():
+            for entry in jobs:
+                if not entry["drained"]:
+                    try:
+                        if entry["child"] is not None:
+                            entry["job"].terminate_and_reap(entry["child"], self.data["termGraceMillis"] / 1000)
+                    finally:
+                        entry["job"].close()
+                        entry["root_job"].close()
+                        entry["drained"] = True
+        def assert_then_drain(pid):
+            try:
+                original_assert(pid)  # Unchanged instantaneous Wait(handle, 0)==0.
+            except AssertionError:
+                drain()  # Reap BEFORE the repeated case's TemporaryDirectory is removed.
+                raise
+        try:
+            with patch.object(windows, "WindowsJob", side_effect=factory), \
+                 patch.object(self, "_assert_exited", side_effect=assert_then_drain):
+                with self.assertRaises(AssertionError):
+                    self._repeat_deadline_reaping(subtests=False)
+        finally:
+            drain()
+        self.assertTrue(jobs)
+        self.assertTrue(all(entry["drained"] for entry in jobs))
+
+    def test_late_grandchild_after_snapshot_handle_release_is_reaped_or_fails_closed(self):
+        import queue
+        import threading
+        from scripts import media_campaign_windows as windows
+        kernel, _ = windows._apis()
+        job = windows.WindowsJob()
+        child = None
+        grandchild_handle = None
+        reader = None
+        grandchild = "import time; time.sleep(10)"
+        script = (
+            "import subprocess,sys,time; sys.stdin.buffer.read(1); "
+            f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}]); "
+            "print(p.pid,flush=True); time.sleep(10)"
+        )
+        try:
+            child = safety.subprocess.Popen(
+                [sys.executable, "-c", script], stdin=safety.subprocess.PIPE,
+                stdout=safety.subprocess.PIPE, stderr=safety.subprocess.DEVNULL,
+                creationflags=0x00000004,  # CREATE_SUSPENDED: Job admission precedes execution.
+            )
+            job.assign_and_resume(child)
+            original_members = job.members
+            first_snapshot = True
+            released = False
+            def members():
+                nonlocal first_snapshot, released, grandchild_handle, reader
+                snapshot = original_members()
+                if first_snapshot:
+                    first_snapshot = False
+                    self.assertEqual(snapshot, {child.pid})
+                    # Open and RELEASE the child's snapshot handle before permitting its birth.
+                    # The production cleanup receives the now-stale snapshot, opening exactly
+                    # the capture->kill window; lifetime accounting must detect this new PID.
+                    handle = kernel.OpenProcess(0x00100000 | 0x1000, False, child.pid)
+                    self.assertTrue(handle)
+                    owned = windows.wintypes.BOOL()
+                    self.assertTrue(kernel.IsProcessInJob(handle, job.handle, windows.ctypes.byref(owned)))
+                    self.assertTrue(owned.value)
+                    self.assertTrue(kernel.CloseHandle(handle))
+                    released = True
+                    acknowledgements = queue.Queue()
+                    reader = threading.Thread(target=lambda: acknowledgements.put(child.stdout.readline()), daemon=True)
+                    reader.start()
+                    child.stdin.write(b"x")
+                    child.stdin.flush()
+                    pid = int(acknowledgements.get(timeout=3).strip())
+                    grandchild_handle = kernel.OpenProcess(0x00100000, False, pid)
+                    self.assertTrue(grandchild_handle)
+                return snapshot
+            job.members = members
+            try:
+                job.terminate_and_reap(child, self.data["termGraceMillis"] / 1000)
+            except windows.WindowsJobError as error:
+                self.assertIn("owned Job teardown unproven", str(error))
+                self.assertIn("accounted=", str(error))
+                self.assertIn("job_live=", str(error))
+                self.assertIn("check=", str(error))
+            else:
+                self.assertEqual(kernel.WaitForSingleObject(grandchild_handle, 0), 0)
+            self.assertTrue(released)
+        finally:
+            job.close()  # Kill-on-close still includes EVERY assignment, including late births.
+            if child is not None:
+                child.wait(timeout=3)
+                if child.stdin is not None:
+                    child.stdin.close()
+                if reader is not None:
+                    reader.join(timeout=3)
+                    self.assertFalse(reader.is_alive())
+                if child.stdout is not None:
+                    child.stdout.close()
+            if grandchild_handle:
+                try:
+                    self.assertEqual(kernel.WaitForSingleObject(grandchild_handle, 3000), 0)
+                finally:
+                    kernel.CloseHandle(grandchild_handle)
 
     def test_child_cap_aborts_and_reaps(self):
         with self.assertRaisesRegex(safety.SupervisionError, "child-footprint"):

@@ -25,11 +25,17 @@ mod common;
 #[path = "adaln_evict_memory.rs"]
 mod adaln_evict_memory;
 
+#[path = "adapter_topology.rs"]
+mod adapter_topology;
+
 #[path = "audio_vae_encode_parity.rs"]
 mod audio_vae_encode_parity;
 
 #[path = "audio_vae_parity.rs"]
 mod audio_vae_parity;
+
+#[path = "convrot_int8.rs"]
+mod convrot_int8;
 
 #[path = "cross_backend.rs"]
 mod cross_backend;
@@ -42,6 +48,9 @@ mod dit_parity;
 
 #[path = "joint_denoise.rs"]
 mod joint_denoise;
+
+#[path = "pruned_adaln.rs"]
+mod pruned_adaln;
 
 #[path = "quant_policy.rs"]
 mod quant_policy;
@@ -72,3 +81,9 @@ mod video_vae_parity;
 
 #[path = "vram_probe.rs"]
 mod vram_probe;
+
+#[path = "w4a8_compare.rs"]
+mod w4a8_compare;
+
+#[path = "w4a8_reader.rs"]
+mod w4a8_reader;

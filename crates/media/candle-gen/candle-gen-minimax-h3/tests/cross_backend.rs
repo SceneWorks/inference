@@ -664,7 +664,7 @@ fn a_gated_ffn_half_swap_is_loud_against_the_mlx_record() {
 /// evidence about the *convention* (the `t,h,w` split, the absent 2π, the partial rotary), which is
 /// exactly what a shared-implementation comparison could not give.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn dit_agrees_with_the_mlx_lane() {
     use candle_gen_minimax_h3::dit::layers::DitAttention;
     use candle_gen_minimax_h3::dit::model::{BlockModulation, PackedForward};
@@ -882,7 +882,7 @@ fn joint_denoise_agrees_with_the_mlx_lane() {
 /// record are both in the repo, so this measures MLX-vs-reference and candle-vs-reference directly
 /// and reports which of the two sets the bound.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn the_dit_cross_backend_floor_is_also_the_mlx_lanes() {
     use candle_gen_minimax_h3::{DitBlock, MmRope};
 
@@ -954,7 +954,7 @@ fn the_dit_cross_backend_floor_is_also_the_mlx_lanes() {
 /// orders more than the floor, while leaving cosine well away from 0 and the L2 norm the same to
 /// within a few percent.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record() {
     use candle_gen_minimax_h3::{swap_gated_halves, DitBlock, MmRope};
 

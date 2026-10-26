@@ -156,6 +156,11 @@ fn ggml_projection_bytes(
                 "FLUX.2 File imports do not support NVFP4 folding".into(),
             ))
         }
+        Quant::Fp8Rowwise => {
+            return Err(gen_core::Error::Unsupported(
+                "FLUX.2 File imports do not support FP8 rowwise folding".into(),
+            ))
+        }
     };
     (elements / 32).checked_mul(bytes_per_block).ok_or_else(|| {
         gen_core::Error::Msg(format!(

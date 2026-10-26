@@ -559,6 +559,8 @@ impl Flux2PromptEncoder {
                 repetition_penalty: 1.0,
                 repetition_context: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
             },
             seed: Some(sampling.seed),
             stop_tokens: vec![eos_token],
@@ -843,6 +845,8 @@ mod tests {
             repetition_penalty: 1.0,
             repetition_context: 0,
             presence_penalty: 0.0,
+            presence_penalty_generated_only: false,
+            presence_penalty_prompt_len: 0,
         };
         let mut logits = encoder
             .decode_logits_from_embeds(prompt_embeds, &mut cache, 0)

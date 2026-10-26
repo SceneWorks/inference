@@ -136,7 +136,7 @@ fn the_context_embedder_reproduces_the_reference_projection() {
 /// `token_refiner`, which is the order the reference's `forward` applies and the order a port that
 /// refined before embedding would get wrong at the same shapes.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_model_embeds_the_context_before_refining_it() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -275,7 +275,10 @@ fn the_seventeen_load_at_the_published_geometry() {
     let tiny = dit_fixture_config();
     let p = DitProjections::from_weights(&model_weights(&f), &tiny).unwrap();
     assert_eq!(
-        p.time_embedder.time_embed_dim(),
+        p.time_embedder
+            .as_ref()
+            .expect("stock checkpoint timestep MLP")
+            .time_embed_dim(),
         tiny.time_embed_dim,
         "the AdaLN projections consume this width"
     );
@@ -321,7 +324,7 @@ fn the_declared_names_partition_the_fixture() {
 /// fixture's packed layout, reproduced by `MiniMaxH3Dit::forward_packed` — which is the very
 /// function `JointDit` calls per step.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_whole_model_reproduces_the_reference_velocity() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -409,7 +412,7 @@ fn the_whole_model_reproduces_the_reference_velocity() {
 /// naming the modulation table to an opaque kernel one, which is exactly the regression the
 /// hoisting invited, so the rejection is asserted here through `forward_packed` itself.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn forward_packed_rejects_an_out_of_range_adaln_index() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -474,7 +477,7 @@ fn forward_packed_rejects_an_out_of_range_adaln_index() {
 /// land on the reference velocity exactly as the un-cached path does. `adaln_evict_memory.rs` is
 /// the memory half.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_cached_modulation_path_reproduces_the_resident_one() {
     use candle_gen_minimax_h3::AdaLnCache;
 

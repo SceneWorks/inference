@@ -370,8 +370,8 @@ fn the_keyframe_anchor_rows_match_the_reference() {
 /// This is where the `view(-1, 6·hidden)`-before-`chunk(6)` row layout is pinned: a port that
 /// chunked the `[T, 18·hidden]` projection directly produces six tensors of the same total size
 /// with different contents.
-#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn adaln_modulation_matches_the_reference() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -407,8 +407,8 @@ fn adaln_modulation_matches_the_reference() {
 
 /// One `MiniMaxH3TransformerBlock`: pre-norm + AdaLN modulation, qk-normed MM-RoPE attention,
 /// gated residual, SwiGLU feed-forward, gated residual.
-#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn transformer_block_matches_the_reference() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -709,8 +709,8 @@ fn qk_norm_runs_per_head_before_the_rotary() {
 /// Crossing them matters even though the shipped config sets all three to 1e-5: they are separate
 /// knobs (`refiner.rs` deliberately reads `final_norm_eps` for `final_norm` and `norm_eps` for the
 /// block norms), so a variant checkpoint that diverged would otherwise run silently wrong.
-#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn every_norm_epsilon_is_wired_through() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -856,7 +856,7 @@ fn published_ffn_projection_is_value_then_gate() {
 /// and the printed norms and cosine show why a magnitude, std or checksum assertion of any
 /// tolerance would not.
 #[test]
-#[ignore = "model inference; explicit model-proof workflow"]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn reading_the_ffn_halves_gate_first_breaks_parity() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1057,8 +1057,8 @@ fn the_wrong_qkv_transform_breaks_parity() {
 
 /// **`adaln_indices = timestep_index · MODALITY_NUM + tag`.** The modality term must be present:
 /// dropping it (addressing by timestep alone) is a legal index vector that selects the wrong rows.
-#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn the_modality_term_of_the_adaln_index_is_load_bearing() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1125,8 +1125,8 @@ fn the_modality_term_of_the_adaln_index_is_load_bearing() {
 /// projection into six `[T, 3·hidden]` pieces instead yields six tensors of the same total size and
 /// different contents; this reconstructs that wrong reading from the fixture's own weights and
 /// shows the six tables differ.
-#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn the_adaln_table_is_reshaped_before_it_is_chunked() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1172,8 +1172,8 @@ fn the_adaln_table_is_reshaped_before_it_is_chunked() {
 
 /// Every one of a block's 12 tensors must move the output. A tensor that can be changed without
 /// changing the result is not wired into the graph and the parity test is not covering it.
-#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn every_block_weight_is_load_bearing() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1226,8 +1226,8 @@ fn every_block_weight_is_load_bearing() {
 /// floor is a property of the hardware and dtype, not of the port. If MLX's reduced-precision f32
 /// matmul ever drifts up to meet the floor, this fails here instead of quietly turning every
 /// mutation test into a coin flip.
-#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn parity_residuals_bound_the_mutation_floor() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1389,6 +1389,7 @@ fn fixture_is_not_degenerate() {
 /// The declared tensor names must be exactly the fixture's block + refiner tensor set, and every
 /// one must be consumed. A silently unmapped tensor still produces plausible output.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn weight_mapping_is_exhaustive_over_the_block_stack() {
     let cfg = dit_fixture_config();
 
