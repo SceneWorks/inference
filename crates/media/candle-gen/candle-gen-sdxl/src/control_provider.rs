@@ -50,8 +50,13 @@ fn effective_guidance(req: &GenerationRequest) -> f64 {
 /// the existing staged peak-memory ordering.
 #[derive(Clone)]
 struct ControlComponents {
-    unet: Arc<UNet2DConditionModel>,
+    denoise: ControlDenoiseComponents,
     vae: Arc<SdxlVaeDecoder>,
+}
+
+#[derive(Clone)]
+struct ControlDenoiseComponents {
+    unet: Arc<UNet2DConditionModel>,
     controls: Arc<Vec<ControlNet>>,
 }
 
@@ -67,6 +72,8 @@ pub(super) struct SdxlControlGenerator {
     adapters: Vec<gen_core::AdapterSpec>,
     file_pin_spec: LoadSpec,
     components: Mutex<Option<ControlComponents>>,
+    conditioner: Mutex<Option<Arc<SdxlConditioner>>>,
+    request: Mutex<()>,
     memory_contract: Option<gen_core::MemoryProviderContract>,
     artifact_seal: Option<SdxlArtifactSeal>,
 }
@@ -115,6 +122,8 @@ impl SdxlControlGenerator {
             adapters: spec.adapters.clone(),
             file_pin_spec: spec.clone(),
             components: Mutex::new(None),
+            conditioner: Mutex::new(None),
+            request: Mutex::new(()),
             memory_contract,
             artifact_seal,
         })
@@ -125,36 +134,183 @@ impl SdxlControlGenerator {
         if let Some(components) = guard.as_ref() {
             return Ok(components.clone());
         }
-        let built =
-            self.file_pin_spec
-                .read_prepared_files_unchanged(|| -> Result<ControlComponents> {
-                    let unet = load_instantid_unet_with_adapters(
-                        &self.root,
-                        &self.device,
-                        DTYPE,
-                        &self.adapters,
-                    )?;
-                    let vae_source =
-                        self.component_paths.vae_fp16_fix.as_ref().ok_or_else(|| {
-                            CandleError::Msg(
-                    "sdxl: ControlNet snapshot load requires the staged vae_fp16_fix component"
-                        .into(),
-                )
-                        })?;
-                    let vae = load_sdxl_vae(vae_source, &self.device, DTYPE)?;
-                    let controls = self
-                        .controls
-                        .iter()
-                        .map(|source| load_sdxl_controlnet(source, &self.device, DTYPE))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(ControlComponents {
-                        unet: Arc::new(unet),
-                        vae: Arc::new(vae),
-                        controls: Arc::new(controls),
-                    })
-                })?;
+        let built = ControlComponents {
+            denoise: self.load_denoise()?,
+            vae: self.load_vae()?,
+        };
         *guard = Some(built.clone());
         Ok(built)
+    }
+
+    fn load_denoise(&self) -> Result<ControlDenoiseComponents> {
+        crate::verify_artifacts(&self.artifact_seal)?;
+        self.file_pin_spec.read_prepared_files_unchanged(|| {
+            let unet =
+                load_instantid_unet_with_adapters(&self.root, &self.device, DTYPE, &self.adapters)?;
+            let controls = self
+                .controls
+                .iter()
+                .map(|source| load_sdxl_controlnet(source, &self.device, DTYPE))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ControlDenoiseComponents {
+                unet: Arc::new(unet),
+                controls: Arc::new(controls),
+            })
+        })
+    }
+
+    fn load_vae(&self) -> Result<Arc<SdxlVaeDecoder>> {
+        crate::verify_artifacts(&self.artifact_seal)?;
+        self.file_pin_spec.read_prepared_files_unchanged(|| {
+            let source = self.component_paths.vae_fp16_fix.as_ref().ok_or_else(|| {
+                CandleError::Msg(
+                    "sdxl: ControlNet snapshot requires the staged fp16-fix VAE".into(),
+                )
+            })?;
+            Ok(Arc::new(load_sdxl_vae(source, &self.device, DTYPE)?))
+        })
+    }
+
+    fn load_conditioner(&self) -> Result<Arc<SdxlConditioner>> {
+        crate::verify_artifacts(&self.artifact_seal)?;
+        self.file_pin_spec.read_prepared_files_unchanged(|| {
+            Ok(Arc::new(SdxlConditioner::load(
+                &self.root,
+                &self.device,
+                DTYPE,
+                &self.component_paths.tokenizer_clip_l,
+                &self.component_paths.tokenizer_clip_bigg,
+            )?))
+        })
+    }
+
+    fn denoise_images(
+        &self,
+        req: &GenerationRequest,
+        conditioning: &Tensor,
+        pooled: &Tensor,
+        components: &ControlDenoiseComponents,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Tensor>> {
+        let lightning = req.sampler.as_deref() == Some("lightning");
+        let guidance = effective_guidance(req);
+        let cfg_on = !lightning && guidance > 1.0;
+        let steps = req.steps.unwrap_or(if lightning {
+            LIGHTNING_DEFAULT_STEPS as u32
+        } else {
+            DEFAULT_STEPS as u32
+        }) as usize;
+        let controls = self.control_requests(req).map_err(CandleError::from)?;
+        let time_ids = text_time_ids(if cfg_on { 2 } else { 1 }, &self.device, DTYPE)?;
+        let contexts = controls
+            .iter()
+            .zip(components.controls.iter())
+            .map(|((image, scale), controlnet)| {
+                let image =
+                    preprocess_generic_control_image(image, req.width, req.height, &self.device)?
+                        .to_dtype(DTYPE)?;
+                let image = if cfg_on {
+                    Tensor::cat(&[&image, &image], 0)?
+                } else {
+                    image
+                };
+                Ok(ControlContext {
+                    controlnet,
+                    cond_embed: controlnet.embed_cond(&image)?,
+                    scale: *scale as f64,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
+
+        let mut images = Vec::with_capacity(req.count as usize);
+        crate::with_request_attention_budget(req, || -> Result<()> {
+            for index in 0..req.count {
+                if req.cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+                let image_seed = seed.wrapping_add(index as u64);
+                let latents = if lightning {
+                    denoise_lightning_control(
+                        &components.unet,
+                        conditioning,
+                        pooled,
+                        &time_ids,
+                        &contexts,
+                        image_seed,
+                        req.width,
+                        req.height,
+                        &self.device,
+                        steps,
+                        &req.cancel,
+                        on_progress,
+                        &req.preview,
+                    )?
+                } else {
+                    let schedule = sdxl_alpha_schedule()?;
+                    let sampling = DiscreteModelSampling::sdxl(&schedule);
+                    let native = schedule_sigmas(Scheduler::Normal, &sampling, steps);
+                    let sigmas = candle_gen::resolve_schedule(
+                        req.scheduler.as_deref(),
+                        &sampling,
+                        steps,
+                        &native,
+                    );
+                    let preview = crate::preview::ve_hook(&req.preview);
+                    let latents = seeded_sigma_prior(
+                        image_seed,
+                        req.width,
+                        req.height,
+                        sigmas[0],
+                        &self.device,
+                    )?;
+                    denoise_curated(
+                        &components.unet,
+                        req.sampler.as_deref().or(Some("ddim")),
+                        &sampling,
+                        &sigmas,
+                        latents,
+                        conditioning,
+                        pooled,
+                        &time_ids,
+                        guidance,
+                        DTYPE,
+                        image_seed,
+                        &req.cancel,
+                        on_progress,
+                        Some(&preview),
+                        &contexts,
+                        conditioning,
+                    )?
+                };
+                images.push(latents);
+            }
+            Ok(())
+        })?;
+        Ok(images)
+    }
+
+    fn decode_images(
+        &self,
+        req: &GenerationRequest,
+        latents: &[Tensor],
+        vae: &SdxlVaeDecoder,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<gen_core::Image>> {
+        latents
+            .iter()
+            .map(|latent| {
+                on_progress(Progress::Decoding);
+                decode_image_with_tiling(
+                    vae,
+                    latent,
+                    None,
+                    Some(&req.cancel),
+                    crate::denoise::decode_tiling(req.memory),
+                )
+            })
+            .collect()
     }
 
     fn control_requests<'a>(
@@ -278,149 +434,74 @@ impl Generator for SdxlControlGenerator {
         if let Some(seal) = &self.artifact_seal {
             seal.ensure_unchanged()?;
         }
-        let staged = req.memory.is_some_and(|memory| memory.stage_residency);
-        struct Clear<'a>(&'a Mutex<Option<ControlComponents>>, bool);
-        impl Drop for Clear<'_> {
-            fn drop(&mut self) {
-                if self.1 {
-                    candle_gen::lock_recover(self.0).take();
-                }
-            }
-        }
+        let _request = candle_gen::lock_recover(&self.request);
+        let staged = crate::staged_execution(self.file_pin_spec.offload_policy, req.memory);
+        let mut effective_req = req.clone();
+        effective_req.seed = Some(req.seed.unwrap_or_else(gen_core::default_seed));
         if staged {
-            candle_gen::lock_recover(&self.components).take();
-        }
-        let _clear = Clear(&self.components, staged);
-        if req.cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
-
-        let lightning = req.sampler.as_deref() == Some("lightning");
-        let guidance = effective_guidance(req);
-        let steps = req.steps.unwrap_or(if lightning {
-            LIGHTNING_DEFAULT_STEPS as u32
-        } else {
-            DEFAULT_STEPS as u32
-        }) as usize;
-        let cfg_on = !lightning && guidance > 1.0;
-        let negative = req.negative_prompt.as_deref().unwrap_or("");
-        let controls = self.control_requests(req)?;
-
-        // Text runs before the cached heavy graph so dual CLIP never overlaps the UNet/ControlNet/VAE
-        // allocation.  This matches the normal SDXL generator's staged residency contract.
-        if let Some(seal) = &self.artifact_seal {
-            seal.ensure_unchanged()?;
-        }
-        let conditioner = self.file_pin_spec.read_prepared_files_unchanged(|| {
-            SdxlConditioner::load(
-                &self.root,
-                &self.device,
-                DTYPE,
-                &self.component_paths.tokenizer_clip_l,
-                &self.component_paths.tokenizer_clip_bigg,
-            )
-        })?;
-        let (conditioning, pooled) = conditioner.encode(&req.prompt, negative, cfg_on)?;
-        drop(conditioner);
-
-        if let Some(seal) = &self.artifact_seal {
-            seal.ensure_unchanged()?;
-        }
-        let components = self.components()?;
-        let time_ids = text_time_ids(if cfg_on { 2 } else { 1 }, &self.device, DTYPE)?;
-        let contexts = controls
-            .iter()
-            .zip(components.controls.iter())
-            .map(|((image, scale), controlnet)| {
-                let image =
-                    preprocess_generic_control_image(image, req.width, req.height, &self.device)?
-                        .to_dtype(DTYPE)?;
-                let image = if cfg_on {
-                    Tensor::cat(&[&image, &image], 0)?
-                } else {
-                    image
-                };
-                Ok(ControlContext {
-                    controlnet,
-                    cond_embed: controlnet.embed_cond(&image)?,
-                    scale: *scale as f64,
+            effective_req
+                .memory
+                .get_or_insert_with(|| gen_core::GenerationMemory {
+                    tile_vae_decode: crate::vae_tiling_enabled(),
+                    ..Default::default()
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
-
-        let mut images = Vec::with_capacity(req.count as usize);
-        crate::with_request_attention_budget(req, || -> gen_core::Result<()> {
-            for index in 0..req.count {
-                if req.cancel.is_cancelled() {
-                    return Err(gen_core::Error::Canceled);
-                }
-                let image_seed = seed.wrapping_add(index as u64);
-                let latents = if lightning {
-                    denoise_lightning_control(
-                        &components.unet,
-                        &conditioning,
-                        &pooled,
-                        &time_ids,
-                        &contexts,
-                        image_seed,
-                        req.width,
-                        req.height,
-                        &self.device,
-                        steps,
-                        &req.cancel,
-                        on_progress,
-                        &req.preview,
-                    )?
-                } else {
-                    let schedule = sdxl_alpha_schedule()?;
-                    let sampling = DiscreteModelSampling::sdxl(&schedule);
-                    let native = schedule_sigmas(Scheduler::Normal, &sampling, steps);
-                    let sigmas = candle_gen::resolve_schedule(
-                        req.scheduler.as_deref(),
-                        &sampling,
-                        steps,
-                        &native,
-                    );
-                    let preview = crate::preview::ve_hook(&req.preview);
-                    let latents = seeded_sigma_prior(
-                        image_seed,
-                        req.width,
-                        req.height,
-                        sigmas[0],
-                        &self.device,
-                    )?;
-                    denoise_curated(
-                        &components.unet,
-                        req.sampler.as_deref().or(Some("ddim")),
-                        &sampling,
-                        &sigmas,
-                        latents,
-                        &conditioning,
-                        &pooled,
-                        &time_ids,
-                        guidance,
-                        DTYPE,
-                        image_seed,
-                        &req.cancel,
-                        on_progress,
-                        Some(&preview),
-                        &contexts,
-                        &conditioning,
-                    )?
-                };
-                on_progress(Progress::Decoding);
-                images.push(decode_image_with_tiling(
-                    &components.vae,
-                    &latents,
-                    None,
-                    Some(&req.cancel),
-                    crate::denoise::decode_tiling(req.memory),
-                )?);
-            }
-            Ok(())
-        })?;
+                .stage_residency = true;
+        }
+        let req = &effective_req;
+        candle_gen::residency::check_cancel(&req.cancel)?;
+        let cfg_on = req.sampler.as_deref() != Some("lightning") && effective_guidance(req) > 1.0;
+        let negative = req.negative_prompt.as_deref().unwrap_or("");
+        if staged {
+            crate::clear_resident_caches(&self.components, &self.conditioner, || {
+                Ok(self.device.synchronize()?)
+            })?;
+        }
+        let images = if staged {
+            let mut state = (None, Vec::new(), on_progress);
+            candle_gen::residency::run_three_stage_sequential(
+                &mut state,
+                |_| self.load_conditioner(),
+                |conditioner, state| {
+                    candle_gen::residency::check_cancel(&req.cancel)?;
+                    state.0 = Some(conditioner.encode(&req.prompt, negative, cfg_on)?);
+                    Ok(())
+                },
+                |_| {
+                    candle_gen::residency::check_cancel(&req.cancel)?;
+                    self.load_denoise()
+                },
+                |components, state| {
+                    let (conditioning, pooled) = state.0.as_ref().ok_or_else(|| {
+                        CandleError::Msg("sdxl: missing control text phase".into())
+                    })?;
+                    state.1 =
+                        self.denoise_images(req, conditioning, pooled, components, state.2)?;
+                    state.0.take();
+                    Ok(())
+                },
+                |_| {
+                    candle_gen::residency::check_cancel(&req.cancel)?;
+                    self.load_vae()
+                },
+                |vae, state| self.decode_images(req, &state.1, vae, state.2),
+                || Ok(self.device.synchronize()?),
+            )?
+        } else {
+            let conditioner = candle_gen::cached(&self.conditioner, || self.load_conditioner())?;
+            let components = self.components()?;
+            let result = (|| -> Result<_> {
+                let (conditioning, pooled) = conditioner.encode(&req.prompt, negative, cfg_on)?;
+                let latents = self.denoise_images(
+                    req,
+                    &conditioning,
+                    &pooled,
+                    &components.denoise,
+                    on_progress,
+                )?;
+                self.decode_images(req, &latents, &components.vae, on_progress)
+            })();
+            candle_gen::residency::synchronize_result(&self.device, result)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }

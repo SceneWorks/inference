@@ -308,4 +308,82 @@ mod tests {
             vec!["use-a", "sync", "drop-a", "use-b", "sync", "drop-b", "use-c", "sync", "drop-c"]
         );
     }
+    #[test]
+    fn endpoint_denoise_failure_syncs_before_drop_and_never_loads_decode() {
+        let log = RefCell::new(Vec::new());
+        let result: Result<()> = run_three_stage_sequential(
+            &mut (),
+            |_| {
+                Ok(Witness {
+                    name: "drop-text",
+                    log: &log,
+                })
+            },
+            |_, _| {
+                log.borrow_mut().push("encode");
+                Ok(())
+            },
+            |_| {
+                Ok(Witness {
+                    name: "drop-unet",
+                    log: &log,
+                })
+            },
+            |_, _| {
+                log.borrow_mut().push("denoise-error");
+                Err(CandleError::Canceled)
+            },
+            |_| {
+                log.borrow_mut().push("load-decode");
+                Ok(())
+            },
+            |_, _| Ok(()),
+            || {
+                log.borrow_mut().push("sync");
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(
+            *log.borrow(),
+            [
+                "encode",
+                "sync",
+                "drop-text",
+                "denoise-error",
+                "sync",
+                "drop-unet"
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_primary_failure_survives_cleanup_failure() {
+        let log = RefCell::new(Vec::new());
+        let result: Result<()> = run_three_stage_sequential(
+            &mut (),
+            |_| {
+                Ok(Witness {
+                    name: "drop-text",
+                    log: &log,
+                })
+            },
+            |_, _| Err(CandleError::Canceled),
+            |_| {
+                panic!("denoise must not load after canceled encode");
+                #[allow(unreachable_code)]
+                Ok(())
+            },
+            |_, _| Ok(()),
+            |_| {
+                panic!("decode must not load after canceled encode");
+                #[allow(unreachable_code)]
+                Ok(())
+            },
+            |_, _| Ok(()),
+            || Err(CandleError::Msg("sync failed".into())),
+        );
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(*log.borrow(), ["drop-text"]);
+    }
 }
