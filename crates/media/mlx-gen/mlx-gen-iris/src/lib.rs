@@ -179,3 +179,7 @@ mod tests {
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

@@ -506,3 +506,7 @@ mod sc2963 {
         super::RETAINED_SILU_GLUE.with(|slot| *slot.borrow_mut() = None);
     }
 }
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

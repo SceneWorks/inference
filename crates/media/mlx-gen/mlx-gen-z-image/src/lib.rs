@@ -681,3 +681,7 @@ mod explicit_registry_tests {
         }
     }
 }
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

@@ -750,3 +750,7 @@ mod explicit_registry_tests {
 
 #[cfg(test)]
 pub(crate) mod model_inference_device;
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::IOS_ENGINEERING_FEATURES_SUPPORTED;

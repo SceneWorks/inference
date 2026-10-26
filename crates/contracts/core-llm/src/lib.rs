@@ -191,3 +191,7 @@ pub use tool::{ToolCall, ToolCallSegmenter, ToolSpec};
 
 /// The crate version, surfaced in conformance / diagnostic messages.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::IOS_ENGINEERING_FEATURES_SUPPORTED;

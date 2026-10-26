@@ -163,3 +163,7 @@ pub use transform::{
 
 #[cfg(test)]
 pub(crate) mod model_inference_device;
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

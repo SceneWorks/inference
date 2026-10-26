@@ -1,11 +1,16 @@
 //! Engineering evidence names executable sources separately from its capture commit. Evidence
 //! rows and reviewed policy data may be committed afterwards without claiming a new device run.
 //!
-//! This identity covers the supported `runtime-ios` inference composition. Cargo exposes this
-//! catalog's effective features and mlx-sys's native build metadata, not arbitrary downstream
-//! feature unification. Consumers enabling provider trainers are outside that composition.
+//! Rust TypeIds of crate-owned provider anchors bind the compiled dependency units. On the
+//! pinned Cargo/rustc toolchain their crate disambiguators include Cargo's recursive unit
+//! metadata, including features unified by downstream users of local, registry and git crates.
+//! This is a build-system identity, not a stable Rust ABI: compiler/Cargo identity is bound too,
+//! and the regression verifies transitive feature changes, rebuild and checkout stability.
+//! Native MLX artifacts remain separately bound. The catalog itself has no anchor so its
+//! capture-only permit and evidence/policy DATA do not invalidate the production closure.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 include!(concat!(env!("OUT_DIR"), "/ios_source_identity.rs"));
 
@@ -18,7 +23,7 @@ pub struct BuildIdentity {
     pub backend: String,
     pub target: String,
     pub rustc: String,
-    /// Enabled catalog features; native features are also sealed in native_mlx_fingerprint.
+    /// Enabled catalog features. Resolved dependency features are sealed in build_config_sha256.
     pub features: String,
     pub build_config_sha256: String,
     /// Hash of the actual mlx-sys manifest, archives and metallib; "unavailable" is unverified.
@@ -33,7 +38,7 @@ impl BuildIdentity {
             target: BUILD_TARGET.into(),
             rustc: BUILD_RUSTC.into(),
             features: BUILD_FEATURES.into(),
-            build_config_sha256: BUILD_CONFIG_SHA256.into(),
+            build_config_sha256: compiled_dependency_identity(),
             native_mlx_fingerprint: NATIVE_MLX_FINGERPRINT.into(),
         }
     }
@@ -66,6 +71,35 @@ impl BuildIdentity {
             && self.native_mlx_fingerprint == other.native_mlx_fingerprint
             && production_features(&self.features) == production_features(&other.features)
     }
+}
+
+fn compiled_dependency_identity() -> String {
+    if !(mlx_gen::IOS_ENGINEERING_FEATURES_SUPPORTED
+        && mlx_gen_sana::IOS_ENGINEERING_FEATURES_SUPPORTED
+        && mlx_gen_anima::IOS_ENGINEERING_FEATURES_SUPPORTED
+        && mlx_gen_iris::IOS_ENGINEERING_FEATURES_SUPPORTED
+        && mlx_gen_sdxl::IOS_ENGINEERING_FEATURES_SUPPORTED
+        && mlx_gen_z_image::IOS_ENGINEERING_FEATURES_SUPPORTED)
+    {
+        // Not a SHA256: even an identical capture cannot authorize unsupported compiled code.
+        return "unsupported-compiled-features".into();
+    }
+    use std::any::TypeId;
+    let units = [
+        TypeId::of::<mlx_gen::IosCompiledDependencyAnchor>(),
+        TypeId::of::<mlx_gen_sana::IosCompiledDependencyAnchor>(),
+        TypeId::of::<mlx_gen_anima::IosCompiledDependencyAnchor>(),
+        TypeId::of::<mlx_gen_iris::IosCompiledDependencyAnchor>(),
+        TypeId::of::<mlx_gen_sdxl::IosCompiledDependencyAnchor>(),
+        TypeId::of::<mlx_gen_z_image::IosCompiledDependencyAnchor>(),
+    ];
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("ios-compiled-dependency-units-v1\0{BUILD_CONFIG_SHA256}\0{units:?}")
+                .as_bytes()
+        )
+    )
 }
 
 #[cfg(test)]

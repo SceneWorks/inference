@@ -57,11 +57,8 @@ fn dependencies(
         return;
     };
     for (name, dependency) in table.iter() {
-        // The supported iOS graph has no optional inference dependency except its catalog,
-        // seeded explicitly below. The optional provider edges are trainers, omitted on iOS.
-        if dependency.get("optional").and_then(Item::as_bool) == Some(true) {
-            continue;
-        }
+        // Include optional source edges conservatively. Enabled trainer/test combinations are
+        // refused by the compiled-feature identity, rather than silently omitting their inputs.
         let (dependency, base) =
             if dependency.get("workspace").and_then(Item::as_bool) == Some(true) {
                 (&workspace["workspace"]["dependencies"][name], root)
@@ -104,7 +101,13 @@ fn source_closure(root: &Path) -> String {
         let manifest = directory.join("Cargo.toml");
         let parsed = document(&manifest);
         collect(&manifest, &mut files);
-        for relative in ["src", "assets", "build.rs", ".cargo/config.toml"] {
+        for relative in [
+            "src",
+            "assets",
+            "build.rs",
+            ".cargo/config.toml",
+            "source-bindings.sha256",
+        ] {
             collect(&directory.join(relative), &mut files);
         }
         for table in ["dependencies", "build-dependencies"] {
@@ -141,6 +144,7 @@ fn source_closure(root: &Path) -> String {
         "ios-host/smoke/src",
         "scripts/ios/run_smoke.sh",
         "scripts/ios/bundle_metallib.py",
+        "vendor/clip-regex/build-verify.rs",
     ] {
         let path = root.join(relative);
         assert!(path.exists(), "missing iOS execution input {relative}");
@@ -220,6 +224,14 @@ fn main() {
         .expect("rustc identity");
     assert!(output.status.success(), "rustc identity failed");
     let rustc = String::from_utf8(output.stdout).expect("UTF-8 rustc identity");
+    println!("cargo:rerun-if-env-changed=CARGO");
+    let cargo = env::var_os("CARGO").expect("Cargo executable");
+    let output = Command::new(cargo)
+        .arg("-vV")
+        .output()
+        .expect("Cargo identity");
+    assert!(output.status.success(), "Cargo identity failed");
+    let cargo = String::from_utf8(output.stdout).expect("UTF-8 Cargo identity");
     let target = env::var("TARGET").expect("Cargo target");
     let features: BTreeSet<_> = env::vars()
         .filter_map(|(key, _)| {
@@ -228,6 +240,7 @@ fn main() {
         })
         .collect();
     let mut config = BTreeMap::new();
+    config.insert("cargo_version", cargo);
     for key in [
         "PROFILE",
         "OPT_LEVEL",
