@@ -68,20 +68,29 @@ pub(crate) enum IrisAnchorReplay {
 }
 
 impl IrisAnchorReplay {
+    fn prefix(provider: &str) -> Result<&'static str> {
+        match provider {
+            "iris_3b" => Ok("iris1-"),
+            crate::ios_admission::IRIS_RESTORE_ID => Ok("iris-restore1-"),
+            crate::ios_admission::IRIS_DEPTH_ID => Ok("iris-depth1-"),
+            _ => Err(unsupported(provider)),
+        }
+    }
+
     pub(crate) fn parse(provider: &str, token: &str) -> Result<Self> {
+        Self::from_native(provider, &native_token(Self::prefix(provider)?, token)?)
+    }
+
+    fn from_native(provider: &str, token: &str) -> Result<Self> {
         Ok(match provider {
-            "iris_3b" => Self::Generation(mlx_gen_iris::ios_pricing::SamplingToken::from_token(
-                &native_token("iris1-", token)?,
-            )?),
-            crate::ios_admission::IRIS_RESTORE_ID => {
-                Self::Restoration(mlx_gen_iris::ios_pricing::RestorationToken::from_token(
-                    &native_token("iris-restore1-", token)?,
-                )?)
+            "iris_3b" => {
+                Self::Generation(mlx_gen_iris::ios_pricing::SamplingToken::from_token(token)?)
             }
+            crate::ios_admission::IRIS_RESTORE_ID => Self::Restoration(
+                mlx_gen_iris::ios_pricing::RestorationToken::from_token(token)?,
+            ),
             crate::ios_admission::IRIS_DEPTH_ID => {
-                Self::Depth(mlx_gen_iris::ios_pricing::DepthToken::from_token(
-                    &native_token("iris-depth1-", token)?,
-                )?)
+                Self::Depth(mlx_gen_iris::ios_pricing::DepthToken::from_token(token)?)
             }
             _ => return Err(unsupported(provider)),
         })
@@ -644,13 +653,17 @@ pub(crate) fn price_metadata_with_estimated_preparation(
         ),
         estimate,
     ) {
+        // The catalog SAFE token decodes into an allocating JSON payload. Guard before even
+        // decoding it, then preflight the native token before its typed JSON constructor.
+        next(estimate.bytes())?;
+        let native = native_token(IrisAnchorReplay::prefix(req.provider)?, token)?;
         mlx_gen_iris::ios_pricing::check_replay_with_estimated_preparation(
             req.provider,
-            token,
+            &native,
             estimate,
             next,
         )?;
-        let replay = IrisAnchorReplay::parse(req.provider, token)?;
+        let replay = IrisAnchorReplay::from_native(req.provider, &native)?;
         return mlx_gen_iris::ios_pricing::pricing_facts_with_estimated_preparation(
             req,
             Some(replay.as_replay()),
@@ -1062,5 +1075,102 @@ mod z_pid_work_token_tests {
             .recipe()
             .canonical_token();
         assert!(z_flow_recipe(provider, &independent_wire(&inactive, 6)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod estimated_replay_guard_tests {
+    use super::*;
+    use mlx_gen::gen_core::{
+        MemoryGeometry, MemoryMode, MemoryNumericTier, MemorySelection, MemoryStrategy,
+        MemoryStrategyParameters,
+    };
+
+    #[test]
+    fn catalog_iris_replay_guards_before_safe_decode_and_native_json_parse() {
+        let spec =
+            mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("unused-no-source-read".into()));
+        let selection = MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: MemoryStrategyParameters::default(),
+            tier: MemoryNumericTier {
+                precision: mlx_gen::gen_core::Precision::Fp32,
+                quant: None,
+                component_precision_floors: &[],
+            },
+        };
+        let execution = mlx_gen::gen_core::GenerationMemory::default();
+        let estimate = mlx_gen_iris::ios_pricing::EstimatedSourcePreparation::new(123_456_789,
+            mlx_gen_iris::ios_pricing::SourcePreparationEstimateProvenance::BeforeRequestConstructionPeakWithMargin).unwrap();
+        for (provider, prefix, native_prefix) in [
+            ("iris_3b", "iris1-", "iris-sampling-v1:"),
+            (
+                crate::IRIS_RESTORE_ID,
+                "iris-restore1-",
+                "iris-restoration-v1:",
+            ),
+            (crate::IRIS_DEPTH_ID, "iris-depth1-", "iris-depth-v1:"),
+        ] {
+            let req = mlx_gen::ios_pricing::IosPricingRequest {
+                provider,
+                spec: &spec,
+                mode: &MemoryMode::TextToImage,
+                geometry: MemoryGeometry {
+                    width: 16,
+                    height: 16,
+                    batch: 1,
+                    frames: 1,
+                    reference_count: 0,
+                },
+                selection: &selection,
+                execution: &execution,
+                token_window: 0,
+                generation: None,
+                transform: None,
+                depth: None,
+            };
+            // Invalid SAFE input would fail decoding if the envelope were checked too late.
+            let mut calls = 0;
+            let error = price_metadata_with_estimated_preparation(
+                &req,
+                "not-safe-hex",
+                0,
+                0,
+                None,
+                Some(estimate),
+                &mut |bytes| {
+                    calls += 1;
+                    assert_eq!(bytes, estimate.bytes());
+                    Err(Error::Canceled)
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::Canceled));
+            assert_eq!(calls, 1);
+            // A valid catalog wrapper with malformed native JSON reaches the native envelope
+            // before its JSON constructor; passing the catalog prefix to that helper skips it.
+            let token = safe_token(prefix, &format!("{native_prefix}{{invalid"));
+            let mut calls = 0;
+            let error = price_metadata_with_estimated_preparation(
+                &req,
+                &token,
+                0,
+                0,
+                None,
+                Some(estimate),
+                &mut |bytes| {
+                    calls += 1;
+                    assert_eq!(bytes, estimate.bytes());
+                    if calls == 2 {
+                        Err(Error::Canceled)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::Canceled));
+            assert_eq!(calls, 2);
+        }
     }
 }

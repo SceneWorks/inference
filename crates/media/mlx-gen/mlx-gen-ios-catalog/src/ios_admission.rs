@@ -1089,6 +1089,48 @@ impl PremisePolicy {
     pub fn engineering_process(&self) -> Option<&crate::engineering::EngineeringProcessModel> {
         self.engineering_process.as_ref()
     }
+    /// Resolve an approved conservative envelope before parsing model/component metadata or
+    /// constructing request carriers. Absence of an engineering model grants no empirical bound.
+    pub fn preparation_envelope(
+        &self,
+        rows: &[AnchorRow],
+        scope: crate::engineering::PreparationScope<'_>,
+    ) -> std::result::Result<Option<u64>, String> {
+        let Some(model) = self.engineering_process() else {
+            return Ok(None);
+        };
+        use crate::engineering::{
+            PROCESS_PREPARATION_PREMISE_ID, PROCESS_PRESSURE_PREMISE_ID,
+            PROCESS_RESIDUAL_PREMISE_ID,
+        };
+        for id in [
+            PROCESS_PREPARATION_PREMISE_ID,
+            PROCESS_PRESSURE_PREMISE_ID,
+            PROCESS_RESIDUAL_PREMISE_ID,
+        ] {
+            if !self.approved.contains(id) {
+                return Err(format!(
+                    "engineering source preparation has unapproved premise {id}"
+                ));
+            }
+        }
+        let mut envelope = None;
+        for row in rows.iter().filter(|row| {
+            row.anchor_kind == AnchorKind::Optimized
+                && row.key.machine == scope.machine
+                && row.key.provider == scope.provider
+                && row.key.route == scope.route
+                && row.key.mode == scope.mode
+                && row.key.tier == scope.tier
+        }) {
+            let bytes = model.preparation_estimate(row)?;
+            envelope = Some(envelope.map_or(bytes, |old: u64| old.max(bytes)));
+        }
+        envelope.map(Some).ok_or_else(|| {
+            "no scoped optimized source-preparation capture exists before source inspection".into()
+        })
+    }
+
     fn approved_native_to_process(&self) -> Option<&IosNativeToProcessModel> {
         self.native_to_process
             .as_ref()
@@ -1249,6 +1291,16 @@ fn anchor_context<'row>(
     registry: &ProviderRegistry,
     candidate: &IosCandidate,
     row: &'row AnchorRow,
+    next: Option<KeyCapacity<'_>>,
+) -> AdmissionResult<AnchorContext<'row>> {
+    anchor_context_with_spec(registry, candidate, &candidate.spec, row, next)
+}
+
+fn anchor_context_with_spec<'row>(
+    registry: &ProviderRegistry,
+    candidate: &IosCandidate,
+    pricing_spec: &LoadSpec,
+    row: &'row AnchorRow,
     mut next: Option<KeyCapacity<'_>>,
 ) -> AdmissionResult<AnchorContext<'row>> {
     let (Some(strategy), Some(parameters)) = (row.selection.strategy(), row.selection.parameters())
@@ -1276,9 +1328,9 @@ fn anchor_context<'row>(
     };
     let mut spec = match next.as_mut() {
         Some(next) => with_source_inventory_capacity(&mut **next, |core_next| {
-            candidate.spec.clone_with_capacity(core_next)
+            pricing_spec.clone_with_capacity(core_next)
         })?,
-        None => candidate.spec.clone(),
+        None => pricing_spec.clone(),
     };
     // This override copies only the two load-form enums; it allocates nothing.
     // Re-price the anchor's actual load, not the requesting endpoint's load form.
@@ -1286,10 +1338,12 @@ fn anchor_context<'row>(
     // Retain the actual matched configured graph, including Control+Reference/IP combinations.
     // Family identity carries normalized overlay semantics; mode-name stripping would silently
     // change the load and defeat the provider's real init/IP interpretation.
-    spec.resolved_route = Some(match next.as_mut() {
-        Some(next) => source_string_clone(&row.key.route, Some(&mut **next))?,
-        None => row.key.route.clone(),
-    });
+    if provider == crate::sdxl::SDXL_ID {
+        spec.resolved_route = Some(match next.as_mut() {
+            Some(next) => source_string_clone(&row.key.route, Some(&mut **next))?,
+            None => row.key.route.clone(),
+        });
+    }
     let contract = registry
         .memory_strategy_contract(provider, &spec)?
         .ok_or_else(|| no_evidence(format!("{provider}: no memory contract")))?;
@@ -1374,19 +1428,22 @@ fn price_anchor_using_source_capacity<'row>(
     row: &'row AnchorRow,
     next: Option<KeyCapacity<'_>>,
 ) -> AdmissionResult<(AnchorContext<'row>, IosPricing)> {
-    price_anchor_using_estimated_preparation(registry, candidate, row, next, None)
+    price_anchor_using_estimated_preparation(registry, candidate, &candidate.spec, row, next, None)
 }
 
 fn price_anchor_using_estimated_preparation<'row>(
     registry: &ProviderRegistry,
     candidate: &IosCandidate,
+    pricing_spec: &LoadSpec,
     row: &'row AnchorRow,
     mut next: Option<KeyCapacity<'_>>,
     estimate: Option<mlx_gen_iris::ios_pricing::EstimatedSourcePreparation>,
 ) -> AdmissionResult<(AnchorContext<'row>, IosPricing)> {
     let context = match next.as_mut() {
-        Some(next) => anchor_context(registry, candidate, row, Some(&mut **next))?,
-        None => anchor_context(registry, candidate, row, None)?,
+        Some(next) => {
+            anchor_context_with_spec(registry, candidate, pricing_spec, row, Some(&mut **next))?
+        }
+        None => anchor_context_with_spec(registry, candidate, pricing_spec, row, None)?,
     };
     let mut pricing = match next {
         Some(next) => with_source_metadata_capacity(next, |next| {
@@ -1669,12 +1726,20 @@ fn anchored_demand(
     Calibration,
     Vec<IosCertificatePremise>,
 )> {
-    anchored_demand_using_source_capacity(registry, candidate, contract, key, rows, evidence, None)
+    anchored_demand_using_source_capacity(
+        registry,
+        (candidate, &candidate.spec),
+        contract,
+        key,
+        rows,
+        evidence,
+        None,
+    )
 }
 
 fn anchored_demand_using_source_capacity(
     registry: &ProviderRegistry,
-    candidate: &IosCandidate,
+    priced_candidate: (&IosCandidate, &LoadSpec),
     contract: &MemoryProviderContract,
     key: &EvidenceKey,
     rows: &[AnchorRow],
@@ -1687,12 +1752,16 @@ fn anchored_demand_using_source_capacity(
     Calibration,
     Vec<IosCertificatePremise>,
 )> {
+    let (candidate, pricing_spec) = priced_candidate;
     let AdmissionEvidence {
         request_baseline,
         execution_facts,
         premise_policy,
     } = evidence;
     if let Some(row) = evidence::lookup(rows, key) {
+        if let Some(model) = premise_policy.engineering_process() {
+            model.validate_row(row).map_err(no_evidence)?;
+        }
         return match &row.outcome {
             evidence::AnchorOutcome::Completed { .. } => {
                 let baseline = request_baseline.ok_or_else(|| no_evidence(
@@ -1784,7 +1853,7 @@ fn anchored_demand_using_source_capacity(
     };
     let request_context = IosPricingRequest {
         provider: &candidate.provider,
-        spec: &candidate.spec,
+        spec: pricing_spec,
         mode: &candidate.context.mode,
         geometry: candidate.context.geometry,
         selection: &candidate.context.selection,
@@ -1906,6 +1975,7 @@ fn anchored_demand_using_source_capacity(
             Some(next) => price_anchor_using_estimated_preparation(
                 registry,
                 candidate,
+                pricing_spec,
                 optimized,
                 Some(&mut **next),
                 engineering_preparation,
@@ -1913,6 +1983,7 @@ fn anchored_demand_using_source_capacity(
             None => price_anchor_using_estimated_preparation(
                 registry,
                 candidate,
+                pricing_spec,
                 optimized,
                 None,
                 engineering_preparation,
@@ -1930,6 +2001,7 @@ fn anchored_demand_using_source_capacity(
                     price_anchor_using_estimated_preparation(
                         registry,
                         candidate,
+                        pricing_spec,
                         resident,
                         Some(&mut **next),
                         engineering_preparation,
@@ -1940,6 +2012,7 @@ fn anchored_demand_using_source_capacity(
                     price_anchor_using_estimated_preparation(
                         registry,
                         candidate,
+                        pricing_spec,
                         resident,
                         None,
                         engineering_preparation,
@@ -2241,49 +2314,30 @@ fn admit_one_using_key_capacity(
             ));
         }
     }
-    if let (Some(model), Some(rows)) = (evidence.premise_policy.engineering_process(), rows) {
-        use crate::engineering::{
-            PROCESS_PREPARATION_PREMISE_ID, PROCESS_PRESSURE_PREMISE_ID,
-            PROCESS_RESIDUAL_PREMISE_ID,
-        };
-        for id in [
-            PROCESS_PREPARATION_PREMISE_ID,
-            PROCESS_PRESSURE_PREMISE_ID,
-            PROCESS_RESIDUAL_PREMISE_ID,
-        ] {
-            if !evidence.premise_policy.approved.contains(id) {
-                return Err(no_evidence(format!(
-                    "engineering source preparation has unapproved premise {id}"
-                )));
-            }
-        }
-        let mut envelope = None;
-        for row in rows.iter().filter(|row| {
-            row.anchor_kind == AnchorKind::Optimized
-                && row.key.machine == machine
-                && row.key.provider == candidate.provider
-                && row.key.route == route
-                && row.key.mode == candidate.context.mode.as_key()
-                && row.key.tier == tier_label(&candidate.spec)
-        }) {
-            let bytes = model.preparation_estimate(row).map_err(no_evidence)?;
-            envelope = Some(envelope.map_or(bytes, |old: u64| old.max(bytes)));
-        }
-        let bytes = envelope.ok_or_else(|| {
-            no_evidence(
-                "no scoped optimized source-preparation capture exists before source inspection"
-                    .into(),
+    if let Some(rows) = rows {
+        let tier = tier_label(&candidate.spec);
+        if let Some(bytes) = evidence
+            .premise_policy
+            .preparation_envelope(
+                rows,
+                crate::engineering::PreparationScope {
+                    machine,
+                    provider: &candidate.provider,
+                    route: &route,
+                    mode: candidate.context.mode.as_key(),
+                    tier: &tier,
+                },
             )
-        })?;
-        let Some(next) = next.as_mut() else {
-            return Err(no_evidence(
-                "engineering estimate requires the actual source-preparation capacity callback"
-                    .into(),
-            ));
-        };
-        with_source_metadata_capacity(&mut **next, |next| next(bytes))?;
-        // This is an approved empirical preparation check, not a parser/HOST allocation proof.
-        // Existing source verification and the same read_unchanged callback remain below.
+            .map_err(no_evidence)?
+        {
+            let Some(next) = next.as_mut() else {
+                return Err(no_evidence(
+                    "engineering estimate requires the actual source-preparation capacity callback"
+                        .into(),
+                ));
+            };
+            with_source_metadata_capacity(&mut **next, |next| next(bytes))?;
+        }
     }
     let fresh_source;
     let guard = if let Some(source) = candidate.spec.source_inventory() {
@@ -2306,6 +2360,25 @@ fn admit_one_using_key_capacity(
     // One inner body; the outer wrapper supplies guarded before/after source checks
     // for the real SDK/capture path and preserves native legacy semantics separately.
     let consume = |mut next: Option<KeyCapacity<'_>>| -> AdmissionResult<Admission> {
+        // The actual full Clone and inventory binding are behind their own
+        // finite requested-layout laws, not a preflight followed by unchecked
+        // copies. Keep the SAME mutable capacity callback for every owner.
+        let mut spec = match next.as_mut() {
+            Some(next) => with_source_inventory_capacity(&mut **next, |core_next| {
+                candidate.spec.clone_with_capacity(core_next)
+            })?,
+            None => candidate.spec.clone(),
+        };
+        if spec.source_inventory().is_none() {
+            match next.as_mut() {
+                Some(next) => with_source_inventory_capacity(&mut **next, |core_next| {
+                    let source = guard.clone_with_capacity(core_next)?;
+                    spec.bind_source_inventory_with_capacity(source, core_next)
+                })?,
+                None => spec.bind_source_inventory((*guard).clone())?,
+            }
+        }
+        // The retained inventory is bound before request AND endpoint metadata pricing.
         // Reborrow the SAME callback for the key, retaining it for both guarded
         // request/anchor repricings below. Never spend it with Option::map.
         let mut key = match next.as_mut() {
@@ -2402,7 +2475,7 @@ fn admit_one_using_key_capacity(
             Some(rows) => match next.as_mut() {
                 Some(next) => anchored_demand_using_source_capacity(
                     registry,
-                    candidate,
+                    (candidate, &spec),
                     &contract,
                     &key,
                     rows,
@@ -2447,24 +2520,6 @@ fn admit_one_using_key_capacity(
                 }
                 None => "ios-capture-permit:no-evidence-row".into(),
             };
-        }
-        // The actual full Clone and inventory binding are behind their own
-        // finite requested-layout laws, not a preflight followed by unchecked
-        // copies. Keep the SAME mutable capacity callback for every owner.
-        let mut spec = match next.as_mut() {
-            Some(next) => with_source_inventory_capacity(&mut **next, |core_next| {
-                candidate.spec.clone_with_capacity(core_next)
-            })?,
-            None => candidate.spec.clone(),
-        };
-        if spec.source_inventory().is_none() {
-            match next.as_mut() {
-                Some(next) => with_source_inventory_capacity(&mut **next, |core_next| {
-                    let source = guard.clone_with_capacity(core_next)?;
-                    spec.bind_source_inventory_with_capacity(source, core_next)
-                })?,
-                None => spec.bind_source_inventory((*guard).clone())?,
-            }
         }
         let provider = match next.as_mut() {
             Some(next) => source_string_clone(&candidate.provider, Some(&mut **next))?,

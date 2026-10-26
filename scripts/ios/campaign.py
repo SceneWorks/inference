@@ -603,8 +603,31 @@ def conditioning_roles_of(key):
     return roles
 
 
+def execution_identity_of(row):
+    """Validate the emitted executable identity without rewriting original capture provenance."""
+    identity, os_build = row.get("build_identity"), row.get("os_build")
+    fields = {"source_closure_sha256", "backend", "target", "rustc", "features",
+              "build_config_sha256", "native_mlx_fingerprint"}
+    if not isinstance(identity, dict) or set(identity) != fields:
+        return None
+    if not all(isinstance(value, str) for value in identity.values()):
+        return None
+    for name in ("source_closure_sha256", "build_config_sha256", "native_mlx_fingerprint"):
+        value = identity[name]
+        if len(value) != 64 or any(c not in "0123456789abcdefABCDEF" for c in value):
+            return None
+    if identity["backend"] != "mlx" or not identity["target"] or not identity["rustc"]:
+        return None
+    if not isinstance(os_build, str) or not os_build:
+        return None
+    return {"build_identity": dict(identity), "os_build": os_build}
+
+
 def capture_of(r):
     """A completed capture with full device telemetry, as a schema-3 `Capture`, else None."""
+    identity = execution_identity_of(r)
+    if identity is None:
+        return None
     peak = r.get("kernel_lifetime_phys_footprint_peak_bytes")
     baseline = r.get("baseline_phys_footprint_bytes")
     if r.get("status") != "diagnostic_success" or r.get("evidence_class") != "capture" or not isinstance(r.get("evidence_key"), dict):
@@ -680,7 +703,7 @@ def capture_of(r):
             quanta[label] = {"priced_scratch_bytes": q["priced_scratch_bytes"], "observed_bytes": q["observed_bytes"], "exact": q["exact"]}
             if context is not None:
                 quanta[label]["preceding_sampling_mark"] = context
-    return {"run_id": str(r.get("run_id") or ""), "build_sha": str(r.get("build_sha") or ""), "steps": steps,
+    return {"run_id": str(r.get("run_id") or ""), "build_sha": str(r.get("build_sha") or ""), **identity, "steps": steps,
             "baseline_footprint_bytes": baseline, "footprint_bytes": peak, "phase_peaks": phases, "sampling_coverage": coverage, "quanta": quanta,
             **snapshots, "observed_current_peak_bytes": r["observed_current_peak_bytes"],
             "observed_model_current_peak_bytes": r["observed_model_current_peak_bytes"],
@@ -708,7 +731,8 @@ def anchor_rows(rows):
             problems.append(f"{purpose} {group[0]['case']}: no anchor selection recorded")
             continue
         completed = [c for c in map(capture_of, group) if c and c["run_id"] and c["build_sha"] and c["steps"] >= 1]
-        refused = [r for r in group if r.get("status") == "capture_refused" and isinstance(r.get("refused_quantum"), dict)]
+        refused = [r for r in group if r.get("status") == "capture_refused" and isinstance(r.get("refused_quantum"), dict)
+                   and execution_identity_of(r) is not None and r.get("run_id") and r.get("build_sha")]
         base = {"key": json.loads(key), "anchor_kind": purpose, "selection": selection, "evidence_class": "device_capture"}
         if completed:
             if purpose == "optimized" and len(completed) < OPTIMIZED_REPEATS:
@@ -717,7 +741,7 @@ def anchor_rows(rows):
             anchors.append(dict(base, outcome={"completed": {"captures": completed}}))
         elif refused and purpose == "resident":
             q = refused[0]["refused_quantum"]
-            anchors.append(dict(base, outcome={"refused": {"refused_quantum": {"label": str(q.get("label")), "scratch_bytes": int(q.get("scratch_bytes") or 0), "reserve_bytes": int(q.get("reserve_bytes") or 0), "available_bytes": q.get("available_bytes")}, "run_id": str(refused[0].get("run_id") or ""), "build_sha": str(refused[0].get("build_sha") or "")}}))
+            anchors.append(dict(base, outcome={"refused": {"refused_quantum": {"label": str(q.get("label")), "scratch_bytes": int(q.get("scratch_bytes") or 0), "reserve_bytes": int(q.get("reserve_bytes") or 0), "available_bytes": q.get("available_bytes")}, "run_id": str(refused[0].get("run_id") or ""), "build_sha": str(refused[0].get("build_sha") or ""), **execution_identity_of(refused[0])}}))
         else:
             problems.append(f"{purpose} {group[0]['case']}: no completed capture" + (" (DEFECT: the fully optimized anchor must fit)" if purpose == "optimized" else ""))
     return anchors, problems

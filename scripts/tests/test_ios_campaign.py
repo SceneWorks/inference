@@ -330,8 +330,16 @@ class CampaignTests(unittest.TestCase):
         row["evidence_revision"] = "no-device-capture"
         self.assertIn("Capacity-refused next-up probes: []", campaign.render([row]))
 
+    @staticmethod
+    def execution_identity():
+        # Synthetic ABI receipt, never device acceptance evidence.
+        return {"build_identity": {"source_closure_sha256": "1" * 64, "backend": "mlx",
+                "target": "aarch64-apple-ios", "rustc": "fixture-rustc", "features": "device-capture",
+                "build_config_sha256": "2" * 64, "native_mlx_fingerprint": "3" * 64},
+                "os_build": "fixture-os"}
+
     def capture_row(self, key, status):
-        row = dict(self.success(key), status=status, production_success=False, diagnostic=True, evidence_class="capture",
+        row = dict(self.success(key), **self.execution_identity(), status=status, production_success=False, diagnostic=True, evidence_class="capture",
                    evidence_key={"machine": "iPhone17,2", "provider": "fake", "execution": key.split("/")[5],
                                  "reference_count": 0, "mask_count": 0, "control_count": 0}, run_id="fixture-run",
                    baseline_phys_footprint_bytes=40, steps=int(key.split("/")[7]) or 16,  # Synthetic resolved default, not the CLI0 sentinel.
@@ -351,6 +359,42 @@ class CampaignTests(unittest.TestCase):
         if status == "capture_refused":
             row.update(refusal_kind="capacity", refused_quantum={"label": "SANA block", "scratch_bytes": 9, "reserve_bytes": 1, "available_bytes": 3})
         return row
+
+    def test_admitted_campaign_guards_reviewed_preparation_before_prelude(self):
+        source = (MODULE.parents[1].parent / "ios-host/smoke/src/campaign_media.rs").read_text()
+        body = source[source.index("impl Provider for DeviceProvider"):]
+        prelude = body.index("self.prepare_for_programme(c, diagnostic)?")
+        guarded = body[:prelude]
+        self.assertIn("admission_policy()", guarded)
+        self.assertIn("rows_with_source_capacity", guarded)
+        self.assertIn(".preparation_envelope(", guarded)
+        self.assertIn("source_metadata_capacity(bytes)", guarded)
+        self.assertIn("if !diagnostic && premise_policy.engineering_process().is_some()", guarded)
+
+    def test_anchor_receipts_roundtrip_execution_identity_and_original_capture_sha(self):
+        rows = [dict(self.capture_row(self.keys[1], "diagnostic_success"), purpose="optimized", run_id=run,
+                     build_sha="original-captured-commit") for run in ("one", "two")]
+        rows.append(dict(self.capture_row(self.keys[0], "capture_refused"), purpose="resident",
+                         build_sha="original-resident-commit"))
+        anchors, problems = campaign.anchor_rows(json.loads(json.dumps(rows)))
+        self.assertEqual(problems, [])
+        self.assertEqual(len(anchors), 2)
+        for anchor in json.loads(json.dumps(anchors)):
+            outcome = anchor["outcome"]
+            records = outcome["completed"]["captures"] if "completed" in outcome else [outcome["refused"]]
+            for record in records:
+                self.assertEqual(record["build_identity"], self.execution_identity()["build_identity"])
+                self.assertEqual(record["os_build"], "fixture-os")
+                self.assertEqual(record["build_sha"], "original-captured-commit" if "completed" in outcome else "original-resident-commit")
+        for field in ("build_identity", "os_build"):
+            for source in (rows[0], rows[-1]):
+                malformed = dict(source)
+                malformed.pop(field)
+                anchors, problems = campaign.anchor_rows([malformed])
+                self.assertEqual(anchors, [])
+                self.assertTrue(problems)
+        invalid = dict(rows[0], build_identity=dict(rows[0]["build_identity"], native_mlx_fingerprint="unavailable"))
+        self.assertIsNone(campaign.capture_of(invalid))
 
     def test_capture_runs_exactly_the_listed_anchor_cases_with_their_repeats(self):
         calls = []
@@ -576,7 +620,7 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(set(optimized), {"key", "anchor_kind", "selection", "outcome", "evidence_class"})
         captures = optimized["outcome"]["completed"]["captures"]
         self.assertEqual([c["run_id"] for c in captures], ["a", "b", "c"])
-        self.assertEqual(set(captures[0]), {"run_id", "build_sha", "steps", "baseline_footprint_bytes", "footprint_bytes", "phase_peaks", "sampling_coverage", "quanta", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds",
+        self.assertEqual(set(captures[0]), {"run_id", "build_sha", "build_identity", "os_build", "steps", "baseline_footprint_bytes", "footprint_bytes", "phase_peaks", "sampling_coverage", "quanta", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds",
                          "before_request_snapshot", "before_model_load_snapshot", "ending_snapshot", "observed_current_peak_bytes", "observed_model_current_peak_bytes",
                          "valid_kernel_queries", "valid_model_kernel_queries", "quantum_coverage", "quantum_query_gaps"})
         self.assertEqual((captures[2]["footprint_bytes"], captures[2]["baseline_footprint_bytes"]), (170, 40))
@@ -751,7 +795,7 @@ class SourceContextWireTests(unittest.TestCase):
                 "reference_index": None, "mask": None,
                 "controls": [{"source_index": 0, "image": {"width": 7, "height": 3, "buffer_bytes": 62}}]}}}
         # Refused-fixture wire only, not fabricated completed native evidence or a valid digest.
-        row = {"purpose": "resident", "case": "source-wire-fixture", "evidence_key": key,
+        row = {**CampaignTests.execution_identity(), "purpose": "resident", "case": "source-wire-fixture", "evidence_key": key,
             "anchor_selection": {"rung": 0}, "status": "capture_refused",
             "refused_quantum": {"label": "fixture", "scratch_bytes": 1, "reserve_bytes": 0, "available_bytes": 0},
             "run_id": "fixture", "build_sha": "a" * 40}

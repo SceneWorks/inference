@@ -22,6 +22,17 @@ pub struct EngineeringProcessModel {
     pub approval_reference: String,
 }
 
+/// Identity known before component manifests, recipes or carriers are constructed. Preparation
+/// uses the largest reviewed upper in this route/tier/mode, never a guessed configured graph.
+#[derive(Clone, Copy, Debug)]
+pub struct PreparationScope<'a> {
+    pub machine: &'a str,
+    pub provider: &'a str,
+    pub route: &'a str,
+    pub mode: &'a str,
+    pub tier: &'a str,
+}
+
 /// Explicit harness/product configuration. Listing premise IDs records approval; carrying a
 /// model by itself never activates it. This is optional, with no environment-dependent default.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +92,7 @@ impl EngineeringProcessModel {
         Ok(())
     }
 
-    fn validate_row(&self, row: &AnchorRow) -> Result<(), String> {
+    pub(crate) fn validate_row(&self, row: &AnchorRow) -> Result<(), String> {
         if row.key.machine != self.machine {
             return Err("engineering estimate has a foreign hardware anchor".into());
         }
@@ -394,6 +405,28 @@ mod tests {
             .engineering_process()
             .is_none());
         assert!(policy_from_json("{}").is_err());
+    }
+
+    /// Source-only validation after reviewed DATA is filled. Device compatibility is checked
+    /// again by the actual SDK/campaign runtime; this host test never relabels a phone receipt.
+    #[test]
+    fn reviewed_policy_and_anchor_receipts_have_matching_scope() {
+        let policy = reviewed_policy().unwrap();
+        let rows = crate::evidence::rows().unwrap();
+        if let Some(model) = policy.engineering_process() {
+            let mut matching = 0;
+            for row in rows.iter().filter(|row| row.key.machine == model.machine) {
+                model.validate_row(row).unwrap();
+                matching += 1;
+                if row.anchor_kind == crate::evidence::AnchorKind::Optimized {
+                    model.preparation_estimate(row).unwrap();
+                }
+            }
+            assert!(
+                matching > 0,
+                "reviewed engineering policy requires actual scoped receipts"
+            );
+        }
     }
 
     #[test]

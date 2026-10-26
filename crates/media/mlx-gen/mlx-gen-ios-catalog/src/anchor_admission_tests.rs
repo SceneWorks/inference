@@ -1582,3 +1582,268 @@ fn engineering_estimate_preserves_refused_resident_and_unknown_host_provenance()
         })
     });
 }
+
+/// Public file-backed candidates arrive unbound; admission must retain the guarded inventory
+/// before the real Iris request and optimized-anchor metadata pricers consume it.
+#[test]
+fn engineering_unbound_iris_candidates_reach_real_metadata_pricing() {
+    use mlx_gen::gen_core::{Image, WeightsSource};
+    let registry = crate::provider_registry().unwrap();
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mlx-gen-iris/tests/fixtures");
+    for (provider, directory) in [
+        ("iris_3b", "tiny-snapshot/iris"),
+        (IRIS_RESTORE_ID, "tiny-snapshot/upscaler"),
+        (IRIS_DEPTH_ID, "tiny-depth"),
+    ] {
+        let mut source = LoadSpec::new(WeightsSource::Dir(fixtures.join(directory)));
+        if provider == "iris_3b" {
+            source.components.insert(
+                "text_encoder".into(),
+                WeightsSource::Dir(fixtures.join("tiny-snapshot/text_encoder")),
+            );
+        }
+        let work = |edge| {
+            let image = || Image {
+                width: edge,
+                height: edge,
+                pixels: vec![0; (edge * edge * 3) as usize],
+            };
+            match provider {
+                IRIS_RESTORE_ID => IosWork::Restore(mlx_gen::gen_core::TransformRequest {
+                    image: image(),
+                    ..Default::default()
+                }),
+                IRIS_DEPTH_ID => IosWork::Depth(mlx_gen::gen_core::iris::depth::DepthRequest {
+                    image: image(),
+                    ..Default::default()
+                }),
+                _ => IosWork::Generate(GenerationRequest {
+                    prompt: "host metadata".into(),
+                    width: edge,
+                    height: edge,
+                    steps: Some(1),
+                    guidance: Some(1.0),
+                    ..Default::default()
+                }),
+            }
+        };
+        let opt_spec = configured_load_form(
+            &registry,
+            provider,
+            &source,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap();
+        let opt = build_candidate(
+            &registry,
+            provider,
+            opt_spec,
+            None,
+            MemoryStrategy::BoundedTransformerResidency,
+            work(16),
+        )
+        .unwrap();
+        let resident = build_candidate(
+            &registry,
+            provider,
+            source.clone(),
+            None,
+            MemoryStrategy::Resident,
+            work(16),
+        )
+        .unwrap();
+        let request = build_candidate(
+            &registry,
+            provider,
+            source,
+            None,
+            MemoryStrategy::Resident,
+            work(32),
+        )
+        .unwrap();
+        assert!(request.spec.source_inventory().is_none());
+        let mut optimized = evidence::fixture::completed(
+            crate::source_work::fixture_key(&registry, &opt, DEVICE),
+            AnchorKind::Optimized,
+            AnchorSelection::from_parts(
+                opt.context.selection.strategy,
+                &opt.context.selection.parameters,
+            ),
+            16 * MIB,
+        );
+        optimized = engineering_source(optimized);
+        let resident = AnchorRow {
+            key: crate::source_work::fixture_key(&registry, &resident, DEVICE),
+            anchor_kind: AnchorKind::Resident,
+            selection: AnchorSelection::from_parts(
+                resident.context.selection.strategy,
+                &resident.context.selection.parameters,
+            ),
+            outcome: AnchorOutcome::Refused {
+                refused_quantum: RefusedQuantum {
+                    label: "synthetic resident provenance".into(),
+                    scratch_bytes: 1,
+                    reserve_bytes: 0,
+                    available_bytes: Some(0),
+                },
+                run_id: "synthetic-resident".into(),
+                build_sha: "a".repeat(40),
+                build_identity: Some(Box::new(crate::engineering::test_identity())),
+                os_build: Some("fixture-os".into()),
+            },
+            evidence_class: DEVICE_CAPTURE_CLASS.into(),
+        };
+        let rows = [optimized, resident];
+        evidence::validate_rows(&rows).unwrap();
+        // No test-pricing override: tokenizer/config/header source pricing and replay are real.
+        let admission =
+            admit_under_engineering(&registry, &request, 4096, &rows, &engineering_policy())
+                .unwrap_or_else(|error| panic!("{provider}: {error}"));
+        assert_eq!(admission.basis(), AdmissionBasis::EngineeringEstimate);
+        assert!(admission.spec.source_inventory().is_some());
+        assert!(request.spec.source_inventory().is_none());
+    }
+}
+
+#[test]
+fn engineering_exact_resident_rejects_missing_or_foreign_execution_receipts() {
+    let registry = crate::provider_registry().unwrap();
+    let root = fixture();
+    let opt = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::BoundedDecode,
+        "text_to_image",
+    );
+    let res = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::Resident,
+        "text_to_image",
+    );
+    let optimized = engineering_source(optimized_anchor(&registry, &opt));
+    let resident = engineering_source(resident_anchor(&registry, &res, 3100));
+    priced(|| {
+        for missing in [false, true] {
+            for refused in [false, true] {
+                let mut row = resident.clone();
+                if refused {
+                    row.outcome = AnchorOutcome::Refused {
+                        refused_quantum: RefusedQuantum {
+                            label: "synthetic".into(),
+                            scratch_bytes: 1,
+                            reserve_bytes: 0,
+                            available_bytes: Some(0),
+                        },
+                        run_id: "synthetic".into(),
+                        build_sha: "a".repeat(40),
+                        build_identity: Some(Box::new(crate::engineering::test_identity())),
+                        os_build: Some("fixture-os".into()),
+                    };
+                }
+                match &mut row.outcome {
+                    AnchorOutcome::Completed { captures } => {
+                        for capture in captures {
+                            if missing {
+                                capture.build_identity = None;
+                            } else {
+                                capture.os_build = Some("foreign-os".into());
+                            }
+                        }
+                    }
+                    AnchorOutcome::Refused {
+                        build_identity,
+                        os_build,
+                        ..
+                    } => {
+                        if missing {
+                            *build_identity = None;
+                        } else {
+                            *os_build = Some("foreign-os".into());
+                        }
+                    }
+                }
+                let rows = [optimized.clone(), row];
+                let result =
+                    admit_under_engineering(&registry, &res, 8192, &rows, &engineering_policy());
+                assert!(no_evidence_reason(result).contains("source/native identity"));
+            }
+        }
+    });
+}
+
+#[test]
+fn engineering_preparation_preflight_uses_conservative_reviewed_route_tier_scope() {
+    let registry = crate::provider_registry().unwrap();
+    let root = fixture();
+    let opt = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::BoundedDecode,
+        "text_to_image",
+    );
+    let first = engineering_source(optimized_anchor(&registry, &opt));
+    let mut larger_preparation = first.clone();
+    // A distinct synthetic configured graph shares only the pre-parser route/tier scope.
+    larger_preparation.key.configured_variant_sha256 = Some("f".repeat(64));
+    if let AnchorOutcome::Completed { captures } = &mut larger_preparation.outcome {
+        for capture in captures {
+            let snapshot = capture.before_model_load_snapshot.as_mut().unwrap();
+            snapshot.current_bytes = Some(500 * MIB);
+            snapshot.lifetime_peak_bytes = Some(500 * MIB);
+        }
+    }
+    let rows = [first, larger_preparation];
+    evidence::validate_rows(&rows).unwrap();
+    let scope = crate::engineering::PreparationScope {
+        machine: DEVICE,
+        provider: &rows[0].key.provider,
+        route: &rows[0].key.route,
+        mode: &rows[0].key.mode,
+        tier: &rows[0].key.tier,
+    };
+    let policy = engineering_policy();
+    let expected = policy
+        .engineering_process()
+        .unwrap()
+        .preparation_estimate(&rows[1])
+        .unwrap();
+    assert_eq!(
+        policy.preparation_envelope(&rows, scope).unwrap(),
+        Some(expected)
+    );
+    assert!(policy
+        .preparation_envelope(
+            &rows,
+            crate::engineering::PreparationScope {
+                route: "different-route",
+                ..scope
+            }
+        )
+        .is_err());
+    assert!(policy
+        .preparation_envelope(
+            &rows,
+            crate::engineering::PreparationScope {
+                tier: "different-tier",
+                ..scope
+            }
+        )
+        .is_err());
+    let unapproved = PremisePolicy::default()
+        .with_engineering_process(policy.engineering_process().unwrap().clone());
+    assert!(unapproved
+        .preparation_envelope(&rows, scope)
+        .unwrap_err()
+        .contains("unapproved premise"));
+    assert_eq!(
+        PremisePolicy::default()
+            .preparation_envelope(&rows, scope)
+            .unwrap(),
+        None
+    );
+}

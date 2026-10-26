@@ -1668,6 +1668,68 @@ impl Provider for DeviceProvider<'_> {
                 ),
             )
         })?;
+        // Admitted preparation includes component/adapter parsing and recipe/carrier/key
+        // construction. Resolve its conservative reviewed envelope BEFORE that prelude.
+        let premise_policy = runtime_ios::media::admission_policy()
+            .map_err(|error| classify(&mut self.refusal_kind, error))?;
+        if !diagnostic && premise_policy.engineering_process().is_some() {
+            let capacity_refused = std::cell::Cell::new(false);
+            let mut next = |bytes| {
+                runtime_ios::media::source_metadata_capacity(bytes).map_err(|error| {
+                    capacity_refused.set(true);
+                    error.into()
+                })
+            };
+            let rows = runtime_ios::media::evidence::rows_with_source_capacity(&mut next).map_err(
+                |reason| {
+                    classify(
+                        &mut self.refusal_kind,
+                        runtime_ios::media::AdmissionError::refused(
+                            if capacity_refused.get() {
+                                runtime_ios::media::RefusalKind::Capacity
+                            } else {
+                                runtime_ios::media::RefusalKind::NoEvidence
+                            },
+                            reason,
+                        ),
+                    )
+                },
+            )?;
+            let bytes = premise_policy
+                .preparation_envelope(
+                    rows,
+                    runtime_ios::media::engineering::PreparationScope {
+                        machine: &runtime_ios::device_machine(),
+                        provider: &c.provider,
+                        route: &c.route,
+                        mode: if runtime_ios::media::control_required(&c.provider) {
+                            "control"
+                        } else {
+                            mode_key(&c.mode)
+                        },
+                        tier: &c.tier,
+                    },
+                )
+                .map_err(|reason| {
+                    classify(
+                        &mut self.refusal_kind,
+                        runtime_ios::media::AdmissionError::refused(
+                            runtime_ios::media::RefusalKind::NoEvidence,
+                            reason,
+                        ),
+                    )
+                })?
+                .ok_or("engineering source preparation has no envelope")?;
+            runtime_ios::media::source_metadata_capacity(bytes).map_err(|error| {
+                classify(
+                    &mut self.refusal_kind,
+                    runtime_ios::media::AdmissionError::refused(
+                        runtime_ios::media::RefusalKind::Capacity,
+                        error.to_string(),
+                    ),
+                )
+            })?;
+        }
         self.prepare_for_programme(c, diagnostic)?;
         // Provenance storage exists before the real counter boundary. Both capture ledger and
         // SDK sidecar use THIS query, not a second arbitrarily timed footprint or budget guess.
@@ -1744,8 +1806,7 @@ impl Provider for DeviceProvider<'_> {
         );
         let facts = runtime_ios::media::execution_facts(Some(callbacks))
             .map_err(|e| classify(&mut self.refusal_kind, e))?;
-        let premise_policy = runtime_ios::media::admission_policy()
-            .map_err(|error| classify(&mut self.refusal_kind, error))?;
+
         let mut source_next =
             |bytes| runtime_ios::media::source_metadata_capacity(bytes).map_err(Into::into);
         if diagnostic {
