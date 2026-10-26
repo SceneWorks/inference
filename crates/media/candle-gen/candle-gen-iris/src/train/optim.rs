@@ -458,13 +458,29 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
 
-    /// The quintic leaves singular values in roughly [0.7, 1.2]: every factor shape the miniature
-    /// exercises comes out near-orthogonal, in bf16, in its own orientation.
+    /// Five quintic steps bring a well-conditioned dense fixture near orthogonal, in bf16,
+    /// across every factor shape the miniature exercises and in its own orientation.
     #[test]
     fn newton_schulz_orthogonalizes_every_factor_shape() {
         let dev = Device::Cpu;
         for (r, c) in [(17, 2), (2, 8), (10, 8), (8, 8), (2, 17), (17, 10), (1, 4)] {
-            let g = Tensor::randn(0f32, 1.0, (r, c), &dev).unwrap();
+            // G = D + E: D's nonzero singular values lie in [1, 1.5), and the dense modular
+            // perturbation has ||E||_2 <= ||E||_F <= 5/128. Thus sigma_min(G) >= 123/128
+            // before dtype conversion; unlike an unseeded Gaussian, the fixture stays conditioned.
+            let scale = 128.0 * ((r * c) as f32).sqrt();
+            let values: Vec<f32> = (0..r * c)
+                .map(|index| {
+                    let (i, j) = (index / c, index % c);
+                    let diagonal = if i == j {
+                        1.0 + i as f32 / (2 * r.min(c)) as f32
+                    } else {
+                        0.0
+                    };
+                    let perturbation = ((7 * i + 3 * j) % 11) as f32 - 5.0;
+                    diagonal + perturbation / scale
+                })
+                .collect();
+            let g = Tensor::from_vec(values, (r, c), &dev).unwrap();
             let o = newton_schulz(&g, 1e-8).unwrap();
             assert_eq!(o.dtype(), DType::BF16);
             assert_eq!(o.dims(), [r, c]);
