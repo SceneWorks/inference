@@ -31,6 +31,7 @@ impl fmt::Debug for GenerationView<'_> {
         let r = self.0;
         f.debug_struct("GenerationRequest")
             .field("prompt", &r.prompt)
+            .field("moss_image", &r.moss_image)
             .field("negative_prompt", &r.negative_prompt)
             .field("width", &r.width)
             .field("height", &r.height)
@@ -51,6 +52,9 @@ impl fmt::Debug for GenerationView<'_> {
             .field("prompt_batch", &r.prompt_batch)
             .field("caption_overflow", &r.caption_overflow)
             .field("conditioning", &r.conditioning)
+            .field("flux3_reference_output", &r.flux3_reference_output)
+            .field("flux3_layout", &r.flux3_layout)
+            .field("flux3_layout_bindings", &r.flux3_layout_bindings)
             .field("strength", &r.strength)
             .field("control_scale", &r.control_scale)
             .field("text_style_gain", &r.text_style_gain)
@@ -284,6 +288,35 @@ pub(crate) mod tests {
         r.h3_terminal_telemetry = true;
         assert_ne!(work_binding(&works[0]), before_telemetry);
         assert_eq!(work_binding(&works[0]), tiny_reference(&works[0]));
+    }
+
+    #[test]
+    fn new_generation_controls_change_the_exact_binding() {
+        use mlx_gen::gen_core::flux3::layouts::{Layout, ReferenceBinding};
+        use mlx_gen::gen_core::flux3::references::ReferenceOutputSize;
+        use mlx_gen::gen_core::moss_image::MossImageOptions;
+
+        let mut request = GenerationRequest::default();
+        let mut previous = work_binding(&IosWork::Generate(request.clone()));
+        let mut check = |request: &GenerationRequest| {
+            let work = IosWork::Generate(request.clone());
+            let current = work_binding(&work);
+            assert_ne!(current, previous);
+            assert_eq!(current, tiny_reference(&work));
+            previous = current;
+        };
+
+        request.moss_image = Some(MossImageOptions::default());
+        check(&request);
+        request.flux3_reference_output = Some(ReferenceOutputSize {
+            width: Some(512),
+            height: None,
+        });
+        check(&request);
+        request.flux3_layout = Some(Layout::parse(r#"{"version":1,"boxes":[]}"#).unwrap());
+        check(&request);
+        request.flux3_layout_bindings = vec![ReferenceBinding::oriented("reference-1", (64, 64))];
+        check(&request);
     }
 
     #[test]
