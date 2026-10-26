@@ -435,7 +435,7 @@ jobs:
           cargo test --locked --release -p candle-audio-yue2 --features metal --test precision_real_weights --no-run --message-format=json > "$RUNNER_TEMP/yue2-precision-proof/build.jsonl" 2> "$RUNNER_TEMP/yue2-precision-proof/build.log"
           python3.12 ../control/scripts/ci/yue2_precision_proof.py resolve-binary --build-json "$RUNNER_TEMP/yue2-precision-proof/build.jsonl" --output "$RUNNER_TEMP/yue2-precision-proof/binary.txt"
       - name: Run exactly one Metal precision test with external sampling
-        shell: python3.12 -I "${{ github.workspace }}/control/scripts/ci/inference_metal_launcher.py" --wait-seconds 14400 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        shell: python3.12 -I "../control/scripts/ci/inference_metal_launcher.py" --wait-seconds 14400 -- /bin/bash --noprofile --norc -eo pipefail {0}
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}

@@ -315,7 +315,7 @@ jobs:
         run: python3.12 control/scripts/ci/yue2_app_precision_profile.py preflight --backend metal --evidence "$APP_EVIDENCE" --label before-install
       - name: Install pinned BF16 model and both decoders through the app, without acceptance cases
         working-directory: app
-        shell: python3.12 -I "${{ github.workspace }}/control/scripts/ci/inference_metal_launcher.py" --wait-seconds 28800 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        shell: python3.12 -I "../control/scripts/ci/inference_metal_launcher.py" --wait-seconds 28800 -- /bin/bash --noprofile --norc -eo pipefail {0}
         run: |
           set -euo pipefail
           unset RUSTC_WRAPPER
@@ -327,7 +327,7 @@ jobs:
         id: capture
         continue-on-error: true
         working-directory: app
-        shell: python3.12 -I "${{ github.workspace }}/control/scripts/ci/inference_metal_launcher.py" --wait-seconds 28800 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        shell: python3.12 -I "../control/scripts/ci/inference_metal_launcher.py" --wait-seconds 28800 -- /bin/bash --noprofile --norc -eo pipefail {0}
         run: |
           set -euo pipefail
           unset RUSTC_WRAPPER HF_HUB_CACHE HUGGINGFACE_HUB_CACHE
