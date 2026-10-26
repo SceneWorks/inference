@@ -459,52 +459,82 @@ pub fn denoise_curated(
             // `x_in` is the `1/√(σ²+1)`-scaled latent (f32 from the solver); cast to the UNet compute
             // dtype, then CFG-batch the single row to [uncond, cond].
             let x = x_in.to_dtype(dtype)?;
-            let x_unet = if cfg_on {
-                Tensor::cat(&[&x, &x], 0)?
-            } else {
-                x
-            };
-            let t = timestep as f64;
+            let evaluate = |row: Option<usize>| -> Result<Tensor> {
+                let select_row = |tensor: &Tensor| -> Result<Tensor> {
+                    match row {
+                        Some(row) => Ok(tensor.narrow(0, row, 1)?.contiguous()?),
+                        None => Ok(tensor.clone()),
+                    }
+                };
+                let conditioning = select_row(conditioning)?;
+                let pooled = select_row(pooled)?;
+                let time_ids = select_row(time_ids)?;
+                let controlnet_encoder = select_row(controlnet_encoder)?;
+                let x_unet = if cfg_on && row.is_none() {
+                    Tensor::cat(&[&x, &x], 0)?
+                } else {
+                    x.clone()
+                };
+                let t = timestep as f64;
 
-            // Sum each branch's (already `scale`'d) residuals — the MultiControlNet rule. One branch ⇒
-            // the single residual; zero ⇒ `None` (no injection). All branches share `controlnet_encoder`.
-            let mut combined: Option<ControlResiduals> = None;
-            for cc in controls {
-                let res = cc.controlnet.forward(
-                    &x_unet,
-                    &cc.cond_embed,
-                    t,
-                    controlnet_encoder,
-                    pooled,
-                    time_ids,
-                    cc.scale,
-                )?;
-                combined = Some(match combined {
-                    None => res,
-                    Some(prev) => prev.add(&res)?,
-                });
-            }
-
-            // The micro-conditioning forward + the decoupled IP branch (from the set context) + the
-            // (summed) control residuals.
-            let eps = match &combined {
-                Some(r) => unet.forward_instantid(
-                    &x_unet,
-                    t,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    Some(r.down.as_slice()),
-                    Some(&r.mid),
-                )?,
-                None => {
-                    unet.forward_instantid(&x_unet, t, conditioning, pooled, time_ids, None, None)?
+                // Sum each branch's (already `scale`'d) residuals — the MultiControlNet rule. One branch ⇒
+                // the single residual; zero ⇒ `None` (no injection). All branches share `controlnet_encoder`.
+                let mut combined: Option<ControlResiduals> = None;
+                for cc in controls {
+                    let cond_embed = select_row(&cc.cond_embed)?;
+                    let res = cc.controlnet.forward(
+                        &x_unet,
+                        &cond_embed,
+                        t,
+                        &controlnet_encoder,
+                        &pooled,
+                        &time_ids,
+                        cc.scale,
+                    )?;
+                    combined = Some(match combined {
+                        None => res,
+                        Some(prev) => prev.add(&res)?,
+                    });
                 }
+
+                // The micro-conditioning forward + the decoupled IP branch (from the set context) + the
+                // (summed) control residuals.
+                let eps = match &combined {
+                    Some(r) => unet.forward_instantid(
+                        &x_unet,
+                        t,
+                        &conditioning,
+                        &pooled,
+                        &time_ids,
+                        Some(r.down.as_slice()),
+                        Some(&r.mid),
+                    )?,
+                    None => unet.forward_instantid(
+                        &x_unet,
+                        t,
+                        &conditioning,
+                        &pooled,
+                        &time_ids,
+                        None,
+                        None,
+                    )?,
+                };
+
+                Ok(eps)
+            };
+            let sequential = cfg_on && crate::sequential_cfg_enabled();
+            let eps = if sequential {
+                let uncond = evaluate(Some(0))?;
+                candle_gen::residency::check_cancel(cancel)?;
+                let cond = evaluate(Some(1))?;
+                (&uncond + ((cond - &uncond)? * cfg)?)?
+            } else {
+                evaluate(None)?
             };
 
             // CFG combine: row 0 = uncond, row 1 = cond (the candle convention). Raw ε in f32 so the
             // `DiscreteModelSampling` x0 recombine + solver math stay f32.
-            let eps = if cfg_on {
+            let eps = if cfg_on && !sequential {
                 let chunks = eps.chunk(2, 0)?;
                 let (uncond, cond) = (&chunks[0], &chunks[1]);
                 (uncond + ((cond - uncond)? * cfg)?)?

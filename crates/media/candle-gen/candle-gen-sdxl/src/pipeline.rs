@@ -530,7 +530,7 @@ impl SdxlUnet {
 ///
 /// The vendored tower is pinned bit-identical to the stock one on a dense build by the
 /// `clip::tests::vendored_dense_matches_stock` parity test.
-enum CandleModule {
+pub(crate) enum CandleModule {
     Stock(stable_diffusion::clip::ClipTextTransformer),
     Vendored(crate::clip::ClipTextTransformer),
 }
@@ -615,6 +615,23 @@ impl Pipeline {
         Ok(Tensor::cat(&[l, g], D::Minus1)?)
     }
 
+    pub(crate) fn text_embeddings_resident(
+        &self,
+        toks: &SdxlTokenizers,
+        models: &(CandleModule, CandleModule),
+        prompt: &str,
+        uncond: &str,
+    ) -> Result<Tensor> {
+        let (plan_l, plan_g) = self.chunk_plans(toks)?;
+        let chunks = long_prompt::common_chunks(
+            &[(&plan_l, &toks.tok_l), (&plan_g, &toks.tok_g)],
+            &[uncond, prompt],
+        )?;
+        let l = self.encode_loaded(&models.0, &toks.tok_l, &plan_l, prompt, uncond, chunks)?;
+        let g = self.encode_loaded(&models.1, &toks.tok_g, &plan_g, prompt, uncond, chunks)?;
+        Ok(Tensor::cat(&[l, g], D::Minus1)?)
+    }
+
     /// The per-encoder [`ChunkPlan`] pair for this pipeline's CLIP configs (`pad_with` +
     /// `max_position_embeddings`), built from the cached tokenizers. Cheap — no weights, no tensors.
     fn chunk_plans(&self, toks: &SdxlTokenizers) -> Result<(ChunkPlan, ChunkPlan)> {
@@ -653,6 +670,19 @@ impl Pipeline {
         uncond: &str,
         chunks: usize,
     ) -> Result<Tensor> {
+        let text_model = self.load_text_model(which)?;
+        let result = self.encode_loaded(&text_model, tokenizer, plan, prompt, uncond, chunks);
+        candle_gen::residency::synchronize_result(&self.device, result)
+    }
+
+    pub(crate) fn load_text_models(&self) -> Result<(CandleModule, CandleModule)> {
+        Ok((
+            self.load_text_model(Clip::L)?,
+            self.load_text_model(Clip::BigG)?,
+        ))
+    }
+
+    fn load_text_model(&self, which: Clip) -> Result<CandleModule> {
         let (_tok_repo, weights_sub) = which.sources();
         let clip_cfg = match which {
             Clip::L => &self.config.clip,
@@ -729,6 +759,18 @@ impl Pipeline {
             }
         };
 
+        Ok(text_model)
+    }
+
+    fn encode_loaded(
+        &self,
+        text_model: &CandleModule,
+        tokenizer: &Tokenizer,
+        plan: &ChunkPlan,
+        prompt: &str,
+        uncond: &str,
+        chunks: usize,
+    ) -> Result<Tensor> {
         // sc-20528: one forward per CLIP window, concatenated on the sequence axis (the A1111/compel
         // "long prompt weighting" shape). A prompt that fits produces exactly one window whose ids are
         // the tokenizer output right-padded with the pad token — bit-for-bit the pre-sc-20528 encoding,
@@ -762,6 +804,12 @@ impl Pipeline {
     /// `vae_fp16_fix` component (sc-13663). The generator owns the caching of the result across calls
     /// (sc-5037); this is the cache-miss loader.
     pub(crate) fn load_components(&self, use_flash_attn: bool) -> Result<Components> {
+        let unet = self.load_unet(use_flash_attn)?;
+        let (vae, pid) = self.load_decoders()?;
+        Ok(Components { unet, vae, pid })
+    }
+
+    pub(crate) fn load_unet(&self, use_flash_attn: bool) -> Result<SdxlUnet> {
         // sc-9416: a **packed** MLX tier (`SceneWorks/sdxl-base-mlx` q4/q8) ships its UNet under the
         // non-`.fp16` filename with a `quantization` block in `unet/config.json` and `.scales`-packed
         // Linear weights. Detect it and load the vendored packed-detecting UNet straight from the packed
@@ -848,6 +896,10 @@ impl Pipeline {
                 }
             }
         };
+        Ok(unet)
+    }
+
+    pub(crate) fn load_decoders(&self) -> Result<(Arc<SdxlVaeDecoder>, Option<Arc<PidEngine>>)> {
         let vae = if let Some(ldm) = &self.ldm {
             // A generic fused A1111 checkpoint may carry the original SDXL VAE, whose fp16 decode is
             // numerically unstable. Consume the checkpoint's own VAE truthfully, but keep it at f32;
@@ -875,11 +927,7 @@ impl Pipeline {
             )?)),
             None => None,
         };
-        Ok(Components {
-            unet,
-            vae: Arc::new(vae),
-            pid,
-        })
+        Ok((Arc::new(vae), pid))
     }
 
     /// Detect a pre-quantized MLX SDXL tier at this pipeline's `root` — the free
@@ -1002,6 +1050,79 @@ impl Pipeline {
         pid: Option<&PidEngine>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let pid_decoder =
+            candle_gen_pid::resolve_pid_decoder(pid, req, base_seed, crate::MODEL_ID)?;
+        self.render_with(
+            req,
+            text_embeddings,
+            unet,
+            on_progress,
+            |latents, progress| {
+                progress(Progress::Decoding);
+                self.decode(
+                    vae,
+                    pid_decoder
+                        .as_ref()
+                        .map(|decoder| decoder as &dyn LatentDecoder),
+                    &latents,
+                    &req.cancel,
+                    crate::denoise::decode_tiling(req.memory),
+                )
+            },
+        )
+    }
+
+    pub(crate) fn denoise_images(
+        &self,
+        req: &GenerationRequest,
+        text_embeddings: &Tensor,
+        unet: &SdxlUnet,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Tensor>> {
+        if req.use_pid && self.pid_spec.is_none() {
+            return Err(CandleError::Msg(
+                "sdxl: PiD requested but no PiD decoder loaded".into(),
+            ));
+        }
+        self.render_with(req, text_embeddings, unet, on_progress, |latents, _| {
+            Ok(latents)
+        })
+    }
+
+    pub(crate) fn decode_images(
+        &self,
+        req: &GenerationRequest,
+        latents: &[Tensor],
+        vae: &SdxlVaeDecoder,
+        pid: Option<&PidEngine>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let decoder = candle_gen_pid::resolve_pid_decoder(pid, req, seed, crate::MODEL_ID)?;
+        latents
+            .iter()
+            .map(|latent| {
+                on_progress(Progress::Decoding);
+                self.decode(
+                    vae,
+                    decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                    latent,
+                    &req.cancel,
+                    crate::denoise::decode_tiling(req.memory),
+                )
+            })
+            .collect()
+    }
+
+    fn render_with<T>(
+        &self,
+        req: &GenerationRequest,
+        text_embeddings: &Tensor,
+        unet: &SdxlUnet,
+        on_progress: &mut dyn FnMut(Progress),
+        mut consume: impl FnMut(Tensor, &mut dyn FnMut(Progress)) -> Result<T>,
+    ) -> Result<Vec<T>> {
         // sc-6128: a `lightning` request runs the few-step Euler-trailing path. Every other render —
         // the omitted-sampler default AND every explicit curated solver name (incl. `ddim`) — routes
         // through the unified curated `Sampler` over `DiscreteModelSampling` (EPS), epic 7114 P4 / sc-7124.
@@ -1030,12 +1151,6 @@ impl Pipeline {
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let total = steps as u32;
         let (lat_h, lat_w) = (self.config.height / 8, self.config.width / 8);
-
-        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
-        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
-        // else `None` → the native SDXL VAE decode. Shared across `count` images (same prompt).
-        let pid_decoder =
-            candle_gen_pid::resolve_pid_decoder(pid, req, base_seed, crate::MODEL_ID)?;
 
         // Lightning precompute (seed-independent): the trailing-Euler policy + the cond-only text
         // embedding (row 1 of the `[uncond, cond]` dual-CLIP stack — Lightning runs one conditioned
@@ -1101,16 +1216,7 @@ impl Pipeline {
                 ));
             };
 
-            on_progress(Progress::Decoding);
-            self.decode(
-                vae,
-                pid_decoder
-                    .as_ref()
-                    .map(|decoder| decoder as &dyn LatentDecoder),
-                &latents,
-                &req.cancel,
-                crate::denoise::decode_tiling(req.memory),
-            )
+            consume(latents, on_progress)
         })
     }
 
@@ -1236,19 +1342,28 @@ impl Pipeline {
             |x_in, t| -> Result<Tensor> {
                 // `x_in` is already `1/√(σ²+1)`-scaled by `denoise()`; `t` is the nearest training-step
                 // index the UNet embeds. CFG batches/combines exactly like the native DDIM path.
-                let model_in = if use_guide {
-                    Tensor::cat(&[x_in, x_in], 0)?
+                let eps = if use_guide && crate::sequential_cfg_enabled() {
+                    let model_in = x_in.to_dtype(self.dtype)?;
+                    let uncond =
+                        unet.forward(&model_in, t as f64, &ehs.narrow(0, 0, 1)?.contiguous()?)?;
+                    candle_gen::residency::check_cancel(&req.cancel)?;
+                    let cond =
+                        unet.forward(&model_in, t as f64, &ehs.narrow(0, 1, 1)?.contiguous()?)?;
+                    (&uncond + ((cond - &uncond)? * guidance)?)?
                 } else {
-                    x_in.clone()
-                };
-                let model_in = model_in.to_dtype(self.dtype)?;
-                let noise_pred = unet.forward(&model_in, t as f64, &ehs)?;
-                let eps = if use_guide {
-                    let chunks = noise_pred.chunk(2, 0)?;
-                    let (uncond, cond) = (&chunks[0], &chunks[1]);
-                    (uncond + ((cond - uncond)? * guidance)?)?
-                } else {
-                    noise_pred
+                    let model_in = if use_guide {
+                        Tensor::cat(&[x_in, x_in], 0)?
+                    } else {
+                        x_in.clone()
+                    };
+                    let noise_pred =
+                        unet.forward(&model_in.to_dtype(self.dtype)?, t as f64, &ehs)?;
+                    if use_guide {
+                        let chunks = noise_pred.chunk(2, 0)?;
+                        (&chunks[0] + ((&chunks[1] - &chunks[0])? * guidance)?)?
+                    } else {
+                        noise_pred
+                    }
                 };
                 // Raw ε in f32 so the DiscreteModelSampling x0 recombine + solver math stay f32.
                 Ok(eps.to_dtype(DType::F32)?)
