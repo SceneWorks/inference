@@ -114,15 +114,15 @@ def main() -> int:
                 or args.copied is not None):
             parser.error("BF16 materialization cannot combine with inventory verification")
         result = materialize_source_bf16(args.materialize_bf16)
-        args.output.write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
+        args.output.write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
         print("pinned SANA BF16 projection materialized through runner Hub cache")
         return 0
     if args.source_inventory is None or (args.source_snapshot is None) == (args.copied is None):
         parser.error("select exactly one of --source-snapshot or --copied")
-    source = json.loads(args.source_inventory.read_text())
+    source = json.loads(args.source_inventory.read_text(encoding="utf-8"))
     result = (authenticate_source_bf16(source, args.source_snapshot)
               if args.source_snapshot is not None else verify_copied_bf16(source, args.copied))
-    args.output.write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
+    args.output.write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     print("SANA BF16 source authenticated against pinned Hub" if args.source_snapshot is not None
           else f"copied SANA BF16 content: OK tier_inventory_sha256={result['tier_inventory_sha256']}")
     return 0

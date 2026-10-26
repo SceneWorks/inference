@@ -43,9 +43,9 @@ class SimulatorSanaTests(unittest.TestCase):
             receipt = Path(directory) / 'materialized.json'
             result = subprocess.run([sys.executable, '-I', script, '--materialize-bf16',
                                      str(snapshot), '--output', str(receipt)],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(receipt.read_text())['missing_before_fetch'], [])
+            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))['missing_before_fetch'], [])
 
     def test_bf16_materialization_uses_exact_pinned_cache_projection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -89,7 +89,7 @@ class SimulatorSanaTests(unittest.TestCase):
                  patch.object(device, 'simctl', return_value='22222222-2222-2222-2222-222222222222'):
                 receipt = device.create(selection, owned, '123', '1', root / 'env', 'nax-macos-2')
             self.assertEqual(receipt['template_udid'], template['udid'])
-            self.assertEqual((root / 'env').read_text(), 'SIMULATOR_UDID=' + receipt['owned_udid'] + '\n')
+            self.assertEqual((root / 'env').read_text(encoding="utf-8"), 'SIMULATOR_UDID=' + receipt['owned_udid'] + '\n')
             with self.assertRaisesRegex(ValueError, 'does not match this workflow attempt'):
                 device.cleanup(owned, root / 'cleanup.json', '123', '1', 'nax-macos')
 
@@ -127,7 +127,7 @@ class SimulatorSanaTests(unittest.TestCase):
     def test_install_only_cannot_be_downgraded_by_later_media_flag(self):
         script = sim.ROOT / 'scripts/ios/run_smoke.sh'
         result = subprocess.run(['bash', str(script), '--simulator-functional', '--install-only',
-                                 '--simulator', 'not-used', '--media'], capture_output=True, text=True)
+                                 '--simulator', 'not-used', '--media'], capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 2)
         self.assertIn('cannot combine with other model modes', result.stderr)
 
@@ -160,16 +160,16 @@ class SimulatorSanaTests(unittest.TestCase):
                 sim.png_pixels(file)
 
     def test_reviewed_policy_cannot_lose_host_reserve_or_expand_cap(self):
-        data = json.loads((sim.ROOT / 'scripts/ci/ios-simulator-sana-policy.json').read_text())
+        data = json.loads((sim.ROOT / 'scripts/ci/ios-simulator-sana-policy.json').read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as directory:
             file = Path(directory) / 'policy.json'
-            file.write_text(json.dumps(data))
+            file.write_text(json.dumps(data), encoding="utf-8")
             sim.policy_for_simulator(file)
             for field, value in [('hostFreeReserveBytes', 1),
                                  ('childFootprintCapBytes', 13 * 1024**3),
                                  ('deadlineSeconds', 7201)]:
                 with self.subTest(field=field):
-                    file.write_text(json.dumps({**data, field: value}))
+                    file.write_text(json.dumps({**data, field: value}), encoding="utf-8")
                     with self.assertRaises(ValueError):
                         sim.policy_for_simulator(file)
 

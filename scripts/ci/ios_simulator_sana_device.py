@@ -50,7 +50,7 @@ def create(selected: Path, output: Path, run_id: str, attempt: str,
            github_env: Path, runner: str) -> dict:
     if output.exists() or not output.parent.is_dir():
         raise ValueError("fresh owned-simulator receipt path required")
-    template = json.loads(selected.read_text())
+    template = json.loads(selected.read_text(encoding="utf-8"))
     if (template.get("run_id") != run_id or template.get("attempt") != attempt
             or template.get("runner") != runner or not UDID.fullmatch(template.get("template_udid", ""))):
         raise ValueError("simulator selection is not bound to this runner and attempt")
@@ -80,7 +80,7 @@ def cleanup(receipt_path: Path, output: Path, run_id: str, attempt: str, runner:
     if not receipt_path.is_file():
         result = {"status": "not-created"}
     else:
-        receipt = json.loads(receipt_path.read_text())
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         owned = receipt.get("owned_udid", "")
         name = f"SceneWorksSana-{run_id}-{attempt}"
         if (not UDID.fullmatch(owned) or receipt.get("run_id") != run_id
@@ -96,7 +96,7 @@ def cleanup(receipt_path: Path, output: Path, run_id: str, attempt: str, runner:
         simctl("delete", owned)
         result = {"status": "owned-simulator-deleted", "owned_udid": owned,
                   "owned_name": name, "runtime": receipt["runtime"]}
-    output.write_text(json.dumps(result, sort_keys=True) + "\n")
+    output.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
     return result
 
 

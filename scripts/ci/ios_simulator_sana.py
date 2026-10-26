@@ -160,7 +160,7 @@ def run(args: argparse.Namespace) -> int:
     if not args.output.is_absolute() or args.output.exists():
         raise ValueError("fresh absolute output directory required")
     policy = policy_for_simulator(args.policy)
-    inventory = json.loads(args.inventory.read_text())
+    inventory = json.loads(args.inventory.read_text(encoding="utf-8"))
     if inventory.get("model") != "sana-1600m-mlx" or not re.fullmatch("[0-9a-f]{64}", inventory.get("inventory_sha256", "")):
         raise ValueError("verified SANA content inventory required")
     app_dir = Path(command("xcrun", "simctl", "get_app_container", args.simulator, args.bundle_id, "app")).resolve()
@@ -186,7 +186,7 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("the exact Documents/sana snapshot must be a real directory")
     if args.copied_inventory.is_symlink():
         raise ValueError("copied snapshot inventory must be a real file")
-    copied = json.loads(args.copied_inventory.read_text())
+    copied = json.loads(args.copied_inventory.read_text(encoding="utf-8"))
     expected_tier = sorted(({"path": row["path"][5:], "size": row["size"],
                              "sha256": row["sha256"]} for row in inventory["files"]
                             if row["path"].startswith("bf16/")), key=lambda row: row["path"])
@@ -207,7 +207,7 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("host free memory below app footprint cap plus reserve")
     args.output.mkdir(parents=True)
     (args.output / "admission.json").write_text(json.dumps({"source_sha": actual, "inventory": inventory,
-        "policy_sha256": policy.sha256, "host_preflight": host}, sort_keys=True) + "\n")
+        "policy_sha256": policy.sha256, "host_preflight": host}, sort_keys=True) + "\n", encoding="utf-8")
     nonce = os.urandom(16).hex()
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("IOS_SMOKE_", "IOS_CAMPAIGN_", "SIMCTL_CHILD_"))}
@@ -228,7 +228,7 @@ def run(args: argparse.Namespace) -> int:
         claimed = app_identity(pid)
         if claimed is None or claimed[0] != str(executable) or claimed[1] <= 0:
             raise ValueError("launched PID path/start did not match installed app")
-        (docs / f"simulator-go-{nonce}").write_text(actual + "\n")
+        (docs / f"simulator-go-{nonce}").write_text(actual + "\n", encoding="utf-8")
         samples = []
         report_file = docs / "smoke-report.txt"
         png_file = docs / "sana-256-tile128-SIMULATOR-FUNCTIONAL-ONLY.png"
@@ -247,7 +247,7 @@ def run(args: argparse.Namespace) -> int:
             samples.append({"elapsed_ms": round((time.monotonic() - started) * 1000),
                             "footprint_bytes": footprint, "host_available_bytes": free_now})
             if report_file.is_file():
-                report = report_file.read_text()
+                report = report_file.read_text(encoding="utf-8")
                 expected = ("SMOKE: PASS\n", f"SIMULATOR_NONCE {nonce}\n", f"SOURCE_SHA {actual}\n",
                             "SIMULATOR FUNCTIONAL ONLY; no phone admission, memory fit, or performance claim")
                 if not all(token in report for token in expected) or "[ok] SANA image generation (E5)" not in report:
@@ -257,7 +257,7 @@ def run(args: argparse.Namespace) -> int:
                 width, height, low, high, spatial_span = png_pixels(png_file)
                 png = args.output / png_file.name
                 png.write_bytes(png_file.read_bytes())
-                (args.output / "report.txt").write_text(report)
+                (args.output / "report.txt").write_text(report, encoding="utf-8")
                 (args.output / "result.json").write_text(json.dumps({"accepted": True,
                     "claim": "simulator SANA functional image only; no phone fit/admission/performance",
                     "source_sha": actual, "snapshot_inventory_sha256": inventory["inventory_sha256"],
@@ -271,7 +271,7 @@ def run(args: argparse.Namespace) -> int:
                     "width": width, "height": height, "pixel_min": low, "pixel_max": high,
                     "max_channel_spatial_span": spatial_span,
                     "peak_phys_footprint_bytes": peak, "minimum_host_available_bytes": minimum_free,
-                    "duration_seconds": time.monotonic() - started, "samples": samples}, sort_keys=True) + "\n")
+                    "duration_seconds": time.monotonic() - started, "samples": samples}, sort_keys=True) + "\n", encoding="utf-8")
                 return 0
             time.sleep(policy.poll_millis / 1000)
         raise ValueError("simulator app exceeded hard validation deadline")
@@ -298,7 +298,7 @@ def main() -> int:
         if args.output.is_absolute() and args.output.is_dir():
             (args.output / "failure.json").write_text(json.dumps({"accepted": False,
                 "reason": str(error), "claim": "no simulator functional acceptance or phone-fit claim"},
-                sort_keys=True) + "\n")
+                sort_keys=True) + "\n", encoding="utf-8")
         print(f"simulator SANA validation refused: {error}", file=sys.stderr)
         return 1
 
