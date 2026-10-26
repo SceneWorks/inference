@@ -2,9 +2,10 @@
 """Catalog-driven, cold-process iOS ANCHOR campaign. Listing never launches a device.
 
 The campaign measures anchors only, per the recorded memory-anchor rule (two measured extremes per
-family, every other rung / selection / geometry DERIVED by the anchor law in
-crates/media/mlx-gen/mlx-gen-ios-catalog/src/anchor.rs). The listing (the runner's own catalog, never
-a hand list) names, per provider route x tier x mode, the fully RESIDENT anchor (rung 0) and the
+selected empirical pressure group; other registered sampling settings, rungs, selections and
+geometries are repriced/derived under the reviewed engineering policy). The listing (the runner's
+own catalog, never a hand list) retains every accepted recipe in `recipe_coverage` and names, per
+provider route x tier x actual mode/configured graph, the fully RESIDENT anchor (rung 0) and the
 fully OPTIMIZED anchor (deepest implemented rung, cheapest selection, captured 2 times: its spread is
 the low-end margin), both at the reference geometry with 2 denoise steps; plus one model's
 full-step case (validation_steps) and its second-geometry case (validation_geometry).
@@ -161,7 +162,7 @@ def catalog(args):
         if result.returncode:
             raise ValueError("catalog export failed: " + result.stderr)
         data = json.loads(result.stdout)
-    if data.get("schema") != 2 or not isinstance(data.get("cases"), list) or not data["cases"]:
+    if data.get("schema") != 3 or not isinstance(data.get("cases"), list) or not data["cases"]:
         raise ValueError("empty/malformed catalog is not coverage")
     for entry in data["cases"]:
         if not isinstance(entry, dict) or set(entry) != {"case", "purpose", "repeats"} \
@@ -174,6 +175,58 @@ def catalog(args):
     keys = [e["case"] for e in data["cases"]]
     if len(keys) != len(set(keys)):
         raise ValueError("duplicate cases")
+    families, coverage = data.get("families"), data.get("recipe_coverage")
+    if not isinstance(families, list) or not families or not isinstance(coverage, list) or not coverage:
+        raise ValueError("catalog lacks representative families or registered recipe coverage")
+    homes = {}
+    for family in families:
+        if not isinstance(family, dict) or set(family) != {"architecture", "tier", "variant", "sampling_recipe", "anchor", "members"} \
+                or not all(isinstance(family[name], str) and family[name] for name in ("architecture", "tier", "variant", "anchor")) \
+                or family["tier"] not in TIERS or not isinstance(family["members"], list) or not family["members"] \
+                or not all(isinstance(member, str) and member for member in family["members"]) \
+                or (family["sampling_recipe"] is not None and not isinstance(family["sampling_recipe"], str)):
+            raise ValueError("malformed representative family")
+        identity = (family["architecture"], family["tier"], family["variant"], family["anchor"])
+        if identity in homes:
+            raise ValueError("duplicate representative family")
+        homes[identity] = family
+        anchor = family["anchor"].split("/")
+        if len(anchor) != 3 or family["anchor"] not in family["members"] \
+                or any(member.split("/")[:2] != anchor[:2] for member in family["members"]):
+            raise ValueError("representative anchor is not a member")
+        if not any(entry["purpose"] == "resident" and
+                   (parts := entry["case"].split("/"))[:3] == [anchor[0], anchor[1], family["tier"]] and
+                   parts[4] == anchor[2] and (parts[8] if len(parts) == 9 else None) == family["sampling_recipe"]
+                   for entry in data["cases"]):
+            raise ValueError("representative family lacks its resident case")
+    seen = set()
+    mapped_homes = set()
+    for item in coverage:
+        required = {"architecture", "provider", "route", "tier", "mode", "recipe", "memory_class",
+                    "configured_variant", "variant", "representative"}
+        if not isinstance(item, dict) or set(item) != required \
+                or not all(isinstance(item[name], str) and item[name] for name in ("architecture", "provider", "route", "tier", "mode", "variant")) \
+                or item["tier"] not in TIERS \
+                or any(item[name] is not None and not isinstance(item[name], str)
+                       for name in ("recipe", "memory_class", "configured_variant", "representative")):
+            raise ValueError("malformed registered recipe coverage")
+        identity = (item["provider"], item["route"], item["tier"], item["mode"], item["recipe"])
+        if identity in seen:
+            raise ValueError("duplicate registered recipe coverage")
+        seen.add(identity)
+        configured = item["configured_variant"]
+        if (configured is None and "/configured=" in item["variant"]) or \
+                (configured is not None and not item["variant"].endswith("/configured=" + configured)):
+            raise ValueError("registered recipe has incompatible configured graph")
+        matches = [(key, family) for key, family in homes.items()
+                   if key[:3] == (item["architecture"], item["tier"], item["variant"])
+                   and family["sampling_recipe"] == item["representative"]
+                   and f'{item["provider"]}/{item["route"]}/{item["mode"]}' in family["members"]]
+        if len(matches) != 1:
+            raise ValueError("registered recipe has no unique measured representative")
+        mapped_homes.add(matches[0][0])
+    if mapped_homes != set(homes):
+        raise ValueError("representative family has no registered recipe coverage")
     return data
 
 

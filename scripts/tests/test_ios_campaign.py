@@ -39,7 +39,16 @@ class CampaignTests(unittest.TestCase):
         self.entries.append({"case": "fake/fake/q4/1024/control/4/s_t256/1", "purpose": "validation_mode", "repeats": 1})
         self.keys = [e["case"] for e in self.entries]
         self.catalog = self.root / "catalog.json"
-        self.catalog.write_text(json.dumps({"schema": 2, "cases": self.entries}), encoding="utf-8")
+        self.families = [{"architecture": "fake-architecture", "tier": tier, "variant": mode,
+                          "sampling_recipe": None, "anchor": f"fake/fake/{mode}",
+                          "members": [f"fake/fake/{mode}"]}
+                         for tier in campaign.TIERS for mode in ("text", "reference")]
+        self.coverage = [{"architecture": "fake-architecture", "provider": "fake", "route": "fake",
+                          "tier": tier, "mode": mode, "recipe": None, "memory_class": None,
+                          "configured_variant": None, "variant": mode, "representative": None}
+                         for tier in campaign.TIERS for mode in ("text", "reference")]
+        self.catalog.write_text(json.dumps({"schema": 3, "cases": self.entries, "families": self.families,
+                                            "recipe_coverage": self.coverage}), encoding="utf-8")
         self.guard = mock.patch.object(campaign.subprocess, "Popen", side_effect=AssertionError("TEST MUST NOT START ANY REAL PROCESS"))
         self.guard.start()
         self.addCleanup(self.guard.stop)
@@ -97,16 +106,17 @@ class CampaignTests(unittest.TestCase):
     def test_the_listing_is_the_anchor_shape_and_malformed_listings_are_refused(self):
         args = campaign.parser().parse_args(["list", "--catalog", str(self.catalog)])
         self.assertEqual(campaign.catalog(args)["cases"], self.entries)
+        good = json.loads(self.catalog.read_text(encoding="utf-8"))
         bad = {
             "schema 1 grid": {"schema": 1, "cases": self.keys},
-            "bare key": {"schema": 2, "cases": [self.keys[0]]},
-            "unknown purpose": {"schema": 2, "cases": [dict(self.entries[0], purpose="ladder")]},
-            "too few optimized repeats": {"schema": 2, "cases": [dict(self.entries[1], repeats=1)]},
-            "zero repeats": {"schema": 2, "cases": [dict(self.entries[0], repeats=0)]},
-            "seven-field key": {"schema": 2, "cases": [dict(self.entries[0], case="fake/fake/q4/512/text/0/base")]},
-            "duplicate": {"schema": 2, "cases": [self.entries[0], self.entries[0]]},
-            "extra field": {"schema": 2, "cases": [dict(self.entries[0], edge=512)]},
-            "empty": {"schema": 2, "cases": []},
+            "bare key": dict(good, cases=[self.keys[0]]),
+            "unknown purpose": dict(good, cases=[dict(self.entries[0], purpose="ladder")]),
+            "too few optimized repeats": dict(good, cases=[dict(self.entries[1], repeats=1)]),
+            "zero repeats": dict(good, cases=[dict(self.entries[0], repeats=0)]),
+            "seven-field key": dict(good, cases=[dict(self.entries[0], case="fake/fake/q4/512/text/0/base")]),
+            "duplicate": dict(good, cases=[self.entries[0], self.entries[0]]),
+            "extra field": dict(good, cases=[dict(self.entries[0], edge=512)]),
+            "empty": dict(good, cases=[]),
         }
         for name, listing in bad.items():
             with self.subTest(name=name):
@@ -117,6 +127,24 @@ class CampaignTests(unittest.TestCase):
         # No 20,000-case budget: the listing is finite by construction and --max-cases optional.
         self.assertIsNone(campaign.parser().parse_args(["run"]).max_cases)
         self.assertEqual(campaign.parser().parse_args(["run", "--max-cases", "50000"]).max_cases, 50000)
+
+    def test_registered_recipe_mapping_rejects_missing_or_foreign_graphs(self):
+        args = campaign.parser().parse_args(["list", "--catalog", str(self.catalog)])
+        base = json.loads(self.catalog.read_text(encoding="utf-8"))
+        for name, mutate in (
+            ("missing setting", lambda data: data["recipe_coverage"].pop()),
+            ("foreign route", lambda data: data["recipe_coverage"][0].update(route="foreign")),
+            ("foreign graph", lambda data: data["recipe_coverage"][0].update(configured_variant="other")),
+            ("duplicate setting", lambda data: data["recipe_coverage"].append(dict(data["recipe_coverage"][0]))),
+            ("stale schema", lambda data: data.update(schema=2)),
+        ):
+            with self.subTest(name=name):
+                data = json.loads(json.dumps(base))
+                mutate(data)
+                self.catalog.write_text(json.dumps(data), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    campaign.catalog(args)
+        self.catalog.write_text(json.dumps(base), encoding="utf-8")
 
     def test_invalid_finite_budgets_and_cases(self):
         for options in (("--case", "p/../q4/512/text/0/base/1"), ("--case", "p/p/q4/512/text/0/base"), ("--case", "p/p/q4/512/text/0/t5.1/1"), ("--case", "p/p/q4/512/text/0/base/4294967296"), ("--timeout-seconds", "0"), ("--timeout-seconds", "20001"), ("--max-cases", "0"), ("--tier", "q5"), ("--edge", "999999"), ("--rung", "5"), ("--steps", "4294967296"), ("--steps", "-1"), ("--steps", "not-an-integer"), ("--purpose", "ladder")):

@@ -266,6 +266,22 @@ pub struct Family {
     pub members: Vec<String>,
 }
 
+/// A discovered, accepted setting and the actual recipe selected to measure its empirical
+/// pressure group. The full recipe remains available for execution and source repricing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipeCoverage {
+    pub architecture: String,
+    pub provider: String,
+    pub route: String,
+    pub tier: String,
+    pub mode: String,
+    pub recipe: Option<String>,
+    pub memory_class: Option<String>,
+    pub configured_variant: Option<String>,
+    pub variant: String,
+    pub representative: Option<String>,
+}
+
 /// The weights-free grouping: no checkpoint collapse (each `(provider, route)` is its own
 /// architecture group), variants from `variant`.
 pub fn per_route<'a>(
@@ -333,6 +349,98 @@ pub fn families(surfaces: &[Surface], grouping: &Grouping<'_>) -> Vec<Family> {
     out
 }
 
+/// Select one actual accepted recipe per empirical pressure scope. Unlike native anchor-family
+/// discovery, this deliberately keeps route and the resolved role/overlay variant: engineering
+/// admission requires the same actual mode and exact configured artifact inventory. Campaign
+/// mode aliases whose source-resolved graph is identical may share one representative.
+/// Allocation class and raw recipe stay visible in `RecipeCoverage`, but are not measurement axes.
+pub fn representative_families(
+    surfaces: &[Surface],
+    grouping: &Grouping<'_>,
+) -> (Vec<Family>, Vec<RecipeCoverage>) {
+    let mut groups: Vec<(Family, Vec<(String, CaptureRecipe)>)> = Vec::new();
+    for surface in surfaces {
+        for route in &surface.routes {
+            for tier in ["q4", "q8", "bf16"]
+                .into_iter()
+                .filter(|tier| surface.serves_route(route, tier))
+            {
+                let architecture = (grouping.architecture)(&surface.provider, route, tier);
+                for mode in &surface.modes {
+                    for recipe in surface.recipes_for(route, tier, mode) {
+                        let mut variant =
+                            (grouping.variant)(&surface.provider, route, mode, tier, &recipe);
+                        if let Some(configured) = &recipe.configured_variant {
+                            variant.push_str("/configured=");
+                            variant.push_str(configured);
+                        }
+                        let home = groups.iter_mut().find(|(family, _)| {
+                            family.architecture == architecture
+                                && family.tier == tier
+                                && family.anchor.0 == surface.provider
+                                && family.anchor.1 == *route
+                                && family.variant == variant
+                        });
+                        if let Some((family, covered)) = home {
+                            if (recipe.token.as_ref(), mode)
+                                < (family.recipe.as_ref(), &family.anchor.2)
+                            {
+                                family.recipe = recipe.token.clone();
+                                family.anchor_steps = recipe.steps;
+                                family.anchor.2 = mode.clone();
+                            }
+                            let member = format!("{}/{route}/{mode}", surface.provider);
+                            if !family.members.contains(&member) {
+                                family.members.push(member);
+                            }
+                            // Factories may list the same canonical token twice. It is one
+                            // executable setting, not two coverage obligations.
+                            if !covered.iter().any(|(listed_mode, listed)| {
+                                listed_mode == mode && listed == &recipe
+                            }) {
+                                covered.push((mode.clone(), recipe));
+                            }
+                        } else {
+                            groups.push((
+                                Family {
+                                    architecture: architecture.clone(),
+                                    tier: tier.into(),
+                                    variant,
+                                    recipe: recipe.token.clone(),
+                                    anchor_steps: recipe.steps,
+                                    anchor: (surface.provider.clone(), route.clone(), mode.clone()),
+                                    members: vec![format!("{}/{route}/{mode}", surface.provider)],
+                                },
+                                vec![(mode.clone(), recipe)],
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut coverage = Vec::new();
+    let mut families = Vec::new();
+    for (family, covered) in groups {
+        for (mode, recipe) in covered {
+            coverage.push(RecipeCoverage {
+                architecture: family.architecture.clone(),
+                provider: family.anchor.0.clone(),
+                route: family.anchor.1.clone(),
+                tier: family.tier.clone(),
+                mode,
+                recipe: recipe.token,
+                memory_class: recipe.memory_class,
+                configured_variant: recipe.configured_variant,
+                variant: family.variant.clone(),
+                representative: family.recipe.clone(),
+            });
+        }
+        families.push(family);
+    }
+    (families, coverage)
+}
+
 /// The anchor campaign, derived from the runner's own catalog (never a hand list): per anchor
 /// FAMILY ([`families`]) the resident and the optimized anchor at the reference geometry and
 /// [`ANCHOR_STEPS`], on the family's anchor cell; plus the validation cases — the full-steps and
@@ -342,11 +450,27 @@ pub fn families(surfaces: &[Surface], grouping: &Grouping<'_>) -> Vec<Family> {
 /// resident anchor. A new provider/mode is visible automatically.
 pub fn plan(surfaces: &[Surface], grouping: &Grouping<'_>) -> (Vec<Family>, Vec<Planned>) {
     let families = families(surfaces, grouping);
+    let planned = plan_families(surfaces, &families);
+    (families, planned)
+}
+
+/// Capture only the source-selected empirical representatives; report every accepted recipe's
+/// mapping so a missing or newly registered setting cannot disappear from campaign coverage.
+pub fn representative_plan(
+    surfaces: &[Surface],
+    grouping: &Grouping<'_>,
+) -> (Vec<Family>, Vec<RecipeCoverage>, Vec<Planned>) {
+    let (families, coverage) = representative_families(surfaces, grouping);
+    let planned = plan_families(surfaces, &families);
+    (families, coverage, planned)
+}
+
+fn plan_families(surfaces: &[Surface], families: &[Family]) -> Vec<Planned> {
     let surface = |provider: &str| surfaces.iter().find(|s| s.provider == provider);
     let mut out = Vec::new();
     let mut validation: Option<Case> = None;
     let mut mode_validation: Option<Case> = None;
-    for f in &families {
+    for f in families {
         let (provider, route, mode) = &f.anchor;
         let Some(s) = surface(provider) else { continue };
         let case = |rung: u8, selection: String| Case {
@@ -418,7 +542,7 @@ pub fn plan(surfaces: &[Surface], grouping: &Grouping<'_>) -> (Vec<Family>, Vec<
             repeats: 1,
         });
     }
-    (families, out)
+    out
 }
 
 /// [`plan`] under the weights-free [`per_route`] grouping with every mode additive (the campaign
@@ -592,6 +716,116 @@ mod tests {
         ] {
             assert!(Case::parse(s).is_err(), "{s}");
         }
+    }
+
+    #[test]
+    fn empirical_capture_keeps_route_mode_and_graph_but_maps_every_setting() {
+        let mut source = surface();
+        source.routes = vec!["base".into(), "finetune".into()];
+        source.modes = vec!["text".into(), "reference".into()];
+        source.selections.clear();
+        source.recipes.clear();
+        for route in &source.routes {
+            source
+                .selections
+                .insert((route.clone(), "q4".into(), 0), vec![BASE_SELECTION.into()]);
+            source
+                .selections
+                .insert((route.clone(), "q4".into(), 4), vec!["optimized".into()]);
+            for mode in &source.modes {
+                let configured = (mode == "reference").then(|| "overlay-a".to_string());
+                source.recipes.insert(
+                    (route.clone(), "q4".into(), mode.clone()),
+                    vec![
+                        CaptureRecipe {
+                            token: Some("recipe-z".into()),
+                            memory_class: Some("class-z".into()),
+                            configured_variant: configured.clone(),
+                            steps: 2,
+                            refusal: None,
+                        },
+                        CaptureRecipe {
+                            token: Some("recipe-a".into()),
+                            memory_class: Some("class-a".into()),
+                            configured_variant: configured,
+                            steps: 2,
+                            refusal: None,
+                        },
+                    ],
+                );
+            }
+        }
+        let grouping = Grouping {
+            architecture: &|_, _, _| "same-architecture".into(),
+            variant: &|_, _, mode, _, _| mode.into(),
+        };
+        let (families, coverage, cases) = representative_plan(&[source.clone()], &grouping);
+        assert_eq!(families.len(), 4, "two routes and two actual mode graphs");
+        assert_eq!(coverage.len(), 8, "both discovered settings in every graph");
+        assert!(coverage
+            .iter()
+            .all(|entry| entry.representative.as_deref() == Some("recipe-a")));
+        assert!(families
+            .iter()
+            .all(|family| family.recipe.as_deref() == Some("recipe-a")));
+        for family in &families {
+            for purpose in [Purpose::Resident, Purpose::Optimized] {
+                assert!(cases.iter().any(|case| case.purpose == purpose
+                    && (&case.case.provider, &case.case.route, &case.case.mode)
+                        == (&family.anchor.0, &family.anchor.1, &family.anchor.2)
+                    && case.case.recipe == family.recipe));
+            }
+        }
+        source
+            .recipes
+            .get_mut(&("base".into(), "q4".into(), "reference".into()))
+            .unwrap()
+            .push(CaptureRecipe {
+                token: Some("recipe-b".into()),
+                memory_class: Some("class-b".into()),
+                configured_variant: Some("overlay-b".into()),
+                steps: 2,
+                refusal: None,
+            });
+        let (split, coverage, _) = representative_plan(&[source.clone()], &grouping);
+        assert_eq!(
+            split.len(),
+            5,
+            "a different configured graph must not borrow an endpoint"
+        );
+        assert_eq!(coverage.len(), 9);
+        let mut with_tier = source;
+        with_tier
+            .selections
+            .insert(("base".into(), "q8".into(), 0), vec![BASE_SELECTION.into()]);
+        with_tier
+            .selections
+            .insert(("base".into(), "q8".into(), 4), vec!["optimized".into()]);
+        with_tier.recipes.insert(
+            ("base".into(), "q8".into(), "text".into()),
+            vec![CaptureRecipe {
+                token: Some("recipe-a".into()),
+                memory_class: Some("class-a".into()),
+                configured_variant: None,
+                steps: 2,
+                refusal: None,
+            }],
+        );
+        with_tier.recipes.insert(
+            ("base".into(), "q8".into(), "reference".into()),
+            vec![CaptureRecipe {
+                token: Some("recipe-a".into()),
+                memory_class: Some("class-a".into()),
+                configured_variant: Some("overlay-a".into()),
+                steps: 2,
+                refusal: None,
+            }],
+        );
+        assert_eq!(
+            representative_plan(&[with_tier], &grouping).0.len(),
+            7,
+            "a different loaded tier must not borrow an endpoint"
+        );
     }
 
     /// The campaign is the ANCHOR SHAPE, derived from the catalog: per FAMILY (architecture group

@@ -457,17 +457,97 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
         assert!(discovered.iter().any(|s| s.provider == r.provider_id));
     }
     let listing: Value = serde_json::from_str(&listing_with(None).unwrap()).unwrap();
-    assert_eq!(listing["schema"], 2);
+    assert_eq!(listing["schema"], 3);
     let listed = listing["cases"].as_array().unwrap();
-    assert_eq!(listed.len(), cases.len());
-    for (entry, planned) in listed.iter().zip(&cases) {
-        assert_eq!(entry["case"], planned.case.key());
-        assert_eq!(entry["purpose"], planned.purpose.label());
-        assert_eq!(entry["repeats"], planned.repeats);
-        assert_eq!(
-            Case::parse(entry["case"].as_str().unwrap()).unwrap(),
-            planned.case
-        );
+    assert!(
+        listed.len() < cases.len(),
+        "registered settings must not become a capture grid"
+    );
+    for entry in listed {
+        Case::parse(entry["case"].as_str().unwrap()).unwrap();
+    }
+    let mut expected = Vec::new();
+    for surface in &discovered {
+        for ((route, tier, mode), recipes) in &surface.recipes {
+            for recipe in recipes.iter().filter(|recipe| recipe.refusal.is_none()) {
+                expected.push(format!(
+                    "{:?}",
+                    (
+                        &surface.provider,
+                        route,
+                        tier,
+                        mode,
+                        &recipe.token,
+                        &recipe.memory_class,
+                        &recipe.configured_variant
+                    )
+                ));
+            }
+        }
+    }
+    let coverage = listing["recipe_coverage"].as_array().unwrap();
+    let mut actual = Vec::new();
+    for entry in coverage {
+        actual.push(format!(
+            "{:?}",
+            (
+                entry["provider"].as_str().unwrap(),
+                entry["route"].as_str().unwrap(),
+                entry["tier"].as_str().unwrap(),
+                entry["mode"].as_str().unwrap(),
+                entry["recipe"].as_str(),
+                entry["memory_class"].as_str(),
+                entry["configured_variant"].as_str()
+            )
+        ));
+        let family = listing["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|family| {
+                family["architecture"] == entry["architecture"]
+                    && family["tier"] == entry["tier"]
+                    && family["variant"] == entry["variant"]
+                    && family["sampling_recipe"] == entry["representative"]
+                    && family["members"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(format!(
+                            "{}/{}/{}",
+                            entry["provider"].as_str().unwrap(),
+                            entry["route"].as_str().unwrap(),
+                            entry["mode"].as_str().unwrap()
+                        )))
+            })
+            .expect("every accepted setting has a measured representative family");
+        for purpose in ["resident", "optimized"] {
+            assert!(listed.iter().any(|case| case["purpose"] == purpose
+                && Case::parse(case["case"].as_str().unwrap())
+                    .unwrap()
+                    .recipe
+                    .as_deref()
+                    == family["sampling_recipe"].as_str()
+                && case["case"].as_str().unwrap().starts_with(&format!(
+                    "{}/{}/{}/",
+                    entry["provider"].as_str().unwrap(),
+                    entry["route"].as_str().unwrap(),
+                    entry["tier"].as_str().unwrap()
+                ))
+                && Case::parse(case["case"].as_str().unwrap()).unwrap().mode
+                    == family["anchor"]
+                        .as_str()
+                        .unwrap()
+                        .rsplit_once('/')
+                        .unwrap()
+                        .1));
+        }
+    }
+    expected.sort();
+    expected.dedup();
+    actual.sort();
+    assert_eq!(actual.len(), expected.len(), "accepted setting count");
+    for (index, (found, wanted)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(found, wanted, "accepted setting mapping at index {index}");
     }
     for purpose in ["validation_steps", "validation_geometry"] {
         assert_eq!(

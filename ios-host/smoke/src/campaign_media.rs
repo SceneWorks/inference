@@ -482,11 +482,11 @@ fn architecture_group(
     Ok(runtime_ios::media::hex(&digest))
 }
 
-/// The campaign listing (schema 2): every planned ANCHOR case with its purpose and repeat count,
-/// and the anchor FAMILIES ([`campaign::plan`]) — derived from the actual runtime catalog. With
+/// The campaign listing (schema 3): every representative ANCHOR case with its purpose and repeat
+/// count, its empirical pressure groups, and coverage of every accepted registered recipe. With
 /// `IOS_CAMPAIGN_SNAPSHOTS=<dir of route/tier slots>` (the slots that will be pushed) families are
-/// grouped by architecture digest, so checkpoints of one architecture share anchors; without it,
-/// every route is its own family (weights-free, conservative).
+/// grouped by architecture digest. Empirical capture remains route-specific because admission
+/// verifies exact source inventory and route before sharing a measured endpoint across settings.
 pub fn listing() -> Result<String, String> {
     let snapshots = std::env::var_os("IOS_CAMPAIGN_SNAPSHOTS").map(PathBuf::from);
     #[cfg(target_os = "ios")]
@@ -562,7 +562,7 @@ pub fn listing_with(snapshots: Option<PathBuf>) -> Result<String, String> {
         architecture: &by_architecture,
         variant: &variant_of,
     };
-    let (families, planned) = campaign::plan(&surfaces, &grouping);
+    let (families, coverage, planned) = campaign::representative_plan(&surfaces, &grouping);
     // Visible, never silently dropped: every provider/route/tier it does not serve.
     let unserved: Vec<Value> = surfaces
         .iter()
@@ -578,10 +578,13 @@ pub fn listing_with(snapshots: Option<PathBuf>) -> Result<String, String> {
     let unserved_sampling: Vec<Value> = surfaces.iter().flat_map(|surface| surface.recipes.iter()
         .flat_map(move |((route, tier, mode), recipes)| recipes.iter().filter_map(move |recipe| recipe.refusal.as_ref()
             .map(|reason| json!({"provider":surface.provider,"route":route,"tier":tier,"mode":mode,"recipe":recipe.token,"memory_class":recipe.memory_class,"configured_variant":recipe.configured_variant,"reason":reason}))))).collect();
-    Ok(json!({"schema": 2,
+    Ok(json!({"schema": 3,
         "grouping": if snapshots.is_some() { "architecture" } else { "per_route" },
         "families": families.iter().map(|f| json!({"architecture": f.architecture, "tier": f.tier, "variant": f.variant, "sampling_recipe": f.recipe,
             "anchor": format!("{}/{}/{}", f.anchor.0, f.anchor.1, f.anchor.2), "members": f.members})).collect::<Vec<_>>(),
+        "recipe_coverage": coverage.iter().map(|c| json!({"architecture": c.architecture, "provider": c.provider, "route": c.route,
+            "tier": c.tier, "mode": c.mode, "recipe": c.recipe, "memory_class": c.memory_class,
+            "configured_variant": c.configured_variant, "variant": c.variant, "representative": c.representative})).collect::<Vec<_>>(),
         "unserved": unserved,
         "unserved_sampling": unserved_sampling,
         "cases": planned.iter().map(|p| json!({"case": p.case.key(), "purpose": p.purpose.label(), "repeats": p.repeats})).collect::<Vec<_>>(),

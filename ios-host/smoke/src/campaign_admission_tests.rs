@@ -817,6 +817,7 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
     let listing: Value = serde_json::from_str(&listing_with(None).unwrap()).unwrap();
     let families = listing["families"].as_array().unwrap();
     let cases = listing["cases"].as_array().unwrap();
+    let coverage = listing["recipe_coverage"].as_array().unwrap();
     let registered = surfaces(catalog.media()).unwrap();
     for tier in ["q4", "q8", "bf16"] {
         let mode_families = |provider: &str, mode: &str| {
@@ -828,26 +829,41 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
                 })
                 .collect();
             assert!(!homes.is_empty(), "{member} {tier}: mode omitted");
-            // The provider's accepted representative inventory is independent of the listing.
-            // One canonical representative per allocation/configuration class needs a family.
+            // Every actual accepted setting is mapped to a measured representative of its
+            // route/mode/configured graph, rather than becoming a capture-grid axis.
             let surface = registered.iter().find(|s| s.provider == provider).unwrap();
-            let mut representatives = std::collections::BTreeMap::new();
-            for recipe in &surface.recipes[&(provider.into(), tier.into(), mode.into())] {
-                if recipe.refusal.is_none() {
-                    representatives
-                        .entry((&recipe.memory_class, &recipe.configured_variant))
-                        .or_insert(recipe.token.as_deref());
-                }
-            }
-            let expected: std::collections::BTreeSet<_> =
-                representatives.values().copied().collect();
+            let expected: std::collections::BTreeSet<_> = surface.recipes
+                [&(provider.into(), tier.into(), mode.into())]
+                .iter()
+                .filter(|recipe| recipe.refusal.is_none())
+                .map(|recipe| recipe.token.as_deref())
+                .collect();
+            let covered: Vec<_> = coverage
+                .iter()
+                .filter(|item| {
+                    item["provider"] == provider
+                        && item["route"] == provider
+                        && item["tier"] == tier
+                        && item["mode"] == mode
+                })
+                .collect();
+            let mapped: std::collections::BTreeSet<_> =
+                covered.iter().map(|item| item["recipe"].as_str()).collect();
+            assert_eq!(
+                mapped, expected,
+                "{member} {tier}: discovered recipe omitted"
+            );
             let observed: std::collections::BTreeSet<_> = homes
                 .iter()
                 .map(|home| home["sampling_recipe"].as_str())
                 .collect();
+            let representatives: std::collections::BTreeSet<_> = covered
+                .iter()
+                .map(|item| item["representative"].as_str())
+                .collect();
             assert_eq!(
-                observed, expected,
-                "{member} {tier}: sampling class coverage"
+                observed, representatives,
+                "{member} {tier}: representative coverage"
             );
             assert_eq!(
                 homes.len(),
@@ -901,9 +917,14 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
             controls.push(control);
             inits.push(init);
         }
-        // Accepted control kinds share topology, while an actual init image is a different graph.
-        assert!(controls.windows(2).all(|pair| pair[0] == pair[1]));
-        assert!(inits.windows(2).all(|pair| pair[0] == pair[1]));
+        // Accepted control kinds share topology but retain separate actual mode captures;
+        // an init image is a different graph.
+        assert!(controls
+            .windows(2)
+            .all(|pair| variants(&pair[0]) == variants(&pair[1])));
+        assert!(inits
+            .windows(2)
+            .all(|pair| variants(&pair[0]) == variants(&pair[1])));
         for family in controls.into_iter().chain(inits).flatten() {
             assert!(!family["members"]
                 .as_array()
