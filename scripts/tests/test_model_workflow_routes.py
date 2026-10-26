@@ -86,20 +86,39 @@ class ModelWorkflowRoutes(unittest.TestCase):
         for filename, name in (('model-inference-proofs.yml', 'prove'), ('real-weights.yml', 'model-proof-execute')):
             steps = document(filename)['jobs'][name]['steps']
             posix = next(step for step in steps if step.get('name') == 'Select Rustup proxies on Linux and macOS')
-            windows = next(step for step in steps if step.get('name') == 'Select Rustup proxies on Windows')
+            windows = next(step for step in steps if step.get('name') == 'Select real pinned Rust toolchain on Windows')
             report = next(step for step in steps if step.get('name') == 'Report actual host and pinned toolchain (no model execution)')
             self.assertEqual(posix['if'], "runner.os != 'Windows'")
             self.assertEqual(windows['if'], "runner.os == 'Windows'")
-            self.assertEqual(windows['shell'], 'cmd')
-            self.assertIn('(cargo rustc rustup)', windows['run'])
-            self.assertIn('if not exist', windows['run'])
-            self.assertIn('%GITHUB_PATH%', windows['run'])
+            self.assertEqual(windows['shell'], 'powershell')
+            self.assertIn('rust-toolchain.toml', windows['run'])
+            self.assertIn("@('cargo', 'rustc')", windows['run'])
+            self.assertIn('MODEL_PROOF_RUST_BIN=', windows['run'])
+            self.assertIn('$env:GITHUB_PATH', windows['run'])
+            self.assertNotIn('CARGO_HOME', windows['run'])
             self.assertLess(steps.index(posix), steps.index(report))
             self.assertLess(steps.index(windows), steps.index(report))
-            self.assertIn('cargo --version', report['run'])
-            self.assertIn('rustc --version', report['run'])
+            self.assertIn('cargo --version --verbose', report['run'])
+            self.assertIn('rustc -vV', report['run'])
+            self.assertIn('command -v cargo', report['run'])
+            self.assertIn('command -v rustc', report['run'])
             selected.append((posix, windows))
         self.assertEqual(selected[0], selected[1])
+
+    def test_bridge_preserves_iris_asset_setup_from_validated_plan(self):
+        bridge = document('real-weights.yml')['jobs']
+        dedicated = document('model-inference-proofs.yml')['jobs']['prove']
+        plan = next(step for step in bridge['model-proof-plan']['steps'] if step.get('id') == 'plan')
+        self.assertIn('"asset_setup":p["asset_setup"]', plan['run'])
+        steps = bridge['model-proof-execute']['steps']
+        for platform, backend in (('macOS', 'mlx'), ('Windows', 'candle-cuda')):
+            step = next(step for step in steps if step.get('name') ==
+                        f'Verify pinned Iris quant snapshots on {"the secondary Mac" if platform == "macOS" else "Windows"}')
+            self.assertIn("matrix.asset_setup == 'iris-quant'", step['if'])
+            self.assertIn(f'--backend {backend}', step['run'])
+            self.assertEqual(step, next(item for item in dedicated['steps'] if item.get('name') == step['name']))
+            self.assertLess(steps.index(step), next(i for i, item in enumerate(steps)
+                              if item.get('name', '').startswith('Run exact registered model tests')))
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX shell mock; Windows selector is source-checked')
     def test_rustup_selection_precedes_shadow_tools_and_rejects_missing_proxy(self):

@@ -6567,7 +6567,7 @@ jobs:
           "$REVIEWED_PYTHON" -I scripts/ci/model_inference_proofs.py --plan \
             --binding-env MODEL_PROOF_BINDING \
             --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
-          "$REVIEWED_PYTHON" -I -c 'import json,os; p=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"model-proof-plan.json"),encoding="utf-8")); matrix={"include":[{"runner":p["runner"]}]}; open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8").write("matrix="+json.dumps(matrix,separators=(",",":"))+"\nbackend="+p["backend"]+"\nrequest="+json.dumps(p["request"],separators=(",",":"))+"\n")'
+          "$REVIEWED_PYTHON" -I -c 'import json,os; p=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"model-proof-plan.json"),encoding="utf-8")); matrix={"include":[{"runner":p["runner"],"asset_setup":p["asset_setup"]}]}; open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8").write("matrix="+json.dumps(matrix,separators=(",",":"))+"\nbackend="+p["backend"]+"\nrequest="+json.dumps(p["request"],separators=(",",":"))+"\n")'
 
   model-proof-execute:
     name: Explicit ${{ needs.model-proof-plan.outputs.backend }} model tests
@@ -6641,25 +6641,49 @@ jobs:
           RUSTUP_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
           for tool in cargo rustc rustup; do test -x "$RUSTUP_BIN/$tool"; done
           printf '%s\n' "$RUSTUP_BIN" >> "$GITHUB_PATH"
-      - name: Select Rustup proxies on Windows
+      - name: Select real pinned Rust toolchain on Windows
         if: runner.os == 'Windows'
-        shell: cmd
+        shell: powershell
         run: |
-          if not defined CARGO_HOME set "CARGO_HOME=%USERPROFILE%\.cargo"
-          for %%T in (cargo rustc rustup) do if not exist "%CARGO_HOME%\bin\%%T.exe" exit /b 1
-          echo %CARGO_HOME%\bin>>"%GITHUB_PATH%"
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"([^"]+)"$' | Select-Object -First 1).Matches.Groups[1].Value
+          if (-not $channel) { throw 'Repository Rust toolchain pin is missing' }
+          $home = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
+          $bin = Join-Path $home "toolchains\${channel}-x86_64-pc-windows-msvc\bin"
+          foreach ($tool in @('cargo', 'rustc')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $bin "$tool.exe") -PathType Leaf)) {
+              throw "Real pinned Windows toolchain is missing $tool.exe under $bin"
+            }
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "MODEL_PROOF_RUST_BIN=$bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
       - name: Report actual host and pinned toolchain (no model execution)
         shell: bash
         run: |
-          rustup show
-          cargo --version
-          rustc --version
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            printf 'Rust bin: %s\nCargo cache: %s\n' "$MODEL_PROOF_RUST_BIN" "$CARGO_HOME"
+            command -v cargo
+            command -v rustc
+          else
+            rustup show
+          fi
+          cargo --version --verbose
+          rustc -vV
           hostname
           df -h .
       - name: Require Python 3.12 on macOS
         if: runner.os == 'macOS'
         shell: bash
         run: command -v python3.12
+      - name: Verify pinned Iris quant snapshots on the secondary Mac
+        if: matrix.asset_setup == 'iris-quant' && runner.os == 'macOS'
+        shell: bash
+        run: python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
+      - name: Verify pinned Iris quant snapshots on Windows
+        if: matrix.asset_setup == 'iris-quant' && runner.os == 'Windows'
+        shell: cmd
+        env:
+          CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
       - name: Run exact registered model tests under external guards (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash

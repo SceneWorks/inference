@@ -767,6 +767,8 @@ def verified_toolchain(env: dict[str, str], *, root: Path = ROOT) -> dict:
     override = env.get('RUSTUP_TOOLCHAIN')
     if override and override != channel:
         raise ValueError('RUSTUP_TOOLCHAIN differs from repository toolchain declaration')
+    if os.name == 'nt':
+        return verified_windows_toolchain(env, root, raw, channel, override)
     cargo_home = Path(env.get('CARGO_HOME') or str(Path.home() / '.cargo'))
     if not cargo_home.is_absolute():
         raise ValueError('Cargo home must be absolute for verified Rustup selection')
@@ -798,6 +800,43 @@ def verified_toolchain(env: dict[str, str], *, root: Path = ROOT) -> dict:
             'proxies': {name: str(path) for name, path in proxies.items()}, 'binaries': binaries,
             'cargo_version': inspect([str(proxies['cargo']), '--version', '--verbose']),
             'rustc_version': inspect([str(proxies['rustc']), '-vV'])}
+
+
+def verified_windows_toolchain(env: dict[str, str], root: Path, declaration: bytes,
+                               channel: str, override: str | None) -> dict:
+    """Use the real pinned toolchain; Windows listener CARGO_HOME is a bin-less cache."""
+    rustup_home = Path(env.get('RUSTUP_HOME') or str(Path(env['USERPROFILE']) / '.rustup'))
+    expected = rustup_home / 'toolchains' / f'{channel}-x86_64-pc-windows-msvc' / 'bin'
+    selected = Path(env.get('MODEL_PROOF_RUST_BIN', ''))
+    if not selected.is_absolute() or selected.resolve() != expected.resolve():
+        raise ValueError('selected Windows Rust bin differs from the pinned repository toolchain')
+    binaries = {tool: expected / f'{tool}.exe' for tool in ('cargo', 'rustc')}
+    if not all(path.is_file() and os.access(path, os.X_OK) for path in binaries.values()):
+        raise ValueError('real pinned Windows cargo/rustc binaries are missing')
+    env['PATH'] = str(expected) + os.pathsep + env.get('PATH', '')
+    for tool, path in binaries.items():
+        selected_tool = shutil.which(tool, path=env['PATH'])
+        if selected_tool is None or Path(selected_tool).resolve() != path.resolve():
+            raise ValueError('compiler PATH does not select the real pinned Windows toolchain: ' + tool)
+    for name in ('RUSTC', 'CARGO_BUILD_RUSTC'):
+        if env.get(name) and Path(env[name]).resolve() != binaries['rustc'].resolve():
+            raise ValueError(name + ' differs from verified repository toolchain compiler')
+    env['RUSTUP_TOOLCHAIN'] = channel
+    env['RUSTC'] = str(binaries['rustc'])
+
+    def inspect(tool: str, *args: str) -> str:
+        return subprocess.run([str(binaries[tool]), *args], cwd=root, env=env, check=True,
+                              capture_output=True, text=True, timeout=30, encoding='utf-8').stdout.strip()
+
+    cargo_version = inspect('cargo', '--version', '--verbose')
+    rustc_version = inspect('rustc', '-vV')
+    if not re.search(rf'(?m)^cargo {re.escape(channel)}\b', cargo_version) or not re.search(
+            rf'(?m)^release: {re.escape(channel)}$', rustc_version):
+        raise ValueError('real Windows toolchain version differs from repository pin')
+    return {'declaration': 'rust-toolchain.toml', 'declaration_sha256': hashlib.sha256(declaration).hexdigest(),
+            'channel': channel, 'inherited_rustup_toolchain': override,
+            'proxies': {}, 'binaries': {name: str(path) for name, path in binaries.items()},
+            'cargo_version': cargo_version, 'rustc_version': rustc_version}
 
 
 def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output: Path) -> int:

@@ -106,6 +106,64 @@ class Collector(unittest.TestCase):
                     proof.verified_toolchain({'RUSTUP_TOOLCHAIN': 'host-override'}, root=root)
                 command.assert_not_called()
 
+    def test_windows_toolchain_uses_real_pinned_binaries_without_listener_cache_proxies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            rustup_home = root / 'rustup'
+            bin_dir = rustup_home / 'toolchains/repository-channel-x86_64-pc-windows-msvc/bin'
+            bin_dir.mkdir(parents=True)
+            for tool in ('cargo', 'rustc'):
+                binary = bin_dir / f'{tool}.exe'
+                binary.write_text('MOCK; never executed', encoding='utf-8')
+                binary.chmod(0o755)
+            env = {'USERPROFILE': str(root), 'RUSTUP_HOME': str(rustup_home),
+                   'CARGO_HOME': str(root / 'listener-cache-without-bin'),
+                   'MODEL_PROOF_RUST_BIN': str(bin_dir), 'PATH': '/shadow'}
+            declaration = b'[toolchain]\nchannel = "repository-channel"\n'
+
+            def inspect(argv, **kwargs):
+                self.assertEqual(kwargs['env']['PATH'].split(os.pathsep)[0], str(bin_dir))
+                self.assertEqual(kwargs['env']['RUSTC'], str(bin_dir / 'rustc.exe'))
+                output = ('cargo repository-channel (mock)\n' if argv[0].endswith('cargo.exe')
+                          else 'rustc repository-channel (mock)\nrelease: repository-channel\n')
+                return subprocess.CompletedProcess(argv, 0, stdout=output)
+
+            with patch.object(proof.shutil, 'which', side_effect=lambda name, path: str(bin_dir / f'{name}.exe')), \
+                 patch.object(proof.subprocess, 'run', side_effect=inspect):
+                value = proof.verified_windows_toolchain(env, root, declaration, 'repository-channel', None)
+                self.assertEqual(value['binaries']['cargo'], str(bin_dir / 'cargo.exe'))
+                self.assertEqual(value['channel'], 'repository-channel')
+                self.assertEqual(env['CARGO_HOME'], str(root / 'listener-cache-without-bin'))
+                env['MODEL_PROOF_RUST_BIN'] = str(root / 'wrong-toolchain/bin')
+                with self.assertRaisesRegex(ValueError, 'differs from the pinned'):
+                    proof.verified_windows_toolchain(env, root, declaration, 'repository-channel', None)
+                env['MODEL_PROOF_RUST_BIN'] = str(bin_dir)
+                (bin_dir / 'rustc.exe').unlink()
+                with self.assertRaisesRegex(ValueError, 'binaries are missing'):
+                    proof.verified_windows_toolchain(env, root, declaration, 'repository-channel', None)
+
+    def test_windows_toolchain_rejects_reported_version_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            rustup_home = root / 'rustup'
+            bin_dir = rustup_home / 'toolchains/1.96.0-x86_64-pc-windows-msvc/bin'
+            bin_dir.mkdir(parents=True)
+            for tool in ('cargo', 'rustc'):
+                binary = bin_dir / f'{tool}.exe'
+                binary.write_text('MOCK; never executed', encoding='utf-8')
+                binary.chmod(0o755)
+            env = {'USERPROFILE': str(root), 'RUSTUP_HOME': str(rustup_home),
+                   'CARGO_HOME': str(root / 'listener-cache'), 'MODEL_PROOF_RUST_BIN': str(bin_dir),
+                   'PATH': '/shadow'}
+            def inspect(argv, **kwargs):
+                output = ('cargo 1.97.0 (mock)\n' if argv[0].endswith('cargo.exe')
+                          else 'rustc 1.96.0 (mock)\nrelease: 1.96.0\n')
+                return subprocess.CompletedProcess(argv, 0, stdout=output)
+            with patch.object(proof.shutil, 'which', side_effect=lambda name, path: str(bin_dir / f'{name}.exe')), \
+                 patch.object(proof.subprocess, 'run', side_effect=inspect):
+                with self.assertRaisesRegex(ValueError, 'version differs'):
+                    proof.verified_windows_toolchain(env, root, b'pin', '1.96.0', None)
+
     def test_bridge_accepts_only_fixed_backend_and_request_envelope(self):
         raw = json.dumps({'backend': 'mlx', 'request': request()})
         self.assertEqual(proof.binding(raw), ('mlx', request()))
