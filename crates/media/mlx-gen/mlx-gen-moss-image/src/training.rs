@@ -138,7 +138,7 @@ impl MossImageTrainer {
                 "MOSS trainer requires the exact unadapted Base/SFT checkpoint".into(),
             ));
         }
-        let sources = Sources::prepare(variant, spec)?;
+        let sources = Sources::selected(variant, spec, MossImageAcceleration::Off)?;
         Self::from_sources(variant, sources)
     }
     pub(crate) fn from_sources(variant: MossImageVariant, sources: Sources) -> Result<Self> {
@@ -1371,6 +1371,54 @@ impl LoadedTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn public_trainer_factories_require_backbone_before_shared_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("parent");
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&shared).unwrap();
+        let unrelated = root.join("prepared-literal");
+        std::fs::write(&unrelated, b"source identity only").unwrap();
+
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.clone()));
+            spec.components.insert(
+                MOSS_SHARED_SNAPSHOT_COMPONENT.into(),
+                gen_core::WeightsSource::Dir(shared.clone()),
+            );
+            spec.prepare_with_file_pins([gen_core::PinnedWeightsFile::pin(&unrelated).unwrap()])
+                .unwrap();
+
+            // Generation still defers the backbone until a request selects its acceleration.
+            let deferred = Sources::prepare(variant, &spec).err().unwrap().to_string();
+            assert!(
+                deferred.contains(
+                    &shared
+                        .join("text_encoder/config.json")
+                        .display()
+                        .to_string()
+                ),
+                "{variant:?}: {deferred}"
+            );
+
+            // Exercise the actual registry factories, not synthetic from_sources fixtures.
+            // Missing prepared identity fails before a header read, device query or model load.
+            EAGER_LOAD_ENTRIES.with(|entries| entries.set(0));
+            let result = match variant {
+                MossImageVariant::Base => load_base(&spec),
+                MossImageVariant::Sft => load_sft(&spec),
+            };
+            let error = result.err().expect("backbone pin is absent").to_string();
+            assert!(error.contains("prepared MOSS identity missing"), "{error}");
+            assert!(
+                error.contains(&root.join("transformer/config.json").display().to_string()),
+                "{variant:?}: {error}"
+            );
+            EAGER_LOAD_ENTRIES.with(|entries| assert_eq!(entries.get(), 0));
+        }
+    }
+
     #[test]
     fn image_token_normalization_preserves_different_bucket_areas() {
         let _device = crate::cpu_test_device();
