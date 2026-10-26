@@ -22,12 +22,12 @@
 //! [`dequant_packed_base`] is the reconstruction the merge uses to build a mergeable dense base off the
 //! packed triple.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use candle_gen::gen_core::checkpoint_codec::{
-    LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt, NVFP4_CODEC,
+    LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt, MXFP8_CODEC, NVFP4_CODEC,
 };
 use candle_gen::gen_core::checkpoint_facts::CheckpointWeightFacts;
 use candle_gen::logical_weights::{
@@ -393,6 +393,11 @@ impl Weights {
         let logical_plan = plan_logical_weights(pinned_source.loader_path(), &mapping, &residency)
             .map_err(|error| Error::Msg(error.to_string()))?;
         let plain_int8 = validate_plain_int8_tensorwise(&st)?;
+        // A BLOCK-PADDED checkpoint (NVFP4, MXFP8) whose architecture's logical shape was never
+        // declared is NOT refused here: the plan stays legal, because a plan is also a *pricing*
+        // artifact (gen-core's rule — `nvfp4_read_refuses_an_undeclared_logical_shape` pins it),
+        // and the refusal belongs at materialization, where the padded grid would otherwise
+        // become real weights. The refusal names the architecture config the caller can supply.
         // The descriptor — resolved through the registered `nvfp4-v1` codec row — is the whole
         // authority on NVFP4-ness (sc-21482). Payload contracts (scale-buffer geometry, scale
         // values, packed byte counts) are enforced by the shared reader's codec decode when each
@@ -703,26 +708,6 @@ impl Weights {
         self.native_nvfp4
     }
 
-    /// Number of descriptor-declared NVFP4 projections in this checkpoint, counted from the
-    /// compiled plan (the codec is the classifier — sc-21482; the pre-plan version counted
-    /// `.weight_scale_2` keys structurally). Used by the exact native-key surface validator to
-    /// account for the two scale companions per packed model weight.
-    pub(crate) fn native_nvfp4_projection_count(&self) -> usize {
-        self.logical_plan()
-            .map(|plan| {
-                // Distinct PHYSICAL keys: `plan.tensors` is "not a set" (sc-21547) — an
-                // adapter-declared transform contributes one entry per logical output, all naming
-                // the same physical tensor, and the caller is accounting for on-disk companions.
-                plan.tensors
-                    .iter()
-                    .filter(|tensor| tensor.codec_id == NVFP4_CODEC.codec_id)
-                    .map(|tensor| tensor.physical_key.as_str())
-                    .collect::<BTreeSet<_>>()
-                    .len()
-            })
-            .unwrap_or(0)
-    }
-
     /// Whether this checkpoint is **native-mmdit-keyed** — its tensors are stored under the reference
     /// names, so `resolve` remaps every diffusers-key lookup to its native counterpart
     /// (sc-14022). True for BOTH the INT8-ConvRot export ([`from_convrot_file`](Self::from_convrot_file))
@@ -1000,11 +985,17 @@ impl Weights {
     /// for a ConvRot checkpoint). The overlay never changes a weight's shape, so the mmap is
     /// authoritative.
     pub fn shape(&self, name: &str) -> Option<Vec<usize>> {
-        // A native NVFP4 checkpoint's plan carries the LOGICAL shape of every row — the compiled
+        // A **block-padded** checkpoint's plan carries the LOGICAL shape of every row — the compiled
         // codec fact, not a `dtype == U8` storage guess (sc-21482) — so architecture validation
-        // sees the layer's true geometry rather than its packed byte grid.
-        if self.native_nvfp4 {
-            if let Some(tensor) = self.planned(name) {
+        // sees the layer's true geometry rather than its stored grid.
+        //
+        // This is true of every BLOCK-PADDED codec, not only of NVFP4: an MXFP8 row stores a
+        // 32-aligned grid that the decoder unpads to the declared logical shape, so comparing the
+        // padded grid against the architecture's shape is wrong for any genuinely padded MXFP8
+        // checkpoint (sc-27092). The other codecs (dense, scalar fp8, int8-per-row) store the
+        // logical grid unchanged, so their stored shape remains the truth.
+        if let Some(tensor) = self.planned(name) {
+            if is_block_padded_codec(tensor.codec_id) {
                 return Some(tensor.shape.clone());
             }
         }
@@ -1116,6 +1107,16 @@ impl Weights {
     }
 }
 
+/// Whether a codec id names a **block-padded** encoding — one whose stored grid is a padded
+/// superset of the layer's logical shape (NVFP4's byte-packed grid, MXFP8's 32-aligned grid), so
+/// the decoded tensor has a *different* shape than the stored one.
+///
+/// The other codecs (dense, scalar fp8, int8-per-row) store the logical grid unchanged, so for
+/// them the stored shape remains the truth and the plan's shape agrees with it.
+fn is_block_padded_codec(codec_id: &str) -> bool {
+    codec_id == NVFP4_CODEC.codec_id || codec_id == MXFP8_CODEC.codec_id
+}
+
 /// Validate the real data-section contract for a non-rotated ComfyUI int8-tensorwise checkpoint.
 ///
 /// The app-side detector can only see header dtypes and key names. That is enough to put a file in
@@ -1124,6 +1125,9 @@ impl Weights {
 /// Perform those checks here, before any projection is dequantized. A `convrot` field at all selects
 /// the distinct rotated convention and is rejected from this constructor rather than falling back to
 /// the old implicit group-size-256 ConvRot path.
+///
+/// A file whose descriptors declare a DIFFERENT convention (ComfyUI's scalar fp8) is not this
+/// constructor's file at all: it returns `Ok(false)` rather than claiming int8 for it.
 fn validate_plain_int8_tensorwise(st: &MmapedSafetensors) -> Result<bool> {
     let tensors = st.tensors();
     let int8_weights: Vec<String> = tensors
@@ -1141,10 +1145,23 @@ fn validate_plain_int8_tensorwise(st: &MmapedSafetensors) -> Result<bool> {
         if descriptors.is_empty() {
             return Ok(false);
         }
-        return Err(candle_gen::candle_core::Error::Msg(format!(
-            "krea plain int8: found {} `.comfy_quant` descriptor(s) but no I8 weight tensors",
-            descriptors.len()
-        )));
+        // A `.comfy_quant` descriptor does NOT by itself mean int8. The same marker rides ComfyUI's
+        // scalar fp8 exports (`float8_e4m3fn`), whose weights are `F8_E4M3` and whose companion is
+        // an `F32` per-tensor scale — a convention this loader does not own but the codec seam
+        // does. Claiming plain int8 for a file that declares another format is what made every
+        // fp8 Krea 2 export fail here with "found 256 `.comfy_quant` descriptor(s) but no I8
+        // weight tensors" (sc-27092). Read what the descriptors actually declare: only an
+        // `int8_tensorwise` descriptor makes this file an int8 file, and an int8 file with no `I8`
+        // weights is genuinely broken.
+        if descriptors_declare_int8_tensorwise(st, &descriptors)? {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: found {} `.comfy_quant` descriptor(s) but no I8 weight tensors",
+                descriptors.len()
+            )));
+        }
+        // Not an int8 file: another descriptor-gated convention owns these bytes. The compiled plan
+        // is the authority on which one.
+        return Ok(false);
     }
 
     for weight_key in &int8_weights {
@@ -1233,6 +1250,40 @@ fn validate_plain_int8_tensorwise(st: &MmapedSafetensors) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+/// Whether any `.comfy_quant` descriptor in the file declares the `int8_tensorwise` format.
+///
+/// The descriptor's `format` string is tensor *data*, invisible to the header-only app-side
+/// detector, so this is where the int8 convention is actually proven — and where a file that
+/// declares a *different* convention is recognised as not-int8 rather than refused as a broken
+/// int8 file (sc-27092).
+///
+/// An unreadable or malformed descriptor is a **refusal**, never a silent "not int8": the file
+/// claims a quantized convention this loader cannot verify, and treating it as something else
+/// would hand the codec seam bytes it may not own.
+fn descriptors_declare_int8_tensorwise(
+    st: &MmapedSafetensors,
+    descriptors: &[String],
+) -> Result<bool> {
+    let mut declares_int8 = false;
+    for descriptor_key in descriptors {
+        let descriptor = st.get(descriptor_key).map_err(|_| {
+            candle_gen::candle_core::Error::Msg(format!(
+                "krea plain int8: `{descriptor_key}` could not be read"
+            ))
+        })?;
+        let json: serde_json::Value =
+            serde_json::from_slice(descriptor.data()).map_err(|error| {
+                candle_gen::candle_core::Error::Msg(format!(
+                    "krea plain int8: `{descriptor_key}` is not valid JSON: {error}"
+                ))
+            })?;
+        if json.get("format").and_then(serde_json::Value::as_str) == Some("int8_tensorwise") {
+            declares_int8 = true;
+        }
+    }
+    Ok(declares_int8)
 }
 
 /// Validate the other side of the descriptor gate: the existing ConvRot constructor may only accept
