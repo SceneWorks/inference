@@ -719,13 +719,116 @@ class MossManualPolicyTests(unittest.TestCase):
                 if mode == "wrong-device": actual[0]["device_contract_observation"] = None
                 if mode == "wrong-source": actual[0]["source"] = {}
                 listing = "\n".join(name+": test" for name in profile.METAL_MODEL_TESTS)
+                packet, receipt = root / "packet.json", root / "receipt.json"
+                packet.write_text("{}", encoding="utf-8"); receipt.write_text("{}", encoding="utf-8")
+                reference = {"packet": str(packet), "packet_sha256": fixture.file_digest(packet),
+                             "receipt": str(receipt), "receipt_sha256": fixture.file_digest(receipt)}
                 with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH":str(event)}), mock.patch.object(profile, "venue", return_value={"head":"a"*40}), mock.patch.object(
                         fixture,"source_stamp",return_value=stamp), mock.patch.object(profile,"compile_binary",return_value=(root/"binary",{"binary_sha256":"c"*64})), mock.patch.object(
-                        profile,"supervise",return_value=listing), mock.patch.object(fixture,"CpuOwner") as owner, mock.patch.object(profile,"independent_tests",return_value=actual):
+                        profile,"supervise",return_value=listing), mock.patch.object(fixture,"CpuOwner") as owner, mock.patch.object(profile,"independent_tests",return_value=actual), mock.patch.object(
+                        profile,"generate_author_backward",return_value=reference) as generate:
                     owner.return_value.collect.return_value = {}
                     proof = profile.run_metal(root / "evidence")
+                    generate.assert_called_once_with(root / "evidence" / "author-backward")
                 self.assertEqual(proof["passed"], mode == "pass")
                 self.assertTrue(proof["source_restored"])
+
+    def test_backward_reference_controls_classify_zeros_subfloor_and_reject_zero_sign_substitution(self):
+        gradients = {f"layers.{layer}.proj.{projection}.lora_{factor}":
+                     {"values": [0., 1e-9, 0.75e-6, 1e-4, -1e-4]}
+                     for layer in range(3)
+                     for projection in ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
+                     for factor in ["a", "b"]}
+        coverage = profile.backward_gradient_coverage(gradients)
+        self.assertEqual(len(coverage), 36)
+        self.assertTrue(all(value == dict(elements=5, true_zero=1, subfloor=2,
+                                         zero_rejected=2, sign_rejected=3)
+                            for value in coverage.values()))
+        # Whole-group zero/sign mutations must be discriminated from reference;
+        # true zeros and values beneath the existing floor make no such claim.
+        for layer in (0, 2):
+            for factor in ("a", "b"):
+                values = [v for name, gradient in gradients.items()
+                          if name.startswith(f"layers.{layer}.") and name.endswith(".lora_"+factor)
+                          for v in gradient["values"]]
+                for mutated in ([0. for v in values], [-v for v in values]):
+                    self.assertFalse(all(abs(a-v) < 1e-6+abs(v)*.02 for a,v in zip(mutated, values)))
+        for invalid in ([], [float("nan")], [float("inf")]):
+            gradients["layers.0.proj.q.lora_a"] = {"values": invalid}
+            with self.assertRaises(UnitFailure): profile.backward_gradient_coverage(gradients)
+
+    def test_author_backward_generation_binds_hashes_runtime_and_owned_release_without_tensors(self):
+        import hashlib
+        for mode in ["pass", "packet-tampered", "generator-drift", "source-drift", "wrong-runtime",
+                     "missing-gradient", "frozen-changed", "unreleased", "bad-geometry",
+                     "bad-coverage", "insensitive-first-a", "insensitive-last-b"]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                inputs = root / "crates/contracts/gen-core/tests/fixtures/moss_image/tiny_author"
+                inputs.mkdir(parents=True)
+                for name in ["generate_fixture.py", "frozen_author_pipeline.py", "fixture.json"]:
+                    (inputs / name).write_text(name, encoding="utf-8")
+                python = root / "python"
+                python.write_text("never executed", encoding="utf-8")
+                output = root / "author-backward"
+                runtime = {"python": "3.12.10", "torch": "2.9.1", "diffusers": "0.38.0"}
+                if mode == "wrong-runtime": runtime["torch"] = "2.8.0"
+                factors = {f"layers.{layer}.proj.{projection}.lora_{factor}":
+                           {"values": [0.0, 1e-9, 0.0001, -0.0001]}
+                           for layer in range(3)
+                           for projection in ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
+                           for factor in ["a", "b"]}
+
+                def generate(argv, owner, log, **bounds):
+                    self.assertEqual(argv[:3], [str(python), "-B", str(inputs / "generate_fixture.py")])
+                    self.assertEqual(argv[3:], ["--backward-only", "--output-dir", str(output)])
+                    self.assertEqual(bounds["deadline"], 120.0)
+                    self.assertEqual(bounds["rss_cap"], 2 * 1024**3)
+                    self.assertEqual(bounds["env"]["CUDA_VISIBLE_DEVICES"], "")
+                    packet = {"kind": "moss-author-bf16-lora-backward-v1", "runtime": runtime,
+                              "source_sha256": fixture.file_digest(inputs / "frozen_author_pipeline.py"),
+                              "forward_fixture_sha256": fixture.file_digest(inputs / "fixture.json"),
+                              "factors": factors, "expected": {"gradients": dict(factors)},
+                              "config": dict(dim=128, ffn_dim=24, num_heads=1, num_layers=3,
+                                             text_dim=12, freq_dim=8, latent_channels=4, rope_base=10000.0),
+                              "inputs": {"latent": {"shape": [1,4,16,16]}, "context": {"shape": [1,21,12]}},
+                              "gradient_coverage": profile.backward_gradient_coverage(factors)}
+                    if mode == "missing-gradient": packet["expected"]["gradients"].pop("layers.0.proj.q.lora_a")
+                    if mode == "bad-geometry": packet["config"]["num_heads"] = 2
+                    if mode == "bad-coverage": packet["gradient_coverage"]["layers.0.proj.q.lora_a"]["true_zero"] = 0
+                    if mode.startswith("insensitive-"):
+                        layer, suffix = (0, ".lora_a") if mode == "insensitive-first-a" else (2, ".lora_b")
+                        for name, gradient in packet["expected"]["gradients"].items():
+                            if name.startswith(f"layers.{layer}.") and name.endswith(suffix):
+                                gradient["values"] = [0., 1e-10]
+                    packet_path = output / "backward_fixture.json"
+                    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+                    receipt = {"status": "PASS_CPU_SYNTHETIC_AUTHOR_BACKWARD", "runtime": runtime,
+                               "runtime_sha256": hashlib.sha256(json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                               "source_sha256": packet["source_sha256"],
+                               "forward_fixture_sha256": packet["forward_fixture_sha256"],
+                               "generator_sha256": fixture.file_digest(inputs / "generate_fixture.py"),
+                               "packet_sha256": fixture.file_digest(packet_path), "factor_tensors": 36,
+                               "device": "cpu", "threads": 1, "real_weights": False,
+                               "frozen_parameters_unchanged": True}
+                    if mode == "packet-tampered": packet_path.write_text("{}", encoding="utf-8")
+                    if mode == "generator-drift": receipt["generator_sha256"] = "0"*64
+                    if mode == "source-drift": receipt["source_sha256"] = "0"*64
+                    if mode == "frozen-changed": receipt["frozen_parameters_unchanged"] = False
+                    (output / "backward_receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+                    return "reference receipt"
+
+                with mock.patch.object(profile, "ROOT", root), mock.patch.dict(os.environ, {"MOSS_AUTHOR_PYTHON": str(python)}), mock.patch.object(
+                        profile, "supervise", side_effect=generate), mock.patch.object(fixture, "CpuOwner") as owner:
+                    owner.return_value.collect.return_value = {123: (1, 2)} if mode == "unreleased" else {}
+                    owner.return_value.peak = 1024
+                    if mode != "pass":
+                        with self.assertRaises(UnitFailure): profile.generate_author_backward(output)
+                    else:
+                        proof = profile.generate_author_backward(output)
+                        self.assertEqual(proof["packet_sha256"], fixture.file_digest(output / "backward_fixture.json"))
+                        self.assertEqual(proof["runtime"], runtime)
+                        self.assertTrue(proof["owned_released"])
 
 
 

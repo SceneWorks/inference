@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -413,6 +414,87 @@ def run(backend: str, directory: Path) -> dict:
     return evidence
 
 
+def backward_gradient_coverage(gradients: dict) -> dict:
+    """Reference-only zero/sign controls with the unchanged numerical bounds."""
+    coverage = {}
+    for name, gradient in gradients.items():
+        values = gradient.get("values", [])
+        if not values or any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in values):
+            raise UnitFailure("author gradient values missing/nonfinite")
+        zero_rejected = sum(abs(v) >= 1e-6 + abs(v)*0.02 for v in values)
+        sign_rejected = sum(abs(2*v) >= 1e-6 + abs(v)*0.02 for v in values)
+        true_zero = sum(v == 0 for v in values)
+        coverage[name] = dict(elements=len(values), true_zero=true_zero,
+                              subfloor=len(values)-true_zero-zero_rejected,
+                              zero_rejected=zero_rejected, sign_rejected=sign_rejected)
+    for layer in (0, 2):
+        for factor in ("a", "b"):
+            group = [value for name, value in coverage.items()
+                     if name.startswith(f"layers.{layer}.") and name.endswith(".lora_"+factor)]
+            if (len(group) != 6 or not sum(v["zero_rejected"] for v in group)
+                    or not sum(v["sign_rejected"] for v in group)):
+                raise UnitFailure("author first/last A/B gradient group lacks numerical sensitivity")
+    return coverage
+
+
+def generate_author_backward(directory: Path) -> dict:
+    """One independent CPU reference, under the existing owned-child guard."""
+    inputs = ROOT / "crates/contracts/gen-core/tests/fixtures/moss_image/tiny_author"
+    generator = inputs / "generate_fixture.py"
+    python = Path(os.environ.get("MOSS_AUTHOR_PYTHON", ""))
+    if not python.is_absolute() or not python.is_file():
+        raise UnitFailure("manual author Python must be an existing absolute interpreter")
+    directory.mkdir()
+    owner = fixture.CpuOwner()
+    started = time.monotonic()
+    environment = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES="",
+                       HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", OMP_NUM_THREADS="1",
+                       VECLIB_MAXIMUM_THREADS="1")
+    supervise([str(python), "-B", str(generator), "--backward-only", "--output-dir", str(directory)],
+              owner, directory / "generator.log", deadline=120.0, rss_cap=fixture.RSS_CAP,
+              env=environment)
+    if owner.collect():
+        raise UnitFailure("author reference owned-child release unproven")
+    receipt_path, packet_path = directory / "backward_receipt.json", directory / "backward_fixture.json"
+    for file in [receipt_path, packet_path]:
+        if file.is_symlink() or not file.is_file() or file.stat().st_size > 16 * 1024**2:
+            raise UnitFailure("author reference output missing/nonregular/oversized")
+    receipt, packet = json.loads(receipt_path.read_text()), json.loads(packet_path.read_text())
+    runtime = receipt.get("runtime", {})
+    source_hash = fixture.file_digest(inputs / "frozen_author_pipeline.py")
+    forward_hash = fixture.file_digest(inputs / "fixture.json")
+    runtime_hash = hashlib.sha256(json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    expected = {"status": "PASS_CPU_SYNTHETIC_AUTHOR_BACKWARD", "source_sha256": source_hash,
+                "generator_sha256": fixture.file_digest(generator), "forward_fixture_sha256": forward_hash,
+                "packet_sha256": fixture.file_digest(packet_path), "runtime_sha256": runtime_hash,
+                "factor_tensors": 36, "device": "cpu", "threads": 1, "real_weights": False,
+                "frozen_parameters_unchanged": True}
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        raise UnitFailure("author reference receipt/hash binding differs")
+    if (runtime.get("torch") != "2.9.1" or runtime.get("diffusers") != "0.38.0"
+            or packet.get("runtime") != runtime or packet.get("source_sha256") != source_hash
+            or packet.get("forward_fixture_sha256") != forward_hash
+            or packet.get("kind") != "moss-author-bf16-lora-backward-v1"
+            or len(packet.get("factors", {})) != 36
+            or set(packet.get("factors", {})) != set(packet.get("expected", {}).get("gradients", {}))):
+        raise UnitFailure("author reference runtime/source/factor population differs")
+    geometry = dict(dim=128, ffn_dim=24, num_heads=1, num_layers=3, text_dim=12,
+                    freq_dim=8, latent_channels=4, rope_base=10000.0)
+    if (packet.get("config") != geometry
+            or packet.get("inputs", {}).get("latent", {}).get("shape") != [1, 4, 16, 16]
+            or packet.get("inputs", {}).get("context", {}).get("shape") != [1, 21, 12]):
+        raise UnitFailure("author backward head128/277-token geometry differs")
+    coverage = backward_gradient_coverage(packet["expected"]["gradients"])
+    if packet.get("gradient_coverage") != coverage:
+        raise UnitFailure("author gradient numerical coverage differs")
+    return {**expected, "runtime": runtime, "gradient_coverage": coverage, "packet": str(packet_path), "receipt": str(receipt_path),
+            "receipt_sha256": fixture.file_digest(receipt_path),
+            "interpreter_sha256": fixture.file_digest(python.resolve()),
+            "owned_released": True, "observed_peak_child_rss_bytes": owner.peak,
+            "observed_elapsed_seconds": time.monotonic()-started,
+            "configured_deadline_seconds": 120.0, "configured_rss_cap_bytes": fixture.RSS_CAP}
+
+
 def run_metal(directory: Path) -> dict:
     """Bounded default-Metal author/optimizer proofs; never enables unrelated lanes."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -438,6 +520,7 @@ def run_metal(directory: Path) -> dict:
         evidence["fixture_inputs"] = {str(path.relative_to(ROOT)): {"bytes": path.stat().st_size,
                                     "sha256": fixture.file_digest(path)}
                                      for path in [inputs / "fixture.json", inputs / "dmd_fixture.json"]}
+        evidence["author_backward"] = generate_author_backward(directory / "author-backward")
         binary, evidence["compiler"] = compile_binary("mlx", directory / "baseline.json")
         owner = fixture.CpuOwner()  # POSIX owned-process/RSS guard; does not select a device.
         listing = supervise([str(binary), "--list"], owner, directory / "unfiltered-list.log",
@@ -445,8 +528,23 @@ def run_metal(directory: Path) -> dict:
         names = [line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")]
         if owner.collect() or len(names) != len(set(names)) or not set(METAL_MODEL_TESTS).issubset(names):
             raise UnitFailure("Metal proof discovery or owned listing cleanup incomplete")
-        evidence["tests"] = independent_tests(binary, list(METAL_MODEL_TESTS), directory, "metal",
-                                               device_marker=METAL_DEVICE_MARKER)
+        packet = evidence["author_backward"]
+        environment = {"MOSS_AUTHOR_BACKWARD_PACKET": packet["packet"],
+                       "MOSS_AUTHOR_BACKWARD_PACKET_SHA256": packet["packet_sha256"]}
+        previous = {key: os.environ.get(key) for key in environment}
+        try:
+            os.environ.update(environment)
+            evidence["tests"] = independent_tests(binary, list(METAL_MODEL_TESTS), directory, "metal",
+                                                   device_marker=METAL_DEVICE_MARKER)
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        if (fixture.file_digest(Path(packet["packet"])) != packet["packet_sha256"]
+                or fixture.file_digest(Path(packet["receipt"])) != packet["receipt_sha256"]):
+            raise UnitFailure("author reference changed during native comparison")
         evidence["passed"] = ([r["test"] for r in evidence["tests"]] == list(METAL_MODEL_TESTS)
                               and all(r["status"] == "passed" and r["owned_released"]
                                       and r["source"] == baseline

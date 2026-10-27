@@ -3439,6 +3439,217 @@ mod training_graph_tests {
                 );
             }
         }
+        author_bf16_adapter_backward_packet();
+    }
+
+    #[cfg(feature = "test-support")]
+    fn author_bf16_adapter_backward_packet() {
+        use mlx_gen::train::lora::LoraParams;
+        use sha2::{Digest, Sha256};
+        use std::{collections::BTreeSet, io::Read, rc::Rc};
+
+        // CI_IMPACT: one head128/277-token BF16 author/native comparison in
+        // this existing ignored Metal test; the manual profile owns CPU reference
+        // generation. No real weights, optimizer update, finite-difference BF16
+        // assumption, or new acceptance gate.
+        let path = std::env::var("MOSS_AUTHOR_BACKWARD_PACKET").expect("manual author packet path");
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .expect("manual author packet")
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .expect("read manual author packet");
+        assert!(bytes.len() <= 16 * 1024 * 1024, "oversized author packet");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            std::env::var("MOSS_AUTHOR_BACKWARD_PACKET_SHA256").expect("bound author packet hash")
+        );
+        let packet: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let original = fixture("ordinary");
+        assert_eq!(packet["schema"], 1);
+        assert_eq!(packet["kind"], "moss-author-bf16-lora-backward-v1");
+        assert_eq!(packet["source_sha256"], original["source_sha256"]);
+        assert_eq!(packet["runtime"]["torch"], "2.9.1");
+        assert_eq!(packet["runtime"]["diffusers"], "0.38.0");
+        assert_eq!(packet["device"], "cpu");
+        assert_eq!(packet["real_weights"], false);
+        assert_eq!(packet["frozen_parameters_unchanged"], true);
+        // Same frozen author definitions and deterministic weight fill, with one
+        // backward-only geometry. This does not prove full 24-head/3072-wide VJP.
+        assert_eq!(
+            packet["config"],
+            serde_json::json!({
+                "dim":128,"ffn_dim":24,"num_heads":1,"num_layers":3,"text_dim":12,
+                "freq_dim":8,"latent_channels":4,"rope_base":10000.0
+            })
+        );
+        assert_eq!(packet["rank"], 4);
+        assert_eq!(packet["alpha"], 6.0);
+        assert_eq!(packet["sigma"], 0.375);
+        assert_eq!(packet["gradient_checkpointing"], false);
+        let g = geometry(&packet);
+        let mut model =
+            Transformer::load(&weights(&packet["weights"], Dtype::Bfloat16), g.clone()).unwrap();
+        let frozen = model
+            .frozen_training_arrays()
+            .iter()
+            .map(read)
+            .collect::<Vec<_>>();
+        let paths = contract::target_paths(g.layers, &[]).unwrap();
+        let (targets, expected) = build_lora_targets(&mut model, &paths, 4, 1789).unwrap();
+        let mut params = LoraParams::new();
+        for (name, value) in packet["factors"].as_object().unwrap() {
+            assert_eq!(value["dtype"], "float32");
+            let parameter = array(value);
+            assert_eq!(parameter.shape(), expected[name.as_str()].shape());
+            assert!(read(&parameter).iter().all(|v| v.is_finite() && *v != 0.));
+            params.insert(Rc::from(name.as_str()), parameter);
+        }
+        assert_eq!(params.len(), 36);
+        assert_eq!(
+            params.keys().collect::<BTreeSet<_>>(),
+            expected.keys().collect()
+        );
+        let adapter = TrainAdapter::Lora { targets };
+        let inputs = &packet["inputs"];
+        assert_eq!(inputs["latent"]["dtype"], "float32");
+        assert_eq!(inputs["noise"]["dtype"], "float32");
+        assert_eq!(inputs["context"]["dtype"], "bfloat16");
+        assert_eq!(inputs["latent"]["shape"], serde_json::json!([1, 4, 16, 16]));
+        assert_eq!(inputs["context"]["shape"], serde_json::json!([1, 21, 12]));
+        let latent = array(&inputs["latent"]);
+        let noise = array(&inputs["noise"]);
+        let context = array(&inputs["context"]).as_dtype(Dtype::Bfloat16).unwrap();
+        let cancel = CancelFlag::new();
+        let cfg = TrainingConfig {
+            rank: 4,
+            alpha: 6.,
+            gradient_checkpointing: false,
+            loss_type: "mse".into(),
+            ..Default::default()
+        };
+        model
+            .install_training_adapter(&adapter, &params, 6., 4.)
+            .unwrap();
+        model.training = true;
+        let sample = add(
+            scale(&latent, 0.625).unwrap(),
+            scale(&noise, 0.375).unwrap(),
+        )
+        .unwrap();
+        let prediction = model
+            .forward(
+                &sample,
+                &[375.],
+                std::slice::from_ref(&context),
+                &[],
+                &cancel,
+            )
+            .unwrap();
+        let reference = &packet["expected"]["velocity"];
+        let expected_values: Vec<f32> =
+            serde_json::from_value(reference["values"].clone()).unwrap();
+        let expected_shape: Vec<i32> = serde_json::from_value(reference["shape"].clone()).unwrap();
+        let error = checked_delta(
+            &read(&prediction),
+            prediction.shape(),
+            &expected_values,
+            &expected_shape,
+        );
+        assert!(error < 1e-3, "adapted author BF16 forward max_abs={error}");
+        let (loss, grads) = crate::training::loss_grads(
+            &mut model, &params, &adapter, &cfg, &latent, &context, &noise, 0.375, None, &cancel,
+        )
+        .unwrap();
+        let expected_loss = packet["expected"]["loss"].as_f64().unwrap() as f32;
+        assert!(
+            expected_loss.is_finite() && (loss - expected_loss).abs() < 1e-3,
+            "adapted author BF16 loss {loss} != {expected_loss}"
+        );
+        let reference = packet["expected"]["gradients"].as_object().unwrap();
+        assert_eq!(
+            grads.keys().map(|k| k.as_ref()).collect::<BTreeSet<_>>(),
+            reference.keys().map(String::as_str).collect()
+        );
+        assert_eq!(grads.len(), 36);
+        // Compute controls from the independent reference alone, before native
+        // values. Exact zero and subfloor values remain compared, but we make no
+        // zero/sign discrimination claim for an insensitive entry/leaf.
+        let mut coverage = serde_json::Map::new();
+        for (name, expected) in reference {
+            let values: Vec<f64> = serde_json::from_value(expected["values"].clone()).unwrap();
+            assert!(!values.is_empty() && values.iter().all(|v| v.is_finite()));
+            let true_zero = values.iter().filter(|&&v| v == 0.).count();
+            let zero_rejected = values
+                .iter()
+                .filter(|&&v| v.abs() >= 1e-6 + v.abs() * 0.02)
+                .count();
+            let sign_rejected = values
+                .iter()
+                .filter(|&&v| (2. * v).abs() >= 1e-6 + v.abs() * 0.02)
+                .count();
+            coverage.insert(
+                name.clone(),
+                serde_json::json!({
+                    "elements":values.len(),"true_zero":true_zero,
+                    "subfloor":values.len()-true_zero-zero_rejected,
+                    "zero_rejected":zero_rejected,"sign_rejected":sign_rejected
+                }),
+            );
+        }
+        assert_eq!(
+            packet["gradient_coverage"],
+            serde_json::Value::Object(coverage.clone())
+        );
+        for layer in [0, 2] {
+            for factor in ["a", "b"] {
+                let group = coverage
+                    .iter()
+                    .filter(|(name, _)| {
+                        name.starts_with(&format!("layers.{layer}."))
+                            && name.ends_with(&format!(".lora_{factor}"))
+                    })
+                    .map(|(_, v)| v)
+                    .collect::<Vec<_>>();
+                assert_eq!(group.len(), 6);
+                for control in ["zero_rejected", "sign_rejected"] {
+                    assert!(
+                        group
+                            .iter()
+                            .map(|v| v[control].as_u64().unwrap())
+                            .sum::<u64>()
+                            > 0,
+                        "reference layer {layer} factor {factor} cannot reject {control} control"
+                    );
+                }
+            }
+        }
+        for (name, gradient) in &grads {
+            assert_eq!(gradient.dtype(), Dtype::Float32);
+            let expected = &reference[name.as_ref()];
+            assert_eq!(expected["dtype"], "float32");
+            let shape: Vec<i32> = serde_json::from_value(expected["shape"].clone()).unwrap();
+            assert_eq!(gradient.shape(), shape);
+            let values: Vec<f32> = serde_json::from_value(expected["values"].clone()).unwrap();
+            let actual = read(gradient);
+            assert_eq!(actual.len(), values.len());
+            for (index, (&actual, &expected)) in actual.iter().zip(&values).enumerate() {
+                assert!(
+                    actual.is_finite()
+                        && expected.is_finite()
+                        && (actual - expected).abs() < 1e-6 + expected.abs() * 0.02,
+                    "author BF16 gradient {name}[{index}]: native {actual} != author {expected}"
+                );
+            }
+        }
+        assert_eq!(
+            frozen,
+            model
+                .frozen_training_arrays()
+                .iter()
+                .map(read)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

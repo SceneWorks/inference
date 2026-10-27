@@ -699,6 +699,18 @@ jobs:
         with:
           shared-key: moss-metal-fixture
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Diagnostic branch only: independent author BF16 backward packet. No
+      # automatic lane, real weights, or permanent product dependency is added.
+      - name: Select Python for the bounded independent author reference
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12.10'
+      - name: Install only the explicit author reference runtime
+        timeout-minutes: 10
+        run: |
+          python3 -m venv "$RUNNER_TEMP/moss-author-runtime"
+          "$RUNNER_TEMP/moss-author-runtime/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: --retries 1 --timeout 30 'torch==2.9.1' 'diffusers==0.38.0'
+          echo "MOSS_AUTHOR_PYTHON=$RUNNER_TEMP/moss-author-runtime/bin/python" >> "$GITHUB_ENV"
       - name: Run only original Metal author model proofs
         env:
           MOSS_CPU_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
