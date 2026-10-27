@@ -1089,7 +1089,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertEqual(job["with"][key], "${{ fromJSON(inputs.ios_pricing_compile_binding)." + key + " }}")
         for key in diagnostic:
             self.assertEqual(job["with"][key],
-                             "${{ fromJSON(inputs.ios_pricing_compile_binding)." + key + " || '' }}")
+                             "${{ format('{0}', fromJSON(inputs.ios_pricing_compile_binding)." + key + ") }}")
         called = yaml.safe_load((REAL_WEIGHTS_WORKFLOW.parent / "ios-simulator-sana.yml").read_text(encoding="utf-8"))
         self.assertEqual(set(called.get("on", called.get(True))), {"workflow_call", "workflow_dispatch"})
         call_inputs = called.get("on", called.get(True))["workflow_call"]["inputs"]
@@ -1123,6 +1123,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         empty = {key: "" for key in diagnostic}
         self.assertTrue(all(not empty[key] for key in image_fields))
         self.assertFalse(any(empty[key] for key in recovery_fields))
+        # GitHub's format converts null to an empty string, but 0/false to nonempty
+        # strings. A malformed diagnostic carrier must reach recovery's validator,
+        # never silently become a normal weighted image request.
+        for malformed in (0, False):
+            converted = "false" if malformed is False else str(malformed)
+            malformed_fields = {key: converted if key == "diagnostic_run_id" else ""
+                                for key in diagnostic}
+            self.assertFalse(all(not malformed_fields[key] for key in image_fields))
+            self.assertTrue(any(malformed_fields[key] for key in recovery_fields))
         self.assertFalse(any("simctl" in step.get("run", "") or "run_smoke" in step.get("run", "")
                              for step in recovery["steps"]))
 

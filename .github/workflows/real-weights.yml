@@ -502,11 +502,11 @@ jobs:
       source_sha: ${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}
       simulator: ${{ fromJSON(inputs.ios_pricing_compile_binding).simulator }}
       snapshot: ${{ fromJSON(inputs.ios_pricing_compile_binding).snapshot }}
-      diagnostic_run_id: ${{ fromJSON(inputs.ios_pricing_compile_binding).diagnostic_run_id || '' }}
-      diagnostic_attempt: ${{ fromJSON(inputs.ios_pricing_compile_binding).diagnostic_attempt || '' }}
-      diagnostic_owned_udid: ${{ fromJSON(inputs.ios_pricing_compile_binding).diagnostic_owned_udid || '' }}
-      diagnostic_start_utc: ${{ fromJSON(inputs.ios_pricing_compile_binding).diagnostic_start_utc || '' }}
-      diagnostic_end_utc: ${{ fromJSON(inputs.ios_pricing_compile_binding).diagnostic_end_utc || '' }}
+      diagnostic_run_id: ${{ format('{0}', fromJSON(inputs.ios_pricing_compile_binding).diagnostic_run_id) }}
+      diagnostic_attempt: ${{ format('{0}', fromJSON(inputs.ios_pricing_compile_binding).diagnostic_attempt) }}
+      diagnostic_owned_udid: ${{ format('{0}', fromJSON(inputs.ios_pricing_compile_binding).diagnostic_owned_udid) }}
+      diagnostic_start_utc: ${{ format('{0}', fromJSON(inputs.ios_pricing_compile_binding).diagnostic_start_utc) }}
+      diagnostic_end_utc: ${{ format('{0}', fromJSON(inputs.ios_pricing_compile_binding).diagnostic_end_utc) }}
 
   ios-prequant:
     needs: validate-selection
