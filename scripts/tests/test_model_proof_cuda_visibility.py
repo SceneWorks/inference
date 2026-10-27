@@ -312,8 +312,8 @@ class ChildCudaVisibility(unittest.TestCase):
             self.assertTrue(claim['post_execution_verified'])
             self.assertEqual(claim['physical_index'], 1)
             self.assertEqual(claim['device_uuid'], APPROVED)
-            self.assertEqual(len(json.loads((output / 'model-proof-admission-samples.json').read_text())), 5)
-            self.assertEqual(len(json.loads((output / 'model-proof-release-samples.json').read_text())), 5)
+            self.assertEqual(len(json.loads((output / 'model-proof-admission-samples.json').read_text(encoding='utf-8'))), 5)
+            self.assertEqual(len(json.loads((output / 'model-proof-release-samples.json').read_text(encoding='utf-8'))), 5)
 
     def test_persistent_selected_gpu_utilization_rejects_after_bounded_retries(self):
         # CI_IMPACT: one controlled precheck plus five synthetic failed samples; never launches model work.
