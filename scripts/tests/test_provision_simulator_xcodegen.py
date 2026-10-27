@@ -65,7 +65,7 @@ class SimulatorProjectToolTests(unittest.TestCase):
 
     def test_prerequisite_follows_checkout_and_preserves_both_unsigned_runners(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ios-simulator-sana.yml').read_text(encoding='utf-8'))
-        job = workflow['jobs']['image']
+        job = workflow['jobs']['runtime-boundary']
         self.assertEqual(job['runs-on'], ['self-hosted', 'macOS', 'ARM64', 'nax'])
         steps = job['steps']
         checkout = next(i for i, step in enumerate(steps) if step.get('id') == 'checkout')
@@ -86,7 +86,7 @@ class SimulatorProjectToolTests(unittest.TestCase):
 
     def test_precheckout_failure_emits_cleanup_receipt_without_python_or_simctl(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ios-simulator-sana.yml').read_text(encoding='utf-8'))
-        cleanup = next(step for step in workflow['jobs']['image']['steps'] if step.get('name', '').startswith('Retire only'))
+        cleanup = next(step for step in workflow['jobs']['runtime-boundary']['steps'] if step.get('name', '').startswith('Retire only'))
         self.assertEqual(cleanup['if'], 'always()')
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, RUNNER_TEMP=directory, CHECKOUT_OUTCOME='skipped')
