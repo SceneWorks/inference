@@ -744,6 +744,8 @@ fn prepare_projections(
         )));
     }
 
+    let _activity =
+        crate::gen_core::LoadActivityScope::enter(crate::gen_core::LoadActivity::VerifyingFiles);
     let mut prepared = Vec::new();
     for base in bases {
         check_cancel(cancel)?;
@@ -1583,6 +1585,9 @@ fn validate_sidecar_counted(
 }
 
 fn validation_payload_digest(bytes: &[u8], cancel: Option<&CancelFlag>) -> Result<[u8; 32]> {
+    check_cancel(cancel)?;
+    let _activity =
+        crate::gen_core::LoadActivityScope::enter(crate::gen_core::LoadActivity::VerifyingFiles);
     let mut hash = Sha256::new();
     for chunk in bytes.chunks(HASH_CANCEL_CHUNK_BYTES) {
         check_cancel(cancel)?;
@@ -1975,6 +1980,11 @@ mod tests {
 
     #[test]
     fn unchanged_external_cache_warm_reopen_hashes_zero_bytes() -> Result<()> {
+        let activities = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = activities.clone();
+        let _observer = crate::gen_core::LoadActivityObserver::new(move |activity| {
+            captured.lock().unwrap().push(activity);
+        });
         let component = TestDir::new("external-warm-component");
         let external = TestDir::new("external-warm-root");
         let source_path = write_source(component.path(), 4, 0.0)?;
@@ -1994,6 +2004,11 @@ mod tests {
             external.path(),
         )?;
         assert!(first.cache_dir().starts_with(external.path()));
+        assert!(activities
+            .lock()
+            .unwrap()
+            .contains(&Some(crate::gen_core::LoadActivity::VerifyingFiles)));
+        activities.lock().unwrap().clear();
         let (_, warm) = PackedWeightSidecars::open_and_prepare_with_external_cache_root(
             std::slice::from_ref(&source_path),
             component.path(),
@@ -2004,6 +2019,10 @@ mod tests {
         assert_eq!(warm.source_bytes_hashed(), 0);
         assert_eq!(warm.payload_bytes_hashed(), 0);
         assert_eq!(warm.reused_count(), 1);
+        assert!(
+            activities.lock().unwrap().is_empty(),
+            "memo hits must not claim to verify files"
+        );
         Ok(())
     }
 

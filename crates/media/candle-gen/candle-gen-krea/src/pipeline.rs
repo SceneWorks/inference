@@ -573,6 +573,7 @@ pub(crate) fn load_text_quantized_for_request(
     quant: gen_core::Quant,
 ) -> Result<KreaText> {
     candle_gen::check_cancel(cancel)?;
+    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::TextEncoder);
     let vision_encoder_source = resolve_vision_encoder_source(root)?;
     let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
     let te_cfg = KreaTeConfig::qwen3_vl_4b();
@@ -607,6 +608,7 @@ fn load_text_cancelable(
     if let Some(cancel) = cancel {
         candle_gen::check_cancel(cancel)?;
     }
+    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::TextEncoder);
     let vision_encoder_source = resolve_vision_encoder_source(root)?;
     let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
 
@@ -654,6 +656,7 @@ fn load_heavy_cancelable(
     use_pid: bool,
     cancel: Option<&gen_core::CancelFlag>,
 ) -> Result<KreaHeavy> {
+    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::Renderer);
     let dit = load_dit_cancelable(root, device, adapters, false, cancel)?;
     check_optional_cancel(cancel)?;
     let vae = load_vae(root, device)?;
@@ -782,6 +785,7 @@ pub(crate) fn load_heavy_convrot(
     device: &Device,
     adapters: &[AdapterSpec],
 ) -> Result<KreaHeavy> {
+    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::Renderer);
     // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
     // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
     // building 32 MiB of workspace, reading two integers off it, and dropping it.
@@ -914,6 +918,7 @@ pub(crate) fn load_heavy_native_with(
     stream_blocks: bool,
     facts: &gen_core::CheckpointFactsSink,
 ) -> Result<KreaHeavy> {
+    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::Renderer);
     let dit = load_native_dit(
         root,
         native_dit,
@@ -1488,6 +1493,7 @@ pub(crate) fn maybe_apply_style_gain(context: Tensor, gain: Option<f32>) -> Resu
 /// seam every txt2img / img2img entry point shares (sc-11878). The negative (CFG-uncond) context is
 /// encoded without the gain, so the knob steers only the conditional prediction (matching the spike).
 fn encode_prompt_context(text: &KreaText, req: &GenerationRequest) -> Result<Tensor> {
+    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::EncodingPrompt);
     let context = text
         .te
         .forward(&text.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
@@ -2950,6 +2956,46 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn load_activity_names_real_component_work_and_unwinds_failed_loads() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let source = resolve_components_text_encoder(fixture.path(), None).unwrap();
+        let file = fixture.path().join("native.safetensors");
+        std::fs::write(&file, b"invalid transformer fixture").unwrap();
+        let pin = gen_core::PinnedWeightsFile::pin(&file).unwrap();
+        let activities = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = activities.clone();
+        let _observer = gen_core::LoadActivityObserver::new(move |activity| {
+            captured.lock().unwrap().push(activity);
+        });
+        assert!(load_text_with_source(fixture.path(), &source, &Device::Cpu).is_ok());
+        assert!(load_heavy_native_with(
+            fixture.path(),
+            &pin,
+            &Device::Cpu,
+            &[],
+            None,
+            false,
+            &gen_core::CheckpointFactsSink::new(),
+        )
+        .is_err());
+        assert_eq!(
+            *activities.lock().unwrap(),
+            [
+                Some(gen_core::LoadActivity::TextEncoder),
+                None,
+                Some(gen_core::LoadActivity::Renderer),
+                None,
+            ],
+            "metadata checks and component errors must not claim to hash model files"
+        );
+    }
 
     /// sc-21483: a Kitchen NVFP4 import admits low-rank **LoRA/LoKr** adapters (they ride as
     /// additive residuals over the packed base) and still refuses a **diff-patch**, which would
