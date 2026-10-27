@@ -157,6 +157,7 @@ jobs:
               --source-sha "$SOURCE_SHA" \
               --inventory "$RUNNER_TEMP/ios-simulator-sana/source-inventory.json" \
               --copied-inventory "$RUNNER_TEMP/ios-simulator-sana/copied-inventory.json" \
+              --owned-receipt "$RUNNER_TEMP/ios-simulator-sana/owned-simulator.json" \
               --policy scripts/ci/ios-simulator-sana-policy.json \
               --output "$RUNNER_TEMP/ios-simulator-sana/result"
       - name: Retire only this workflow attempt's disposable simulator

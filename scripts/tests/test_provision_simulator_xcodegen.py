@@ -79,6 +79,10 @@ class SimulatorProjectToolTests(unittest.TestCase):
         self.assertNotIn('brew install', yaml.safe_dump(workflow))
         create = next(i for i, step in enumerate(steps) if 'ios_simulator_sana_device.py create' in step.get('run', ''))
         self.assertLess(prerequisite, create)
+        execute = next(i for i, step in enumerate(steps) if 'ios_simulator_sana.py' in step.get('run', ''))
+        self.assertLess(create, execute)
+        self.assertIn('--owned-receipt "$RUNNER_TEMP/ios-simulator-sana/owned-simulator.json"',
+                      steps[execute]['run'])
 
     def test_precheckout_failure_emits_cleanup_receipt_without_python_or_simctl(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ios-simulator-sana.yml').read_text(encoding='utf-8'))

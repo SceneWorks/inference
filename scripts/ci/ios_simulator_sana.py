@@ -43,6 +43,42 @@ def require_dispatch(env: dict[str, str]) -> None:
         raise ValueError("RUNNER_NAME must be a provisioned Mac runner")
 
 
+def owned_booted_device(simulator: str, receipt_path: Path,
+                        env: dict[str, str]) -> tuple[str, dict]:
+    """Bind the booted UUID to this workflow attempt's disposable iPhone simulator."""
+    if receipt_path.is_symlink() or not receipt_path.is_file() or receipt_path.stat().st_size > 4096:
+        raise ValueError("owned simulator receipt missing or invalid")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    run_id, attempt = env.get("GITHUB_RUN_ID", ""), env.get("GITHUB_RUN_ATTEMPT", "")
+    name = f"SceneWorksSana-{run_id}-{attempt}"
+    if (not run_id.isdecimal() or not attempt.isdecimal()
+            or receipt.get("owned_udid") != simulator
+            or receipt.get("owned_name") != name
+            or receipt.get("run_id") != run_id or receipt.get("attempt") != attempt
+            or receipt.get("runner") != env.get("RUNNER_NAME")
+            or receipt.get("template_name") != env.get("SIMULATOR_SELECTOR")
+            or not isinstance(receipt.get("template_name"), str)
+            or not receipt["template_name"].startswith("iPhone ")
+            or not isinstance(receipt.get("template_udid"), str)
+            or not UDID.fullmatch(receipt["template_udid"])
+            or receipt["template_udid"].casefold() == simulator.casefold()
+            or not isinstance(receipt.get("device_type"), str)
+            or not receipt["device_type"].startswith("com.apple.CoreSimulator.SimDeviceType.iPhone-")
+            or not isinstance(receipt.get("runtime"), str)
+            or not re.fullmatch(r"com\.apple\.CoreSimulator\.SimRuntime\.iOS-\d+-\d+", receipt["runtime"])):
+        raise ValueError("owned simulator receipt does not match this workflow attempt")
+    devices = json.loads(command("xcrun", "simctl", "list", "devices", "booted", "--json"))["devices"]
+    matches = [(runtime, device) for runtime, rows in devices.items() for device in rows
+               if device.get("udid", "").casefold() == simulator.casefold()
+               and device.get("state") == "Booted" and device.get("isAvailable")
+               and device.get("name") == name
+               and device.get("deviceTypeIdentifier") == receipt.get("device_type")
+               and runtime == receipt.get("runtime")]
+    if len(matches) != 1:
+        raise ValueError("owned iPhone simulator is not uniquely booted with its receipt identity")
+    return matches[0]
+
+
 def policy_for_simulator(path: Path) -> safety.SafetyPolicy:
     policy = safety.load_policy(path)
     if (policy.backend != "darwin-mlx" or policy.deadline_seconds > 7200
@@ -168,14 +204,7 @@ def run(args: argparse.Namespace) -> int:
     app_info = plistlib.loads((app_dir / "Info.plist").read_bytes())
     if app_info.get("CFBundleIdentifier") != args.bundle_id:
         raise ValueError("installed simulator bundle identity mismatch")
-    devices = json.loads(command("xcrun", "simctl", "list", "devices", "booted", "--json"))["devices"]
-    matches = [(runtime, device) for runtime, rows in devices.items() for device in rows
-               if device["udid"].casefold() == args.simulator.casefold()
-               and device["state"] == "Booted" and device["isAvailable"]
-               and "iPhone" in device["name"]]
-    if len(matches) != 1:
-        raise ValueError("requested iPhone simulator is not uniquely booted and available")
-    runtime, device = matches[0]
+    runtime, device = owned_booted_device(args.simulator, args.owned_receipt, os.environ)
     executable = (app_dir / app_info["CFBundleExecutable"]).resolve()
     metallib = app_dir / "mlx.metallib"
     if not executable.is_file() or not metallib.is_file():
@@ -289,8 +318,8 @@ def run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    for flag in ("simulator", "bundle-id", "source-sha", "inventory", "copied-inventory", "policy", "output"):
-        parser.add_argument("--" + flag, required=True, type=Path if flag in ("inventory", "copied-inventory", "policy", "output") else str)
+    for flag in ("simulator", "bundle-id", "source-sha", "inventory", "copied-inventory", "owned-receipt", "policy", "output"):
+        parser.add_argument("--" + flag, required=True, type=Path if flag in ("inventory", "copied-inventory", "owned-receipt", "policy", "output") else str)
     args = parser.parse_args()
     try:
         return run(args)

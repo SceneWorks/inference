@@ -32,6 +32,47 @@ def png(row: bytes) -> bytes:
 
 
 class SimulatorSanaTests(unittest.TestCase):
+    def test_controller_accepts_only_this_attempts_booted_owned_iphone(self):
+        owned = '22222222-2222-2222-2222-222222222222'
+        template = '11111111-1111-1111-1111-111111111111'
+        runtime = 'com.apple.CoreSimulator.SimRuntime.iOS-26-5'
+        device_type = 'com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max'
+        receipt = {'owned_udid': owned, 'owned_name': 'SceneWorksSana-123-1',
+                   'template_udid': template, 'template_name': 'iPhone 17 Pro Max',
+                   'run_id': '123', 'attempt': '1', 'runner': 'nax-macos-2',
+                   'runtime': runtime, 'device_type': device_type}
+        booted = {'udid': owned, 'name': receipt['owned_name'], 'state': 'Booted',
+                  'isAvailable': True, 'deviceTypeIdentifier': device_type}
+        env = {'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1', 'RUNNER_NAME': 'nax-macos-2',
+               'SIMULATOR_SELECTOR': 'iPhone 17 Pro Max'}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'owned.json'
+            path.write_text(json.dumps(receipt), encoding='utf-8')
+            with patch.object(sim, 'command', return_value=json.dumps({'devices': {runtime: [booted]}})):
+                self.assertEqual(sim.owned_booted_device(owned, path, env), (runtime, booted))
+                # The old "iPhone" display-name selector rejected this real owned device.
+                with self.assertRaisesRegex(ValueError, 'receipt does not match'):
+                    sim.owned_booted_device(template, path, env)
+                with self.assertRaisesRegex(ValueError, 'receipt does not match'):
+                    sim.owned_booted_device(owned, path, {**env, 'GITHUB_RUN_ATTEMPT': '2'})
+                with self.assertRaisesRegex(ValueError, 'receipt does not match'):
+                    sim.owned_booted_device(owned, path, {**env, 'RUNNER_NAME': 'nax-macos'})
+                with self.assertRaisesRegex(ValueError, 'receipt does not match'):
+                    sim.owned_booted_device(owned, path, {**env, 'SIMULATOR_SELECTOR': 'iPhone 17'})
+            for altered in ({**booted, 'name': 'iPhone 17 Pro Max'},
+                            {**booted, 'deviceTypeIdentifier': 'other'},
+                            {**booted, 'state': 'Shutdown'},
+                            {**booted, 'isAvailable': False}):
+                with self.subTest(altered=altered), patch.object(sim, 'command', return_value=json.dumps({'devices': {runtime: [altered]}})):
+                    with self.assertRaisesRegex(ValueError, 'not uniquely booted'):
+                        sim.owned_booted_device(owned, path, env)
+            with patch.object(sim, 'command', return_value=json.dumps({'devices': {runtime: [booted, booted]}})):
+                with self.assertRaisesRegex(ValueError, 'not uniquely booted'):
+                    sim.owned_booted_device(owned, path, env)
+            with patch.object(sim, 'command', return_value=json.dumps({'devices': {'other': [booted]}})):
+                with self.assertRaisesRegex(ValueError, 'not uniquely booted'):
+                    sim.owned_booted_device(owned, path, env)
+
     def test_inventory_entrypoint_imports_under_workflow_isolation(self):
         script = str(sim.ROOT / 'scripts/ci/ios_simulator_sana_inventory.py')
         with tempfile.TemporaryDirectory() as directory:
