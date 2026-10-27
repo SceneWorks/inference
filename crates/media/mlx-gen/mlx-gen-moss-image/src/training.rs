@@ -2,9 +2,11 @@
 //! encoding are cached before functional autograd; only the explicit adapter-factor map is a leaf.
 #[cfg(feature = "test-support")]
 mod audit;
+mod optimizer;
 mod recovery;
 #[cfg(feature = "test-support")]
 use gen_core_testkit::moss_training_probe::{RunProbe, TrainingProbe};
+pub(crate) use optimizer::MossOptimizer as TrainOptimizer;
 
 use crate::training_memory::{
     self as admission, EstimateRequest, FootprintFacts, MemoryEstimate, Phase,
@@ -18,15 +20,12 @@ use mlx_gen::gen_core::{self, moss_image::*, moss_image_training as contract};
 use mlx_gen::train::{
     checkpoint,
     dataset::center_crop_square,
-    lora::{
-        accumulate_grads, adapter_optimizer_update, build_lokr_targets, build_lora_targets,
-        LoraParams, TrainAdapter,
-    },
+    lora::{accumulate_grads, build_lokr_targets, build_lora_targets, LoraParams, TrainAdapter},
     schedule::{lr_multiplier, schedule_updates},
 };
 use mlx_gen::{
-    CancelFlag, Error, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
-    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+    CancelFlag, Error, LoadSpec, Modality, NetworkType, Result, Trainer, TrainerDescriptor,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use mlx_gen_flux2::vae::{Flux2Vae, Flux2VaeDecoderConfig};
 use mlx_rs::error::{Exception, Result as MlxResult};
@@ -1160,7 +1159,7 @@ impl LoadedTrainer {
                     accumulated_tokens,
                 )?;
                 accumulated_tokens = 0;
-                adapter_optimizer_update(&mut opt, &mut params, &avg, c, update, c.seed)?;
+                opt.update(&mut params, &avg, c, update, c.seed)?;
                 update += 1;
             }
             #[cfg(feature = "test-support")]

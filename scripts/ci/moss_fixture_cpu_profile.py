@@ -73,6 +73,7 @@ CPU_MODEL_TESTS = {
     ),
 }
 METAL_MODEL_TESTS = (
+    'transformer::training_graph_tests::moss_adamw_bias_correction_resume_and_fixed_batch_descent',
     'transformer::author_fixture_tests::frozen_author_full_graph_ragged_masks_fp32_bf16_and_skipping',
     'transformer::author_fixture_tests::frozen_reference_unmerged_fp32_projection_and_three_step_dmd',
 )
@@ -413,7 +414,7 @@ def run(backend: str, directory: Path) -> dict:
 
 
 def run_metal(directory: Path) -> dict:
-    """Only the original default-Metal author proofs; never enables unrelated lanes."""
+    """Bounded default-Metal author/optimizer proofs; never enables unrelated lanes."""
     directory.mkdir(parents=True, exist_ok=True)
     evidence = {"profile": "moss-metal-fixture-v1", "backend": "mlx", "head": None,
                 "passed": False, "expected_tests": list(METAL_MODEL_TESTS),
