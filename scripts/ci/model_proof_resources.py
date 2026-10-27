@@ -82,9 +82,9 @@ def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[s
                                                                  for row in rows)}}
 
 
-def cuda_release_diagnostic(output: Path, uuid: str, physical_index: int, policy, baseline: dict) -> dict:
-    """Retain only bounded predicates from the release samples already collected by the guard."""
-    path = output / 'model-proof-release-samples.json'
+def cuda_sample_diagnostic(output: Path, phase: str, uuid: str, physical_index: int, policy, baseline: dict) -> dict:
+    """Retain only bounded predicates from samples already collected by the guard."""
+    path = output / f'{phase}-samples.json'
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
             return {'status': 'missing-or-over-budget'}
@@ -108,16 +108,60 @@ def cuda_release_diagnostic(output: Path, uuid: str, physical_index: int, policy
                 raise ValueError('malformed release inventory')
             observed = cuda_claim_diagnostic(uuid, devices, processes, policy)
             card = observed['selected_card']
+            matched = [device for device in devices if device.get('uuid') == uuid]
+            contexts_match = proof_cuda_contexts(uuid, processes) == baseline['process_identities']
+            index_matches = card is not None and card.get('index') == physical_index
             facts.append({'sample_number': sample.get('sample_number'),
                           'selected_card': card,
-                          'selected_index_matches_admission': card is not None and card.get('index') == physical_index,
+                          'selected_index_matches_admission': index_matches,
                           'selected_process_count': observed['selected_process_count'],
                           'selected_process_type_counts': observed['selected_process_type_counts'],
-                          'context_identities_match_admission': proof_cuda_contexts(uuid, processes) == baseline['process_identities'],
+                          'context_identities_match_admission': contexts_match,
+                          'transient_utilization_only': (len(matched) == 1 and index_matches and contexts_match
+                              and type(card.get('utilization_percent')) is int and card['utilization_percent'] > 0
+                              and proof_cuda_idle({**matched[0], 'utilization_percent': 0}, processes, policy)),
                           'predicates': observed['predicates']})
         return {'status': 'retained-existing-samples', 'sample_count': len(facts), 'samples': facts}
     except (OSError, UnicodeError, ValueError, TypeError, KeyError):
         return {'status': 'missing-or-malformed'}
+
+
+def cuda_release_diagnostic(output: Path, uuid: str, physical_index: int, policy, baseline: dict) -> dict:
+    return cuda_sample_diagnostic(output, 'model-proof-release', uuid, physical_index, policy, baseline)
+
+
+def settled_cuda_samples(probe, output: Path, phase: str, uuid: str, physical_index: int,
+                         policy, baseline: dict, deadline: float):
+    """Require five clean samples; retry only a bounded transient utilization reading."""
+    failed_attempts = []
+    for attempt in range(5):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f'CUDA settle deadline expired during {phase}')
+        try:
+            result = probe()
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f'CUDA settle deadline expired during {phase}')
+            return result
+        except RuntimeError as error:
+            diagnostic = cuda_sample_diagnostic(output, phase, uuid, physical_index, policy, baseline)
+            failed_attempts.append(diagnostic)
+            samples = diagnostic.get('samples', [])
+            transient = (str(error) == f'physical GPU occupied during {phase}' and samples
+                         and all(item['predicates']['proof_policy_headroom_and_inactive_contexts']
+                                 and item['selected_index_matches_admission']
+                                 and item['context_identities_match_admission'] for item in samples[:-1])
+                         and samples[-1]['transient_utilization_only'])
+            if not transient or attempt == 4 or time.monotonic() + 0.5 >= deadline:
+                error.cuda_settle_attempts = failed_attempts
+                raise
+            time.sleep(0.5)
+
+
+def cuda_settle_refusal(error: RuntimeError, diagnostic: dict) -> dict:
+    attempts = getattr(error, 'cuda_settle_attempts', None)
+    if attempts:
+        return {**diagnostic, 'settle_attempt_count': len(attempts), 'settle_attempts': attempts}
+    return diagnostic
 
 
 def validate_child_visibility(row: dict) -> None:
@@ -285,7 +329,10 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         idle_check = lambda device, rows: (device.get('uuid') == uuid and
                                            (required_index is None or device.get('index') == required_index) and
                                            proof_cuda_idle(device, rows, policy))
-        if len(matched) != 1 or not idle_check(matched[0], processes):
+        if (len(matched) != 1 or not idle_check(matched[0], processes)
+                and not (type(matched[0].get('utilization_percent')) is int
+                         and matched[0]['utilization_percent'] > 0
+                         and idle_check({**matched[0], 'utilization_percent': 0}, processes))):
             raise CudaClaimRejected(cuda_claim_diagnostic(uuid, devices, processes, policy))
         record = {'mechanism': 'existing PUBLIC/SceneWorks/gpu-locks UUID lock', 'device_uuid': uuid,
                   'physical_index': matched[0]['index'], 'runner': env.get('RUNNER_NAME'),
@@ -296,12 +343,20 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         # Reuse five fresh samples, with this proof's actual free reserve and child cap.
         context_baseline = {'uuid': uuid, 'reserved_baseline_mib': matched[0]['used_mib'],
                             'process_identities': proof_cuda_contexts(uuid, processes)}
+        settle_deadline = min(started + policy.deadline_seconds, time.monotonic() + 30)
         try:
-            selected, baseline = veda_cuda_guard.sample_baseline(
-                matched[0], output, 'model-proof-admission', context_baseline, idle_check=idle_check,
-                identity_key=proof_cuda_contexts, permit_bounded_growth=True)
+            selected, baseline = settled_cuda_samples(
+                lambda: veda_cuda_guard.sample_baseline(
+                    matched[0], output, 'model-proof-admission', context_baseline, idle_check=idle_check,
+                    identity_key=proof_cuda_contexts, permit_bounded_growth=True),
+                output, 'model-proof-admission', uuid, matched[0]['index'], policy, context_baseline,
+                settle_deadline)
         except RuntimeError as error:
-            raise ValueError('CUDA physical admission failed: ' + str(error)) from error
+            diagnostic = cuda_sample_diagnostic(output, 'model-proof-admission', uuid, matched[0]['index'], policy,
+                                                context_baseline)
+            raise CudaClaimRejected({**cuda_claim_diagnostic(uuid, devices, processes, policy),
+                                     'admission_samples': cuda_settle_refusal(error, diagnostic),
+                                     'admission_error': str(error)}) from error
         record['post_execution_verified'] = False
         record['admission_baseline'] = baseline
         (output / 'physical-execution-claim.json').write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
@@ -309,12 +364,17 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             yield record
         finally:
             try:
-                veda_cuda_guard.verify_idle(selected, output, 'model-proof-release', baseline,
-                                            idle_check=idle_check, identity_key=proof_cuda_contexts,
-                                            permit_bounded_growth=True)
+                settled_cuda_samples(
+                    lambda: veda_cuda_guard.verify_idle(
+                        selected, output, 'model-proof-release', baseline, idle_check=idle_check,
+                        identity_key=proof_cuda_contexts, permit_bounded_growth=True),
+                    output, 'model-proof-release', uuid, matched[0]['index'], policy, baseline,
+                    min(started + policy.deadline_seconds, time.monotonic() + 30))
             except RuntimeError as error:
                 raise CudaReleaseRejected('CUDA post-idle verification failed: ' + str(error),
-                                          cuda_release_diagnostic(output, uuid, matched[0]['index'], policy, baseline)) from error
+                                          cuda_settle_refusal(
+                                              error, cuda_release_diagnostic(output, uuid, matched[0]['index'], policy,
+                                                                             baseline))) from error
             record['post_execution_verified'] = True
     finally:
         if claimed:

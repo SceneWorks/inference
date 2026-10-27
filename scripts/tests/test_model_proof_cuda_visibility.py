@@ -10,7 +10,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -192,9 +192,6 @@ class ChildCudaVisibility(unittest.TestCase):
               'free_mib': 81919, 'utilization_percent': 0},
              [[APPROVED, '123', 'private.exe', 'C']], 'free_memory_above_policy_headroom'),
             ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
-              'free_mib': 97280, 'utilization_percent': 5},
-             [[APPROVED, '123', 'private.exe', 'C']], 'selected_gpu_zero_utilization'),
-            ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
               'free_mib': 97280, 'utilization_percent': 0},
              [[APPROVED, '123', 'private.exe', 'unknown']], 'selected_process_types_allowed'),
             ({'uuid': OTHER, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
@@ -283,15 +280,93 @@ class ChildCudaVisibility(unittest.TestCase):
             with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
                     patch.object(guard, 'inventory', return_value=([card], rows)), \
                     patch.object(guard, 'sample_baseline', return_value=(card, baseline)), \
-                    patch.object(guard, 'verify_idle', side_effect=refuse):
+                    patch.object(guard, 'verify_idle', side_effect=refuse), patch.object(guard.time, 'sleep'):
                 with self.assertRaises(resources.CudaReleaseRejected) as caught:
                     with resources.execution_claim('candle-cuda', GPU_POLICY, output, environment,
                                                    constraints={'required_cuda_physical_index': 1}) as claim:
                         self.assertFalse(claim['post_execution_verified'])
             self.assertFalse(claim['post_execution_verified'])
             self.assertEqual(caught.exception.diagnostic['sample_count'], 1)
+            self.assertEqual(caught.exception.diagnostic['settle_attempt_count'], 5)
             self.assertFalse(caught.exception.diagnostic['samples'][0]['predicates']['selected_gpu_zero_utilization'])
             self.assertNotIn('private-process-name', json.dumps(caught.exception.diagnostic))
+
+    def test_transient_selected_gpu_utilization_requires_five_clean_admission_and_release_samples(self):
+        # CI_IMPACT: mocked SMI snapshots prove bounded settle without learned work or device queries.
+        card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 0}
+        warm = dict(card, utilization_percent=2)
+        rows = [[APPROVED, '123', 'private-process-name', 'C']]
+        snapshots = [([warm], rows)] + [([card], rows)] * 5 + [([warm], rows)] + [([card], rows)] * 5
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner'}
+            fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
+            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_args: None)
+            with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
+                    patch.object(guard, 'inventory', side_effect=snapshots) as inventory, patch.object(guard.time, 'sleep'):
+                with resources.execution_claim('candle-cuda', GPU_POLICY, output, environment,
+                                               constraints={'required_cuda_physical_index': 1}) as claim:
+                    self.assertFalse(claim['post_execution_verified'])
+            self.assertEqual(inventory.call_count, 12)
+            self.assertTrue(claim['post_execution_verified'])
+            self.assertEqual(claim['physical_index'], 1)
+            self.assertEqual(claim['device_uuid'], APPROVED)
+            self.assertEqual(len(json.loads((output / 'model-proof-admission-samples.json').read_text())), 5)
+            self.assertEqual(len(json.loads((output / 'model-proof-release-samples.json').read_text())), 5)
+
+    def test_persistent_selected_gpu_utilization_rejects_after_bounded_retries(self):
+        # CI_IMPACT: one controlled precheck plus five synthetic failed samples; never launches model work.
+        warm = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 2}
+        rows = [[APPROVED, '123', 'private-process-name', 'C']]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner'}
+            fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
+            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_args: None)
+            with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
+                    patch.object(guard, 'inventory', return_value=([warm], rows)) as inventory, \
+                    patch.object(guard.time, 'sleep'):
+                with self.assertRaises(resources.CudaClaimRejected) as caught:
+                    with resources.execution_claim('candle-cuda', GPU_POLICY, output, environment,
+                                                   constraints={'required_cuda_physical_index': 1}):
+                        self.fail('persistent GPU activity must never execute model body')
+            self.assertEqual(inventory.call_count, 6)
+            self.assertEqual(caught.exception.diagnostic['admission_samples']['sample_count'], 1)
+            self.assertEqual(caught.exception.diagnostic['admission_samples']['settle_attempt_count'], 5)
+            self.assertTrue(caught.exception.diagnostic['admission_samples']['samples'][0]['transient_utilization_only'])
+
+    def test_settle_deadline_expires_without_additional_driver_probe(self):
+        # CI_IMPACT: pure deadline control; no driver, CUDA or model work.
+        probe = Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(RuntimeError, 'settle deadline expired'):
+                resources.settled_cuda_samples(probe, Path(temporary), 'model-proof-admission',
+                                               APPROVED, 1, GPU_POLICY, {'process_identities': []}, 0)
+        probe.assert_not_called()
+
+    def test_settle_never_retries_capacity_loss_or_unknown_context(self):
+        # CI_IMPACT: synthetic already-sampled refusals; no GPU or model work.
+        card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 0}
+        baseline = {'process_identities': [(APPROVED, '123', 'C')]}
+        for changed_card, rows in (
+            (dict(card, used_mib=15968, free_mib=81919), [[APPROVED, '123', 'opaque', 'C']]),
+            (card, [[APPROVED, '123', 'opaque', 'unknown']]),
+        ):
+            with self.subTest(card=changed_card, rows=rows), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary)
+                def refuse():
+                    (output / 'model-proof-release-samples.json').write_text(json.dumps([
+                        {'sample_number': 1, 'devices': [changed_card], 'processes': rows},
+                    ]), encoding='utf-8')
+                    raise RuntimeError('physical GPU occupied during model-proof-release')
+                probe = Mock(side_effect=refuse)
+                with self.assertRaisesRegex(RuntimeError, 'physical GPU occupied'):
+                    resources.settled_cuda_samples(probe, output, 'model-proof-release', APPROVED, 1,
+                                                   GPU_POLICY, baseline, 10**18)
+                probe.assert_called_once()
 
     def test_proof_admits_stable_inactive_gpu1_context_while_gpu0_is_busy(self):
         # CI_IMPACT: fake driver rows only; no CUDA, GPU query, model, or process execution.
