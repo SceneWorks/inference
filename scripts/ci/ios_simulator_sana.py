@@ -17,6 +17,7 @@ from pathlib import Path
 import plistlib
 import re
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -186,6 +187,37 @@ def png_pixels(path: Path) -> tuple[int, int, int, int, int]:
     return 256, 256, low, high, spatial_span
 
 
+def retain_failure_diagnostics(docs: Path, output: Path, policy: safety.SafetyPolicy,
+                               nonce: str, source_sha: str) -> None:
+    """Retain bounded app breadcrumbs before owned-simulator cleanup; never certify them."""
+    files = {}
+    for name, destination, cap in (("smoke-report.txt", "failure-report.txt", policy.stdout_cap_bytes),
+                                   ("sana-progress.txt", "failure-progress.txt", policy.stderr_cap_bytes)):
+        path = docs / name
+        try:
+            meta = path.lstat()
+            if not stat.S_ISREG(meta.st_mode) or meta.st_size > cap:
+                files[name] = "absent, nonregular, or over cap"
+                continue
+            with path.open("rb") as stream:
+                data = stream.read(cap + 1)
+            if len(data) > cap:
+                files[name] = "grew beyond cap during read"
+                continue
+            (output / destination).write_bytes(data)
+            files[name] = {"path": destination, "bytes": len(data),
+                           "sha256": hashlib.sha256(data).hexdigest()}
+            if name == "smoke-report.txt":
+                files[name]["nonce_seen"] = f"SIMULATOR_NONCE {nonce}\n".encode() in data
+                files[name]["source_seen"] = f"SOURCE_SHA {source_sha}\n".encode() in data
+        except OSError as error:
+            files[name] = f"unavailable: {type(error).__name__}"
+    (output / "failure-diagnostics.json").write_text(json.dumps({
+        "accepted": False, "claim": "diagnostic-only app breadcrumbs; no functional or phone-fit evidence",
+        "source_sha": source_sha, "nonce": nonce, "files": files,
+    }, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def run(args: argparse.Namespace) -> int:
     require_dispatch(os.environ)
     if not UDID.fullmatch(args.simulator) or not SHA.fullmatch(args.source_sha):
@@ -260,7 +292,7 @@ def run(args: argparse.Namespace) -> int:
         (docs / f"simulator-go-{nonce}").write_text(actual + "\n", encoding="utf-8")
         samples = []
         report_file = docs / "smoke-report.txt"
-        png_file = docs / "sana-256-tile128-SIMULATOR-FUNCTIONAL-ONLY.png"
+        png_file = docs / "sana-256-tile192-SIMULATOR-FUNCTIONAL-ONLY.png"
         while time.monotonic() - started < policy.deadline_seconds:
             if app_identity(pid) != claimed:
                 raise ValueError("owned simulator app PID exited or changed identity before verified report")
@@ -305,6 +337,11 @@ def run(args: argparse.Namespace) -> int:
             time.sleep(policy.poll_millis / 1000)
         raise ValueError("simulator app exceeded hard validation deadline")
     finally:
+        if args.output.is_dir() and not (args.output / "result.json").exists():
+            try:
+                retain_failure_diagnostics(docs, args.output, policy, nonce, actual)
+            except OSError:
+                pass  # Do not hide the primary refusal or delay owned-process cleanup.
         gate = docs / f"simulator-go-{nonce}"
         gate.unlink(missing_ok=True)
         if pid is not None and claimed is not None and app_identity(pid) == claimed:

@@ -1148,6 +1148,32 @@ fn append_breadcrumb(name: &str, line: &str) {
     }
 }
 
+#[cfg(feature = "media")]
+const SIMULATOR_SANA_TILE_EDGE: u32 = 192;
+
+#[cfg(feature = "media")]
+fn finish_image_generation(
+    name: &'static str,
+    simulator_functional: bool,
+    completed: usize,
+    expected: usize,
+    details: Vec<String>,
+) -> Check {
+    let passed = !simulator_functional || completed == expected;
+    Check {
+        name,
+        passed,
+        detail: if passed {
+            details.join(" | ")
+        } else {
+            format!(
+                "simulator functional image incomplete ({completed}/{expected} completed): {}",
+                details.join(" | ")
+            )
+        },
+    }
+}
+
 /// **E5: SANA image generation on device.** The deciding measurement for S5.2.
 ///
 /// The host harness (`mlx-gen-ios-catalog`'s `image_budget`) puts the sequential peak at 3294-4773
@@ -1289,9 +1315,9 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         false,
     )];
     const SIMULATOR: &[(&str, u32, Option<u32>, bool)] = &[(
-        "256 tile128 SIMULATOR FUNCTIONAL ONLY",
+        "256 tile192 SIMULATOR FUNCTIONAL ONLY",
         256,
-        Some(128),
+        Some(SIMULATOR_SANA_TILE_EDGE),
         false,
     )];
     let configs: &[(&str, u32, Option<u32>, bool)] = if simulator_functional {
@@ -1312,6 +1338,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     }
 
     let mut details: Vec<String> = Vec::new();
+    let mut completed = 0;
     for &(label, edge, tile, stage_eval) in configs {
         // The env var is now used for ONE thing: forcing whole-image.
         //
@@ -1338,8 +1365,9 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         }
 
         // E4: admission BEFORE any weight load, against runtime-ios's single cap constant and the
-        // headroom left in this process now. A refused configuration is the designed outcome, not
-        // a failure: it is recorded and the next one runs. The load itself goes through
+        // headroom left in this process now. A refused device configuration is recorded and the
+        // next one runs; the simulator's single functional configuration must complete. The load
+        // itself goes through
         // `runtime_ios::media::load_sana`, which re-admits, so admission is bound to the load
         // rather than only reported beside it. The diagnostic lane (`IOS_SMOKE_IMAGE_ONLY`)
         // deliberately bypasses admission — its whole purpose is to run configurations admission
@@ -1565,9 +1593,9 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 
             // Save it. The checks above prove the decode produced *content* (a wide pixel range);
             // only the image proves it produced the *right* content, and it is the artifact worth
-            // having — a render made on a phone. Written into Documents so `devicectl copy from`
-            // can pull it, named per configuration so neither overwrites the other. Best-effort:
-            // failing to encode a PNG must not fail the generation check.
+            // having — a render made on the selected target. Written into Documents for the
+            // device or simulator collector, named per configuration. The device PNG remains
+            // best-effort; the simulator functional witness requires it.
             if let Some(docs) = dirs_documents() {
                 let name = format!("sana-{}.png", label.replace(' ', "-"));
                 match image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()) {
@@ -1630,6 +1658,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 // configuration after this one" rather than as a mystery.
                 append_breadcrumb("sana-progress.txt", &detail);
                 details.push(detail);
+                completed += 1;
             }
             Err(e) => {
                 std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
@@ -1644,11 +1673,13 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     }
     std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
 
-    Check {
-        name: NAME,
-        passed: true,
-        detail: details.join(" | "),
-    }
+    finish_image_generation(
+        NAME,
+        simulator_functional,
+        completed,
+        configs.len(),
+        details,
+    )
 }
 
 /// The Z-Image Turbo lane (`--zimage`, sc-26433): one bounded device CAPTURE of a Z-Image campaign
@@ -1890,6 +1921,36 @@ pub unsafe extern "C" fn ios_smoke_free(ptr: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    /// CI_IMPACT: pure completion and provider-edge assertions; no model or Metal execution.
+    #[cfg(feature = "media")]
+    #[test]
+    fn simulator_image_requires_a_completed_served_decode() {
+        assert!(mlx_gen_sana::memory_strategy::DECODE_TILE_EDGES
+            .contains(&super::SIMULATOR_SANA_TILE_EDGE));
+        assert!(
+            mlx_gen_sana::memory_strategy::DECODE_TILE_EDGES_REJECTED.contains(&128),
+            "the failed simulator attempt selected this unserved tile"
+        );
+        let refused = super::finish_image_generation(
+            "SANA image generation (E5)",
+            true,
+            0,
+            1,
+            vec!["no candidate: selection is not executable".into()],
+        );
+        assert!(!refused.passed);
+        assert!(refused.detail.contains("0/1 completed"));
+        assert!(refused.detail.contains("no candidate"));
+        let rendered = super::finish_image_generation(
+            "SANA image generation (E5)",
+            true,
+            1,
+            1,
+            vec!["rendered".into()],
+        );
+        assert!(rendered.passed);
+    }
+
     #[test]
     fn campaign_public_entrypoint_rejects_bad_case_before_legacy_kernels() {
         let old_case = std::env::var_os("IOS_CAMPAIGN_CASE");

@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import subprocess
+from argparse import Namespace
 from pathlib import Path
 import struct
 import sys
@@ -32,6 +34,96 @@ def png(row: bytes) -> bytes:
 
 
 class SimulatorSanaTests(unittest.TestCase):
+    def test_missing_png_retains_fresh_report_before_owned_app_termination(self):
+        source, nonce = 'b' * 40, 'a' * 32
+        simulator = '22222222-2222-2222-2222-222222222222'
+        bundle = 'com.michaeltrefry.SceneWorksSmokeSim123a1'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, data, output = root / 'app', root / 'data', root / 'result'
+            app.mkdir()
+            docs = data / 'Documents'
+            (docs / 'sana').mkdir(parents=True)
+            (app / 'Info.plist').write_bytes(plistlib.dumps({
+                'CFBundleIdentifier': bundle, 'CFBundleExecutable': 'Smoke'}))
+            (app / 'Smoke').write_bytes(b'executable')
+            (app / 'mlx.metallib').write_bytes(b'metallib')
+            inventory = {'model': 'sana-1600m-mlx', 'inventory_sha256': 'c' * 64,
+                         'revision': 'd' * 40, 'files': []}
+            copied = {'source_inventory_sha256': inventory['inventory_sha256'],
+                      'revision': inventory['revision'], 'tier': 'bf16', 'files': [],
+                      'tier_inventory_sha256': sim.content_digest([])}
+            for name, value in [('inventory.json', inventory), ('copied.json', copied)]:
+                (root / name).write_text(json.dumps(value), encoding='utf-8')
+            args = Namespace(simulator=simulator, bundle_id=bundle, source_sha=source,
+                             inventory=root / 'inventory.json', copied_inventory=root / 'copied.json',
+                             owned_receipt=root / 'owned.json',
+                             policy=sim.ROOT / 'scripts/ci/ios-simulator-sana-policy.json', output=output)
+            calls = []
+
+            def command(*parts, timeout=20, env=None):
+                if parts[:2] == ('git', 'rev-parse'):
+                    return source
+                if parts[:4] == ('xcrun', 'simctl', 'get_app_container', simulator):
+                    return str(app if parts[-1] == 'app' else data)
+                if parts[:3] == ('xcrun', 'simctl', 'launch'):
+                    assert env is not None
+                    self.assertEqual(env['SIMCTL_CHILD_IOS_CAMPAIGN_BUILD_SHA'], source)
+                    (docs / 'smoke-report.txt').write_text(
+                        f'SMOKE: PASS\nSIMULATOR_NONCE {env["SIMCTL_CHILD_IOS_SIMULATOR_SANA_NONCE"]}\n'
+                        f'SOURCE_SHA {source}\n  [ok] SANA image generation (E5)\n'
+                        'SIMULATOR FUNCTIONAL ONLY; no phone admission, memory fit, or performance claim',
+                        encoding='utf-8')
+                    (docs / 'sana-progress.txt').write_text('no candidate: unserved tile128\n', encoding='utf-8')
+                    return bundle + ': 42'
+                if parts[:3] == ('xcrun', 'simctl', 'terminate'):
+                    self.assertTrue((output / 'failure-report.txt').is_file())
+                    calls.append('terminated after diagnostic copy')
+                    return ''
+                self.fail(f'unexpected command: {parts}')
+
+            with patch.dict(os.environ, {'RUNNER_NAME': 'nax-macos-2'}), \
+                 patch.object(sim, 'require_dispatch'), patch.object(sim, 'command', side_effect=command), \
+                 patch.object(sim, 'owned_booted_device', return_value=('iOS-26-5', {'name': 'SceneWorksSana-123-1'})), \
+                 patch.object(sim.safety, 'SystemProbe', return_value=object()), \
+                 patch.object(sim.safety, 'read_host', return_value=(32 * 1024**3, {})), \
+                 patch.object(sim.safety, 'proc_pid_rusage_footprint', return_value=(100, 100)), \
+                 patch.object(sim, 'app_identity', return_value=(str((app / 'Smoke').resolve()), 1)), \
+                 patch.object(sim.os, 'urandom', return_value=bytes.fromhex(nonce)):
+                with self.assertRaisesRegex(ValueError, 'no exact PNG'):
+                    sim.run(args)
+            self.assertEqual(calls, ['terminated after diagnostic copy'])
+            self.assertFalse((docs / ('simulator-go-' + nonce)).exists())
+            self.assertFalse((output / 'result.json').exists())
+            self.assertFalse(json.loads((output / 'failure-diagnostics.json').read_text(encoding='utf-8'))['accepted'])
+
+    def test_failed_simulator_report_and_progress_are_retained_only_as_bounded_diagnostics(self):
+        policy = sim.policy_for_simulator(sim.ROOT / 'scripts/ci/ios-simulator-sana-policy.json')
+        nonce, source = 'a' * 32, 'b' * 40
+        with tempfile.TemporaryDirectory() as directory:
+            docs, output = Path(directory) / 'Documents', Path(directory) / 'result'
+            docs.mkdir()
+            output.mkdir()
+            report = f'SMOKE: PASS\nSIMULATOR_NONCE {nonce}\nSOURCE_SHA {source}\n  [ok] SANA image generation (E5)\n'
+            (docs / 'smoke-report.txt').write_text(report, encoding='utf-8')
+            (docs / 'sana-progress.txt').write_text('no candidate: unserved tile128\n', encoding='utf-8')
+            sim.retain_failure_diagnostics(docs, output, policy, nonce, source)
+            receipt = json.loads((output / 'failure-diagnostics.json').read_text(encoding='utf-8'))
+            self.assertFalse(receipt['accepted'])
+            self.assertIn('diagnostic-only', receipt['claim'])
+            self.assertTrue(receipt['files']['smoke-report.txt']['nonce_seen'])
+            self.assertTrue(receipt['files']['smoke-report.txt']['source_seen'])
+            self.assertEqual((output / 'failure-report.txt').read_text(encoding='utf-8'), report)
+            self.assertIn('unserved tile128', (output / 'failure-progress.txt').read_text(encoding='utf-8'))
+            (docs / 'smoke-report.txt').unlink()
+            (docs / 'smoke-report.txt').symlink_to(docs / 'sana-progress.txt')
+            (docs / 'sana-progress.txt').write_bytes(b'x' * (policy.stderr_cap_bytes + 1))
+            second = Path(directory) / 'second'
+            second.mkdir()
+            sim.retain_failure_diagnostics(docs, second, policy, nonce, source)
+            self.assertFalse((second / 'failure-report.txt').exists())
+            self.assertFalse((second / 'failure-progress.txt').exists())
+
     def test_controller_accepts_only_this_attempts_booted_owned_iphone(self):
         owned = '22222222-2222-2222-2222-222222222222'
         template = '11111111-1111-1111-1111-111111111111'

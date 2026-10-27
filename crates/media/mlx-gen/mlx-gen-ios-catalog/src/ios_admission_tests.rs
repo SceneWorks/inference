@@ -4,8 +4,8 @@ use super::*;
 use crate::sdxl::tests::{admit_fixture_rows as admit_with_rows, budget, DEVICE};
 use mlx_gen::gen_core::iris::depth::{DepthOutput, IrisDepthEstimator};
 use mlx_gen::gen_core::{
-    GenerationOutput, Generator, Image, MemoryStrategy, Progress, Transform, TransformDescriptor,
-    WeightsSource,
+    GenerationOutput, Generator, Image, MemoryNumericTier, MemoryStrategy, Progress, Transform,
+    TransformDescriptor, WeightsSource,
 };
 use std::cell::Cell;
 use std::path::Path;
@@ -870,6 +870,59 @@ fn capture_permit_needs_bounded_quanta_not_evidence() {
     })
     .unwrap();
     assert_eq!(refused, Some(RefusalKind::Strategy));
+}
+
+/// CI_IMPACT: one CPU-only SANA candidate check using tiny safetensors headers; no tensors,
+/// generator load, Metal, or model inference. The manual workflow supplies the image witness.
+#[test]
+fn simulator_sana_tile_uses_the_served_provider_ladder() {
+    let registry = crate::provider_registry().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let spec = sana(root.path());
+    let contract = registry
+        .memory_strategy_contract("sana_1600m", &spec)
+        .unwrap()
+        .unwrap();
+    let tier = MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    };
+    let mut selected = contract
+        .representative_selection(MemoryStrategy::BoundedDecode, tier, false)
+        .unwrap();
+    let work = IosWork::Generate(GenerationRequest {
+        prompt: "a lighthouse on a rocky coast at dawn".into(),
+        width: 256,
+        height: 256,
+        count: 1,
+        steps: Some(4),
+        seed: Some(0),
+        ..Default::default()
+    });
+    selected.parameters.decode_tile_edge = Some(192);
+    let candidate = build_candidate(
+        &registry,
+        "sana_1600m",
+        spec.clone(),
+        Some(selected),
+        MemoryStrategy::BoundedDecode,
+        work.clone(),
+    )
+    .expect("simulator tile192 must reach permit construction");
+    validate_actual(&registry, &candidate).expect("simulator request must be served");
+    execution_key(&candidate).expect("simulator request must have an execution key");
+    selected.parameters.decode_tile_edge = Some(128);
+    let refusal = build_candidate(
+        &registry,
+        "sana_1600m",
+        spec,
+        Some(selected),
+        MemoryStrategy::BoundedDecode,
+        work,
+    )
+    .unwrap_err();
+    assert_eq!(refusal.refusal_kind(), Some(RefusalKind::Strategy));
 }
 
 /// CI_IMPACT: simulator-only metadata/permit check; no tensor or model execution. The manual
