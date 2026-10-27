@@ -245,7 +245,9 @@ class WindowsOwnerTests(unittest.TestCase):
     def assert_exited(self, name):
         from scripts.tests.test_media_campaign_supervisor import WindowsSupervisorTests
 
-        WindowsSupervisorTests._assert_exited(self, int((self.dir / name).read_text(encoding="ascii")))
+        # CI_IMPACT: fixture adapter only; preserve the same native process-death assertion.
+        pid = int((self.dir / name).read_text(encoding="ascii"))
+        self.assertTrue(WindowsSupervisorTests._has_exited(self, pid), f"owned process {pid} is still alive")
 
     def test_success_and_nonzero_exit(self):
         self.assertEqual(self.supervise("print('hello')").strip(), "hello")
