@@ -689,13 +689,14 @@ impl MossImageTrainer {
                 encoder
                     .frozen_training_tensors()
                     .map_err(|e| CandleError::Msg(e.to_string()))?,
+                &req.cancel,
             )?)
         } else {
             None
         };
         #[cfg(feature = "test-support")]
         let vae_before = if probe.is_some() {
-            Some(audit::digest(vae.frozen_training_tensors())?)
+            Some(audit::digest(vae.frozen_training_tensors(), &req.cancel)?)
         } else {
             None
         };
@@ -816,12 +817,13 @@ impl MossImageTrainer {
                     encoder
                         .frozen_training_tensors()
                         .map_err(|e| CandleError::Msg(e.to_string()))?,
+                    &req.cancel,
                 )?,
             )?;
             probe.frozen(
                 "vae",
                 vae_before.as_ref().expect("observed VAE"),
-                &audit::digest(vae.frozen_training_tensors())?,
+                &audit::digest(vae.frozen_training_tensors(), &req.cancel)?,
             )?;
             for context in contexts
                 .iter()
@@ -866,7 +868,7 @@ impl MossImageTrainer {
         #[cfg(feature = "test-support")]
         let base_before = frozen_base
             .as_ref()
-            .map(|values| audit::digest(values.iter().cloned()))
+            .map(|values| audit::digest(values.iter().cloned(), &req.cancel))
             .transpose()?;
         drop(weights);
         estimate
@@ -921,7 +923,7 @@ impl MossImageTrainer {
                 )?;
                 probe.record_run_start_export(&target, start, update, self.variant)?;
             }
-            let factors = audit::factors(&set)?;
+            let factors = audit::factors(&set, &req.cancel)?;
             let loss =
                 evaluation
                     .as_ref()
@@ -930,7 +932,7 @@ impl MossImageTrainer {
             let observation = evaluation
                 .as_ref()
                 .expect("heldout prepared")
-                .observation(loss)?;
+                .observation(loss, &req.cancel)?;
             probe.update(|r| {
                 r.factor_before = factors;
                 r.evaluation_before = Some(loss);
@@ -1143,11 +1145,11 @@ impl MossImageTrainer {
                     .as_ref()
                     .expect("heldout prepared")
                     .loss(&transformer, &set, req)?;
-            let factors = audit::factors(&set)?;
+            let factors = audit::factors(&set, &req.cancel)?;
             let observation = evaluation
                 .as_ref()
                 .expect("heldout prepared")
-                .observation(loss)?;
+                .observation(loss, &req.cancel)?;
             probe.update(|r| {
                 r.factor_after = factors;
                 r.evaluation_after = Some(loss);
@@ -1164,6 +1166,7 @@ impl MossImageTrainer {
                         .expect("observed backbone")
                         .iter()
                         .cloned(),
+                    &req.cancel,
                 )?,
             )?;
             if let Some(encoder) = &encoder {
@@ -1174,6 +1177,7 @@ impl MossImageTrainer {
                         encoder
                             .frozen_training_tensors()
                             .map_err(|e| CandleError::Msg(e.to_string()))?,
+                        &req.cancel,
                     )?,
                 )?;
             }
@@ -1181,7 +1185,7 @@ impl MossImageTrainer {
                 probe.frozen(
                     "vae",
                     vae_before.as_ref().expect("observed VAE"),
-                    &audit::digest(vae.frozen_training_tensors())?,
+                    &audit::digest(vae.frozen_training_tensors(), &req.cancel)?,
                 )?;
             }
         }

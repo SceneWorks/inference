@@ -1,27 +1,30 @@
 //! Explicit test-support/terminal acceptance observations from the actual native tensors.
 use super::*;
 use gen_core_testkit::moss_training_probe::{
-    EvaluationContentHasher, EvaluationObservation, EvaluationTensorDescriptor, RunProbe,
-    EVALUATION_CONTENT_ENCODING,
+    update_audit_f32_hash, EvaluationContentHasher, EvaluationObservation,
+    EvaluationTensorDescriptor, RunProbe, EVALUATION_CONTENT_ENCODING,
 };
 use sha2::{Digest, Sha256};
 const CHUNK: usize = 4_194_304;
 
-pub(super) fn digest(tensors: impl IntoIterator<Item = Tensor>) -> Result<String> {
+pub(super) fn digest(
+    tensors: impl IntoIterator<Item = Tensor>,
+    cancel: &CancelFlag,
+) -> Result<String> {
+    check_cancel(cancel)?;
     let mut hash = Sha256::new();
     for tensor in tensors {
+        check_cancel(cancel)?;
         hash.update(format!("{:?}:{:?};", tensor.dtype(), tensor.dims()).as_bytes());
         let flat = tensor.flatten_all()?;
         for start in (0..flat.elem_count()).step_by(CHUNK) {
+            check_cancel(cancel)?;
             let values = flat
                 .narrow(0, start, CHUNK.min(flat.elem_count() - start))?
                 .to_dtype(DType::F32)?
                 .to_vec1::<f32>()?;
-            let bytes = values
-                .into_iter()
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<_>>();
-            hash.update(&bytes);
+            check_cancel(cancel)?;
+            update_audit_f32_hash(&mut hash, &values, cancel)?;
         }
     }
     Ok(format!("{:x}", hash.finalize()))
@@ -31,10 +34,14 @@ pub(super) fn base_handles(weights: &candle_gen::weights::Weights) -> Result<Vec
     keys.sort();
     keys.into_iter().map(|key| weights.require(key)).collect()
 }
-pub(super) fn factors(set: &LoraSet) -> Result<String> {
+pub(super) fn factors(set: &LoraSet, cancel: &CancelFlag) -> Result<String> {
+    check_cancel(cancel)?;
     let mut named = set.named_vars();
     named.sort_by(|(a, _), (b, _)| a.cmp(b));
-    digest(named.into_iter().map(|(_, v)| v.as_tensor().clone()))
+    digest(
+        named.into_iter().map(|(_, v)| v.as_tensor().clone()),
+        cancel,
+    )
 }
 pub(super) fn gradients(probe: &RunProbe, gradients: &GradStore, set: &LoraSet) -> Result<()> {
     let mut finite = true;
@@ -130,15 +137,18 @@ pub(super) fn prepare(
     })
 }
 impl Evaluation {
-    fn descriptor(tensor: &Tensor) -> Result<EvaluationTensorDescriptor> {
+    fn descriptor(tensor: &Tensor, cancel: &CancelFlag) -> Result<EvaluationTensorDescriptor> {
+        check_cancel(cancel)?;
         let mut hash = EvaluationContentHasher::default();
         let flat = tensor.flatten_all()?;
         for start in (0..flat.elem_count()).step_by(CHUNK) {
+            check_cancel(cancel)?;
             let values = flat
                 .narrow(0, start, CHUNK.min(flat.elem_count() - start))?
                 .to_dtype(DType::F32)?
                 .to_vec1::<f32>()?;
-            hash.update(values);
+            check_cancel(cancel)?;
+            hash.update_cancellable(&values, cancel)?;
         }
         Ok(EvaluationTensorDescriptor {
             shape: tensor.dims().to_vec(),
@@ -148,17 +158,21 @@ impl Evaluation {
             content_sha256: hash.finish(),
         })
     }
-    pub(super) fn observation(&self, loss: f32) -> Result<EvaluationObservation> {
+    pub(super) fn observation(
+        &self,
+        loss: f32,
+        cancel: &CancelFlag,
+    ) -> Result<EvaluationObservation> {
         let mut tensors = std::collections::BTreeMap::new();
         for (name, tensor) in [
             ("latent", &self.latent),
             ("context", &self.context),
             ("noise", &self.noise),
         ] {
-            tensors.insert(name.into(), Self::descriptor(tensor)?);
+            tensors.insert(name.into(), Self::descriptor(tensor, cancel)?);
         }
         if let Some(mask) = &self.mask {
-            tensors.insert("mask".into(), Self::descriptor(mask)?);
+            tensors.insert("mask".into(), Self::descriptor(mask, cancel)?);
         }
         Ok(EvaluationObservation {
             tensors,
@@ -188,5 +202,24 @@ impl Evaluation {
             return Err(CandleError::Msg("heldout objective is nonfinite".into()));
         }
         Ok(loss)
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn precancelled_digest_never_requests_a_tensor() {
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let shared =
+            update_audit_f32_hash(&mut Sha256::new(), &[1.0], &cancel).map_err(CandleError::from);
+        assert!(matches!(shared, Err(CandleError::Canceled)));
+        let tensors = std::iter::from_fn(|| panic!("canceled audit must not touch tensor input"));
+        assert!(matches!(
+            digest(tensors, &cancel),
+            Err(CandleError::Canceled)
+        ));
     }
 }

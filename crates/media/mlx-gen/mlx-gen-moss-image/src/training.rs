@@ -838,7 +838,10 @@ impl LoadedTrainer {
 
         #[cfg(feature = "test-support")]
         let base_before = if probe.is_some() {
-            Some(audit::digest(self.transformer.frozen_training_arrays())?)
+            Some(audit::digest(
+                self.transformer.frozen_training_arrays(),
+                &req.cancel,
+            )?)
         } else {
             None
         };
@@ -849,6 +852,7 @@ impl LoadedTrainer {
                     .as_ref()
                     .expect("run encoder")
                     .frozen_training_arrays(),
+                &req.cancel,
             )?)
         } else {
             None
@@ -860,6 +864,7 @@ impl LoadedTrainer {
                     .as_ref()
                     .expect("run VAE")
                     .frozen_training_arrays()?,
+                &req.cancel,
             )?)
         } else {
             None
@@ -946,6 +951,7 @@ impl LoadedTrainer {
                         .as_ref()
                         .expect("run encoder")
                         .frozen_training_arrays(),
+                    &req.cancel,
                 )?,
             )?;
             probe.frozen(
@@ -956,6 +962,7 @@ impl LoadedTrainer {
                         .as_ref()
                         .expect("run VAE")
                         .frozen_training_arrays()?,
+                    &req.cancel,
                 )?,
             )?;
             for context in contexts
@@ -1042,7 +1049,7 @@ impl LoadedTrainer {
                 )?;
                 probe.record_run_start_export(&target, start, update, self.variant)?;
             }
-            let factors = audit::factors(&params)?;
+            let factors = audit::factors(&params, &req.cancel)?;
             let loss = evaluation.as_ref().expect("heldout prepared").loss(
                 &mut self.transformer,
                 &params,
@@ -1052,7 +1059,7 @@ impl LoadedTrainer {
             let observation = evaluation
                 .as_ref()
                 .expect("heldout prepared")
-                .observation(loss)?;
+                .observation(loss, &req.cancel)?;
             probe.update(|r| {
                 r.factor_before = factors;
                 r.evaluation_before = Some(loss);
@@ -1229,11 +1236,11 @@ impl LoadedTrainer {
                 &adapter,
                 req,
             )?;
-            let factors = audit::factors(&params)?;
+            let factors = audit::factors(&params, &req.cancel)?;
             let observation = evaluation
                 .as_ref()
                 .expect("heldout prepared")
-                .observation(loss)?;
+                .observation(loss, &req.cancel)?;
             probe.update(|r| {
                 r.factor_after = factors;
                 r.evaluation_after = Some(loss);
@@ -1244,20 +1251,20 @@ impl LoadedTrainer {
             probe.frozen(
                 "backbone",
                 base_before.as_ref().expect("observed backbone"),
-                &audit::digest(self.transformer.frozen_training_arrays())?,
+                &audit::digest(self.transformer.frozen_training_arrays(), &req.cancel)?,
             )?;
             if let Some(encoder) = &self.encoder {
                 probe.frozen(
                     "text_encoder",
                     te_before.as_ref().expect("observed encoder"),
-                    &audit::digest(encoder.frozen_training_arrays())?,
+                    &audit::digest(encoder.frozen_training_arrays(), &req.cancel)?,
                 )?;
             }
             if let Some(vae) = &self.vae {
                 probe.frozen(
                     "vae",
                     vae_before.as_ref().expect("observed VAE"),
-                    &audit::digest(vae.frozen_training_arrays()?)?,
+                    &audit::digest(vae.frozen_training_arrays()?, &req.cancel)?,
                 )?;
             }
         }
