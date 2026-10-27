@@ -5,7 +5,8 @@ use gen_core_testkit::moss_training_probe::{
     EvaluationTensorDescriptor, RunProbe, EVALUATION_CONTENT_ENCODING,
 };
 use sha2::{Digest, Sha256};
-const CHUNK: usize = 4_194_304;
+mod chunks;
+use chunks::audit_chunks;
 pub(super) fn digest(
     arrays: impl IntoIterator<Item = Array>,
     cancel: &CancelFlag,
@@ -18,10 +19,9 @@ pub(super) fn digest(
         let flat = array.reshape(&[-1])?;
         let n = usize::try_from(flat.shape()[0])
             .map_err(|_| Error::Msg("unrepresentable audit tensor".into()))?;
-        for start in (0..n).step_by(CHUNK) {
+        for (start, len) in audit_chunks(n) {
             crate::pipeline::check(cancel)?;
-            let end = start + CHUNK.min(n - start);
-            let part = mlx_gen::attention::slice_axis(&flat, 0, start as i32, end as i32)?;
+            let part = mlx_gen::attention::slice_axis(&flat, 0, start as i32, len as i32)?;
             let values = crate::pipeline::logical_f32_readback(&part)?;
             crate::pipeline::check(cancel)?;
             update_audit_f32_hash(&mut hash, &values, cancel)?;
@@ -142,14 +142,9 @@ impl Evaluation {
         let flat = tensor.reshape(&[-1])?;
         let n = usize::try_from(flat.shape()[0])
             .map_err(|_| Error::Msg("unrepresentable audit tensor".into()))?;
-        for start in (0..n).step_by(CHUNK) {
+        for (start, len) in audit_chunks(n) {
             crate::pipeline::check(cancel)?;
-            let part = mlx_gen::attention::slice_axis(
-                &flat,
-                0,
-                start as i32,
-                (start + CHUNK.min(n - start)) as i32,
-            )?;
+            let part = mlx_gen::attention::slice_axis(&flat, 0, start as i32, len as i32)?;
             let values = crate::pipeline::logical_f32_readback(&part)?;
             crate::pipeline::check(cancel)?;
             hash.update_cancellable(&values, cancel)?;
