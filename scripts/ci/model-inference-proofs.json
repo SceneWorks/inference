@@ -35398,6 +35398,7 @@
       },
       "source_selected_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512/source_selected_cuda",
+        "cuda_activity_profile": "non-isolated-correctness-low-activity",
         "environment": {},
         "cargo_features": [
           "cuda",
@@ -35415,6 +35416,7 @@
       },
       "source_selected_cuda_gpu0": {
         "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512/source_selected_cuda_gpu0",
+        "cuda_activity_profile": "non-isolated-correctness-low-activity",
         "environment": {},
         "cargo_features": [
           "cuda",
@@ -35609,6 +35611,7 @@
     "configurations": {
       "source_selected_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_tiers_shrink_the_resident_weights/source_selected_cuda",
+        "cuda_activity_profile": "non-isolated-correctness-low-activity",
         "environment": {},
         "cargo_features": [
           "cuda",
@@ -35626,6 +35629,7 @@
       },
       "source_selected_cuda_gpu0": {
         "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_tiers_shrink_the_resident_weights/source_selected_cuda_gpu0",
+        "cuda_activity_profile": "non-isolated-correctness-low-activity",
         "environment": {},
         "cargo_features": [
           "cuda",

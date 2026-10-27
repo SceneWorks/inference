@@ -16,6 +16,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from scripts.ci import model_proof_resources as resources
+from scripts.ci import model_inference_proofs as proof
 from scripts.ci import windows_cuda_metadata as metadata
 from scripts.release import veda_cuda_guard as guard
 
@@ -477,6 +478,128 @@ class ChildCudaVisibility(unittest.TestCase):
                                                            constraints={'required_cuda_physical_index': required_index}):
                                 self.fail('wrong physical index must never reach a model body')
                         inventory.assert_called_once()
+
+    def test_iris_correctness_profile_admits_two_percent_and_seals_five_samples(self):
+        # CI_IMPACT: four exact registry recipes, synthetic SMI rows; no model/GPU process.
+        rows = proof.load_registry()
+        for fqn in ('quant_real_weights::real_tiers_shrink_the_resident_weights',
+                    'quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512'):
+            source = next(row for row in rows if row['package'] == 'candle-gen-iris' and row['fqn'] == fqn)
+            for configuration, index, selected_uuid in (('source_selected_cuda', 1, APPROVED),
+                                                        ('source_selected_cuda_gpu0', 0, OTHER)):
+                with self.subTest(fqn=fqn, configuration=configuration), tempfile.TemporaryDirectory() as temporary:
+                    case = proof.configured_case(source, configuration)
+                    selected = {'uuid': selected_uuid, 'index': index, 'total_mib': 97887,
+                                'used_mib': 1884, 'free_mib': 96003, 'utilization_percent': 2}
+                    other = {'uuid': OTHER if index == 1 else APPROVED, 'index': 1 - index,
+                             'total_mib': 97887, 'used_mib': 29510, 'free_mib': 68377, 'utilization_percent': 100}
+                    processes = [[selected_uuid, '123', 'graphics-only', 'G'],
+                                 [selected_uuid, '124', 'mixed-context', 'C+G'],
+                                 [other['uuid'], '987', 'busy-other-card', 'C']]
+                    policy = SimpleNamespace(**{**vars(GPU_POLICY), 'cuda_device_uuid': selected_uuid})
+                    output = Path(temporary)
+                    environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner',
+                                   'CUDA_VISIBLE_DEVICES': selected_uuid}
+                    fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
+                    fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_args: None)
+                    with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
+                            patch.object(guard, 'inventory', return_value=([selected, other], processes)) as inventory, \
+                            patch.object(guard.time, 'sleep'):
+                        with resources.execution_claim('candle-cuda', policy, output, environment, constraints=case) as receipt:
+                            self.assertFalse(receipt['post_execution_verified'])
+                            self.assertEqual(receipt['admission_utilization_percent'], [2] * 5)
+                            self.assertEqual(receipt['activity_profile'], resources.IRIS_CUDA_CORRECTNESS_ACTIVITY)
+                            self.assertFalse(receipt['isolated_benchmark_claim'])
+                        self.assertTrue(receipt['post_execution_verified'])
+                        self.assertEqual(receipt['release_utilization_percent'], [2] * 5)
+                        self.assertEqual(receipt['physical_index'], index)
+                        self.assertEqual(inventory.call_count, 11)
+
+    def test_iris_low_activity_still_refuses_compute_unknown_and_capacity(self):
+        # CI_IMPACT: pure predicate negatives; no driver query or learned work.
+        profile = resources.IRIS_CUDA_CORRECTNESS_ACTIVITY
+        card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 2}
+        graphics = [[APPROVED, '123', 'private', 'G']]
+        self.assertTrue(resources.proof_cuda_idle(card, graphics, GPU_POLICY, activity_profile=profile))
+        self.assertFalse(resources.proof_cuda_idle(card, graphics, GPU_POLICY))
+        for invalid_card, invalid_processes in (
+            (dict(card, utilization_percent=5), graphics),
+            (dict(card, free_mib=81919, used_mib=15968), graphics),
+            (card, [[APPROVED, '123', 'private', 'C']]),
+            (card, [[APPROVED, '123', 'private', 'unknown']]),
+            (card, [[APPROVED, '123', 'private']]),
+            (card, []),
+        ):
+            with self.subTest(card=invalid_card, rows=invalid_processes):
+                self.assertFalse(resources.proof_cuda_idle(invalid_card, invalid_processes, GPU_POLICY,
+                                                           activity_profile=profile))
+        self.assertTrue(resources.proof_cuda_idle(dict(card, utilization_percent=0),
+                                                  [[APPROVED, '123', 'inactive', 'C']], GPU_POLICY,
+                                                  activity_profile=profile))
+        baseline = {'uuid': APPROVED, 'reserved_baseline_mib': 1884,
+                    'process_identities': resources.proof_cuda_contexts(APPROVED, graphics,
+                                                                          activity_profile=profile)}
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(guard, 'inventory', return_value=([card], [[APPROVED, '124', 'changed', 'G']])):
+            with self.assertRaisesRegex(RuntimeError, 'baseline changed'):
+                guard.sample_baseline(card, Path(temporary), 'MOCK', baseline,
+                                      idle_check=lambda current, current_rows: resources.proof_cuda_idle(
+                                          current, current_rows, GPU_POLICY, activity_profile=profile),
+                                      identity_key=lambda selected_uuid, current_rows: resources.proof_cuda_contexts(
+                                          selected_uuid, current_rows, activity_profile=profile),
+                                      permit_bounded_growth=True)
+
+    def test_iris_profile_forgery_and_post_failure_remain_unaccepted(self):
+        # CI_IMPACT: registry forgery and mocked release rows only; no device/model execution.
+        row = next(row for row in proof.load_registry() if row['package'] == 'candle-gen-iris'
+                   and row['fqn'] == 'quant_real_weights::real_tiers_shrink_the_resident_weights')
+        configured = proof.configured_case(row, 'source_selected_cuda')
+        self.assertEqual(resources.bound_cuda_activity_profile(configured), resources.IRIS_CUDA_CORRECTNESS_ACTIVITY)
+        for forged in ({**configured, 'source': 'crates/media/candle-gen/candle-gen-iris/tests/other.rs'},
+                       {**configured, 'fqn': 'other::proof'},
+                       {**configured, 'selected_configuration': {**configured['selected_configuration'],
+                                                                   'cuda_activity_profile': 'benchmark-isolated'}}):
+            with self.assertRaises(ValueError):
+                resources.bound_cuda_activity_profile(forged)
+        wrong_card = {'uuid': APPROVED, 'index': 0, 'total_mib': 97887, 'used_mib': 1884,
+                      'free_mib': 96003, 'utilization_percent': 2}
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': APPROVED}
+            fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
+            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_args: None)
+            for inventory_cards, expected in (([wrong_card], ValueError),
+                                               ([dict(wrong_card, uuid=OTHER, index=1)], resources.CudaClaimRejected)):
+                with self.subTest(cards=inventory_cards), patch.object(resources, 'os', fake_windows_os), \
+                        patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
+                        patch.object(guard, 'inventory', return_value=(inventory_cards, [])) as inventory:
+                    with self.assertRaises(expected):
+                        with resources.execution_claim('candle-cuda', GPU_POLICY, output, environment,
+                                                       constraints=configured):
+                            self.fail('wrong physical card must never reach the model body')
+                    inventory.assert_called_once()
+        card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 2}
+        changed = dict(card, utilization_percent=5)
+        processes = [[APPROVED, '123', 'private', 'G']]
+        snapshots = [([card], processes)] * 6 + [([changed], processes)] * 5
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': APPROVED}
+            fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
+            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_args: None)
+            with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
+                    patch.object(guard, 'inventory', side_effect=snapshots), patch.object(guard.time, 'sleep'):
+                with self.assertRaises(resources.CudaReleaseRejected) as caught:
+                    with resources.execution_claim('candle-cuda', GPU_POLICY, output, environment,
+                                                   constraints=configured) as receipt:
+                        self.assertFalse(receipt['post_execution_verified'])
+            self.assertFalse(receipt['post_execution_verified'])
+            self.assertEqual(receipt['admission_utilization_percent'], [2] * 5)
+            self.assertNotIn('release_utilization_percent', receipt)
+            self.assertEqual(caught.exception.diagnostic['activity_profile'], resources.IRIS_CUDA_CORRECTNESS_ACTIVITY)
+            self.assertEqual(caught.exception.diagnostic['samples'][0]['selected_card']['utilization_percent'], 5)
 
 
 if __name__ == '__main__':

@@ -493,6 +493,8 @@ class ExactProofProtocol(unittest.TestCase):
             cuda = proof.configured_case(item, 'source_selected_cuda')
             self.assertEqual(cuda['expected_devices'], ['candle-cuda'])
             self.assertEqual(cuda['required_cuda_physical_index'], 1)
+            self.assertEqual(cuda['selected_configuration']['cuda_activity_profile'],
+                             proof.IRIS_CUDA_CORRECTNESS_PROFILE)
             with self.assertRaisesRegex(ValueError, 'effective configuration differs'):
                 proof.apply_configuration({**cuda, 'required_cuda_physical_index': 0}, {})
             # CI_IMPACT: registry-only recipe binding; no CUDA or model work.
@@ -500,6 +502,8 @@ class ExactProofProtocol(unittest.TestCase):
             self.assertEqual(gpu0['expected_devices'], ['candle-cuda'])
             self.assertEqual(gpu0['cargo_features'], cuda['cargo_features'])
             self.assertEqual(gpu0['required_cuda_physical_index'], 0)
+            self.assertEqual(gpu0['selected_configuration']['cuda_activity_profile'],
+                             proof.IRIS_CUDA_CORRECTNESS_PROFILE)
             self.assertEqual(gpu0['input_contract'], cuda['input_contract'])
             self.assertEqual(gpu0['output_contract'], cuda['output_contract'])
             proof.apply_configuration(gpu0, {})
@@ -508,6 +512,16 @@ class ExactProofProtocol(unittest.TestCase):
         cpu = proof.configured_case(render, 'source_default_cpu')
         self.assertEqual(cpu['expected_devices'], ['candle-cpu'])
         self.assertNotIn('required_cuda_physical_index', cpu)
+        self.assertNotIn('cuda_activity_profile', cpu['selected_configuration'])
+        for name in ('source_selected_cuda', 'source_selected_cuda_gpu0'):
+            forged = copy.deepcopy(render)
+            forged['configurations'][name]['cuda_activity_profile'] = 'benchmark-isolated'
+            with self.assertRaisesRegex(ValueError, 'limited to the exact Iris correctness recipes'):
+                proof.validate_configurations(forged)
+        forged = copy.deepcopy(render)
+        forged['configurations']['source_default_cpu']['cuda_activity_profile'] = proof.IRIS_CUDA_CORRECTNESS_PROFILE
+        with self.assertRaisesRegex(ValueError, 'limited to the exact Iris correctness recipes'):
+            proof.validate_configurations(forged)
         invalid = copy.deepcopy(render)
         invalid['configurations']['source_default_cpu']['required_cuda_physical_index'] = 1
         with self.assertRaisesRegex(ValueError, 'requires a CUDA source recipe'):

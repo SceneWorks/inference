@@ -50,6 +50,10 @@ IRIS_QUANT_PROOFS = frozenset(
     for test in ('real_tiers_shrink_the_resident_weights',
                  'real_quantized_renders_track_the_bf16_render_at_512')
 )
+IRIS_CUDA_CORRECTNESS_PROOFS = frozenset(
+    binding for binding in IRIS_QUANT_PROOFS if binding.startswith('candle-gen-iris/')
+)
+IRIS_CUDA_CORRECTNESS_PROFILE = 'non-isolated-correctness-low-activity'
 
 
 def identity(row: dict) -> str:
@@ -241,7 +245,7 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
         required = {'source_identity', 'environment', 'backend', 'expected_devices', 'scope', 'required_work', 'cargo_features'}
         optional = {'backend_compatibility', 'source_guard'}
         if feature_only or source_controls:
-            optional |= {'execution_lane', 'required_cuda_physical_index'}
+            optional |= {'execution_lane', 'required_cuda_physical_index', 'cuda_activity_profile'}
         if not isinstance(recipe, dict) or not required <= set(recipe) or not set(recipe) <= required | optional:
             raise ValueError('configuration must bind source, flags, devices and required work')
         if any(not isinstance(recipe[field], str) or not recipe[field] for field in ('backend_compatibility', 'source_guard') if field in recipe):
@@ -279,6 +283,13 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
                 if feature.removeprefix(row['package'] + '/') not in source_features:
                     raise ValueError('configuration feature is absent from actual source manifest: ' + feature)
         route = configuration_route(row, recipe)
+        expected_activity_profile = (IRIS_CUDA_CORRECTNESS_PROFILE
+                                     if identity(row) in IRIS_CUDA_CORRECTNESS_PROOFS
+                                     and name in ('source_selected_cuda', 'source_selected_cuda_gpu0') else None)
+        if (('cuda_activity_profile' in recipe) != (expected_activity_profile is not None)
+                or recipe.get('cuda_activity_profile') != expected_activity_profile
+                or (expected_activity_profile is not None and route != 'candle-cuda')):
+            raise ValueError('CUDA low-activity profile is limited to the exact Iris correctness recipes')
         physical_index = recipe.get('required_cuda_physical_index')
         if physical_index is not None and (type(physical_index) is not int or physical_index < 0
                                            or route != 'candle-cuda'):
