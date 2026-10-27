@@ -2972,7 +2972,7 @@ mod tests {
         let activities = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = activities.clone();
         let _observer = gen_core::LoadActivityObserver::new(move |activity| {
-            captured.lock().unwrap().push(activity);
+            candle_gen::lock_recover(&captured).push(activity);
         });
         assert!(load_text_with_source(fixture.path(), &source, &Device::Cpu).is_ok());
         assert!(load_heavy_native_with(
@@ -2986,7 +2986,7 @@ mod tests {
         )
         .is_err());
         assert_eq!(
-            *activities.lock().unwrap(),
+            *candle_gen::lock_recover(&activities),
             [
                 Some(gen_core::LoadActivity::TextEncoder),
                 None,

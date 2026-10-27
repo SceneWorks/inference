@@ -1983,7 +1983,7 @@ mod tests {
         let activities = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = activities.clone();
         let _observer = crate::gen_core::LoadActivityObserver::new(move |activity| {
-            captured.lock().unwrap().push(activity);
+            crate::lock_recover(&captured).push(activity);
         });
         let component = TestDir::new("external-warm-component");
         let external = TestDir::new("external-warm-root");
@@ -2004,11 +2004,9 @@ mod tests {
             external.path(),
         )?;
         assert!(first.cache_dir().starts_with(external.path()));
-        assert!(activities
-            .lock()
-            .unwrap()
+        assert!(crate::lock_recover(&activities)
             .contains(&Some(crate::gen_core::LoadActivity::VerifyingFiles)));
-        activities.lock().unwrap().clear();
+        crate::lock_recover(&activities).clear();
         let (_, warm) = PackedWeightSidecars::open_and_prepare_with_external_cache_root(
             std::slice::from_ref(&source_path),
             component.path(),
@@ -2020,7 +2018,7 @@ mod tests {
         assert_eq!(warm.payload_bytes_hashed(), 0);
         assert_eq!(warm.reused_count(), 1);
         assert!(
-            activities.lock().unwrap().is_empty(),
+            crate::lock_recover(&activities).is_empty(),
             "memo hits must not claim to verify files"
         );
         Ok(())
