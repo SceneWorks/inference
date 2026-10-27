@@ -401,7 +401,8 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                   'physical_index': matched[0]['index'], 'runner': env.get('RUNNER_NAME'),
                   'activity_profile': activity_profile, 'claim_utilization_percent': matched[0]['utilization_percent']}
         if activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY:
-            record['activity_policy'] = ('non-isolated correctness, stable selected-card G/C+G contexts below '
+            record['activity_policy'] = ('non-isolated correctness, stable selected-card G/C+G contexts when utilization '
+                                         'is nonzero; C also permitted at zero; below '
                                          f'{MAX_BASELINE_UTILIZATION_PERCENT}% utilization, policy cap plus reserve free')
             record['isolated_benchmark_claim'] = False
         else:
