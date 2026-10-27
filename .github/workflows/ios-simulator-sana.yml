@@ -2,9 +2,10 @@ name: iOS simulator SANA functional image
 
 # E8: never called by PR/push CI. The simulator image is a functional witness only; it does not
 # establish physical-iPhone admission, memory fit, timing, or kernel correctness.
-# CI_IMPACT: one separately dispatched job, no added PR/push cost; cold iOS SDK compile and
-# snapshot transfer cost are host/asset dependent (unknown). Pinned job-local XcodeGen adds
-# 4,286,070 download bytes plus a version probe; no Homebrew/global install. Timeout: 240 minutes.
+# CI_IMPACT: one separately dispatched image job or one metadata-only crash recovery job, no
+# added PR/push cost. Cold iOS SDK compile and snapshot transfer cost are host/asset dependent
+# (unknown). Pinned job-local XcodeGen adds 4,286,070 download bytes plus a version probe;
+# no Homebrew/global install. Image timeout: 240 minutes; recovery timeout: 15 minutes.
 on:
   workflow_call:
     inputs:
@@ -31,6 +32,26 @@ on:
         description: Exact 40-hex source SHA bound to this validation
         required: true
         type: string
+      diagnostic_run_id:
+        description: Prior simulator Actions run ID; set with all diagnostic inputs for metadata-only crash recovery
+        required: false
+        type: string
+      diagnostic_attempt:
+        description: Prior simulator Actions attempt number
+        required: false
+        type: string
+      diagnostic_owned_udid:
+        description: Prior attempt's disposable simulator UUID from its owned-simulator receipt
+        required: false
+        type: string
+      diagnostic_start_utc:
+        description: Narrow crash window start (UTC ISO 8601)
+        required: false
+        type: string
+      diagnostic_end_utc:
+        description: Narrow crash window end (UTC ISO 8601; at most five minutes later)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -38,7 +59,7 @@ permissions:
 jobs:
   image:
     name: One bounded SANA simulator image
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.diagnostic_run_id && !inputs.diagnostic_attempt && !inputs.diagnostic_owned_udid && !inputs.diagnostic_start_utc && !inputs.diagnostic_end_utc
     runs-on: [self-hosted, macOS, ARM64, nax]
     timeout-minutes: 240
     env:
@@ -185,4 +206,36 @@ jobs:
         with:
           name: ios-simulator-sana-${{ github.sha }}-${{ github.run_id }}
           path: ${{ runner.temp }}/ios-simulator-sana
+          if-no-files-found: error
+
+  recover-crash:
+    name: Recover one prior simulator crash without launching an app
+    if: github.event_name == 'workflow_dispatch' && (inputs.diagnostic_run_id || inputs.diagnostic_attempt || inputs.diagnostic_owned_udid || inputs.diagnostic_start_utc || inputs.diagnostic_end_utc)
+    runs-on: [self-hosted, macOS, ARM64, nax, rw-llm]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Recover only the exact prior app crash report
+        shell: bash
+        env:
+          PRIOR_RUN_ID: ${{ inputs.diagnostic_run_id }}
+          PRIOR_ATTEMPT: ${{ inputs.diagnostic_attempt }}
+          PRIOR_OWNED_UDID: ${{ inputs.diagnostic_owned_udid }}
+          PRIOR_START_UTC: ${{ inputs.diagnostic_start_utc }}
+          PRIOR_END_UTC: ${{ inputs.diagnostic_end_utc }}
+        run: |
+          python3.12 -I scripts/ci/ios_simulator_sana_crash.py \
+            --run-id "$PRIOR_RUN_ID" --attempt "$PRIOR_ATTEMPT" \
+            --owned-udid "$PRIOR_OWNED_UDID" \
+            --start-utc "$PRIOR_START_UTC" --end-utc "$PRIOR_END_UTC" \
+            --output "$RUNNER_TEMP/ios-simulator-sana-crash"
+      - name: Upload exact crash or refusal receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-simulator-sana-crash-${{ inputs.diagnostic_run_id }}-a${{ inputs.diagnostic_attempt }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/ios-simulator-sana-crash
           if-no-files-found: error

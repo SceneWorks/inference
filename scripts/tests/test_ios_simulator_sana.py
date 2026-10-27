@@ -69,6 +69,10 @@ class SimulatorSanaTests(unittest.TestCase):
                 if parts[:3] == ('xcrun', 'simctl', 'launch'):
                     assert env is not None
                     self.assertEqual(env['SIMCTL_CHILD_IOS_CAMPAIGN_BUILD_SHA'], source)
+                    self.assertIn(f'--stdout={(docs / "simulator-stdout.txt").resolve()}', parts)
+                    self.assertIn(f'--stderr={(docs / "simulator-stderr.txt").resolve()}', parts)
+                    (docs / 'launch-memory.txt').write_text('launch: simulator memory diagnostic\n', encoding='utf-8')
+                    (docs / 'simulator-stderr.txt').write_text('owned app diagnostic\n', encoding='utf-8')
                     (docs / 'smoke-report.txt').write_text(
                         f'SMOKE: PASS\nSIMULATOR_NONCE {env["SIMCTL_CHILD_IOS_SIMULATOR_SANA_NONCE"]}\n'
                         f'SOURCE_SHA {source}\n  [ok] SANA image generation (E5)\n'
@@ -96,6 +100,13 @@ class SimulatorSanaTests(unittest.TestCase):
             self.assertFalse((docs / ('simulator-go-' + nonce)).exists())
             self.assertFalse((output / 'result.json').exists())
             self.assertFalse(json.loads((output / 'failure-diagnostics.json').read_text(encoding='utf-8'))['accepted'])
+            self.assertIn('simulator memory diagnostic',
+                          (output / 'failure-launch-memory.txt').read_text(encoding='utf-8'))
+            self.assertIn('owned app diagnostic',
+                          (output / 'failure-stderr.txt').read_text(encoding='utf-8'))
+            launch = json.loads((output / 'launch-attempt.json').read_text(encoding='utf-8'))
+            self.assertFalse(launch['accepted'])
+            self.assertEqual((launch['nonce'], launch['source_sha'], launch['pid']), (nonce, source, 42))
 
     def test_failed_simulator_report_and_progress_are_retained_only_as_bounded_diagnostics(self):
         policy = sim.policy_for_simulator(sim.ROOT / 'scripts/ci/ios-simulator-sana-policy.json')
@@ -123,6 +134,26 @@ class SimulatorSanaTests(unittest.TestCase):
             sim.retain_failure_diagnostics(docs, second, policy, nonce, source)
             self.assertFalse((second / 'failure-report.txt').exists())
             self.assertFalse((second / 'failure-progress.txt').exists())
+
+    def test_no_report_crash_retains_only_bound_progress_and_launch_diagnostic(self):
+        policy = sim.policy_for_simulator(sim.ROOT / 'scripts/ci/ios-simulator-sana-policy.json')
+        nonce, source = 'a' * 32, 'b' * 40
+        with tempfile.TemporaryDirectory() as directory:
+            docs, output = Path(directory) / 'Documents', Path(directory) / 'result'
+            docs.mkdir()
+            output.mkdir()
+            (docs / 'sana-progress.txt').write_text(
+                f'SIMULATOR_NONCE {nonce} SOURCE_SHA {source} stage=before generator load\n',
+                encoding='utf-8')
+            (docs / 'launch-memory.txt').write_text('launch: os_proc_available_memory = -1 MiB\n',
+                                                     encoding='utf-8')
+            sim.retain_failure_diagnostics(docs, output, policy, nonce, source)
+            receipt = json.loads((output / 'failure-diagnostics.json').read_text(encoding='utf-8'))
+            self.assertFalse(receipt['accepted'])
+            self.assertFalse((output / 'failure-report.txt').exists())
+            self.assertTrue(receipt['files']['sana-progress.txt']['nonce_and_source_seen'])
+            self.assertTrue((output / 'failure-progress.txt').is_file())
+            self.assertTrue((output / 'failure-launch-memory.txt').is_file())
 
     def test_controller_accepts_only_this_attempts_booted_owned_iphone(self):
         owned = '22222222-2222-2222-2222-222222222222'

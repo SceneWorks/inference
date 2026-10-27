@@ -1086,7 +1086,16 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertEqual(job["with"][key], "${{ fromJSON(inputs.ios_pricing_compile_binding)." + key + " }}")
         called = yaml.safe_load((REAL_WEIGHTS_WORKFLOW.parent / "ios-simulator-sana.yml").read_text(encoding="utf-8"))
         self.assertEqual(set(called.get("on", called.get(True))), {"workflow_call", "workflow_dispatch"})
-        self.assertEqual(called["jobs"]["image"]["if"], "github.event_name == 'workflow_dispatch'")
+        image = called["jobs"]["image"]
+        self.assertEqual(image["if"], "github.event_name == 'workflow_dispatch' && "
+                         "!inputs.diagnostic_run_id && !inputs.diagnostic_attempt && "
+                         "!inputs.diagnostic_owned_udid && !inputs.diagnostic_start_utc && "
+                         "!inputs.diagnostic_end_utc")
+        recovery = called["jobs"]["recover-crash"]
+        self.assertEqual(recovery["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "rw-llm"])
+        self.assertIn("inputs.diagnostic_run_id || inputs.diagnostic_attempt", recovery["if"])
+        self.assertFalse(any("simctl" in step.get("run", "") or "run_smoke" in step.get("run", "")
+                             for step in recovery["steps"]))
 
     def test_ios_prequant_is_single_manual_cpu_route_with_receipt_only(self) -> None:
         workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))

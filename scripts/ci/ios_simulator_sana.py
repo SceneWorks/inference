@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -192,7 +193,10 @@ def retain_failure_diagnostics(docs: Path, output: Path, policy: safety.SafetyPo
     """Retain bounded app breadcrumbs before owned-simulator cleanup; never certify them."""
     files = {}
     for name, destination, cap in (("smoke-report.txt", "failure-report.txt", policy.stdout_cap_bytes),
-                                   ("sana-progress.txt", "failure-progress.txt", policy.stderr_cap_bytes)):
+                                   ("sana-progress.txt", "failure-progress.txt", policy.stderr_cap_bytes),
+                                   ("launch-memory.txt", "failure-launch-memory.txt", 4096),
+                                   ("simulator-stdout.txt", "failure-stdout.txt", policy.stdout_cap_bytes),
+                                   ("simulator-stderr.txt", "failure-stderr.txt", policy.stderr_cap_bytes)):
         path = docs / name
         try:
             meta = path.lstat()
@@ -210,6 +214,9 @@ def retain_failure_diagnostics(docs: Path, output: Path, policy: safety.SafetyPo
             if name == "smoke-report.txt":
                 files[name]["nonce_seen"] = f"SIMULATOR_NONCE {nonce}\n".encode() in data
                 files[name]["source_seen"] = f"SOURCE_SHA {source_sha}\n".encode() in data
+            elif name == "sana-progress.txt":
+                files[name]["nonce_and_source_seen"] = (
+                    f"SIMULATOR_NONCE {nonce} SOURCE_SHA {source_sha} stage=".encode() in data)
         except OSError as error:
             files[name] = f"unavailable: {type(error).__name__}"
     (output / "failure-diagnostics.json").write_text(json.dumps({
@@ -257,7 +264,8 @@ def run(args: argparse.Namespace) -> int:
             or copied.get("files") != expected_tier
             or copied.get("tier_inventory_sha256") != content_digest(expected_tier)):
         raise ValueError("installed snapshot content differs from verified source")
-    for name in ("smoke-report.txt", "renders.txt", "sana-progress.txt"):
+    for name in ("smoke-report.txt", "renders.txt", "sana-progress.txt",
+                 "simulator-stdout.txt", "simulator-stderr.txt"):
         if (docs / name).exists():
             raise ValueError("fresh simulator app container required; stale report or render manifest")
     if list(docs.glob("sana-*.png")):
@@ -281,7 +289,10 @@ def run(args: argparse.Namespace) -> int:
         raise InterruptedError("simulator validation interrupted")
     old_handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
-        launched = command("xcrun", "simctl", "launch", args.simulator, args.bundle_id, timeout=30, env=env)
+        stdout_file, stderr_file = docs / "simulator-stdout.txt", docs / "simulator-stderr.txt"
+        launched = command("xcrun", "simctl", "launch", f"--stdout={stdout_file}",
+                           f"--stderr={stderr_file}", args.simulator, args.bundle_id,
+                           timeout=30, env=env)
         match = re.fullmatch(re.escape(args.bundle_id) + r":\s*(\d+)", launched)
         if not match:
             raise ValueError("simctl did not return the exact bundle PID")
@@ -289,6 +300,13 @@ def run(args: argparse.Namespace) -> int:
         claimed = app_identity(pid)
         if claimed is None or claimed[0] != str(executable) or claimed[1] <= 0:
             raise ValueError("launched PID path/start did not match installed app")
+        (args.output / "launch-attempt.json").write_text(json.dumps({
+            "accepted": False, "claim": "diagnostic-only claimed app launch; no image or phone-fit evidence",
+            "source_sha": actual, "nonce": nonce, "bundle_id": args.bundle_id,
+            "simulator_udid": args.simulator, "runner_name": os.environ["RUNNER_NAME"],
+            "pid": pid, "executable_path": claimed[0], "process_start_abstime": claimed[1],
+            "claimed_at_utc": datetime.now(timezone.utc).isoformat(),
+        }, sort_keys=True) + "\n", encoding="utf-8")
         (docs / f"simulator-go-{nonce}").write_text(actual + "\n", encoding="utf-8")
         samples = []
         report_file = docs / "smoke-report.txt"
@@ -301,7 +319,11 @@ def run(args: argparse.Namespace) -> int:
             if footprint > policy.child_footprint_cap_bytes or free_now < policy.host_free_reserve_bytes:
                 raise ValueError("simulator footprint cap or host reserve breached")
             peak, minimum_free = max(peak, footprint, lifetime), min(minimum_free, free_now)
-            for path, cap in ((report_file, policy.stdout_cap_bytes), (docs / "sana-progress.txt", policy.stderr_cap_bytes),
+            for path, cap in ((report_file, policy.stdout_cap_bytes),
+                              (docs / "sana-progress.txt", policy.stderr_cap_bytes),
+                              (docs / "launch-memory.txt", 4096),
+                              (stdout_file, policy.stdout_cap_bytes),
+                              (stderr_file, policy.stderr_cap_bytes),
                               (png_file, policy.event_cap_bytes)):
                 if path.exists() and (path.is_symlink() or path.stat().st_size > cap):
                     raise ValueError(f"simulator output cap or file type breached: {path.name}")

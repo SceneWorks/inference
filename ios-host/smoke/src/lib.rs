@@ -1152,6 +1152,16 @@ fn append_breadcrumb(name: &str, line: &str) {
 const SIMULATOR_SANA_TILE_EDGE: u32 = 192;
 
 #[cfg(feature = "media")]
+fn simulator_sana_stage(stage: &'static str) {
+    let nonce = std::env::var("IOS_SIMULATOR_SANA_NONCE").unwrap_or_default();
+    let source = option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or_default();
+    append_breadcrumb(
+        "sana-progress.txt",
+        &format!("SIMULATOR_NONCE {nonce} SOURCE_SHA {source} stage={stage}"),
+    );
+}
+
+#[cfg(feature = "media")]
 fn finish_image_generation(
     name: &'static str,
     simulator_functional: bool,
@@ -1204,8 +1214,6 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         GenerationOutput, GenerationRequest, MemoryNumericTier, MemoryStrategy, OffloadPolicy,
         Progress, WeightsSource,
     };
-    let media_catalog = runtime_ios::catalog();
-
     /// The base (non-Sprint) SANA id. Pinned as a literal on purpose: if the catalog ever stops
     /// registering it, this check must fail loudly rather than quietly pick whatever is first.
     const SANA_ID: &str = "sana_1600m";
@@ -1336,6 +1344,10 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     if let Some(docs) = dirs_documents() {
         let _ = std::fs::remove_file(docs.join("sana-progress.txt"));
     }
+    if simulator_functional {
+        simulator_sana_stage("entered E5 before catalog");
+    }
+    let media_catalog = runtime_ios::catalog();
 
     let mut details: Vec<String> = Vec::new();
     let mut completed = 0;
@@ -1458,6 +1470,9 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 continue;
             }
         };
+        if simulator_functional {
+            simulator_sana_stage("candidate built");
+        }
         // Admitted lane: the evidence facade. Device diagnostics use bounded capture quanta;
         // the simulator-only functional route relies on its external process supervisor.
         let admission = if diagnostic {
@@ -1486,6 +1501,9 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             details.push(line);
             continue;
         }
+        if simulator_functional {
+            simulator_sana_stage("initial permit accepted");
+        }
 
         mlx_rs::memory::clear_cache();
         mlx_rs::memory::reset_peak_memory();
@@ -1511,6 +1529,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                         &candidate,
                     )
                     .map_err(|e| format!("{label}: simulator functional permit refused: {e}"))?;
+                    simulator_sana_stage("before generator load");
                     Box::new(
                         permit
                             .load_generator(&registry, |_| Ok(()))
@@ -1537,6 +1556,9 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                     .1,
                 )
             };
+            if simulator_functional {
+                simulator_sana_stage("generator loaded");
+            }
             // Tiling asked for through the CONTRACT (the candidate wrote the provider's ladder
             // execution onto the request), not the env var.
             let runtime_ios::media::IosWork::Generate(request) = &candidate.work else {
