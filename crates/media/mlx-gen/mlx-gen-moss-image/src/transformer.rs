@@ -3266,7 +3266,6 @@ mod training_graph_tests {
             &cancel,
         )
         .unwrap();
-        eprintln!("MOSS corrected AdamW fixed-batch loss {before} -> {after}");
         assert!(after < before, "fixed-batch AdamW update did not descend");
         assert_eq!(
             frozen,
