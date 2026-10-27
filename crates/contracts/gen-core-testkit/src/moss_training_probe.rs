@@ -127,6 +127,54 @@ pub struct FrozenReceipt {
 /// Canonical hash encoding shared by both native diagnostic implementations.
 pub const EVALUATION_CONTENT_ENCODING: &str = "logical-row-major-f32-le-v1";
 
+// Bound each CPU hash operation to 64 KiB, independent of native readback size.
+const AUDIT_HASH_CHUNK_FLOATS: usize = 16 * 1024;
+
+/// Hash canonical F32 little-endian bytes without allocating another readback-sized buffer.
+/// Cancellation is checked before and after each bounded CPU block. Native callers must also
+/// check around their indivisible device readback, which this host-only helper cannot interrupt.
+pub fn update_audit_f32_hash(
+    hash: &mut Sha256,
+    values: &[f32],
+    cancel: &gen_core::CancelFlag,
+) -> Result<()> {
+    update_audit_f32_hash_checked(hash, values, || {
+        if cancel.is_cancelled() {
+            Err(Error::Canceled)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn update_audit_f32_hash_checked(
+    hash: &mut Sha256,
+    values: &[f32],
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    check()?;
+    for values in values.chunks(AUDIT_HASH_CHUNK_FLOATS) {
+        check()?;
+        #[cfg(target_endian = "little")]
+        hash.update(image::EncodableLayout::as_bytes(values));
+        #[cfg(target_endian = "big")]
+        {
+            let mut bytes = [0u8; AUDIT_HASH_CHUNK_FLOATS * 4];
+            encode_audit_f32_le(values, &mut bytes);
+            hash.update(&bytes[..values.len() * 4]);
+        }
+        check()?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_endian = "big"))]
+fn encode_audit_f32_le(values: &[f32], bytes: &mut [u8]) {
+    for (value, destination) in values.iter().zip(bytes.chunks_exact_mut(4)) {
+        destination.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
 /// Streaming canonical serialization: source values converted to F32, visited in
 /// logical row-major order, each serialized with `f32::to_le_bytes` (no header/padding).
 #[derive(Default)]
@@ -136,6 +184,13 @@ impl EvaluationContentHasher {
         for value in values {
             self.0.update(value.to_le_bytes());
         }
+    }
+    pub fn update_cancellable(
+        &mut self,
+        values: &[f32],
+        cancel: &gen_core::CancelFlag,
+    ) -> Result<()> {
+        update_audit_f32_hash(&mut self.0, values, cancel)
     }
     pub fn finish(self) -> String {
         format!("{:x}", self.0.finalize())
@@ -880,6 +935,83 @@ mod prepared_evaluation_tests {
         chunks.update([-0.0, -2.5]);
         assert_eq!(whole.finish(), expected);
         assert_eq!(chunks.finish(), expected);
+    }
+
+    #[test]
+    fn bounded_audit_hash_preserves_all_f32_bits_prefixes_and_uneven_chunks() {
+        let patterns = [
+            0,
+            0x8000_0000,
+            0x3f80_0000,
+            0xc020_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_1234,
+            0x7f80_0001,
+            1,
+        ];
+        let values = (0..AUDIT_HASH_CHUNK_FLOATS * 3 + 7)
+            .map(|i| f32::from_bits(patterns[i % patterns.len()]))
+            .collect::<Vec<_>>();
+        let reference = values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut fallback = vec![0; reference.len()];
+        encode_audit_f32_le(&values, &mut fallback);
+        assert_eq!(
+            fallback, reference,
+            "big-endian conversion preserves every bit"
+        );
+        let cancel = gen_core::CancelFlag::new();
+        let prefix = b"Bfloat16:[3, 16387];";
+        let mut expected = Sha256::new();
+        expected.update(prefix);
+        expected.update(&reference);
+        let mut whole = Sha256::new();
+        whole.update(prefix);
+        update_audit_f32_hash(&mut whole, &values, &cancel).unwrap();
+        assert_eq!(whole.finalize(), expected.finalize());
+        let mut chunked = EvaluationContentHasher::default();
+        chunked.update_cancellable(&[], &cancel).unwrap();
+        for chunk in values.chunks(AUDIT_HASH_CHUNK_FLOATS - 1) {
+            chunked.update_cancellable(chunk, &cancel).unwrap();
+        }
+        assert_eq!(chunked.finish(), format!("{:x}", Sha256::digest(reference)));
+    }
+
+    #[test]
+    fn bounded_audit_hash_refuses_before_input_and_after_one_cpu_block() {
+        let cancel = gen_core::CancelFlag::new();
+        cancel.cancel();
+        let mut hash = Sha256::new();
+        assert!(matches!(
+            update_audit_f32_hash(&mut hash, &[1.0], &cancel),
+            Err(Error::Canceled)
+        ));
+        assert_eq!(hash.finalize(), Sha256::digest([]));
+        let cancel = gen_core::CancelFlag::new();
+        let values = vec![-0.0; AUDIT_HASH_CHUNK_FLOATS * 3 + 1];
+        let mut hash = Sha256::new();
+        let mut checks = 0;
+        let result = update_audit_f32_hash_checked(&mut hash, &values, || {
+            checks += 1;
+            if checks == 3 {
+                cancel.cancel();
+            } // Initial, before block, after block.
+            if cancel.is_cancelled() {
+                Err(Error::Canceled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert_eq!(checks, 3);
+        let first_block = values[..AUDIT_HASH_CHUNK_FLOATS]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(hash.finalize(), Sha256::digest(first_block));
     }
 
     #[test]
