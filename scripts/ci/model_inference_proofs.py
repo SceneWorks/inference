@@ -284,7 +284,8 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
                     raise ValueError('configuration feature is absent from actual source manifest: ' + feature)
         route = configuration_route(row, recipe)
         expected_activity_profile = (IRIS_CUDA_CORRECTNESS_PROFILE
-                                     if identity(row) in IRIS_CUDA_CORRECTNESS_PROOFS
+                                     if all(key in row for key in ('package', 'target', 'fqn'))
+                                     and identity(row) in IRIS_CUDA_CORRECTNESS_PROOFS
                                      and name in ('source_selected_cuda', 'source_selected_cuda_gpu0') else None)
         if (('cuda_activity_profile' in recipe) != (expected_activity_profile is not None)
                 or recipe.get('cuda_activity_profile') != expected_activity_profile
