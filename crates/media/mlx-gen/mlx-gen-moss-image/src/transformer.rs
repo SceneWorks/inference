@@ -934,13 +934,7 @@ impl Transformer {
                 .forward(&Array::from_slice(&features, &[1, g.freq]))?;
             let time = self
                 .time2
-                .forward(&if self.training
-                    || mlx_rs::Device::try_default()? == mlx_rs::Device::cpu()
-                {
-                    multiply(&time, sigmoid(&time)?)?
-                } else {
-                    mlx_rs::fast::silu_exact(&time)?
-                })?
+                .forward(&ordinary_time_silu(&time, self.training)?)?
                 .as_dtype(Dtype::Float32)?;
             let modulation = self.modulation.forward(&time)?.reshape(&[1, 6, g.dim])?;
             let head = self.head.forward(&time)?.reshape(&[1, 2, g.dim])?;
@@ -1157,6 +1151,43 @@ mod author_fixture_tests {
     fn frozen_author_full_graph_ragged_masks_fp32_bf16_and_skipping() {
         #[cfg(feature = "test-support")]
         crate::test_support::assert_default_metal_profile_device();
+        ordinary_author_time_conformance();
+    }
+
+    pub(super) fn ordinary_author_time_conformance() {
+        // CI_IMPACT: reuse actual nn.SiLU hooks from the frozen author edit packet;
+        // these tiny BF16 operations run only through existing manual Metal oracles.
+        // The edit entry also reuses four tiny author forwards plus two training forwards.
+        // The ordinary packet has no time-activation hook. Both graphs use nn.SiLU.
+        let time_fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v2/fixture.json"
+        ))
+        .unwrap();
+        for probe in time_fixture["time_probes"].as_array().unwrap() {
+            let input = array(&probe["silu_input"])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let expected = &probe["silu"];
+            for training in [false, true] {
+                assert_eq!(
+                    delta(&ordinary_time_silu(&input, training).unwrap(), expected),
+                    0.0,
+                    "author BF16 time SiLU training={training}"
+                );
+            }
+            for (label, eager) in [
+                ("inference", mlx_rs::fast::silu_exact(&input).unwrap()),
+                (
+                    "training",
+                    multiply(&input, sigmoid(&input).unwrap()).unwrap(),
+                ),
+            ] {
+                assert!(
+                    delta(&eager, expected) > 0.0,
+                    "author time SiLU hook must discriminate eager BF16 {label} rounding"
+                );
+            }
+        }
         let f = fixture("ordinary");
         let g = geometry(&f);
         let context = contexts(
@@ -1178,7 +1209,7 @@ mod author_fixture_tests {
                 Dtype::Bfloat16
             };
             let w = weights(&f["weights"], dtype);
-            let model = Transformer::load(&w, g.clone()).unwrap();
+            let mut model = Transformer::load(&w, g.clone()).unwrap();
             assert!(w.unused_keys().is_empty());
             assert!(context.iter().all(|c| c.dtype() == Dtype::Float32));
             if dtype == Dtype::Float32 {
@@ -1216,6 +1247,19 @@ mod author_fixture_tests {
                 difference < tolerance,
                 "dtype={dtype:?} skip={skip:?} max_abs={difference}"
             );
+            if dtype == Dtype::Bfloat16 {
+                // Training mode must match the same frozen author packet,
+                // including its fused SiLU boundary; no regenerated golden or wider tolerance.
+                model.training = true;
+                let training_output = model
+                    .forward(&input, &times, &context, &skip, &CancelFlag::new())
+                    .unwrap();
+                let training_difference = delta(&training_output, &case["velocity"]);
+                assert!(
+                    training_difference < tolerance,
+                    "training dtype={dtype:?} skip={skip:?} max_abs={training_difference}"
+                );
+            }
         }
         let hidden = array(&f["leaf_ops"]["situ_hidden"]);
         let gate = array(&f["leaf_ops"]["situ_gate"]);
@@ -1493,6 +1537,22 @@ fn edit_situ(hidden: &Array, gate: &Array) -> Result<Array> {
         gated,
         scale(&divide_then_tanh(hidden, 25.0)?, 25.0)?,
     )?)
+}
+
+fn ordinary_time_silu(x: &Array, training: bool) -> Result<Array> {
+    // Author nn.SiLU evaluates BF16 inputs in FP32 and rounds only its output.
+    // Preserve the existing primitive training path and fast inference path.
+    let input = if x.dtype() == Dtype::Bfloat16 {
+        x.as_dtype(Dtype::Float32)?
+    } else {
+        x.clone()
+    };
+    let output = if training || mlx_rs::Device::try_default()? == mlx_rs::Device::cpu() {
+        multiply(&input, sigmoid(&input)?)?
+    } else {
+        mlx_rs::fast::silu_exact(&input)?
+    };
+    Ok(output.as_dtype(x.dtype())?)
 }
 
 fn edit_silu(x: &Array) -> Result<Array> {
@@ -2042,6 +2102,7 @@ mod edit_fixture_tests {
             Ok("1")
         );
         mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+            author_fixture_tests::ordinary_author_time_conformance();
             run_oracle(false);
             trained_custom_adapters_compose_with_edit();
         });
