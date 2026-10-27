@@ -1,9 +1,9 @@
-name: iOS simulator SANA functional image
+name: iOS simulator SANA runtime boundary
 
-# E8: never called by PR/push CI. The simulator image is a functional witness only; it does not
-# establish physical-iPhone admission, memory fit, timing, or kernel correctness.
-# CI_IMPACT: one separately dispatched job, no added PR/push cost; cold iOS SDK compile and
-# snapshot transfer cost are host/asset dependent (unknown). Pinned job-local XcodeGen adds
+# E8: never called by PR/push CI. The iOS simulator cannot execute MLX Metal inference;
+# this witnesses build/install/launch and an explicit unsupported-runtime response only.
+# CI_IMPACT: one separately dispatched no-model job, no added PR/push cost; cold iOS SDK compile
+# cost is host dependent (unknown). Pinned job-local XcodeGen adds
 # 4,286,070 download bytes plus a version probe; no Homebrew/global install. Timeout: 240 minutes.
 on:
   workflow_call:
@@ -12,8 +12,9 @@ on:
         required: true
         type: string
       snapshot:
-        required: true
+        required: false
         type: string
+        default: ''
       source_sha:
         required: true
         type: string
@@ -24,8 +25,8 @@ on:
         required: true
         type: string
       snapshot:
-        description: Runner-local absolute or ~/ path to pinned canonical SANA 1600M MLX snapshot root with BF16
-        required: true
+        description: Legacy carrier field; ignored by the model-free runtime-boundary check
+        required: false
         type: string
       source_sha:
         description: Exact 40-hex source SHA bound to this validation
@@ -36,14 +37,13 @@ permissions:
   contents: read
 
 jobs:
-  image:
-    name: One bounded SANA simulator image
+  runtime-boundary:
+    name: Build, install and launch with explicit unsupported MLX runtime
     if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, macOS, ARM64, nax]
     timeout-minutes: 240
     env:
       SIMULATOR_SELECTOR: ${{ inputs.simulator }}
-      SANA_SNAPSHOT: ${{ inputs.snapshot }}
       SOURCE_SHA: ${{ inputs.source_sha }}
       SMOKE_BUNDLE_ID: com.michaeltrefry.SceneWorksSmokeSim${{ github.run_id }}a${{ github.run_attempt }}
       CARGO_BUILD_JOBS: '4'
@@ -69,10 +69,6 @@ jobs:
         run: |
           command -v python3.12
           python3.12 -I scripts/ci/provision_simulator_xcodegen.py
-      - name: Resolve the pinned snapshot under this runner's own home
-        shell: bash
-        run: |
-          python3.12 scripts/release/resolve_snapshot_paths.py SANA_SNAPSHOT
       - name: Select an available iPhone runtime on the claiming runner
         shell: bash
         run: |
@@ -104,28 +100,6 @@ jobs:
               output.write('CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=' + linker + '\n')
           print('selected native host SDK:', sdk)
           PY
-      - name: Materialize the pinned public snapshot and BF16 projection on this runner
-        shell: bash
-        run: |
-          [[ "$SANA_SNAPSHOT" = /* ]]
-          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes \
-            --target "$RUNNER_TEMP/huggingface-hub" \
-            -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py \
-            --model sana-1600m-mlx --snapshot "$SANA_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/ci/ios_simulator_sana_inventory.py \
-            --materialize-bf16 "$SANA_SNAPSHOT" \
-            --output "$RUNNER_TEMP/ios-simulator-sana/bf16-materialization.json"
-      - name: Verify immutable input snapshot identity and content
-        shell: bash
-        run: |
-          [[ "$SANA_SNAPSHOT" = /* && -d "$SANA_SNAPSHOT/bf16" ]]
-          python3.12 scripts/release/verify_model_snapshot.py --model sana-1600m-mlx \
-            --snapshot "$SANA_SNAPSHOT" --inventory-output "$RUNNER_TEMP/ios-simulator-sana/source-inventory.json"
-          python3.12 -I scripts/ci/ios_simulator_sana_inventory.py \
-            --source-inventory "$RUNNER_TEMP/ios-simulator-sana/source-inventory.json" \
-            --source-snapshot "$SANA_SNAPSHOT" \
-            --output "$RUNNER_TEMP/ios-simulator-sana/bf16-hub-auth.json"
       - name: Create a disposable simulator from the selected iPhone template
         shell: bash
         run: |
@@ -137,29 +111,16 @@ jobs:
         shell: bash
         run: |
           rustup target add aarch64-apple-ios-sim
-          scripts/ios/run_smoke.sh --simulator "$SIMULATOR_UDID" --simulator-functional --install-only
-      - name: Copy exact SANA snapshot and verify installed content
+          scripts/ios/run_smoke.sh --simulator "$SIMULATOR_UDID" --simulator-runtime-boundary --install-only
+      - name: Verify one supervised unsupported-runtime response
         shell: bash
         run: |
-          test -d "$SANA_SNAPSHOT/bf16"
-          scripts/ios/push_model.sh "$SANA_SNAPSHOT/bf16" sana --simulator "$SIMULATOR_UDID"
-          DATA="$(xcrun simctl get_app_container "$SIMULATOR_UDID" "$SMOKE_BUNDLE_ID" data)"
-          python3.12 -I scripts/ci/ios_simulator_sana_inventory.py \
-            --source-inventory "$RUNNER_TEMP/ios-simulator-sana/source-inventory.json" \
-            --copied "$DATA/Documents/sana" \
-            --output "$RUNNER_TEMP/ios-simulator-sana/copied-inventory.json"
-      - name: Execute one supervised simulator SANA image
-        shell: bash
-        run: |
-          python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- \
-            python3.12 -I scripts/ci/ios_simulator_sana.py \
-              --simulator "$SIMULATOR_UDID" --bundle-id "$SMOKE_BUNDLE_ID" \
-              --source-sha "$SOURCE_SHA" \
-              --inventory "$RUNNER_TEMP/ios-simulator-sana/source-inventory.json" \
-              --copied-inventory "$RUNNER_TEMP/ios-simulator-sana/copied-inventory.json" \
-              --owned-receipt "$RUNNER_TEMP/ios-simulator-sana/owned-simulator.json" \
-              --policy scripts/ci/ios-simulator-sana-policy.json \
-              --output "$RUNNER_TEMP/ios-simulator-sana/result"
+          python3.12 -I scripts/ci/ios_simulator_sana.py \
+            --simulator "$SIMULATOR_UDID" --bundle-id "$SMOKE_BUNDLE_ID" \
+            --source-sha "$SOURCE_SHA" \
+            --owned-receipt "$RUNNER_TEMP/ios-simulator-sana/owned-simulator.json" \
+            --policy scripts/ci/ios-simulator-sana-policy.json \
+            --output "$RUNNER_TEMP/ios-simulator-sana/result"
       - name: Retire only this workflow attempt's disposable simulator
         if: always()
         shell: bash
@@ -179,7 +140,7 @@ jobs:
               --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
               --receipt "$receipt" --output "$output"
           fi
-      - name: Upload result, source inventory and refusal logs
+      - name: Upload runtime-boundary result and refusal logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

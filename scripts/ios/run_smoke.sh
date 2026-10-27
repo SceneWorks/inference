@@ -9,9 +9,10 @@
 #             [--device <udid> | --simulator [<udid>|<name>]] [--memory-entitlement on|off]
 #
 # Device:    a paired device with Developer Mode on, xcodegen, and a signing identity.
-# Simulator: xcodegen and an installed iOS simulator runtime; no signing, no device. The simulator
-#            is a BUILD/packaging/correctness check only: it has no jetsam per-app cap (the report
-#            says so) and no ANE, so no memory or performance claim may rest on it.
+# Simulator: xcodegen and an installed iOS simulator runtime; no signing, no device. The
+#            dispatch-only runtime-boundary route builds, installs and launches, then reports
+#            MLX Metal unsupported before any device or model call. It proves no image, kernel,
+#            memory-fit or performance claim.
 #
 # --memory-entitlement (device only; default on) selects whether the app is signed with
 # com.apple.developer.kernel.increased-memory-limit. The app logs os_proc_available_memory at
@@ -61,7 +62,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "--campaign-case needs provider/route/tier/edge/mode/rung/selection/steps" >&2; exit 2; }
       OTHER_MEDIA_MODE=1; export IOS_CAMPAIGN_CASE="$2"; CARGO_FEATURES="--features media"; shift 2 ;;
     --install-only) INSTALL_ONLY=1; shift ;;
-    --simulator-functional) SIMULATOR_FUNCTIONAL=1; shift ;;
+    --simulator-runtime-boundary|--simulator-functional) SIMULATOR_FUNCTIONAL=1; shift ;;
     --campaign-timeout) export IOS_CAMPAIGN_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --campaign-list) OTHER_MEDIA_MODE=1; export IOS_CAMPAIGN_LIST=1; CARGO_FEATURES="--features media"; shift ;;
     --campaign-diagnostic) export IOS_CAMPAIGN_DIAGNOSTIC=1; shift ;;
@@ -69,10 +70,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ "$SIMULATOR_FUNCTIONAL" -eq 0 ] || { [ -n "$SIMULATOR" ] && [ "$INSTALL_ONLY" -eq 1 ]; } \
-  || { echo "--simulator-functional is build/install-only; use the dispatch-only simulator controller to launch" >&2; exit 2; }
+  || { echo "--simulator-runtime-boundary is build/install-only; use the dispatch-only simulator controller to launch" >&2; exit 2; }
 if [ "$SIMULATOR_FUNCTIONAL" -eq 1 ]; then
   [ "$OTHER_MEDIA_MODE" -eq 0 ] && [ -z "${IOS_SMOKE_IMAGE_ONLY:-}${IOS_SMOKE_SANA_CAPTURE:-}${IOS_SMOKE_UNADMITTED:-}" ] \
-    || { echo "--simulator-functional cannot combine with other model modes" >&2; exit 2; }
+    || { echo "--simulator-runtime-boundary cannot combine with other model modes" >&2; exit 2; }
   CARGO_FEATURES="--features simulator-functional"
 fi
 

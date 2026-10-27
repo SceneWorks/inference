@@ -1082,11 +1082,23 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-simulator-sana'")
         self.assertEqual(job["uses"], "./.github/workflows/ios-simulator-sana.yml")
         self.assertEqual(set(job["with"]), {"source_sha", "simulator", "snapshot"})
-        for key in job["with"]:
+        for key in ("source_sha", "simulator"):
             self.assertEqual(job["with"][key], "${{ fromJSON(inputs.ios_pricing_compile_binding)." + key + " }}")
+        self.assertEqual(job["with"]["snapshot"],
+                         "${{ format('{0}', fromJSON(inputs.ios_pricing_compile_binding).snapshot) }}")
         called = yaml.safe_load((REAL_WEIGHTS_WORKFLOW.parent / "ios-simulator-sana.yml").read_text(encoding="utf-8"))
         self.assertEqual(set(called.get("on", called.get(True))), {"workflow_call", "workflow_dispatch"})
-        self.assertEqual(called["jobs"]["image"]["if"], "github.event_name == 'workflow_dispatch'")
+        self.assertFalse(called.get("on", called.get(True))["workflow_call"]["inputs"]["snapshot"]["required"])
+        boundary = called["jobs"]["runtime-boundary"]
+        self.assertEqual(boundary["if"], "github.event_name == 'workflow_dispatch'")
+        runs = "\n".join(step.get("run", "") for step in boundary["steps"])
+        self.assertIn("--simulator-runtime-boundary --install-only", runs)
+        self.assertIn("ios_simulator_sana.py", runs)
+        for forbidden in ("push_model.sh", "ensure_model_snapshot.py", "verify_model_snapshot.py",
+                          "ios_simulator_sana_inventory.py", "inference_metal_launcher.py",
+                          "--inventory", "--copied-inventory"):
+            self.assertNotIn(forbidden, runs)
+        self.assertNotIn("SANA_SNAPSHOT", boundary["env"])
 
     def test_ios_prequant_is_single_manual_cpu_route_with_receipt_only(self) -> None:
         workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))

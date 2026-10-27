@@ -1,7 +1,4 @@
-"""CI_IMPACT: ~0.1 s pure Python and a mocked shell command; no simulator, Metal, model, or download.
-
-Covers the mandatory dispatch boundary and independent PNG-content witness for sc-16780.
-"""
+"""CI_IMPACT: pure mocked simulator metadata/receipt checks; no Metal, model, or download."""
 from __future__ import annotations
 
 import json
@@ -10,12 +7,10 @@ import plistlib
 import subprocess
 from argparse import Namespace
 from pathlib import Path
-import struct
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-import zlib
 
 from scripts.ci import ios_simulator_sana as sim
 from scripts.ci import ios_simulator_sana_device as device
@@ -24,17 +19,8 @@ from scripts.ci.ios_simulator_sana_inventory import (REPOSITORY, REVISION, REQUI
                                                     verify_copied_bf16)
 
 
-def png(row: bytes) -> bytes:
-    def chunk(kind: bytes, payload: bytes) -> bytes:
-        return (struct.pack('>I', len(payload)) + kind + payload
-                + struct.pack('>I', zlib.crc32(kind + payload)))
-    header = struct.pack('>IIBBBBB', 256, 256, 8, 2, 0, 0, 0)
-    rows = b''.join(b'\x00' + row for _ in range(256))
-    return sim.PNG + chunk(b'IHDR', header) + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b'')
-
-
 class SimulatorSanaTests(unittest.TestCase):
-    def test_missing_png_retains_fresh_report_before_owned_app_termination(self):
+    def run_mock_boundary(self, report_kind: str) -> tuple[dict | None, dict | None, list[str]]:
         source, nonce = 'b' * 40, 'a' * 32
         simulator = '22222222-2222-2222-2222-222222222222'
         bundle = 'com.michaeltrefry.SceneWorksSmokeSim123a1'
@@ -43,23 +29,17 @@ class SimulatorSanaTests(unittest.TestCase):
             app, data, output = root / 'app', root / 'data', root / 'result'
             app.mkdir()
             docs = data / 'Documents'
-            (docs / 'sana').mkdir(parents=True)
+            docs.mkdir(parents=True)
             (app / 'Info.plist').write_bytes(plistlib.dumps({
                 'CFBundleIdentifier': bundle, 'CFBundleExecutable': 'Smoke'}))
             (app / 'Smoke').write_bytes(b'executable')
-            (app / 'mlx.metallib').write_bytes(b'metallib')
-            inventory = {'model': 'sana-1600m-mlx', 'inventory_sha256': 'c' * 64,
-                         'revision': 'd' * 40, 'files': []}
-            copied = {'source_inventory_sha256': inventory['inventory_sha256'],
-                      'revision': inventory['revision'], 'tier': 'bf16', 'files': [],
-                      'tier_inventory_sha256': sim.content_digest([])}
-            for name, value in [('inventory.json', inventory), ('copied.json', copied)]:
-                (root / name).write_text(json.dumps(value), encoding='utf-8')
+            (app / 'mlx.metallib').write_bytes(b'simulator-metallib')
             args = Namespace(simulator=simulator, bundle_id=bundle, source_sha=source,
-                             inventory=root / 'inventory.json', copied_inventory=root / 'copied.json',
                              owned_receipt=root / 'owned.json',
                              policy=sim.ROOT / 'scripts/ci/ios-simulator-sana-policy.json', output=output)
             calls = []
+            if report_kind == 'stale':
+                (docs / 'smoke-report.txt').write_text('stale', encoding='utf-8')
 
             def command(*parts, timeout=20, env=None):
                 if parts[:2] == ('git', 'rev-parse'):
@@ -69,18 +49,25 @@ class SimulatorSanaTests(unittest.TestCase):
                 if parts[:3] == ('xcrun', 'simctl', 'launch'):
                     assert env is not None
                     self.assertEqual(env['SIMCTL_CHILD_IOS_CAMPAIGN_BUILD_SHA'], source)
-                    (docs / 'smoke-report.txt').write_text(
-                        f'SMOKE: PASS\nSIMULATOR_NONCE {env["SIMCTL_CHILD_IOS_SIMULATOR_SANA_NONCE"]}\n'
-                        f'SOURCE_SHA {source}\n  [ok] SANA image generation (E5)\n'
-                        'SIMULATOR FUNCTIONAL ONLY; no phone admission, memory fit, or performance claim',
-                        encoding='utf-8')
-                    (docs / 'sana-progress.txt').write_text('no candidate: unserved tile128\n', encoding='utf-8')
+                    calls.append('launched')
+                    report = sim.expected_runtime_report(env['SIMCTL_CHILD_IOS_SIMULATOR_SANA_NONCE'], source)
+                    if report_kind == 'forged':
+                        report = report.replace('SMOKE: UNSUPPORTED_RUNTIME', 'SMOKE: PASS')
+                    elif report_kind == 'wrong-source':
+                        report = report.replace(f'SOURCE_SHA {source}', 'SOURCE_SHA ' + '0' * 40)
+                    if report_kind not in ('missing', 'crash'):
+                        (docs / 'smoke-report.txt').write_text(report, encoding='utf-8')
                     return bundle + ': 42'
                 if parts[:3] == ('xcrun', 'simctl', 'terminate'):
-                    self.assertTrue((output / 'failure-report.txt').is_file())
-                    calls.append('terminated after diagnostic copy')
+                    calls.append('terminated')
                     return ''
                 self.fail(f'unexpected command: {parts}')
+
+            identity_calls = 0
+            def identity(_pid):
+                nonlocal identity_calls
+                identity_calls += 1
+                return None if report_kind == 'crash' and identity_calls > 1 else (str((app / 'Smoke').resolve()), 1)
 
             with patch.dict(os.environ, {'RUNNER_NAME': 'nax-macos-2'}), \
                  patch.object(sim, 'require_dispatch'), patch.object(sim, 'command', side_effect=command), \
@@ -88,14 +75,71 @@ class SimulatorSanaTests(unittest.TestCase):
                  patch.object(sim.safety, 'SystemProbe', return_value=object()), \
                  patch.object(sim.safety, 'read_host', return_value=(32 * 1024**3, {})), \
                  patch.object(sim.safety, 'proc_pid_rusage_footprint', return_value=(100, 100)), \
-                 patch.object(sim, 'app_identity', return_value=(str((app / 'Smoke').resolve()), 1)), \
+                 patch.object(sim, 'app_identity', side_effect=identity), \
                  patch.object(sim.os, 'urandom', return_value=bytes.fromhex(nonce)):
-                with self.assertRaisesRegex(ValueError, 'no exact PNG'):
-                    sim.run(args)
-            self.assertEqual(calls, ['terminated after diagnostic copy'])
+                if report_kind == 'missing':
+                    with patch.object(sim.time, 'monotonic', side_effect=[0, 121]):
+                        with self.assertRaisesRegex(ValueError, 'deadline'):
+                            sim.run(args)
+                elif report_kind == 'crash':
+                    with self.assertRaisesRegex(ValueError, 'PID exited'):
+                        sim.run(args)
+                elif report_kind == 'stale':
+                    with self.assertRaisesRegex(ValueError, 'fresh simulator app container'):
+                        sim.run(args)
+                elif report_kind in ('forged', 'wrong-source'):
+                    with self.assertRaisesRegex(ValueError, 'failed exact source/nonce/classification'):
+                        sim.run(args)
+                else:
+                    self.assertEqual(sim.run(args), 0)
             self.assertFalse((docs / ('simulator-go-' + nonce)).exists())
-            self.assertFalse((output / 'result.json').exists())
-            self.assertFalse(json.loads((output / 'failure-diagnostics.json').read_text(encoding='utf-8'))['accepted'])
+            result = json.loads((output / 'result.json').read_text(encoding='utf-8')) if (output / 'result.json').is_file() else None
+            failure = json.loads((output / 'failure-diagnostics.json').read_text(encoding='utf-8')) if (output / 'failure-diagnostics.json').is_file() else None
+            return result, failure, calls
+
+    def test_exact_unsupported_runtime_binds_packaging_without_model_acceptance(self):
+        nonce, source = 'a' * 32, 'b' * 40
+        self.assertEqual(sim.expected_runtime_report(nonce, source),
+                         f'SMOKE: UNSUPPORTED_RUNTIME\nSIMULATOR_NONCE {nonce}\nSOURCE_SHA {source}\n'
+                         'UNSUPPORTED_RUNTIME mlx-metal-ios-simulator\nMODEL_EXECUTION false\n'
+                         'MODEL_ACCEPTANCE false\nIMAGE_ACCEPTANCE false\nPHONE_FIT_ACCEPTANCE false\n')
+        result, failure, calls = self.run_mock_boundary('valid')
+        self.assertIsNone(failure)
+        self.assertEqual(calls, ['launched', 'terminated'])
+        self.assertFalse(result['accepted'])
+        self.assertTrue(result['packaging_runtime_boundary_accepted'])
+        for key in ('model_execution', 'model_acceptance', 'image_acceptance', 'phone_fit_acceptance'):
+            self.assertFalse(result[key])
+        self.assertEqual(result['source_sha'], source)
+        self.assertEqual(result['nonce'], nonce)
+        self.assertEqual(result['bundle_id'], 'com.michaeltrefry.SceneWorksSmokeSim123a1')
+        self.assertEqual(result['simulator_udid'], '22222222-2222-2222-2222-222222222222')
+        self.assertEqual(result['process_start_abstime'], 1)
+        self.assertEqual(len(result['executable_sha256']), 64)
+        self.assertEqual(len(result['metallib_sha256']), 64)
+        self.assertNotIn('png', result)
+
+    def test_stale_forged_missing_or_crashed_app_never_accepts_boundary(self):
+        for kind in ('stale', 'forged', 'wrong-source', 'missing', 'crash'):
+            with self.subTest(kind=kind):
+                result, failure, calls = self.run_mock_boundary(kind)
+                self.assertIsNone(result)
+                self.assertNotIn('packaging_runtime_boundary_accepted', failure or {})
+                if kind == 'stale':
+                    self.assertEqual(calls, [])
+                else:
+                    self.assertIn('launched', calls)
+
+    def test_simulator_report_returns_before_any_mlx_or_model_path(self):
+        source = (sim.ROOT / 'ios-host/smoke/src/lib.rs').read_text(encoding='utf-8')
+        start = source.index('pub fn run_report() -> String {')
+        end = source.index('#[cfg(all(target_os = "ios", not(target_abi = "sim")))]', start)
+        simulator = source[start:end]
+        self.assertIn('option_env!("IOS_CAMPAIGN_BUILD_SHA")', simulator)
+        self.assertIn('return format!("SMOKE: UNSUPPORTED_RUNTIME', simulator)
+        self.assertNotIn('check_image_generation(', simulator)
+        self.assertNotIn('mlx_rs::', simulator)
+        self.assertNotIn('load_generator(', simulator)
 
     def test_failed_simulator_report_and_progress_are_retained_only_as_bounded_diagnostics(self):
         policy = sim.policy_for_simulator(sim.ROOT / 'scripts/ci/ios-simulator-sana-policy.json')
@@ -260,7 +304,7 @@ class SimulatorSanaTests(unittest.TestCase):
 
     def test_install_only_cannot_be_downgraded_by_later_media_flag(self):
         script = sim.ROOT / 'scripts/ios/run_smoke.sh'
-        result = subprocess.run(['bash', str(script), '--simulator-functional', '--install-only',
+        result = subprocess.run(['bash', str(script), '--simulator-runtime-boundary', '--install-only',
                                  '--simulator', 'not-used', '--media'], capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 2)
         self.assertIn('cannot combine with other model modes', result.stderr)
@@ -293,24 +337,6 @@ class SimulatorSanaTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 sim.require_dispatch({**good, key: wrong})
 
-    def test_png_pixels_requires_nonconstant_decoded_rgb(self):
-        with tempfile.TemporaryDirectory() as directory:
-            file = Path(directory) / 'render.png'
-            gradient = b''.join(bytes((i, i // 2, 255 - i)) for i in range(256))
-            file.write_bytes(png(gradient))
-            self.assertEqual(sim.png_pixels(file), (256, 256, 0, 255, 255))
-            file.write_bytes(png(bytes((0, 128, 255)) * 256))
-            with self.assertRaisesRegex(ValueError, 'spatially near-constant'):
-                sim.png_pixels(file)
-            file.write_bytes(png(bytes((4, 4, 4)) * 256))
-            with self.assertRaisesRegex(ValueError, 'near-constant'):
-                sim.png_pixels(file)
-            bad = bytearray(png(gradient))
-            bad[32] ^= 1
-            file.write_bytes(bad)
-            with self.assertRaisesRegex(ValueError, 'CRC'):
-                sim.png_pixels(file)
-
     def test_reviewed_policy_cannot_lose_host_reserve_or_expand_cap(self):
         data = json.loads((sim.ROOT / 'scripts/ci/ios-simulator-sana-policy.json').read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as directory:
@@ -319,7 +345,7 @@ class SimulatorSanaTests(unittest.TestCase):
             sim.policy_for_simulator(file)
             for field, value in [('hostFreeReserveBytes', 1),
                                  ('childFootprintCapBytes', 13 * 1024**3),
-                                 ('deadlineSeconds', 7201)]:
+                                 ('deadlineSeconds', 121)]:
                 with self.subTest(field=field):
                     file.write_text(json.dumps({**data, field: value}), encoding="utf-8")
                     with self.assertRaises(ValueError):

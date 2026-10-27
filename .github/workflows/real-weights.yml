@@ -146,7 +146,7 @@ on:
       # this existing JSON input to {"confirm_all": true}; no extra keys are accepted.
       # Every other profile, including the iOS profiles, retains its existing meaning/default.
       ios_pricing_compile_binding:
-        description: 'iOS JSON carrier: selected-captures selection; compile-only owner binding; prequant typed route; simulator-sana exact source_sha, simulator UDID, snapshot path (see runbook).'
+        description: 'iOS JSON carrier: selected-captures selection; compile-only owner binding; prequant typed route; simulator runtime boundary exact source_sha and simulator selector (see runbook).'
         type: string
         required: false
         default: '{"source_sha":"","manifest_sha256":"","host":"second-mac"}'
@@ -493,8 +493,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'model-exhaustive-tests'
     uses: ./.github/workflows/model-test-suites.yml
 
-  # S3 simulator image: dispatch from the existing registered workflow before the new reusable
-  # workflow file reaches default branch. The called workflow validates exact source and resources.
+  # S3 simulator build/install/launch and explicit unsupported MLX runtime; no model execution.
   ios-simulator-sana:
     needs: validate-selection
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-simulator-sana'
@@ -502,7 +501,7 @@ jobs:
     with:
       source_sha: ${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}
       simulator: ${{ fromJSON(inputs.ios_pricing_compile_binding).simulator }}
-      snapshot: ${{ fromJSON(inputs.ios_pricing_compile_binding).snapshot }}
+      snapshot: ${{ format('{0}', fromJSON(inputs.ios_pricing_compile_binding).snapshot) }}
 
   ios-prequant:
     needs: validate-selection

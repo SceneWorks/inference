@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Dispatch-only SANA simulator image witness; never a physical-iPhone fit claim.
+"""Dispatch-only simulator packaging and explicit unsupported-runtime witness.
 
 simctl reparents GUI apps to launchd_sim, so a process-tree supervisor around `simctl launch`
-does not own the model process. This controller gates the app until it verifies the returned PID,
+does not own the app process. This controller gates the app until it verifies the returned PID,
 executable path and kernel start identity, then samples that exact PID and host reserve until a
-fresh nonce-bound report and PNG exist. Its cleanup terminates only the still-owned app.
+fresh nonce-bound unsupported-runtime report exists. Its cleanup terminates only the still-owned app.
 """
 from __future__ import annotations
 
@@ -18,20 +18,16 @@ import plistlib
 import re
 import signal
 import stat
-import struct
 import subprocess
 import sys
 import time
-import zlib
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from scripts import media_campaign_supervisor as safety
-from scripts.ci.ios_simulator_sana_inventory import content_digest
 
 UDID = re.compile(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
-PNG = b"\x89PNG\r\n\x1a\n"
 
 
 def require_dispatch(env: dict[str, str]) -> None:
@@ -82,14 +78,14 @@ def owned_booted_device(simulator: str, receipt_path: Path,
 
 def policy_for_simulator(path: Path) -> safety.SafetyPolicy:
     policy = safety.load_policy(path)
-    if (policy.backend != "darwin-mlx" or policy.deadline_seconds > 7200
+    if (policy.backend != "darwin-mlx" or policy.deadline_seconds > 120
             or policy.child_footprint_cap_bytes > 12 * 1024**3
             or policy.host_free_reserve_bytes < 16 * 1024**3
             or not 100 <= policy.poll_millis <= 1000
             or policy.stdout_cap_bytes > 1024**2
             or policy.stderr_cap_bytes > 1024**2
             or policy.event_cap_bytes > 16 * 1024**2):
-        raise ValueError("simulator policy exceeds the reviewed deadline/cap/output bounds or weakens host reserve")
+        raise ValueError("simulator boundary policy exceeds the reviewed deadline/cap/output bounds or weakens host reserve")
     return policy
 
 
@@ -124,67 +120,12 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def png_pixels(path: Path) -> tuple[int, int, int, int, int]:
-    """Decode the fixed RGB8 PNG format the Rust image crate writes; verify real pixel spread."""
-    data = path.read_bytes()
-    if not data.startswith(PNG):
-        raise ValueError("PNG signature missing")
-    at, compressed, size = len(PNG), bytearray(), None
-    while at + 12 <= len(data):
-        length = int.from_bytes(data[at:at + 4], "big")
-        kind = data[at + 4:at + 8]
-        end = at + 12 + length
-        if end > len(data) or zlib.crc32(data[at + 4:at + 8 + length]) & 0xffffffff != int.from_bytes(data[at + 8 + length:end], "big"):
-            raise ValueError("PNG chunk length or CRC invalid")
-        payload = data[at + 8:at + 8 + length]
-        if kind == b"IHDR":
-            width, height, bits, color, compression, filtering, interlace = struct.unpack(">IIBBBBB", payload)
-            if (width, height, bits, color, compression, filtering, interlace) != (256, 256, 8, 2, 0, 0, 0):
-                raise ValueError("PNG is not the required 256x256 RGB8 image")
-            size = width * 3
-        elif kind == b"IDAT":
-            compressed.extend(payload)
-        elif kind == b"IEND":
-            break
-        at = end
-    if size is None or not compressed:
-        raise ValueError("PNG lacks image payload")
-    decoder = zlib.decompressobj()
-    expected = 256 * (size + 1)
-    raw = decoder.decompress(compressed, expected + 1)
-    if len(raw) != expected or not decoder.eof or decoder.unconsumed_tail or decoder.unused_data:
-        raise ValueError("PNG decoded length is invalid")
-    before = bytearray(size)
-    low, high = 255, 0
-    channel_low, channel_high = [255] * 3, [0] * 3
-    for row in range(256):
-        start = row * (size + 1)
-        filt = raw[start]
-        scan = bytearray(raw[start + 1:start + 1 + size])
-        if filt > 4:
-            raise ValueError("PNG filter unsupported")
-        for i, value in enumerate(scan):
-            left = scan[i - 3] if i >= 3 else 0
-            above = before[i]
-            upper_left = before[i - 3] if i >= 3 else 0
-            if filt == 1: value += left
-            elif filt == 2: value += above
-            elif filt == 3: value += (left + above) // 2
-            elif filt == 4:
-                p = left + above - upper_left
-                distances = (abs(p - left), abs(p - above), abs(p - upper_left))
-                value += (left, above, upper_left)[distances.index(min(distances))]
-            scan[i] = value & 255
-        low, high = min(low, min(scan)), max(high, max(scan))
-        for channel in range(3):
-            values = scan[channel::3]
-            channel_low[channel] = min(channel_low[channel], min(values))
-            channel_high[channel] = max(channel_high[channel], max(values))
-        before = scan
-    spatial_span = max(hi - lo for hi, lo in zip(channel_high, channel_low))
-    if spatial_span < 32:
-        raise ValueError("simulator PNG is spatially near-constant")
-    return 256, 256, low, high, spatial_span
+def expected_runtime_report(nonce: str, source_sha: str) -> str:
+    """The app's exact, source-compiled result before any MLX device call."""
+    return (f"SMOKE: UNSUPPORTED_RUNTIME\nSIMULATOR_NONCE {nonce}\n"
+            f"SOURCE_SHA {source_sha}\nUNSUPPORTED_RUNTIME mlx-metal-ios-simulator\n"
+            "MODEL_EXECUTION false\nMODEL_ACCEPTANCE false\nIMAGE_ACCEPTANCE false\n"
+            "PHONE_FIT_ACCEPTANCE false\n")
 
 
 def retain_failure_diagnostics(docs: Path, output: Path, policy: safety.SafetyPolicy,
@@ -213,7 +154,7 @@ def retain_failure_diagnostics(docs: Path, output: Path, policy: safety.SafetyPo
         except OSError as error:
             files[name] = f"unavailable: {type(error).__name__}"
     (output / "failure-diagnostics.json").write_text(json.dumps({
-        "accepted": False, "claim": "diagnostic-only app breadcrumbs; no functional or phone-fit evidence",
+        "accepted": False, "claim": "diagnostic-only app breadcrumbs; no simulator boundary or phone-fit evidence",
         "source_sha": source_sha, "nonce": nonce, "files": files,
     }, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -228,9 +169,6 @@ def run(args: argparse.Namespace) -> int:
     if not args.output.is_absolute() or args.output.exists():
         raise ValueError("fresh absolute output directory required")
     policy = policy_for_simulator(args.policy)
-    inventory = json.loads(args.inventory.read_text(encoding="utf-8"))
-    if inventory.get("model") != "sana-1600m-mlx" or not re.fullmatch("[0-9a-f]{64}", inventory.get("inventory_sha256", "")):
-        raise ValueError("verified SANA content inventory required")
     app_dir = Path(command("xcrun", "simctl", "get_app_container", args.simulator, args.bundle_id, "app")).resolve()
     data_dir = Path(command("xcrun", "simctl", "get_app_container", args.simulator, args.bundle_id, "data")).resolve()
     app_info = plistlib.loads((app_dir / "Info.plist").read_bytes())
@@ -242,21 +180,8 @@ def run(args: argparse.Namespace) -> int:
     if not executable.is_file() or not metallib.is_file():
         raise ValueError("installed app executable or simulator metallib absent")
     docs = data_dir / "Documents"
-    snapshot = docs / "sana"
-    if snapshot.is_symlink() or not snapshot.is_dir() or snapshot.resolve() != snapshot:
-        raise ValueError("the exact Documents/sana snapshot must be a real directory")
-    if args.copied_inventory.is_symlink():
-        raise ValueError("copied snapshot inventory must be a real file")
-    copied = json.loads(args.copied_inventory.read_text(encoding="utf-8"))
-    expected_tier = sorted(({"path": row["path"][5:], "size": row["size"],
-                             "sha256": row["sha256"]} for row in inventory["files"]
-                            if row["path"].startswith("bf16/")), key=lambda row: row["path"])
-    if (copied.get("source_inventory_sha256") != inventory["inventory_sha256"]
-            or copied.get("revision") != inventory.get("revision")
-            or copied.get("tier") != "bf16"
-            or copied.get("files") != expected_tier
-            or copied.get("tier_inventory_sha256") != content_digest(expected_tier)):
-        raise ValueError("installed snapshot content differs from verified source")
+    if not docs.is_dir() or (docs / "sana").exists():
+        raise ValueError("fresh model-free simulator Documents container required")
     for name in ("smoke-report.txt", "renders.txt", "sana-progress.txt"):
         if (docs / name).exists():
             raise ValueError("fresh simulator app container required; stale report or render manifest")
@@ -267,7 +192,7 @@ def run(args: argparse.Namespace) -> int:
     if free < policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes:
         raise ValueError("host free memory below app footprint cap plus reserve")
     args.output.mkdir(parents=True)
-    (args.output / "admission.json").write_text(json.dumps({"source_sha": actual, "inventory": inventory,
+    (args.output / "admission.json").write_text(json.dumps({"source_sha": actual,
         "policy_sha256": policy.sha256, "host_preflight": host}, sort_keys=True) + "\n", encoding="utf-8")
     nonce = os.urandom(16).hex()
     env = {key: value for key, value in os.environ.items()
@@ -292,7 +217,6 @@ def run(args: argparse.Namespace) -> int:
         (docs / f"simulator-go-{nonce}").write_text(actual + "\n", encoding="utf-8")
         samples = []
         report_file = docs / "smoke-report.txt"
-        png_file = docs / "sana-256-tile192-SIMULATOR-FUNCTIONAL-ONLY.png"
         while time.monotonic() - started < policy.deadline_seconds:
             if app_identity(pid) != claimed:
                 raise ValueError("owned simulator app PID exited or changed identity before verified report")
@@ -301,41 +225,37 @@ def run(args: argparse.Namespace) -> int:
             if footprint > policy.child_footprint_cap_bytes or free_now < policy.host_free_reserve_bytes:
                 raise ValueError("simulator footprint cap or host reserve breached")
             peak, minimum_free = max(peak, footprint, lifetime), min(minimum_free, free_now)
-            for path, cap in ((report_file, policy.stdout_cap_bytes), (docs / "sana-progress.txt", policy.stderr_cap_bytes),
-                              (png_file, policy.event_cap_bytes)):
+            for path, cap in ((report_file, policy.stdout_cap_bytes),
+                              (docs / "sana-progress.txt", policy.stderr_cap_bytes)):
                 if path.exists() and (path.is_symlink() or path.stat().st_size > cap):
                     raise ValueError(f"simulator output cap or file type breached: {path.name}")
             samples.append({"elapsed_ms": round((time.monotonic() - started) * 1000),
                             "footprint_bytes": footprint, "host_available_bytes": free_now})
             if report_file.is_file():
                 report = report_file.read_text(encoding="utf-8")
-                expected = ("SMOKE: PASS\n", f"SIMULATOR_NONCE {nonce}\n", f"SOURCE_SHA {actual}\n",
-                            "SIMULATOR FUNCTIONAL ONLY; no phone admission, memory fit, or performance claim")
-                if not all(token in report for token in expected) or "[ok] SANA image generation (E5)" not in report:
-                    raise ValueError("fresh simulator SANA report failed or lacked source/nonce/body witness")
-                if not png_file.is_file():
-                    raise ValueError("SANA report has no exact PNG")
-                width, height, low, high, spatial_span = png_pixels(png_file)
-                png = args.output / png_file.name
-                png.write_bytes(png_file.read_bytes())
+                if report != expected_runtime_report(nonce, actual):
+                    raise ValueError("fresh simulator unsupported-runtime report failed exact source/nonce/classification check")
+                if list(docs.glob("sana-*.png")) or (docs / "sana").exists():
+                    raise ValueError("model content or image appeared in simulator boundary run")
                 (args.output / "report.txt").write_text(report, encoding="utf-8")
-                (args.output / "result.json").write_text(json.dumps({"accepted": True,
-                    "claim": "simulator SANA functional image only; no phone fit/admission/performance",
-                    "source_sha": actual, "snapshot_inventory_sha256": inventory["inventory_sha256"],
-                    "tier": "bf16", "tier_inventory_sha256": copied["tier_inventory_sha256"],
+                (args.output / "result.json").write_text(json.dumps({
+                    "accepted": False, "packaging_runtime_boundary_accepted": True,
+                    "unsupported_runtime": "mlx-metal-ios-simulator",
+                    "model_execution": False, "model_acceptance": False,
+                    "image_acceptance": False, "phone_fit_acceptance": False,
+                    "claim": "simulator build/install/launch and explicit unsupported runtime only",
+                    "source_sha": actual, "nonce": nonce,
                     "bundle_id": args.bundle_id, "simulator_udid": args.simulator,
                     "runner_name": os.environ["RUNNER_NAME"],
                     "simulator_name": device["name"], "simulator_runtime": runtime,
                     "pid": pid, "process_start_abstime": claimed[1], "executable_sha256": sha256_file(executable),
                     "metallib_sha256": sha256_file(metallib),
-                    "png": png.name, "png_sha256": sha256_file(png),
-                    "width": width, "height": height, "pixel_min": low, "pixel_max": high,
-                    "max_channel_spatial_span": spatial_span,
+                    "report_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
                     "peak_phys_footprint_bytes": peak, "minimum_host_available_bytes": minimum_free,
                     "duration_seconds": time.monotonic() - started, "samples": samples}, sort_keys=True) + "\n", encoding="utf-8")
                 return 0
             time.sleep(policy.poll_millis / 1000)
-        raise ValueError("simulator app exceeded hard validation deadline")
+        raise ValueError("simulator app exceeded hard unsupported-runtime report deadline")
     finally:
         if args.output.is_dir() and not (args.output / "result.json").exists():
             try:
@@ -355,15 +275,15 @@ def run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    for flag in ("simulator", "bundle-id", "source-sha", "inventory", "copied-inventory", "owned-receipt", "policy", "output"):
-        parser.add_argument("--" + flag, required=True, type=Path if flag in ("inventory", "copied-inventory", "owned-receipt", "policy", "output") else str)
+    for flag in ("simulator", "bundle-id", "source-sha", "owned-receipt", "policy", "output"):
+        parser.add_argument("--" + flag, required=True, type=Path if flag in ("owned-receipt", "policy", "output") else str)
     args = parser.parse_args()
     try:
         return run(args)
     except (ValueError, OSError, subprocess.SubprocessError, safety.SupervisionError, InterruptedError) as error:
         if args.output.is_absolute() and args.output.is_dir():
             (args.output / "failure.json").write_text(json.dumps({"accepted": False,
-                "reason": str(error), "claim": "no simulator functional acceptance or phone-fit claim"},
+                "reason": str(error), "claim": "no simulator boundary acceptance or phone-fit claim"},
                 sort_keys=True) + "\n", encoding="utf-8")
         print(f"simulator SANA validation refused: {error}", file=sys.stderr)
         return 1

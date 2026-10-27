@@ -1732,8 +1732,8 @@ fn check_zimage_generation() -> Check {
 
 /// Run every check and render a human- and test-readable report.
 ///
-/// The first line is `SMOKE: PASS` or `SMOKE: FAIL` so an XCTest can assert on a prefix without
-/// parsing the body.
+/// The first line is `SMOKE: PASS` or `SMOKE: FAIL` for normal runs; the simulator-only
+/// runtime boundary returns `SMOKE: UNSUPPORTED_RUNTIME` with no model execution.
 pub fn run_report() -> String {
     #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
     if std::env::var("IOS_SIMULATOR_SANA").as_deref() != Ok("1") {
@@ -1754,17 +1754,11 @@ pub fn run_report() -> String {
         if compiled_source != source {
             return "SMOKE: FAIL\n  [XX] simulator compiled source identity mismatch\n".into();
         }
-        if let Some(docs) = dirs_documents() {
-            let _ = std::fs::remove_file(docs.join(RENDERS_MANIFEST));
-        }
-        // The controller verifies the copied `Documents/sana` content inventory. Do not use the
-        // ordinary first-match finder here: a second sana-named directory could bind the receipt
-        // to one payload while the app loaded another.
-        let snapshot = dirs_documents().map(|docs| docs.join("sana"));
-        let check = check_image_generation(snapshot.as_deref());
-        return format!("SMOKE: {}\nSIMULATOR_NONCE {nonce}\nSOURCE_SHA {compiled_source}\n  [{}] {} -- {}\nSIMULATOR FUNCTIONAL ONLY; no phone admission, memory fit, or performance claim\n",
-            if check.passed { "PASS" } else { "FAIL" },
-            if check.passed { "ok" } else { "XX" }, check.name, check.detail);
+        // MLX's Metal backend requires a GPU family the iOS Simulator does not expose. The
+        // pinned backend segfaults while asking MTLSimDevice for its architecture at its first
+        // allocator call. Report that runtime boundary before ANY MLX memory/device/loader call;
+        // a packaged and launched simulator app is not an image or phone-fit witness.
+        return format!("SMOKE: UNSUPPORTED_RUNTIME\nSIMULATOR_NONCE {nonce}\nSOURCE_SHA {compiled_source}\nUNSUPPORTED_RUNTIME mlx-metal-ios-simulator\nMODEL_EXECUTION false\nMODEL_ACCEPTANCE false\nIMAGE_ACCEPTANCE false\nPHONE_FIT_ACCEPTANCE false\n");
     }
     #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
     if let Some(docs) = dirs_documents() {

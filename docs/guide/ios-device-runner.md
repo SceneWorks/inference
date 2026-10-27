@@ -42,32 +42,33 @@ State a bounded loan and obtain approval each session before Mac real-weight
 measurements; use an external RSS/physical-footprint guard, and return the GPU
 at the agreed deadline. This documentation change runs neither devices nor GPUs.
 
-## Separately dispatched SANA simulator image
+## Separately dispatched SANA simulator runtime boundary
 
-S3's simulator image is a manual `real-weights.yml` profile on a provisioned
-Mac runner. Use an already provisioned immutable `sana-1600m-mlx` snapshot and an
-exact iPhone simulator model name available on that runner. The workflow selects
-its runtime there, creates and later deletes its own simulator without touching
-the template's apps or data. Until the dedicated reusable
+The iOS simulator cannot run MLX Metal inference: its Metal device does not
+provide the GPU family MLX requires. The approved simulator acceptance is a
+verified build, install, launch and explicit `UNSUPPORTED_RUNTIME` response,
+with no model execution. The SANA image remains required on the target phone.
+This manual `real-weights.yml` profile selects an available iPhone simulator
+on the claiming Mac, creates and later deletes only its own device, and never
+touches the template's apps or data. Until the dedicated reusable
 workflow is on the default branch, dispatch through the registered workflow at
 the exact feature ref:
 
 ```sh
 gh workflow run real-weights.yml --ref <feature-ref> \
   -f profile=ios-simulator-sana \
-  -f ios_pricing_compile_binding='{"source_sha":"<40-hex-feature-head>","simulator":"iPhone 17 Pro Max","snapshot":"~/.cache/huggingface/hub/models--SceneWorks--Sana_1600M_1024px_mlx/snapshots/ac421696dd6eb0b41f446f4c45a53ccc057d82a1"}'
+  -f ios_pricing_compile_binding='{"source_sha":"<40-hex-feature-head>","simulator":"iPhone 17 Pro Max"}'
 ```
 
-The route checks out that SHA, verifies the canonical snapshot root and the BF16
-component files against the pinned public Hub metadata, then copies its
-BF16 component tree into a fresh simulator app container and compares every file
-against the source inventory. It builds a simulator metallib and installs without
-launching. The controller then claims the exact app PID before releasing its
-model-load gate, samples physical footprint and host reserve, and accepts only a
-nonce-bound SANA report with a nondegenerate 256×256 PNG. Its artifact includes
-the source, snapshot inventory, binary and PNG identities. This witness proves
-simulator image functionality only; it establishes no physical-phone memory
-admission, fit, kernel correctness, or performance claim.
+The route builds a simulator metallib and installs without launching. The
+controller claims the exact app PID and process start before releasing its gate,
+samples physical footprint and host reserve, and accepts only a fresh, exact
+nonce/source-bound `SMOKE: UNSUPPORTED_RUNTIME` report emitted before MLX device
+initialization. The artifact binds the compiled source, bundle, executable and
+metallib hashes, simulator UUID, PID and runtime. Its
+`packaging_runtime_boundary_accepted` field can be true while
+`model_execution`, `model_acceptance`, `image_acceptance` and
+`phone_fit_acceptance` are all false. No SANA weights are fetched or copied.
 
 ## Optional tooling is not campaign evidence
 
