@@ -243,6 +243,25 @@ class OwnedCpuSafetyTests(unittest.TestCase):
                     owner.collect()
         self.assertEqual(owner.known,{})
 
+    def test_exit_between_session_birth_samples_is_not_identity_drift(self):
+        # CI_IMPACT: one deterministic process-metadata race fixture; no child, sleep or model.
+        owner = fixture.CpuOwner()
+        owner.session = 4242
+        identity = (owner.uid, 100)
+        owner.root_identity = identity
+        owner.known = {4242: identity}
+        table = subprocess.CompletedProcess([], 0, f"4242 1 4242 {owner.uid} 1\n", "")
+        # The ps row and first birth sample are live; the recheck and final census see
+        # the same child gone/zombied. No foreign live identity is accepted or signaled.
+        with mock.patch.object(fixture.subprocess, "run", return_value=table), \
+             mock.patch.object(fixture.os, "getsid", return_value=4242), \
+             mock.patch.object(fixture, "process_identity", side_effect=[identity, None, None]), \
+             mock.patch.object(fixture.os, "kill") as kill:
+            self.assertEqual(owner.collect(), {})
+        self.assertEqual(owner.known, {4242: identity})
+        self.assertEqual(owner.peak, 0)
+        kill.assert_not_called()
+
     def test_metadata_denial_is_failure_not_idle(self):
         owner = fixture.CpuOwner()
         with mock.patch.object(fixture.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["ps"])):
