@@ -1609,6 +1609,11 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # Register before rust-cache so its cache upload finishes before target removal.
+      - uses: ./.github/actions/cleanup-runner-storage
+      - name: Test runner storage cleanup guards
+        shell: powershell
+        run: node --test scripts/runner-storage-cleanup.test.mjs
       # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in the repo's
       # CI config); its daemon resets mid-build on heavy Candle/CUDA graphs ("An existing connection
       # was forcibly closed by the remote host (os error 10054)" with zero rustc diagnostics). Clear
@@ -1714,6 +1719,11 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # Register before rust-cache so its cache upload finishes before target removal.
+      - uses: ./.github/actions/cleanup-runner-storage
+      - name: Test runner storage cleanup guards
+        shell: powershell
+        run: node --test scripts/runner-storage-cleanup.test.mjs
       - name: Isolate persistent-runner HF caches
         shell: cmd
         run: |
@@ -1846,6 +1856,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: ./.github/actions/cleanup-runner-storage
       # Same runner-global sccache hazard as the other heavy Candle lanes (native-12219): clear the
       # wrapper for THIS job only, in a step, never as a job-level env override.
       - name: Disable unstable sccache wrapper for the heavy Candle lane
@@ -1909,6 +1920,7 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: ./.github/actions/cleanup-runner-storage
       # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in the repo's
       # CI config); its daemon resets mid-build on heavy Candle/CUDA graphs ("os error 10054" with
       # zero rustc diagnostics). Clear the wrapper for THIS job only; sibling jobs keep sccache and
@@ -2499,6 +2511,7 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: ./.github/actions/cleanup-runner-storage
       - name: Select Git Bash
         shell: cmd
         run: |
