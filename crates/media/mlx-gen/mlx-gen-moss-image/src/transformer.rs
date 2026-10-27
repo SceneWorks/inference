@@ -3336,6 +3336,109 @@ mod training_graph_tests {
                 .map(read)
                 .collect::<Vec<_>>()
         );
+
+        // CI_IMPACT: ten additional tiny F32 forward/backward evaluations in this
+        // existing ignored Metal oracle only. No real weights or new test/profile.
+        // B=0 makes the first A gradient zero; challenge both factors after the
+        // first production update, across the earliest and latest adapted blocks.
+        // F32 avoids mistaking BF16 forward rounding discontinuities for bad VJPs.
+        let mut model =
+            Transformer::load(&weights(&f["weights"], Dtype::Float32), g.clone()).unwrap();
+        let (targets, mut params) = build_lora_targets(&mut model, &paths, 4, cfg.seed).unwrap();
+        let adapter = TrainAdapter::Lora { targets };
+        let mut objective = |p: &LoraParams| {
+            crate::training::loss_grads(
+                &mut model,
+                p,
+                &adapter,
+                &cfg,
+                &x,
+                &context[0],
+                &noise,
+                0.375,
+                None,
+                &cancel,
+            )
+            .unwrap()
+        };
+        let (_, initial_grads) = objective(&params);
+        let mut opt =
+            TrainOptimizer::from_config("adamw", cfg.learning_rate, cfg.weight_decay).unwrap();
+        opt.update(&mut params, &initial_grads, &cfg, 0, cfg.seed)
+            .unwrap();
+        let (_, grads) = objective(&params);
+        assert!(
+            g.layers >= 2,
+            "gradient probe needs distinct first/last blocks"
+        );
+        for block in [0, g.layers - 1] {
+            for suffix in [".lora_a", ".lora_b"] {
+                let prefix = format!("layers.{block}.proj.");
+                let mut keys: Vec<_> = grads
+                    .keys()
+                    .filter(|key| key.starts_with(&prefix) && key.ends_with(suffix))
+                    .cloned()
+                    .collect();
+                keys.sort();
+                let mut selected: Option<(Rc<str>, usize, f32)> = None;
+                for key in keys {
+                    for (index, gradient) in read(&grads[&key]).into_iter().enumerate() {
+                        if selected
+                            .as_ref()
+                            .is_none_or(|(_, _, best)| gradient.abs() > best.abs())
+                        {
+                            selected = Some((key.clone(), index, gradient));
+                        }
+                    }
+                }
+                let (key, index, gradient) = selected.expect("adapted block factor missing");
+                assert!(
+                    gradient.is_finite() && gradient != 0.,
+                    "Metal F32 block {block} {suffix} gradient must be nonzero"
+                );
+                assert!(
+                    read(&params[&key]).iter().any(|value| *value != 0.),
+                    "Metal F32 factor {key} is still zero after the first update"
+                );
+                let other_suffix = if suffix == ".lora_a" {
+                    ".lora_b"
+                } else {
+                    ".lora_a"
+                };
+                let counterpart = format!("{}{other_suffix}", key.strip_suffix(suffix).unwrap());
+                assert!(
+                    read(&params[counterpart.as_str()])
+                        .iter()
+                        .any(|value| *value != 0.),
+                    "Metal F32 factor pair {key}/{counterpart} is not fully nonzero"
+                );
+                // Same symmetric difference, epsilon and error bound as the existing
+                // CPU F32 production-loss check below; no new numerical golden.
+                let epsilon = 0.01;
+                let mut evaluate = |sign: f32| {
+                    let mut perturbed = params.clone();
+                    let mut values = read(&perturbed[&key]);
+                    values[index] += sign * epsilon;
+                    perturbed.insert(
+                        key.clone(),
+                        Array::from_slice(&values, params[&key].shape()),
+                    );
+                    objective(&perturbed).0
+                };
+                let finite_difference = (evaluate(1.) - evaluate(-1.)) / (2. * epsilon);
+                let tolerance = 1e-6 + gradient.abs() * 0.02;
+                assert!(
+                    (finite_difference - gradient).abs() < tolerance,
+                    "Metal F32 {key}[{index}] after first update: finite difference \
+                     {finite_difference} vs backward {gradient}"
+                );
+                assert!(
+                    (finite_difference + gradient).abs() >= tolerance,
+                    "Metal F32 {key}[{index}] probe cannot discriminate a wrong-sign \
+                     gradient at the existing finite-difference bound"
+                );
+            }
+        }
     }
 
     #[test]
