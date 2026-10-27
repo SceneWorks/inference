@@ -904,7 +904,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     work.mkdir()
     sys.path.insert(0, str(ROOT))
     from scripts.media_campaign_supervisor import load_policy, run_guarded, SupervisionError, SystemProbe
-    from scripts.ci.model_proof_resources import CudaClaimRejected, metadata_policy_payload, execution_claim
+    from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejected, metadata_policy_payload, execution_claim
     policy_path = work / 'policy.json'
     write_json(policy_path, value['policy'])
     policy = load_policy(policy_path)
@@ -1054,6 +1054,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                 result['error'] = redact(str(error), env)
                 if isinstance(error, CudaClaimRejected):
                     result['cuda_claim_diagnostic'] = error.diagnostic
+                if isinstance(error, CudaReleaseRejected):
+                    result['cuda_release_diagnostic'] = error.diagnostic
                 if isinstance(error, SupervisionError):
                     result['supervision_failure'] = {'reason': error.reason, 'admission': error.admission,
                                                      'pid': error.pid, 'watchdog_child_footprint': error.watchdog_child_footprint}

@@ -230,6 +230,69 @@ class ChildCudaVisibility(unittest.TestCase):
         self.assertEqual(len(diagnostic['selected_processes']), 64)
         self.assertTrue(diagnostic['process_list_truncated'])
 
+    def test_release_refusal_reports_only_existing_bounded_sample_predicates(self):
+        # CI_IMPACT: synthetic saved driver rows only; no GPU, model or process execution.
+        card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 0}
+        rows = [[APPROVED, '123', 'private-process-name', 'C']]
+        baseline = {'process_identities': [(APPROVED, '123', 'C')]}
+        samples = [
+            {'sample_number': 1, 'devices': [dict(card, utilization_percent=1)], 'processes': rows},
+            {'sample_number': 2, 'devices': [dict(card, used_mib=15968, free_mib=81919)], 'processes': rows},
+            {'sample_number': 3, 'devices': [card], 'processes': [[APPROVED, '124', 'other-private-name', 'C']]},
+            {'sample_number': 4, 'devices': [card], 'processes': rows},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            path = output / 'model-proof-release-samples.json'
+            path.write_text(json.dumps(samples), encoding='utf-8')
+            facts = resources.cuda_release_diagnostic(output, APPROVED, 1, GPU_POLICY, baseline)
+            self.assertEqual(facts['status'], 'retained-existing-samples')
+            self.assertEqual(facts['sample_count'], 4)
+            self.assertFalse(facts['samples'][0]['predicates']['selected_gpu_zero_utilization'])
+            self.assertFalse(facts['samples'][1]['predicates']['free_memory_above_policy_headroom'])
+            self.assertFalse(facts['samples'][2]['context_identities_match_admission'])
+            self.assertTrue(facts['samples'][3]['predicates']['proof_policy_headroom_and_inactive_contexts'])
+            self.assertNotIn('private-process-name', json.dumps(facts))
+            self.assertNotIn('other-private-name', json.dumps(facts))
+            path.write_bytes(b'x' * (512 * 1024 + 1))
+            self.assertEqual(resources.cuda_release_diagnostic(output, APPROVED, 1, GPU_POLICY, baseline),
+                             {'status': 'missing-or-over-budget'})
+            path.unlink()
+            path.symlink_to(output / 'missing')
+            self.assertEqual(resources.cuda_release_diagnostic(output, APPROVED, 1, GPU_POLICY, baseline),
+                             {'status': 'missing-or-over-budget'})
+
+    def test_release_refusal_keeps_unsealed_claim_and_existing_sample_diagnostic(self):
+        # CI_IMPACT: mocked physical controller only; no driver, GPU, model or process execution.
+        card = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 0}
+        rows = [[APPROVED, '123', 'private-process-name', 'C']]
+        baseline = {'uuid': APPROVED, 'reserved_baseline_mib': 1884,
+                    'process_identities': [(APPROVED, '123', 'C')]}
+        def refuse(_card, output, _phase, _baseline, **_kwargs):
+            (output / 'model-proof-release-samples.json').write_text(json.dumps([
+                {'sample_number': 1, 'devices': [dict(card, utilization_percent=1)], 'processes': rows},
+            ]), encoding='utf-8')
+            raise RuntimeError('physical GPU occupied during model-proof-release')
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner'}
+            fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
+            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_args: None)
+            with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
+                    patch.object(guard, 'inventory', return_value=([card], rows)), \
+                    patch.object(guard, 'sample_baseline', return_value=(card, baseline)), \
+                    patch.object(guard, 'verify_idle', side_effect=refuse):
+                with self.assertRaises(resources.CudaReleaseRejected) as caught:
+                    with resources.execution_claim('candle-cuda', GPU_POLICY, output, environment,
+                                                   constraints={'required_cuda_physical_index': 1}) as claim:
+                        self.assertFalse(claim['post_execution_verified'])
+            self.assertFalse(claim['post_execution_verified'])
+            self.assertEqual(caught.exception.diagnostic['sample_count'], 1)
+            self.assertFalse(caught.exception.diagnostic['samples'][0]['predicates']['selected_gpu_zero_utilization'])
+            self.assertNotIn('private-process-name', json.dumps(caught.exception.diagnostic))
+
     def test_proof_admits_stable_inactive_gpu1_context_while_gpu0_is_busy(self):
         # CI_IMPACT: fake driver rows only; no CUDA, GPU query, model, or process execution.
         gpu0 = {'uuid': OTHER, 'index': 0, 'total_mib': 97887, 'used_mib': 70000,

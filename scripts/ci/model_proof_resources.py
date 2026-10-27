@@ -23,6 +23,12 @@ class CudaClaimRejected(ValueError):
         self.diagnostic = diagnostic
 
 
+class CudaReleaseRejected(ValueError):
+    def __init__(self, message: str, diagnostic: dict):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
 def proof_cuda_contexts(uuid: str, processes: list[list[str]]) -> list[tuple[str, str, str]]:
     return sorted((row[0], row[1], row[3]) for row in processes
                   if len(row) == 4 and row[0] == uuid and row[3] in ('C', 'C+G'))
@@ -74,6 +80,44 @@ def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[s
                            'selected_gpu_zero_utilization': selected is not None and selected['utilization_percent'] == 0,
                            'selected_process_types_allowed': all(len(row) == 4 and row[3] in ('G', 'C+G', 'C') and row[1]
                                                                  for row in rows)}}
+
+
+def cuda_release_diagnostic(output: Path, uuid: str, physical_index: int, policy, baseline: dict) -> dict:
+    """Retain only bounded predicates from the release samples already collected by the guard."""
+    path = output / 'model-proof-release-samples.json'
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+            return {'status': 'missing-or-over-budget'}
+        with path.open('rb') as stream:
+            raw = stream.read(512 * 1024 + 1)
+        if len(raw) > 512 * 1024:
+            return {'status': 'missing-or-over-budget'}
+        samples = json.loads(raw.decode('utf-8'))
+        if not isinstance(samples, list) or not 1 <= len(samples) <= 5:
+            raise ValueError('invalid release sample count')
+        facts = []
+        for sample in samples:
+            if (not isinstance(sample, dict) or sample.get('sample_number') != len(facts) + 1
+                    or type(sample.get('sample_number')) is not int
+                    or not isinstance(sample.get('devices'), list) or not isinstance(sample.get('processes'), list)):
+                raise ValueError('malformed release sample')
+            devices, processes = sample['devices'], sample['processes']
+            if any(not isinstance(device, dict) for device in devices) or any(
+                    not isinstance(row, list) or len(row) != 4 or any(not isinstance(cell, str) for cell in row)
+                    for row in processes):
+                raise ValueError('malformed release inventory')
+            observed = cuda_claim_diagnostic(uuid, devices, processes, policy)
+            card = observed['selected_card']
+            facts.append({'sample_number': sample.get('sample_number'),
+                          'selected_card': card,
+                          'selected_index_matches_admission': card is not None and card.get('index') == physical_index,
+                          'selected_process_count': observed['selected_process_count'],
+                          'selected_process_type_counts': observed['selected_process_type_counts'],
+                          'context_identities_match_admission': proof_cuda_contexts(uuid, processes) == baseline['process_identities'],
+                          'predicates': observed['predicates']})
+        return {'status': 'retained-existing-samples', 'sample_count': len(facts), 'samples': facts}
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+        return {'status': 'missing-or-malformed'}
 
 
 def validate_child_visibility(row: dict) -> None:
@@ -269,7 +313,8 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                                             idle_check=idle_check, identity_key=proof_cuda_contexts,
                                             permit_bounded_growth=True)
             except RuntimeError as error:
-                raise ValueError('CUDA post-idle verification failed: ' + str(error)) from error
+                raise CudaReleaseRejected('CUDA post-idle verification failed: ' + str(error),
+                                          cuda_release_diagnostic(output, uuid, matched[0]['index'], policy, baseline)) from error
             record['post_execution_verified'] = True
     finally:
         if claimed:

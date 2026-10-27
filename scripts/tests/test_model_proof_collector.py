@@ -262,6 +262,9 @@ class Collector(unittest.TestCase):
             yield {'mechanism': 'MOCK controller', 'post_execution_verified': False}
             if preseal == 'cancel':
                 raise KeyboardInterrupt('MOCK cancellation before physical seal')
+            if preseal == 'release':
+                raise resources.CudaReleaseRejected('MOCK release refusal',
+                                                    {'status': 'retained-existing-samples', 'sample_count': 1})
             raise ValueError('MOCK controller post-idle failure')
         claim_patch = patch.object(resources, 'execution_claim', side_effect=incomplete_controller) if preseal else contextlib.nullcontext()
         expected = '1' * 40
@@ -379,6 +382,23 @@ class Collector(unittest.TestCase):
             self.assertEqual(json.loads((output / '00000/result.json').read_text(encoding='utf-8')), case)
             self.assertFalse(verified['accepted_model_run'])
             self.assertFalse((output / '00000/body.stdout.log').exists())
+
+    def test_postbody_release_diagnostic_retains_failure_without_resource_seal(self):
+        # CI_IMPACT: mocked resource controller only; no model, CUDA, Cargo or process execution.
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, output = self._mock_run(Path(temporary).resolve(), preseal='release')
+            self.assertEqual(status, 1)
+            self.assertEqual(calls, 2)
+            self.assertFalse(receipt['accepted'])
+            self.assertEqual(receipt['completed'], 0)
+            case = receipt['cases'][0]
+            self.assertTrue(case['body_proof_accepted'])
+            self.assertTrue(case['resource_verification_pending'])
+            self.assertFalse(case['accepted'])
+            self.assertFalse(case['physical_execution']['post_execution_verified'])
+            self.assertEqual(case['cuda_release_diagnostic']['status'], 'retained-existing-samples')
+            self.assertEqual(json.loads((output / '00000/result.json').read_text(encoding='utf-8')), case)
+            self.assertFalse(verified['accepted_model_run'])
 
     def test_final_upload_rejects_unknown_files_changed_results_and_wrong_source(self):
         with tempfile.TemporaryDirectory() as temporary:
