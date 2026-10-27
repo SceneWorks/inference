@@ -446,6 +446,38 @@ class ChildCudaVisibility(unittest.TestCase):
                 self.assertEqual(inventory.call_count, 11)  # claim + five admission + five cleanup
                 self.assertEqual(locks, [1, 2])
 
+    def test_explicit_gpu0_claim_ignores_busy_gpu1_but_rejects_wrong_physical_index(self):
+        # CI_IMPACT: synthetic driver snapshots and a fake lock only; no GPU or model work.
+        gpu0 = {'uuid': OTHER, 'index': 0, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 0}
+        gpu1 = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 29510,
+                'free_mib': 68377, 'utilization_percent': 100}
+        policy = SimpleNamespace(**{**vars(GPU_POLICY), 'cuda_device_uuid': OTHER})
+        rows = [[APPROVED, '987', 'busy GPU1', 'C'], [OTHER, '123', 'inactive GPU0 context', 'C']]
+        fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
+        fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_args: None)
+        for required_index, accepted in ((0, True), (1, False)):
+            with self.subTest(required_index=required_index), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary)
+                environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner',
+                               'CUDA_VISIBLE_DEVICES': OTHER}
+                with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
+                        patch.object(guard, 'inventory', return_value=([gpu0, gpu1], rows)) as inventory, \
+                        patch.object(guard.time, 'sleep'):
+                    if accepted:
+                        with resources.execution_claim('candle-cuda', policy, output, environment,
+                                                       constraints={'required_cuda_physical_index': required_index}) as receipt:
+                            self.assertEqual(receipt['physical_index'], 0)
+                            self.assertEqual(receipt['device_uuid'], OTHER)
+                        self.assertTrue(receipt['post_execution_verified'])
+                        self.assertEqual(inventory.call_count, 11)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'fixed physical-index restriction'):
+                            with resources.execution_claim('candle-cuda', policy, output, environment,
+                                                           constraints={'required_cuda_physical_index': required_index}):
+                                self.fail('wrong physical index must never reach a model body')
+                        inventory.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

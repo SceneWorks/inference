@@ -35413,6 +35413,23 @@
         ],
         "required_cuda_physical_index": 1
       },
+      "source_selected_cuda_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512/source_selected_cuda_gpu0",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ],
+        "required_cuda_physical_index": 0
+      },
       "source_selected_metal": {
         "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512/source_selected_metal",
         "environment": {},
@@ -35606,6 +35623,23 @@
           "All three source tiers, original loaded resident-byte pricing and component/pair ratios"
         ],
         "required_cuda_physical_index": 1
+      },
+      "source_selected_cuda_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_tiers_shrink_the_resident_weights/source_selected_cuda_gpu0",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "All three source tiers, original loaded resident-byte pricing and component/pair ratios"
+        ],
+        "required_cuda_physical_index": 0
       }
     },
     "configuration_controls": []

@@ -495,6 +495,16 @@ class ExactProofProtocol(unittest.TestCase):
             self.assertEqual(cuda['required_cuda_physical_index'], 1)
             with self.assertRaisesRegex(ValueError, 'effective configuration differs'):
                 proof.apply_configuration({**cuda, 'required_cuda_physical_index': 0}, {})
+            # CI_IMPACT: registry-only recipe binding; no CUDA or model work.
+            gpu0 = proof.configured_case(item, 'source_selected_cuda_gpu0')
+            self.assertEqual(gpu0['expected_devices'], ['candle-cuda'])
+            self.assertEqual(gpu0['cargo_features'], cuda['cargo_features'])
+            self.assertEqual(gpu0['required_cuda_physical_index'], 0)
+            self.assertEqual(gpu0['input_contract'], cuda['input_contract'])
+            self.assertEqual(gpu0['output_contract'], cuda['output_contract'])
+            proof.apply_configuration(gpu0, {})
+            with self.assertRaisesRegex(ValueError, 'effective configuration differs'):
+                proof.apply_configuration({**gpu0, 'required_cuda_physical_index': 1}, {})
         cpu = proof.configured_case(render, 'source_default_cpu')
         self.assertEqual(cpu['expected_devices'], ['candle-cpu'])
         self.assertNotIn('required_cuda_physical_index', cpu)
