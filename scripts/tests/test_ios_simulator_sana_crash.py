@@ -20,12 +20,15 @@ END = utc("2026-10-27T20:23:00Z")
 
 
 def ips(*, bundle: str = BUNDLE, udid: str = UDID,
-        captured: str = "2026-10-27 16:22:20.1234 -0400") -> bytes:
+        captured: str = "2026-10-27 16:22:20.1234 -0400",
+        redacted_path: bool = False) -> bytes:
     header = {"app_name": "SceneWorksSmoke", "bundleID": bundle,
               "timestamp": captured}
     body = {"procName": "SceneWorksSmoke", "pid": 1234, "captureTime": captured,
             "bundleInfo": {"CFBundleIdentifier": bundle},
-            "procPath": f"/Users/runner/Library/Developer/CoreSimulator/Devices/{udid}/data/Containers/Bundle/Application/X/SceneWorksSmoke.app/SceneWorksSmoke",
+            "procPath": ("/private/var/containers/Bundle/Application/X/SceneWorksSmoke.app/SceneWorksSmoke"
+                         if redacted_path else
+                         f"/Users/runner/Library/Developer/CoreSimulator/Devices/{udid}/data/Containers/Bundle/Application/X/SceneWorksSmoke.app/SceneWorksSmoke"),
             "termination": {"namespace": "SIGNAL", "code": 9}}
     return (json.dumps(header) + "\n" + json.dumps(body)).encode()
 
@@ -47,8 +50,28 @@ class SimulatorCrashRecoveryTests(unittest.TestCase):
             receipt = json.loads((output / "recovery.json").read_text(encoding="utf-8"))
             self.assertFalse(receipt["accepted"])
             self.assertEqual(receipt["matching_crash_count"], 1)
+            self.assertEqual(receipt["status"], "app-crash-diagnostic-retained")
+            self.assertEqual(receipt["expected_owned_udid"], UDID)
+            self.assertEqual(receipt["crash"]["device_binding"], "path-confirmed")
             self.assertEqual(receipt["crash"]["termination"]["code"], 9)
             self.assertEqual(receipt["crash_sha256"], hashlib.sha256(data).hexdigest())
+            self.assertEqual((output / "matching-crash.ips").read_bytes(), data)
+
+    def test_redacted_path_retains_run_diagnostic_without_device_attestation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reports = root / "reports"
+            reports.mkdir()
+            data = ips(redacted_path=True)
+            (reports / "SceneWorksSmoke-redacted.ips").write_bytes(data)
+            output = root / "result"
+            self.assertTrue(recover(reports, output, RUN, ATTEMPT, UDID, START, END))
+            receipt = json.loads((output / "recovery.json").read_text(encoding="utf-8"))
+            self.assertFalse(receipt["accepted"])
+            self.assertEqual(receipt["status"], "app-crash-diagnostic-retained")
+            self.assertEqual(receipt["expected_owned_udid"], UDID)
+            self.assertEqual(receipt["crash"]["device_binding"],
+                             "run-bundle-time-only; device-not-attested-by-crash")
             self.assertEqual((output / "matching-crash.ips").read_bytes(), data)
 
     def test_ambiguous_or_oversized_reports_cannot_be_certified_or_copied(self):

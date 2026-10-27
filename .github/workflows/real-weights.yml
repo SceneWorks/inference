@@ -146,7 +146,7 @@ on:
       # this existing JSON input to {"confirm_all": true}; no extra keys are accepted.
       # Every other profile, including the iOS profiles, retains its existing meaning/default.
       ios_pricing_compile_binding:
-        description: 'iOS JSON carrier: selected-captures selection; compile-only owner binding; prequant typed route; simulator-sana exact source_sha, simulator UDID, snapshot path (see runbook).'
+        description: 'iOS JSON carrier for capture, compile, prequant, and simulator image or crash recovery (see runbook).'
         type: string
         required: false
         default: '{"source_sha":"","manifest_sha256":"","host":"second-mac"}'
@@ -493,8 +493,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'model-exhaustive-tests'
     uses: ./.github/workflows/model-test-suites.yml
 
-  # S3 simulator image: dispatch from the existing registered workflow before the new reusable
-  # workflow file reaches default branch. The called workflow validates exact source and resources.
+  # Registered bridge for simulator image and metadata-only crash recovery.
   ios-simulator-sana:
     needs: validate-selection
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-simulator-sana'
@@ -503,6 +502,11 @@ jobs:
       source_sha: ${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}
       simulator: ${{ fromJSON(inputs.ios_pricing_compile_binding).simulator }}
       snapshot: ${{ fromJSON(inputs.ios_pricing_compile_binding).snapshot }}
+      diagnostic_run_id: ${{ fromJSON(inputs.ios_pricing_compile_binding).diagnostic_run_id || '' }}
+      diagnostic_attempt: ${{ fromJSON(inputs.ios_pricing_compile_binding).diagnostic_attempt || '' }}
+      diagnostic_owned_udid: ${{ fromJSON(inputs.ios_pricing_compile_binding).diagnostic_owned_udid || '' }}
+      diagnostic_start_utc: ${{ fromJSON(inputs.ios_pricing_compile_binding).diagnostic_start_utc || '' }}
+      diagnostic_end_utc: ${{ fromJSON(inputs.ios_pricing_compile_binding).diagnostic_end_utc || '' }}
 
   ios-prequant:
     needs: validate-selection

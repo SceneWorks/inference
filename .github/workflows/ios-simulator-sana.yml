@@ -18,6 +18,26 @@ on:
       source_sha:
         required: true
         type: string
+      diagnostic_run_id:
+        required: false
+        type: string
+        default: ''
+      diagnostic_attempt:
+        required: false
+        type: string
+        default: ''
+      diagnostic_owned_udid:
+        required: false
+        type: string
+        default: ''
+      diagnostic_start_utc:
+        required: false
+        type: string
+        default: ''
+      diagnostic_end_utc:
+        required: false
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       simulator:

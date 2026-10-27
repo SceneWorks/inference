@@ -53,10 +53,14 @@ def matching_ips(data: bytes, bundle: str, udid: str, start: datetime,
     path = body.get("procPath", "")
     if not isinstance(path, str) or not path.endswith("/SceneWorksSmoke.app/SceneWorksSmoke"):
         return None
-    # CoreSimulator host paths carry the device UUID. A privacy-redacted in-simulator path may
-    # omit it; the run-unique bundle identity and tight timestamp must still agree in that case.
-    if "/CoreSimulator/Devices/" in path and f"/{udid}/".casefold() not in path.casefold():
-        return None
+    # Apple may redact the device path. A visible different device is a mismatch; a
+    # redacted path can identify the run, but cannot attest the simulator UUID.
+    if "/CoreSimulator/Devices/" in path:
+        if f"/{udid}/".casefold() not in path.casefold():
+            return None
+        device_binding = "path-confirmed"
+    else:
+        device_binding = "run-bundle-time-only; device-not-attested-by-crash"
     captured = crash_time(body.get("captureTime", ""))
     stamped = crash_time(header.get("timestamp", ""))
     if not start <= captured <= end or not start <= stamped <= end:
@@ -66,6 +70,7 @@ def matching_ips(data: bytes, bundle: str, udid: str, start: datetime,
         return None
     return {"pid": pid, "capture_time_utc": captured.isoformat(),
             "header_time_utc": stamped.isoformat(), "proc_path": path,
+            "device_binding": device_binding,
             "termination": body.get("termination"), "exception": body.get("exception"),
             "fatal_dyld_error": body.get("fatalDyldError")}
 
@@ -98,14 +103,15 @@ def recover(root: Path, output: Path, run_id: str, attempt: str, udid: str,
                 matches.append((data, details))
         except (OSError, ValueError, UnicodeDecodeError, TypeError):
             continue
-    receipt = {"accepted": False, "claim": "diagnostic-only exact app crash; no image or phone-fit evidence",
-               "run_id": run_id, "attempt": attempt, "bundle_id": bundle, "owned_udid": udid,
+    receipt = {"accepted": False, "claim": "diagnostic-only app crash; no image or phone-fit evidence",
+               "run_id": run_id, "attempt": attempt, "bundle_id": bundle,
+               "expected_owned_udid": udid,
                "window_start_utc": start.isoformat(), "window_end_utc": end.isoformat(),
                "matching_crash_count": len(matches)}
     if len(matches) == 1:
         data, details = matches[0]
         (output / "matching-crash.ips").write_bytes(data)
-        receipt.update(status="exact-matching-crash-retained", crash=details,
+        receipt.update(status="app-crash-diagnostic-retained", crash=details,
                        crash_bytes=len(data), crash_sha256=hashlib.sha256(data).hexdigest())
     else:
         receipt["status"] = "no-match" if not matches else "ambiguous-matches"

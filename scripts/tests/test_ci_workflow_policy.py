@@ -1081,11 +1081,31 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(job["needs"], "validate-selection")
         self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-simulator-sana'")
         self.assertEqual(job["uses"], "./.github/workflows/ios-simulator-sana.yml")
-        self.assertEqual(set(job["with"]), {"source_sha", "simulator", "snapshot"})
-        for key in job["with"]:
+        required = {"source_sha", "simulator", "snapshot"}
+        diagnostic = {"diagnostic_run_id", "diagnostic_attempt", "diagnostic_owned_udid",
+                      "diagnostic_start_utc", "diagnostic_end_utc"}
+        self.assertEqual(set(job["with"]), required | diagnostic)
+        for key in required:
             self.assertEqual(job["with"][key], "${{ fromJSON(inputs.ios_pricing_compile_binding)." + key + " }}")
+        for key in diagnostic:
+            self.assertEqual(job["with"][key],
+                             "${{ fromJSON(inputs.ios_pricing_compile_binding)." + key + " || '' }}")
         called = yaml.safe_load((REAL_WEIGHTS_WORKFLOW.parent / "ios-simulator-sana.yml").read_text(encoding="utf-8"))
         self.assertEqual(set(called.get("on", called.get(True))), {"workflow_call", "workflow_dispatch"})
+        call_inputs = called.get("on", called.get(True))["workflow_call"]["inputs"]
+        self.assertEqual(set(call_inputs), required | diagnostic)
+        for key in diagnostic:
+            self.assertEqual(call_inputs[key]["default"], "")
+            self.assertFalse(call_inputs[key]["required"])
+        # A bound prior run travels through the registered bridge and selects only recovery;
+        # omission of every diagnostic field preserves the original image job.
+        binding = {"source_sha": "9" * 40, "simulator": "iPhone 17 Pro Max",
+                   "snapshot": "~/pinned-sana", "diagnostic_run_id": "40576563280",
+                   "diagnostic_attempt": "1", "diagnostic_owned_udid": "A" * 8 + "-" + "A" * 4 + "-" + "A" * 4 + "-" + "A" * 4 + "-" + "A" * 12,
+                   "diagnostic_start_utc": "2026-10-27T20:22:00Z",
+                   "diagnostic_end_utc": "2026-10-27T20:23:00Z"}
+        forwarded = {key: binding.get(key, "") for key in job["with"]}
+        self.assertEqual(set(key for key in diagnostic if forwarded[key]), diagnostic)
         image = called["jobs"]["image"]
         self.assertEqual(image["if"], "github.event_name == 'workflow_dispatch' && "
                          "!inputs.diagnostic_run_id && !inputs.diagnostic_attempt && "
@@ -1094,6 +1114,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         recovery = called["jobs"]["recover-crash"]
         self.assertEqual(recovery["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "rw-llm"])
         self.assertIn("inputs.diagnostic_run_id || inputs.diagnostic_attempt", recovery["if"])
+        image_fields = set(re.findall(r"!inputs\.(diagnostic_\w+)", image["if"]))
+        recovery_fields = set(re.findall(r"inputs\.(diagnostic_\w+)", recovery["if"]))
+        self.assertEqual(image_fields, diagnostic)
+        self.assertEqual(recovery_fields, diagnostic)
+        self.assertFalse(all(not forwarded[key] for key in image_fields))
+        self.assertTrue(any(forwarded[key] for key in recovery_fields))
+        empty = {key: "" for key in diagnostic}
+        self.assertTrue(all(not empty[key] for key in image_fields))
+        self.assertFalse(any(empty[key] for key in recovery_fields))
         self.assertFalse(any("simctl" in step.get("run", "") or "run_smoke" in step.get("run", "")
                              for step in recovery["steps"]))
 
