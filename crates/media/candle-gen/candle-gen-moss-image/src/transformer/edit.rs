@@ -11,7 +11,7 @@ pub(crate) struct EditConditioning<'a> {
     pub cache: Option<&'a EditCache>,
 }
 
-fn silu(x: &Tensor) -> Result<Tensor> {
+pub(super) fn silu(x: &Tensor) -> Result<Tensor> {
     // nn.SiLU has one rounding boundary, after its FP32 activation evaluation.
     Ok(candle_nn::ops::silu(&x.to_dtype(DType::F32)?)?.to_dtype(x.dtype())?)
 }
