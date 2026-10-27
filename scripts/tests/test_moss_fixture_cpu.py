@@ -228,6 +228,52 @@ class OwnedCpuSafetyTests(unittest.TestCase):
                     owner._signal(15)
                     kill.assert_not_called()
 
+    def test_exit_between_session_identity_reads_is_absent_not_ownership_drift(self):
+        owner = fixture.CpuOwner()
+        owner.session = 4242
+        owner.root_identity = (owner.uid, 100)
+        table = subprocess.CompletedProcess([], 0, f"4242 1 4242 {owner.uid} 1\n", "")
+        with mock.patch.object(fixture.subprocess, "run", return_value=table), mock.patch.object(
+                fixture.os, "getsid", return_value=4242), mock.patch.object(
+                fixture, "process_identity", side_effect=[(owner.uid, 101), None]) as identity:
+            self.assertEqual(owner.collect(), {})
+        self.assertEqual(identity.call_count, 2)
+        self.assertEqual(owner.known, {}, "a vanished row must not be adopted")
+
+    def test_live_session_uid_birth_or_session_drift_still_refuses_adoption(self):
+        owner = fixture.CpuOwner()
+        owner.session = 4242
+        owner.root_identity = (owner.uid, 100)
+        table = subprocess.CompletedProcess([], 0, f"4242 1 4242 {owner.uid} 1\n", "")
+        cases = [
+            ([(owner.uid, 101), (owner.uid, 102)], [4242, 4242]),
+            ([(owner.uid, 101), (owner.uid + 1, 101)], [4242, 4242]),
+            ([(owner.uid + 1, 101)] * 2, [4242, 4242]),
+            ([(owner.uid, 99)] * 2, [4242, 4242]),
+            ([(owner.uid, 101)] * 2, [4242, 4243]),
+            ([(owner.uid, 101)] * 2, [4243, 4243]),
+        ]
+        for identities, sessions in cases:
+            with self.subTest(identities=identities, sessions=sessions), mock.patch.object(
+                    fixture.subprocess, "run", return_value=table), mock.patch.object(
+                    fixture.os, "getsid", side_effect=sessions), mock.patch.object(
+                    fixture, "process_identity", side_effect=identities):
+                with self.assertRaisesRegex(UnitFailure, "ownership differs"):
+                    owner.collect()
+            self.assertEqual(owner.known, {})
+
+    def test_second_session_identity_denial_is_failure_not_absence(self):
+        owner = fixture.CpuOwner()
+        owner.session = 4242
+        owner.root_identity = (owner.uid, 100)
+        table = subprocess.CompletedProcess([], 0, f"4242 1 4242 {owner.uid} 1\n", "")
+        with mock.patch.object(fixture.subprocess, "run", return_value=table), mock.patch.object(
+                fixture.os, "getsid", return_value=4242), mock.patch.object(
+                fixture, "process_identity", side_effect=[(owner.uid, 101), UnitFailure("birth metadata denied")]):
+            with self.assertRaisesRegex(UnitFailure, "birth metadata denied"):
+                owner.collect()
+        self.assertEqual(owner.known, {})
+
     def test_session_metadata_denial_and_changed_identity_are_unproven(self):
         owner = fixture.CpuOwner()
         owner.session = 4242
