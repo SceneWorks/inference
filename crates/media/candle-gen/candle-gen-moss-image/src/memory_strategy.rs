@@ -189,11 +189,28 @@ pub fn selected_preload_estimate(
     request: &GenerationRequest,
     inputs: MossImageAdvancedInputs<'_>,
 ) -> gen_core::Result<SelectedPreloadEstimate> {
+    selected_preload_estimate_with_check(variant, spec, request, inputs, &mut || Ok(()))
+}
+
+/// Cooperatively check caller-owned cancellation/deadlines throughout cold source validation.
+/// The native request cancellation flag remains active alongside the synchronous callback.
+pub fn selected_preload_estimate_with_check(
+    variant: MossImageVariant,
+    spec: &LoadSpec,
+    request: &GenerationRequest,
+    inputs: MossImageAdvancedInputs<'_>,
+    check: &mut dyn FnMut() -> gen_core::Result<()>,
+) -> gen_core::Result<SelectedPreloadEstimate> {
+    if request.cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    check_request(request)?;
+    check()?;
     let r = MossImageResolved::resolve(variant, request)?;
     let images = inputs.validate(request, &r)?;
     crate::checked_host_elements(request, images)?;
     check_request(request)?;
-    let s = Sources::selected_with_cancel(variant, spec, r.acceleration, &request.cancel)?;
+    let s = Sources::selected_with_check(variant, spec, r.acceleration, &request.cancel, check)?;
     let asset_facts = selected_facts(&s, r.acceleration)?;
     let branches = branches(&r);
     let workspace_bytes = request_workspace_bytes(
@@ -210,6 +227,11 @@ pub fn selected_preload_estimate(
             m.stage_residency
         });
     let peak_bytes = estimate(&s, &r, request, images, staged)?;
+    if request.cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    check_request(request)?;
+    check()?;
     Ok(SelectedPreloadEstimate {
         asset_facts,
         workspace_bytes,
