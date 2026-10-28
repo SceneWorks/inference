@@ -165,6 +165,8 @@ sha2 = { workspace = true }
 # byte views before converting them into MLX's supported bf16 storage dtype.
 safetensors-fp8 = { package = "safetensors", version = "0.4" }
 memmap2 = "0.9"
+# `testing::save_png` only (behind `test-support`).
+image = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # SC-20686 observer: `proc_pid_rusage` reads the process phys_footprint without spawning
@@ -189,4 +191,4 @@ path = "tests/main.rs"
 model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "mlx-llm/model-inference-proof"]
 # Shared test-only comparison helpers (`mlx_gen::testing`, sc-27323) for provider tests; enabled
 # through a provider dev-dependency, never by a runtime bundle.
-test-support = []
+test-support = ["dep:image"]
