@@ -25,6 +25,8 @@ safetensors = "0.7"
 # `block_q4_1` stores its per-block scale/min as f16 and candle-core does not re-export `half`.
 # Same version candle-core itself resolves (Cargo.lock), so no duplicate-crate risk.
 half = "2"
+# Row-parallel Q4 repack (sc-26691); already in the lockfile via candle-gen-seedvr2.
+rayon = "1"
 # The NVFP4 codec + cuBLASLt fp8/int8/NVFP4 wrapper, lifted into a shared crate so candle-llm can
 # serve the same implementation (sc-24135). Re-exported at `candle_gen::quant::{nvfp4, cublaslt,
 # nvfp4_linear, nvfp4_outlier}` so media callers are unchanged.

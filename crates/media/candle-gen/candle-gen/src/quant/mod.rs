@@ -1357,7 +1357,11 @@ pub fn linear_from_weights_gs(
     let scales_key = format!("{base}.scales");
     if weights.contains(&scales_key) {
         let weight_key = format!("{base}.weight");
-        let device = weights.require(&weight_key)?.device().clone();
+        // A host-packed set (sc-26691) keeps the triple on the CPU; its destination is explicit.
+        let device = match weights.host_packed_target() {
+            Some(d) => d.clone(),
+            None => weights.require(&weight_key)?.device().clone(),
+        };
         let host = Device::Cpu;
         let wq = weights.require(&weight_key)?.to_device(&host)?;
         let scales = weights.require(&scales_key)?.to_device(&host)?;
