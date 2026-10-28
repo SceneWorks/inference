@@ -1317,3 +1317,30 @@ fn files_and_directories_sync_through_handles_the_platform_accepts() {
     assert!(!missing.exists());
     assert!(sync_dir(&tmp.path().join("missing-dir")).is_err());
 }
+
+/// sc-27347: the claim is an OS lock, not the lock file's existence — a lock file left by a run
+/// that died without releasing it (SIGKILL, OOM, power loss) is taken over so the resume that
+/// crash needs can proceed, while a live holder still refuses a second claim.
+#[test]
+fn a_stale_lock_file_is_taken_over_but_a_live_claim_still_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("song.partial");
+    fs::create_dir(&work).unwrap();
+    let lock = work.join(LOCK_FILE);
+    fs::write(&lock, "pid 4294967295\n").unwrap();
+
+    let claim = Claim::take(&work).expect("an unheld lock file is stale and taken over");
+    assert_eq!(
+        fs::read_to_string(&lock).unwrap(),
+        format!("pid {}\n", std::process::id())
+    );
+    assert!(matches!(Claim::take(&work), Err(RunError::Locked(_))));
+    drop(claim);
+    assert!(!lock.exists(), "a released claim removes its lock file");
+
+    // A fresh claim after release works, and is exclusive again.
+    let again = Claim::take(&work).unwrap();
+    assert!(matches!(Claim::take(&work), Err(RunError::Locked(_))));
+    drop(again);
+    assert!(!lock.exists());
+}

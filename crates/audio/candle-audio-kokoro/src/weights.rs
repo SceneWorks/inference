@@ -357,6 +357,38 @@ mod tests {
         }
     }
 
+    /// sc-27456: the vendored pickle reader refuses a tensor whose declared shape needs more
+    /// bytes than its storage entry holds, before allocating the declared size.
+    #[test]
+    fn vendored_pickle_refuses_a_tensor_larger_than_its_storage() {
+        use candle_audio::candle_core::pickle;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../contracts/gen-core/tests/fixtures/latent_perceptual/tiny_bn_state_dict.pth",
+        );
+        let mut source_zip = zip::ZipArchive::new(std::fs::File::open(&source).unwrap()).unwrap();
+        let mut entries = Vec::new();
+        for index in 0..source_zip.len() {
+            let mut entry = source_zip.by_index(index).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            // Truncate every tensor storage to one byte: the pickle still declares the shapes.
+            if name.contains("/data/") {
+                bytes.truncate(1);
+            }
+            entries.push((name, bytes));
+        }
+        let borrowed: Vec<_> = entries
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("truncated.pth");
+        write_archive(&path, zip::CompressionMethod::Stored, &borrowed);
+        let err = pickle::read_all(&path).unwrap_err().to_string();
+        assert!(err.contains("needs more bytes than"), "{err}");
+    }
+
     fn voice_archive() -> Vec<u8> {
         use std::io::{Cursor, Write};
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
