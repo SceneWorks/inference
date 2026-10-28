@@ -91,6 +91,10 @@ pub use attention::{
     ATTN_SCORES_BUDGET,
 };
 
+// Shared interleaved-RoPE application + sinusoidal timestep embedding (sc-27286), hoisted from the
+// byte-identical lens / qwen-image / flux2 / wan copies.
+pub mod rope;
+
 // Fused-attention dispatch (sc-26691): FlashAttention-2 for unmasked bf16/f16 CUDA attention when the
 // build enables `flash-attn`, the planned budgeted path above for everything else.
 pub mod fused_attention;
@@ -245,8 +249,9 @@ pub mod architecture_facts;
 // validation modules in the provider crates. Weight snapshots are not resolved here: inference never
 // self-fetches or derives a cache location (epic 13657); real-weight tests take explicit passed-in
 // env paths. Gated behind the `testkit` feature so this test-only surface never compiles into a
-// production build; provider crates enable it as a dev-dependency feature.
-#[cfg(feature = "testkit")]
+// production build; provider crates enable it as a dev-dependency feature (and this crate's own unit
+// tests compile it, sc-27381).
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
 use thiserror::Error;

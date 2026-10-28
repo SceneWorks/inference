@@ -15,6 +15,7 @@ use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Module, RmsNorm, VarBuilder};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::Quant;
+use candle_gen::rope::GeometryCache;
 use candle_gen::Result as GenResult;
 
 use crate::config::Flux2Config;
@@ -55,19 +56,7 @@ fn swiglu(x: &Tensor) -> Result<Tensor> {
 /// Sinusoidal timestep embedding `[1, dim]`: `[cos(args) | sin(args)]`, `args = t · 10000^{-i/half}`
 /// (diffusers `flip_sin_to_cos = True`, cos first).
 fn timestep_embedding(t: f32, dim: usize, device: &Device) -> Result<Tensor> {
-    let half = dim / 2;
-    let mut cos = vec![0f32; half];
-    let mut sin = vec![0f32; half];
-    let ln10000 = 10000f32.ln();
-    for i in 0..half {
-        let freq = (-ln10000 * i as f32 / half as f32).exp();
-        let arg = t * freq;
-        cos[i] = arg.cos();
-        sin[i] = arg.sin();
-    }
-    let cos = Tensor::from_vec(cos, (1, half), device)?;
-    let sin = Tensor::from_vec(sin, (1, half), device)?;
-    Tensor::cat(&[&cos, &sin], D::Minus1)
+    candle_gen::rope::sinusoidal_timestep_embedding(t, dim, 1.0, device)
 }
 
 /// SDPA over `[B,H,S,D]` q/k/v → `[B, S, H·D]`. scale = `head_dim^-0.5`. Delegates to the shared
@@ -581,16 +570,10 @@ impl NormOut {
 }
 
 /// The FLUX.2 MMDiT.
-/// Per-render RoPE-table cache (sc-8992 / F-012). The `[txt, img]` `(cos, sin)` tables depend only on
-/// the fixed `img_ids`/`txt_ids` geometry (not σ / the current latent), so they are identical across
-/// every denoise step (×2 under CFG). Cache them keyed on the ids and rebuild only when the geometry
-/// changes; the stored handles are Arc-cloned on a hit (cheap). Byte-identical to recomputing.
-struct Flux2RopeCache {
-    img_ids: Vec<[i64; 4]>,
-    txt_ids: Vec<[i64; 4]>,
-    cos: Tensor,
-    sin: Tensor,
-}
+/// Per-render `[txt, img]` RoPE-table cache key (sc-8992): the tables depend only on the fixed
+/// `img_ids`/`txt_ids` geometry (not σ / the current latent), so they are identical across every
+/// denoise step (×2 under CFG) and rebuilt only when the ids change.
+type Flux2RopeKey = (Vec<[i64; 4]>, Vec<[i64; 4]>);
 
 enum Flux2Blocks {
     Resident {
@@ -619,7 +602,7 @@ pub struct Flux2Transformer {
     device: Device,
     /// `Mutex` (not `RefCell`) because the transformer is shared as `Arc<Flux2Transformer>` and must
     /// stay `Send + Sync`. Contended only within a single render; the lock is held only to swap handles.
-    rope_cache: std::sync::Mutex<Option<Flux2RopeCache>>,
+    rope_cache: GeometryCache<Flux2RopeKey, (Tensor, Tensor)>,
 }
 
 impl Flux2Transformer {
@@ -789,7 +772,7 @@ impl Flux2Transformer {
             proj_out: vb.linear(inner, cfg.out_channels, "proj_out", false)?,
             pos_embed: Flux2PosEmbed::new(cfg),
             device: vb.device(),
-            rope_cache: std::sync::Mutex::new(None),
+            rope_cache: GeometryCache::new(1),
         };
         if stream_blocks {
             if let Some(quant) = quant {
@@ -807,23 +790,17 @@ impl Flux2Transformer {
     /// Arc-backed handles are cloned. The construction is identical to computing it inline, so every
     /// step remains byte-identical.
     fn rope_tables(&self, img_ids: &[[i64; 4]], txt_ids: &[[i64; 4]]) -> Result<(Tensor, Tensor)> {
-        let mut guard = candle_gen::lock_recover(&self.rope_cache);
-        if let Some(c) = guard.as_ref() {
-            if c.img_ids.as_slice() == img_ids && c.txt_ids.as_slice() == txt_ids {
-                return Ok((c.cos.clone(), c.sin.clone()));
-            }
-        }
-        let (txt_cos, txt_sin) = self.pos_embed.cos_sin(txt_ids, &self.device)?;
-        let (img_cos, img_sin) = self.pos_embed.cos_sin(img_ids, &self.device)?;
-        let cos = Tensor::cat(&[&txt_cos, &img_cos], 0)?;
-        let sin = Tensor::cat(&[&txt_sin, &img_sin], 0)?;
-        *guard = Some(Flux2RopeCache {
-            img_ids: img_ids.to_vec(),
-            txt_ids: txt_ids.to_vec(),
-            cos: cos.clone(),
-            sin: sin.clone(),
-        });
-        Ok((cos, sin))
+        self.rope_cache.get_or_build_by(
+            |(img, txt)| img.as_slice() == img_ids && txt.as_slice() == txt_ids,
+            || (img_ids.to_vec(), txt_ids.to_vec()),
+            || {
+                let (txt_cos, txt_sin) = self.pos_embed.cos_sin(txt_ids, &self.device)?;
+                let (img_cos, img_sin) = self.pos_embed.cos_sin(img_ids, &self.device)?;
+                let cos = Tensor::cat(&[&txt_cos, &img_cos], 0)?;
+                let sin = Tensor::cat(&[&txt_sin, &img_sin], 0)?;
+                Ok((cos, sin))
+            },
+        )
     }
 
     /// Fold every projection to `Q4_0`/`Q8_0` **onto `device`** and carry the full-precision norms
@@ -857,7 +834,7 @@ impl Flux2Transformer {
         // The RoPE cache pins tables on the old device; drop it so the next forward rebuilds on
         // `device` (sc-8992). Empty at load anyway, but keep this correct if quantize ever runs after
         // a warmup forward.
-        *candle_gen::lock_recover(&self.rope_cache) = None;
+        self.rope_cache.clear();
         Ok(())
     }
 

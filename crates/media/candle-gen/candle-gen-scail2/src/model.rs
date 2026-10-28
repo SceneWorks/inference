@@ -16,6 +16,7 @@
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Linear, Module, VarBuilder};
 use candle_gen::quant::QLinear;
+use candle_gen::rope::GeometryCache;
 use candle_gen_wan::rope::apply_rope;
 
 use crate::common::{
@@ -259,24 +260,16 @@ pub struct Scail2Dit {
     rope: ScailRope,
     cfg: Scail2Config,
     device: Device,
-    /// Per-render RoPE-table cache (sc-8992 / F-012). The packed `[additional_ref | ref | video | pose]`
+    /// Per-render RoPE-table cache (sc-8992). The packed `[additional_ref | ref | video | pose]`
     /// `(cos, sin)` tables depend only on the fixed patch-grid geometry `(rope_t, rope_h, rope_w)`, the
     /// additional-reference count, and the H-shift — not on σ / the current latent — so they are
     /// identical across every denoise step (×2 under CFG) within a segment, and rebuild only when the
-    /// segment geometry changes. `Mutex` (not `RefCell`): the DiT is used behind a shared cache and must
-    /// stay `Send + Sync`.
-    rope_cache: std::sync::Mutex<Option<ScailRopeCache>>,
+    /// segment geometry changes (single slot).
+    rope_cache: GeometryCache<ScailRopeGeom, (Tensor, Tensor)>,
 }
 
-struct ScailRopeCache {
-    rope_t: usize,
-    rope_h: usize,
-    rope_w: usize,
-    addref_count: usize,
-    h_shift: usize,
-    cos: Tensor,
-    sin: Tensor,
-}
+/// `(rope_t, rope_h, rope_w, addref_count, h_shift)` — the per-segment RoPE geometry.
+type ScailRopeGeom = (usize, usize, usize, usize, usize);
 
 impl Scail2Dit {
     /// Load the DiT from a `VarBuilder` over the converted `SCAIL2Model` parameters (raw param names:
@@ -338,7 +331,7 @@ impl Scail2Dit {
             rope: ScailRope::new(cfg.head_dim()),
             cfg: cfg.clone(),
             device: vb.device().clone(),
-            rope_cache: std::sync::Mutex::new(None),
+            rope_cache: GeometryCache::new(1),
         })
     }
 
@@ -355,69 +348,52 @@ impl Scail2Dit {
         addref_count: usize,
         h_shift: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let mut guard = candle_gen::lock_recover(&self.rope_cache);
-        if let Some(c) = guard.as_ref() {
-            if c.rope_t == rope_t
-                && c.rope_h == rope_h
-                && c.rope_w == rope_w
-                && c.addref_count == addref_count
-                && c.h_shift == h_shift
-            {
-                return Ok((c.cos.clone(), c.sin.clone()));
+        let key = (rope_t, rope_h, rope_w, addref_count, h_shift);
+        self.rope_cache.get_or_build(key, || {
+            let dev = &self.device;
+            let base_video_shift = 1usize;
+            let mut cos_list: Vec<Tensor> = Vec::new();
+            let mut sin_list: Vec<Tensor> = Vec::new();
+
+            if addref_count > 0 {
+                let (c, s) =
+                    self.rope
+                        .chunk((addref_count, rope_h, rope_w), (0, h_shift, 0), false, dev)?;
+                cos_list.push(c);
+                sin_list.push(s);
             }
-        }
-        let dev = &self.device;
-        let base_video_shift = 1usize;
-        let mut cos_list: Vec<Tensor> = Vec::new();
-        let mut sin_list: Vec<Tensor> = Vec::new();
 
-        if addref_count > 0 {
-            let (c, s) =
+            // ref+video tokens (one block); RoPE splits ref (1 frame) and video (rope_t frames).
+            let (rc, rs) =
                 self.rope
-                    .chunk((addref_count, rope_h, rope_w), (0, h_shift, 0), false, dev)?;
-            cos_list.push(c);
-            sin_list.push(s);
-        }
+                    .chunk((1, rope_h, rope_w), (addref_count, h_shift, 0), false, dev)?;
+            let (vc, vs) = self.rope.chunk(
+                (rope_t, rope_h, rope_w),
+                (base_video_shift + addref_count, 0, 0),
+                false,
+                dev,
+            )?;
+            cos_list.push(rc);
+            cos_list.push(vc);
+            sin_list.push(rs);
+            sin_list.push(vs);
 
-        // ref+video tokens (one block); RoPE splits ref (1 frame) and video (rope_t frames).
-        let (rc, rs) =
-            self.rope
-                .chunk((1, rope_h, rope_w), (addref_count, h_shift, 0), false, dev)?;
-        let (vc, vs) = self.rope.chunk(
-            (rope_t, rope_h, rope_w),
-            (base_video_shift + addref_count, 0, 0),
-            false,
-            dev,
-        )?;
-        cos_list.push(rc);
-        cos_list.push(vc);
-        sin_list.push(rs);
-        sin_list.push(vs);
+            // pose tokens (W-shifted, freq avg-pool downsampled).
+            let (pc, psn) = self.rope.chunk(
+                (rope_t, rope_h, rope_w),
+                (base_video_shift + addref_count, 0, self.cfg.pose_w_shift),
+                true,
+                dev,
+            )?;
+            cos_list.push(pc);
+            sin_list.push(psn);
 
-        // pose tokens (W-shifted, freq avg-pool downsampled).
-        let (pc, psn) = self.rope.chunk(
-            (rope_t, rope_h, rope_w),
-            (base_video_shift + addref_count, 0, self.cfg.pose_w_shift),
-            true,
-            dev,
-        )?;
-        cos_list.push(pc);
-        sin_list.push(psn);
-
-        let cos_refs: Vec<&Tensor> = cos_list.iter().collect();
-        let sin_refs: Vec<&Tensor> = sin_list.iter().collect();
-        let cos = Tensor::cat(&cos_refs, 0)?; // [L_total, half_d]
-        let sin = Tensor::cat(&sin_refs, 0)?;
-        *guard = Some(ScailRopeCache {
-            rope_t,
-            rope_h,
-            rope_w,
-            addref_count,
-            h_shift,
-            cos: cos.clone(),
-            sin: sin.clone(),
-        });
-        Ok((cos, sin))
+            let cos_refs: Vec<&Tensor> = cos_list.iter().collect();
+            let sin_refs: Vec<&Tensor> = sin_list.iter().collect();
+            let cos = Tensor::cat(&cos_refs, 0)?; // [L_total, half_d]
+            let sin = Tensor::cat(&sin_refs, 0)?;
+            Ok((cos, sin))
+        })
     }
 
     /// Number of transformer blocks (40 for the 14B).
