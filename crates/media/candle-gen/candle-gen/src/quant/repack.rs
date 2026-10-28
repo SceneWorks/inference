@@ -40,6 +40,29 @@ use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use half::f16;
 
+/// Cumulative per-phase wall-clock counters for packed loads (sc-26691), read by the real-weight load
+/// profiler. Nanoseconds, relaxed atomics: negligible next to the work they time.
+pub mod profile {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static PARTS_NS: AtomicU64 = AtomicU64::new(0);
+    pub static REPACK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub(super) fn add(c: &AtomicU64, t: std::time::Instant) {
+        c.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    }
+    /// `(calls, parts_s, repack_s, upload_s)` accumulated since process start.
+    pub fn snapshot() -> (u64, f64, f64, f64) {
+        let s = |c: &AtomicU64| c.load(Relaxed) as f64 / 1e9;
+        (
+            CALLS.load(Relaxed),
+            s(&PARTS_NS),
+            s(&REPACK_NS),
+            s(&UPLOAD_NS),
+        )
+    }
+}
+
 /// MLX's default (and the hosted tiers' only) quantization group size along the input dim.
 pub const MLX_GROUP_SIZE: usize = 64;
 
@@ -265,15 +288,23 @@ pub fn repack_mlx_q4_to_q4_1_gs(
             "MLX Q4 group_size {group_size} must be a multiple of the Q4_1 block ({Q4_1_BLOCK})"
         );
     }
+    let t0 = std::time::Instant::now();
     let (wq, scales, biases, out_dim, in_dim) = q4_parts(wq, scales, biases, group_size)?;
+    profile::add(&profile::PARTS_NS, t0);
+    let t0 = std::time::Instant::now();
     let bytes = q4_1_bytes(&wq, &scales, &biases, out_dim, in_dim, group_size);
+    profile::add(&profile::REPACK_NS, t0);
 
     // MUST be `Cow::Borrowed`: candle's `as_t_slice` takes the Cow by value and returns a slice
     // borrowed from it, so an `Owned` cow's backing Vec is dropped before `from_data` copies the
     // blocks out — a use-after-free that reads freed memory (garbage weights, found in the sc-9085
     // spike). Borrowed keeps `bytes` alive across the call; `from_data` clones into its own Vec.
+    let t0 = std::time::Instant::now();
     let storage = QStorage::from_data(Cow::Borrowed(&bytes), device, GgmlDType::Q4_1)?;
-    QTensor::new(storage, (out_dim, in_dim))
+    let q = QTensor::new(storage, (out_dim, in_dim));
+    profile::add(&profile::UPLOAD_NS, t0);
+    profile::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    q
 }
 
 /// The exact f32 grid values of an MLX group-64 Q4 pack — the repack's loss-free reference (spike

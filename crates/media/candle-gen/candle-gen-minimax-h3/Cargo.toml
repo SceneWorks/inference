@@ -39,6 +39,8 @@ rand = { workspace = true }
 # Parses `vae/config.json` and the audio VAE's `config.json` + `config.yaml` + `metadata.json`
 # source triple (the three documents the Apache-2.0 reference's `from_pretrained` reads).
 serde_json = { workspace = true }
+# Load-phase timing events (sc-26691), the same `tracing` the sdxl / candle-llm crates use.
+tracing = "0.1"
 
 [features]
 default = []

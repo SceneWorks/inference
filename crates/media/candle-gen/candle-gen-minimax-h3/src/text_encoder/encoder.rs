@@ -328,11 +328,17 @@ impl MiniMaxH3TextEncoder {
                 .map_or(0, |t| t.elem_count() * t.dtype().size_in_bytes());
             (n + 1, b + bytes)
         });
-        eprintln!(
-            "minimax-h3 te: from_weights built {} layers from {tensors} tensors ({:.2} GiB source) in {:.1?}",
-            te.num_loaded_layers(),
-            bytes as f64 / (1u64 << 30) as f64,
-            started.elapsed()
+        let (calls, parts_s, repack_s, upload_s) = candle_gen::quant::repack::profile::snapshot();
+        tracing::info!(
+            layers = te.num_loaded_layers(),
+            tensors,
+            source_gib = bytes as f64 / (1u64 << 30) as f64,
+            elapsed_s = started.elapsed().as_secs_f64(),
+            packed_tensors = calls,
+            parts_s,
+            repack_s,
+            upload_s,
+            "minimax-h3 te: from_weights"
         );
         Ok(te)
     }
