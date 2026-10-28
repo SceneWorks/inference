@@ -26,7 +26,7 @@ candle-transformers = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity, shared with z-image/ideogram).
 rand = { workspace = true }
 rand_distr = { workspace = true }
-serde_json = "1"
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [features]
@@ -40,7 +40,7 @@ cuda = ["candle-gen/cuda", "candle-gen-flux/cuda", "candle-transformers/cuda", "
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
 tempfile = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 # Shared test-support helpers (`candle_gen::testkit` — PPM IO / env-path / mean-abs-diff) for the
 # `#[ignore]`d img2img real-weight validation (sc-11786). Cargo unifies this with the `[dependencies]`
 # `candle-gen` entry, but the `testkit` feature is dev-only so it never reaches the shipped provider.

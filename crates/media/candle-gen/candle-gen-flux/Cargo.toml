@@ -43,7 +43,7 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 # Parse the snapshot's `text_encoder_2/config.json` into candle's `t5::Config` (same path the candle
 # `flux` example uses). Matches the serde_json major candle's own tree pulls in (no dup).
-serde_json = "1"
+serde_json = { workspace = true }
 
 [features]
 model-inference-proof = ["candle-gen-pid/model-inference-proof", "candle-gen-sdxl/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof"]
@@ -60,7 +60,7 @@ cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-sdxl/cuda", "
 tempfile = { workspace = true }
 # `examples/flux-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a
 # real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 # gen-core conformance suite (sc-4481): drives this provider through the public Generator contract
 # (cancel / progress / seed-determinism / capability honesty). Pinned to the SAME gen-core rev the
 # workspace pins (e9c569c2) so it shares one contract build. Used by tests/conformance.rs (cuda-gated,

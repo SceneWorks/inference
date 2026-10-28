@@ -32,5 +32,5 @@ serde_json = { workspace = true }
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
 tempfile = { workspace = true }
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }

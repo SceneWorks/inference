@@ -17,7 +17,7 @@ sha2 = { workspace = true }
 # Match candle-core's Tensor/View trait, not gen-core's neutral 0.4 header reader.
 safetensors = "0.7"
 rand = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { workspace = true }
 
 [features]
 model-inference-proof = ["candle-gen/model-inference-proof"]

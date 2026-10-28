@@ -15,10 +15,10 @@ path = "src/main.rs"
 # The engine + the backend-neutral contract it re-exports (`mlx_llm::core_llm`). The server composes
 # mlx-llm's explicit provider catalog, then serves the selected provider through only the
 # `core_llm::TextLlm` contract. Linking `mlx-llm` builds MLX, so this example is Apple-Silicon-only.
-mlx-llm = { path = ".." }
+mlx-llm = { workspace = true }
 # JSON request/response (OpenAI wire format). Derive keeps the request/response types readable.
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The draft-model fixture the CLI flags' end-to-end test loads (sc-24436).

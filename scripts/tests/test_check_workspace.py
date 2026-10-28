@@ -2131,5 +2131,135 @@ class RegexArchiveLockTests(unittest.TestCase):
             self.gate.check_lockfile_inventory(self.manifest)
 
 
+class WorkspaceDependencyInheritanceTests(unittest.TestCase):
+    """sc-27276: workspace-declared dependencies are inherited, never re-declared inline."""
+
+    WORKSPACE = {
+        "serde": {"version": "1", "features": ["derive"]},
+        "tokenizers": {"version": "0.22"},
+        "safetensors": "0.4",
+        "core-llm": {"path": "crates/contracts/core-llm"},
+        "sceneworks-gen-core-testkit": {"path": "crates/contracts/gen-core-testkit"},
+    }
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def errors(self, dependencies: dict, section: str = "dependencies") -> list[str]:
+        return self.gate.workspace_dependency_inheritance_errors(
+            self.WORKSPACE, {"crates/x/Cargo.toml": {"package": {}, section: dependencies}}
+        )
+
+    def test_inherited_entries_pass(self) -> None:
+        self.assertEqual(
+            self.errors({"serde": {"workspace": True, "optional": True}, "anyhow": "1"}), []
+        )
+
+    def test_inline_version_or_path_fails(self) -> None:
+        self.assertTrue(self.errors({"serde": "1"}))
+        self.assertTrue(self.errors({"serde": {"version": "1"}}, "dev-dependencies"))
+        self.assertTrue(self.errors({"core-llm": {"path": "../core-llm"}}))
+        self.assertTrue(
+            self.gate.workspace_dependency_inheritance_errors(
+                self.WORKSPACE,
+                {
+                    "crates/x/Cargo.toml": {
+                        "package": {},
+                        "target": {"cfg(unix)": {"dependencies": {"serde": "1"}}},
+                    }
+                },
+            )
+        )
+
+    def test_only_the_declared_version_splits_stay_inline(self) -> None:
+        self.assertEqual(self.errors({"tokenizers": {"version": "0.21"}}), [])
+        self.assertEqual(self.errors({"safetensors": "0.7"}), [])
+        self.assertTrue(self.errors({"tokenizers": {"version": "0.22"}}))
+        self.assertTrue(self.errors({"safetensors": "0.4"}))
+
+    def test_renames_and_self_dev_dependencies_are_exempt(self) -> None:
+        self.assertEqual(
+            self.errors(
+                {
+                    "gen-core-testkit": {
+                        "package": "sceneworks-gen-core-testkit",
+                        "path": "../gen-core-testkit",
+                    }
+                },
+                "dev-dependencies",
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.gate.workspace_dependency_inheritance_errors(
+                {"x": {"path": "crates/x"}},
+                {"crates/x/Cargo.toml": {"dev-dependencies": {"x": {"path": "."}}}},
+            ),
+            [],
+        )
+
+
+class ProviderTierEdgeTests(unittest.TestCase):
+    """sc-27415: lateral provider edges stay same-backend and never reach a composition root."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def metadata(self, edges: dict[str, list[str]], dev: bool = False) -> dict:
+        names = set(edges) | {target for targets in edges.values() for target in targets}
+        packages = [
+            {
+                "id": name,
+                "name": name,
+                "manifest_path": (
+                    f"/repo/crates/bundles/{name}/Cargo.toml"
+                    if name.startswith("runtime-")
+                    else f"/repo/crates/x/{name}/Cargo.toml"
+                ),
+                "dependencies": [
+                    {"name": target, "kind": "dev" if dev else None}
+                    for target in edges.get(name, [])
+                ],
+            }
+            for name in sorted(names)
+        ]
+        return {"packages": packages, "workspace_members": sorted(names)}
+
+    def test_same_backend_lateral_edges_pass(self) -> None:
+        metadata = self.metadata(
+            {
+                "candle-gen-flux": ["candle-gen-pid", "candle-gen", "sceneworks-gen-core"],
+                "mlx-gen-sdxl": ["mlx-gen-pid", "mlx-gen"],
+                "candle-audio-yue2": ["candle-audio", "candle-llm"],
+                "candle-gen-catalog": ["candle-gen-flux"],
+            }
+        )
+        self.assertEqual(self.gate.provider_tier_edge_errors(metadata), [])
+
+    def test_cross_backend_provider_edges_fail(self) -> None:
+        for source, target in (
+            ("mlx-gen-sdxl", "candle-gen-pid"),
+            ("candle-gen-flux", "mlx-gen-pid"),
+            ("mlx-gen-ltx", "candle-audio-mmaudio"),
+            ("mlx-gen-ltx", "candle-llm"),
+        ):
+            with self.subTest(source=source, target=target):
+                errors = self.gate.provider_tier_edge_errors(self.metadata({source: [target]}))
+                self.assertTrue(errors)
+
+    def test_provider_edges_into_catalogs_or_bundles_fail(self) -> None:
+        for target in ("candle-gen-catalog", "runtime-cpu"):
+            with self.subTest(target=target):
+                self.assertTrue(
+                    self.gate.provider_tier_edge_errors(
+                        self.metadata({"candle-gen-flux": [target]})
+                    )
+                )
+
+    def test_dev_dependencies_are_not_tier_edges(self) -> None:
+        metadata = self.metadata({"candle-gen-flux": ["mlx-gen-pid"]}, dev=True)
+        self.assertEqual(self.gate.provider_tier_edge_errors(metadata), [])
+
+
 if __name__ == "__main__":
     unittest.main()

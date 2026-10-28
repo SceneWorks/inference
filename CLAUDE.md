@@ -84,8 +84,10 @@ Stable Audio 3 checkout), never an import error from a missing dependency.
 `check-workspace.py` is the enforcement point for the architecture: it asserts the
 `EXPECTED_MEMBER_COUNT` of path members, one root `Cargo.lock`, one `[workspace]` manifest, that all internal deps are path edges
 (not SHA pins), that pinned MLX/Candle backend revisions are unchanged, that `inventory` is absent
-from the resolved graph, and that the intentional `tokenizers` 0.21/0.22 split is preserved. If you
-add or remove a crate, update `EXPECTED_MEMBER_COUNT`.
+from the resolved graph, and that the intentional `tokenizers` 0.21/0.22 split is preserved. It also
+requires member manifests to inherit `[workspace.dependencies]` entries (`{ workspace = true }`)
+rather than re-declaring them, and lateral provider→provider edges to stay on one backend and never
+reach a catalog or bundle. If you add or remove a crate, update `EXPECTED_MEMBER_COUNT`.
 
 It also enforces the **epic-13657 self-fetch boundary**: no network/HTTP client
 (`hf-hub`, `reqwest`, `ureq`, `curl`, `git2`, `hyper`, …) may resolve in the graph, and no Rust of

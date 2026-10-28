@@ -36,7 +36,7 @@ sha2 = { workspace = true }
 fs2 = "0.4"
 rand = { workspace = true }
 rand_distr = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Stable std exposes Windows write time but not the handle's file ID/change time. The sidecar warm
