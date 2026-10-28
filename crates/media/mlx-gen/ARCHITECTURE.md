@@ -49,6 +49,19 @@ carries an explicit remap in its `from_weights`. Today the Z-Image block keys al
   pre-sc-15265 numerics.
 - The base is **never fused/mutated**: fusing would force re-quantization on every adapter
   swap and break the quant-safe property. LoRA/LoKr compose with Q4/Q8 for free.
+- Sanctioned exceptions to the `AdaptableLinear` rule (sc-27321) — private Linear stacks that are
+  never adapter-installed and whose numerics are parity-pinned as they stand:
+  - `mlx-gen-seedvr2` (`src/dit.rs` `Linear`/`LinearWeight`, `src/vae.rs` `Linear`): quantizable,
+    but its dense forward is `matmul + add` rather than the fused `addmm` and its quantized form
+    keeps the bias un-cast, so moving it onto `AdaptableLinear` changes the bf16 numerics its
+    goldens pin. It shares the alignment predicate (`quant::is_quant_aligned`, sc-27320).
+  - `mlx-gen-lens` (`src/dit/mod.rs` `Linear`) and `mlx-gen-minimax-h3` (`src/blocks.rs`
+    `Linear`): dense-only, never quantized or adapted.
+  - `mlx-gen-ltx` (`src/transformer.rs` `LinearKind` + its own LoRA stack): predates the rule
+    (sc-2687) and carries its own quantized/adapter forward.
+- A quantize cascade that leaves misaligned projections dense uses
+  `AdaptableLinear::quantize_if_aligned` / `is_quant_aligned` (sc-27320) rather than re-spelling
+  the `in_features % group_size == 0` predicate.
 - Adapters are installed by **dotted path** (`AdaptableHost::adaptable_mut` +
   `install_adapter`) — the Rust replacement for Python's dynamic `getattr`, since `mlx-rs`
   flattens module params to `Array` leaves and can't swap a submodule in place.
