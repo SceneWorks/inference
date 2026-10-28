@@ -62,13 +62,15 @@ use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind,
     MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryParameterRanges, MemoryPhase,
     MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
     MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
     MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
+// Rung-1 residency resolution is the SDXL U-Net's, shared verbatim (sc-27413).
+pub(crate) use mlx_gen_sdxl::memory_strategy::{default_stage_residency, stage_residency};
 
 /// The decode tile edge a rung-2 request would have defaulted to, kept as the sweep's anchor.
 ///
@@ -712,17 +714,8 @@ pub fn streamable(spec: &LoadSpec) -> bool {
 /// with a better message a moment later, and a contract builder is not the place to surface it
 /// first.
 pub fn load_leaves_blocks_lazy(spec: &LoadSpec) -> bool {
-    let Some(quant) = spec.quantize else {
-        // Dense fp16: `cast_all` is lazy, nothing packs.
-        return true;
-    };
-    let WeightsSource::Dir(root) = &spec.weights else {
-        return false;
-    };
-    matches!(
-        mlx_gen::quant::needs_load_time_quant(root, "unet", quant.bits(), crate::MODEL_ID),
-        Ok(false)
-    )
+    // The SDXL U-Net rule, verbatim: Kolors loads the same U-Net through the same packer (sc-27413).
+    mlx_gen_sdxl::memory_strategy::load_leaves_blocks_lazy(spec)
 }
 
 /// Whether this load leaves the **ChatGLM3-6B** blocks unmaterialized — the text-encoder half of
@@ -775,11 +768,7 @@ pub fn text_encoder_leaves_blocks_lazy(spec: &LoadSpec) -> bool {
 /// surface at that tier. It is still the right answer — SC-15521's alternative was rendering the
 /// base model and calling it a LoRA render.
 pub fn adapters_are_replayable(spec: &LoadSpec) -> bool {
-    if spec.adapters.is_empty() {
-        return true;
-    }
-    // A merge happens on a DENSE base. Only an already-packed snapshot pushes residuals.
-    spec.quantize.is_some() && load_leaves_blocks_lazy(spec)
+    mlx_gen_sdxl::memory_strategy::adapters_are_replayable(spec)
 }
 
 /// Build the Kolors MLX provider contract at this [`LoadSpec`].
@@ -1039,7 +1028,7 @@ fn contract_with_asset_facts(
 ) -> CoreResult<MemoryProviderContract> {
     let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
         mlx_gen::gen_core::MemoryBackend::Mlx,
-        loaded_tier(spec),
+        mlx_gen_sdxl::memory_strategy::loaded_tier(spec),
     )?;
     let geometry_decode = decode_policies.iter().any(|policy| {
         matches!(
@@ -1220,15 +1209,6 @@ fn validate_window(size: u32) -> CoreResult<()> {
     Ok(())
 }
 
-/// The numeric tier this generator actually runs.
-fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    }
-}
-
 /// The provider safety check: the calibration handshake and tier match, then the shared contract's
 /// own selection validation, then this provider's route gate, then the budget. Defense in depth
 /// only — it can reject, never swap in a different strategy or tier.
@@ -1293,7 +1273,7 @@ pub(crate) fn safety_check(
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(loaded_tier(spec)),
+        Some(mlx_gen_sdxl::memory_strategy::loaded_tier(spec)),
         Some(&route_gate),
     )
 }
@@ -1311,7 +1291,7 @@ pub(crate) fn registered_valid_fixture(
     {
         return Ok(Vec::new());
     }
-    let tier = loaded_tier(spec);
+    let tier = mlx_gen_sdxl::memory_strategy::loaded_tier(spec);
     let route = |use_pid| MemoryBehaviorRoute {
         mode: MemoryMode::TextToImage,
         reference_count: 0,
@@ -1577,18 +1557,6 @@ pub(crate) fn attention_plan(
         ));
     }
     Ok(mlx_gen::attention::AttentionPlan::UNBOUNDED)
-}
-
-/// Rung 1: whether this request stages its component residency. `default_staged` is the load-time
-/// [`OffloadPolicy`] verdict, which a request that names nothing keeps.
-pub(crate) fn stage_residency(req: &GenerationRequest, default_staged: bool) -> bool {
-    req.memory
-        .map_or(default_staged, |memory| memory.stage_residency)
-}
-
-/// The load-time default for `stage_residency`.
-pub(crate) fn default_stage_residency(spec: &LoadSpec) -> bool {
-    matches!(spec.offload_policy, OffloadPolicy::Sequential)
 }
 
 /// The strategy parameters this provider accepts, for a caller that wants the whole domain in one

@@ -1323,8 +1323,8 @@ fn validate_window(size: u32) -> CoreResult<()> {
     Ok(())
 }
 
-/// The numeric tier this generator actually runs.
-fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
+/// The numeric tier this generator actually runs (shared by the Kolors U-Net, sc-27413).
+pub fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: spec.precision,
         quant: spec.quantize,
@@ -1697,13 +1697,13 @@ pub(crate) fn attention_plan(
 
 /// Rung 1: whether this request stages its component residency. `default_staged` is the load-time
 /// [`OffloadPolicy`] verdict, which a request that names nothing keeps.
-pub(crate) fn stage_residency(req: &GenerationRequest, default_staged: bool) -> bool {
+pub fn stage_residency(req: &GenerationRequest, default_staged: bool) -> bool {
     req.memory
         .map_or(default_staged, |memory| memory.stage_residency)
 }
 
 /// The load-time default for `stage_residency`.
-pub(crate) fn default_stage_residency(spec: &LoadSpec) -> bool {
+pub fn default_stage_residency(spec: &LoadSpec) -> bool {
     matches!(spec.offload_policy, OffloadPolicy::Sequential)
 }
 
