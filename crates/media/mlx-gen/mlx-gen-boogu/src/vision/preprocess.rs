@@ -191,8 +191,77 @@ pub fn preprocess_image(img: &RgbImage) -> Result<(Array, [i32; 3])> {
     Ok((pixels, grid))
 }
 
+/// Qwen3-VL preprocessing of one temporal patch of video: exactly [`TEMPORAL_PATCH_SIZE`]
+/// consecutive frames of one geometry, laid out across the temporal axis in order. Same
+/// `pixel_values` / `grid_thw` contract as [`preprocess_image`], which is this with the single image
+/// repeated. A video reference is one such group per sampled frame pair, each its own `grid_t == 1`
+/// block: the tower attends within a temporal group, so encoding the pairs separately is the
+/// reference's whole-clip encoding.
+pub fn preprocess_frames(frames: &[&RgbImage]) -> Result<(Array, [i32; 3])> {
+    if frames.len() != TEMPORAL_PATCH_SIZE as usize {
+        return Err(mlx_gen::Error::Msg(format!(
+            "boogu vision: a temporal patch is {TEMPORAL_PATCH_SIZE} frames, got {}",
+            frames.len()
+        )));
+    }
+    let (w, h) = (frames[0].width() as i64, frames[0].height() as i64);
+    if frames
+        .iter()
+        .any(|f| (f.width() as i64, f.height() as i64) != (w, h))
+    {
+        return Err(mlx_gen::Error::Msg(
+            "boogu vision: a temporal patch's frames must share one geometry".into(),
+        ));
+    }
+    let geometry = image_geometry(h, w)?;
+    let (rh, rw) = (geometry.resized_height, geometry.resized_width);
+    let normalized = frames
+        .iter()
+        .map(|img| {
+            let resized = if (rh, rw) == (h, w) {
+                (*img).clone()
+            } else {
+                image::imageops::resize(*img, rw as u32, rh as u32, FilterType::CatmullRom)
+            };
+            normalized_frame(resized.as_raw(), rh, rw, IMAGE_MEAN, IMAGE_STD)
+        })
+        .collect::<Vec<_>>();
+    let stacked = concatenate_axis(&normalized.iter().collect::<Vec<_>>(), 0)?;
+    let (pixels, grid) = pack_patches(&stacked, PATCH_SIZE, TEMPORAL_PATCH_SIZE, MERGE_SIZE)?;
+    debug_assert_eq!(grid, geometry.grid);
+    Ok((pixels, grid))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_frame_pair_lays_each_frame_on_its_own_temporal_slot() {
+        let a = RgbImage::from_pixel(64, 64, image::Rgb([10, 10, 10]));
+        let b = RgbImage::from_pixel(64, 64, image::Rgb([200, 200, 200]));
+        let (image, image_grid) = preprocess_image(&a).unwrap();
+        let (repeated, repeated_grid) = preprocess_frames(&[&a, &a]).unwrap();
+        assert_eq!(image_grid, repeated_grid);
+        assert_eq!(
+            image.as_slice::<f32>(),
+            repeated.as_slice::<f32>(),
+            "an image is exactly its own frame repeated across the temporal patch"
+        );
+        let (pair, pair_grid) = preprocess_frames(&[&a, &b]).unwrap();
+        assert_eq!(
+            pair_grid, image_grid,
+            "one temporal patch is one grid_t == 1 block"
+        );
+        // Feature order is (channel, temporal, patch_y, patch_x): frame a, then frame b.
+        let row = &pair.as_slice::<f32>()[..pair.shape()[1] as usize];
+        let p2 = (PATCH_SIZE * PATCH_SIZE) as usize;
+        let level = |u: f32, c: usize| (u / 255.0 - IMAGE_MEAN[c]) / IMAGE_STD[c];
+        assert!(row[..p2].iter().all(|&x| (x - level(10.0, 0)).abs() < 1e-5));
+        assert!(row[p2..2 * p2]
+            .iter()
+            .all(|&x| (x - level(200.0, 0)).abs() < 1e-5));
+        assert!(preprocess_frames(&[&a]).is_err());
+    }
+
     use super::*;
 
     #[test]
