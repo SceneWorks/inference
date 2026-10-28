@@ -485,7 +485,7 @@ pub fn quantize_map(
         let base = k.strip_suffix(".weight").filter(|b| is_target(b));
         let packable = base.is_some()
             && v.shape().len() == 2
-            && v.shape()[1] % group_size == 0
+            && is_quant_aligned(v.shape()[1], group_size)
             && v.shape()[1] >= group_size;
         if let (Some(base), true) = (base, packable) {
             // sc-24114: consume the source bytes BEFORE the GPU quantize kernel is scheduled
