@@ -7,6 +7,7 @@
 //! there is deliberately no new field on the generic training request. These are structural
 //! operator bounds, not measured calibration, an allocator prediction, or a runtime RSS limit.
 use crate::loader::Sources;
+use candle_gen::gen_core::moss_image_training::admission as shared;
 use candle_gen::gen_core::{
     self,
     moss_image::{MossImageAssetRole, MossImageConfig},
@@ -56,6 +57,14 @@ impl fmt::Display for AdmissionError {
     }
 }
 impl std::error::Error for AdmissionError {}
+impl From<shared::AdmissionArithmeticError> for AdmissionError {
+    fn from(e: shared::AdmissionArithmeticError) -> Self {
+        match e {
+            shared::AdmissionArithmeticError::Overflow(what) => Self::Overflow(what),
+            shared::AdmissionArithmeticError::Invalid(why) => Self::Invalid(why),
+        }
+    }
+}
 fn source(e: impl fmt::Display) -> AdmissionError {
     AdmissionError::Source(e.to_string())
 }
@@ -63,29 +72,19 @@ fn invalid(s: impl Into<String>) -> AdmissionError {
     AdmissionError::Invalid(s.into())
 }
 fn sum(xs: impl IntoIterator<Item = u64>, what: &'static str) -> Result<u64> {
-    xs.into_iter().try_fold(0u64, |a, b| {
-        a.checked_add(b).ok_or(AdmissionError::Overflow(what))
-    })
+    Ok(shared::checked_sum(xs, what)?)
 }
 fn mul(xs: &[u64], what: &'static str) -> Result<u64> {
-    xs.iter().try_fold(1u64, |a, b| {
-        a.checked_mul(*b).ok_or(AdmissionError::Overflow(what))
-    })
+    Ok(shared::checked_product(xs, what)?)
 }
 fn dim(n: usize) -> Result<u64> {
-    u64::try_from(n).map_err(|_| invalid("dimension exceeds u64"))
+    Ok(shared::dim(n)?)
 }
 fn positive(n: i32) -> Result<u64> {
-    if n <= 0 {
-        return Err(invalid("nonpositive encoder dimension"));
-    }
-    u64::try_from(n).map_err(|_| invalid("unrepresentable encoder dimension"))
+    Ok(shared::positive(n)?)
 }
 
-/// Pure override resolution: a zero override is a real zero cap, not a request to disable guards.
-pub(crate) fn resolve_budget(override_bytes: Option<u64>, device_bytes: u64) -> u64 {
-    override_bytes.unwrap_or(device_bytes)
-}
+pub(crate) use shared::resolve_budget;
 /// Resolve an actual allocator/device budget. CPU numerical oracles must explicitly provide
 /// an override; unknown CUDA memory never disables preallocation admission.
 #[cfg(test)]
@@ -367,11 +366,7 @@ pub(crate) enum AssetKind {
     Backbone,
 }
 fn vae_selected(name: &str) -> bool {
-    ["encoder.", "decoder.", "quant_conv.", "post_quant_conv."]
-        .iter()
-        .any(|p| name.starts_with(p))
-        || name == "bn.running_mean"
-        || name == "bn.running_var"
+    shared::is_constructed_vae_tensor(name)
 }
 
 #[derive(Clone, Debug)]
@@ -547,31 +542,13 @@ fn adapter_shape(out: u64, input: u64, c: &TrainingConfig, tokens: u64) -> Resul
     }
 }
 fn optimizer_states(name: &str) -> Result<u64> {
-    let n: String = name
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| *c != '-' && *c != '_')
-        .collect();
-    match n.as_str() {
-        "adam" | "adamw" | "adam8bit" | "adamw8bit" => Ok(2),
-        "rose" | "roseopt" => Ok(0),
-        "prodigy" | "prodigyopt" => Ok(4),
-        _ => Err(invalid(format!("unsupported optimizer {name}"))),
-    }
+    Ok(shared::optimizer_states(name)?)
 }
 fn compute_width(c: &TrainingConfig) -> Result<u64> {
-    match c.train_dtype.to_ascii_lowercase().as_str() {
-        "bf16" | "bfloat16" => Ok(2),
-        "f32" | "float32" | "fp32" => Ok(4),
-        _ => Err(invalid("compute dtype must be bf16 or f32")),
-    }
+    Ok(shared::compute_width(c)?)
 }
 fn image_tokens(edge: u64) -> Result<u64> {
-    if edge == 0 || !edge.is_multiple_of(16) {
-        return Err(invalid("bucket edge must be positive and divisible by 16"));
-    }
-    mul(&[edge / 16, edge / 16], "image tokens")
+    Ok(shared::image_tokens(edge)?)
 }
 
 /// Whole-layer encoder live tensors plus fresh per-caption KV/recurrent state. The layer hook
@@ -780,10 +757,7 @@ fn vae_work_canvas(
         outputs.push(mul(&[area, channels, buffers, 4], "VAE output buffers")?);
     }
     let mid_area = mul(&[width / 8, height / 8], "VAE mid attention sequence")?;
-    let score_bytes = mul(&[mid_area, mid_area, 4], "VAE mid scores")?;
-    let score_bytes = score_bytes.min(
-        (candle_gen::ATTN_SCORES_BUDGET as u64).max(mul(&[mid_area, 4], "one VAE query row")?),
-    );
+    let score_bytes = vae_mid_score_bytes(mid_area)?;
     outputs.push(mul(&[score_bytes, 3], "VAE score/softmax temporaries")?);
     // Preprocessing RGB/normalization and raw moments/packed-latent normalization temporaries.
     let pixels = mul(
@@ -814,6 +788,22 @@ fn vae_work_canvas(
         ],
         "VAE work",
     )
+}
+
+/// Peak bytes of one f32 scores block of the VAE mid-block's single-head spatial attention over
+/// `mid_area` tokens (batch 1).
+///
+/// The Flux.2 VAE runs that attention through `candle_gen::sdpa_budgeted_flat` at
+/// [`candle_gen::ATTN_SCORES_BUDGET`], a cap in score **elements** (the CUDA i32-index guard), so a
+/// scores block holds at most the planner's `query_block_rows · Sk` elements. The VAE computes in
+/// f32, so that block is 4 bytes per element. The budget is never compared with bytes directly.
+fn vae_mid_score_bytes(mid_area: u64) -> Result<u64> {
+    let rows = gen_core::attention_budget::AttentionBudget::from_score_elements(
+        candle_gen::ATTN_SCORES_BUDGET as u64,
+        false,
+    )
+    .query_block_rows(mid_area, mid_area);
+    mul(&[rows, mid_area, 4], "VAE mid scores")
 }
 
 pub(crate) fn estimate(f: &FootprintFacts, r: &EstimateRequest) -> Result<MemoryEstimate> {
@@ -1374,6 +1364,26 @@ pub(crate) fn estimate(f: &FootprintFacts, r: &EstimateRequest) -> Result<Memory
 pub(crate) mod tests {
     use super::*;
     use candle_gen::gen_core::{weightsmeta::Dtype, ResolutionBucket};
+
+    /// sc-27256 units check: `ATTN_SCORES_BUDGET` caps score ELEMENTS (it is the CUDA i32-index
+    /// guard `sdpa_budgeted_flat` plans query blocks against), and the VAE scores are f32. The old
+    /// estimate clamped f32 score BYTES to the element count, understating every chunked or
+    /// near-cap block up to 4x. Pin the planner boundary on both sides.
+    #[test]
+    fn vae_mid_scores_are_capped_in_elements_not_bytes() {
+        let cap = candle_gen::ATTN_SCORES_BUDGET as u64;
+        assert_eq!(cap, 1_000_000_000);
+        // 31622² = 999_950_884 elements fits: one un-chunked pass.
+        assert_eq!(vae_mid_score_bytes(31_622).unwrap(), 31_622 * 31_622 * 4);
+        // One more token overflows the cap: blocks of ⌊1e9 / 31623⌋ = 31622 query rows.
+        assert_eq!(vae_mid_score_bytes(31_623).unwrap(), 31_622 * 31_623 * 4);
+        // A 2048² image (mid grid 256² = 65536 tokens) chunks at 15258 rows: ~4.0e9 bytes, which
+        // the byte-clamped estimate priced at 1.0e9.
+        assert_eq!(vae_mid_score_bytes(65_536).unwrap(), 15_258 * 65_536 * 4);
+        // A 1024² image (16384 tokens) is a single 1.07e9-byte pass, above the old 1e9 clamp.
+        assert_eq!(vae_mid_score_bytes(16_384).unwrap(), 16_384 * 16_384 * 4);
+        assert!(vae_mid_score_bytes(16_384).unwrap() > cap);
+    }
 
     fn header(name: &str, shape: &[usize], width: u64) -> SafetensorsTensorHeader {
         let n = shape.iter().map(|n| *n as u64).product::<u64>();
