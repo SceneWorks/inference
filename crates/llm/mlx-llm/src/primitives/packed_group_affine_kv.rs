@@ -6864,6 +6864,7 @@ mod tests {
 
     /// The fused reader against the independent fp32 oracle: decode over two K groups plus a
     /// residual tail, a causal prefill chunk, and a split-KV history, at the campaign tolerance.
+    #[cfg(feature = "campaign")]
     #[cfg(target_os = "macos")]
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]

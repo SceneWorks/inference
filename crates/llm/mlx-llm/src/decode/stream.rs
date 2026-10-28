@@ -226,7 +226,7 @@ pub(crate) fn generate_with_observer(
     on_event: &mut dyn FnMut(StreamEvent),
     constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
-    mut observer: Option<&mut dyn crate::campaign::Observer>,
+    mut observer: Option<&mut dyn crate::decode::observe::Observer>,
 ) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         if let Some(observer) = observer.as_deref_mut() {
@@ -308,7 +308,7 @@ pub(super) struct ObservedCache {
 pub(super) fn observe_cache_events(
     cache: &mut dyn KvCache,
     state: &mut ObservedCache,
-    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    observer: &mut Option<&mut dyn crate::decode::observe::Observer>,
 ) -> Result<()> {
     let Some(observer) = observer.as_deref_mut() else {
         return Ok(());
@@ -371,7 +371,7 @@ pub(super) fn observe_cache_events(
 fn observe_contiguous(
     cache: &ContiguousKvCache,
     seen: &mut usize,
-    observer: &mut dyn crate::campaign::Observer,
+    observer: &mut dyn crate::decode::observe::Observer,
 ) -> Result<()> {
     if *seen > cache.events().len() {
         // A packed cache replaced its dense fallback instance; its events start afresh.
@@ -397,7 +397,7 @@ fn observe_contiguous(
 /// after decode and before reset, so fused/fallback counts are never double counted.
 pub(super) fn observe_packed_evidence(
     cache: &dyn KvCache,
-    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    observer: &mut Option<&mut dyn crate::decode::observe::Observer>,
 ) {
     if let (Some(observer), Some(evidence)) = (observer.as_deref_mut(), cache.packed_evidence()) {
         observer.packed_cache_evidence(&evidence);
@@ -499,13 +499,14 @@ pub fn generate_from_prefill(
 
 /// [`generate_with_cache`] with a campaign observer attached to the decode loop, so the observer
 /// sees every sampled token including a terminating stop token.
+#[cfg(feature = "campaign")]
 pub(crate) fn generate_with_cache_observed(
     decoder: &dyn Decode,
     prompt_ids: &[i32],
     cache: &mut dyn KvCache,
     config: &GenerationConfig,
     cancel: &CancelFlag,
-    observer: &mut dyn crate::campaign::Observer,
+    observer: &mut dyn crate::decode::observe::Observer,
 ) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
@@ -534,6 +535,7 @@ pub(crate) fn generate_with_cache_observed(
 
 /// [`generate_from_prefill`] with a campaign observer attached to the decode loop (used for
 /// teacher-forced greedy agreement; product generation never attaches one here).
+#[cfg(feature = "campaign")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_from_prefill_observed(
     decoder: &dyn Decode,
@@ -543,7 +545,7 @@ pub(crate) fn generate_from_prefill_observed(
     config: &GenerationConfig,
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
-    observer: &mut dyn crate::campaign::Observer,
+    observer: &mut dyn crate::decode::observe::Observer,
 ) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
@@ -587,7 +589,7 @@ pub(crate) fn decode_loop(
     on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
-    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    observer: &mut Option<&mut dyn crate::decode::observe::Observer>,
 ) -> Result<GenerationOutput> {
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;
@@ -612,12 +614,12 @@ pub(crate) fn decode_loop(
             .as_deref_mut()
             .map(|o| o.teacher_forced_token(step))
         {
-            Some(crate::campaign::TeacherForcing::Token(token)) => Some(token),
-            Some(crate::campaign::TeacherForcing::Exhausted) => {
+            Some(crate::decode::observe::TeacherForcing::Token(token)) => Some(token),
+            Some(crate::decode::observe::TeacherForcing::Exhausted) => {
                 finish = FinishReason::Stopped;
                 break;
             }
-            Some(crate::campaign::TeacherForcing::Off) | None => None,
+            Some(crate::decode::observe::TeacherForcing::Off) | None => None,
         };
 
         // Apply the constraint mask (if any) for this step, then sample. The mask borrow is scoped
@@ -688,6 +690,7 @@ pub(crate) fn decode_loop(
 
 /// A fixed-length steady-decode measurement (SC-20671): `tokens` greedy tokens after a prefill,
 /// generated with every stop token ignored, and the synchronized duration of all but the first.
+#[cfg(feature = "campaign")]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ForcedDecode {
     /// Every generated id, including the first (which closes the prefill and is not timed).
@@ -722,6 +725,7 @@ pub(crate) struct ForcedDecode {
 /// agreement). With `score`, the decoder's probability of each stream token is recorded too
 /// ([`ForcedDecode::stream_probabilities`]); a timing measurement never scores (the host softmax
 /// would sit inside its timed window).
+#[cfg(feature = "campaign")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forced_greedy_decode(
     decoder: &dyn Decode,
@@ -749,6 +753,7 @@ pub(crate) fn forced_greedy_decode(
 /// [`forced_greedy_decode`] over a `cache` that already holds the first `prefilled` prompt ids (a
 /// prompt-cache hit, SC-20671 multi-turn fixture): only the uncached suffix is prefilled, at its
 /// true position, before the identical forced decode.
+#[cfg(feature = "campaign")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forced_greedy_decode_from(
     decoder: &dyn Decode,
@@ -934,7 +939,7 @@ mod tests {
         cache_snapshots: Vec<(u64, u64, u64, u64)>,
     }
 
-    impl crate::campaign::Observer for DecodeObserver {
+    impl crate::decode::observe::Observer for DecodeObserver {
         fn phase(&mut self, name: &'static str) {
             self.phases.push(name);
         }
@@ -995,14 +1000,17 @@ mod tests {
             choices: Vec<i32>,
             scored: Vec<(i32, f64)>,
         }
-        impl crate::campaign::Observer for Forcing {
+        impl crate::decode::observe::Observer for Forcing {
             fn phase(&mut self, _name: &'static str) {}
             fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
-            fn teacher_forced_token(&mut self, step: usize) -> crate::campaign::TeacherForcing {
+            fn teacher_forced_token(
+                &mut self,
+                step: usize,
+            ) -> crate::decode::observe::TeacherForcing {
                 self.forced
                     .get(step)
-                    .map_or(crate::campaign::TeacherForcing::Exhausted, |token| {
-                        crate::campaign::TeacherForcing::Token(*token)
+                    .map_or(crate::decode::observe::TeacherForcing::Exhausted, |token| {
+                        crate::decode::observe::TeacherForcing::Token(*token)
                     })
             }
             fn token_probability(&mut self, _stage: &'static str, token: i32, _probability: f64) {
@@ -1101,7 +1109,7 @@ mod tests {
         phases: Vec<(&'static str, usize, bool)>,
     }
 
-    impl crate::campaign::Observer for BoundaryProbe {
+    impl crate::decode::observe::Observer for BoundaryProbe {
         fn phase(&mut self, name: &'static str) {
             let produced = self.produced.borrow();
             let complete = produced.iter().all(mlx_array_is_available);
@@ -1153,6 +1161,7 @@ mod tests {
 
     /// SC-20671 steady decode is a fixed-length measurement: a sampled stop token is decoded
     /// through (and counted), never a reason to end early and shrink the timed window.
+    #[cfg(feature = "campaign")]
     #[test]
     fn forced_steady_decode_ignores_stop_tokens_and_produces_exactly_n() {
         let mut cache = FixedDecoder.make_cache();
@@ -1189,6 +1198,7 @@ mod tests {
 
     /// Teacher forcing feeds the forced stream, not the decoder's own choice, and returns the
     /// decoder's argmax at every forced position.
+    #[cfg(feature = "campaign")]
     #[test]
     fn forced_greedy_decode_teacher_forces_the_given_stream() {
         struct EchoDecoder(std::cell::RefCell<Vec<i32>>);
@@ -1291,6 +1301,7 @@ mod tests {
 
     /// Every steady-decode stamp is taken after the logits it closes over reached GPU completion,
     /// so a lazy-only timer (stamping graph construction) cannot pass as decode throughput.
+    #[cfg(feature = "campaign")]
     #[test]
     fn forced_steady_decode_stamps_only_after_the_sampled_logits_complete() {
         let produced = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -1327,7 +1338,7 @@ mod tests {
         cache.update(0, &key, &key).unwrap();
         let mut seen = ObservedCache::default();
         let mut observer = DecodeObserver::default();
-        let mut attached: Option<&mut dyn crate::campaign::Observer> = Some(&mut observer);
+        let mut attached: Option<&mut dyn crate::decode::observe::Observer> = Some(&mut observer);
         observe_cache_events(&mut cache, &mut seen, &mut attached).unwrap();
         observe_cache_events(&mut cache, &mut seen, &mut attached).unwrap();
         assert_eq!(
@@ -1345,7 +1356,7 @@ mod tests {
         evidence: Vec<crate::primitives::PackedCacheEvidence>,
     }
 
-    impl crate::campaign::Observer for CompressedCapture {
+    impl crate::decode::observe::Observer for CompressedCapture {
         fn phase(&mut self, _name: &'static str) {}
         fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
         fn cache_snapshot(&mut self, bytes: u64, tokens: u64, capacity: u64, element_bytes: u64) {
@@ -1409,7 +1420,7 @@ mod tests {
             .is_some());
         let mut state = ObservedCache::default();
         let mut capture = CompressedCapture::default();
-        let mut attached: Option<&mut dyn crate::campaign::Observer> = Some(&mut capture);
+        let mut attached: Option<&mut dyn crate::decode::observe::Observer> = Some(&mut capture);
         observe_cache_events(cache.as_mut(), &mut state, &mut attached).unwrap();
         observe_packed_evidence(cache.as_ref(), &mut attached);
         cache

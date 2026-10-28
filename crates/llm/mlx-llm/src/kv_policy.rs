@@ -376,9 +376,12 @@ pub(crate) fn compressed_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "campaign")]
     use crate::campaign::{context_band_target, LLAMA_CANDIDATE, QWEN_CANDIDATE};
+    #[cfg(feature = "campaign")]
     use core_llm::{qualify_kv_compression, KvCompressionPolicy, KV_COMPRESSION_QUALIFICATIONS};
 
+    #[cfg(feature = "campaign")]
     fn row(family: KvModelFamily) -> &'static core_llm::KvQualification {
         KV_COMPRESSION_QUALIFICATIONS
             .iter()
@@ -388,6 +391,7 @@ mod tests {
 
     /// The table's thresholds are the SC-20671 campaign coordinates of the evidence models, and
     /// each evidence model's campaign family names the table family.
+    #[cfg(feature = "campaign")]
     #[test]
     fn qualification_thresholds_are_the_campaign_coordinates() {
         let band = |spec: &crate::campaign::BenchmarkModelSpec, name| {
@@ -442,7 +446,7 @@ mod tests {
     /// profile must be the ones this builder uses.
     #[test]
     fn campaign_arms_record_the_reader_this_builder_makes() {
-        for method in crate::campaign::CompressedKvMethod::ALL {
+        for method in crate::decode::observe::CompressedKvMethod::ALL {
             assert_eq!(
                 method.representation_identity(),
                 packed_metal_identity(method.code_bits())

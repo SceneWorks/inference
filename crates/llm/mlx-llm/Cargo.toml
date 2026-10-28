@@ -67,5 +67,22 @@ core-llm = { workspace = true, features = ["test-clock"] }
 name = "integration"
 path = "tests/main.rs"
 
+# The measurement-campaign bins need the opt-in `campaign` harness (sc-27303).
+[[bin]]
+name = "sc20671_kv_baseline"
+required-features = ["campaign"]
+
+[[bin]]
+name = "sc20676_packed_evidence"
+required-features = ["campaign"]
+
+[[bin]]
+name = "sc20677_capture_kv"
+required-features = ["campaign"]
+
 [features]
 model-inference-proof = ["core-llm/model-inference-proof"]
+# The sc-20671/20676/20677 measurement-campaign harness (`campaign`, `campaign_supervisor`,
+# `kv_capture`, `sc20676_evidence` and the provider's campaign entry points). Off by default: it
+# spawns subprocesses and knows the SceneWorks checkout, so no runtime consumer compiles it.
+campaign = []

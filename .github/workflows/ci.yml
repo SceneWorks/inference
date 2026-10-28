@@ -794,6 +794,27 @@ jobs:
           python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core
           --all-targets -- -D warnings
+      # sc-27303: the measurement-campaign harness is behind mlx-llm's opt-in `campaign` feature, so
+      # the step above lints the shipped (campaign-free) graph. Lint and document the harness build
+      # too, so neither configuration can rot unseen.
+      - name: Clippy mlx-llm campaign harness
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going -p mlx-llm --features campaign --all-targets -- -D warnings
+      - name: Rustdoc mlx-llm campaign harness
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: python3 scripts/ci/run_ci_collection.py -- cargo doc --locked --keep-going --no-deps -p mlx-llm --features campaign
       - name: Compile and lint opt-in MOSS model tests without execution
         run: cargo clippy --locked --all-targets -j 1 -p mlx-gen-moss-image --features test-support -- -D warnings
       - name: Rustdoc macOS MLX packages
@@ -867,6 +888,11 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
+          # sc-27303: mlx-llm's campaign-harness tests compile only under its opt-in `campaign`
+          # feature; keep running them whenever mlx-llm is in scope.
+          for package in "${packages[@]}"; do
+            if [[ "$package" == mlx-llm ]]; then packages+=(--features mlx-llm/campaign); break; fi
+          done
           python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --no-fail-fast --lib --tests "${packages[@]}"
           python3 scripts/ci/run_ci_collection.py -- python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" routine -- cargo test --locked --no-fail-fast --lib --tests "${packages[@]}"
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
@@ -1221,8 +1247,8 @@ jobs:
           cache-bin: "false"
       - name: Exercise MLX engine and complete runtime catalog on NAX
         run: |
-          python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --lib -p mlx-llm -p runtime-macos
-          python3 scripts/ci/test_suites.py routine -- cargo test --locked --lib -p mlx-llm -p runtime-macos
+          python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --lib -p mlx-llm -p runtime-macos --features mlx-llm/campaign
+          python3 scripts/ci/test_suites.py routine -- cargo test --locked --lib -p mlx-llm -p runtime-macos --features mlx-llm/campaign
       # SC-18318 acceptance is correctness-only: exercise the focused synthetic
       # request-scoped exact-epilogue equality/receipt suite on a live Metal
       # device. The p3_ filter is intentionally narrow and invokes no timing,
