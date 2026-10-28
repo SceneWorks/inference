@@ -25,7 +25,6 @@ use candle_audio::gen_core::{
     self, AudioTrack, LoadSpec, VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding,
     WeightsSource,
 };
-use candle_nn::VarBuilder;
 
 use crate::config;
 use crate::encoder::SpeakerEncoder;
@@ -84,16 +83,12 @@ impl ChatterboxVoiceEmbedder {
             )));
         }
         let device = candle_audio::default_device()?;
-        // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the same idiom every
-        // candle provider uses for its checkpoint.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                std::slice::from_ref(&self.weights),
-                DType::F32,
-                &device,
-            )
-            .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: loading {WEIGHTS_FILE}: {e}")))?
-        };
+        let vb = candle_audio::weights::mmap_var_builder(
+            std::slice::from_ref(&self.weights),
+            DType::F32,
+            &device,
+        )
+        .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: loading {WEIGHTS_FILE}: {e}")))?;
         let built = Arc::new(
             SpeakerEncoder::new(vb, device)
                 .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: building encoder: {e}")))?,

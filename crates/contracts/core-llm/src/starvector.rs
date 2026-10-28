@@ -494,6 +494,262 @@ impl<'a> StarVectorBoundedStream<'a> {
     }
 }
 
+/// The text contract's finish reason for a bounded SVG stream's terminal reason. A stream cut by
+/// any budget (tokens, bytes or wall time) is a truncated answer, so it is `Length`.
+pub fn svg_finish_reason(reason: StarVectorFinishReason) -> crate::FinishReason {
+    match reason {
+        StarVectorFinishReason::CompleteRoot | StarVectorFinishReason::Eos => {
+            crate::FinishReason::Stop
+        }
+        StarVectorFinishReason::TokenLimit
+        | StarVectorFinishReason::ByteLimit
+        | StarVectorFinishReason::WallTimeLimit => crate::FinishReason::Length,
+        StarVectorFinishReason::Cancelled => crate::FinishReason::Cancelled,
+    }
+}
+
+/// Emit the bounded stream's terminal `Done` event for `output` and hand the output back — the
+/// one place every StarVector decode ends its stream.
+pub fn emit_svg_done(
+    output: StarVectorOutput,
+    events: &mut dyn FnMut(StarVectorStreamEvent),
+) -> StarVectorOutput {
+    events(StarVectorStreamEvent::Done {
+        finish_reason: output.finish_reason,
+        generated_tokens: output.generated_tokens,
+        generated_bytes: output.generated_bytes,
+    });
+    output
+}
+
+/// The one conditioning image of an image-only StarVector request: free-form text guidance, a
+/// second image or no image is refused, naming `model` (e.g. `StarVector-8B`) in the error.
+pub fn starvector_conditioning_image<'a>(
+    model: &str,
+    request: &'a TextLlmRequest,
+) -> Result<&'a crate::ImageRef> {
+    if request
+        .messages
+        .iter()
+        .any(|message| !message.text_content().trim().is_empty())
+    {
+        return Err(Error::Unsupported(format!(
+            "{model} im2svg is image-conditioned and does not accept free-form text guidance"
+        )));
+    }
+    let mut image = None;
+    for message in &request.messages {
+        for content in &message.content {
+            if let crate::Content::Image(value) = content {
+                if image.replace(value).is_some() {
+                    return Err(Error::Unsupported(format!(
+                        "{model} accepts exactly one conditioning image"
+                    )));
+                }
+            }
+        }
+    }
+    image.ok_or_else(|| Error::InvalidRequest(format!("{model} requires one conditioning image")))
+}
+
+/// Refuse a loaded snapshot whose advertised generation cap does not fit its context once the
+/// image prefix and the tokenized SVG prompt are prefilled. `model` names the tier in the error.
+pub fn validate_loaded_svg_context_cap(
+    model: &str,
+    descriptor: &crate::TextLlmDescriptor,
+    starvector: &StarVectorDescriptor,
+    prompt_tokens: usize,
+) -> Result<()> {
+    let prefill_tokens = usize::try_from(starvector.projection.image_token_count)
+        .map_err(|_| Error::InvalidRequest(format!("{model} image prefix does not fit usize")))?
+        .checked_add(prompt_tokens)
+        .ok_or_else(|| Error::InvalidRequest(format!("{model} prefill token count overflow")))?;
+    validate_advertised_generated_token_cap(
+        descriptor.capabilities.max_new_tokens,
+        descriptor.capabilities.max_context_tokens,
+        prefill_tokens,
+    )
+}
+
+/// The text contract's answer for one SVG generation, shared by every StarVector provider on both
+/// backends (sc-27301). `decode` runs the bounded SVG request built from `request` (capped at
+/// `max_svg_bytes` and `max_wall_time`); its stream events are re-emitted on `on_event` as content
+/// tokens and `Done`, its output becomes the text, usage and finish reason, and its measured decode
+/// report (`None` only when the stream stopped on the static prefix, before a decode) carries the
+/// captioner reasons — StarVector advertises no proposer and has no prefix cache — with the
+/// request's option resolved against the provider's `speculative_default`. `decode` must end every
+/// successful stream with [`emit_svg_done`], the only source of the text `Done`.
+#[allow(clippy::too_many_arguments)]
+pub fn svg_text_output(
+    request: &TextLlmRequest,
+    prompt_tokens: u32,
+    max_svg_bytes: usize,
+    max_wall_time: Duration,
+    speculative_default: crate::Speculative,
+    on_event: &mut dyn FnMut(crate::StreamEvent),
+    decode: impl FnOnce(
+        &StarVectorRequest,
+        &mut dyn FnMut(StarVectorStreamEvent),
+    ) -> Result<(StarVectorOutput, Option<crate::DecodeReport>)>,
+) -> Result<crate::TextLlmOutput> {
+    let svg_request = StarVectorRequest::new(request.clone(), max_svg_bytes, max_wall_time);
+    let (output, report) = decode(&svg_request, &mut |event| match event {
+        StarVectorStreamEvent::Source { text, index } => on_event(crate::StreamEvent::Token {
+            id: index,
+            text,
+            index: index as usize,
+            channel: crate::Channel::Content,
+        }),
+        StarVectorStreamEvent::Progress { .. } => {}
+        StarVectorStreamEvent::Done {
+            finish_reason,
+            generated_tokens,
+            ..
+        } => on_event(crate::StreamEvent::Done {
+            finish_reason: svg_finish_reason(finish_reason),
+            usage: crate::Usage {
+                prompt_tokens,
+                generated_tokens,
+            },
+        }),
+    })?;
+    Ok(crate::TextLlmOutput {
+        timings: None,
+        text: output.svg.unwrap_or_default(),
+        thinking: None,
+        tool_calls: Vec::new(),
+        usage: crate::Usage {
+            prompt_tokens,
+            generated_tokens: output.generated_tokens,
+        },
+        mtp: None,
+        decode: report.map(|report| {
+            report.with_captioner_reasons(request.speculative_or(speculative_default))
+        }),
+        finish_reason: Some(svg_finish_reason(output.finish_reason)),
+        // A StarVector decoder has no compressed-KV table family: the dense KV-cache report for
+        // the request's policy (sc-20683).
+        kv_cache: Some(crate::KvCacheReport::without_table_family(
+            request.kv_compression,
+        )),
+    })
+}
+
+/// The exact `starvector/starvector-8b-im2svg` snapshot both backends serve (sc-27255): its
+/// geometry, the probe that recognizes it, and its contract descriptors. Model loading and
+/// decoding stay per backend.
+pub mod starvector_8b {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use serde_json::Value;
+
+    use super::{
+        DecoderArchitecture, ImagePreprocessing, ProjectionMetadata, StarVectorDescriptor,
+        StarVectorTier, VisionEncoderArchitecture,
+    };
+    use crate::{TextLlmCapabilities, TextLlmDescriptor};
+
+    /// The published snapshot's repository.
+    pub const SNAPSHOT_REPOSITORY: &str = "starvector/starvector-8b-im2svg";
+    /// The exact published revision the probe and the providers are bound to.
+    pub const SNAPSHOT_REVISION: &str = "518beea8dcb5f7a37c5911e92d1d62a76beee7f9";
+    /// The static SVG prefix every decode starts from.
+    pub const SVG_PROMPT: &str = "<svg";
+    /// The decoder's end-of-sequence token id.
+    pub const EOS_TOKEN_ID: i32 = 0;
+    /// The SigLIP input edge.
+    pub const IMAGE_SIZE: usize = 384;
+    /// Image-prefix tokens the adapter projects.
+    pub const IMAGE_TOKENS: usize = 576;
+    /// SigLIP row width.
+    pub const VISION_HIDDEN: usize = 1024;
+    /// StarCoder2 decoder row width.
+    pub const DECODER_HIDDEN: usize = 4608;
+    /// The decoder's context window.
+    pub const MAX_CONTEXT_TOKENS: usize = 16_000;
+    /// Tokens the static SVG prefix encodes to.
+    pub const SVG_PROMPT_TOKEN_COUNT: usize = 2;
+    /// Hard wall-time cap for one SVG decode. Sized so a decode that uses the whole context
+    /// window can finish; hosts may request less.
+    pub const MAX_WALL_TIME: Duration = Duration::from_secs(600);
+    /// The UTF-8 byte cap of one SVG source.
+    pub const MAX_SVG_BYTES: usize = 2 * 1024 * 1024;
+    /// The generation cap the context leaves after the image prefix and the SVG prefix.
+    pub const MAX_NEW_TOKENS: u32 =
+        (MAX_CONTEXT_TOKENS - (IMAGE_TOKENS + SVG_PROMPT_TOKEN_COUNT)) as u32;
+
+    /// Whether `config` is the exact published snapshot's `config.json`.
+    pub fn exact_config(config: &Value) -> bool {
+        config.get("model_type").and_then(Value::as_str) == Some("starvector")
+            && config.get("starcoder_model_name").and_then(Value::as_str)
+                == Some("bigcode/starcoder2-7b")
+            && config.get("image_encoder_type").and_then(Value::as_str) == Some("siglip_384")
+            && config.get("adapter_norm").and_then(Value::as_str) == Some("layer_norm")
+            && config.get("image_size").and_then(Value::as_i64) == Some(384)
+            && config.get("hidden_size").and_then(Value::as_i64) == Some(4608)
+            && config.get("num_attention_heads").and_then(Value::as_i64) == Some(36)
+            && config.get("num_hidden_layers").and_then(Value::as_i64) == Some(32)
+            && config.get("num_kv_heads").and_then(Value::as_i64) == Some(4)
+            && config.get("vocab_size").and_then(Value::as_i64) == Some(49_152)
+    }
+
+    /// The weightless structural probe: `source`'s `config.json` is the exact snapshot's.
+    pub fn snapshot_matches(source: &str) -> bool {
+        std::fs::read_to_string(Path::new(source).join("config.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|config| exact_config(&config))
+    }
+
+    /// The text-contract descriptor of provider `id` on `backend`.
+    pub fn text_descriptor(id: &str, backend: &str) -> TextLlmDescriptor {
+        TextLlmDescriptor {
+            id: id.into(),
+            family: "starvector".into(),
+            backend: backend.into(),
+            capabilities: TextLlmCapabilities {
+                max_context_tokens: MAX_CONTEXT_TOKENS,
+                max_new_tokens: MAX_NEW_TOKENS,
+                supports_system_prompt: false,
+                supports_vision: true,
+                supports_video: false,
+                supports_audio: false,
+                supports_thinking: false,
+                supports_reasoning_effort: false,
+                reasoning_efforts: Vec::new(),
+                model_sampling_defaults: None,
+                supports_preserve_thinking: false,
+                supports_tools: false,
+                mtp: None,
+                speculative: Vec::new(),
+                supported_constraints: Vec::new(),
+            },
+        }
+    }
+
+    /// The tensor-neutral model facts visible through the shared StarVector contract.
+    pub fn starvector_descriptor() -> StarVectorDescriptor {
+        StarVectorDescriptor {
+            tier: StarVectorTier::EightB,
+            preprocessing: ImagePreprocessing {
+                image_size: IMAGE_SIZE as u32,
+                channels: 3,
+                preserve_aspect_ratio: false,
+            },
+            projection: ProjectionMetadata {
+                vision_encoder: VisionEncoderArchitecture::Siglip,
+                decoder: DecoderArchitecture::StarCoder2,
+                vision_hidden_size: VISION_HIDDEN as u32,
+                decoder_hidden_size: DECODER_HIDDEN as u32,
+                image_token_count: IMAGE_TOKENS as u32,
+            },
+            max_svg_bytes: MAX_SVG_BYTES,
+            max_wall_time: Some(MAX_WALL_TIME),
+        }
+    }
+}
+
 /// A loaded native StarVector provider.
 pub trait StarVectorProvider: TextLlm {
     /// SVG-specific architecture, preprocessing, and declared limits. Identity and capabilities
@@ -679,6 +935,93 @@ mod tests {
 
     fn assert_status(actual: StarVectorStreamStatus, expected: StarVectorStreamStatus) {
         assert_eq!(actual, expected);
+    }
+
+    /// sc-27301: the shared SVG text answer re-emits the stream as content tokens and one `Done`,
+    /// publishes the SVG, and reports the dense KV cache for the request's policy.
+    #[test]
+    fn svg_text_output_streams_the_svg_and_reports_the_dense_kv_cache() {
+        use crate::{
+            KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
+        };
+        for (policy, reason) in [
+            (Policy::Off, Reason::PolicyDisabled),
+            (Policy::Qualified, Reason::UnqualifiedModel),
+        ] {
+            let mut text = TextLlmRequest::new(vec![Message::user("x")], 64);
+            text.kv_compression = policy;
+            let mut events = Vec::new();
+            let output = svg_text_output(
+                &text,
+                7,
+                128,
+                TEST_LIMIT,
+                crate::Speculative::Off,
+                &mut |event| events.push(event),
+                |svg, on_event| {
+                    let mut stream = StarVectorBoundedStream::new(svg);
+                    stream.push("<svg></svg>", STEP)?;
+                    on_event(StarVectorStreamEvent::Source {
+                        text: "<svg></svg>".into(),
+                        index: 0,
+                    });
+                    Ok((emit_svg_done(stream.output()?, on_event), None))
+                },
+            )
+            .unwrap();
+            assert_eq!(output.text, "<svg></svg>");
+            assert_eq!(output.finish_reason, Some(crate::FinishReason::Stop));
+            assert_eq!(output.usage.prompt_tokens, 7);
+            assert_eq!(output.kv_cache, Some(KvCacheReport::dense(reason, None)));
+            assert!(matches!(events[0], crate::StreamEvent::Token { .. }));
+            assert!(matches!(
+                events[1],
+                crate::StreamEvent::Done {
+                    finish_reason: crate::FinishReason::Stop,
+                    ..
+                }
+            ));
+            assert_eq!(events.len(), 2);
+        }
+    }
+
+    /// sc-27301: an image-only StarVector request takes exactly one image and no text guidance.
+    #[test]
+    fn conditioning_image_refuses_text_and_extra_or_missing_images() {
+        let image = crate::ImageRef::new(1, 1, vec![0; 3]).unwrap();
+        let with = |content: Vec<crate::Content>| {
+            TextLlmRequest::new(
+                vec![Message {
+                    role: crate::Role::User,
+                    content,
+                    thinking: None,
+                    tool_calls: Vec::new(),
+                }],
+                16,
+            )
+        };
+        let one = with(vec![crate::Content::Image(image.clone())]);
+        assert!(starvector_conditioning_image("StarVector-8B", &one).is_ok());
+        let guided = with(vec![
+            crate::Content::Text("make it blue".into()),
+            crate::Content::Image(image.clone()),
+        ]);
+        assert!(matches!(
+            starvector_conditioning_image("StarVector-8B", &guided),
+            Err(Error::Unsupported(_))
+        ));
+        let two = with(vec![
+            crate::Content::Image(image.clone()),
+            crate::Content::Image(image),
+        ]);
+        assert!(matches!(
+            starvector_conditioning_image("StarVector-8B", &two),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            starvector_conditioning_image("StarVector-8B", &with(Vec::new())),
+            Err(Error::InvalidRequest(_))
+        ));
     }
 
     #[test]

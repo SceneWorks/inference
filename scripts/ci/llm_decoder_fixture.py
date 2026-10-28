@@ -33,7 +33,12 @@ CASES = {
 }
 PACKAGES = {"candle": "candle-llm", "mlx": "mlx-llm"}
 LIBRARIES = {"candle": "candle_llm", "mlx": "mlx_llm"}
-SOURCES = {backend: f"crates/llm/{package}/src/models/qwen35.rs" for backend, package in PACKAGES.items()}
+# The Rust source that declares each lane's decoder cases (MLX keeps its `qwen35` tests in a sibling
+# file, sc-27409); the MLX decoder itself is stamped beside it in `venue`.
+SOURCES = {
+    "candle": "crates/llm/candle-llm/src/models/qwen35.rs",
+    "mlx": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
+}
 COMPILER_SECONDS = 2700
 
 
@@ -84,7 +89,7 @@ def venue(backend: str) -> dict:
     paths = ["Cargo.lock", "rust-toolchain.toml", ".github/workflows/moss-model-fixtures.yml",
              "scripts/ci/llm_decoder_fixture.py", SOURCES[backend]]
     if backend == "mlx":
-        paths.append("crates/llm/mlx-llm/src/primitives/kv_cache.rs")
+        paths += ["crates/llm/mlx-llm/src/models/qwen35.rs", "crates/llm/mlx-llm/src/primitives/kv_cache.rs"]
     return {"head": head, "repository": "SceneWorks/inference", "event": event_name,
             "workflow_ref": workflow, "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
             "dispatch_choice": LANE, "runner_os": os.environ["RUNNER_OS"], "toolchain": version,

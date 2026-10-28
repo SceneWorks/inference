@@ -65,6 +65,7 @@ pub mod detok;
 pub mod error;
 pub mod kv_compression;
 pub mod message;
+pub mod model_config;
 pub mod mtp_head;
 pub mod output;
 pub mod paging;
@@ -86,6 +87,7 @@ pub mod text_llm;
 pub mod thinking;
 pub mod tokenizer;
 pub mod tool;
+pub mod vision_preprocess;
 
 pub use cancel::CancelFlag;
 pub use capabilities::{
@@ -174,8 +176,9 @@ pub use speculative::{
     PROMPT_LOOKUP_RECOMMENDED_DEPTH, SHAPE_WARMUP_STEPS,
 };
 pub use starvector::{
-    generated_token_budget, validate_advertised_generated_token_cap,
-    validate_generated_token_budget, DecoderArchitecture, ImagePreprocessing, ProjectionMetadata,
+    emit_svg_done, generated_token_budget, starvector_conditioning_image, svg_finish_reason,
+    svg_text_output, validate_advertised_generated_token_cap, validate_generated_token_budget,
+    validate_loaded_svg_context_cap, DecoderArchitecture, ImagePreprocessing, ProjectionMetadata,
     StarVectorBoundedStream, StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput,
     StarVectorProvider, StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus,
     StarVectorTier, VisionEncoderArchitecture,

@@ -258,6 +258,13 @@ class ProductionEnvReadTests(unittest.TestCase):
         self.write("crates/media/x/tests/real.rs", 'fn r() { std::env::var("X_SNAPSHOT").ok(); }\n')
         self.check()  # no raise
 
+    def test_stale_allowlist_entry_fails_only_when_asked(self) -> None:
+        # The fixture reads one listed knob; every other allowlist entry is unread here.
+        self.write("crates/media/x/src/lib.rs", 'fn f() -> bool { gen_core::env_flag("SVD_FORCE_F16") }\n')
+        self.check()  # no raise: fixtures do not reject stale entries
+        with self.assertRaisesRegex(AssertionError, "no production code reads any more"):
+            self.gate.check_production_env_reads(self.root, reject_stale=True)
+
 
 class RepositoryTreeIsCleanTests(unittest.TestCase):
     """The real inference tree must satisfy the guardrail (green on the committed clean tree)."""
@@ -265,7 +272,7 @@ class RepositoryTreeIsCleanTests(unittest.TestCase):
     def test_workspace_rust_has_no_hf_cache_or_side_channel(self) -> None:
         gate = load_gate_module()
         gate.check_rust_sources(ROOT)  # no raise on the clean tree
-        gate.check_production_env_reads(ROOT)
+        gate.check_production_env_reads(ROOT, reject_stale=True)
 
 
 if __name__ == "__main__":

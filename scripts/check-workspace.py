@@ -196,13 +196,13 @@ DELETED_ENV_SIDE_CHANNELS = (
 PRODUCTION_ENV_READS = frozenset({
     # Platform / device / process plumbing.
     "CANDLE_LLM_DEVICE", "CUDA_PATH", "CUDA_VISIBLE_DEVICES", "HOME", "LOCALAPPDATA", "SystemRoot",
-    "XDG_CACHE_HOME", "SCENEWORKS_CANDLE_DEVICE_CACHE_DIR", "SCENEWORKS_ROOT",
+    "XDG_CACHE_HOME", "SCENEWORKS_ROOT",
     # Memory-budget / attention-budget / token-cap overrides.
     "LTX_MAX_LATENT_TOKENS", "SEEDVR2_BUDGET_GIB", "WAN_ATTN_SCORES_BUDGET", "MLX_SDPA_BLOCKS",
     "SDXL_PREDICTION_BUDGET_BYTES", "MLX_GEN_SANA_DECODE_TILE", "ANIMA_SPLIT_FILES",
     # Numeric / behaviour A/B toggles (boolean ones go through `env_flag`).
     "FLUX2_IMG_GUIDANCE", "PID_PIXEL_POS_ABS", "SCAIL2_COMPUTE_BF16", "SDXL_LORA_VENDORED",
-    "SVD_FORCE_BF16", "SVD_FORCE_F16", "WAN_ATTN_SOFTMAX_BF16", "MOSS_TTS_MIN_FRAMES",
+    "SVD_FORCE_BF16", "SVD_FORCE_F16", "WAN_ATTN_SOFTMAX_BF16",
     # Calibration / measurement / proof harness inputs and CI provenance.
     "MEMORY_EXPECTED_ABI", "MEMORY_EXPECTED_FINGERPRINT", "MODEL_INFERENCE_CASE_FQN", "GITHUB_SHA",
     "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "MOSS_CPU_RECEIPT_PATH", "MOSS_CUDA_UNIT_EXPECTED_GPU_UUID",
@@ -2066,16 +2066,19 @@ def check_rust_sources(root: Path) -> None:
         fail(f"inference source must not reference HF caches or deleted env side channels:\n  {joined}")
 
 
-def check_production_env_reads(root: Path) -> None:
+def check_production_env_reads(root: Path, *, reject_stale: bool = False) -> None:
     """Fail on a production `src/` read of a process-environment variable that is not in
     PRODUCTION_ENV_READS (sc-27313). `#[cfg(test)]` blocks and `#[cfg(test)] mod name;` files are test
-    code and exempt; only literal names are matched."""
+    code and exempt; only literal names are matched. With `reject_stale` (the real tree), an allowlist
+    entry no production code reads any more is also a failure, so the list names exactly the knobs
+    that exist."""
     crates = root / "crates"
     if not crates.is_dir():
         return
     read = re.compile(r"\b(?:env::var(?:_os)?|env_flag)\s*\(\s*\"([A-Za-z0-9_]+)\"\s*\)")
     test_only = _test_only_files(root)
     violations: list[str] = []
+    seen: set[str] = set()
     for path in sorted(crates.rglob("*.rs")):
         relative = path.relative_to(root)
         if "src" not in relative.parts or path in test_only:
@@ -2087,17 +2090,23 @@ def check_production_env_reads(root: Path) -> None:
         spans = _cfg_test_spans(code)
         for match in read.finditer(code):
             name = match.group(1)
-            if name in PRODUCTION_ENV_READS:
-                continue
             if any(start <= match.start() < end for start, end in spans):
                 continue
+            seen.add(name)
+            if name in PRODUCTION_ENV_READS:
+                continue
             violations.append(f"{relative}:{_line_of(code, match.start())}: {name}")
+    if reject_stale:
+        violations.extend(
+            f"PRODUCTION_ENV_READS lists {name!r}, which no production code reads any more"
+            for name in sorted(PRODUCTION_ENV_READS - seen)
+        )
     if violations:
         joined = "\n  ".join(violations)
         fail(
-            "production code reads an unlisted process-environment variable; inference takes its "
-            "inputs from the request/provider contract — add a deliberate knob to "
-            f"PRODUCTION_ENV_READS:\n  {joined}"
+            "production env reads and PRODUCTION_ENV_READS disagree; inference takes its inputs from "
+            "the request/provider contract — add a deliberate knob to the allowlist, or drop an "
+            f"entry nothing reads:\n  {joined}"
         )
 
 
@@ -2364,6 +2373,43 @@ def check_snapshot_path_derivation(root: Path) -> None:
             "chain, so pointing a variable at a real store cannot reach it and the row skips while "
             "looking green. Add the override (keep $HOME as the default for a derived cache; hard-"
             "fail with the epic-13657 message for a provided input):\n  " + joined
+        )
+
+
+# --- audio-lane HF hub-layout derivation (sc-27258) ----------------------------------------------
+# Building a `models--<owner>--<name>` directory name is deriving the Hugging Face cache's on-disk
+# layout. The YuE2 / SheetSage2 real-weight harnesses take a passed-in hub directory, and exactly
+# one helper maps it to per-repo snapshot dirs; a second copy is the drift (and quiet epic-13657
+# erosion) sc-27258 removed. Scoped to `crates/audio` deliberately: the media families carry their
+# own derivations and their own stories, and a fixture that merely *names* such a directory
+# (`temp.path().join("models--org--x")`) builds nothing from a repo id, so only the formatted
+# derivation is matched.
+AUDIO_HUB_LAYOUT_DERIVATION = re.compile(r'format!\(\s*"models--')
+AUDIO_HUB_LAYOUT_HELPER = Path("crates/audio/candle-audio-yue2/src/snapshot.rs")
+
+
+def check_audio_hub_layout_derivation(root: Path) -> None:
+    """Fail when audio-lane Rust formats an HF hub `models--` directory name outside the one
+    `candle_audio_yue2::snapshot::hub_layout_snapshot_dir` helper (sc-27258)."""
+    audio = root / "crates" / "audio"
+    if not audio.is_dir():
+        return
+    violations: list[str] = []
+    for path in sorted(audio.rglob("*.rs")):
+        relative = path.relative_to(root)
+        if not SOURCE_LINT_IGNORED_PARTS.isdisjoint(relative.parts):
+            continue
+        if relative == AUDIO_HUB_LAYOUT_HELPER:
+            continue
+        text = strip_rust_comments(path.read_text(encoding="utf-8"))
+        for match in AUDIO_HUB_LAYOUT_DERIVATION.finditer(text):
+            violations.append(f"{relative}:{_line_of(text, match.start())}")
+    if violations:
+        joined = "\n  ".join(violations)
+        fail(
+            "audio-lane Rust re-derives the HF hub `models--<owner>--<name>` layout; use "
+            "`candle_audio_yue2::SnapshotDirs::from_hub_layout` / `snapshot::hub_layout_snapshot_dir` "
+            "(sc-27258):\n  " + joined
         )
 
 
@@ -3404,9 +3450,10 @@ def main() -> int:
         check_network_clients(metadata)
         check_ios_graph(args.offline)
         check_rust_sources(ROOT)
-        check_production_env_reads(ROOT)
+        check_production_env_reads(ROOT, reject_stale=True)
         check_pid_decode_route_adoption(metadata, ROOT)
         check_snapshot_path_derivation(ROOT)
+        check_audio_hub_layout_derivation(ROOT)
         check_test_temp_dir_guards(ROOT)
         check_cross_backend_geometry(metadata, ROOT)
     except (AssertionError, json.JSONDecodeError) as error:
@@ -3418,7 +3465,8 @@ def main() -> int:
         f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
         "intentional tokenizer split, no network clients, no trainers in the iOS graph, "
         "no HF-cache references, only listed production env reads, "
-        "no $HOME-derived snapshot paths, no unguarded test temp roots, "
+        "no $HOME-derived snapshot paths, no audio hub-layout re-derivations, "
+        "no unguarded test temp roots, "
         "no cross-backend geometry drift)"
     )
     return 0

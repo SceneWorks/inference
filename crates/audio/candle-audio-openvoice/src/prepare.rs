@@ -12,7 +12,8 @@
 
 use std::path::Path;
 
-use core_llm::{Error as CoreError, ModelFormat, PrepareReport, PrepareSpec, Result as CoreResult};
+use candle_audio::prepare::{passthrough_report, probe_json_config};
+use core_llm::{PrepareReport, PrepareSpec, Result as CoreResult};
 
 use crate::pipeline::{CHECKPOINT_FILE, CONFIG_FILE};
 
@@ -20,18 +21,10 @@ use crate::pipeline::{CHECKPOINT_FILE, CONFIG_FILE};
 /// `data.filter_length` + `model.gin_channels` blocks alongside `checkpoint.pth`)? Reads only
 /// `config.json` metadata, never a weight shard.
 pub fn is_openvoice_snapshot(dir: &Path) -> bool {
-    if !dir.is_dir() || !dir.join(CHECKPOINT_FILE).is_file() {
-        return false;
-    }
-    let Ok(text) = std::fs::read_to_string(dir.join(CONFIG_FILE)) else {
-        return false;
-    };
-    serde_json::from_str::<serde_json::Value>(&text)
-        .map(|v| {
-            v.get("data").and_then(|d| d.get("filter_length")).is_some()
-                && v.get("model").and_then(|m| m.get("gin_channels")).is_some()
-        })
-        .unwrap_or(false)
+    probe_json_config(dir, CHECKPOINT_FILE, CONFIG_FILE, |v| {
+        v.get("data").and_then(|d| d.get("filter_length")).is_some()
+            && v.get("model").and_then(|m| m.get("gin_channels")).is_some()
+    })
 }
 
 /// [`is_openvoice_snapshot`] over a [`PrepareSpec`] — the probe the composed audio-lane registration
@@ -40,34 +33,21 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
     is_openvoice_snapshot(&spec.source)
 }
 
-/// Prepare (verify + passthrough) an OpenVoice V2 converter snapshot.
+/// Prepare (verify + passthrough) an OpenVoice V2 converter snapshot; the report carries no tensor
+/// count (the pickle checkpoint rides inside the HF-snapshot shape).
 pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
-    if !is_openvoice_snapshot(&spec.source) {
-        return Err(CoreError::Unsupported(format!(
-            "prepare: {} is not an OpenVoice V2 converter snapshot",
-            spec.source.display()
-        )));
-    }
-    if let Some(q) = spec.quantize {
-        return Err(CoreError::Unsupported(format!(
-            "prepare: OpenVoice V2 converter snapshots have no {q:?} form — the checkpoint ships \
-             dense-only"
-        )));
-    }
-    Ok(PrepareReport {
-        // core-llm's detect_format calls a config.json-bearing snapshot dir Safetensors (the
-        // HF-snapshot shape); the pickle checkpoint rides inside that shape.
-        input_format: ModelFormat::Safetensors,
-        quantized: None,
-        out_dir: spec.source.clone(),
-        num_tensors: 0,
-        passthrough: true,
-    })
+    passthrough_report(
+        spec,
+        "OpenVoice V2 converter",
+        is_openvoice_snapshot,
+        |_| Ok(0),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_llm::Error as CoreError;
 
     fn spec(dir: &Path) -> PrepareSpec {
         PrepareSpec {

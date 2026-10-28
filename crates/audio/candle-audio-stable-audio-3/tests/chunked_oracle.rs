@@ -4,13 +4,14 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
     );
 };
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device, Tensor};
@@ -26,28 +27,9 @@ const LATENTS: usize = 225;
 const RATIO: usize = 4096;
 const CHUNK: usize = 128;
 
-fn snapshot(name: &str) -> PathBuf {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("{name} must point to the pinned immutable snapshot"))
-}
+use common::snapshot_dir as snapshot;
 
-fn test_device() -> Device {
-    if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
-        #[cfg(feature = "cuda")]
-        {
-            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            panic!("SA3_TEST_CUDA requires --features cuda")
-        }
-    } else {
-        Device::Cpu
-    }
-}
+use common::test_device;
 
 fn device_allocated_bytes(device: &Device) -> Option<usize> {
     #[cfg(feature = "metal")]
@@ -96,18 +78,13 @@ fn with_peak_device_bytes<T>(device: &Device, operation: impl FnOnce() -> T) -> 
 fn fixture(device: &Device) -> VarBuilder<'static> {
     let root =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/migration/sa3-chunked-reference");
-    // Safety: both generated artifacts are hash-pinned and immutable for the test process.
-    unsafe {
-        VarBuilder::from_mmaped_safetensors(
-            &[
-                root.join("chunked-f32.safetensors"),
-                root.join("chunked-outputs-f16.safetensors"),
-            ],
-            DType::F32,
-            device,
-        )
-        .unwrap()
-    }
+    common::mmap_f32(
+        &[
+            root.join("chunked-f32.safetensors"),
+            root.join("chunked-outputs-f16.safetensors"),
+        ],
+        device,
+    )
 }
 
 fn portable(shape: &[usize], stream: u64, scale: f32, device: &Device) -> Tensor {

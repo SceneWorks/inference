@@ -11,27 +11,17 @@
 
 use std::path::Path;
 
-use core_llm::{Error as CoreError, ModelFormat, PrepareReport, PrepareSpec, Result as CoreResult};
+use candle_audio::prepare::{json_str_is, passthrough_report, probe_json_config};
+use core_llm::{PrepareReport, PrepareSpec, Result as CoreResult};
 
 use crate::model::{CONFIG_FILE, WEIGHTS_FILE};
 
 /// Weightless probe: is `dir` a CLAP snapshot (a `config.json` whose `model_type` is `"clap"`
 /// alongside `pytorch_model.bin`)? Reads only `config.json` metadata, never a weight shard.
 pub fn is_clap_snapshot(dir: &Path) -> bool {
-    if !dir.is_dir() || !dir.join(WEIGHTS_FILE).is_file() {
-        return false;
-    }
-    let Ok(text) = std::fs::read_to_string(dir.join(CONFIG_FILE)) else {
-        return false;
-    };
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| {
-            v.get("model_type")
-                .and_then(|m| m.as_str())
-                .map(|s| s == "clap")
-        })
-        .unwrap_or(false)
+    probe_json_config(dir, WEIGHTS_FILE, CONFIG_FILE, |v| {
+        json_str_is(v, "model_type", "clap")
+    })
 }
 
 /// [`is_clap_snapshot`] over a [`PrepareSpec`] — the probe the composed audio-lane registration
@@ -40,33 +30,16 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
     is_clap_snapshot(&spec.source)
 }
 
-/// Prepare (verify + passthrough) a CLAP snapshot.
+/// Prepare (verify + passthrough) a CLAP snapshot. The weights are a pytorch pickle loaded via
+/// `VarBuilder::from_pth`; the report carries no tensor count.
 pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
-    if !is_clap_snapshot(&spec.source) {
-        return Err(CoreError::Unsupported(format!(
-            "prepare: {} is not a CLAP snapshot",
-            spec.source.display()
-        )));
-    }
-    if let Some(q) = spec.quantize {
-        return Err(CoreError::Unsupported(format!(
-            "prepare: CLAP snapshots have no {q:?} form — the checkpoint ships dense-only"
-        )));
-    }
-    Ok(PrepareReport {
-        // The snapshot is an HF-shaped directory (the closest `ModelFormat` tag); the weights are a
-        // pytorch pickle loaded via `VarBuilder::from_pth`, but `prepare` is a pure passthrough.
-        input_format: ModelFormat::Safetensors,
-        quantized: None,
-        out_dir: spec.source.clone(),
-        num_tensors: 0,
-        passthrough: true,
-    })
+    passthrough_report(spec, "CLAP", is_clap_snapshot, |_| Ok(0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_llm::Error as CoreError;
 
     fn spec(dir: &Path) -> PrepareSpec {
         PrepareSpec {

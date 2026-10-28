@@ -37,8 +37,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_audio::candle_core::safetensors::MmapedSafetensors;
-use candle_audio::candle_core::{DType, Device, Module, Tensor, D};
+use candle_audio::candle_core::{Device, Module, Tensor, D};
 use candle_audio::gen_core::{self, AudioTrack, CancelFlag};
 use candle_audio::neural_codec::{resolve_weight_norm, rvq_encode, DacEncoder};
 use candle_audio::AudioError;
@@ -250,31 +249,19 @@ impl XcodecEncoder {
     /// (HuBERT — the checkpoint's copy, which upstream's `load_state_dict` puts over the
     /// `semantic_ckpts` one) and quantizer 0's codebook. The decoder half is never paged in.
     pub fn load(checkpoint: &Path, device: &Device) -> Result<Self, AudioError> {
-        // SAFETY: the checkpoint is a caller-staged, read-only weight file; nothing in this process
-        // writes it while the map is alive (the contract every candle mmap loader relies on).
-        let st = unsafe { MmapedSafetensors::new(checkpoint) }
+        let st = candle_audio::weights::mmap_safetensors(checkpoint)
             .map_err(|e| AudioError::Msg(format!("xcodec: open {}: {e}", checkpoint.display())))?;
         let load = |name: &str| -> Result<Tensor, AudioError> {
-            Ok(st
-                .load(name, device)
-                .map_err(|e| AudioError::Msg(format!("xcodec: tensor {name:?}: {e}")))?
-                .to_dtype(DType::F32)?)
+            candle_audio::weights::load_f32(&st, name, device)
+                .map_err(|e| AudioError::Msg(format!("xcodec: tensor {name:?}: {e}")))
         };
-        let (mut acoustic, mut semantic, mut hubert) =
-            (HashMap::new(), HashMap::new(), HashMap::new());
-        for (name, _) in st.tensors() {
-            let bucket = if name.starts_with("encoder.") {
-                &mut acoustic
-            } else if name.starts_with("encoder_semantic.") {
-                &mut semantic
-            } else if name.starts_with("semantic_model.") {
-                &mut hubert
-            } else {
-                continue;
-            };
-            let t = load(&name)?;
-            bucket.insert(name, t);
-        }
+        let prefixed = |prefix: &'static str| {
+            candle_audio::weights::load_f32_map(&st, device, |name| name.starts_with(prefix))
+                .map_err(|e| AudioError::Msg(format!("xcodec: {e}")))
+        };
+        let acoustic = prefixed("encoder.")?;
+        let semantic = prefixed("encoder_semantic.")?;
+        let hubert = prefixed("semantic_model.")?;
         // Only the DAC encoder's pairs are dim-0 weight norms; HuBERT's positional conv is
         // `weight_norm(dim = 2)` and is folded by `Hubert::load`.
         let acoustic =
@@ -595,6 +582,7 @@ impl IclEncoder for StubIclEncoder {
 mod tests {
     use super::*;
     use candle_audio::candle_core::safetensors::save;
+    use candle_audio::candle_core::DType;
 
     /// Tiny synthetic widths — every loader reads its widths from the tensors, so a small
     /// checkpoint drives the real load + encode path end to end.

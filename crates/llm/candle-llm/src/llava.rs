@@ -25,7 +25,7 @@ use serde_json::Value;
 use core_llm::{
     Channel, ChatTemplate, Content, Error as CoreError, FinishReason as CoreFinish,
     IncrementalDetok, JinjaChatTemplate, Llama3Template, LoadSpec, Message, Quantize,
-    Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
+    Result as CoreResult, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
     TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
@@ -35,8 +35,8 @@ use crate::decode::{
     RequestSpan, StreamEvent,
 };
 use crate::device::select_eager_device;
-use crate::error::{Error, Result};
-use crate::image::SiglipImageProcessor;
+use crate::error::{to_core, Error, Result};
+use crate::image::{SiglipImageProcessor, SiglipPreprocess};
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
 use crate::models::CausalLm;
 use crate::primitives::nn::{gelu, gelu_erf, linear};
@@ -574,7 +574,7 @@ impl TextLlm for LlavaProvider {
             .image_features(&image.pixels, image.width as usize, image.height as usize)
             .map_err(to_core)?;
 
-        let params = map_sampling(&req.sampling);
+        let params = SamplingParams::from(&req.sampling);
         let max_new = req.max_new_tokens as usize;
 
         // Stream contract token events via incremental detokenization (re-decode, emit new suffix).
@@ -712,35 +712,11 @@ fn load_chat_template(dir: &Path) -> Box<dyn ChatTemplate> {
     }
 }
 
-fn map_sampling(s: &Sampling) -> SamplingParams {
-    SamplingParams {
-        temperature: s.temperature,
-        top_p: s.top_p,
-        top_k: s.top_k,
-        presence_penalty: s.presence_penalty,
-        presence_penalty_generated_only: s.presence_penalty_generated_only,
-        presence_penalty_prompt_len: 0,
-        repetition_penalty: s.repetition_penalty,
-        repetition_context: s.repetition_context,
-    }
-}
-
 fn map_finish(f: FinishReason) -> CoreFinish {
     match f {
         FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
         FinishReason::MaxTokens => CoreFinish::Length,
         FinishReason::Cancelled => CoreFinish::Cancelled,
-    }
-}
-
-fn to_core(e: Error) -> CoreError {
-    match e {
-        Error::Canceled => CoreError::Canceled,
-        Error::Unsupported(m) => CoreError::Unsupported(m),
-        Error::MissingTensor(m) => CoreError::Load(format!("missing tensor: {m}")),
-        Error::Config(m) => CoreError::Load(m),
-        Error::Io(e) => CoreError::Io(e),
-        other => CoreError::backend(other),
     }
 }
 
@@ -984,7 +960,7 @@ mod tests {
             }],
             speculative,
             max_new_tokens: 3,
-            sampling: Sampling::greedy(),
+            sampling: core_llm::Sampling::greedy(),
             ..Default::default()
         };
         let report = |provider: &LlavaProvider, speculative| {

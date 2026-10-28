@@ -37,10 +37,7 @@ fn env_path(name: &str) -> PathBuf {
 
 fn yue2_3b_snapshot() -> PathBuf {
     let repo = ComponentId::QwenTiktoken.component().repo;
-    env_path("YUE2_HF_HUB")
-        .join(format!("models--{}", repo.id.replace('/', "--")))
-        .join("snapshots")
-        .join(repo.revision)
+    candle_audio_yue2::snapshot::hub_layout_snapshot_dir(&env_path("YUE2_HF_HUB"), &repo)
 }
 
 fn tokenizer() -> Yue2TextTokenizer {

@@ -12,7 +12,8 @@
 
 use std::path::Path;
 
-use core_llm::{Error as CoreError, ModelFormat, PrepareReport, PrepareSpec, Result as CoreResult};
+use candle_audio::prepare::{passthrough_report, safetensors_tensor_count};
+use core_llm::{PrepareReport, PrepareSpec, Result as CoreResult};
 
 use crate::model::{T3_WEIGHTS_FILE, TOKENIZER_FILE};
 use crate::s3gen::S3GEN_WEIGHTS_FILE;
@@ -32,65 +33,20 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
     is_chatterbox_snapshot(&spec.source)
 }
 
-/// Count the tensors of one safetensors file from its header only (8-byte little-endian length +
-/// JSON; `__metadata__` is not a tensor). No tensor storage is read.
-fn safetensors_tensor_count(path: &Path) -> CoreResult<usize> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| CoreError::Msg(format!("prepare: read {}: {e}", path.display())))?;
-    if bytes.len() < 8 {
-        return Err(CoreError::Msg(format!(
-            "prepare: {} is not a safetensors file (short header)",
-            path.display()
-        )));
-    }
-    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-    let header = bytes.get(8..8 + n).ok_or_else(|| {
-        CoreError::Msg(format!(
-            "prepare: {} safetensors header truncated",
-            path.display()
-        ))
-    })?;
-    let v: serde_json::Value = serde_json::from_slice(header)
-        .map_err(|e| CoreError::Msg(format!("prepare: {} header: {e}", path.display())))?;
-    let obj = v.as_object().ok_or_else(|| {
-        CoreError::Msg(format!(
-            "prepare: {} header is not a JSON object",
-            path.display()
-        ))
-    })?;
-    Ok(obj.keys().filter(|k| *k != "__metadata__").count())
-}
-
 /// Prepare (verify + passthrough) a Chatterbox snapshot. Counts the T3 and S3Gen safetensors
 /// tensors from their headers so the report is honest about what the snapshot holds.
 pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
-    if !is_chatterbox_snapshot(&spec.source) {
-        return Err(CoreError::Unsupported(format!(
-            "prepare: {} is not a Chatterbox audio snapshot",
-            spec.source.display()
-        )));
-    }
-    if let Some(q) = spec.quantize {
-        return Err(CoreError::Unsupported(format!(
-            "prepare: Chatterbox snapshots have no {q:?} form — the pinned checkpoints ship \
-             dense-only"
-        )));
-    }
-    let num_tensors = safetensors_tensor_count(&spec.source.join(T3_WEIGHTS_FILE))?
-        + safetensors_tensor_count(&spec.source.join(S3GEN_WEIGHTS_FILE))?;
-
-    Ok(PrepareReport {
-        input_format: ModelFormat::Safetensors,
-        quantized: None,
-        out_dir: spec.source.clone(),
-        num_tensors,
-        passthrough: true,
+    passthrough_report(spec, "Chatterbox", is_chatterbox_snapshot, |dir| {
+        Ok(safetensors_tensor_count(&dir.join(T3_WEIGHTS_FILE))?
+            + safetensors_tensor_count(&dir.join(S3GEN_WEIGHTS_FILE))?)
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_audio::testkit::tiny_safetensors;
+    use core_llm::Error as CoreError;
 
     fn spec(dir: &Path) -> PrepareSpec {
         PrepareSpec {
@@ -98,17 +54,6 @@ mod tests {
             out_dir: dir.join("out"),
             quantize: None,
         }
-    }
-
-    fn tiny_safetensors(names: &[&str]) -> Vec<u8> {
-        let entries: Vec<String> = names
-            .iter()
-            .map(|n| format!(r#""{n}": {{"dtype": "F32", "shape": [0], "data_offsets": [0, 0]}}"#))
-            .collect();
-        let header = format!("{{{}}}", entries.join(", "));
-        let mut out = (header.len() as u64).to_le_bytes().to_vec();
-        out.extend_from_slice(header.as_bytes());
-        out
     }
 
     fn make_snapshot(dir: &Path) {
