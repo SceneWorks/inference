@@ -93,9 +93,9 @@ impl Projection {
     }
 
     fn forward(&self, x: &Tensor) -> AudioResult<Tensor> {
-        let x = self.linear1.forward(x)?;
+        let x = __model_proof_output!(self.linear1.forward(x))?;
         let x = x.relu()?;
-        Ok(self.linear2.forward(&x)?)
+        Ok(__model_proof_output!(self.linear2.forward(&x))?)
     }
 }
 
@@ -145,8 +145,14 @@ impl ClapEmbedder {
                 self.root.display()
             )));
         }
-        let tokenizer = Tokenizer::from_file(self.root.join(TOKENIZER_FILE))
-            .map_err(|e| AudioError::Msg(format!("{MODEL_ID}: tokenizer load failed: {e}")))?;
+        let tokenizer = candle_audio::gen_core::__model_input_reader!(
+            Tokenizer::from_file(self.root.join(TOKENIZER_FILE)),
+            "candle-audio-clap::model::ClapEmbedder::build/tokenizer",
+            Tokenizer,
+            self.root.join(TOKENIZER_FILE),
+            |path| Tokenizer::from_file(path)
+        )
+        .map_err(|e| AudioError::Msg(format!("{MODEL_ID}: tokenizer load failed: {e}")))?;
 
         // Load the whole pickle checkpoint as f32.
         let vb = VarBuilder::from_pth(&weights, DType::F32, &device).map_err(AudioError::from)?;

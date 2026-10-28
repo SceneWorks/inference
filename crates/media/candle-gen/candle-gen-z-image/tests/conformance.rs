@@ -47,6 +47,9 @@ fn z_image_conformance() {
 
     // Resolve through this provider's direct loader. Panics with aggregated failures.
     conformance(|| candle_gen_z_image::load(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::z_image_conformance");
 }
 
 /// Base (non-Turbo) `z_image` real-weight smoke (sc-8414): load a `Tongyi-MAI/Z-Image` snapshot and
@@ -130,6 +133,9 @@ fn base_z_image_smoke() {
     );
     assert!(std > 8.0, "near-flat render (no structure): std={std:.1}");
     eprintln!("[base smoke] coherent 512x512 render: mean={mean:.1} std={std:.1}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::base_z_image_smoke");
 }
 
 /// sc-8646 regression: base `z_image` CFG (`guidance = 4.0`) with an **unset** `negative_prompt` must
@@ -202,4 +208,7 @@ fn base_z_image_cfg_no_negative_smoke() {
     );
     assert!(std > 8.0, "near-flat render (no structure): std={std:.1}");
     eprintln!("[base no-neg smoke] coherent 512x512 render: mean={mean:.1} std={std:.1}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::base_z_image_cfg_no_negative_smoke");
 }

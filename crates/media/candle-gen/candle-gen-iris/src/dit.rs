@@ -16,8 +16,8 @@ use candle_gen::gen_core::iris::{self, ModelConfig};
 use candle_gen::{CandleError as Error, Result};
 
 use crate::nn::{
-    add, attention, cat, chunk_last, key_padding_mask, modulate, mul, split_at, Checkpoint, Linear,
-    Loader, RmsNorm, Rope,
+    add, attention, cat, chunk_last, key_padding_mask, modulate, mul, split_at, BackboneQuant,
+    Checkpoint, Linear, Loader, RmsNorm, Rope,
 };
 
 /// `SwiGLU`: `w2(silu(w1 x) · w3 x)`, bias-free.
@@ -265,6 +265,8 @@ pub struct IrisDiT {
     final_norm: RmsNorm,
     final_linear: Linear,
     pos_cache: Mutex<HashMap<(usize, usize), Tensor>>,
+    /// Bytes the built parameters hold ([`Self::resident_weight_bytes`]).
+    resident_weight_bytes: u64,
 }
 
 /// Shape of one forward's text conditioning.
@@ -287,6 +289,19 @@ impl IrisDiT {
         Self::from_checkpoint_widened(w, cfg, compute, device, cfg.in_channels)
     }
 
+    /// [`Self::from_checkpoint`] at a quantized tier (sc-26266): every projection is held as
+    /// [`crate::nn::ProjectionLayout::of`] says under `quant` (`None` is the dense tier). Adapter
+    /// residuals installed on the checkpoint stay forward-time terms over the packed base.
+    pub fn from_checkpoint_quantized(
+        w: &Checkpoint,
+        cfg: &ModelConfig,
+        compute: DType,
+        device: &Device,
+        quant: Option<BackboneQuant>,
+    ) -> Result<Self> {
+        Self::build(w, cfg, compute, device, cfg.in_channels, quant)
+    }
+
     /// [`Self::from_checkpoint`] for a backbone whose input projections were widened to
     /// `input_channels` (`iris3b/downstream/depth.py` `_widen`: the depth task concatenates a zero
     /// channel after RGB). The output stays `model.in_channels` wide.
@@ -297,9 +312,22 @@ impl IrisDiT {
         device: &Device,
         input_channels: usize,
     ) -> Result<Self> {
+        Self::build(w, cfg, compute, device, input_channels, None)
+    }
+
+    fn build(
+        w: &Checkpoint,
+        cfg: &ModelConfig,
+        compute: DType,
+        device: &Device,
+        input_channels: usize,
+        quant: Option<BackboneQuant>,
+    ) -> Result<Self> {
+        let held_before = w.resident_bytes();
         let l = Loader {
             weights: w,
             compute,
+            quant,
         };
         let eps = cfg.norm_eps as f32;
         let gqa = cfg.num_kv_heads.is_some_and(|kv| kv != cfg.num_heads);
@@ -443,6 +471,7 @@ impl IrisDiT {
             final_norm: l.norm("final_layer.norm", eps)?,
             final_linear: l.linear("final_layer.linear", true)?,
             pos_cache: Mutex::new(HashMap::new()),
+            resident_weight_bytes: w.resident_bytes() - held_before,
         };
         let unused = w.unused_keys();
         if !unused.is_empty() {
@@ -460,15 +489,15 @@ impl IrisDiT {
             )));
         }
         let p = cfg.patch_size;
-        crate::nn::expect_shape(
+        crate::nn::expect_dims(
             "s_embedder.proj.weight",
-            dit.s_embedder.weight(),
-            &[cfg.hidden_size, p * p * input_channels],
+            dit.s_embedder.logical_shape()?,
+            (cfg.hidden_size, p * p * input_channels),
         )?;
-        crate::nn::expect_shape(
+        crate::nn::expect_dims(
             "pixel_embedder.proj.weight",
-            dit.pixel_proj.weight(),
-            &[cfg.pixel.hidden_size, input_channels],
+            dit.pixel_proj.logical_shape()?,
+            (cfg.pixel.hidden_size, input_channels),
         )?;
         Ok(dit)
     }
@@ -481,8 +510,30 @@ impl IrisDiT {
         self.compute
     }
 
+    /// Bytes the loaded parameters hold — every tensor the build handed a module, at the width it
+    /// is resident in (GGML blocks for a packed projection on a quantized tier), summed from the
+    /// tensors as they were built. Adapter residuals are an overlay and are not counted.
+    pub fn resident_weight_bytes(&self) -> u64 {
+        self.resident_weight_bytes
+    }
+
+    /// Whether any projection is GGML-packed (a quantized tier).
+    pub fn is_quantized(&self) -> bool {
+        self.s_embedder.quant_dtype().is_some()
+            || self.blocks.iter().any(|block| match block {
+                Block::Dual(b) => b.proj_x.quant_dtype().is_some(),
+                Block::Single(b) => b.attn_proj.quant_dtype().is_some(),
+            })
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Device of a parameter retained by the loaded backbone, for explicit residency proofs.
+    #[cfg(feature = "model-inference-proof")]
+    pub fn resident_device(&self) -> &Device {
+        self.y_pos_embedding.device()
     }
 
     /// `TimestepEmbedder`: sinusoid bank (period `timestep_max_period`, 256 frequencies, cos‖sin)

@@ -35,6 +35,16 @@
 //!
 //! [`MetricEnvelope`]: candle_audio::harness::MetricEnvelope
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_kokoro::candle_audio::harness;
@@ -274,4 +284,7 @@ fn kokoro_regression_fixture() {
         first.true_peak_dbtp,
         first.clipped_samples,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kokoro_regression_fixture");
 }

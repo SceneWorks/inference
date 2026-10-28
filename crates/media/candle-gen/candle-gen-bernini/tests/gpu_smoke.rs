@@ -153,4 +153,7 @@ fn gpu_smoke_raw_render() {
         dt.as_secs_f32(),
         last_step,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gpu_smoke::gpu_smoke_raw_render");
 }

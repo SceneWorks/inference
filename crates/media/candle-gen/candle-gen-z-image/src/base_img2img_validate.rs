@@ -180,4 +180,7 @@ fn real_weight_base_img2img() {
     );
 
     println!("base z_image img2img validation PASS ✅ (eyeball the PPMs for edit quality)");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED base_img2img_validate::real_weight_base_img2img");
 }

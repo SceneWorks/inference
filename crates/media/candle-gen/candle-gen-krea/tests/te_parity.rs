@@ -49,6 +49,7 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn te_matches_reference() -> Result<()> {
     let w = Weights::from_file(Path::new(FIXTURE), &Device::Cpu, DType::F32)
         .unwrap_or_else(|e| panic!("load te fixture: {e}"));
@@ -72,6 +73,8 @@ fn te_matches_reference() -> Result<()> {
         max_abs_diff(&hiddens, &want) < 2e-2,
         "TE stacked context diverged beyond 2e-2 (cosine {c:.7})"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED te_parity::te_matches_reference");
     Ok(())
 }
 
@@ -83,6 +86,7 @@ fn te_matches_reference() -> Result<()> {
 /// finite, and — the key check — that changing the spliced vision embeds *changes* the output (the
 /// splice actually feeds through the decoder), which the weight-free helper tests can't show.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn grounded_forward_splices_vision_through() -> Result<()> {
     let w = Weights::from_file(Path::new(FIXTURE), &Device::Cpu, DType::F32)
         .unwrap_or_else(|e| panic!("load te fixture: {e}"));
@@ -135,6 +139,8 @@ fn grounded_forward_splices_vision_through() -> Result<()> {
         d > 1e-4,
         "changing the vision embeds must change the grounded context (Δ={d:e})"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED te_parity::grounded_forward_splices_vision_through");
     Ok(())
 }
 
@@ -147,6 +153,7 @@ fn grounded_forward_splices_vision_through() -> Result<()> {
 /// gate (cosine / max|Δ| on the context). CPU-runnable: the compute never leaves f32 (each bf16 weight
 /// is upcast per matmul), so there is no bf16 matmul.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn bf16_store_te_stays_within_parity() -> Result<()> {
     let cfg = tiny_te_config();
 
@@ -201,5 +208,7 @@ fn bf16_store_te_stays_within_parity() -> Result<()> {
             .dtype(),
         DType::BF16
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED te_parity::bf16_store_te_stays_within_parity");
     Ok(())
 }

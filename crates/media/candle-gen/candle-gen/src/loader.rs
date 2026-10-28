@@ -211,7 +211,16 @@ pub fn mmap_var_builder(
 ) -> Result<VarBuilder<'static>> {
     // SAFETY: see the function-level doc — mmap of read-only, process-owned weight files, live for
     // the process lifetime and not mutated behind the mapping. Standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(files, dtype, device)? })
+    __model_proof_inspect!(
+        Ok(unsafe { VarBuilder::from_mmaped_safetensors(files, dtype, device)? }),
+        |_| {
+            gen_core::model_input_proof::record_reader_paths(
+                "candle-gen::loader::mmap_var_builder",
+                gen_core::model_input_proof::InputRole::ModelWeights,
+                files,
+            );
+        }
+    )
 }
 
 #[cfg(test)]

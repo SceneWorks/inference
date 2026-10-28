@@ -291,6 +291,7 @@ fn the_two_sigma_grids_match_the_published_shifts() {
 /// **The swap and one-shift-for-both mutations, at loop level.** Each produces a materially
 /// different final latent, measured against the same control the generator recorded.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn swapped_or_shared_shifts_change_the_output() {
     let f = fixture();
     let want_video = f.batched("out.video_latents.1");
@@ -340,6 +341,9 @@ fn swapped_or_shared_shifts_change_the_output() {
         std_dev(&want_video) > 1e-4,
         "the golden must not be constant"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED joint_denoise::swapped_or_shared_shifts_change_the_output");
 }
 
 /// A double-applied shift is a different grid, and the generator measured how different.
@@ -467,6 +471,7 @@ fn row_timesteps_resolve_to_the_reference_values() {
 
 /// The AdaLN gather stays in bounds at every step, and addresses more than one table block.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_adaln_indices_stay_in_bounds() {
     let f = fixture();
     let l = layout();
@@ -494,6 +499,9 @@ fn the_adaln_indices_stay_in_bounds() {
     let b = model.seen_adaln[1].to_vec1::<u32>().unwrap();
     let row = l.generated_video_rows()[0] as usize;
     assert_ne!(a[row], b[row], "the video rows must re-address per step");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED joint_denoise::the_adaln_indices_stay_in_bounds");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -502,6 +510,7 @@ fn the_adaln_indices_stay_in_bounds() {
 
 /// **The parity claim.** Both modalities, after each of the two steps.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_joint_loop_matches_the_reference_at_two_steps() {
     let f = fixture();
     let l = layout();
@@ -552,6 +561,9 @@ fn the_joint_loop_matches_the_reference_at_two_steps() {
             joint.audio().timesteps()[step]
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED joint_denoise::the_joint_loop_matches_the_reference_at_two_steps");
 }
 
 /// **One forward per step, batch of one — the no-CFG pin.**
@@ -559,6 +571,7 @@ fn the_joint_loop_matches_the_reference_at_two_steps() {
 /// A reintroduced classifier-free-guidance path doubles either the call count (a second
 /// unconditional pass) or the batch axis (a `cat([uncond, cond])`). Both are failures here.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn one_forward_per_step_and_no_cfg() {
     let f = fixture();
     let l = layout();
@@ -593,11 +606,15 @@ fn one_forward_per_step_and_no_cfg() {
     for seen in model.seen_video.iter().chain(&model.seen_audio) {
         assert_eq!(seen.dims()[0], 1);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED joint_denoise::one_forward_per_step_and_no_cfg");
 }
 
 /// The `fl2va` keyframe anchors are **bit-identical** after the loop: the scheduler writes only the
 /// generated tail.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_conditioning_anchors_are_untouched() {
     let f = fixture();
     let l = layout();
@@ -619,12 +636,18 @@ fn the_conditioning_anchors_are_untouched() {
         &after[head..],
         "…and the target rows must have moved"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED joint_denoise::the_conditioning_anchors_are_untouched"
+    );
 }
 
 /// **Both modalities are emitted, and both really moved.** The acceptance criterion is "joint
 /// denoise emits both modalities", so a loop that returned the audio unchanged — or returned the
 /// video twice — must fail rather than pass on the video half alone.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_loop_emits_two_distinct_moved_modalities() {
     let f = fixture();
     let l = layout();
@@ -673,6 +696,9 @@ fn the_loop_emits_two_distinct_moved_modalities() {
         g.num_audio_latents,
         g.av_drift_seconds() * 1e3
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED joint_denoise::the_loop_emits_two_distinct_moved_modalities");
 }
 
 /// Cancellation returns the typed error and stops calling the model.
@@ -685,6 +711,7 @@ fn the_loop_emits_two_distinct_moved_modalities() {
 /// Claiming a measured cancellation window on a device this suite does not run on would be the
 /// overclaim; what is asserted is what can be shown.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cancel_stops_the_loop_at_a_step_boundary() {
     let f = fixture();
     let l = layout();
@@ -725,4 +752,7 @@ fn a_cancel_stops_the_loop_at_a_step_boundary() {
     .unwrap_err();
     assert!(matches!(err, CandleError::Canceled), "{err}");
     assert_eq!(m.calls, 2, "the model must not run after the cancel");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED joint_denoise::a_cancel_stops_the_loop_at_a_step_boundary");
 }

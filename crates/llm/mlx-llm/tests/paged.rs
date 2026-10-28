@@ -221,9 +221,14 @@ fn run_suite(fx: Fixture) {
 fn paged_cache_llama() {
     let Some(fx) = load_from("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in paged_cache_llama; see preceding skip diagnostic",
+        );
         return;
     };
     run_suite(fx);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED paged::paged_cache_llama");
 }
 
 #[test]
@@ -231,7 +236,12 @@ fn paged_cache_llama() {
 fn paged_cache_qwen3() {
     let Some(fx) = load_from("MLX_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set MLX_LLM_QWEN3_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in paged_cache_qwen3; see preceding skip diagnostic",
+        );
         return;
     };
     run_suite(fx);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED paged::paged_cache_qwen3");
 }

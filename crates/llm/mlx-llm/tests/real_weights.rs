@@ -68,6 +68,8 @@ fn streams_text_from_snapshot() {
         .unwrap();
     println!("\n=== generated ===\n{text}\n=================");
     assert!(!text.trim().is_empty());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::streams_text_from_snapshot");
 }
 
 #[test]
@@ -110,6 +112,8 @@ fn mid_stream_cancel_on_real_model() {
 
     assert_eq!(out.finish_reason, FinishReason::Cancelled);
     assert!(out.tokens.len() <= 6, "cancel should stop promptly");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::mid_stream_cancel_on_real_model");
 }
 
 #[test]

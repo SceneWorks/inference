@@ -18,8 +18,10 @@
 
 use crate::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
+use mlx_rs::Array;
 
 pub struct ZImageControlBlock {
     /// The base transformer block (attention + FFN + adaLN) — its `forward` is what
@@ -32,6 +34,28 @@ pub struct ZImageControlBlock {
 }
 
 impl ZImageControlBlock {
+    const BEFORE_PROJ_PATH: &'static str = "before_proj";
+    const AFTER_PROJ_PATH: &'static str = "after_proj";
+
+    /// The exact named Linear set visited by this block's quantizer, not every 2-D header in a
+    /// checkpoint. The base schema is shared with its native adapter/constructor targets; control
+    /// projection keys below are the SAME constants the constructor consumes. The patch embedder
+    /// and norm parameters are not members of this set.
+    pub(crate) fn quantization_header_targets(
+        prefix: &str,
+        has_before_proj: bool,
+    ) -> Vec<(String, bool)> {
+        let mut targets = crate::transformer_block::adapter_target_paths()
+            .into_iter()
+            .map(|path| (format!("{prefix}.{path}"), false))
+            .collect::<Vec<_>>();
+        targets.push((format!("{prefix}.{}", Self::AFTER_PROJ_PATH), false));
+        if has_before_proj {
+            targets.push((format!("{prefix}.{}", Self::BEFORE_PROJ_PATH), false));
+        }
+        targets
+    }
+
     /// Load a control block from the Fun-Controlnet-Union checkpoint under `prefix` (e.g.
     /// `"control_layers.0"`). The base-block keys (`attention.*`, `feed_forward.*`,
     /// `attention_norm{1,2}`, `ffn_norm{1,2}`, `adaLN_modulation.0`) map 1:1 onto
@@ -47,11 +71,12 @@ impl ZImageControlBlock {
         // Packed-detect (sc-8670): the control projections load packed from a pre-quantized control
         // snapshot or dense otherwise; both carry a bias. Their in-features (3840) are group-64
         // divisible, so they pack in a quantized tier.
-        let after_proj = crate::quant::lin(w, &format!("{prefix}.after_proj"), true)?;
+        let after_proj =
+            crate::quant::lin(w, &format!("{prefix}.{}", Self::AFTER_PROJ_PATH), true)?;
         let before_proj = if has_before_proj {
             Some(crate::quant::lin(
                 w,
-                &format!("{prefix}.before_proj"),
+                &format!("{prefix}.{}", Self::BEFORE_PROJ_PATH),
                 true,
             )?)
         } else {
@@ -75,6 +100,87 @@ impl ZImageControlBlock {
             bp.quantize(bits, None)?;
         }
         Ok(())
+    }
+
+    /// [`Self::quantize`] as one iOS quantum: the packed copies ([`Self::quantize_bytes`]) are checked
+    /// before they exist and materialized before return, so the resident dense source is released
+    /// block by block. Exactly `quantize` off device.
+    pub(crate) fn quantize_quantum(&mut self, bits: i32) -> Result<()> {
+        if !mlx_gen::ios_quantum::enabled() {
+            return self.quantize(bits);
+        }
+        mlx_gen::ios_quantum::before(crate::quantum::CONTROL_QUANTIZE, self.quantize_bytes(bits))?;
+        self.quantize(bits)?;
+        mlx_gen::ios_quantum::finish(crate::quantum::CONTROL_QUANTIZE, &self.weight_arrays())
+    }
+
+    /// The packed bytes [`Self::quantize`] builds from this block's dense projections (0 when packed).
+    pub(crate) fn quantize_bytes(&self, bits: i32) -> u64 {
+        self.projections()
+            .into_iter()
+            .map(|lin| crate::quantum::quantize_bytes(lin, bits))
+            .sum()
+    }
+
+    /// Every projection [`Self::quantize`] packs: the base block's, `after_proj` and (block 0)
+    /// `before_proj`.
+    pub(crate) fn projections(&self) -> Vec<&AdaptableLinear> {
+        self.base
+            .projections()
+            .into_iter()
+            .chain(std::iter::once(&self.after_proj))
+            .chain(self.before_proj.iter())
+            .collect()
+    }
+
+    /// The block's iOS quantum price over control state `c` (`[1, L, D]`): the base block's
+    /// ([`ZImageTransformerBlock::quantum_scratch`]) plus the `after_proj` hint and, on block 0, the
+    /// `before_proj` output and its sum with the base stream (`[1, L, D]` each, f32 — the control
+    /// branch runs f32), the projections' stream-width weight copies.
+    pub(crate) fn quantum_scratch(
+        &self,
+        c: &Array,
+        x_base: &Array,
+        freqs_cis: &Array,
+        plan: AttentionPlan<'_>,
+        backend: mlx_gen::ios_quantum::Backend,
+    ) -> u64 {
+        let width = if self.before_proj.is_some() {
+            c.item_size().max(x_base.item_size())
+        } else {
+            c.item_size()
+        }
+        .max(freqs_cis.item_size()) as u64;
+        let sh = c.shape();
+        let u = crate::quantum::u;
+        let hidden = crate::quantum::tb(width, &[u(sh[0]), u(sh[1]), u(sh[2])]);
+        let mut projections = vec![&self.after_proj];
+        projections.extend(self.before_proj.iter());
+        let units = 1 + 2 * u64::from(self.before_proj.is_some());
+        self.base
+            .quantum_scratch(c, freqs_cis, plan, backend)
+            .saturating_add(hidden.saturating_mul(units))
+            .saturating_add(crate::quantum::promoted_weight_bytes(&projections, width))
+            .saturating_add(mlx_gen::ios_quantum::page_slack(units))
+    }
+
+    /// Every weight array the block's projections hold (packed: weight, scales, biases, bias), for
+    /// the iOS load-time packing quantum to materialize.
+    pub(crate) fn weight_arrays(&self) -> Vec<&Array> {
+        self.projections()
+            .into_iter()
+            .flat_map(|lin| match lin.quantized_params() {
+                Some((w, scales, biases, bias, ..)) => {
+                    let mut v = vec![w, scales, biases];
+                    v.extend(bias);
+                    v
+                }
+                None => lin
+                    .dense_weight()
+                    .map(|(w, b)| std::iter::once(w).chain(b).collect())
+                    .unwrap_or_default(),
+            })
+            .collect()
     }
 
     /// The block-0 seed projection (`None` for every other block).

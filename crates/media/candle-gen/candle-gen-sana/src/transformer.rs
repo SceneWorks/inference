@@ -1277,6 +1277,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn trunk_forward_shape_finite_cpu() {
         // A random-weight forward through every trunk primitive (patch embed → ReLU linear self-attn →
         // cross-attn → GLUMBConv Mix-FFN → adaLN-single → output modnorm → unpatchify): finite, right
@@ -1306,9 +1307,15 @@ mod tests {
             hi - lo > 1e-5,
             "trunk output is constant — graph degenerate: [{lo}, {hi}]"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::trunk_forward_shape_finite_cpu"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn bounded_caption_cross_attention_preserves_the_full_row_domain() {
         let dev = Device::Cpu;
         let cfg = small_cfg();
@@ -1342,9 +1349,13 @@ mod tests {
             max_error < 1e-5,
             "query-row chunking changed caption attention by {max_error}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::bounded_caption_cross_attention_preserves_the_full_row_domain");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn caption_mask_excludes_padding_keys_for_full_and_chunked_attention() {
         let dev = Device::Cpu;
         let cfg = small_cfg();
@@ -1424,6 +1435,9 @@ mod tests {
             error.contains("caption mask shape"),
             "unexpected error: {error}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::caption_mask_excludes_padding_keys_for_full_and_chunked_attention");
     }
 
     #[test]
@@ -1527,6 +1541,7 @@ mod tests {
     /// negative half of the capability gate and runs on the CPU lane (no CUDA required); the positive
     /// half (`fp4_lit > 0` on real sm_120) is asserted by `tests/nvfp4_sana_dit_gpu.rs`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn nvfp4_plan_falls_back_cleanly_off_blackwell() {
         let dev = Device::Cpu;
         let cfg = nvfp4_eligible_cfg();
@@ -1601,11 +1616,15 @@ mod tests {
             hi - lo > 1e-5,
             "NVFP4-fallback trunk output constant: [{lo}, {hi}]"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::nvfp4_plan_falls_back_cleanly_off_blackwell");
     }
 
     /// The activation probe records one measurement per quantizable projection per forward, stamped
     /// with the step the caller set — the mechanism the sc-11045 residual gate reads on a real denoise.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn nvfp4_act_probe_records_every_projection_per_step() {
         use std::sync::Arc;
         let dev = Device::Cpu;
@@ -1640,6 +1659,9 @@ mod tests {
         let summary = crate::nvfp4_dit::summarize(&records);
         assert_eq!(summary.len(), per_step);
         assert!(summary.iter().all(|s| s.steps == 2));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::nvfp4_act_probe_records_every_projection_per_step");
     }
 
     /// **GPU full-trunk forward at SANA-1.6B config and latent resolution** (32×32 latent = 1024px).
@@ -1691,6 +1713,11 @@ mod tests {
         println!(
             "SANA-1.6B f32 32² trunk forward OK on physical GPU {}: range=[{lo:.4}, {hi:.4}]  VRAM: {report}",
             candle_gen::testkit::probe_gpu()
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::gpu_trunk_forward_sana1600m"
         );
     }
 }

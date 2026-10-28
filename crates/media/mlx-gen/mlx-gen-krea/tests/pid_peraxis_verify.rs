@@ -104,4 +104,8 @@ fn per_axis_clamp_fixes_both_orientations() {
     eprintln!("\n=== per-axis fix: tall bottom-top={tall:+.2}  wide bottom-top={wide:+.2} (both should be ~neutral) ===");
     assert!(tall.abs() < 5.0, "tall still cast: bottom-top={tall}");
     assert!(wide.abs() < 5.0, "wide cast: bottom-top={wide}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED pid_peraxis_verify::per_axis_clamp_fixes_both_orientations"
+    );
 }

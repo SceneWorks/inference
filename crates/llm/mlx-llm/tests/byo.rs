@@ -62,6 +62,8 @@ fn qwen3_dense_dispatch_and_stream() {
             .as_deref()
             .is_some_and(|t| !t.trim().is_empty());
     assert!(n > 0 && produced);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED byo::qwen3_dense_dispatch_and_stream");
 }
 
 #[test]
@@ -87,6 +89,8 @@ fn llama_quantize_on_load_q8() {
     let (qout, qn) = run(&q8, "The capital of France is", 16);
     println!("\n[llama Q8] {}\n", qout.text);
     assert!(qn > 0 && !qout.text.trim().is_empty());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED byo::llama_quantize_on_load_q8");
 }
 
 #[test]
@@ -107,4 +111,6 @@ fn llama_quantize_on_load_q4() {
     let (out, n) = run(&q4, "The capital of France is", 16);
     println!("\n[llama Q4] {}\n", out.text);
     assert!(n > 0 && !out.text.trim().is_empty());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED byo::llama_quantize_on_load_q4");
 }

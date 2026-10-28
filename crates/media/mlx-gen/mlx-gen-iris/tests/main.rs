@@ -16,6 +16,9 @@ mod common;
 #[path = "adapter_parity.rs"]
 mod adapter_parity;
 
+#[path = "bounded_attention.rs"]
+mod bounded_attention;
+
 #[path = "controls_contract.rs"]
 mod controls_contract;
 
@@ -63,6 +66,12 @@ mod lib_ops;
 
 #[path = "memory_contract.rs"]
 mod memory_contract;
+
+#[path = "quant_real_weights.rs"]
+mod quant_real_weights;
+
+#[path = "quant_tiers.rs"]
+mod quant_tiers;
 
 #[path = "real_weights.rs"]
 mod real_weights;

@@ -59,4 +59,6 @@ fn te_matches_transformers_reference() {
         c > 0.999,
         "TE parity cosine {c} too low — structural mismatch"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::te_matches_transformers_reference");
 }

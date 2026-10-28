@@ -126,7 +126,7 @@ impl ProsodyPredictor {
     /// `sigmoid(duration_proj(lstm(d))).sum(-1)`, before the speed divide / rounding.
     pub fn durations(&self, d: &Tensor) -> Result<Vec<f32>> {
         let x = self.lstm.forward(d)?; // [1, T, d_hid]
-        let logits = self.duration_proj.forward(&x)?; // [1, T, max_dur]
+        let logits = __model_proof_output!(self.duration_proj.forward(&x))?; // [1, T, max_dur]
         let probs = candle_nn::ops::sigmoid(&logits)?;
         let dur = probs.sum(2)?.i(0)?; // [T]
         Ok(dur.to_vec1()?)
@@ -142,12 +142,12 @@ impl ProsodyPredictor {
         for block in &self.f0_blocks {
             f0 = block.forward(&f0, s)?;
         }
-        let f0 = self.f0_proj.forward(&f0)?; // [1, 1, 2F]
+        let f0 = __model_proof_output!(self.f0_proj.forward(&f0))?; // [1, 1, 2F]
         let mut n = x;
         for block in &self.n_blocks {
             n = block.forward(&n, s)?;
         }
-        let n = self.n_proj.forward(&n)?; // [1, 1, 2F]
+        let n = __model_proof_output!(self.n_proj.forward(&n))?; // [1, 1, 2F]
         Ok((f0.flatten_all()?.to_vec1()?, n.flatten_all()?.to_vec1()?))
     }
 }

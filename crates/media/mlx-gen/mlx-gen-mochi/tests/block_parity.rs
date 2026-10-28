@@ -116,4 +116,6 @@ fn block0_forward_matches_golden() {
         txt_rel < 5e-2,
         "block_out.1 text valid-row peak_rel {txt_rel:.3e} too high"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_parity::block0_forward_matches_golden");
 }

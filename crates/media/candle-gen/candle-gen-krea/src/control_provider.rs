@@ -966,7 +966,15 @@ mod tests {
         let base_quant = crate::actual_quant_tier(&tier_spec, "krea_2_turbo_control")
             .expect("resolve measured Krea control base tier");
 
-        let pose = image::open(pose_path).expect("decode pose PNG").to_rgb8();
+        let pose = candle_gen::gen_core::__model_input_reader!(
+image::open(pose_path),
+"crates/media/candle-gen/candle-gen-krea/src/control_provider.rs::control_probed_generate_for_offload_ab::image::open@43740",
+Reference,
+pose_path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).expect("decode pose PNG").to_rgb8();
         let pose = image::imageops::resize(&pose, res, res, image::imageops::FilterType::Lanczos3);
         let pose = Image {
             width: res,
@@ -1109,5 +1117,8 @@ mod tests {
             paths.convrot_dit.is_some(),
             image.pixels.len(),
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control_provider::tests::control_probed_generate_for_offload_ab");
     }
 }

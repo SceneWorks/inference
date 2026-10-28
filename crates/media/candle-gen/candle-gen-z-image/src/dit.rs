@@ -618,7 +618,7 @@ impl ZImageTransformer2DModel {
         let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
         let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
         let cap_normed = self.cap_embedder_norm.forward_diff(cap_feats)?;
-        let mut cap = cap_normed.apply(&self.cap_embedder_linear)?;
+        let mut cap = __model_proof_output!(cap_normed.apply(&self.cap_embedder_linear))?;
         for layer in &self.context_refiner {
             cap = layer.forward(&cap, Some(&cap_attn_mask), &cap_cos, &cap_sin, None)?;
         }
@@ -657,9 +657,9 @@ impl ZImageTransformer2DModel {
             )
         }
         let t_scaled = (t * self.cfg.t_scale)?;
-        let adaln_input = self.t_embedder.forward(&t_scaled)?;
+        let adaln_input = __model_proof_output!(self.t_embedder.forward(&t_scaled))?;
         let (x_patches, _) = patchify(x, self.cfg.all_patch_size[0], self.cfg.all_f_patch_size[0])?;
-        let mut x = x_patches.apply(&self.x_embedder)?;
+        let mut x = __model_proof_output!(x_patches.apply(&self.x_embedder))?;
         for layer in &self.noise_refiner {
             x = layer.forward(
                 &x,
@@ -680,7 +680,7 @@ impl ZImageTransformer2DModel {
             )?;
         }
         let x_out = unified.narrow(1, 0, prepared.img_seq_len)?;
-        let x_out = self.final_layer.forward(&x_out, &adaln_input)?;
+        let x_out = __model_proof_output!(self.final_layer.forward(&x_out, &adaln_input))?;
         unpatchify(
             &x_out,
             prepared.orig_size,
@@ -750,11 +750,11 @@ impl ZImageTransformer2DModel {
 
         // 1. Timestep embedding
         let t_scaled = (t * self.cfg.t_scale)?;
-        let adaln_input = self.t_embedder.forward(&t_scaled)?;
+        let adaln_input = __model_proof_output!(self.t_embedder.forward(&t_scaled))?;
 
         // 2. Patchify + embed image
         let (x_patches, orig_size) = patchify(x, patch_size, f_patch_size)?;
-        let mut x = x_patches.apply(&self.x_embedder)?;
+        let mut x = __model_proof_output!(x_patches.apply(&self.x_embedder))?;
         let img_seq_len = x.dim(1)?;
 
         // 3. Image position IDs (offset past the text block)
@@ -768,7 +768,7 @@ impl ZImageTransformer2DModel {
 
         // 4. Caption embedding (composable norm — see the module header on fused RMSNorm).
         let cap_normed = self.cap_embedder_norm.forward_diff(cap_feats)?;
-        let mut cap = cap_normed.apply(&self.cap_embedder_linear)?;
+        let mut cap = __model_proof_output!(cap_normed.apply(&self.cap_embedder_linear))?;
 
         // 5. Caption position IDs
         let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
@@ -839,7 +839,7 @@ impl ZImageTransformer2DModel {
     /// [`forward_pre_main`](Self::forward_pre_main).
     pub fn velocity_out(&self, unified_final: &Tensor, ctx: &MainContext) -> Result<Tensor> {
         let x_out = unified_final.narrow(1, 0, ctx.img_seq_len)?;
-        let x_out = self.final_layer.forward(&x_out, &ctx.adaln_input)?;
+        let x_out = __model_proof_output!(self.final_layer.forward(&x_out, &ctx.adaln_input))?;
         unpatchify(
             &x_out,
             ctx.orig_size,
@@ -929,6 +929,7 @@ mod parity_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_dit_matches_stock_forward() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -946,22 +947,20 @@ mod parity_tests {
         let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
         let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
 
-        let y_v = vendored
-            .forward(
-                &prepared.latents,
-                &t,
-                &prepared.cap_feats,
-                &prepared.cap_mask,
-            )
-            .unwrap();
-        let y_s = stock
-            .forward(
-                &prepared.latents,
-                &t,
-                &prepared.cap_feats,
-                &prepared.cap_mask,
-            )
-            .unwrap();
+        let y_v = __model_proof_output!(vendored.forward(
+            &prepared.latents,
+            &t,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+        ))
+        .unwrap();
+        let y_s = __model_proof_output!(stock.forward(
+            &prepared.latents,
+            &t,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+        ))
+        .unwrap();
 
         assert_eq!(y_v.dims(), y_s.dims());
         let diff = (y_v - y_s)
@@ -973,9 +972,13 @@ mod parity_tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(diff < 1e-5, "vendored DiT diverged from stock by {diff}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::parity_tests::vendored_dit_matches_stock_forward");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_dense_conditioning_is_reused_by_actual_forwards_and_rejects_stale_keys() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1014,6 +1017,9 @@ mod parity_tests {
         assert!(model
             .forward_prepared(&inputs.latents, &t, &prepared)
             .is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::parity_tests::prepared_dense_conditioning_is_reused_by_actual_forwards_and_rejects_stale_keys");
     }
 
     /// The [`LoraHost`] walk reaches exactly `4 × (n_refiner·2 + n_layers)` projections — the four

@@ -115,42 +115,57 @@ impl Components {
 
     fn render_pair_impl(&self, prompt: &str, seed: u64, direct_preview_api: bool) -> Pair {
         let tokens = self.tokenizer.tokenize_batch(prompt, Some("")).unwrap();
-        let (conditioning, pooled) = encode_conditioning(&self.te1, &self.te2, &tokens).unwrap();
+        let (conditioning, pooled) = (
+            crate::common::record_model_inference_device(),
+            encode_conditioning(&self.te1, &self.te2, &tokens),
+        )
+            .1
+            .unwrap();
         let time_ids = text_time_ids(2);
         let sampler =
             AncestralEuler::new(&self.base_sampler, STEPS, self.base_sampler.max_time()).unwrap();
         let init = seeded_prior(&self.base_sampler, seed, WIDTH, HEIGHT).unwrap();
         let denoiser = Denoiser::new(&self.unet, &sampler);
         let latents = if direct_preview_api {
-            denoise_with_preview(
-                &denoiser,
-                init,
-                &conditioning,
-                &pooled,
-                &time_ids,
-                GUIDANCE,
-                &CancelFlag::default(),
-                &mut |_| {},
-                &PreviewSink::default(),
+            (
+                crate::common::record_model_inference_device(),
+                denoise_with_preview(
+                    &denoiser,
+                    init,
+                    &conditioning,
+                    &pooled,
+                    &time_ids,
+                    GUIDANCE,
+                    &CancelFlag::default(),
+                    &mut |_| {},
+                    &PreviewSink::default(),
+                ),
             )
+                .1
         } else {
-            denoise(
-                &denoiser,
-                init,
-                &conditioning,
-                &pooled,
-                &time_ids,
-                GUIDANCE,
-                &CancelFlag::default(),
-                &mut |_| {},
+            (
+                crate::common::record_model_inference_device(),
+                denoise(
+                    &denoiser,
+                    init,
+                    &conditioning,
+                    &pooled,
+                    &time_ids,
+                    GUIDANCE,
+                    &CancelFlag::default(),
+                    &mut |_| {},
+                ),
             )
+                .1
         }
         .unwrap()
         .as_dtype(Dtype::Float32)
         .unwrap();
-        let decoded_tensor = self
-            .vae
-            .decode(&latents)
+        let decoded_tensor = (
+            crate::common::record_model_inference_device(),
+            self.vae.decode(&latents),
+        )
+            .1
             .unwrap()
             .as_dtype(Dtype::Float32)
             .unwrap();
@@ -300,7 +315,8 @@ fn save_pair_artifacts(dir: &Path, split: &str, index: usize, pair: &Pair, coef:
 }
 
 #[test]
-#[ignore = "needs real SDXL weights and a Metal-capable macOS host"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs real SDXL weights and a Metal-capable macOS host"]
 fn fit_preview_rgb() {
     let components = Components::load(&snapshot());
     let mut fit_pairs = Vec::new();
@@ -395,4 +411,6 @@ fn fit_preview_rgb() {
         }
         std::fs::write(dir.join("fit_report.txt"), report).unwrap();
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED fit_preview_rgb::fit_preview_rgb");
 }

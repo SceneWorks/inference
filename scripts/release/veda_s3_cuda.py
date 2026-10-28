@@ -147,7 +147,7 @@ def main() -> int:
         binary = compiled_binary(out, Path(os.environ["CARGO_TARGET_DIR"]))
         receipt["binary_path"] = str(binary)
         receipt["binary_sha256"] = hash_file(binary)
-        argv = [str(binary), TEST, "--exact", "--nocapture"]
+        argv = [str(binary), TEST, "--exact", "--ignored", "--nocapture"]
         for phase, absent in (("absent_device", True), ("actual_device", False)):
             guard.verify_idle(device, out, phase, baseline)
             os.environ["CUDA_VISIBLE_DEVICES"] = "-1" if absent else device["uuid"]

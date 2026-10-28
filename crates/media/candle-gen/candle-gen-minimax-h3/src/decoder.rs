@@ -173,7 +173,7 @@ impl ViT3dDecoder {
         let num_patches = t * h * w;
 
         let tokens = pack_tokens(&latent)?;
-        let hidden = linear(&tokens, &self.proj_in_w, &self.proj_in_b)?;
+        let hidden = __model_proof_output!(linear(&tokens, &self.proj_in_w, &self.proj_in_b))?;
 
         // registers, then a ZERO cls token (`torch.zeros_like`, not a learned parameter).
         let registers = self
@@ -198,13 +198,13 @@ impl ViT3dDecoder {
             hidden = block.forward(&hidden, &self.rope, &tables)?;
         }
 
-        let hidden = layer_norm(
+        let hidden = __model_proof_output!(layer_norm(
             &hidden,
             &self.norm_out_w,
             &self.norm_out_b,
             self.cfg.norm_eps,
-        )?;
-        let out = linear(&hidden, &self.proj_out_w, &self.proj_out_b)?;
+        ))?;
+        let out = __model_proof_output!(linear(&hidden, &self.proj_out_w, &self.proj_out_b))?;
         // Suffix rows are projected and then discarded, matching upstream.
         let out = out.narrow(1, 0, num_patches)?.contiguous()?;
 

@@ -26,16 +26,40 @@ fn fresh_and_warm_text_and_grounded_contexts_match() {
     let root = std::path::PathBuf::from(std::env::var("MINIMAX_H3_SNAPSHOT").unwrap());
     let component = std::path::PathBuf::from(std::env::var("MINIMAX_H3_TE").unwrap());
     let prompt = std::env::var("MINIMAX_H3_PROMPT_FILE")
-        .map(|p| std::fs::read_to_string(p).unwrap())
+        .map(|p| mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(p),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/te_load_integrity.rs::fresh_and_warm_text_and_grounded_contexts_match::std::fs::read_to_string@1357",
+Reference,
+p,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap())
         .unwrap_or_else(|_| "A heron turns its head beside a quiet lake.".into());
     let tok = MiniMaxH3Tokenizer::from_snapshot(&root).unwrap();
     let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
     let component_config: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(component.join("config.json")).unwrap()).unwrap();
+        serde_json::from_slice(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(component.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/te_load_integrity.rs::fresh_and_warm_text_and_grounded_contexts_match::std::fs::read@1669",
+Configuration,
+component.join("config.json"),
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap()).unwrap();
     let tier_bits = component_config["quantization"]["bits"]
         .as_i64()
         .map(|n| n as i32);
-    let im = image::open(std::env::var("MINIMAX_H3_IMAGE").unwrap())
+    let im = mlx_gen::gen_core::__model_input_reader!(
+image::open(std::env::var("MINIMAX_H3_IMAGE").unwrap()),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/te_load_integrity.rs::fresh_and_warm_text_and_grounded_contexts_match::image::open@1854",
+Reference,
+std::env::var("MINIMAX_H3_IMAGE").unwrap(),
+|__model_input_path| image::open(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .unwrap()
         .to_rgb8();
     let im = mlx_gen::media::Image {
@@ -114,4 +138,6 @@ fn fresh_and_warm_text_and_grounded_contexts_match() {
         drop((first, second, encoder));
         mlx_gen::residency::drain_allocator_cache();
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_load_integrity::fresh_and_warm_text_and_grounded_contexts_match");
 }

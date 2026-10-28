@@ -208,6 +208,7 @@ mod tests {
     /// the original dense Linear (Q4 cosine parity). Proves the producer ↔ consumer round-trip that lets
     /// candle host its own tiers.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_component_loads_through_the_seam() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128, 256);
@@ -246,7 +247,9 @@ mod tests {
         let dense_lin = Linear::new(w, None);
         let x = dense(4, in_dim, 11.0);
         let a = loaded.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
-        let b = dense_lin.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
+        let b = __model_proof_output!(dense_lin.forward(&x))?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
         for (x, y) in a.iter().zip(&b) {
             dot += *x as f64 * *y as f64;
@@ -259,6 +262,8 @@ mod tests {
             "packed-load forward cosine {cos:.6} vs dense too low"
         );
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED candle_tier_build::tests::packed_component_loads_through_the_seam");
         Ok(())
     }
 

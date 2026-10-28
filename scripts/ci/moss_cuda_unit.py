@@ -31,7 +31,7 @@ COMPILE_ARGV = [
     "cargo", "test", "--locked", "--lib", "-p", PACKAGE, "--features", "cuda",
     "--no-run", "--message-format=json",
 ]
-RUN_ARGS = [TEST_NAME, "--exact", "--nocapture", "--color", "never", "--test-threads=1"]
+RUN_ARGS = [TEST_NAME, "--exact", "--ignored", "--nocapture", "--color", "never", "--test-threads=1"]
 DEADLINE_SECONDS = 300.0
 RSS_CAP_BYTES = 6 * 1024**3
 POLL_SECONDS = 0.25
@@ -315,7 +315,7 @@ def derive_unit_budget(resource: dict, fixture: dict, dmd: dict) -> dict:
         raise UnitFailure("invalid source fixture/resource accounting") from error
 
 
-def require_gpu0_budget(query=None, budget: dict | None = None) -> dict:
+def require_gpu1_budget(query=None, budget: dict | None = None) -> dict:
     """WDDM desktop rows are NOT exclusion evidence. This is a fallible resource check, not a lease."""
     query = smi_query if query is None else query
     budget = derive_unit_budget(*read_unit_resources()) if budget is None else budget
@@ -326,15 +326,15 @@ def require_gpu0_budget(query=None, budget: dict | None = None) -> dict:
         uuids = [canonical_gpu_uuid(row[1].strip()) for row in rows]
         if len(set(uuids)) != len(rows) or len({int(row[0]) for row in rows}) != len(rows):
             raise UnitFailure("ambiguous GPU resource inventory")
-        selected = [(row, uuid) for row, uuid in zip(rows, uuids) if int(row[0]) == 0]
-        if len(selected) != 1: raise UnitFailure("GPU 0 is not present exactly once")
+        selected = [(row, uuid) for row, uuid in zip(rows, uuids) if int(row[0]) == 1]
+        if len(selected) != 1: raise UnitFailure("GPU 1 is not present exactly once")
         row, uuid = selected[0]
         free, total = Decimal(row[2].strip()), Decimal(row[3].strip())
         if not free.is_finite() or not total.is_finite() or free < 0 or total <= 0 or free > total:
-            raise UnitFailure("unknown or invalid GPU 0 free/total VRAM")
+            raise UnitFailure("unknown or invalid GPU 1 free/total VRAM")
         free_bytes = int(free * MIB)  # Round fractional bytes DOWN; never inflate reported free VRAM.
         if free_bytes < budget["required_bytes"]:
-            raise UnitFailure(f"GPU 0 has {free_bytes} free bytes, below unit requirement {budget['required_bytes']}")
+            raise UnitFailure(f"GPU 1 has {free_bytes} free bytes, below unit requirement {budget['required_bytes']}")
         return {"uuid": uuid, "free_bytes": free_bytes, "budget": budget}
     except UnitFailure:
         raise
@@ -389,11 +389,12 @@ def run_command(source: Path) -> None:
     if not exe.is_file():
         raise UnitFailure(f"recorded test executable {exe} is missing")
     print(f"moss-cuda-unit: device {provenance()}")
-    admission = require_gpu0_budget()
-    print(f"moss-cuda-unit: GPU0 uuid={admission['uuid']} free_bytes={admission['free_bytes']} required_bytes={admission['budget']['required_bytes']}; resource check, not idle/exclusive")
+    admission = require_gpu1_budget()
+    print(f"moss-cuda-unit: GPU1 uuid={admission['uuid']} free_bytes={admission['free_bytes']} required_bytes={admission['budget']['required_bytes']}; resource check, not idle/exclusive")
     environment = dict(os.environ)
     environment["CUDA_VISIBLE_DEVICES"] = admission["uuid"]
     environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    environment["SCENEWORKS_GPU_ID"] = "1"
     environment[EXPECTED_UUID_ENV] = admission["uuid"]
     owner = WindowsOwner()
     with tempfile.TemporaryDirectory() as scratch:

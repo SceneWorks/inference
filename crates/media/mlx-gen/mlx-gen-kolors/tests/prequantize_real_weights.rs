@@ -80,6 +80,7 @@ fn build_tier_only() {
 fn prequantize_turnkey_loads_packed_and_renders() {
     let Some(src) = common::snapshot_opt() else {
         eprintln!("skip: no Kolors snapshot (set KOLORS_SNAPSHOT or populate the HF cache)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in prequantize_turnkey_loads_packed_and_renders; see preceding skip diagnostic");
         return;
     };
     let bits: i32 = std::env::var("KOLORS_BITS")
@@ -143,4 +144,6 @@ fn prequantize_turnkey_loads_packed_and_renders() {
         let _ = std::fs::remove_dir_all(&out);
         println!("  removed {} (set KOLORS_KEEP to retain)", out.display());
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prequantize_real_weights::prequantize_turnkey_loads_packed_and_renders");
 }

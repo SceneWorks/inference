@@ -39,8 +39,13 @@ pub fn load_t5(root: &Path, device: &Device) -> Result<T5EncoderModel> {
     let dir = root.join("text_encoder");
     let cfg_str = std::fs::read_to_string(dir.join("config.json"))
         .map_err(|e| CandleError::Msg(format!("chroma: read text_encoder/config.json: {e}")))?;
-    let cfg: T5Config = serde_json::from_str(&cfg_str)
-        .map_err(|e| CandleError::Msg(format!("chroma: parse T5 config.json: {e}")))?;
+    let cfg: T5Config = candle_gen::gen_core::__model_input_result!(
+        serde_json::from_str(&cfg_str)
+            .map_err(|e| CandleError::Msg(format!("chroma: parse T5 config.json: {e}"))),
+        "candle-gen-chroma::text::load_t5/configuration",
+        Configuration,
+        &[dir.join("config.json")]
+    )?;
     let files = safetensors_in(&dir)?;
     // The T5 runs at the checkpoint's native BF16 width. Its sequence embedding is promoted at the
     // existing `context_embedder` call site, where the F32 Chroma DiT actually requires it.
@@ -66,7 +71,7 @@ pub fn encode_prompt(
         return Err(CandleError::Msg("chroma: empty T5 tokenization".into()));
     }
     let input = Tensor::new(ids.as_slice(), device)?.unsqueeze(0)?; // [1, L]
-    Ok(t5.forward(&input)?)
+    Ok(__model_proof_output!(t5.forward(&input))?)
 }
 
 /// Sorted list of every `.safetensors` in `dir` (sharded T5 checkpoints ship as

@@ -124,4 +124,6 @@ fn prequantize_loads_and_generates() {
         .save(&out_path)
         .unwrap();
     println!("wrote {}", out_path.display());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prequantize::prequantize_loads_and_generates");
 }

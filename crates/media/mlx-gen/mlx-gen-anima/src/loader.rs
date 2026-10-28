@@ -27,10 +27,38 @@ use crate::vae::{load_vae, QwenVae};
 /// hardcode it.
 const ADAPTER_MARKER: &str = "llm_adapter.";
 /// A key that unambiguously fixes the DiT root prefix (present in every Anima DiT file).
-const PREFIX_ANCHOR: &str = ".x_embedder.proj.1.weight";
+pub(crate) const PREFIX_ANCHOR: &str = ".x_embedder.proj.1.weight";
 
-const TEXT_ENCODER_FILE: &str = "text_encoders/qwen_3_06b_base.safetensors";
-const VAE_FILE: &str = "vae/qwen_image_vae.safetensors";
+pub(crate) const TEXT_ENCODER_FILE: &str = "text_encoders/qwen_3_06b_base.safetensors";
+pub(crate) const VAE_FILE: &str = "vae/qwen_image_vae.safetensors";
+
+/// iOS pre-load quantum labels (see [`mlx_gen::ios_quantum::before_load`]).
+pub(crate) const TEXT_LOAD_QUANTUM: &str = "Anima text load";
+pub(crate) const HEAVY_LOAD_QUANTUM: &str = "Anima heavy load";
+pub(crate) const VAE_LOAD_QUANTUM: &str = "Anima VAE load";
+pub(crate) const CONDITIONING_LOAD_QUANTUM: &str = "Anima conditioning load";
+
+/// The model configs the loaders build: the shipped Anima configs. A CPU proof fixture
+/// (`quantum_tests`) substitutes tiny ones so it can drive the production load + generate path on
+/// tiny weights; nothing outside the crate's tests can.
+pub(crate) fn model_configs() -> (DitConfig, ConditionerConfig, Qwen3Config) {
+    #[cfg(test)]
+    if let Some(configs) = FIXTURE_CONFIGS.with(std::cell::Cell::get) {
+        return configs;
+    }
+    (
+        DitConfig::anima(),
+        ConditionerConfig::anima(),
+        Qwen3Config::anima(),
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`model_configs`] (see there).
+    pub(crate) static FIXTURE_CONFIGS: std::cell::Cell<Option<(DitConfig, ConditionerConfig, Qwen3Config)>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Detect the DiT root prefix (`net` or `model.diffusion_model`) from the checkpoint keys.
 fn detect_dit_prefix(w: &Weights) -> Result<String> {
@@ -63,7 +91,7 @@ pub fn split_anima_keys(w: &Weights) -> (Vec<String>, Vec<String>) {
 ///
 /// - `Dir(p)`: `p` itself if it already contains `diffusion_models/`, else `p/split_files`.
 /// - `File(dit)`: the DiT's grandparent (`.../split_files/diffusion_models/x.safetensors` → `split_files`).
-fn resolve_split_files(source: &WeightsSource) -> Result<PathBuf> {
+pub(crate) fn resolve_split_files(source: &WeightsSource) -> Result<PathBuf> {
     match source {
         WeightsSource::Dir(p) => {
             if p.join("diffusion_models").is_dir() {
@@ -154,8 +182,10 @@ pub fn load_text_phase(
     _variant: Variant,
 ) -> Result<(AnimaQwen3, AnimaTokenizers)> {
     let root = resolve_split_files(source)?;
+    // iOS: header-only pre-load floor, checked BEFORE the tower is constructed (no-op elsewhere).
+    mlx_gen::ios_quantum::before_load(TEXT_LOAD_QUANTUM, &[root.join(TEXT_ENCODER_FILE)])?;
     let te_weights = Weights::from_file(root.join(TEXT_ENCODER_FILE))?;
-    let text_encoder = AnimaQwen3::from_weights(&te_weights, "model", &Qwen3Config::anima())?;
+    let text_encoder = AnimaQwen3::from_weights(&te_weights, "model", &model_configs().2)?;
     // Materialize at load (sc-24245; see `load_heavy_phase_with_stream`).
     te_weights.materialize_accessed()?;
     let tokenizers = AnimaTokenizers::load()?;
@@ -203,11 +233,35 @@ pub fn load_heavy_phase_with_stream(
         )));
     }
 
+    // iOS: header-only pre-load floor over the DiT + bundled conditioner file, checked BEFORE either
+    // is constructed (no-op elsewhere). A streamable (rung-4) load reads only the non-block DiT
+    // tensors and the conditioner here; the `{prefix}.blocks.*` bodies stay lazy handles and are read
+    // per window inside each block's own priced quantum, so they are not resident at load and are
+    // not priced here. The VAE file is checked separately, right before it is read: its loader casts
+    // every tensor to f32 (`load_vae`), so it is priced at stored + cast bytes.
+    if streamable && mlx_gen::ios_quantum::enabled() {
+        let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&dit_path)
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        let prefix = headers
+            .iter()
+            .find_map(|h| h.name.strip_suffix(PREFIX_ANCHOR))
+            .ok_or_else(|| Error::Msg("anima: DiT root prefix not found in headers".into()))?;
+        let blocks = format!("{prefix}.blocks.");
+        mlx_gen::ios_quantum::before_load_where(
+            HEAVY_LOAD_QUANTUM,
+            std::slice::from_ref(&dit_path),
+            |name| !name.starts_with(&blocks),
+        )?;
+    } else {
+        mlx_gen::ios_quantum::before_load(HEAVY_LOAD_QUANTUM, std::slice::from_ref(&dit_path))?;
+    }
+
     // The DiT file carries both the Cosmos DiT and the bundled conditioner. The root prefix is
     // `net` (base) or `model.diffusion_model` (turbo/aesthetic) — detect it.
     let dit_weights = Weights::from_file(&dit_path)?;
     let prefix = detect_dit_prefix(&dit_weights)?;
-    let dit = CosmosDiT::from_weights(&dit_weights, &prefix, DitConfig::anima())?;
+    let (dit_config, conditioner_config, _) = model_configs();
+    let dit = CosmosDiT::from_weights(&dit_weights, &prefix, dit_config)?;
     let dit = if streamable {
         dit.with_block_stream(WeightsSource::File(dit_path), &prefix)
     } else {
@@ -216,7 +270,7 @@ pub fn load_heavy_phase_with_stream(
     let conditioner = AnimaTextConditioner::from_weights(
         &dit_weights,
         &format!("{prefix}.llm_adapter"),
-        ConditionerConfig::anima(),
+        conditioner_config,
     )?;
     // Materialize at load (sc-24245): MLX runs a safetensors `Load` on its CPU stream; left lazy, the
     // first forward's Metal command buffers wait on the disk read — past the GPU watchdog on a cold
@@ -238,8 +292,21 @@ pub fn load_heavy_phase_with_stream(
         dit_weights.materialize_accessed()?;
     }
 
+    check_vae_load(&root)?;
     let vae = load_vae(root.join(VAE_FILE))?;
     Ok((dit, conditioner, vae))
+}
+
+/// iOS: the VAE's pre-load floor, checked right before it is read — after the DiT + conditioner
+/// are materialized, so the live headroom already carries them. [`load_vae`] casts every tensor
+/// to f32, so it is priced at its stored bytes, their f32 cast copies and the largest cast tensor
+/// (header-only; a no-op off device).
+pub(crate) fn check_vae_load(root: &Path) -> Result<()> {
+    mlx_gen::ios_quantum::before_load_cast(
+        VAE_LOAD_QUANTUM,
+        &[root.join(VAE_FILE)],
+        mlx_gen::ios_quantum::dtype_bytes(crate::vae::VAE_DTYPE),
+    )
 }
 
 /// Build a `Weights` holding an fp-cast copy of ONLY the keys containing `marker` (avoids
@@ -281,6 +348,11 @@ pub fn load_conditioning_at_dtype(
             dit_path.display()
         )));
     }
+    // iOS: header-only pre-load floor before either module is constructed (no-op elsewhere).
+    mlx_gen::ios_quantum::before_load(
+        CONDITIONING_LOAD_QUANTUM,
+        &[dit_path.clone(), root.join(TEXT_ENCODER_FILE)],
+    )?;
     let dit_weights = Weights::from_file(&dit_path)?;
     let prefix = detect_dit_prefix(&dit_weights)?;
     let cond_weights = cast_subset(&dit_weights, ADAPTER_MARKER, dtype)?;

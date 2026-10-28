@@ -122,9 +122,9 @@ impl Trms2d {
         let var = xf.sqr()?.mean_keepdim(1)?; // mean over channel axis
         let denom = (var + self.eps)?.sqrt()?;
         let normed = xf.broadcast_div(&denom)?;
-        normed
-            .broadcast_mul(&self.weight)?
-            .broadcast_add(&self.bias)
+        __model_proof_output!(
+            __model_proof_output!(normed.broadcast_mul(&self.weight))?.broadcast_add(&self.bias)
+        )
     }
 }
 
@@ -943,6 +943,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn trms2d_matches_manual() {
         // Build a Trms2d with weight=1, bias=0 and compare to a hand-computed channel-RMS-norm.
         let dev = Device::Cpu;
@@ -970,6 +971,9 @@ mod tests {
                 v / denom
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::tests::trms2d_matches_manual");
     }
 
     #[test]
@@ -1029,6 +1033,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decoder_smoke_tiny_cpu() {
         // A random-weight forward through every primitive on the tiny config: finite, right shape,
         // non-degenerate (not a constant field). This is the CPU analogue of the GPU 1024² smoke.
@@ -1049,9 +1054,13 @@ mod tests {
             hi - lo > 1e-4,
             "decode output is constant — graph degenerate: [{lo}, {hi}]"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::tests::decoder_smoke_tiny_cpu");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn encode_decode_roundtrip_shape_tiny_cpu() {
         // Round-trip geometry: encode an image to the latent grid, decode back to the image grid.
         // Proves the encoder/decoder down/up-sampling are exact geometric inverses and the shared
@@ -1076,6 +1085,11 @@ mod tests {
                 .iter()
                 .all(|v| v.is_finite()),
             "non-finite round-trip reconstruction"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::tests::encode_decode_roundtrip_shape_tiny_cpu"
         );
     }
 
@@ -1133,6 +1147,9 @@ mod tests {
             "DC-AE f32 1024² single-pass decode OK on physical GPU {}: range=[{lo:.4}, {hi:.4}]  VRAM: {report}",
             candle_gen::testkit::probe_gpu()
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::tests::gpu_decode_1024_memory_profile");
     }
 
     /// PSNR (dB) of `b` against reference `a`, peak = `a`'s dynamic range. The codebase's seam metric:
@@ -1173,6 +1190,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiled_tail_matches_single_pass_cpu() {
         // The sc-11804 seam gate on CPU: the tiled tail must reproduce the single-pass tail **seam-free**.
         // Decode a latent through the shared (whole) head, then compare the whole-tail decode against the
@@ -1215,6 +1233,11 @@ mod tests {
             psnr >= 40.0,
             "tiled tail must be seam-free vs single-pass; PSNR={psnr:.2} dB (< 40)"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::tests::tiled_tail_matches_single_pass_cpu"
+        );
     }
 
     /// sc-19753 — the **mechanism** proof that the DC-AE head/tail boundary is drawn in the only
@@ -1249,6 +1272,7 @@ mod tests {
     ///    `num.broadcast_div(&(den + eps)?)` → `Ok(v.clone())`: the head interior residual becomes
     ///    **0.00e0** and the "no safe interior" guard fires.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decoder_tail_is_crop_decomposable_but_the_head_is_not() {
         let dev = Device::Cpu;
         let cfg = DcAeConfig::tiny_test();
@@ -1312,6 +1336,9 @@ mod tests {
             "column 0 is the farthest from the crop boundary; contamination there is what proves the \
              divergence is the global reduction and not a padding artifact; max|Δ|={head_edge_column:.3e}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::tests::decoder_tail_is_crop_decomposable_but_the_head_is_not");
     }
 
     /// sc-19753 — the **executed defect control**: tiling the *whole* decoder is observably worse than
@@ -1357,6 +1384,7 @@ mod tests {
     /// exactly 1.0 under full coverage, so that division normalizes nothing at these dims and is not
     /// a guard this test can hold.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn head_tail_split_is_load_bearing_vs_whole_decoder_tiling() {
         let dev = Device::Cpu;
         let cfg = DcAeConfig::tiny_test();
@@ -1417,6 +1445,9 @@ mod tests {
             "the head/tail split must buy a large margin over whole-decoder tiling; \
              shipped={shipped_psnr:.2} dB defect={defect_psnr:.2} dB"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::tests::head_tail_split_is_load_bearing_vs_whole_decoder_tiling");
     }
 
     /// sc-19753 — the operator-level companion to the two decoder proofs above: the tail's only
@@ -1435,6 +1466,7 @@ mod tests {
     ///  - `relu_linear_attention`'s final `num.broadcast_div(&(den + eps)?)` → `Ok(v.clone())`
     ///    (a purely position-local op): the residual becomes **0.00e0** and the `> 1e-2` guard fires.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tail_norm_is_crop_invariant_while_head_attention_is_not() {
         let dev = Device::Cpu;
         let cfg = DcAeConfig::tiny_test();
@@ -1470,6 +1502,9 @@ mod tests {
             "the head's token-axis reduction must NOT commute with a crop — that is why it may never \
              be tiled; max|Δ|={attn_residual:.3e}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::tests::tail_norm_is_crop_invariant_while_head_attention_is_not");
     }
 
     /// Deterministic **signed**, position-dependent values for the three sc-19753 proofs above.
@@ -1512,6 +1547,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decode_fit_gate_selects_by_budget() {
         // The VRAM-fit gate wires through: with a tiny `SANA_VAE_BUDGET_GIB` the estimated peak exceeds
         // budget ⇒ the tiled tail runs, and it must still equal the single-pass `decode` (seam-free). A
@@ -1562,6 +1598,11 @@ mod tests {
         assert!(
             dmax < 1e-6,
             "huge-budget fit must be the single-pass decode; max|Δ|={dmax}"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::tests::decode_fit_gate_selects_by_budget"
         );
     }
 
@@ -1618,6 +1659,9 @@ mod tests {
             tiled_peak < single_peak,
             "the tiled tail must lower the decode VRAM peak ({tiled_peak:.2} vs {single_peak:.2} GB)"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::tests::gpu_decode_1024_tiled_matches_single_pass");
     }
 
     // -- synthetic weight-map builders (deterministic; cover every key `from_weights` requires) -----

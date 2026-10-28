@@ -600,6 +600,7 @@ mod tests {
     /// `snake_logscale` is not cosmetic: the two modes disagree, and the identity `α=β=0`
     /// (log-scale) reduces to `x + sin²(x)`.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn snakebeta_log_scale_is_load_bearing() {
         let x = spread(&[1, 5, 3]);
         let alpha = Array::from_slice(&[0.3f32, -0.2, 0.7], &[3]);
@@ -636,6 +637,8 @@ mod tests {
             .unwrap()
             .item();
         assert!(err < 1e-5, "exp(0)=1 identity drifted by {err:.3e}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED alias_free::tests::snakebeta_log_scale_is_load_bearing");
     }
 
     #[test]

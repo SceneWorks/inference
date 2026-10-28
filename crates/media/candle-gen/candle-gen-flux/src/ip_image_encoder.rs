@@ -66,8 +66,10 @@ impl FluxIpImageEncoder {
         let px = preprocess_clip_image_sized(image, self.image_size, &device)?.to_dtype(dtype)?;
         let last = self.encoder.last_hidden(&px)?; // [1, num_positions, 1024]
         let cls = last.i((.., 0))?; // [1, 1024] — the class token
-        let pooled = self.post_ln.forward(&cls)?;
-        Ok(self.visual_projection.forward(&pooled)?) // [1, 768]
+        let pooled = __model_proof_output!(self.post_ln.forward(&cls))?;
+        Ok(__model_proof_output!(self
+            .visual_projection
+            .forward(&pooled))?) // [1, 768]
     }
 }
 
@@ -129,6 +131,7 @@ mod tests {
     /// `from_weights` wires the tower + projection head, and `image_embeds` produces a finite
     /// `[1, proj_dim]` pooled embedding (tiny dims; the real 1024→768 shape is the GPU validation).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn image_embeds_shape_and_finite() {
         let dev = Device::Cpu;
         // A tiny ViT-L-shaped tower: hidden 16, 2 layers, 2 heads, patch 2, 8px → 5×... grid 4 → 17.
@@ -171,5 +174,8 @@ mod tests {
             .unwrap()
             .iter()
             .all(|v| v.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_image_encoder::tests::image_embeds_shape_and_finite");
     }
 }

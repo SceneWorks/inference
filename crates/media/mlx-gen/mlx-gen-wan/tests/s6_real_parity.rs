@@ -68,6 +68,7 @@ fn wan_a14b_real_weight_e2e_matches_reference() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_A14B_MODEL_DIR to the converted A14B model dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_a14b_real_weight_e2e_matches_reference; see preceding skip diagnostic");
             return;
         }
     };
@@ -75,6 +76,7 @@ fn wan_a14b_real_weight_e2e_matches_reference() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_A14B_FIXTURE (run tools/dump_s6_real_fixtures.py first)");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_a14b_real_weight_e2e_matches_reference; see preceding skip diagnostic");
             return;
         }
     };
@@ -209,4 +211,8 @@ fn wan_a14b_real_weight_e2e_matches_reference() {
     );
     assert!(la_mr < 8e-2, "a14b latents diverged: mean_rel={la_mr:.3e}");
     assert!(vid_mr < 8e-2, "a14b video diverged: mean_rel={vid_mr:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED s6_real_parity::wan_a14b_real_weight_e2e_matches_reference"
+    );
 }

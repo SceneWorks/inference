@@ -78,14 +78,14 @@ impl PerceiverAttentionCA {
     /// arrives in the DiT's dtype (bf16); it is cast to f32 for the f32 conditioning math.
     pub fn forward(&self, id_embedding: &Tensor, img: &Tensor) -> candle_core::Result<Tensor> {
         let img = img.to_dtype(DType::F32)?;
-        let x = self.norm1.forward(id_embedding)?;
-        let lat = self.norm2.forward(&img)?;
+        let x = __model_proof_output!(self.norm1.forward(id_embedding))?;
+        let lat = __model_proof_output!(self.norm2.forward(&img))?;
         let (b, s, _dim) = lat.dims3()?;
         let n_kv = x.dim(1)?;
         let (h, hd) = (self.heads, self.dim_head);
 
-        let q = self.to_q.forward(&lat)?; // [B, S, inner]
-        let kv = self.to_kv.forward(&x)?; // [B, 32, inner*2]
+        let q = __model_proof_output!(self.to_q.forward(&lat))?; // [B, S, inner]
+        let kv = __model_proof_output!(self.to_kv.forward(&x))?; // [B, 32, inner*2]
         let parts = kv.chunk(2, D::Minus1)?;
         let to_heads = |t: &Tensor, n: usize| -> candle_core::Result<Tensor> {
             t.reshape((b, n, h, hd))?.transpose(1, 2)?.contiguous()
@@ -101,7 +101,7 @@ impl PerceiverAttentionCA {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, s, h * hd))?;
-        self.to_out.forward(&out)
+        __model_proof_output!(self.to_out.forward(&out))
     }
 }
 
@@ -219,6 +219,7 @@ mod tests {
     /// The injection schedule + shapes: `after_double` fires on even block indices, `after_single` on
     /// multiples of 4 (continuing the shared counter), and an `id_weight = 0` PulidCa injects nothing.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn injection_schedule_and_shapes() {
         let dev = Device::Cpu;
         let (dim, kv_dim, s) = (3usize, 4usize, 5usize);
@@ -263,5 +264,8 @@ mod tests {
         };
         assert!(off.after_double(0, &img).unwrap().is_none());
         assert!(!off.injects_after_single(0));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED ca::tests::injection_schedule_and_shapes");
     }
 }

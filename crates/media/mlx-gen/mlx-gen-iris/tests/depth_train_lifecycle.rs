@@ -185,10 +185,14 @@ fn bytes_of(path: &Path) -> Vec<(String, Vec<f32>)> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn gen_core_trainer_conformance_checks() {
     crate::common::cpu_process(
         "depth_train_lifecycle::gen_core_trainer_conformance_checks",
-        gen_core_trainer_conformance_checks_body,
+        || {
+            gen_core_trainer_conformance_checks_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::gen_core_trainer_conformance_checks");
+        },
     );
 }
 
@@ -231,10 +235,14 @@ fn gen_core_trainer_conformance_checks_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn cancel_and_resume_reproduce_the_uninterrupted_run() {
     crate::common::cpu_process(
         "depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run",
-        cancel_and_resume_reproduce_the_uninterrupted_run_body,
+        || {
+            cancel_and_resume_reproduce_the_uninterrupted_run_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run");
+        },
     );
 }
 
@@ -246,10 +254,10 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run_body() {
 /// cancel → durable checkpoint → resume reproduces the uninterrupted checkpointed run bit for bit
 /// (weights, EMA, optimizer, scheduler / data position, export).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing() {
     crate::common::cpu_process(
-        "depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing",
-        || cancel_and_resume_under(true),
+        "depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing", || { cancel_and_resume_under(true); eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing"); },
     );
 }
 
@@ -351,10 +359,14 @@ fn cancel_and_resume_under(ac: bool) {
 /// `gradient_checkpointing` into its step, the export moves by rounding only, keeps the release's
 /// layout and stamps, and loads in the estimator.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn activation_checkpointing_leaves_the_run_unchanged() {
     crate::common::cpu_process(
         "depth_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged",
-        activation_checkpointing_leaves_the_run_unchanged_body,
+        || {
+            activation_checkpointing_leaves_the_run_unchanged_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged");
+        },
     );
 }
 
@@ -401,10 +413,14 @@ fn activation_checkpointing_leaves_the_run_unchanged_body() {
 
 /// `invalid_examples`: `reject` refuses before any step naming the item; `skip` trains on the rest.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn invalid_examples_follow_the_policy() {
     crate::common::cpu_process(
         "depth_train_lifecycle::invalid_examples_follow_the_policy",
-        invalid_examples_follow_the_policy_body,
+        || {
+            invalid_examples_follow_the_policy_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::invalid_examples_follow_the_policy");
+        },
     );
 }
 
@@ -441,7 +457,15 @@ fn estimate(dir: &Path, image: &Image) -> Vec<f32> {
 }
 
 fn rgb_image(item: &TrainingItem) -> Image {
-    let img = image::open(&item.image_path).unwrap().to_rgb8();
+    let img = mlx_gen::gen_core::__model_input_reader!(
+        image::open(&item.image_path),
+        "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_lifecycle.rs::rgb_image/image::open",
+        Reference,
+        &item.image_path,
+        |__model_input_path| image::open(__model_input_path)
+    )
+    .unwrap()
+    .to_rgb8();
     Image {
         width: img.width(),
         height: img.height(),
@@ -467,10 +491,14 @@ fn target_error(pred: &[f32], item: &TrainingItem) -> f64 {
 /// sane, and the exported model — loaded by the standalone `iris_3b_depth` estimator unchanged —
 /// predicts depth closer to the training targets than the starting export.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn overfit_export_and_load_in_the_estimator() {
     crate::common::cpu_process(
         "depth_train_lifecycle::overfit_export_and_load_in_the_estimator",
-        overfit_export_and_load_in_the_estimator_body,
+        || {
+            overfit_export_and_load_in_the_estimator_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::overfit_export_and_load_in_the_estimator");
+        },
     );
 }
 
@@ -577,10 +605,14 @@ fn overfit_export_and_load_in_the_estimator_body() {
 /// From the generation parent: the empty prompt comes from a staged file (equal to the export's)
 /// or is encoded once by the text encoder; the run trains and its export loads in the estimator.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn parent_init_from_a_file_or_the_text_encoder() {
     crate::common::cpu_process(
         "depth_train_lifecycle::parent_init_from_a_file_or_the_text_encoder",
-        parent_init_from_a_file_or_the_text_encoder_body,
+        || {
+            parent_init_from_a_file_or_the_text_encoder_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::parent_init_from_a_file_or_the_text_encoder");
+        },
     );
 }
 

@@ -237,7 +237,13 @@ pub(crate) fn open_verified(
     let weights = verified.weights_path().ok_or_else(|| {
         gen_core::Error::Msg("verified YuE2-3B snapshot has no weights file".into())
     })?;
-    let config_json = std::fs::read_to_string(config_path)?;
+    let config_json = candle_audio::gen_core::__model_input_reader!(
+        std::fs::read_to_string(config_path),
+        "crates/audio/candle-audio-yue2/src/model.rs::open_verified::std::fs::read_to_string@11282",
+        ArtifactInput,
+        config_path,
+        |__model_input_path| std::fs::read_to_string(__model_input_path)
+    )?;
     // SAFETY: the file is the snapshot's verified weights file, opened read-only; the mapping
     // lives only for the duration of the caller's load (every tensor is copied out in `dtype`).
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device) }
@@ -279,7 +285,13 @@ pub(crate) fn open_tier(
     device: &Device,
 ) -> gen_core::Result<VerifiedLmFiles> {
     check_compute(dtype, device)?;
-    let config_json = std::fs::read_to_string(verified.config_path())?;
+    let config_json = candle_audio::gen_core::__model_input_reader!(
+        std::fs::read_to_string(verified.config_path()),
+        "crates/audio/candle-audio-yue2/src/model.rs::open_tier::std::fs::read_to_string@12893",
+        ArtifactInput,
+        verified.config_path(),
+        |__model_input_path| std::fs::read_to_string(__model_input_path)
+    )?;
     // SAFETY: the verified tier weights file, opened read-only; every tensor is copied out.
     let vb =
         unsafe { VarBuilder::from_mmaped_safetensors(&[verified.weights_path()], dtype, device) }
@@ -1216,6 +1228,7 @@ mod tests {
     /// Prefill-then-decode equals a full recompute of the same sequence: the cache holds the right
     /// keys at the right positions, and a decode step's RoPE position is its cache slot.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cached_decode_equals_full_recompute() {
         let lm = synthetic::model(MotPaths::Ar);
         let seq: Vec<u32> = vec![151643, 40, 1234, 99, 151847, 5, 777, 151848, 151851, 160000];
@@ -1231,12 +1244,18 @@ mod tests {
         // Same function, different matmul shapes: F32 reduction-order noise only.
         let d = max_abs(&a, &b);
         assert!(d < 1e-4, "cached vs recompute max |Δ| = {d}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED model::tests::cached_decode_equals_full_recompute"
+        );
     }
 
     /// A prefix longer than one prefill chunk is prefilled in bounded chunks and equals the same
     /// prefix prefilled as one forward (bottom-right causal over the cache: same keys, same
     /// positions).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chunked_prefill_equals_single_forward() {
         let lm = synthetic::model(MotPaths::Ar);
         let seq: Vec<u32> = (0..PREFILL_CHUNK as u32 + 37)
@@ -1256,9 +1275,15 @@ mod tests {
         let single = lm.forward_last(&seq, &mut one).unwrap();
         let d = max_abs(&to_vec(&chunked), &to_vec(&single));
         assert!(d < 1e-4, "chunked vs single prefill max |Δ| = {d}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED model::tests::chunked_prefill_equals_single_forward"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cache_capacity_is_a_hard_bound() {
         let lm = synthetic::model(MotPaths::Ar);
         let mut cache = lm.new_cache(3).unwrap();
@@ -1267,5 +1292,8 @@ mod tests {
         let mut cache = lm.new_cache(4).unwrap();
         assert!(lm.prefill(&[1, 2, 3], &mut cache, || Ok(())).is_ok());
         assert!(lm.decode(u32::MAX, &mut cache).is_err(), "out-of-vocab id");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED model::tests::cache_capacity_is_a_hard_bound");
     }
 }

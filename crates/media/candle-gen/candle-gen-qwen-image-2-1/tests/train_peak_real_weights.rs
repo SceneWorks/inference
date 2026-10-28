@@ -279,4 +279,7 @@ fn training_peak_is_within_the_preflight_estimate() {
             gib(used_high)
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_peak_real_weights::training_peak_is_within_the_preflight_estimate");
 }

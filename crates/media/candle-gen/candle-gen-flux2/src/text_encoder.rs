@@ -304,10 +304,14 @@ impl DecoderLayer {
     }
 
     fn forward(&self, x: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
-        let h = (x + self
-            .attn
-            .forward(&self.input_ln.forward(x)?, rotary, mask)?)?;
-        &h + self.mlp.forward(&self.post_ln.forward(&h)?)?
+        let h = (x + self.attn.forward(
+            &__model_proof_output!(self.input_ln.forward(x))?,
+            rotary,
+            mask,
+        )?)?;
+        &h + self
+            .mlp
+            .forward(&__model_proof_output!(self.post_ln.forward(&h))?)?
     }
 
     fn forward_step(
@@ -319,13 +323,15 @@ impl DecoderLayer {
         offset: usize,
     ) -> Result<Tensor> {
         let h = (x + self.attn.forward_step(
-            &self.input_ln.forward(x)?,
+            &__model_proof_output!(self.input_ln.forward(x))?,
             rotary,
             cache,
             layer,
             offset,
         )?)?;
-        &h + self.mlp.forward(&self.post_ln.forward(&h)?)?
+        &h + self
+            .mlp
+            .forward(&__model_proof_output!(self.post_ln.forward(&h))?)?
     }
 }
 
@@ -760,6 +766,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cached_offset_decode_matches_one_shot_prefill() -> Result<()> {
         let encoder = tiny_dev_encoder()?;
         let embeds = Tensor::from_vec(
@@ -784,10 +791,13 @@ mod tests {
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f32, f32::max);
         assert!(max_abs <= 1e-4, "cached decode drifted by {max_abs}");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::cached_offset_decode_matches_one_shot_prefill");
         Ok(())
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn generation_is_seeded_bounded_and_pre_cancelable() -> Result<()> {
         let encoder = tiny_dev_encoder()?;
         let embeds = Tensor::zeros((1, 2, 8), DType::F32, &Device::Cpu)?;
@@ -811,6 +821,8 @@ mod tests {
             encoder.generate_from_embeds(&embeds, -1, sampling, &cancel),
             Err(candle_gen::CandleError::Canceled)
         ));
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::generation_is_seeded_bounded_and_pre_cancelable");
         Ok(())
     }
 
@@ -862,6 +874,7 @@ mod tests {
     /// pre-engine loop — greedy and seeded temperature draws over several seeds, with both an eos
     /// end (an eos taken from the run's own budget-end tokens) and a budget end.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn caption_engine_decode_matches_the_pre_engine_loop() -> Result<()> {
         let mut cfg = crate::config::Flux2Config::dev();
         cfg.te_hidden_size = 8;
@@ -963,6 +976,8 @@ mod tests {
         let cancelled = decode(3);
         assert_eq!(cancelled.finish_reason, FinishReason::Cancelled);
         assert_eq!(cancelled.tokens.len(), 1);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::caption_engine_decode_matches_the_pre_engine_loop");
         Ok(())
     }
 

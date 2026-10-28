@@ -601,6 +601,7 @@ mod tests {
     /// A same-stem `.safetensors` rehost loads through `from_dir` and computes what the in-memory
     /// formula network computes (the published `.pth` path is covered by `pth`'s state-dict test).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn loads_a_safetensors_rehost_from_a_snapshot_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("sdxl_latest_vgg16_tuned.safetensors");
@@ -631,6 +632,8 @@ mod tests {
             scalar(&net(4).distance(&x, &y).unwrap()),
         );
         assert!((a - b).abs() <= 1e-6 * b.abs().max(1.0), "{a} vs {b}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED train::latent_lpips::tests::loads_a_safetensors_rehost_from_a_snapshot_dir");
     }
 
     /// The parameter count is the published checkpoints' size: both files exceed `param_count · 4`
@@ -652,6 +655,7 @@ mod tests {
     /// zero at the clean latent and positive off it. Mutation: report `DecodedPixels` from `input`
     /// ⇒ `PerceptualPath::new(None, …)` refuses ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn runs_on_the_shared_path_without_a_decoder() {
         let mut path = PerceptualPath::new(
             None,
@@ -682,6 +686,8 @@ mod tests {
         assert!(scalar(&path.aux_loss(&plan, 0, &off).unwrap().unwrap().weighted) > 0.0);
         // Outside the [0, 0.5] window the loss does not fire.
         assert!(path.plan(1, 0, 0.8).unwrap().aux.is_empty());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED train::latent_lpips::tests::runs_on_the_shared_path_without_a_decoder");
     }
 
     /// E7: the footprint carries the weights, a positive working set that grows with the latent,

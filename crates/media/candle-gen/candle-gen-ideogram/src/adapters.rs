@@ -280,6 +280,7 @@ mod tests {
     /// fold the *same* delta into the dense affine grid the pack represents and forward it densely. The
     /// two forwards must agree — proving the residual reproduces the fold on a kept-quantized base.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn additive_residual_matches_dense_fold_on_packed_base() -> Result<()> {
         use candle_gen::candle_core::{Device, Tensor};
         use candle_gen::candle_nn::{Linear, Module};
@@ -321,10 +322,11 @@ mod tests {
             .push_lora(a.clone(), b_fac.clone(), eff)
             .unwrap();
         let folded = Linear::new((grid.clone() + (delta * eff)?)?, None);
-        let resid_diff = (dense_additive.forward(&x)? - folded.forward(&x)?)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
+        let resid_diff = (dense_additive.forward(&x)?
+            - __model_proof_output!(folded.forward(&x))?)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
         assert!(resid_diff < 1e-3, "residual vs fold max diff {resid_diff}");
 
         // (B) The packed base carries the same residual: the packed-additive forward tracks the
@@ -347,6 +349,8 @@ mod tests {
             cos > 0.99999,
             "packed-additive vs dense-additive cosine {cos:.6}"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::additive_residual_matches_dense_fold_on_packed_base");
         Ok(())
     }
 }

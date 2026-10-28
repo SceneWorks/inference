@@ -193,6 +193,8 @@ fn connector_inputs_match_the_reference_geometry_and_are_well_formed() {
         vf.shape(),
         af.shape()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_te_connector_inputs::connector_inputs_match_the_reference_geometry_and_are_well_formed");
 }
 
 /// `max|got - want| / max|want|` — the peak-relative error the 2.3 TE sibling (`te_parity.rs`)
@@ -286,6 +288,8 @@ fn connector_inputs_match_the_2_5_reference_golden() {
         v_af < 1.5e-2,
         "audio_features valid-row peak_rel {v_af:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_te_connector_inputs::connector_inputs_match_the_2_5_reference_golden");
 }
 
 /// The same gate one stage further on — GREEN since sc-21663 fixed the `crate::connector` defects
@@ -334,6 +338,8 @@ fn connector_outputs_match_the_2_5_reference_golden() {
         v_ae < 6e-2,
         "audio_embeddings valid-row peak_rel {v_ae:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_te_connector_inputs::connector_outputs_match_the_2_5_reference_golden");
 }
 
 /// The video-only constructor is reachable and genuinely leaves the audio head absent.
@@ -376,6 +382,8 @@ fn the_video_only_constructor_omits_the_audio_head() {
         err.to_string().contains("from_packed_video"),
         "the refusal must name the constructor that produced this encoder: {err}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_te_connector_inputs::the_video_only_constructor_omits_the_audio_head");
 }
 
 /// The mask half of the contract: padded positions must carry **no token-dependent** information.
@@ -446,4 +454,6 @@ fn padded_positions_carry_no_token_dependent_conditioning() {
         "a valid position must differ from the padded constant (separation {signal:.3e}) — the \
          encoder produced no conditioning at all"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_te_connector_inputs::padded_positions_carry_no_token_dependent_conditioning");
 }

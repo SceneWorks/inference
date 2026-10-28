@@ -300,6 +300,9 @@ fn wan_t2v_14b_trainer_lora_trains_reloads_and_renders() {
     assert_reloads_pair(&out.high_path, &out.low_path, AdapterKind::Lora);
     render_finite_with_pair(&out.high_path, &out.low_path, AdapterKind::Lora);
     println!("[wan-lora] e2e OK — {n_high} targets/expert reload + merge, video renders finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_t2v_14b_trainer_lora_trains_reloads_and_renders");
 }
 
 /// LoKr (MoE): both experts train + converge, write a LoKr high/low pair (with `decomposeFactor`),
@@ -324,6 +327,9 @@ fn wan_t2v_14b_trainer_lokr_trains_reloads_and_renders() {
     assert_reloads_pair(&out.high_path, &out.low_path, AdapterKind::Lokr);
     render_finite_with_pair(&out.high_path, &out.low_path, AdapterKind::Lokr);
     println!("[wan-lokr] e2e OK — {n_high} targets/expert reload + merge, video renders finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_t2v_14b_trainer_lokr_trains_reloads_and_renders");
 }
 
 /// Launch-portable determinism: the same seed produces the same adapter pair, run to run.
@@ -362,6 +368,9 @@ fn wan_t2v_14b_trainer_same_seed_is_reproducible() {
         }
     }
     println!("[wan-det] e2e OK — same seed reproduces the adapter pair bit-for-bit");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_t2v_14b_trainer_same_seed_is_reproducible");
 }
 
 /// sc-8650: with a sample cadence set, the dual-expert MoE trainer renders preview images from the
@@ -382,6 +391,8 @@ fn wan_t2v_14b_trainer_same_seed_is_reproducible() {
 fn wan_trainer_emits_preview_samples() {
     if !snapshot().exists() {
         eprintln!("skipping: set WAN_T2V_14B_SNAPSHOT (or populate the HF cache)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-wan/tests/trainer_e2e.rs:383 (wan_trainer_emits_preview_samples): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     }
     let tmp_guard = tempfile::tempdir().unwrap();
@@ -459,4 +470,7 @@ fn wan_trainer_emits_preview_samples() {
             img.width, img.height
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_trainer_emits_preview_samples");
 }

@@ -384,6 +384,8 @@ fn staged_residency_bounds_the_request_peak_and_preserves_output() {
         resident.pixels, staged_row.pixels,
         "rung 1 is a residency change, not an arithmetic one — the image must be byte-identical"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::staged_residency_bounds_the_request_peak_and_preserves_output");
 }
 
 // ── Rungs 2 and 3: refused by the production path ────────────────────────────────────────────────
@@ -437,6 +439,8 @@ fn the_rejected_rungs_are_refused_by_the_production_path() {
     model
         .generate(&request(Some(staged()), 512, 1), &mut |_: Progress| {})
         .expect("a plain staged request must still render");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_rejected_rungs_are_refused_by_the_production_path");
 }
 
 // ── The staged re-assembly, for the two rungs `generate` refuses ─────────────────────────────────
@@ -616,6 +620,8 @@ fn the_end_to_end_reassembly_reproduces_the_real_generate_peak() {
         reassembled.peak_gib,
         production.peak_gib
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_end_to_end_reassembly_reproduces_the_real_generate_peak");
 }
 
 // ── Rung 2 ───────────────────────────────────────────────────────────────────────────────────────
@@ -747,6 +753,10 @@ fn decode_tile_mechanism_sweep() {
          layer-wise normalization is no longer preserving the production quality contract",
         ms::DECODE_DRIFT_BAR
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::decode_tile_mechanism_sweep"
+    );
 }
 
 /// SC-19753 regression across the advertised output range using production latents. Whole-tail
@@ -797,6 +807,8 @@ fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
         "layer-wise decode must clear the {}/255 bar across the advertised range; worst={worst}",
         ms::DECODE_DRIFT_BAR
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::layerwise_decode_clears_the_bar_across_the_advertised_output_range");
 }
 
 /// Request-level memory and quality for layer-wise decode on a production latent.
@@ -850,6 +862,8 @@ fn layerwise_decode_is_priced_at_the_request_level() {
          against a {}/255 bar)",
         ms::DECODE_DRIFT_BAR
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::layerwise_decode_is_priced_at_the_request_level");
 }
 
 // ── Rung 3 ───────────────────────────────────────────────────────────────────────────────────────
@@ -912,6 +926,8 @@ fn attention_chunking_is_measured_against_the_rung_two_top() {
          every query-block size, the output-preservation half of ATTENTION_SUPPORT no longer holds \
          and the rung must be re-measured, not left Missing on a stale reason"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::attention_chunking_is_measured_against_the_rung_two_top");
 }
 
 /// **The rung-3 mechanism measurement.**
@@ -1011,6 +1027,8 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
          peak IDENTICALLY at this seam — re-measure and re-publish it rather than widening this \
          margin"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::attention_chunking_is_measured_at_the_unet_seam");
 }
 
 // ── Rung 4 ───────────────────────────────────────────────────────────────────────────────────────
@@ -1102,6 +1120,8 @@ fn transformer_window_sweep_and_streamed_output_identity() {
          TRANSFORMER_WINDOW_SIZES' flat column and the phase-separation mechanism it rests on must \
          be re-derived before the domain is published again"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::transformer_window_sweep_and_streamed_output_identity");
 }
 
 /// **Rung 4 with an IP-Adapter actually installed** — the end-to-end half of the replay guard.
@@ -1189,6 +1209,7 @@ fn the_rung_four_stream_replays_an_installed_ip_adapter() {
          here means the streamed cross-attention ran without the image prompt for some layers — a \
          plausible, wrong image. See mlx_gen_sdxl::block_stream's replay guard"
     );
+    crate::model_inference_device::record_model_inference_device();
 }
 
 /// **The rung-4 saving is the whole `transformer_blocks` weight set**, cross-checked against the
@@ -1254,6 +1275,8 @@ fn the_rung_four_saving_is_the_whole_transformer_block_weight_set() {
         saving / GIB,
         block_set / GIB
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_rung_four_saving_is_the_whole_transformer_block_weight_set");
 }
 
 /// Sum the U-Net snapshot's `data_offsets`: (whole file, `transformer_blocks.*`, one deep block).
@@ -1377,6 +1400,8 @@ fn the_cadence_flatness_condition_is_checked_not_assumed() {
          TRANSFORMER_WINDOW_SIZES documents this as the boundary of the flat region — record the \
          new boundary rather than leaving the prose describing a region that has moved"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_cadence_flatness_condition_is_checked_not_assumed");
 }
 
 /// **The `TransformerComponent::TextEncoder` scope question, measured — the one place SDXL's answer
@@ -1402,6 +1427,7 @@ fn the_text_encoder_window_scope_cannot_move_the_request_peak() {
     for tier in TIERS {
         let Some(dir) = tier_dir(tier) else {
             println!("SKIPPED-BY-ABSENCE: tier {tier} is not cached under {ROOT_ENV}");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in the_text_encoder_window_scope_cannot_move_the_request_peak; see preceding skip diagnostic");
             continue;
         };
         warm_up(&dir, tier);
@@ -1466,6 +1492,8 @@ fn the_text_encoder_window_scope_cannot_move_the_request_peak() {
         "the conditioning phase now carries the request peak at an output above the advertised \
          min_size ({bearing:?}) — TRANSFORMER_WINDOW_COMPONENTS' recorded reason no longer holds"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_text_encoder_window_scope_cannot_move_the_request_peak");
 }
 
 /// **The published cadence domain is enforced AND reachable on the production path.**
@@ -1542,6 +1570,8 @@ fn the_published_window_domain_is_enforced_and_reachable_on_the_production_path(
             out.err()
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_published_window_domain_is_enforced_and_reachable_on_the_production_path");
 }
 
 /// **Rung 4's preconditions fail closed on real weights.**
@@ -1611,6 +1641,8 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
         "a load-time quantization over the dense bf16 tier must not arm rung 4"
     );
     assert!(!ms::load_leaves_blocks_lazy(&dense_q8));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::rung_four_preconditions_fail_closed_on_real_weights");
 }
 
 /// **Kolors' U-Net has eleven windowable sub-stacks at two depths — measured on the snapshot, not
@@ -1669,6 +1701,7 @@ fn every_advertised_tier_loads_and_publishes_the_ladder() {
     for tier in TIERS {
         let Some(dir) = tier_dir(tier) else {
             println!("SKIPPED-BY-ABSENCE: tier {tier} is not cached under {ROOT_ENV}");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in every_advertised_tier_loads_and_publishes_the_ladder; see preceding skip diagnostic");
             continue;
         };
         warm_up(&dir, tier);
@@ -1729,6 +1762,8 @@ fn every_advertised_tier_loads_and_publishes_the_ladder() {
          {ROOT_ENV}; this test's claim is per-tier and cannot be made from a subset",
         TIERS.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::every_advertised_tier_loads_and_publishes_the_ladder");
 }
 
 /// **The whole ladder renders under a memory cap that the unwindowed composition does not fit.**
@@ -1777,6 +1812,8 @@ fn the_full_ladder_renders_under_a_memory_cap() {
         capped.pixels, windowed.pixels,
         "the capped render must be byte-identical to the uncapped windowed one"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_full_ladder_renders_under_a_memory_cap");
 }
 
 /// **The `TextEncoder` scope measured where it pays** — the `bf16` tier at the advertised
@@ -1880,4 +1917,6 @@ fn the_text_encoder_window_bounds_the_conditioning_bearing_cell() {
          TRANSFORMER_WINDOW_COMPONENTS' table owes fresh numbers",
         both / text
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_text_encoder_window_bounds_the_conditioning_bearing_cell");
 }

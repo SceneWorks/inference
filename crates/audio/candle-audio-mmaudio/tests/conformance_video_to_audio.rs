@@ -16,6 +16,16 @@
 //! `raw_frames_8fps` `(T,H,W,3)` u8 tensor (the reference dump carries one) to drive it from a REAL
 //! clip; otherwise it uses deterministic synthetic motion.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 mod common;
 
 use std::path::PathBuf;
@@ -110,6 +120,9 @@ fn mmaudio_video_to_audio_conformance() {
     gen_core_testkit::check_video_to_audio(g.as_ref(), &profile)
         .expect("MMAudio passes the video→audio (Foley) contract");
     println!("check_video_to_audio: PASS");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mmaudio_video_to_audio_conformance");
 }
 
 /// The real-Foley DoD: fixed clip + prompt + seed → non-empty, 16 kHz, mono, finite, NON-SILENT
@@ -202,4 +215,7 @@ fn mmaudio_synced_foley_wav() {
         .unwrap_or_else(|_| std::env::temp_dir().join("mmaudio_foley.wav"));
     candle_audio::wav::write_wav_pcm16(&out_path, &track).expect("write WAV");
     println!("wrote {}", out_path.display());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mmaudio_synced_foley_wav");
 }

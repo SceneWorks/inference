@@ -32,31 +32,45 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + VAE golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + VAE golden"]
 fn vae_decode_matches_vendored() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let vae = load_vae(&snapshot()).unwrap();
 
-    let decoded = vae.decode(g.require("latents").unwrap()).unwrap();
+    let decoded = (
+        crate::common::record_model_inference_device(),
+        vae.decode(g.require("latents").unwrap()),
+    )
+        .1
+        .unwrap();
     let golden = g.require("decoded").unwrap();
     assert_eq!(decoded.shape(), golden.shape(), "decoded shape");
     let pr = peak_rel(&decoded, golden);
     println!("vae decode {:?}: peak_rel={pr:.3e}", decoded.shape());
     assert!(pr < 5e-3, "VAE decode diverged: peak_rel {pr:.3e}");
     println!("✓ SDXL VAE decode matches the vendored reference (f32)");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_real_weights::vae_decode_matches_vendored");
 }
 
 /// SC-18309 N1 hardware gate: execute the exact pre-seam native expression and the full engine
 /// no-override route over the same real normalized latent. Equality is bitwise, not tolerance-based:
 /// the seam may only transpose around the native VAE and must not alter normalization or readback.
 #[test]
-#[ignore = "needs the real SDXL VAE snapshot"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL VAE snapshot"]
 fn native_decode_seam_is_byte_exact_to_pre_seam_engine() {
     let vae = load_vae(&snapshot()).unwrap();
     let key = random::key(18_309).unwrap();
     let latents_nhwc = random::normal::<f32>(&[1, 8, 8, 4], None, None, Some(&key)).unwrap();
 
-    let legacy_tensor = vae.decode(&latents_nhwc).unwrap();
+    let legacy_tensor = (
+        crate::common::record_model_inference_device(),
+        vae.decode(&latents_nhwc),
+    )
+        .1
+        .unwrap();
     let latents_nchw = latents_nhwc.transpose_axes(&[0, 3, 1, 2]).unwrap();
     let seam_nchw = SdxlLatentDecoder::new(&vae).decode(&latents_nchw).unwrap();
     let seam_nhwc = seam_nchw.transpose_axes(&[0, 2, 3, 1]).unwrap();
@@ -70,7 +84,12 @@ fn native_decode_seam_is_byte_exact_to_pre_seam_engine() {
     );
 
     let legacy_image = decoded_to_image(&legacy_tensor).unwrap();
-    let engine_image = decode_image(&vae, &latents_nhwc, None).unwrap();
+    let engine_image = (
+        crate::common::record_model_inference_device(),
+        decode_image(&vae, &latents_nhwc, None),
+    )
+        .1
+        .unwrap();
     assert_eq!(engine_image, legacy_image, "engine RGB bytes changed");
 
     let malformed = Array::from_slice(&[1.0f32], &[1]);
@@ -81,7 +100,11 @@ fn native_decode_seam_is_byte_exact_to_pre_seam_engine() {
         mlx_gen::tiling::TilingConfig::spatial_only(4096, 64),
     ] {
         assert!(matches!(
-            vae.decode_tiled(&malformed, &cfg, Some(&cancel)),
+            (
+                crate::common::record_model_inference_device(),
+                vae.decode_tiled(&malformed, &cfg, Some(&cancel))
+            )
+                .1,
             Err(Error::Canceled)
         ));
         assert!(matches!(
@@ -89,19 +112,29 @@ fn native_decode_seam_is_byte_exact_to_pre_seam_engine() {
             Err(Error::Canceled)
         ));
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_real_weights::native_decode_seam_is_byte_exact_to_pre_seam_engine");
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + VAE golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + VAE golden"]
 fn vae_encode_mean_matches_vendored() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let vae = load_vae(&snapshot()).unwrap();
 
-    let mean = vae.encode_mean(g.require("image").unwrap()).unwrap();
+    let mean = (
+        crate::common::record_model_inference_device(),
+        vae.encode_mean(g.require("image").unwrap()),
+    )
+        .1
+        .unwrap();
     let golden = g.require("enc_mean").unwrap();
     assert_eq!(mean.shape(), golden.shape(), "enc_mean shape");
     let pr = peak_rel(&mean, golden);
     println!("vae encode_mean {:?}: peak_rel={pr:.3e}", mean.shape());
     assert!(pr < 5e-3, "VAE encode diverged: peak_rel {pr:.3e}");
     println!("✓ SDXL VAE encode (mean) matches the vendored reference (f32)");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_real_weights::vae_encode_mean_matches_vendored");
 }

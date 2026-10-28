@@ -14,6 +14,10 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[cfg(target_vendor = "apple")]
+#[path = "encoder_guarded.rs"]
+mod guarded;
+
 use crate::weightsmeta::Dtype;
 use crate::{
     safetensors_path_tensor_headers, Error, PinnedWeightsFile, Result, SafetensorsTensorHeader,
@@ -637,6 +641,16 @@ impl ValidatedEncoderSource {
         self.ensure_unchanged().map_err(E::from)?;
         let result = read(&self.weights);
         self.ensure_unchanged().map_err(E::from)?;
+        #[cfg(feature = "model-inference-proof")]
+        if result.is_ok() {
+            crate::runtime::record_sealed_input_read(
+                "gen-core::ValidatedEncoderSource::read_unchanged",
+                self.pinned
+                    .shard_pins
+                    .iter()
+                    .chain(self.pinned.config_pin.iter()),
+            );
+        }
         result
     }
 
@@ -728,6 +742,14 @@ impl ValidatedTokenizerSource {
         self.ensure_unchanged().map_err(E::from)?;
         let result = read(self.path());
         self.ensure_unchanged().map_err(E::from)?;
+        #[cfg(feature = "model-inference-proof")]
+        if result.is_ok() {
+            crate::runtime::record_sealed_input_read_with_role(
+                "gen-core::ValidatedTokenizerSource::read_unchanged",
+                crate::model_input_proof::InputRole::Tokenizer,
+                std::iter::once(&self.base.pin),
+            );
+        }
         result
     }
 

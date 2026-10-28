@@ -36,6 +36,16 @@
 //!   from it 15 s, plan only 11 s, a 2 s song from the restored plan 44 s); `ru_maxrss` 23.2 GB,
 //!   peak footprint 17.0 GB.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -302,6 +312,11 @@ fn registered_loader_generates_a_song_with_every_artifact() {
             "truncated": result["truncated"],
         }))
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED registered_loader_generates_a_song_with_every_artifact"
+    );
 }
 
 #[test]
@@ -399,6 +414,11 @@ fn a_saved_closure_serves_plan_only_and_restored_plan_runs() {
     assert_eq!(outcome.result["plan_identity"], plan_id.to_string());
     let saved = SymbolicPlan::restore(&run_dir, engine.tokenizer()).unwrap();
     assert_eq!(saved.abc_ids(), restored.abc_ids(), "exact token ids kept");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED a_saved_closure_serves_plan_only_and_restored_plan_runs"
+    );
 }
 
 /// Every tier the descriptor advertises (`supported_quants`, sc-22988 finding 13) loads through

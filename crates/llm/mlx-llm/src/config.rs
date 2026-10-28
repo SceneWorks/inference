@@ -807,7 +807,11 @@ impl ModelConfig {
         let quantization = v.get("quantization").and_then(|q| {
             let group_size = q.get("group_size").and_then(|x| x.as_i64())? as i32;
             let bits = q.get("bits").and_then(|x| x.as_i64())? as i32;
-            Some(QuantSpec { group_size, bits })
+            Some(QuantSpec {
+                group_size,
+                bits,
+                grid: Default::default(),
+            })
         });
 
         // Mixture-of-Experts FFN params: present iff a routed-expert count is configured
@@ -1063,7 +1067,13 @@ impl ModelConfig {
         } else {
             dir.to_path_buf()
         };
-        let text = std::fs::read_to_string(&path)?;
+        let text = crate::__model_input_reader!(
+            std::fs::read_to_string(&path),
+            "crates/llm/mlx-llm/src/config.rs::from_dir::std::fs::read_to_string@49555",
+            ArtifactInput,
+            &path,
+            |__model_input_path| std::fs::read_to_string(__model_input_path)
+        )?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
         Self::from_json(&v)
@@ -1414,7 +1424,8 @@ mod tests {
             cfg.quantization,
             Some(QuantSpec {
                 group_size: 64,
-                bits: 4
+                bits: 4,
+                grid: Default::default(),
             })
         );
 

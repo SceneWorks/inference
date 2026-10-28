@@ -185,4 +185,7 @@ fn real_weight_edit() {
         "default-strength edit diff {d_edit:.2} too small"
     );
     println!("Z-Image img2img validation PASS ✅ (eyeball the PPMs for edit quality)");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED edit_validate::real_weight_edit");
 }

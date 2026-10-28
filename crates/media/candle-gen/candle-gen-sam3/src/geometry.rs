@@ -63,16 +63,16 @@ impl GeometryLayer {
     /// `prompt`: `[1, P, C]`; `vision`: `[1, H·W, C]` (raw 72² feature, flattened); `vision_pos`:
     /// `[1, H·W, C]`. All prompt tokens are valid (PVS path), so attention runs unmasked.
     fn forward(&self, prompt: &Tensor, vision: &Tensor, vision_pos: &Tensor) -> Result<Tensor> {
-        let h = layer_norm(prompt, &self.ln1_w, &self.ln1_b, self.eps)?;
+        let h = __model_proof_output!(layer_norm(prompt, &self.ln1_w, &self.ln1_b, self.eps))?;
         let a = self.self_attn.forward(&h, &h, &h, None)?;
         let x = prompt.add(&a)?;
 
-        let h = layer_norm(&x, &self.ln2_w, &self.ln2_b, self.eps)?;
+        let h = __model_proof_output!(layer_norm(&x, &self.ln2_w, &self.ln2_b, self.eps))?;
         let key = vision.add(vision_pos)?;
         let a = self.cross_attn.forward(&h, &key, vision, None)?;
         let x = x.add(&a)?;
 
-        let h = layer_norm(&x, &self.ln3_w, &self.ln3_b, self.eps)?;
+        let h = __model_proof_output!(layer_norm(&x, &self.ln3_w, &self.ln3_b, self.eps))?;
         let a = self.ffn.forward(&h)?;
         Ok(x.add(&a)?)
     }
@@ -170,7 +170,12 @@ impl Sam3GeometryEncoder {
         let direct = self.boxes_direct.forward(boxes)?; // [1, N, C]
 
         // (2) ROI-align pooling of the channel-normalized 72² feature, then the 7×7 conv
-        let norm_feat = layer_norm(vision, &self.vision_ln_w, &self.vision_ln_b, eps)?; // [1,H,W,C]
+        let norm_feat = __model_proof_output!(layer_norm(
+            vision,
+            &self.vision_ln_w,
+            &self.vision_ln_b,
+            eps
+        ))?; // [1,H,W,C]
         let pooled = self.roi_pool(&boxes_host, n, &norm_feat, h, w)?; // [1, N, C]
 
         // (3) sine position encoding of the box center (+ raw h/w), projected to C
@@ -192,12 +197,12 @@ impl Sam3GeometryEncoder {
         // append the always-valid CLS token
         let cls = self.cls_embed.reshape((1, 1, c))?;
         let prompt = Tensor::cat(&[&boxes_embed, &cls], 1)?; // [1, N+1, C]
-        let prompt = layer_norm(
+        let prompt = __model_proof_output!(layer_norm(
             &self.final_proj.forward(&prompt)?,
             &self.prompt_ln_w,
             &self.prompt_ln_b,
             eps,
-        )?;
+        ))?;
 
         // refine with transformer layers cross-attending to the raw vision feature
         let vision_flat = vision.reshape((1, h * w, c))?;
@@ -205,7 +210,7 @@ impl Sam3GeometryEncoder {
         for layer in &self.layers {
             x = layer.forward(&x, &vision_flat, vision_pos)?;
         }
-        layer_norm(&x, &self.output_ln_w, &self.output_ln_b, eps)
+        __model_proof_output!(layer_norm(&x, &self.output_ln_w, &self.output_ln_b, eps))
     }
 
     /// `roi_align` (bilinear ROI pool, `roi_size`²) + the `boxes_pool_project` 7×7 conv, fused as two

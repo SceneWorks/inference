@@ -15,7 +15,7 @@
 //! | domain | prior form | equivalence class |
 //! |---|---|---|
 //! | [graph-evaluation cadence](GraphEvalCadence) | `eval_per_block` — a bool (every block, or never) — on `mlx_gen_flux2::MemoryConfig` (sc-6266) and `mlx_gen_wan::DitMemoryConfig` (sc-5681) | **bit-identical** |
-//! | [CFG batching](CfgBatching) | `mlx_gen_kolors` `cfg_conditioning`/`cfg_batch_*`, `candle_gen_kolors::common::cfg_batch_context` (an implicit `cfg > 1.0` doubling convention) | **bit-identical** |
+//! | [CFG batching](CfgBatching) | `mlx_gen_kolors` `cfg_conditioning`/`cfg_batch_*`, `candle_gen_kolors::common::cfg_batch_context` (an implicit `cfg > 1.0` doubling convention) | **bit-identical** up to a row-count-dependent GEMM (see below) |
 //! | [FFN chunking](FfnChunk) | `ffn_seq_chunk` on the same two config structs | *numerically* equivalent (see below) |
 //! | [prefix KV cache](PrefixKvCacheMode) | none — no prefix cache before epic 25899; its port (sc-25903, sc-25904) is selected only through this domain (sc-25905), and an unset request runs the prefill path | *numerically* equivalent (see below) |
 //!
@@ -62,8 +62,11 @@
 //!
 //! # Equivalence classes are part of the contract, not a footnote
 //!
-//! [`GraphEvalCadence`] and [`CfgBatching`] only reorder *when* work is materialized, so they are
-//! exactly bit-identical at every value. [`FfnChunk`] splits a GEMM along its row dimension, and
+//! [`GraphEvalCadence`] only reorders *when* work is materialized, so it is exactly bit-identical
+//! at every value. [`CfgBatching`] runs the same per-row arithmetic, but a sequential half hands
+//! each GEMM half the rows the batched pair does, so it is bit-identical except where the backend
+//! picks its matmul kernel by row count (measured ~1e-6 of peak on the MLX CPU device, sc-26268;
+//! see [`CfgBatching`]). [`FfnChunk`] splits a GEMM along its row dimension, and
 //! MLX's Metal kernels are tile-specialized by that dimension, so a chunked FFN is *numerically*
 //! equivalent rather than bit-identical (cosine ≈ 1, max|Δ| ~1e-3 — the same class as the models'
 //! own torch parity; see `mlx_gen_flux2::chunk`). A selector that must not perturb pixels at all
@@ -204,9 +207,18 @@ impl FfnChunk {
 /// than a bool — `cfg_batch: false` reads as "no CFG" at a call site, which is a third, unrelated
 /// state (guidance off) that neither variant here describes.
 ///
-/// **Bit-identical where a provider implements both**, and a provider that implements only one
-/// declares only that one: [`CfgBatchingDomain::Modes`] is a closed candidate list precisely so the
-/// missing mode is a typed refusal instead of a silent fallback to the mode that exists.
+/// **Bit-identical where a provider implements both, up to the backend's GEMM.** The one admitted
+/// deviation is a matrix multiply whose reduction order depends on its row count: a sequential
+/// half runs `M = tokens` rows where the batched pair runs `2·tokens`, and a BLAS is free to pick a
+/// different kernel (GEMV for one row, a different blocking for a few) for each. That is float reassociation of the same
+/// arithmetic — sc-26268 measured ~1e-6 of peak on the MLX CPU device, where a lone row and row 0
+/// of a two-row product differ in the last ulps — never a different computation. A provider test
+/// bounds it at reassociation scale (the SDXL real-weight check asserts the 8-bit image unchanged);
+/// anything above that is a provider bug (a row mix-up, a coupled batch statistic).
+///
+/// A provider that implements only one mode declares only that one: [`CfgBatchingDomain::Modes`]
+/// is a closed candidate list precisely so the missing mode is a typed refusal instead of a silent
+/// fallback to the mode that exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CfgBatching {
     /// One forward over a `[cond, uncond]` batch — the convention every CFG provider in this

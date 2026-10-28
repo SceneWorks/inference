@@ -178,9 +178,9 @@ impl SwinAttention {
     /// `hidden`: (nW, WW, dim). `mask`: optional (nW, WW, WW).
     fn forward(&self, hidden: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let (nw, seq, dim) = hidden.dims3()?;
-        let q = self.heads(&self.query.forward(hidden)?)?;
-        let k = self.heads(&self.key.forward(hidden)?)?;
-        let v = self.heads(&self.value.forward(hidden)?)?;
+        let q = self.heads(&__model_proof_output!(self.query.forward(hidden))?)?;
+        let k = self.heads(&__model_proof_output!(self.key.forward(hidden))?)?;
+        let v = self.heads(&__model_proof_output!(self.value.forward(hidden))?)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?)? * scale)?;
 
@@ -193,7 +193,7 @@ impl SwinAttention {
             .permute((2, 0, 1))?
             .contiguous()?
             .unsqueeze(0)?; // (1, heads, WW, WW)
-        scores = scores.broadcast_add(&bias)?;
+        scores = __model_proof_output!(scores.broadcast_add(&bias))?;
 
         if let Some(mask) = mask {
             // scores: (nW, heads, WW, WW); mask: (nW, WW, WW) → (nW, 1, WW, WW).
@@ -204,7 +204,7 @@ impl SwinAttention {
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?; // (nW, heads, WW, head_dim)
         let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((nw, seq, dim))?;
-        self.proj.forward(&ctx)
+        __model_proof_output!(self.proj.forward(&ctx))
     }
 }
 
@@ -254,7 +254,7 @@ impl SwinBlock {
         let (_b, _l, c) = hidden.dims3()?;
         let res = self.resolution;
         let shortcut = hidden.clone();
-        let x = self.ln_before.forward(hidden)?;
+        let x = __model_proof_output!(self.ln_before.forward(hidden))?;
         let x = x.reshape((1, res, res, c))?;
 
         let x = if self.shift > 0 {
@@ -278,9 +278,9 @@ impl SwinBlock {
         let x = x.reshape((1, res * res, c))?;
         let hidden = (shortcut + x)?;
 
-        let y = self.ln_after.forward(&hidden)?;
-        let y = self.intermediate.forward(&y)?.gelu_erf()?;
-        let y = self.output.forward(&y)?;
+        let y = __model_proof_output!(self.ln_after.forward(&hidden))?;
+        let y = __model_proof_output!(self.intermediate.forward(&y))?.gelu_erf()?;
+        let y = __model_proof_output!(self.output.forward(&y))?;
         hidden + y
     }
 }
@@ -318,8 +318,8 @@ impl PatchMerging {
         let x3 = rows_o.index_select(&io, 2)?; // odd rows, odd cols
         let cat = Tensor::cat(&[&x0, &x1, &x2, &x3], D::Minus1)?; // (1, r/2, r/2, 4C)
         let merged = cat.reshape((1, (r / 2) * (r / 2), 4 * c))?;
-        let merged = self.norm.forward(&merged)?;
-        self.reduction.forward(&merged)
+        let merged = __model_proof_output!(self.norm.forward(&merged))?;
+        __model_proof_output!(self.reduction.forward(&merged))
     }
 }
 
@@ -490,17 +490,17 @@ impl AudioTower {
             .reshape((1, 1, f * fr, t / fr))?; // (1,1,256,256)
 
         // Patch embed: conv2d(1→96, k4,s4) → (1,96,64,64) → flatten → (1,4096,96) → norm.
-        let x = self.patch_proj.forward(&img)?; // (1, 96, 64, 64)
+        let x = __model_proof_output!(self.patch_proj.forward(&img))?; // (1, 96, 64, 64)
         let (_b, c, gh, gw) = x.dims4()?;
         let x = x.reshape((1, c, gh * gw))?.transpose(1, 2)?.contiguous()?; // (1, 4096, 96)
-        let mut hidden = self.patch_norm.forward(&x)?;
+        let mut hidden = __model_proof_output!(self.patch_norm.forward(&x))?;
 
         for stage in &self.stages {
             hidden = stage.forward(&hidden)?;
         }
 
-        let hidden = self.final_norm.forward(&hidden)?; // (1, 64, 768)
-                                                        // avgpool over all spatial tokens per channel (see module doc — identical to HF pooling).
+        let hidden = __model_proof_output!(self.final_norm.forward(&hidden))?; // (1, 64, 768)
+                                                                               // avgpool over all spatial tokens per channel (see module doc — identical to HF pooling).
         hidden.mean(1)
     }
 }

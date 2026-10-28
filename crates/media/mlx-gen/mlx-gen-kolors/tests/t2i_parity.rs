@@ -198,4 +198,6 @@ fn kolors_t2i_matches_diffusers() {
         (mean_r - mean_g).abs()
     );
     println!("✓ Kolors T2I full pipeline renders coherently (cross-backend px delta is chaos-limited, see note)");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2i_parity::kolors_t2i_matches_diffusers");
 }

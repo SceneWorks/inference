@@ -333,6 +333,8 @@ fn the_text_encoder_arm_is_measured_per_window() {
         floor_peak,
     );
     common::write_rung4_evidence("text_encoder", &tier, &cells, resident_peak);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_window_real::the_text_encoder_arm_is_measured_per_window");
 }
 
 /// **The packed TE arm (sc-17153)** — the tier `MINIMAX_H3_TE` names, which is the encoder a
@@ -370,6 +372,8 @@ fn the_packed_text_encoder_arm_is_measured_per_window() {
         te_dir.display()
     );
     common::write_rung4_evidence("text_encoder", &tier, &cells, resident_peak);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_window_real::the_packed_text_encoder_arm_is_measured_per_window");
 }
 
 /// **The DiT arm**, per window and per tier. `MINIMAX_H3_DIT` selects the tier.
@@ -482,4 +486,6 @@ fn the_dit_arm_is_measured_per_window_and_tier() {
         floor_peak,
     );
     common::write_rung4_evidence("dit", &tier, &cells, resident_peak);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_window_real::the_dit_arm_is_measured_per_window_and_tier");
 }

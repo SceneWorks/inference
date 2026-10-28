@@ -20,6 +20,7 @@ half = { version = "2" }
 float8 = { version = "0.7", optional = true }
 
 [features]
+model-inference-proof = ["candle-core/model-inference-proof"]
 # CPU by default: the codec, capability floors and quant helpers are pure host/candle code.
 default = []
 # NVIDIA CUDA backend. All device code (the cuBLASLt handle, the nvrtc fused quantizer, the

@@ -170,6 +170,8 @@ fn av_e2e_matches_reference() {
     );
     assert_eq!(track.channels, 2);
     assert_eq!(track.sample_rate, 48000);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED av_e2e_parity::av_e2e_matches_reference");
 }
 
 /// sc-5551 — `generate_av_latents` (the production LTX A/V path) must honor the engine cancel flag
@@ -242,4 +244,6 @@ fn av_generate_honors_midloop_cancel() {
         steps, 1,
         "cancel tripped after step 1 must abort at the next step-check, before all steps run"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED av_e2e_parity::av_generate_honors_midloop_cancel");
 }

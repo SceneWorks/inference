@@ -55,6 +55,9 @@ fn ltx_vae_decode_sweep() {
         Some(p) => p,
         None => {
             eprintln!("skip: set LTX_VAE_DIR to a snapshot dir holding vae_decoder.safetensors");
+            crate::model_inference_device::record_model_inference_prerequisite_missing(
+                "required work unavailable in ltx_vae_decode_sweep; see preceding skip diagnostic",
+            );
             return;
         }
     };
@@ -161,6 +164,8 @@ fn ltx_vae_decode_sweep() {
         peak_bytes as f64 / out_vox as f64,
         peak_bytes as f64 / tile_vox as f64,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_sweep::ltx_vae_decode_sweep");
 }
 
 /// Discover the LTX VAE decoder dir (`vae_decoder.safetensors`): `LTX_VAE_DIR` first, else the `q4`
@@ -204,6 +209,7 @@ fn over_bound_output_matches_below_bound_reference() {
         eprintln!(
             "skip: no LTX_VAE_DIR and no ltx-2.3-mlx vae_decoder.safetensors under the HF cache"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in over_bound_output_matches_below_bound_reference; see preceding skip diagnostic");
         return;
     };
     if let Some(g) = std::env::var("LTX_LIMIT_GB")
@@ -402,4 +408,6 @@ fn over_bound_output_matches_below_bound_reference() {
         "assembled over-bound output diverged from the standalone last-tile decode by {max_d:.3e} — \
          the >i32::MAX region of the pad-and-accumulate assembly is corrupted (sc-12926 tier-3)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_sweep::over_bound_output_matches_below_bound_reference");
 }

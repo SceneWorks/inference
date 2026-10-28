@@ -3317,6 +3317,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn lora_scale_zero_is_bit_exact_noop_and_nonzero_has_effect() {
         // base [out=2, in=3]; LoRA a=[in=3, rank=2], b=[rank=2, out=2] (residual form, alpha/rank
         // already folded into the per-pass scale by the loader — here it's the raw scale).
@@ -3347,6 +3348,8 @@ mod tests {
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::lora_scale_zero_is_bit_exact_noop_and_nonzero_has_effect");
     }
 
     // ── sc-15265: LTX carries its own adapter stack, so the shared seam's two rules are
@@ -3356,6 +3359,7 @@ mod tests {
     // cheap synthetic fixtures and no weights.
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn dtype_narrowing_keeps_a_bf16_ltx_linear_bf16_under_f32_factors() {
         // Rule 2. A bf16 host with f32 LoRA factors: `add(bf16, f32)` promotes, so pre-sc-15265
         // this Linear — and every op downstream of it — silently became f32 the moment a LoRA was
@@ -3393,9 +3397,12 @@ mod tests {
             bit_exact(&got, &want_adapted(&base, &resid, 0.75)),
             "forward must be base + bf16(0.75·residual)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::dtype_narrowing_keeps_a_bf16_ltx_linear_bf16_under_f32_factors");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn disabled_ltx_adapters_residual_is_never_evaluated() {
         // Rule 1. A pass whose scale is exactly 0 must be SKIPPED, not added as a zero — the
         // distinction the all-f32 fixtures above cannot see, because casting an exact-zero
@@ -3436,9 +3443,12 @@ mod tests {
                 .item::<bool>(),
             "fixture check: the ON pass DOES evaluate the poisoned residual"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::disabled_ltx_adapters_residual_is_never_evaluated");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn empty_pass_scale_forward_errors_not_panics() {
         // A malformed adapter with an empty pass_scale must surface a clean error from forward,
         // not underflow `ps.len() - 1` (usize) into an OOB index and panic (F-009).
@@ -3449,9 +3459,12 @@ mod tests {
         let mut lin = dense(w);
         lin.push_lora(a, b, vec![]);
         assert!(lin.forward(&x).is_err());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::empty_pass_scale_forward_errors_not_panics");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn lora_per_pass_selects_strength() {
         // pass_scale [0.0, 1.0]: pass 0 is a no-op, pass 1 applies the full residual (sc-2687).
         let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
@@ -3476,9 +3489,14 @@ mod tests {
                 .item::<bool>(),
             "pass 1 (strength 1) must change the output"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED transformer::tests::lora_per_pass_selects_strength"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn lora_pass_index_clamps_into_uniform_scale() {
         // A uniform (length-1) pass_scale is used regardless of the selected pass — the clamp keeps a
         // uniform adapter working even when the pipeline advances to pass 1.
@@ -3493,9 +3511,12 @@ mod tests {
         lin.set_lora_pass(1);
         let p1 = lin.forward(&x).unwrap();
         assert!(array_eq(&p0, &p1, false).unwrap().item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::lora_pass_index_clamps_into_uniform_scale");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn lokr_scale_zero_is_noop_nonzero_matches_delta_and_per_pass() {
         // sc-2393: a LoKr residual carries a precomputed `[out,in]` delta (alpha/rank baked in). The
         // forward is `out + pass_scale · x·ΔWᵀ` — scale 0 a bit-exact no-op, scale s = `base + s·x·ΔWᵀ`,
@@ -3533,9 +3554,12 @@ mod tests {
         assert!(!array_eq(linp.forward(&x).unwrap(), &base, false)
             .unwrap()
             .item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::lokr_scale_zero_is_noop_nonzero_matches_delta_and_per_pass");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn lora_and_lokr_stack_on_one_linear() {
         // Both adapter kinds sum onto a single base: `out + lora_resid + lokr_resid`.
         let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
@@ -3558,6 +3582,10 @@ mod tests {
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED transformer::tests::lora_and_lokr_stack_on_one_linear"
+        );
     }
 
     // --- sc-18758: ff_bias / audio_ff_bias / connector_ff_bias, keyframes_abs_pos_embedding ---------
@@ -3607,6 +3635,7 @@ mod tests {
     /// even though the tensor was present in the source map — proving the flag, not the checkpoint
     /// content, decides whether the bias parameter exists in the built module.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn ff_bias_flag_changes_constructed_params_and_forward() {
         let prec = Precision::dense_f32(4, 64);
         let w = ff_weights(true);
@@ -3636,6 +3665,8 @@ mod tests {
                 .item::<bool>(),
             "ff_bias:true vs false must produce different output on a checkpoint with real bias values"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::ff_bias_flag_changes_constructed_params_and_forward");
     }
 
     /// The other half of the mutation proof: `bias:false` on a checkpoint that genuinely carries no

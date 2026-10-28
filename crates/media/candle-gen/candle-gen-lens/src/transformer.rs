@@ -218,8 +218,8 @@ impl TimeEmbed {
 
     pub fn forward(&self, sigma: f32, device: &Device, dtype: DType) -> Result<Tensor> {
         let emb = timestep_embedding(sigma, self.channels, device)?.to_dtype(dtype)?;
-        let h = self.linear_1.forward(&emb)?.silu()?;
-        self.linear_2.forward(&h)
+        let h = __model_proof_output!(self.linear_1.forward(&emb))?.silu()?;
+        __model_proof_output!(self.linear_2.forward(&h))
     }
 }
 
@@ -371,10 +371,10 @@ impl JointAttention {
         let (tq, tk, tv) = self.qkv(&self.txt_qkv, txt)?;
 
         // QK RMSNorm over head_dim (in `[B, seq, heads, head_dim]`).
-        let iq = self.norm_q.forward(&iq)?;
-        let ik = self.norm_k.forward(&ik)?;
-        let tq = self.norm_added_q.forward(&tq)?;
-        let tk = self.norm_added_k.forward(&tk)?;
+        let iq = __model_proof_output!(self.norm_q.forward(&iq))?;
+        let ik = __model_proof_output!(self.norm_k.forward(&ik))?;
+        let tq = __model_proof_output!(self.norm_added_q.forward(&tq))?;
+        let tk = __model_proof_output!(self.norm_added_k.forward(&tk))?;
 
         // To heads-first `[B, heads, seq, head_dim]`, then interleaved RoPE on q/k.
         let bhsd = |x: &Tensor| -> Result<Tensor> { x.transpose(1, 2)?.contiguous() };
@@ -548,8 +548,8 @@ impl LensTransformerBlock {
     ) -> candle_gen::Result<(Tensor, Tensor)> {
         // SiLU'd timestep → per-stream 6·inner modulation, split into mod1 (around attn) / mod2 (MLP).
         let act = temb.silu()?;
-        let img_mod = self.img_mod.forward(&act)?;
-        let txt_mod = self.txt_mod.forward(&act)?;
+        let img_mod = __model_proof_output!(self.img_mod.forward(&act))?;
+        let txt_mod = __model_proof_output!(self.txt_mod.forward(&act))?;
         let n = img_mod.dim(D::Minus1)? / 2;
         let (im0, im1) = (
             img_mod.narrow(D::Minus1, 0, n)?,
@@ -561,8 +561,14 @@ impl LensTransformerBlock {
         );
 
         // attention path
-        let (img_n, img_g1) = modulate(&self.img_norm1.forward(hidden)?, &im0)?;
-        let (txt_n, txt_g1) = modulate(&self.txt_norm1.forward(encoder)?, &tm0)?;
+        let (img_n, img_g1) = modulate(
+            &__model_proof_output!(self.img_norm1.forward(hidden))?,
+            &im0,
+        )?;
+        let (txt_n, txt_g1) = modulate(
+            &__model_proof_output!(self.txt_norm1.forward(encoder))?,
+            &tm0,
+        )?;
         let (img_attn, txt_attn) = self.attn.forward(
             &img_n,
             &txt_n,
@@ -577,9 +583,15 @@ impl LensTransformerBlock {
         let encoder = gated(encoder, &txt_g1, &txt_attn)?;
 
         // feed-forward path (SwiGLU)
-        let (img_n2, img_g2) = modulate(&self.img_norm2.forward(&hidden)?, &im1)?;
+        let (img_n2, img_g2) = modulate(
+            &__model_proof_output!(self.img_norm2.forward(&hidden))?,
+            &im1,
+        )?;
         let hidden = gated(&hidden, &img_g2, &self.img_mlp.forward(&img_n2)?)?;
-        let (txt_n2, txt_g2) = modulate(&self.txt_norm2.forward(&encoder)?, &tm1)?;
+        let (txt_n2, txt_g2) = modulate(
+            &__model_proof_output!(self.txt_norm2.forward(&encoder))?,
+            &tm1,
+        )?;
         let encoder = gated(&encoder, &txt_g2, &self.txt_mlp.forward(&txt_n2)?)?;
 
         Ok((encoder, hidden))
@@ -602,7 +614,7 @@ impl NormOut {
     }
 
     pub fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
-        let p = self.linear.forward(&temb.silu()?)?;
+        let p = __model_proof_output!(self.linear.forward(&temb.silu()?))?;
         let inner = p.dim(D::Minus1)? / 2;
         let scale = p.narrow(D::Minus1, 0, inner)?.unsqueeze(1)?;
         let shift = p.narrow(D::Minus1, inner, inner)?.unsqueeze(1)?;
@@ -1124,6 +1136,7 @@ mod tests {
     /// wiring end-to-end on a dense-base fixture (the base-agnostic additive path is byte-equal on a
     /// packed base; the stays-packed property is proven at the `AdaptLinear` unit level).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn install_additive_lora_on_dit_applies_and_shifts() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         use std::collections::HashMap as Map;
@@ -1185,6 +1198,9 @@ mod tests {
             shift > 1e-5,
             "additive LoRA did not shift the DiT forward ({shift})"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::install_additive_lora_on_dit_applies_and_shifts");
     }
 
     #[test]

@@ -4658,8 +4658,13 @@ fn save_lora(
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = image::open(path)
-        .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_result!(
+        image::open(path),
+        "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::decode_image/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Ok(Image {
@@ -4938,6 +4943,8 @@ mod first_step_repro {
             max_rel < 1e-5,
             "attention-segment checkpointing must not change grads: max rel {max_rel:.2e}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::attn_ckpt_grads_match_retained");
     }
 
     /// sc-4942 — block (gradient) checkpointing must not change the math: the checkpointed forward+grads
@@ -4977,6 +4984,8 @@ mod first_step_repro {
             max_rel < 5e-3,
             "block checkpointing must match dense within tolerance: max rel {max_rel:.2e}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::block_ckpt_grads_match_dense");
     }
 
     /// sc-4942 — the MEASURED finding that LTX trains f32, not bf16 (the rest of the family casts to
@@ -5096,6 +5105,8 @@ mod first_step_repro {
              video tier, so bf16's saving is not needed",
             100.0 * bf16_peak / f32_peak
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::bf16_grads_decorrelate_justifying_f32");
     }
 
     /// sc-4942 — first-step peak sweep on the dense path (attention-segment checkpointing always on),
@@ -5173,6 +5184,10 @@ mod first_step_repro {
             "blk-ckpt bf16",
         )
         .map_err(|e| eprintln!("  blk-ckpt bf16 CATCHABLE error: {e}"));
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_attn_ckpt_sweep"
+        );
     }
 
     /// sc-4942 — block checkpointing must drop the first-step peak below the dense path at production
@@ -5215,6 +5230,8 @@ mod first_step_repro {
             ckpt_peak < dense_peak,
             "block checkpointing must reduce the first-step peak: dense {dense_peak:.2} vs ckpt {ckpt_peak:.2}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::block_ckpt_reduces_peak_vs_dense");
     }
 }
 
@@ -6183,6 +6200,7 @@ mod ltx25_tiny_production_lifecycle {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn train_changes_output_and_strict_save_reloads_on_fresh_av_model() {
         let _cpu = cpu_only();
         let mut cfg = crate::transformer::rung4_block_window_tests::tiny_cfg();
@@ -6362,6 +6380,8 @@ mod ltx25_tiny_production_lifecycle {
             roundtrip < 1e-6,
             "fresh strict reload must reproduce output"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::ltx25_tiny_production_lifecycle::train_changes_output_and_strict_save_reloads_on_fresh_av_model");
     }
 }
 
@@ -6543,6 +6563,7 @@ mod depth_anchoring_tests {
     /// gradient; a diffusion step (key 1) carries no depth term. Mutation: force
     /// `diffusion_on = true` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let mut f = fixture();
         let d = aux_driver(
@@ -6574,12 +6595,15 @@ mod depth_anchoring_tests {
                 .sum();
             assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B grad {gb}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths");
     }
 
     /// AC (c): depth off ⇒ bit-identical to the pre-epic-2123 step (its closure reproduced), and a
     /// diffusion-only step of an enabled path takes the same graph. Mutation: scale the diffusion
     /// reduction (×1.0001) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_off_is_bit_identical_to_the_legacy_step() {
         assert!(load_perceptual_path(&TrainingConfig::default())
             .unwrap()
@@ -6632,6 +6656,8 @@ mod depth_anchoring_tests {
         for (k, v) in &g_off {
             assert_eq!(bits(v), bits(&g_on[k]), "{k}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// The patchified `(1, S, C)` cache latent unpatchifies to the decoder's NCHW at its bucket's
@@ -6642,6 +6668,7 @@ mod depth_anchoring_tests {
     /// a depth run ⇒ red; unpatchify every entry at the first bucket's edge ⇒ the 4×4 entries fail
     /// to reshape ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn buckets_interleave_with_per_entry_references_at_their_own_edge() {
         let z = random::normal::<f32>(&[1, 4, 1, 3, 3], None, None, Some(&random::key(5).unwrap()))
             .unwrap();
@@ -6707,6 +6734,8 @@ mod depth_anchoring_tests {
                 "image {image} ({kinds:?})"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::buckets_interleave_with_per_entry_references_at_their_own_edge");
     }
 
     /// AC (d), E7: depth grows the estimate by TAELTX2.3 + DA2 (more for Large) and the guard
@@ -6936,6 +6965,7 @@ mod ltx25_depth_anchoring_tests {
     /// factors get a nonzero finite gradient through the decoded video x0; a diffusion step (key 1)
     /// carries no depth term. Mutation: force `diffusion_on = true` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_the_video_stream_only() {
         let _cpu = cpu_only();
         for with_audio in [true, false] {
@@ -6981,12 +7011,15 @@ mod ltx25_depth_anchoring_tests {
                 "audio={with_audio}: LoRA-B grad {gb}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::ltx25_depth_anchoring_tests::depth_step_trains_the_lora_through_the_video_stream_only");
     }
 
     /// AC (c): depth off ⇒ bit-identical to the pre-epic-2123 LTX-2.5 step (its closure reproduced),
     /// and a diffusion-only planned step equals it too. Mutation: scale the joint loss (×1.0001) ⇒
     /// red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_off_is_bit_identical_to_the_legacy_av_step() {
         let _cpu = cpu_only();
         let mut f = fixture(GENERATED, true);
@@ -7043,12 +7076,15 @@ mod ltx25_depth_anchoring_tests {
         for (k, v) in &g_off {
             assert_eq!(bits(v), bits(&g_on[k]), "{k}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::ltx25_depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_av_step");
     }
 
     /// The depth frames skip conditioning frames (I2V first frame) and pick evenly spaced generated
     /// frames; `nchw` takes exactly those frames from the patchified tokens. Mutations: drop the
     /// candidate filter ⇒ frame 0 is picked ⇒ red; take frames along the wrong axis ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_frames_follow_the_generated_frames_and_the_token_layout() {
         let _cpu = cpu_only();
         // 4 frames × 2 tokens; frame 0 conditioning.
@@ -7104,6 +7140,8 @@ mod ltx25_depth_anchoring_tests {
             frames: vec![2, 0],
         };
         assert!(bad.decode_frames().is_err());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::ltx25_depth_anchoring_tests::depth_frames_follow_the_generated_frames_and_the_token_layout");
     }
 
     /// `Ltx25DepthDecoder` decodes one pixel frame per selected frame: frame 0 exactly as a lone
@@ -7113,6 +7151,7 @@ mod ltx25_depth_anchoring_tests {
     /// Mutations: decode every row as an independent `T = 1` frame ⇒ red; drop the lone-frame-0
     /// branch (treat the batch as pairs only) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_decoder_decodes_each_frame_with_its_predecessor() {
         let _cpu = cpu_only();
         use mlx_rs::ops::indexing::IndexOp;
@@ -7162,6 +7201,8 @@ mod ltx25_depth_anchoring_tests {
             let m = g.index(row).abs().unwrap().sum(None).unwrap().item::<f32>();
             assert!(m > 0.0 && m.is_finite(), "row {row}: {m}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::ltx25_depth_anchoring_tests::depth_decoder_decodes_each_frame_with_its_predecessor");
     }
 
     /// The depth memory estimate's video grid comes from each bundle's safetensors HEADER alone:

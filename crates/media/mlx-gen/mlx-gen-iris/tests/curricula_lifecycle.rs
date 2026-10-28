@@ -180,10 +180,14 @@ fn latest(out: &Path) -> PathBuf {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn stage_presets_chain_256_to_512_with_repa_and_a_new_phase() {
     cpu_process(
         "curricula_lifecycle::stage_presets_chain_256_to_512_with_repa_and_a_new_phase",
-        stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body,
+        || {
+            stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_lifecycle::stage_presets_chain_256_to_512_with_repa_and_a_new_phase");
+        },
     );
 }
 
@@ -286,10 +290,14 @@ fn stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn area_shape_batches_train_per_shape_and_resume_exactly() {
     cpu_process(
         "curricula_lifecycle::area_shape_batches_train_per_shape_and_resume_exactly",
-        area_shape_batches_train_per_shape_and_resume_exactly_body,
+        || {
+            area_shape_batches_train_per_shape_and_resume_exactly_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_lifecycle::area_shape_batches_train_per_shape_and_resume_exactly");
+        },
     );
 }
 
@@ -345,10 +353,14 @@ fn area_shape_batches_train_per_shape_and_resume_exactly_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn activation_checkpointing_leaves_the_run_unchanged() {
     cpu_process(
         "curricula_lifecycle::activation_checkpointing_leaves_the_run_unchanged",
-        activation_checkpointing_leaves_the_run_unchanged_body,
+        || {
+            activation_checkpointing_leaves_the_run_unchanged_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_lifecycle::activation_checkpointing_leaves_the_run_unchanged");
+        },
     );
 }
 
@@ -391,10 +403,14 @@ fn activation_checkpointing_leaves_the_run_unchanged_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn holdout_validation_writes_the_banded_metrics() {
     cpu_process(
         "curricula_lifecycle::holdout_validation_writes_the_banded_metrics",
-        holdout_validation_writes_the_banded_metrics_body,
+        || {
+            holdout_validation_writes_the_banded_metrics_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_lifecycle::holdout_validation_writes_the_banded_metrics");
+        },
     );
 }
 
@@ -427,10 +443,14 @@ fn holdout_validation_writes_the_banded_metrics_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn fp16_trains_with_the_dynamic_loss_scaler() {
     cpu_process(
         "curricula_lifecycle::fp16_trains_with_the_dynamic_loss_scaler",
-        fp16_trains_with_the_dynamic_loss_scaler_body,
+        || {
+            fp16_trains_with_the_dynamic_loss_scaler_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_lifecycle::fp16_trains_with_the_dynamic_loss_scaler");
+        },
     );
 }
 
@@ -456,10 +476,14 @@ fn fp16_trains_with_the_dynamic_loss_scaler_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn resume_optimizer_core_starts_a_new_projector_cold() {
     cpu_process(
         "curricula_lifecycle::resume_optimizer_core_starts_a_new_projector_cold",
-        resume_optimizer_core_starts_a_new_projector_cold_body,
+        || {
+            resume_optimizer_core_starts_a_new_projector_cold_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_lifecycle::resume_optimizer_core_starts_a_new_projector_cold");
+        },
     );
 }
 
@@ -494,10 +518,14 @@ fn resume_optimizer_core_starts_a_new_projector_cold_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_pre_curricula_checkpoint_resumes_exactly() {
     cpu_process(
         "curricula_lifecycle::a_pre_curricula_checkpoint_resumes_exactly",
-        a_pre_curricula_checkpoint_resumes_exactly_body,
+        || {
+            a_pre_curricula_checkpoint_resumes_exactly_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_lifecycle::a_pre_curricula_checkpoint_resumes_exactly");
+        },
     );
 }
 

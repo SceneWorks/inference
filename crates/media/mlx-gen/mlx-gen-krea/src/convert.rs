@@ -384,7 +384,13 @@ pub fn quantize_text_encoder(src_root: &Path, dst_root: &Path, bits: i32) -> Res
 /// Read `text_config.num_hidden_layers` from `{src_root}/text_encoder/config.json` (default 36).
 fn read_te_num_layers(src_root: &Path) -> Result<usize> {
     let path = src_root.join("text_encoder").join("config.json");
-    let text = std::fs::read_to_string(&path)
+    let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-krea/src/convert.rs::read_te_num_layers::std::fs::read_to_string@15823",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
         .map_err(|e| Error::Msg(format!("krea: read {}: {e}", path.display())))?;
     let v: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| Error::Msg(format!("krea: parse {}: {e}", path.display())))?;

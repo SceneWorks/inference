@@ -96,6 +96,8 @@ fn lens_adapters_match_reference() -> Result<()> {
         Ok(d) => d,
         Err(_) => {
             eprintln!("SKIP: set LENS_DIT_DIR to the Lens-Turbo transformer snapshot dir");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/adapter_parity.rs:99 (lens_adapters_match_reference): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return Ok(());
         }
     };
@@ -110,6 +112,8 @@ fn lens_adapters_match_reference() -> Result<()> {
                 "SKIP: {} not found (run scripts/dump_lens_adapter_golden.py)",
                 p.display()
             );
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/adapter_parity.rs:108 (lens_adapters_match_reference): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return Ok(());
         }
     }
@@ -212,5 +216,7 @@ fn lens_adapters_match_reference() -> Result<()> {
     );
 
     eprintln!("ALL PASS");
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapter_parity::lens_adapters_match_reference");
     Ok(())
 }

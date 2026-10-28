@@ -134,6 +134,7 @@ fn gguf_bpe_tokenizer_roundtrip_matches_hf() {
 fn gguf_bpe_snapshot_runs_self_contained() {
     let Ok(gguf) = std::env::var("MLX_LLM_BPE_GGUF") else {
         eprintln!("skip: set MLX_LLM_BPE_GGUF");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in gguf_bpe_snapshot_runs_self_contained; see preceding skip diagnostic");
         return;
     };
 
@@ -179,6 +180,10 @@ fn gguf_bpe_snapshot_runs_self_contained() {
     assert!(
         !text.trim().is_empty(),
         "self-contained snapshot produced no text"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED gguf_tokenizer::gguf_bpe_snapshot_runs_self_contained"
     );
 }
 

@@ -278,7 +278,7 @@ fn encode_caption(
     let ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
     let len = ids.len();
     let input_ids = Tensor::from_vec(ids, (1, len), device)?;
-    let enc = te.forward(&input_ids)?; // (1, L, 2560)
+    let enc = __model_proof_output!(te.forward(&input_ids))?; // (1, L, 2560)
     Ok(enc.squeeze(0)?.to_dtype(DType::F32)?) // (L, 2560)
 }
 
@@ -318,9 +318,10 @@ fn sample_noise_latent(edge: u32, seed: u64, device: &Device) -> Result<Tensor> 
 fn decode_preview(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
     // Drop the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w).
     let latents = latents.squeeze(2)?;
-    let decoded =
-        candle_gen::bounded_kl_decode(&crate::common::VAE_DECODER, &latents, |l| vae.decode(l))?
-            .to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
+    let decoded = candle_gen::bounded_kl_decode(&crate::common::VAE_DECODER, &latents, |l| {
+        __model_proof_output!(vae.decode(l))
+    })?
+    .to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
     let img = postprocess_image(&decoded)? // u8 (1, 3, H, W)
         .i(0)?
         .to_device(&Device::Cpu)?;
@@ -909,6 +910,7 @@ mod tests {
     /// LoRA factors yields a finite loss and a gradient on **every** adapter `Var` (backprop reaches
     /// the LoRA seam through the negated-velocity loss).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn backward_reaches_lora_factors() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -961,6 +963,9 @@ mod tests {
             expected_targets * 2,
             "two factors per target"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::backward_reaches_lora_factors");
     }
 
     /// The correctness gate for the `gradient_checkpointing` lever: the checkpointed backward must
@@ -971,6 +976,7 @@ mod tests {
     /// **checkpointed** main `layers` (grads from the segmented VJP). A break in either path surfaces
     /// here as a missing or mismatched grad. Mirrors the SDXL trainer's `dense_and_checkpoint_grads_match`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dense_and_checkpoint_grads_match() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -1055,12 +1061,18 @@ mod tests {
             }
         }
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED training::tests::dense_and_checkpoint_grads_match"
+        );
     }
 
     /// sc-24828: subject-masked loss on both backward paths. An all-ones map is the unweighted loss;
     /// an all-zero map zeroes the loss AND every adapter gradient (dense and checkpointed — a path
     /// that dropped the weight would train on the background); a half map matches across paths.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -1121,11 +1133,15 @@ mod tests {
             (dense - ckpt).abs() < 1e-4,
             "dense {dense} vs checkpoint {ckpt}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 
     /// One optimizer step over the tiny DiT lowers (or holds) the loss on the same fixed batch — the
     /// step actually descends the flow-match objective, end to end through the harness.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn one_optimizer_step_descends() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -1192,6 +1208,9 @@ mod tests {
             loss1 < loss0,
             "5 steps on a fixed batch should lower the loss: {loss0} -> {loss1}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::one_optimizer_step_descends");
     }
 
     /// The trainer resolves through the explicit family registry as the candle
@@ -1284,25 +1303,74 @@ mod tests {
             noise: Tensor,
         }
 
+        /// `N(0, std²)` of shape `dims` from the seeded `rng`.
+        fn randn_seeded(rng: &mut StdRng, std: f32, dims: &[usize]) -> Tensor {
+            let n = dims.iter().product();
+            let v: Vec<f32> = candle_gen::seeded_normal_vec(rng, n)
+                .into_iter()
+                .map(|x| x * std)
+                .collect();
+            Tensor::from_vec(v, dims, &Device::Cpu).unwrap()
+        }
+
+        /// Redraw every random-init var of `vm` from `rng`, in name order (the map is a `HashMap`),
+        /// at candle-nn's own init scale: Kaiming-normal weights `√(2/fan_in)` and `±1/√fan_in`
+        /// biases (std `1/√(3·fan_in)`). Constant-init vars (norm γ/β) are left as they are.
+        fn reseed_varmap(vm: &VarMap, rng: &mut StdRng) {
+            let data = vm.data().lock().unwrap();
+            let fan_in = |dims: &[usize]| dims[1..].iter().product::<usize>() as f32;
+            let mut names: Vec<&String> = data.keys().collect();
+            names.sort();
+            for name in names {
+                let v = &data[name];
+                let vals = v
+                    .as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                if vals.iter().all(|x| *x == vals[0]) {
+                    continue;
+                }
+                let std = if v.dims().len() >= 2 {
+                    (2.0 / fan_in(v.dims())).sqrt()
+                } else {
+                    let w = name
+                        .strip_suffix("bias")
+                        .and_then(|stem| data.get(&format!("{stem}weight")))
+                        .unwrap_or_else(|| panic!("random-init 1-D var {name} has no weight"));
+                    (3.0 * fan_in(w.dims())).sqrt().recip()
+                };
+                v.set(&randn_seeded(rng, std, v.dims())).unwrap();
+            }
+        }
+
+        /// Seeded: candle's CPU backend ignores `Device::set_seed`, so `Tensor::randn` and the
+        /// `VarMap` init draw from the process-global RNG; a rare draw pushes the tiny random
+        /// decoder's output outside `[0, 1]` at every pixel, its final clamp zeroes every adapter
+        /// gradient, and the depth test fails intermittently (the SDXL / Lens fixtures' flake).
+        /// Every tensor here comes from one `StdRng`.
         fn fixture() -> Fixture {
             let dev = Device::Cpu;
+            let mut rng = StdRng::seed_from_u64(0x5a1e_2123);
             let vm = VarMap::new();
             let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
             let (mut dit, cfg) = tiny_dit(vb);
+            reseed_varmap(&vm, &mut rng);
             let suffixes: Vec<String> =
                 Z_IMAGE_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
             let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
             for v in &set.vars {
-                v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                v.set(&randn_seeded(&mut rng, 0.02, v.as_tensor().dims()))
                     .unwrap();
             }
-            let shape = (1, cfg.in_channels, 4, 4);
+            let shape = [1, cfg.in_channels, 4, 4];
             Fixture {
                 dit,
                 vars: set.vars,
-                x0: Tensor::randn(0f32, 1f32, shape, &dev).unwrap(),
-                cap: Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap(),
-                noise: Tensor::randn(0f32, 1f32, shape, &dev).unwrap(),
+                x0: randn_seeded(&mut rng, 1.0, &shape),
+                cap: randn_seeded(&mut rng, 1.0, &[3, cfg.cap_feat_dim]),
+                noise: randn_seeded(&mut rng, 1.0, &shape),
             }
         }
 
@@ -1360,6 +1428,7 @@ mod tests {
         /// term. Mutations: compute the diffusion term unconditionally in `step_loss` ⇒ (a) red;
         /// pass `None` as `aux` in the checkpointed segment ⇒ ckpt (a) red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_only_step_trains_the_adapter_through_depth_alone() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1394,12 +1463,16 @@ mod tests {
                     "ckpt={ckpt}: no LoRA B gradient from the depth term"
                 );
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_only_step_trains_the_adapter_through_depth_alone");
         }
 
         /// The aux term is the depth loss of THE trainer's x0 estimate: recomputed independently from
         /// the model output with the trainer's parameterisation, it matches the step's aux bits.
         /// Mutation: swap the parameterisation in `step_loss` (e.g. `FlowX0MinusNoise`) ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1432,12 +1505,16 @@ mod tests {
                 .to_scalar::<f32>()
                 .unwrap();
             assert_eq!(l.aux.unwrap().to_bits(), want.to_bits());
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_term_is_the_depth_loss_of_the_recovered_x0");
         }
 
         /// (c) Depth off is bit-identical to the pre-epic-2123 dense step (reproduced here
         /// verbatim): loss and every gradient. Mutation: route the `None` case through a scaled
         /// combine (e.g. `diffusion * 1.0000001`) ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn depth_off_is_bit_identical_to_the_legacy_step() {
             let f = fixture();
             let (l, g) = run(&f, 0.5, false, None);
@@ -1467,11 +1544,15 @@ mod tests {
             for v in &f.vars {
                 assert_eq!(grad_bits(&g, v), grad_bits(&lg, v));
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::depth_off_is_bit_identical_to_the_legacy_step");
         }
 
         /// The trainer's `micro_step` trains an aux-only step at the plan's REMAPPED σ (not the
         /// sampled one). Mutation: drop `sigma = a.noise_level()` ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn micro_step_trains_at_the_planned_noise_level() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1521,6 +1602,9 @@ mod tests {
                 .micro_step(&f.dit, &f.vars, &cached, &(), &cfg, 2, sample, &Device::Cpu)
                 .unwrap();
             assert_eq!(got.to_bits(), expect.to_bits());
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::micro_step_trains_at_the_planned_noise_level");
         }
 
         fn depth_on() -> TrainingConfig {
@@ -1703,6 +1787,7 @@ mod training_adapter_tests {
     /// Mutations: install at strength 2 / swap `a`,`b` ⇒ the delta assert fails; skip a target ⇒ the
     /// count assert fails; preview scale 1.0 ⇒ the preview assert fails.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_adapter_adds_exactly_its_delta_and_the_preview_pass_removes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut dit, bare, _) = twin_dits();
@@ -1742,6 +1827,9 @@ mod training_adapter_tests {
                 "{path}: training pass not restored"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::training_adapter_tests::the_adapter_adds_exactly_its_delta_and_the_preview_pass_removes_it");
     }
 
     /// (b) + training: the adapter adds no trainable `Var`, a training step on the adapted DiT runs
@@ -1750,6 +1838,7 @@ mod training_adapter_tests {
     /// Mutations: skip the install ⇒ the loss assert fails; make the residual a `Var` collected into
     /// the set ⇒ the var-count assert fails.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn training_runs_against_the_adapter_and_saves_only_the_trainable_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -1810,6 +1899,9 @@ mod training_adapter_tests {
             }
         });
         assert_eq!(keys, trainable);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::training_adapter_tests::training_runs_against_the_adapter_and_saves_only_the_trainable_keys");
     }
 
     /// Previews render as the user will see the LoRA: `render_sample` on the adapted DiT produces
@@ -1818,6 +1910,7 @@ mod training_adapter_tests {
     /// Mutation: drop the `PREVIEW_PASS` switch in `render_sample` ⇒ the image assert fails; drop
     /// the `TRAIN_PASS` restore ⇒ the restored assert fails.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn render_sample_renders_without_the_adapter_and_restores_it() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -1864,6 +1957,9 @@ mod training_adapter_tests {
                 "{path}: not back on the training pass"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::training_adapter_tests::render_sample_renders_without_the_adapter_and_restores_it");
     }
 
     /// A module the DiT does not have, a non-LoRA key, or a missing file is a named error — never a

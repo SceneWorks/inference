@@ -269,18 +269,30 @@ impl Tensor {
 
     /// Reads a npy file and return the stored multi-dimensional array as a tensor.
     pub fn read_npy<T: AsRef<Path>>(path: T) -> Result<Self> {
-        let mut reader = File::open(path.as_ref())?;
+        #[cfg(feature = "model-inference-proof")]
+        let __input_path = path.as_ref();
+        let mut reader = File::open(crate::__model_input_choose!(path.as_ref(), __input_path))?;
         let header = read_header(&mut reader)?;
         let header = Header::parse(&header)?;
         if header.fortran_order {
             return Err(Error::Npy("fortran order not supported".to_string()));
         }
-        Self::from_reader(header.shape(), header.descr, &mut reader)
+        crate::__model_input_result!(
+            Self::from_reader(header.shape(), header.descr, &mut reader),
+            "candle-core::Tensor::read_npy",
+            TensorInput,
+            &[__input_path]
+        )
     }
 
     /// Reads a npz file and returns the stored multi-dimensional arrays together with their names.
     pub fn read_npz<T: AsRef<Path>>(path: T) -> Result<Vec<(String, Self)>> {
-        let zip_reader = BufReader::new(File::open(path.as_ref())?);
+        #[cfg(feature = "model-inference-proof")]
+        let __input_path = path.as_ref();
+        let zip_reader = BufReader::new(File::open(crate::__model_input_choose!(
+            path.as_ref(),
+            __input_path
+        ))?);
         let mut zip = zip::ZipArchive::new(zip_reader)?;
         let mut result = vec![];
         for i in 0..zip.len() {
@@ -297,12 +309,22 @@ impl Tensor {
             let s = Self::from_reader(header.shape(), header.descr, &mut reader)?;
             result.push((name, s))
         }
-        Ok(result)
+        crate::__model_input_result!(
+            Ok(result),
+            "candle-core::Tensor::read_npz",
+            TensorInput,
+            &[__input_path]
+        )
     }
 
     /// Reads a npz file and returns the stored multi-dimensional arrays for some specified names.
     pub fn read_npz_by_name<T: AsRef<Path>>(path: T, names: &[&str]) -> Result<Vec<Self>> {
-        let zip_reader = BufReader::new(File::open(path.as_ref())?);
+        #[cfg(feature = "model-inference-proof")]
+        let __input_path = path.as_ref();
+        let zip_reader = BufReader::new(File::open(crate::__model_input_choose!(
+            path.as_ref(),
+            __input_path
+        ))?);
         let mut zip = zip::ZipArchive::new(zip_reader)?;
         let mut result = vec![];
         for name in names.iter() {
@@ -321,7 +343,12 @@ impl Tensor {
             let s = Self::from_reader(header.shape(), header.descr, &mut reader)?;
             result.push(s)
         }
-        Ok(result)
+        crate::__model_input_result!(
+            Ok(result),
+            "candle-core::Tensor::read_npz_by_name",
+            TensorInput,
+            &[__input_path]
+        )
     }
 
     fn write<T: Write>(&self, f: &mut T) -> Result<()> {
@@ -428,7 +455,12 @@ impl NpzTensors {
             return Err(Error::Npy("fortran order not supported".to_string()));
         }
         let tensor = Tensor::from_reader(header.shape(), header.descr, &mut reader)?;
-        Ok(Some(tensor))
+        crate::__model_input_result!(
+            Ok(Some(tensor)),
+            "candle-core::NpzTensors::get",
+            TensorInput,
+            &[&self.path]
+        )
     }
 }
 

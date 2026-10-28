@@ -751,6 +751,7 @@ fn cuda_uuid_bytes_use_canonical_order_and_reject_mismatches() {
 
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "model inference; explicit MOSS fixture workflow"]
 fn cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload() {
     // This is actual CUDA execution, not a CPU oracle or a fallback. CI's CUDA lane owns the GPU.
     let device = Device::new_cuda(0).expect("CUDA lane requires an actual CUDA device");
@@ -771,6 +772,8 @@ fn cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_relo
     });
     verify_cuda_uuid(&actual, expected.as_deref()).expect("CUDA physical identity binding failed");
     native_graph_cases(device);
+    #[cfg(feature = "model-inference-proof")]
+    println!("MODEL_INFERENCE_BODY_COMPLETED tests::training_contract_tests::cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload");
 }
 
 #[test]

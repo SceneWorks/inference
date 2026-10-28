@@ -68,6 +68,7 @@ fn argmax(v: &[f32]) -> i32 {
     best as i32
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn append_generated_image_matches_reference() {
     let (w, case) = crate::compact_fixture::load(CASE_FIXTURE);
@@ -121,4 +122,6 @@ fn append_generated_image_matches_reference() {
         / peak;
     println!("append logits peak-rel={rel:.3e}");
     assert!(rel < 5e-3, "append logits peak-rel {rel:.3e} exceeds 5e-3");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED interleave_parity::append_generated_image_matches_reference");
 }

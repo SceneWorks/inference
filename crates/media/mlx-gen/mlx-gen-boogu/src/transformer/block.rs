@@ -764,6 +764,7 @@ mod tests {
     /// to prove. Both halves are asserted: the dense arm asserts it actually packed, and the
     /// quantized arm asserts the refusal **by name**.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn self_attention_packs_while_dense_and_is_refused_once_quantized() {
         // The divisibility facts the decision rests on, asserted as arithmetic so a constant drift
         // fails here rather than silently re-enabling an unsafe pack.
@@ -852,5 +853,7 @@ mod tests {
             Some(&mlx_gen::qkv::NoFusion::Disabled),
             "with no opt-in the block is split because fusion is off, and says so"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::block::tests::self_attention_packs_while_dense_and_is_refused_once_quantized");
     }
 }

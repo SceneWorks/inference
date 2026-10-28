@@ -62,10 +62,14 @@ pub fn case_request(case: &Value, config: &IrisConfig) -> GenerationRequest {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn every_control_matches_upstream_on_the_miniature() {
     cpu_process(
         "controls_parity::every_control_matches_upstream_on_the_miniature",
-        every_control_matches_upstream_on_the_miniature_body,
+        || {
+            every_control_matches_upstream_on_the_miniature_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED controls_parity::every_control_matches_upstream_on_the_miniature");
+        },
     );
 }
 

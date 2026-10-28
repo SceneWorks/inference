@@ -17,6 +17,7 @@ use crate::common::{assert_close, fixture, host_f32, meta_f32, meta_usize, tiny_
 
 const TOL: f32 = 2.5e-2;
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn rope_every_stage_and_velocity_match_upstream() {
     let w = fixture("qwen21_transformer.safetensors");
@@ -84,4 +85,6 @@ fn rope_every_stage_and_velocity_match_upstream() {
             TOL,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer_parity::rope_every_stage_and_velocity_match_upstream");
 }

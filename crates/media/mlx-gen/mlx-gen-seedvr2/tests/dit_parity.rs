@@ -39,11 +39,13 @@ fn metrics(got: &Array, exp: &Array) -> (f32, f32) {
     )
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn seedvr2_dit_matches_reference() {
     let dir = golden_dir();
     if !dir.join("dit_f32.safetensors").exists() {
         eprintln!("SKIP: dit goldens absent at {dir:?} (run tools/dump_seedvr2_goldens.py --component dit)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_dit_matches_reference; see preceding skip diagnostic");
         return;
     }
     let w = Weights::from_file(dir.join("dit_f32.safetensors")).expect("dit weights");
@@ -64,11 +66,14 @@ fn seedvr2_dit_matches_reference() {
     );
     assert!(cos > 0.999, "dit cosine {cos} too low");
     assert!(pr < 3e-2, "dit peak_rel {pr} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::seedvr2_dit_matches_reference");
 }
 
 /// 7B parity (sc-5197): the 36-layer pixel-mode-RoPE / GELU-MLP / no-output-ada variant. Exercises
 /// the `rope_pixel` path (normalized `linspace` positions, no temporal offset, `rope_on_text=false`).
 /// Goldens from `--component dit --model 7b` (`dit_7b_*`).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn seedvr2_dit_7b_matches_reference() {
     let dir = golden_dir();
@@ -76,6 +81,7 @@ fn seedvr2_dit_7b_matches_reference() {
         eprintln!(
             "SKIP: 7B dit goldens absent (run tools/dump_seedvr2_goldens.py --component dit --model 7b)"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_dit_7b_matches_reference; see preceding skip diagnostic");
         return;
     }
     let w = Weights::from_file(dir.join("dit_7b_f32.safetensors")).expect("7B dit weights");
@@ -96,4 +102,6 @@ fn seedvr2_dit_7b_matches_reference() {
     );
     assert!(cos > 0.999, "7B dit cosine {cos} too low");
     assert!(pr < 3e-2, "7B dit peak_rel {pr} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::seedvr2_dit_7b_matches_reference");
 }

@@ -587,6 +587,7 @@ mod tests {
     /// mode-dispatch plumbing to the packed-forward seam (ported from mlx `t2v_mode_matches_manual_cfg`;
     /// an internal-consistency test, no real weights / no conditioning).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn t2v_mode_matches_manual_cfg() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -619,6 +620,9 @@ mod tests {
         let want = (&e_u + ((&e_c - &e_u).unwrap() * omega as f64).unwrap()).unwrap();
         assert_eq!(got.dims(), noisy.dims());
         assert_eq!(max_abs(&got, &want), 0.0, "t2v must equal manual CFG");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED forward::tests::t2v_mode_matches_manual_cfg");
     }
 
     /// The video-only guidance combo (`Combos::v`) must carry EVERY conditioning video, mirroring the
@@ -648,6 +652,7 @@ mod tests {
     /// the same source under two different source-ids across combos) must produce bit-identical
     /// velocities to a fresh, cache-cold `PackedForward` on every call.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cached_velocity_matches_uncached() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -693,9 +698,15 @@ mod tests {
             max_abs(&warm, &id2) > 0.0,
             "distinct source-ids must differ"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED forward::tests::cached_velocity_matches_uncached"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn poisoned_patch_cache_recovers_on_next_embed() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -718,11 +729,15 @@ mod tests {
         assert_eq!(max_abs(&before.0, &after.0), 0.0);
         assert_eq!(max_abs(&before.1, &after.1), 0.0);
         assert_eq!(max_abs(&before.2, &after.2), 0.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED forward::tests::poisoned_patch_cache_recovers_on_next_embed");
     }
 
     /// A conditioning image extends the packed sequence but the sliced target velocity keeps the target's
     /// shape (ported from mlx `conditioning_source_preserves_target_shape`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn conditioning_source_preserves_target_shape() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -739,12 +754,16 @@ mod tests {
             noisy.dims(),
             "target velocity keeps target shape"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED forward::tests::conditioning_source_preserves_target_shape");
     }
 
     /// Every advertised mode actually runs end-to-end over the packed forward with the conditioning it
     /// consumes (no stubbed mode) and yields a finite, target-shaped velocity — the "a mode you advertise
     /// MUST run" bar. Exercises all 7 renderer modes.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn all_seven_modes_run_and_keep_shape() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -790,12 +809,18 @@ mod tests {
                 .all(|x| x.is_finite());
             assert!(finite, "{mode:?} produced non-finite velocity");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED forward::tests::all_seven_modes_run_and_keep_shape"
+        );
     }
 
     /// Every full-Bernini ViT-conditioned mode runs end-to-end over the packed forward with the
     /// planner's 4 prompt streams + its conditioning, and yields a finite, target-shaped velocity — the
     /// "a mode you advertise MUST run" bar for the `*_wapg` / `v2v_apg` planner path (sc-10995).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn all_five_vit_modes_run_and_keep_shape() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -853,6 +878,9 @@ mod tests {
                 .all(|x| x.is_finite());
             assert!(finite, "{mode:?} produced non-finite velocity");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED forward::tests::all_five_vit_modes_run_and_keep_shape");
     }
 
     /// F-096/F-161: the ViT-mode conditioning requirement + momentum-buffer count mappings.
@@ -882,6 +910,7 @@ mod tests {
     /// The second step sharing a buffer with the first must differ from that same step run against a
     /// fresh buffer.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn v2v_apg_momentum_persists_across_steps() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -936,6 +965,9 @@ mod tests {
             max_abs(&carried, &fresh_second) > 0.0,
             "persistent momentum must change the second step"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED forward::tests::v2v_apg_momentum_persists_across_steps");
     }
 
     /// `vae_txt_vit` dispatch: [`vit_one_step`] must equal the manual 4-forward combine via
@@ -943,6 +975,7 @@ mod tests {
     /// the `sample_one_step` stream/source routing to the packed-forward seam. Distinct streams make a
     /// wrong routing show up.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vae_txt_vit_dispatch_matches_manual() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1006,6 +1039,11 @@ mod tests {
             max_abs(&got, &want),
             0.0,
             "vae_txt_vit dispatch must equal manual combine"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED forward::tests::vae_txt_vit_dispatch_matches_manual"
         );
     }
 

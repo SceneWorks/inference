@@ -102,4 +102,6 @@ fn t2i_and_i2i_upsample_produce_nonempty_rewrites() {
     .expect("i2i upsample");
     println!("I2I rewrite: {i2i}");
     assert!(!i2i.trim().is_empty(), "I2I rewrite must be non-empty");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED caption_upsample_real_weights::t2i_and_i2i_upsample_produce_nonempty_rewrites");
 }

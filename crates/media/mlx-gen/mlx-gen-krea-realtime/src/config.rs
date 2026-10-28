@@ -313,7 +313,13 @@ impl KreaRealtimeConfig {
         let mut cfg = Self::krea_realtime_14b();
         let path = root.join("config.json");
         if path.exists() {
-            let text = std::fs::read_to_string(&path)?;
+            let text = mlx_gen::gen_core::__model_input_choose!(
+                std::fs::read_to_string(&path),
+                mlx_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+                    &path,
+                    "mlx-gen-krea-realtime::config::KreaRealtimeConfig::from_model_dir",
+                )
+            )?;
             let v: Value = serde_json::from_str(&text)
                 .map_err(|e| Error::Msg(format!("krea-realtime: parse config.json: {e}")))?;
             // The Wan DiT half auto-detects/overlays via the shared Wan loader, then we force the

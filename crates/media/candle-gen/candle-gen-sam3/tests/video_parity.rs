@@ -88,6 +88,9 @@ fn video_pcs_matches_oracle() {
     }
     println!("worst per-object mask cosine = {worst:.7}");
     assert!(worst > 0.999, "video PCS mask cosine {worst}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_parity::video_pcs_matches_oracle");
 }
 
 // --- F-014 (sc-8994): on-device mask selection ---------------------------------------------------
@@ -256,4 +259,7 @@ fn on_device_mask_selection_matches_full_readback_gpu() {
         "no threshold produced a non-empty kept-set — index_select readback path not exercised"
     );
     println!("F-014 on-device selection is bit-identical to full-readback across all thresholds");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_parity::on_device_mask_selection_matches_full_readback_gpu");
 }

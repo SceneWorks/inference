@@ -94,6 +94,8 @@ fn registered_base_renders_1024_at_exact_thirty_step_cfg_five_defaults() {
         repeated_rows < 102,
         "Base render has {repeated_rows} repeated adjacent rows"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED base_real_weights::registered_base_renders_1024_at_exact_thirty_step_cfg_five_defaults");
 }
 
 #[test]
@@ -124,4 +126,6 @@ fn cfg_five_uses_the_negative_prompt() {
         second.as_slice::<u8>(),
         "cfg=5 output ignored a changed negative prompt"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED base_real_weights::cfg_five_uses_the_negative_prompt");
 }

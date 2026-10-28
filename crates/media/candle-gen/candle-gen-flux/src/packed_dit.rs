@@ -155,9 +155,7 @@ impl AdaLayerNormZero {
         emb: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
         let p = self.linear.forward(&emb.silu()?)?.chunk(6, D::Minus1)?;
-        let normed = self
-            .norm
-            .forward(hidden)?
+        let normed = __model_proof_output!(self.norm.forward(hidden))?
             .broadcast_mul(&(p[1].unsqueeze(1)? + 1.0)?)?
             .broadcast_add(&p[0].unsqueeze(1)?)?;
         Ok((
@@ -172,9 +170,7 @@ impl AdaLayerNormZero {
     /// 3-chunk (single block): `(normed, gate)`.
     fn forward_three(&self, hidden: &Tensor, emb: &Tensor) -> Result<(Tensor, Tensor)> {
         let p = self.linear.forward(&emb.silu()?)?.chunk(3, D::Minus1)?;
-        let normed = self
-            .norm
-            .forward(hidden)?
+        let normed = __model_proof_output!(self.norm.forward(hidden))?
             .broadcast_mul(&(p[1].unsqueeze(1)? + 1.0)?)?
             .broadcast_add(&p[0].unsqueeze(1)?)?;
         Ok((normed, p[2].clone()))
@@ -240,8 +236,8 @@ impl JointAttention {
         let (heads, head_dim) = (self.heads, self.head_dim);
         let to_heads =
             |t: Tensor| -> Result<Tensor> { t.reshape((b, s, heads, head_dim))?.transpose(1, 2) };
-        let q = to_heads(q.forward(x)?)?.apply(nq)?;
-        let k = to_heads(k.forward(x)?)?.apply(nk)?;
+        let q = __model_proof_output!(to_heads(q.forward(x)?)?.apply(nq))?;
+        let k = __model_proof_output!(to_heads(k.forward(x)?)?.apply(nk))?;
         let v = to_heads(v.forward(x)?)?;
         Ok((q, k, v))
     }
@@ -484,8 +480,7 @@ fn apply_norm_ff(
     norm: &LayerNorm,
 ) -> Result<Tensor> {
     let hidden = (hidden + attn.broadcast_mul(&gate_msa.unsqueeze(1)?)?)?;
-    let normed = norm
-        .forward(&hidden)?
+    let normed = __model_proof_output!(norm.forward(&hidden))?
         .broadcast_mul(&(scale_mlp.unsqueeze(1)? + 1.0)?)?
         .broadcast_add(&shift_mlp.unsqueeze(1)?)?;
     let ff_out = ff.forward(&normed)?;
@@ -584,8 +579,10 @@ impl SingleBlock {
         let (heads, head_dim) = (self.heads, self.head_dim);
         let to_heads =
             |t: Tensor| -> Result<Tensor> { t.reshape((b, s, heads, head_dim))?.transpose(1, 2) };
-        let q = to_heads(self.to_q.forward(&norm_hidden)?)?.apply(&self.norm_q)?;
-        let k = to_heads(self.to_k.forward(&norm_hidden)?)?.apply(&self.norm_k)?;
+        let q =
+            __model_proof_output!(to_heads(self.to_q.forward(&norm_hidden)?)?.apply(&self.norm_q))?;
+        let k =
+            __model_proof_output!(to_heads(self.to_k.forward(&norm_hidden)?)?.apply(&self.norm_k))?;
         let v = to_heads(self.to_v.forward(&norm_hidden)?)?;
         let q = apply_rope(&q, pe)?.contiguous()?;
         let k = apply_rope(&k, pe)?.contiguous()?;
@@ -735,9 +732,7 @@ impl OutputHead {
             .norm_linear
             .forward(&emb.silu()?)?
             .chunk(2, D::Minus1)?;
-        let normed = self
-            .norm
-            .forward(hidden)?
+        let normed = __model_proof_output!(self.norm.forward(hidden))?
             .broadcast_mul(&(p[0].unsqueeze(1)? + 1.0)?)?
             .broadcast_add(&p[1].unsqueeze(1)?)?;
         self.proj_out.forward(&normed)
@@ -1413,6 +1408,7 @@ mod tests {
     /// `cat(txt,img)` single-block plumbing end-to-end. `guidance_embed = true` also exercises the dev
     /// guidance-embedder path. A 2-double / 2-single tiny config keeps it GPU-free.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_dit_dense_forward_shape_and_finite() -> Result<()> {
         let dev = Device::Cpu;
         let cfg = tiny_cfg(true);
@@ -1433,10 +1429,13 @@ mod tests {
         assert_eq!(out.dims(), &[b, img_seq, 64]);
         let max = out.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(max.is_finite(), "DiT output must be finite, got max {max}");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::packed_dit_dense_forward_shape_and_finite");
         Ok(())
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_packed_conditioning_is_reused_by_base_and_control_forwards() -> Result<()> {
         let dev = Device::Cpu;
         let cfg = tiny_cfg(true);
@@ -1541,10 +1540,13 @@ mod tests {
             .is_err());
         prepared.device = candle_gen::candle_core::DeviceLocation::Metal { gpu_id: 3 };
         assert!(prepared.validate(&img, &img_ids, &txt, &txt_ids).is_err());
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::prepared_packed_conditioning_is_reused_by_base_and_control_forwards");
         Ok(())
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dense_streamed_blocks_match_resident_window_one() -> Result<()> {
         let dev = Device::Cpu;
         let cfg = tiny_cfg(true);
@@ -1584,6 +1586,8 @@ mod tests {
             )
             .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
         assert_eq!(expected.to_vec3::<f32>()?, actual.to_vec3::<f32>()?);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::dense_streamed_blocks_match_resident_window_one");
         Ok(())
     }
 
@@ -1667,6 +1671,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_injected_window_one_matches_resident_across_both_namespaces() -> Result<()> {
         let dev = Device::Cpu;
         let (resident, streamed) = randomized_tiny_dit_pair(&dev)?;
@@ -1717,6 +1722,8 @@ mod tests {
             )
             .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
         assert_eq!(expected.to_vec3::<f32>()?, actual.to_vec3::<f32>()?);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::streamed_injected_window_one_matches_resident_across_both_namespaces");
         Ok(())
     }
 
@@ -1724,6 +1731,7 @@ mod tests {
     /// generic post-block injector). Window-one streaming must preserve its absolute block index and
     /// populate exactly one cached image-token K/V pair per adapted block.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache() -> Result<()> {
         let dev = Device::Cpu;
         let (resident, streamed) = randomized_tiny_dit_pair(&dev)?;
@@ -1793,10 +1801,13 @@ mod tests {
             max_abs_diff(&baseline, &expected) > 1e-6,
             "nonzero XLabs residual must affect the packed DiT output"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::streamed_xlabs_window_one_matches_resident_and_populates_each_block_cache");
         Ok(())
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_control_window_one_matches_resident_with_absolute_residual_indices() -> Result<()> {
         let dev = Device::Cpu;
         let (resident, streamed) = randomized_tiny_dit_pair(&dev)?;
@@ -1859,10 +1870,13 @@ mod tests {
             Some(&guidance),
         )?;
         assert!(max_abs_diff(&baseline, &expected) > 1e-6);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices");
         Ok(())
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_window_one_observes_cancel_before_next_block_materialization() -> Result<()> {
         struct CancelAfterFirst<'a> {
             cancel: &'a candle_gen::gen_core::CancelFlag,
@@ -1922,12 +1936,15 @@ mod tests {
             .expect_err("cancel after block zero must stop the next window");
         assert!(matches!(error, candle_gen::CandleError::Canceled));
         assert_eq!(&*injector.visited.borrow(), &[0]);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::streamed_window_one_observes_cancel_before_next_block_materialization");
         Ok(())
     }
 
     /// `forward_injected(.., None)` is byte-identical to `forward(..)` — the seam is inert with no
     /// injector, so the txt2img packed path is unperturbed (mirrors the BFL `IpFlux` invariant).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_injected_none_matches_forward() -> Result<()> {
         let dev = Device::Cpu;
         let dit = randomized_tiny_dit(&dev)?;
@@ -1948,12 +1965,15 @@ mod tests {
             0.0,
             "None injector must be a no-op"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::forward_injected_none_matches_forward");
         Ok(())
     }
 
     /// A nonzero injected residual (after a double block AND a single block) changes the output — the
     /// seam is actually wired into both block loops, not silently dropped.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_injected_residual_changes_output() -> Result<()> {
         let dev = Device::Cpu;
         let dit = randomized_tiny_dit(&dev)?;
@@ -1988,6 +2008,8 @@ mod tests {
             d > 1e-4,
             "a nonzero injected residual must change the output: max|Δ| = {d}"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::forward_injected_residual_changes_output");
         Ok(())
     }
 
@@ -2417,7 +2439,15 @@ mod tests {
         };
 
         let v = vendored.forward(&img, &img_ids, &txt, &txt_ids, &ts, &pooled, guid.as_ref())?;
-        let s = stock.forward(&img, &img_ids, &txt, &txt_ids, &ts, &pooled, guid.as_ref())?;
+        let s = __model_proof_output!(stock.forward(
+            &img,
+            &img_ids,
+            &txt,
+            &txt_ids,
+            &ts,
+            &pooled,
+            guid.as_ref()
+        ))?;
         assert_eq!(v.dims(), s.dims());
         let d = max_abs_diff(&v, &s);
         assert!(
@@ -2431,23 +2461,29 @@ mod tests {
     /// Tight anchor: single-block + IO + output-head path is bit-exact against stock (no image-FF GELU
     /// divergence, since `depth = 0`). Runs both the schnell (no guidance) and dev (guidance) heads.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_dit_single_and_io_matches_stock_bfl_dense() -> Result<()> {
         for guidance in [false, true] {
             let d = run_parity(0, 2, guidance, 1e-4)?;
             assert!(d < 1e-4, "single-block/IO parity max|Δ| = {d}");
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::vendored_dit_single_and_io_matches_stock_bfl_dense");
         Ok(())
     }
 
     /// Full-network anchor: 2 double + 2 single blocks, bounded at 5e-3 (absorbs only the documented
     /// image-FF `gelu_erf` vs stock `gelu_tanh` gap; a structural bug would diverge by O(1)).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_dit_full_network_close_to_stock_bfl_dense() -> Result<()> {
         for guidance in [false, true] {
             let d = run_parity(2, 2, guidance, 5e-3)?;
             // Sanity: the divergence must be well within the documented GELU-variant band, not O(1).
             assert!(d < 5e-3, "full-network parity max|Δ| = {d}");
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::vendored_dit_full_network_close_to_stock_bfl_dense");
         Ok(())
     }
 
@@ -2478,9 +2514,12 @@ mod tests {
     /// output head to shift-first breaks it (sc-10914). One double block is already covered by the tiny
     /// [`vendored_dit_full_network_close_to_stock_bfl_dense`]; kept to depth=0 here to bound CI cost.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_dit_real_config_matches_stock_bfl_dense() -> Result<()> {
         let d = run_parity_cfg(real_cfg(), 0, 1, true, 1e-4)?;
         assert!(d < 1e-4, "real-config single/IO parity max|Δ| = {d}");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::vendored_dit_real_config_matches_stock_bfl_dense");
         Ok(())
     }
 }

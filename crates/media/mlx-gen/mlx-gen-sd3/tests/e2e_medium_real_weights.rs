@@ -187,6 +187,8 @@ fn run_smoke(label: &str, w: u32, h: u32, steps: u32, quant: Quant, guidance: f3
 #[ignore = "needs the SD3.5-Medium snapshot (set SD3_MEDIUM_SNAPSHOT) + Metal"]
 fn e2e_medium_1024_q8() {
     run_smoke("1024_q8", 1024, 1024, 40, Quant::Q8, 5.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_medium_real_weights::e2e_medium_1024_q8");
 }
 
 /// Faster correctness pre-check at a smaller resolution / fewer steps (Q4) — proves the path before
@@ -195,6 +197,8 @@ fn e2e_medium_1024_q8() {
 #[ignore = "needs the SD3.5-Medium snapshot (set SD3_MEDIUM_SNAPSHOT) + Metal"]
 fn e2e_medium_512_q4_quick() {
     run_smoke("512_q4", 512, 512, 28, Quant::Q4, 5.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_medium_real_weights::e2e_medium_512_q4_quick");
 }
 
 /// HIGHER-RES acceptance: 1440² (the validated Medium ceiling — pos_embed_max_size 384 spans a 90×90
@@ -204,4 +208,6 @@ fn e2e_medium_512_q4_quick() {
 #[ignore = "needs the SD3.5-Medium snapshot (set SD3_MEDIUM_SNAPSHOT) + Metal"]
 fn e2e_medium_1440_q8_highres() {
     run_smoke("1440_q8", 1440, 1440, 40, Quant::Q8, 5.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_medium_real_weights::e2e_medium_1440_q8_highres");
 }

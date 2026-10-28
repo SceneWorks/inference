@@ -1539,7 +1539,14 @@ fn fixture_tier(spec: &LoadSpec) -> MemoryNumericTier {
 }
 
 fn quant_manifest(path: &std::path::Path) -> CoreResult<Option<(i32, usize)>> {
-    let bytes = std::fs::read(path).map_err(|error| {
+    let bytes = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(path),
+"crates/media/mlx-gen/mlx-gen-bernini/src/memory_strategy.rs::quant_manifest::std::fs::read@72701",
+ArtifactInput,
+path,
+|__model_input_path| std::fs::read(__model_input_path)
+)
+    .map_err(|error| {
         CoreError::Unsupported(format!(
             "bernini numeric tier cannot read {}: {error}",
             path.display()

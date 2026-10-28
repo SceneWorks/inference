@@ -35,6 +35,7 @@ fn inputs(w: &Weights) -> (Array, Array, Array) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn block_matches_python_reference() {
     let w = load();
     let block = ZImageTransformerBlock::from_weights(&w, "w", CFG).unwrap();
@@ -51,9 +52,13 @@ fn block_matches_python_reference() {
         close,
         "block output diverged from Python reference beyond 1e-2"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED z_image_block::block_matches_python_reference");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn zero_scale_adapter_install_is_noop() {
     let w = load();
     let (x, freqs_cis, t_emb) = inputs(&w);
@@ -75,9 +80,13 @@ fn zero_scale_adapter_install_is_noop() {
 
     let out = block.forward(&x, &freqs_cis, &t_emb).unwrap();
     assert!(array_eq(&out, &base, false).unwrap().item::<bool>());
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED z_image_block::zero_scale_adapter_install_is_noop");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn nonzero_adapter_install_changes_output() {
     let w = load();
     let (x, freqs_cis, t_emb) = inputs(&w);
@@ -99,6 +108,11 @@ fn nonzero_adapter_install_changes_output() {
 
     let out = block.forward(&x, &freqs_cis, &t_emb).unwrap();
     assert!(!array_eq(&out, &base, false).unwrap().item::<bool>());
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED z_image_block::nonzero_adapter_install_changes_output"
+    );
 }
 
 #[test]

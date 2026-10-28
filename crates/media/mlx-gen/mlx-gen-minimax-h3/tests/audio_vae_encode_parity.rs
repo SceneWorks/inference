@@ -352,6 +352,7 @@ fn adaptive_pool_matches_the_reference() {
 ///
 /// Held separately from `encode` because an end-to-end golden cannot say which of the trunk and
 /// `pre_block` is wrong.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn encoder_trunk_has_the_reference_geometry() {
     let f = fixture();
@@ -374,6 +375,8 @@ fn encoder_trunk_has_the_reference_geometry() {
         &[2, 96, 32],
         "the reference dumps NCL; a port that compared without transposing would be checking          a transposed tensor against itself only because 32 == 32 here"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::encoder_trunk_has_the_reference_geometry");
 }
 
 /// Where the trunk's residual comes from: one convolution, then one residual unit, then one
@@ -385,6 +388,7 @@ fn encoder_trunk_has_the_reference_geometry() {
 /// structural error — a wrong dilation, a wrong `ceil(stride/2)` padding, a mis-ordered Snake —
 /// is order-1 wrong at the FIRST stage that contains it, not 1e-6 wrong there and 1e-2 wrong
 /// twenty layers later.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_trunk_residual_is_accumulated_round_off() {
     let f = fixture();
@@ -443,6 +447,8 @@ fn the_trunk_residual_is_accumulated_round_off() {
         TOL,
         "the whole DAC trunk",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::the_trunk_residual_is_accumulated_round_off");
 }
 
 /// The attention branch on its own — `attn(norm1(x))`, before the residual sum can hide it.
@@ -450,6 +456,7 @@ fn the_trunk_residual_is_accumulated_round_off() {
 /// This is the piece that carries the causal mask, the head **mean-pool** and the adaptive pool,
 /// and the reference dumps it separately for exactly that reason. The LayerNorm is applied here
 /// rather than inside [`AttnProjection`] so the branch is genuinely isolated.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn attention_branch_matches_the_reference() {
     let f = fixture();
@@ -510,12 +517,15 @@ fn attention_branch_matches_the_reference() {
         "the attention branch and the block output are near-identical ({branch_gap:.3e}); the \
          residual assembly is not being exercised"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::attention_branch_matches_the_reference");
 }
 
 /// `AutoencoderKLMiniMaxH3Audio.encode`: trunk → `pre_block` → `mean_proj` / `logs_proj`.
 ///
 /// Both heads are checked, and `std = exp(logs)` with them: the pipeline only ever consumes
 /// `mode()`, so a wrong `logs_proj` would otherwise never be observed by anything.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn encode_matches_the_reference() {
     let f = fixture();
@@ -556,10 +566,15 @@ fn encode_matches_the_reference() {
 
     // `mode()` is bit-for-bit `mean_proj`'s output, as the reference documents.
     assert_eq!(values(posterior.mode()), values(posterior.mean()));
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::encode_matches_the_reference"
+    );
 }
 
 /// `encode` zero-pads on the RIGHT to a whole number of hops, so a clip that is not a multiple of
 /// 800 samples still produces `ceil(S / 800)` frames — and the same ones the padded clip does.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn encode_right_pads_to_a_whole_hop() {
     let f = fixture();
@@ -595,6 +610,10 @@ fn encode_right_pads_to_a_whole_hop() {
     assert!(
         peak > MUTATION_FLOOR,
         "the padded and unpadded clips encode identically ({peak:.3e}); the pad is untested"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::encode_right_pads_to_a_whole_hop"
     );
 }
 
@@ -702,6 +721,7 @@ fn a_mismatched_configuration_is_rejected() {
 
 /// The model is MONO. A stereo clip is two BATCH items, and a `[1, 2, samples]` packing — the
 /// plausible transposition — is rejected rather than encoded as something the model never saw.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn mis_packed_waveforms_are_rejected() {
     let f = fixture();
@@ -733,6 +753,10 @@ fn mis_packed_waveforms_are_rejected() {
         &wave.reshape(&[2, 1, 320, 1]).unwrap(),
         "rank 4 is not [B, 1, S]",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::mis_packed_waveforms_are_rejected"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -744,6 +768,7 @@ fn mis_packed_waveforms_are_rejected() {
 ///
 /// Cross-checked against the *other* module's implementation rather than against a restatement of
 /// the same formula: the two are supposed to be inverses, and only running both can show it.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn normalization_is_the_decoders_exact_inverse() {
     let f = fixture();
@@ -818,6 +843,8 @@ fn normalization_is_the_decoders_exact_inverse() {
         msg.contains("cannot normalize a rank-1 latent"),
         "the rank guard must be what rejects this: {msg}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::normalization_is_the_decoders_exact_inverse");
 }
 
 /// The audio posterior's second parameter is a log **standard deviation** with **no clamp** — not
@@ -923,6 +950,7 @@ fn fixture_is_not_degenerate() {
 /// One representative per role, including both halves of a weight-norm pair (a port that read
 /// only `weight_v` would encode plausibly), the `Snake1d` alphas, the three separately-stored
 /// attention biases, and both ends of the residual stack.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn every_weight_is_load_bearing() {
     let baseline = encode_with(|_| {});
@@ -970,6 +998,10 @@ fn every_weight_is_load_bearing() {
              {MUTATION_FLOOR:.1e} floor — it is not wired into the graph"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::every_weight_is_load_bearing"
+    );
 }
 
 /// **The key bias is mathematically inert, which is why it ships as a frozen zero buffer** — and
@@ -984,6 +1016,7 @@ fn every_weight_is_load_bearing() {
 /// * a checkpoint that shipped a non-zero key bias would still be honoured — the port
 ///   concatenates whatever is stored, and the measured inertness below is a property of softmax,
 ///   not of the loader ignoring the tensor.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_key_bias_is_read_and_is_inert_by_construction() {
     // Deleting it is a load error, so the tensor is genuinely required.
@@ -1048,6 +1081,8 @@ fn the_key_bias_is_read_and_is_inert_by_construction() {
         q_peak > peak * 50.0,
         "perturbing q_bias ({q_peak:.3e}) is no louder than perturbing the inert key bias          ({peak:.3e}); the three biases are not landing on their own thirds"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::the_key_bias_is_read_and_is_inert_by_construction");
 }
 
 /// The single-convolution residual is **MLX's convolution kernel**, not the port's weights — and
@@ -1084,6 +1119,7 @@ fn the_key_bias_is_read_and_is_inert_by_construction() {
 /// Every gate here is an upper bound instead, and the budget in (4) degrades gracefully to
 /// `struct_abs` on a host with an exact kernel rather than asserting a floor that host has no
 /// reason to have.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_matmul_free_convolution_reproduces_the_reference_exactly() {
     let f = fixture();
@@ -1217,6 +1253,8 @@ fn a_matmul_free_convolution_reproduces_the_reference_exactly() {
         obs_abs <= budget * BUDGET_SLACK,
         "WnConv1d strays {obs_abs:.3e} from the reference, but this host's kernel precision          ({tap_err:.3e} per tap) and the port's own structural residual ({struct_abs:.3e}) only          account for {budget:.3e} — the excess is NOT kernel round-off"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::a_matmul_free_convolution_reproduces_the_reference_exactly");
 }
 
 /// The three structural transforms this port could plausibly get wrong, each shape-identical to
@@ -1225,6 +1263,7 @@ fn a_matmul_free_convolution_reproduces_the_reference_exactly() {
 /// The generator measured the same three on the REFERENCE and recorded them in the fixture's
 /// metadata (`fixture_provenance_is_the_converted_reference` asserts those are large); this is the
 /// in-repo half of that contract, applied to the loader.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn structural_transforms_are_load_bearing() {
     let baseline = encode_with(|_| {});
@@ -1310,6 +1349,8 @@ fn structural_transforms_are_load_bearing() {
         peak > MUTATION_FLOOR,
         "the posterior heads are interchangeable"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::structural_transforms_are_load_bearing");
 }
 
 /// `pre_block`'s attention is **causal**: perturbing the last row of its input must leave every
@@ -1317,6 +1358,7 @@ fn structural_transforms_are_load_bearing() {
 ///
 /// This cannot be checked end-to-end — the convolutional trunk is symmetrically padded and is not
 /// causal — which is why `AttnProjection` is public.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn attention_does_not_look_ahead() {
     let f = fixture();
@@ -1369,10 +1411,15 @@ fn attention_does_not_look_ahead() {
         tail_gap > MUTATION_FLOOR,
         "the perturbation never reached the last row ({tail_gap:.3e}); the probe is inert"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::attention_does_not_look_ahead"
+    );
 }
 
 /// The `pre_block` head count changes the result, so it is a real parameter rather than a
 /// spelling — and the shipped [`ATTN_PROJ_HEADS`] is what `from_weights` uses.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn head_count_is_load_bearing() {
     let f = fixture();
@@ -1414,6 +1461,8 @@ fn head_count_is_load_bearing() {
     )
     .is_err());
     assert_eq!(ATTN_PROJ_HEADS, 8, "the published checkpoint uses 8 heads");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::head_count_is_load_bearing");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1555,4 +1604,6 @@ fn real_weight_encode_matches_the_diffusers_reference() {
         orphans.is_empty(),
         "published tensors that neither half reads: {orphans:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::real_weight_encode_matches_the_diffusers_reference");
 }

@@ -363,4 +363,6 @@ fn every_tier_renders_the_reference_edit_and_the_boogu_group_size_fails_the_gate
         );
         mlx_rs::memory::clear_cache();
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_quant_real_weights::every_tier_renders_the_reference_edit_and_the_boogu_group_size_fails_the_gate");
 }

@@ -157,7 +157,12 @@ fn packed_component(root: &Path, component: &str) -> Result<bool> {
     };
     let config: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| CandleError::Msg(format!("{LABEL}: parse {}: {error}", path.display())))?;
-    Ok(candle_gen::quant::PackedConfig::from_config(&config).is_some())
+    candle_gen::gen_core::__model_input_result!(
+        Ok(candle_gen::quant::PackedConfig::from_config(&config).is_some()),
+        "candle-gen-sd3::training::packed_component/configuration",
+        Configuration,
+        &[&path]
+    )
 }
 
 fn load_large(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
@@ -731,6 +736,7 @@ mod tests {
     /// sc-2127: one installed adapter set trains on latents of two bucket sizes through the real
     /// MMDiT (the positional table is cropped per forward, so no size is baked in at load).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn one_adapter_set_trains_on_two_bucket_sizes() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -766,6 +772,9 @@ mod tests {
                 "side {side}: the bucket's step must reach the shared adapter"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::one_adapter_set_trains_on_two_bucket_sizes");
     }
 
     #[test]
@@ -829,6 +838,7 @@ mod tests {
     /// sc-24828: the subject-mask weight reaches the trainer's loss. An all-ones map is the unweighted
     /// loss; an all-zero map zeroes the loss AND every adapter gradient; a half map lands between.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_the_step_loss() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -885,6 +895,9 @@ mod tests {
         let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
         let half = run(Some(&map(&half))).to_scalar::<f32>().unwrap();
         assert!(half > 0.0 && half < plain, "{half} vs {plain}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_the_step_loss");
     }
 
     #[test]
@@ -894,6 +907,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn backward_reaches_real_mmdit_lora_residuals() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -946,6 +960,9 @@ mod tests {
             2,
             "the one attn2 projection has A/B factors"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::backward_reaches_real_mmdit_lora_residuals");
     }
 
     /// Epic 2123 depth anchoring (sc-24830) on the candle SD3.5 trainer: the tiny MMDiT + a
@@ -955,6 +972,7 @@ mod tests {
         use candle_gen::candle_core::backprop::GradStore;
         use candle_gen::candle_core::Var;
         use candle_gen::gen_core::train::{AuxLossSchedule, DepthModelSize};
+        use rand::{rngs::StdRng, SeedableRng};
 
         fn schedule() -> AuxLossSchedule {
             AuxLossSchedule {
@@ -973,36 +991,83 @@ mod tests {
             noise: Tensor,
         }
 
+        /// `N(0, std²)` of shape `dims` from the seeded `rng`.
+        fn randn_seeded(rng: &mut StdRng, std: f32, dims: &[usize]) -> Tensor {
+            let n = dims.iter().product();
+            let v: Vec<f32> = candle_gen::seeded_normal_vec(rng, n)
+                .into_iter()
+                .map(|x| x * std)
+                .collect();
+            Tensor::from_vec(v, dims, &Device::Cpu).unwrap()
+        }
+
+        /// Redraw every random-init var of `vm` from `rng`, in name order (the map is a `HashMap`),
+        /// at candle-nn's own init scale: Kaiming-normal weights `√(2/fan_in)` and `±1/√fan_in`
+        /// biases (std `1/√(3·fan_in)`). Constant-init vars (norm γ/β) are left as they are.
+        fn reseed_varmap(vm: &VarMap, rng: &mut StdRng) {
+            let data = vm.data().lock().unwrap();
+            let fan_in = |dims: &[usize]| dims[1..].iter().product::<usize>() as f32;
+            let mut names: Vec<&String> = data.keys().collect();
+            names.sort();
+            for name in names {
+                let v = &data[name];
+                let vals = v
+                    .as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                if vals.iter().all(|x| *x == vals[0]) {
+                    continue;
+                }
+                let std = if v.dims().len() >= 2 {
+                    (2.0 / fan_in(v.dims())).sqrt()
+                } else {
+                    let w = name
+                        .strip_suffix("bias")
+                        .and_then(|stem| data.get(&format!("{stem}weight")))
+                        .unwrap_or_else(|| panic!("random-init 1-D var {name} has no weight"));
+                    (3.0 * fan_in(w.dims())).sqrt().recip()
+                };
+                v.set(&randn_seeded(rng, std, v.dims())).unwrap();
+            }
+        }
+
+        /// Seeded: candle's CPU backend ignores `Device::set_seed`, so `Tensor::randn` and the
+        /// `VarMap` init draw from the process-global RNG; a rare draw pushes the tiny random
+        /// decoder's output outside `[0, 1]` at every pixel, its final clamp zeroes every adapter
+        /// gradient, and the depth test fails intermittently (the SDXL / Lens fixtures' flake).
+        /// Every tensor here comes from one `StdRng`.
         fn fixture() -> Fixture {
             let dev = Device::Cpu;
+            let mut rng = StdRng::seed_from_u64(0x5d3d_2123);
             let cfg = tiny_cfg();
             let vm = VarMap::new();
             let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
             let mut transformer = Sd3Transformer::new(&cfg, vb).unwrap();
+            reseed_varmap(&vm, &mut rng);
             // Downstream of SDPA (as the other SD3 tests): exercises the MMDiT-X route.
             let targets = vec!["attn2.to_out.0".to_string()];
             let set =
                 build_adapt_lora_targets(&mut transformer, &targets, 2, 2.0, 7, &dev).unwrap();
             for v in &set.vars {
-                v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                v.set(&randn_seeded(&mut rng, 0.02, v.as_tensor().dims()))
                     .unwrap();
             }
             let shape = [1usize, 16, 4, 4];
             Fixture {
                 transformer,
                 vars: set.vars,
-                x0: Tensor::randn(0f32, 1f32, &shape, &dev).unwrap(),
+                x0: randn_seeded(&mut rng, 1.0, &shape),
                 conditioning: Sd3Conditioning {
-                    context: Tensor::randn(
-                        0f32,
-                        1f32,
-                        (1, cfg.context_seq_len(), cfg.joint_attention_dim),
-                        &dev,
-                    )
-                    .unwrap(),
-                    pooled: Tensor::randn(0f32, 1f32, (1, cfg.pooled_dim), &dev).unwrap(),
+                    context: randn_seeded(
+                        &mut rng,
+                        1.0,
+                        &[1, cfg.context_seq_len(), cfg.joint_attention_dim],
+                    ),
+                    pooled: randn_seeded(&mut rng, 1.0, &[1, cfg.pooled_dim]),
                 },
-                noise: Tensor::randn(0f32, 1f32, &shape, &dev).unwrap(),
+                noise: randn_seeded(&mut rng, 1.0, &shape),
             }
         }
 
@@ -1053,6 +1118,7 @@ mod tests {
         /// compute the diffusion term unconditionally ⇒ red; keep the sampled σ in `plan_sigma` on
         /// an aux step ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_only_step_trains_the_adapter_through_depth_alone() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1085,6 +1151,9 @@ mod tests {
                 "no LoRA B gradient from the depth term"
             );
             assert_eq!(plan_sigma(&StepSample::plain(0, 0), 0.3).unwrap().0, 0.3);
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_only_step_trains_the_adapter_through_depth_alone");
         }
 
         /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
@@ -1125,6 +1194,7 @@ mod tests {
         /// The aux term is the depth loss of THE trainer's x0 estimate `x_t − σ·v`, recomputed
         /// independently. Mutation: `FlowX0MinusNoise` in `step_loss` ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1146,11 +1216,15 @@ mod tests {
                 .to_scalar::<f32>()
                 .unwrap();
             assert_eq!(l.aux.unwrap().to_bits(), want.to_bits());
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_term_is_the_depth_loss_of_the_recovered_x0");
         }
 
         /// (c) Depth off is bit-identical to the pre-epic-2123 step (reproduced verbatim).
         /// Mutation: perturb the `None` combine ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn depth_off_is_bit_identical_to_the_legacy_step() {
             let f = fixture();
             let (l, g) = run(&f, 0.5, None);
@@ -1168,6 +1242,9 @@ mod tests {
             for v in &f.vars {
                 assert_eq!(grad_bits(&g, v), grad_bits(&lg, v));
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::depth_off_is_bit_identical_to_the_legacy_step");
         }
 
         fn depth_on() -> TrainingConfig {

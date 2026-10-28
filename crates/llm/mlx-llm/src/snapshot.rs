@@ -694,8 +694,14 @@ fn write_hf_snapshot_inner(
     // config.json is required — it carries the architecture + shapes the loader dispatches on. Read
     // it as a Value so the writer can add the quantization block; all other keys pass through.
     let config_path = source.join("config.json");
-    let config_text = std::fs::read_to_string(&config_path)
-        .map_err(|e| Error::Config(format!("read {}: {e}", config_path.display())))?;
+    let config_text = crate::__model_input_reader!(
+std::fs::read_to_string(&config_path),
+"crates/llm/mlx-llm/src/snapshot.rs::write_hf_snapshot_inner::std::fs::read_to_string@32724",
+ArtifactInput,
+&config_path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+    .map_err(|e| Error::Config(format!("read {}: {e}", config_path.display())))?;
     let mut config: Value = serde_json::from_str(&config_text)
         .map_err(|e| Error::Config(format!("parse {}: {e}", config_path.display())))?;
     if drop_native_mtp {
@@ -761,7 +767,13 @@ fn write_json_string(path: &Path, value: &Value) -> Result<()> {
 
 /// Read a file to a string, returning `None` if it does not exist (other IO errors propagate).
 fn read_to_string_if_exists(path: &Path) -> Result<Option<String>> {
-    match std::fs::read_to_string(path) {
+    match crate::__model_input_reader!(
+std::fs::read_to_string(path),
+"crates/llm/mlx-llm/src/snapshot.rs::read_to_string_if_exists::std::fs::read_to_string@35710",
+ArtifactInput,
+path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::Msg(format!("read {}: {e}", path.display()))),
@@ -965,6 +977,7 @@ pub(crate) mod tests {
     /// projection path, so a dense `mtp.fc` under a `quantization` block fails the load — and the
     /// stored head drafts exactly what the load-time-quantized head drafts, dense and MoE.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn qwen35_native_mtp_head_round_trips_through_a_quantized_snapshot() {
         for moe in [false, true] {
             let spec = QuantSpec::q4();
@@ -1032,12 +1045,15 @@ pub(crate) mod tests {
                 "moe={moe}: stored/load-time MTP parity max_abs={max_abs}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED snapshot::tests::qwen35_native_mtp_head_round_trips_through_a_quantized_snapshot");
     }
 
     /// `write_hf_snapshot_without_native_mtp` (sc-24446) writes the plain decoder: no `mtp.*`
     /// tensor, `mtp_num_hidden_layers: 0`, a model without a head whose body is the full
     /// snapshot's — dense and MoE.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn qwen35_snapshot_without_native_mtp_loads_the_plain_decoder() {
         for moe in [false, true] {
             let label = if moe { "moe" } else { "dense" };
@@ -1100,6 +1116,8 @@ pub(crate) mod tests {
             };
             assert_eq!(logits(&with_head), logits(&without), "moe={moe}: same body");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED snapshot::tests::qwen35_snapshot_without_native_mtp_loads_the_plain_decoder");
     }
 
     fn qwen35_load_error(result: Result<Qwen35Model>, context: &str) -> Error {
@@ -1159,6 +1177,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn qwen35_dense_and_moe_q4_q8_round_trip_match_load_time_quantization() {
         for moe in [false, true] {
             for spec in [QuantSpec::q4(), QuantSpec::q8()] {
@@ -1267,6 +1286,8 @@ pub(crate) mod tests {
                 assert!(max_abs <= 1e-5, "stored/load-time parity max_abs={max_abs}");
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED snapshot::tests::qwen35_dense_and_moe_q4_q8_round_trip_match_load_time_quantization");
     }
 
     #[test]
@@ -1389,6 +1410,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn streaming_q4_q8_match_direct_quantization() {
         let key = "model.layers.0.self_attn.q_proj.weight".to_string();
         let data: Vec<f32> = (0..128)
@@ -1456,6 +1478,8 @@ pub(crate) mod tests {
                     .unwrap();
             assert_eq!(config["quantization"]["bits"], spec.bits);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED snapshot::tests::streaming_q4_q8_match_direct_quantization");
     }
 
     /// Scaled synthetic RSS probe: 16 × 2048² f32 source tensors (256 MiB aggregate,

@@ -125,6 +125,8 @@ fn short_train_produces_loadable_adapter() {
         out.adapter_path.display(),
         std::fs::metadata(&out.adapter_path).unwrap().len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_real_weights::short_train_produces_loadable_adapter");
 }
 
 /// The same short run with **gradient checkpointing** on — exercises the
@@ -175,4 +177,6 @@ fn short_train_checkpointed_produces_loadable_adapter() {
         "[sc-7577] ✅ checkpointed adapter {}",
         out.adapter_path.display()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_real_weights::short_train_checkpointed_produces_loadable_adapter");
 }

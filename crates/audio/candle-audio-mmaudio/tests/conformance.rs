@@ -23,6 +23,16 @@
 //! `ext_weights/` or at its root), or leave unset to resolve the pinned checkpoint via the audio
 //! lane's F-029 hub path (downloads ~907 MB into the ordinary HF cache on first run).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use candle_audio_mmaudio as sf;
 use candle_audio_mmaudio::candle_audio::candle_core::Device;
 use image::{Rgb, RgbImage};
@@ -102,6 +112,9 @@ fn synchformer_features_shape_finite_deterministic() {
         a.iter().cloned().fold(f32::INFINITY, f32::min),
         a.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED synchformer_features_shape_finite_deterministic");
 }
 
 #[test]
@@ -142,4 +155,7 @@ fn synchformer_features_are_frame_varying() {
         moving_seg_diff > static_seg_diff,
         "a moving clip's segments must vary more than a static clip's (moving={moving_seg_diff}, static={static_seg_diff})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED synchformer_features_are_frame_varying");
 }

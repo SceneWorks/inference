@@ -784,6 +784,7 @@ mod tests {
     /// LoRA factors yields a finite loss and a gradient on **every** adapter `Var` (backprop reaches the
     /// LoRA seam through the composable softmax/RMSNorm of the single-stream blocks + final layer).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn backward_reaches_lora_factors() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -831,11 +832,15 @@ mod tests {
             "two factors per attention target"
         );
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::backward_reaches_lora_factors");
     }
 
     /// The correctness gate for the `gradient_checkpointing` lever: the checkpointed backward over the
     /// single-stream `blocks` must reproduce the dense `loss.backward()` grads (mod float reassociation).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dense_and_checkpoint_grads_match() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -908,12 +913,18 @@ mod tests {
         }
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED training::tests::dense_and_checkpoint_grads_match"
+        );
     }
 
     /// sc-24828: subject-masked loss on both backward paths. An all-ones map is the unweighted loss;
     /// an all-zero map zeroes the loss AND every adapter gradient (dense and checkpointed — a path
     /// that dropped the weight would train on the background); a half map matches across paths.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -972,6 +983,9 @@ mod tests {
             "dense {dense} vs checkpoint {ckpt}"
         );
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 
     /// The candle Krea LoRA trainer declares subject-masked loss (sc-24828).
@@ -983,6 +997,7 @@ mod tests {
     /// A few optimizer steps over the tiny DiT lower the loss on the same fixed batch — the step
     /// actually descends the flow-match objective, end to end through the harness.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn optimizer_steps_descend() {
         let dev = Device::Cpu;
         // Draw the ENTIRE fixture — base DiT weights, LoRA adapter nudge, and probe batch — from one
@@ -1061,6 +1076,9 @@ mod tests {
             loss1 / loss0
         );
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::optimizer_steps_descend");
     }
 
     /// The trainer resolves through the explicit family registry as the candle Krea
@@ -1211,6 +1229,7 @@ mod depth_anchoring_tests {
     /// zero-init LoRA-B factors — and step 1 carries no depth term. Mutation: compute the diffusion
     /// term unconditionally in `step_loss` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -1287,12 +1306,16 @@ mod depth_anchoring_tests {
                 .sum();
             assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B grad {gb}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths");
     }
 
     /// AC (c): depth off ⇒ bit-identical to the legacy step (its body reproduced here), and a
     /// diffusion-only planned step equals it too. Mutation: scale the diffusion loss (×1.0001) in
     /// `step_loss` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_off_is_bit_identical_to_the_legacy_step() {
         assert!(
             load_perceptual_path(&TrainingConfig::default(), &Device::Cpu)
@@ -1372,6 +1395,9 @@ mod depth_anchoring_tests {
         .unwrap();
         assert_eq!(on, off);
         assert_eq!(grad_bits(&g_on, &set.vars), grad_bits(&g_off, &set.vars));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// AC (d), E7: depth grows the guarded footprint by TAEW2.1 + DA2 (more for Large), and the guard

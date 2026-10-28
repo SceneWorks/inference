@@ -33,6 +33,7 @@ safetensors = "0.7"
 image = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen/model-inference-proof", "candle-llm/model-inference-proof"]
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider crate selects the matching candle backend everywhere.
 default = []

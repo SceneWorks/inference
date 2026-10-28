@@ -41,6 +41,9 @@ fn kolors_conformance() {
         ..Profile::cheap()
     };
     conformance(|| candle_gen_kolors::load(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::kolors_conformance");
 }
 
 /// sc-10819 (epic 9083): the SAME gen-core contract suite against a **packed** `SceneWorks/kolors-mlx`
@@ -63,4 +66,7 @@ fn kolors_packed_conformance() {
         ..Profile::cheap()
     };
     conformance(|| candle_gen_kolors::load(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::kolors_packed_conformance");
 }

@@ -77,7 +77,7 @@ impl SpatialResnet {
 
     fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
         let y = self.conv1.forward(&self.norm1.forward(x)?.silu()?)?;
-        let tp = self.temb_proj.forward(&temb.silu()?)?; // [B·F, out_c]
+        let tp = __model_proof_output!(self.temb_proj.forward(&temb.silu()?))?; // [B·F, out_c]
         let (bf, oc) = tp.dims2()?;
         let y = y.broadcast_add(&tp.reshape((bf, oc, 1, 1))?)?;
         let y = self.conv2.forward(&self.norm2.forward(&y)?.silu()?)?;
@@ -112,7 +112,7 @@ impl TemporalResnet {
 
     fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
         let y = self.conv1.forward(&self.norm1.forward(x)?.silu()?)?;
-        let tp = self.temb_proj.forward(&temb.silu()?)?; // [B, F, c]
+        let tp = __model_proof_output!(self.temb_proj.forward(&temb.silu()?))?; // [B, F, c]
         let (b, f, c) = tp.dims3()?;
         let tp = tp.transpose(1, 2)?.reshape((b, c, f, 1, 1))?; // [B, c, F, 1, 1]
         let y = y.broadcast_add(&tp)?;

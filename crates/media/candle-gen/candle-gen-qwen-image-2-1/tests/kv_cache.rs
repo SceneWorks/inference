@@ -320,6 +320,7 @@ fn extract(
 /// for the cached target tokens; the wrong RoPE rows for the target; the cached arm calling the
 /// prefill forward (the block stages are then joint-length).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cached_velocity_is_the_prefill_velocity_at_every_evaluation() {
     let w = kv_fixture();
     let model = load_transformer(&tiny_snapshot(), &device()).unwrap();
@@ -375,6 +376,9 @@ fn cached_velocity_is_the_prefill_velocity_at_every_evaluation() {
             }
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::cached_velocity_is_the_prefill_velocity_at_every_evaluation");
 }
 
 /// Question 2 at the transformer: the port's extract velocity, the K/V it caches for every block,
@@ -388,6 +392,7 @@ fn cached_velocity_is_the_prefill_velocity_at_every_evaluation() {
 /// `QwenImage21KVLayerCache` documents); caching `v` after the norm; caching the wrong rows (e.g.
 /// the target's); any cached-step defect listed on the test above.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn extract_cache_and_cached_velocity_match_upstream() {
     let w = kv_fixture();
     let model = load_transformer(&tiny_snapshot(), &device()).unwrap();
@@ -445,6 +450,9 @@ fn extract_cache_and_cached_velocity_match_upstream() {
             }
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::extract_cache_and_cached_velocity_match_upstream");
 }
 
 /// Everything one `denoise_reported` call needs for a fixture case.
@@ -566,6 +574,7 @@ fn assert_cached_shape(
 /// two CFG branches (the `*_cfg` cases diverge by ~1e0 and `kv_cache_bytes` halves); ignoring the
 /// switch (`Off` reporting a cache, or `On` reporting none).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cached_denoise_matches_prefill_denoise_and_reports_its_path() {
     let w = kv_fixture();
     let model = load_transformer(&tiny_snapshot(), &device()).unwrap();
@@ -605,6 +614,9 @@ fn cached_denoise_matches_prefill_denoise_and_reports_its_path() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::cached_denoise_matches_prefill_denoise_and_reports_its_path");
 }
 
 /// Question 2 for the whole loop: three Euler steps with the cache on land on upstream's
@@ -616,6 +628,7 @@ fn cached_denoise_matches_prefill_denoise_and_reports_its_path() {
 /// the true-CFG combine applied with the wrong scale, or `Attention::project` normalising `k` with
 /// `norm_q`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cached_denoise_matches_upstream_end_to_end() {
     let w = kv_fixture();
     let model = load_transformer(&tiny_snapshot(), &device()).unwrap();
@@ -651,6 +664,11 @@ fn cached_denoise_matches_upstream_end_to_end() {
             UPSTREAM_TOL,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::cached_denoise_matches_upstream_end_to_end"
+    );
 }
 
 /// The rule is per model **evaluation**, not per sampler step. Heun evaluates the model twice on
@@ -662,6 +680,7 @@ fn cached_denoise_matches_upstream_end_to_end() {
 /// after a decode so the next evaluation prefills again) — the report then shows more than one
 /// `Extract` for the branch.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_multi_evaluation_sampler_extracts_once_and_decodes_every_other_evaluation() {
     let w = kv_fixture();
     let model = load_transformer(&tiny_snapshot(), &device()).unwrap();
@@ -701,6 +720,9 @@ fn a_multi_evaluation_sampler_extracts_once_and_decodes_every_other_evaluation()
             RTOL,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::a_multi_evaluation_sampler_extracts_once_and_decodes_every_other_evaluation");
 }
 
 /// True CFG holds two independent caches. The prompts differ in length, so the two prefixes do too
@@ -711,6 +733,7 @@ fn a_multi_evaluation_sampler_extracts_once_and_decodes_every_other_evaluation()
 /// *Mutation that reds this (and the `*_cfg` rows of the tests above):* the negative branch
 /// reading the positive branch's cache.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_negative_branch_has_its_own_cache() {
     let w = kv_fixture();
     let model = load_transformer(&tiny_snapshot(), &device()).unwrap();
@@ -746,6 +769,9 @@ fn the_negative_branch_has_its_own_cache() {
              their isolation"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::the_negative_branch_has_its_own_cache");
 }
 
 /// With the switch off the loop is the plain prefill loop: the latents are bit-for-bit what the
@@ -759,6 +785,7 @@ fn the_negative_branch_has_its_own_cache() {
 /// combine rewritten as `pos + (s − 1)·(pos − neg)`. (An ignored switch is caught by the report
 /// assertions of `cached_denoise_matches_prefill_denoise_and_reports_its_path`.)
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cache_off_is_bit_identical_to_the_prefill_loop() {
     let w = kv_fixture();
     let model = load_transformer(&tiny_snapshot(), &device()).unwrap();
@@ -825,6 +852,11 @@ fn cache_off_is_bit_identical_to_the_prefill_loop() {
             "{name}: cache off must be the prefill loop, bit for bit"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::cache_off_is_bit_identical_to_the_prefill_loop"
+    );
 }
 
 /// The shared sampler gates every model evaluation on the cancel flag *before* announcing its
@@ -837,6 +869,7 @@ fn cache_off_is_bit_identical_to_the_prefill_loop() {
 /// run would then report nothing), or a loop that keeps evaluating after the cancellation (the
 /// report would carry `Cached` entries).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cancelling_after_the_prefill_step_runs_no_cached_evaluation() {
     let w = kv_fixture();
     let model = load_transformer(&tiny_snapshot(), &device()).unwrap();
@@ -896,6 +929,9 @@ fn cancelling_after_the_prefill_step_runs_no_cached_evaluation() {
         let (_, report) = run.ok();
         assert_cached_shape(name, &model, &case, &report, case.steps);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::cancelling_after_the_prefill_step_runs_no_cached_evaluation");
 }
 
 /// The caches live exactly as long as the denoise loop: once `denoise_reported` has returned —
@@ -906,6 +942,7 @@ fn cancelling_after_the_prefill_step_runs_no_cached_evaluation() {
 /// *Mutation that reds this:* anything that lets a cache outlive the loop — e.g. the report
 /// keeping the `PrefixKvCache` it accounts for, or the branches living in a caller-owned slot.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_caches_are_dropped_when_the_loop_returns() {
     let w = kv_fixture();
     let model = load_transformer(&tiny_snapshot(), &device()).unwrap();
@@ -970,6 +1007,11 @@ fn the_caches_are_dropped_when_the_loop_returns() {
         "a cancelled run still holds {} bytes — a cache ({cache_bytes} bytes) outlived the loop",
         cancelled.held
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::the_caches_are_dropped_when_the_loop_returns"
+    );
 }
 
 /// The same tiny weights as a model that is **not** `causal_condition`.
@@ -993,6 +1035,7 @@ fn non_causal_model() -> QwenImage21Transformer {
 /// run fails with the transformer's refusal) or the refusal from the transformer (a step-dependent
 /// prefix would be cached silently).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn without_causal_condition_the_cache_is_refused_and_the_loop_runs_prefill() {
     let w = kv_fixture();
     let model = non_causal_model();
@@ -1045,11 +1088,15 @@ fn without_causal_condition_the_cache_is_refused_and_the_loop_runs_prefill() {
         .iter()
         .all(|e| e.path == EvaluationPath::Prefill));
     assert_eq!(bits(&on), bits(&off));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::without_causal_condition_the_cache_is_refused_and_the_loop_runs_prefill");
 }
 
 /// A cache cannot be built from a failed prefill, and it decodes only the target it was extracted
 /// for.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cache_is_only_ever_complete_and_only_fits_its_own_target() {
     let w = kv_fixture();
     let model = load_transformer(&tiny_snapshot(), &device()).unwrap();
@@ -1075,6 +1122,9 @@ fn a_cache_is_only_ever_complete_and_only_fits_its_own_target() {
         err.to_string(),
         "qwen_image_2_1: the prefix KV cache was extracted for a 16-token target, got 32"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::a_cache_is_only_ever_complete_and_only_fits_its_own_target");
 }
 
 /// A seeded random f32 model at an arbitrary geometry — for the production head dim, and for a
@@ -1166,6 +1216,7 @@ fn seeded(shape: (usize, usize, usize), seed: u64) -> Tensor {
 /// *Mutations that red this:* the same cached-step defects as the tiny-fixture test, at this
 /// geometry (e.g. `k` cached before RoPE, the prefix concat skipped).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cached_velocity_is_the_prefill_velocity_at_the_production_head_dim() {
     let cfg = production_head_config();
     let layout = JointLayout {
@@ -1243,6 +1294,9 @@ fn cached_velocity_is_the_prefill_velocity_at_the_production_head_dim() {
             "a cache of other references is within {worst:.2}× the bound"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::cached_velocity_is_the_prefill_velocity_at_the_production_head_dim");
 }
 
 /// Elements of the storage a CPU tensor shares, and where in it the tensor starts.
@@ -1275,6 +1329,7 @@ fn cpu_storage_elements(t: &Tensor) -> (usize, usize) {
 /// *Mutation that reds this:* caching the views (`owned_prefix_rows` returning the `narrow`, or
 /// its `contiguous()`).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_cache_does_not_pin_the_prefill_keys_and_values() {
     for heads in [2usize, 1] {
         let cfg = TransformerConfig {
@@ -1341,6 +1396,9 @@ fn the_cache_does_not_pin_the_prefill_keys_and_values() {
             RTOL,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::the_cache_does_not_pin_the_prefill_keys_and_values");
 }
 
 /// The extract step does not hold every block's K/V at once. Each block's prefix rows are cut from
@@ -1359,6 +1417,7 @@ fn the_cache_does_not_pin_the_prefill_keys_and_values() {
 /// *Mutation that reds this:* keeping the captured views alive across blocks and copying them only
 /// when the forward ends.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_extract_step_peaks_at_the_prefill_plus_the_cache() {
     let cfg = TransformerConfig {
         num_layers: 12,
@@ -1410,6 +1469,9 @@ fn the_extract_step_peaks_at_the_prefill_plus_the_cache() {
         extract_heap.peak.saturating_sub(prefill_heap.peak),
         cfg.num_layers
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::the_extract_step_peaks_at_the_prefill_plus_the_cache");
 }
 
 /// AT4's committed half (sc-25909) on this backend: **the base id's render with the cache shed is
@@ -1430,6 +1492,7 @@ fn the_extract_step_peaks_at_the_prefill_plus_the_cache() {
 /// *Mutations that red this:* the base generator running cached when nothing is selected (link
 /// 1); any numeric change to the prefill forward or loop (link 2).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates() {
     use candle_gen::gen_core::{
         GenerationMemory, GenerationOutput, GenerationRequest, LoadSpec, PrefixKvCacheMode,
@@ -1552,4 +1615,7 @@ fn the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates
         &w.tensor("t2i/latents_final_prefill"),
         UPSTREAM_TOL,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_cache::the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates");
 }

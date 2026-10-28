@@ -257,4 +257,6 @@ fn av_lora_e2e_matches_reference() {
     );
     assert_eq!(track.channels, 2);
     assert_eq!(track.sample_rate, 48000);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED av_lora_e2e_parity::av_lora_e2e_matches_reference");
 }

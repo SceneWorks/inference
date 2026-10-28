@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 import yaml
 from scripts.ci import moss_edit_cuda as gate
+from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
 
 
 class DirectExecutionTests(unittest.TestCase):
@@ -36,7 +37,8 @@ class DirectExecutionTests(unittest.TestCase):
                     self.assertEqual(child_env['CUDA_VISIBLE_DEVICES'], '-1')
                     names = ignored if label.endswith('-ignored') else expected
                     if mode == 'missing-test' and label == 'edit-list': names = set()
-                    if mode == 'unexpected-ignored' and label == 'edit-ignored': names = expected
+                    if mode == 'missing-ignored' and label == 'edit-ignored': names = expected - {sorted(expected)[0]}
+                    if mode == 'extra-ignored' and label == 'edit-ignored': names = expected | {'unexpected::case'}
                     if mode == 'binary-change' and label == 'encoder-ignored': binaries[gate.MOSS].write_bytes(b'changed')
                     return 0, '\n'.join(name+': test' for name in sorted(names))
                 if label.endswith('-device'):
@@ -46,7 +48,9 @@ class DirectExecutionTests(unittest.TestCase):
                 self.assertEqual(child_env['CUDA_VISIBLE_DEVICES'], gate.GPU_UUID)
                 self.assertEqual(child_env['SCENEWORKS_GPU_ID'], '1')
                 self.assertEqual(child_env['REQUIRE_SM120'], '1')
-                self.assertEqual('--include-ignored' in args, bool(ignored))
+                self.assertIn('--ignored', args)
+                self.assertNotIn('--include-ignored', args)
+                self.assertEqual(ignored, expected)
                 if mode == 'numerical-failure': return 101, 'test result: FAILED. 0 passed; 1 failed; 0 ignored;'
                 if mode == 'skipped': return 0, f'test result: ok. 0 passed; 0 failed; {len(expected)} ignored;'
                 return 0, f'test result: ok. {len(expected)} passed; 0 failed; 0 ignored;'
@@ -67,7 +71,7 @@ class DirectExecutionTests(unittest.TestCase):
         self.assertEqual([label for label, _, _ in calls if label.endswith('-tests')], ['edit-tests', 'layout-tests', 'encoder-tests'])
 
     def test_compile_identity_membership_source_binary_and_numerical_failures_are_terminal(self):
-        for mode in ('compile-failure', 'missing-binary', 'missing-test', 'unexpected-ignored', 'source-change', 'binary-change', 'wrong-device', 'numerical-failure', 'skipped'):
+        for mode in ('compile-failure', 'missing-binary', 'missing-test', 'missing-ignored', 'extra-ignored', 'source-change', 'binary-change', 'wrong-device', 'numerical-failure', 'skipped'):
             with self.subTest(mode=mode): self.exercise(mode)
 
     def test_device_identity_rejects_other_physical_index_uuid_pci_or_ambiguous_rows(self):
@@ -263,10 +267,10 @@ class WindowsJobMetadataTests(unittest.TestCase):
 
 class WorkflowTests(unittest.TestCase):
     def test_dedicated_manual_graph_and_owned_target_preserve_device_boundary(self):
-        workflow = yaml.safe_load((gate.ROOT/'.github/workflows/ci.yml').read_text(encoding='utf-8'))
+        workflow = yaml.safe_load(real_weights_inline_text())
         job = workflow['jobs']['moss-edit-cuda']
         self.assertIn("github.event_name == 'workflow_dispatch'", job['if'])
-        self.assertIn("inputs.lanes == 'moss-edit-cuda'", job['if'])
+        self.assertIn("inputs.profile == 'moss-edit-cuda'", job['if'])
         self.assertEqual(job['env']['CUDA_VISIBLE_DEVICES'], '-1')
         self.assertEqual(job['env']['CUDA_COMPUTE_CAP'], '120'); self.assertEqual(job['env']['CARGO_BUILD_JOBS'], '4')
         target = next(step for step in job['steps'] if step.get('name', '').startswith('Reserve an exclusive'))
@@ -280,34 +284,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('MOSS_CUDA_ADMISSION', run.get('env', {}))
         self.assertNotIn('${{ inputs.moss_cuda_admission }}', commands)
 
-    def test_new_selector_isolates_job_with_semantic_sibling_barriers(self):
-        from scripts.tests.test_windows_gpu1_diagnostic import selected_jobs
-        workflow = yaml.safe_load((gate.ROOT/'.github/workflows/ci.yml').read_text(encoding='utf-8'))
-        for selected in (True, False):
-            for fork in (True, False):
-                for tag in (True, False):
-                    for synthetic in ('none', 'cuda', 'mlx', 'both'):
-                        self.assertEqual(selected_jobs(workflow, 'workflow_dispatch', 'moss-edit-cuda', selected=selected, fork=fork, tag=tag, synthetic=synthetic), {'moss-edit-cuda'})
-        for event in ('push', 'pull_request', 'schedule', 'merge_group'):
-            self.assertNotIn('moss-edit-cuda', selected_jobs(workflow, event, 'moss-edit-cuda'))
-        for lane in ('all', 'windows-cuda', 'windows-gpu-diagnostic', 'moss-edit-cuda-extra'):
-            self.assertNotIn('moss-edit-cuda', selected_jobs(workflow, 'workflow_dispatch', lane))
-        guard = "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda')"
-        for name, job in workflow['jobs'].items():
-            if name == 'moss-edit-cuda':
-                continue
-            condition = job['if']
-            selector = f"inputs.lanes == '{name}'"
-            self.assertTrue(guard in condition or selector in condition, name)
-            condition = condition.replace(guard + ' && ', '').replace(guard, 'True')
-            condition = condition.replace(selector, "inputs.lanes == 'moss-edit-cuda'")
-            mutant = copy.deepcopy(workflow)
-            mutant['jobs'][name]['if'] = condition
-            self.assertTrue(any(name in selected_jobs(mutant, 'workflow_dispatch', 'moss-edit-cuda', synthetic=synthetic, tag=tag)
-                                for synthetic in ('none', 'cuda', 'mlx', 'both') for tag in (False, True)), name)
+    def test_profile_isolates_job_and_rejects_unrelated_manual_selections(self):
+        from scripts.tests.test_windows_gpu1_diagnostic import selected_model_jobs
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assertEqual(selected_model_jobs(workflow, 'workflow_dispatch', 'moss-edit-cuda'), {'moss-edit-cuda'})
+        self.assertEqual(workflow['jobs']['moss-edit-cuda']['needs'], 'validate-selection')
+        for event in ('push', 'pull_request', 'schedule', 'merge_group', 'workflow_call'):
+            self.assertNotIn('moss-edit-cuda', selected_model_jobs(workflow, event, 'moss-edit-cuda'))
+        for profile in ('all', 'media', 'windows-cuda', 'windows-gpu-diagnostic', 'moss-edit-cuda-extra', 'moss-edit-metal', ''):
+            self.assertNotIn('moss-edit-cuda', selected_model_jobs(workflow, 'workflow_dispatch', profile))
         mutant = copy.deepcopy(workflow)
-        mutant['jobs']['moss-edit-cuda']['if'] = mutant['jobs']['moss-edit-cuda']['if'].replace("inputs.lanes == 'moss-edit-cuda'", 'True')
-        self.assertIn('moss-edit-cuda', selected_jobs(mutant, 'workflow_dispatch', 'windows-gpu-diagnostic'))
+        mutant['jobs']['moss-edit-cuda']['if'] = mutant['jobs']['moss-edit-cuda']['if'].replace("inputs.profile == 'moss-edit-cuda'", 'True')
+        self.assertIn('moss-edit-cuda', selected_model_jobs(mutant, 'workflow_dispatch', 'moss-edit-metal'))
+        mutant = copy.deepcopy(workflow)
+        mutant['jobs']['moss-edit-cuda']['if'] = mutant['jobs']['moss-edit-cuda']['if'].replace("github.event_name == 'workflow_dispatch'", 'True')
+        self.assertIn('moss-edit-cuda', selected_model_jobs(mutant, 'push', 'moss-edit-cuda'))
 
     def test_final_snapshot_is_not_full_telemetry_and_uses_existing_queries(self):
         script = (gate.ROOT/'scripts/ci/windows-gpu1-diagnostic.ps1').read_text(encoding='utf-8')

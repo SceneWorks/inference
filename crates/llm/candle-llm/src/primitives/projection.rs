@@ -30,6 +30,9 @@ pub struct QuantSpec {
     /// Source group size when the checkpoint stores an MLX affine packed triple.
     /// Dense load-time quantization ignores this value.
     group_size: usize,
+    /// Dense load-time quantization serves the weight by dequantizing it per forward
+    /// ([`QuantSpec::with_dequantized_forward`]) instead of through `QMatMul`.
+    dequantized_forward: bool,
 }
 
 impl QuantSpec {
@@ -38,6 +41,7 @@ impl QuantSpec {
         Self {
             dtype: GgmlDType::Q4K,
             group_size: 64,
+            dequantized_forward: false,
         }
     }
 
@@ -46,7 +50,27 @@ impl QuantSpec {
         Self {
             dtype: GgmlDType::Q8_0,
             group_size: 64,
+            dequantized_forward: false,
         }
+    }
+
+    /// The same blocks, but a dense weight quantized on load is served **weight-only**: the
+    /// resident GGML tensor is dequantized to the activation dtype per forward and multiplied
+    /// densely, so the activation is never quantized. The default (`QMatMul`) path quantizes the
+    /// activation to per-32-element `q8_1` on CUDA, where a single outlier channel sets a block's
+    /// scale and flushes its neighbours — harmless for next-token logits, but a conditioning
+    /// encoder whose hidden states ARE the output (Iris-3B's Qwen3-VL tower, sc-26266) needs them
+    /// intact; the same reason the media providers' packed tiers dequantize (sc-7702). The
+    /// resident bytes are identical; only the per-forward dequant is added.
+    pub fn with_dequantized_forward(mut self) -> Self {
+        self.dequantized_forward = true;
+        self
+    }
+
+    /// Whether a dense weight quantized under this spec is served weight-only
+    /// ([`Self::with_dequantized_forward`]).
+    pub fn dequantizes_forward(&self) -> bool {
+        self.dequantized_forward
     }
 
     /// Map a persisted `quantization.bits` value to a spec: `4 → Q4_K`, `8 → Q8_0`. Any other width
@@ -64,10 +88,12 @@ impl QuantSpec {
             4 => Some(Self {
                 dtype: GgmlDType::Q4K,
                 group_size,
+                dequantized_forward: false,
             }),
             8 => Some(Self {
                 dtype: GgmlDType::Q8_0,
                 group_size,
+                dequantized_forward: false,
             }),
             _ => None,
         }
@@ -285,6 +311,10 @@ pub struct ProjectionCensus {
     pub prism: ProjectionTally,
     /// NVFP4 projections.
     pub nvfp4: ProjectionTally,
+    /// How many of the `ggml` projections are served weight-only (sc-26266): the forward
+    /// dequantizes the weight and multiplies the activation densely, never quantizing it
+    /// ([`QuantSpec::with_dequantized_forward`]). The rest of `ggml` runs through `QMatMul`.
+    pub ggml_weight_only: u64,
 }
 
 impl ProjectionCensus {
@@ -296,6 +326,9 @@ impl ProjectionCensus {
             ProjectionKind::Prism => &mut self.prism,
             ProjectionKind::Nvfp4 => &mut self.nvfp4,
         };
+        if let Projection::Quantized(q) = p {
+            self.ggml_weight_only += u64::from(q.dequantizes_forward());
+        }
         tally.count += 1;
         tally.params += p.params();
         match p.resident_bytes() {
@@ -329,6 +362,7 @@ impl ProjectionCensus {
         self.ggml.add(&other.ggml);
         self.prism.add(&other.prism);
         self.nvfp4.add(&other.nvfp4);
+        self.ggml_weight_only += other.ggml_weight_only;
     }
 }
 
@@ -389,11 +423,12 @@ impl Projection {
             None => Ok(Projection::Dense(Linear::new(weight, bias))),
             Some(q) => {
                 let in_dim = weight.dims().last().copied().unwrap_or(0);
-                Ok(Projection::Quantized(QuantizedLinear::quantize(
-                    &weight,
-                    q.dtype_for_in_dim(in_dim),
-                    bias,
-                )?))
+                let dtype = q.dtype_for_in_dim(in_dim);
+                Ok(Projection::Quantized(if q.dequantizes_forward() {
+                    QuantizedLinear::quantize_dequantized(&weight, dtype, bias)?
+                } else {
+                    QuantizedLinear::quantize(&weight, dtype, bias)?
+                }))
             }
         }
     }
@@ -558,9 +593,9 @@ impl Projection {
     /// cuBLASLt W4A4 GEMM, recording which ran ([`nvfp4_path`](super::nvfp4_path), sc-24136).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Projection::Dense(l) => Ok(l.forward(x)?),
-            Projection::Quantized(q) => q.forward(x),
-            Projection::Prism(weight) => weight.forward(x),
+            Projection::Dense(l) => Ok(__model_proof_output!(l.forward(x))?),
+            Projection::Quantized(q) => __model_proof_output!(q.forward(x)),
+            Projection::Prism(weight) => __model_proof_output!(weight.forward(x)),
             Projection::Nvfp4(weight) => super::nvfp4_path::forward(weight, x),
         }
     }
@@ -809,9 +844,12 @@ mod tests {
     /// quantization error itself on uniform random operands).
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn nvfp4_forward_matches_the_dequantize_then_matmul_reference() {
         let Some((device, format)) = nvfp4_format() else {
             candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/primitives/projection.rs:850 (nvfp4_forward_matches_the_dequantize_then_matmul_reference): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let (n, k) = (96usize, 80usize); // K=80 pads to 96 at quantization
@@ -929,6 +967,9 @@ mod tests {
         let bytes = p.resident_bytes().unwrap();
         assert_eq!(bytes, (wq.packed.len() + wq.scales.len() + n * 2) as u64);
         assert!(bytes < (n * k * 2) as u64);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::projection::tests::nvfp4_forward_matches_the_dequantize_then_matmul_reference");
     }
 
     /// sc-24140: the llama-family loader's shape policy — under NVFP4, an eligible shape becomes

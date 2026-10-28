@@ -20,6 +20,27 @@ use mlx_gen::Result;
 /// Group size the converter writes — the codebase-wide `mlx_gen::quant::DEFAULT_GROUP_SIZE` (64).
 pub(crate) const GROUP_SIZE: i32 = 64;
 
+// Constructor policy, shared by the actual module loaders and header-only conversion pricing.
+// An authored sibling bias is not a module parameter when the corresponding flag is false.
+// This says nothing about the raw Weights dictionary or native backing ownership.
+pub(crate) const TEXT_LINEAR_HAS_BIAS: bool = false;
+pub(crate) const DIT_ATTENTION_HAS_BIAS: bool = false;
+pub(crate) const DIT_FFN_HAS_BIAS: bool = false;
+
+/// Bias policy over the closed native DiT/Control quantization target schema. The attention and
+/// feed-forward paths are bias-free; globals, adaLN and Control before/after projections carry bias
+/// (adaLN probes its optional bias before construction). Callers supply native target paths, never
+/// arbitrary rank-2 headers. Raw ignored siblings remain in the source inventory unchanged.
+pub(crate) fn dit_quantization_has_bias(path: &str) -> bool {
+    if path.contains(".attention.") {
+        DIT_ATTENTION_HAS_BIAS
+    } else if path.contains(".feed_forward.") {
+        DIT_FFN_HAS_BIAS
+    } else {
+        true
+    }
+}
+
 /// Load `{base}` as an [`AdaptableLinear`] at Z-Image's [`GROUP_SIZE`] — packed when `{base}.scales`
 /// is present (a pre-quantized snapshot), else dense. The shared [`mlx_gen::quant::lin`]; `bias` loads
 /// the dense `{base}.bias` (the quantization's own `{base}.biases` is distinct, always loaded packed).

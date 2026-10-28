@@ -77,19 +77,13 @@ impl Attention {
     fn forward(&self, x: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.n_heads, self.n_kv_heads, self.head_dim);
-        let q = self
-            .q_proj
-            .forward(x)?
+        let q = __model_proof_output!(self.q_proj.forward(x))?
             .reshape((b, s, nh, hd))?
             .transpose(1, 2)?;
-        let k = self
-            .k_proj
-            .forward(x)?
+        let k = __model_proof_output!(self.k_proj.forward(x))?
             .reshape((b, s, nkv, hd))?
             .transpose(1, 2)?;
-        let v = self
-            .v_proj
-            .forward(x)?
+        let v = __model_proof_output!(self.v_proj.forward(x))?
             .reshape((b, s, nkv, hd))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -104,7 +98,7 @@ impl Attention {
             .matmul(&v)?
             .transpose(1, 2)?
             .reshape((b, s, nh * hd))?;
-        self.o_proj.forward(&o)
+        __model_proof_output!(self.o_proj.forward(&o))
     }
 }
 
@@ -135,8 +129,10 @@ impl Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let g = self.gate.forward(x)?.silu()?;
-        self.down.forward(&(g * self.up.forward(x)?)?)
+        let g = __model_proof_output!(self.gate.forward(x))?.silu()?;
+        __model_proof_output!(self
+            .down
+            .forward(&(g * __model_proof_output!(self.up.forward(x))?)?))
     }
 }
 
@@ -162,10 +158,14 @@ impl DecoderLayer {
     }
 
     fn forward(&self, x: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
-        let h = (x + self
-            .attn
-            .forward(&self.input_ln.forward(x)?, rotary, mask)?)?;
-        &h + self.mlp.forward(&self.post_ln.forward(&h)?)?
+        let h = (x + self.attn.forward(
+            &__model_proof_output!(self.input_ln.forward(x))?,
+            rotary,
+            mask,
+        )?)?;
+        &h + self
+            .mlp
+            .forward(&__model_proof_output!(self.post_ln.forward(&h))?)?
     }
 }
 
@@ -217,7 +217,7 @@ impl QwenTextEncoder {
     /// Token embeddings `[b, s, hidden]` (f32) — the LM-stack input, and the seam where the
     /// Qwen-Image-Edit vision-language encoder splices vision embeds (sc-5487).
     pub fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
-        self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)
+        __model_proof_output!(self.embed_tokens.forward(input_ids))?.to_dtype(DType::F32)
     }
 
     /// Run the 28 LM layers + final RMSNorm over pre-embedded hidden states `[b, s, hidden]`,
@@ -231,7 +231,7 @@ impl QwenTextEncoder {
         for layer in &self.layers {
             hidden = layer.forward(&hidden, &self.rotary, &mask)?;
         }
-        self.norm.forward(&hidden)
+        __model_proof_output!(self.norm.forward(&hidden))
     }
 
     /// `input_ids` `[1, S]` → `prompt_embeds` `[1, S − drop_idx, 3584]` (f32): the last layer's normed

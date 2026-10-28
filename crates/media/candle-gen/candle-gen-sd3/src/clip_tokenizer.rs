@@ -58,7 +58,13 @@ pub fn load_clip_tokenizer(dir: &Path, label: &str) -> CandleResult<Tokenizer> {
     let json = dir.join("tokenizer.json");
     if json.is_file() {
         // Fast path: a real (canonical or previously-synthesized) tokenizer.json.
-        return Tokenizer::from_file(&json)
+        return candle_gen::gen_core::__model_input_reader!(
+Tokenizer::from_file(&json),
+"crates/media/candle-gen/candle-gen-sd3/src/clip_tokenizer.rs::load_clip_tokenizer::Tokenizer::from_file@3310",
+Tokenizer,
+&json,
+|__model_input_path| Tokenizer::from_file(__model_input_path)
+)
             .map_err(|e| CandleError::Msg(format!("sd3: load {label} tokenizer.json: {e}")));
     }
 
@@ -163,6 +169,12 @@ pub fn synthesize_clip_tokenizer(
         AddedToken::from(EOS, true).normalized(false),
     ]);
 
+    #[cfg(feature = "model-inference-proof")]
+    candle_gen::gen_core::model_input_proof::record_reader_paths(
+        "candle-gen-sd3::clip_tokenizer::synthesize_clip_tokenizer/tokenizer-pair",
+        candle_gen::gen_core::model_input_proof::InputRole::Tokenizer,
+        &[vocab_path, merges_path],
+    );
     Ok(tok)
 }
 

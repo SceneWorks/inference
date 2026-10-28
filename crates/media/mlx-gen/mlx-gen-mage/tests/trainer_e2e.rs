@@ -223,12 +223,20 @@ fn train_and_check(network_type: NetworkType, kind: AdapterKind, tag: &str) {
 #[ignore = "needs real Mage-Flow-Base weights (MAGE_BASE_SNAPSHOT)"]
 fn mage_lora_trains_writes_adapter_and_reloads() {
     train_and_check(NetworkType::Lora, AdapterKind::Lora, "lora");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::mage_lora_trains_writes_adapter_and_reloads"
+    );
 }
 
 #[test]
 #[ignore = "needs real Mage-Flow-Base weights (MAGE_BASE_SNAPSHOT)"]
 fn mage_lokr_trains_writes_adapter_and_reloads() {
     train_and_check(NetworkType::Lokr, AdapterKind::Lokr, "lokr");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::mage_lokr_trains_writes_adapter_and_reloads"
+    );
 }
 
 /// Preview samples (the `sample_every` / `sample_prompts` controls): a short run must emit
@@ -313,6 +321,8 @@ fn mage_trainer_emits_preview_samples() {
         "[trainer-samples] e2e OK — {} previews: {samples:?}",
         samples.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::mage_trainer_emits_preview_samples");
 }
 
 /// The literal-DoD render check: train a LoRA, then decode a full image from the Base pipeline with
@@ -410,5 +420,9 @@ fn mage_lora_reload_changes_generated_image() {
     assert!(
         delta > 0.5,
         "reloading the trained LoRA must visibly change the generated image (max pixel delta {delta})"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::mage_lora_reload_changes_generated_image"
     );
 }

@@ -16,9 +16,16 @@ const ENDPOINTS: [&str; 4] = [
 #[ignore = "four fixed current-donor trajectories/32 forwards/four endpoint identity decodes; never acceptance"]
 fn diagnostic_current_failed_adapter_actual_dense_q4_trajectory() {
     run().unwrap();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED conditioning_velocity_diagnostic::trajectory::diagnostic_current_failed_adapter_actual_dense_q4_trajectory");
 }
 
-fn read_vector(out: &Path, row: &Value, cache: &mut math::Cache) -> Result<Tensor> {
+fn read_vector(
+    out: &Path,
+    row: &Value,
+    cache: &mut math::Cache,
+    _for_decode: bool,
+) -> Result<Tensor> {
     let bytes = row["bytes"].as_u64().ok_or("vector byte count missing")?;
     assert_eq!(bytes, 147456 * 4);
     cache.reserve(bytes * 2)?;
@@ -26,7 +33,7 @@ fn read_vector(out: &Path, row: &Value, cache: &mut math::Cache) -> Result<Tenso
     assert!(!Path::new(file).is_absolute() && !file.split('/').any(|p| p == ".."));
     let path = out.join(file);
     assert_eq!(evidence::sha256_file(&path), row["sha256"]);
-    let raw = std::fs::read(path)?;
+    let raw = mlx_gen::gen_core::__model_input_choose!(std::fs::read(path), std::fs::read(&path))?;
     assert_eq!(raw.len() as u64, bytes);
     let values = raw
         .chunks_exact(4)
@@ -35,6 +42,14 @@ fn read_vector(out: &Path, row: &Value, cache: &mut math::Cache) -> Result<Tenso
     assert!(values.iter().all(|v| v.is_finite()));
     drop(raw);
     cache.release(bytes);
+    #[cfg(feature = "model-inference-proof")]
+    if _for_decode {
+        mlx_gen::gen_core::model_input_proof::record_reader_paths(
+            "mlx-gen-qwen-image-2-1::conditioning_velocity_trajectory::read_vector#decode_rgb",
+            mlx_gen::gen_core::model_input_proof::InputRole::TensorInput,
+            &[&path],
+        );
+    }
     Ok(Tensor {
         shape: vec![1, 2304, 64],
         values,
@@ -385,7 +400,7 @@ fn run() -> Result<()> {
         drop(model);
         crate::q4_diagnostic::retirement_boundary();
         assert_retired(baseline_active);
-        let final_cpu = read_vector(&out, &final_row, &mut cache)?;
+        let final_cpu = read_vector(&out, &final_row, &mut cache, true)?;
         let final_error = trajectory_math::mean_squared_difference(&final_cpu.values, &x0.values)?;
         let final_array = final_cpu.array();
         let vae = crate::loader::load_vae(dense)?;
@@ -419,14 +434,14 @@ fn run() -> Result<()> {
         assert_retired(baseline_active);
         let mut metrics = Vec::new();
         for step in 0..trajectory_math::STEPS {
-            let x = read_vector(&out, &observed[step]["x"], &mut cache)?;
-            let v = read_vector(&out, &observed[step]["velocity"], &mut cache)?;
+            let x = read_vector(&out, &observed[step]["x"], &mut cache, false)?;
+            let v = read_vector(&out, &observed[step]["velocity"], &mut cache, false)?;
             let next_row = if step + 1 == trajectory_math::STEPS {
                 &final_row
             } else {
                 &observed[step + 1]["x"]
             };
-            let next = read_vector(&out, next_row, &mut cache)?;
+            let next = read_vector(&out, next_row, &mut cache, false)?;
             let m = trajectory_math::step_metrics(
                 &x.values,
                 &v.values,
@@ -475,7 +490,7 @@ fn run() -> Result<()> {
             } else {
                 &t["steps"][step]["x"]
             };
-            values.push(read_vector(&out, row, &mut cache)?);
+            values.push(read_vector(&out, row, &mut cache, false)?);
         }
         comparisons.push(json!({"step":step,
             "denseDenoisedEstimateErrorGain":if step<trajectory_math::STEPS {Some(trajectories[0]["metrics"][step]["denoisedEstimateError"].as_f64().unwrap()-trajectories[1]["metrics"][step]["denoisedEstimateError"].as_f64().unwrap())} else {None},

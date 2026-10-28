@@ -75,4 +75,6 @@ fn full_segmenter_matches_oracle() {
         worst_iou > 0.95,
         "worst instance mask IoU {worst_iou:.4} below 0.95"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_parity::full_segmenter_matches_oracle");
 }

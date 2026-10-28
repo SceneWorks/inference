@@ -148,6 +148,7 @@ mod tests {
     /// stays **dense**, and the packed forward matches the affine grid the pack represents (bit-exact
     /// repack + dequant-on-forward). The residual-capable shared `AdaptLinear` load path.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_packed_on_dit_key_layout() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -202,6 +203,10 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::linear_detect_packed_on_dit_key_layout"
+        );
         Ok(())
     }
 
@@ -209,6 +214,7 @@ mod tests {
     /// checkpoint (no `.scales` anywhere) loads every leaf dense, unchanged. Confirms the current dense
     /// `Wan-AI/*-Diffusers` checkpoint path is untouched.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_dense_path_unchanged() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -230,15 +236,21 @@ mod tests {
         // Reference: the exact legacy read.
         let ref_lin = Linear::new(w, Some(b));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let dev_max = (lin.forward(&x)?.sub(&ref_lin.forward(&x)?)?)
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
+        let dev_max = (lin
+            .forward(&x)?
+            .sub(&__model_proof_output!(ref_lin.forward(&x))?)?)
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
         assert_eq!(
             dev_max, 0.0,
             "dense arm deviates from the legacy linear read"
         );
 
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::linear_detect_dense_path_unchanged"
+        );
         Ok(())
     }
 
@@ -246,6 +258,7 @@ mod tests {
     /// sibling and reproduces the affine grid rows exactly; a leaf with no `.scales` loads dense. This is
     /// the loader the UMT5 encoder uses for its `shared` embedding.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn shared_embedding_packed_detect_on_umt5_layout() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -281,12 +294,15 @@ mod tests {
             );
         }
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::shared_embedding_packed_detect_on_umt5_layout");
         Ok(())
     }
 
     /// `quantize` is a **no-op** on a packed `shared::QLinear` — an MLX-packed weight must never be
     /// double-quantized. The stored `Q4_1` weight and the forward stay unchanged.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_quantize_is_noop() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
@@ -299,6 +315,8 @@ mod tests {
         let after = packed.forward(&x)?;
         let dev_max = (before.sub(&after)?).abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "no-op quantize changed the packed forward");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_quantize_is_noop");
         Ok(())
     }
 

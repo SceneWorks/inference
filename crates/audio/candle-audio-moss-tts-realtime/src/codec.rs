@@ -253,7 +253,12 @@ impl CodecConfig {
         let path = dir.join("config.json");
         let text = std::fs::read_to_string(&path)
             .map_err(|e| AudioError::Msg(format!("read {}: {e}", path.display())))?;
-        Self::from_json(&text)
+        candle_audio::gen_core::__model_input_result!(
+            Self::from_json(&text),
+            "candle-audio-moss-tts-realtime::codec::CodecConfig::from_dir",
+            Configuration,
+            &[&path]
+        )
     }
 
     /// Parse and validate a codec `config.json` document.
@@ -406,7 +411,7 @@ impl RlfqDecoder {
             let z_q = self.out_projs[i].forward(&z)?; // [1, rvq_dim, T]
             emb = (emb + z_q)?;
         }
-        self.output_proj.forward(&emb) // [1, output_dim, T]
+        __model_proof_output!(self.output_proj.forward(&emb)) // [1, output_dim, T]
     }
 }
 
@@ -595,11 +600,18 @@ impl CodecLayer {
         mask: &Tensor,
     ) -> CandleResult<Tensor> {
         // Self-attention block: x + layer_scale_1 * attn(norm1(x)).
-        let attn = self.attention(&self.norm1.forward(x)?, cos, sin, mask)?;
+        let attn = self.attention(
+            &__model_proof_output!(self.norm1.forward(x))?,
+            cos,
+            sin,
+            mask,
+        )?;
         let x = (x + attn.broadcast_mul(&self.layer_scale_1)?)?;
         // Feed-forward block: x + layer_scale_2 * linear2(gelu(linear1(norm2(x)))).
-        let h = self.linear1.forward(&self.norm2.forward(&x)?)?;
-        let h = self.linear2.forward(&h.gelu_erf()?)?;
+        let h = __model_proof_output!(self
+            .linear1
+            .forward(&__model_proof_output!(self.norm2.forward(&x))?))?;
+        let h = __model_proof_output!(self.linear2.forward(&h.gelu_erf()?))?;
         x.broadcast_add(&h.broadcast_mul(&self.layer_scale_2)?)
     }
 
@@ -614,7 +626,7 @@ impl CodecLayer {
         let h = self.num_heads;
         let d = self.head_dim;
         // Fused qkv → [B, T, 3, H, D] → per the reference reshape/permute.
-        let qkv = self.in_proj.forward(x)?.reshape((b, t, 3, h, d))?;
+        let qkv = __model_proof_output!(self.in_proj.forward(x))?.reshape((b, t, 3, h, d))?;
         let q = qkv.i((.., .., 0))?.transpose(1, 2)?.contiguous()?; // [B, H, T, D]
         let k = qkv.i((.., .., 1))?.transpose(1, 2)?.contiguous()?;
         let v = qkv.i((.., .., 2))?.transpose(1, 2)?.contiguous()?;
@@ -626,7 +638,7 @@ impl CodecLayer {
         let att = candle_nn::ops::softmax_last_dim(&att)?;
         let out = att.matmul(&v)?; // [B, H, T, D]
         let out = out.transpose(1, 2)?.reshape((b, t, h * d))?;
-        self.out_proj.forward(&out)
+        __model_proof_output!(self.out_proj.forward(&out))
     }
 
     /// Streaming counterpart of [`forward`](Self::forward) for a chunk of `c` new positions (`x` =
@@ -641,10 +653,18 @@ impl CodecLayer {
         context: usize,
         cache: &mut KvCache,
     ) -> CandleResult<Tensor> {
-        let attn = self.attention_streaming(&self.norm1.forward(x)?, cos, sin, context, cache)?;
+        let attn = self.attention_streaming(
+            &__model_proof_output!(self.norm1.forward(x))?,
+            cos,
+            sin,
+            context,
+            cache,
+        )?;
         let x = (x + attn.broadcast_mul(&self.layer_scale_1)?)?;
-        let h = self.linear1.forward(&self.norm2.forward(&x)?)?;
-        let h = self.linear2.forward(&h.gelu_erf()?)?;
+        let h = __model_proof_output!(self
+            .linear1
+            .forward(&__model_proof_output!(self.norm2.forward(&x))?))?;
+        let h = __model_proof_output!(self.linear2.forward(&h.gelu_erf()?))?;
         x.broadcast_add(&h.broadcast_mul(&self.layer_scale_2)?)
     }
 
@@ -663,7 +683,7 @@ impl CodecLayer {
         let (b, c, _) = x.dims3()?;
         let h = self.num_heads;
         let d = self.head_dim;
-        let qkv = self.in_proj.forward(x)?.reshape((b, c, 3, h, d))?;
+        let qkv = __model_proof_output!(self.in_proj.forward(x))?.reshape((b, c, 3, h, d))?;
         let q = qkv.i((.., .., 0))?.transpose(1, 2)?.contiguous()?; // [b, h, c, d]
         let k = qkv.i((.., .., 1))?.transpose(1, 2)?.contiguous()?;
         let v = qkv.i((.., .., 2))?.transpose(1, 2)?.contiguous()?;
@@ -679,7 +699,7 @@ impl CodecLayer {
         let out = att.matmul(&v_all)?; // [b, h, c, d]
         let out = out.transpose(1, 2)?.reshape((b, c, h * d))?;
         cache.retain_last(context.saturating_sub(1))?;
-        self.out_proj.forward(&out)
+        __model_proof_output!(self.out_proj.forward(&out))
     }
 }
 
@@ -746,7 +766,7 @@ impl CodecStage {
         // (B, D, T) -> (B, T, D)
         let mut h = x.transpose(1, 2)?.contiguous()?;
         if let Some(p) = &self.input_proj {
-            h = p.forward(&h)?;
+            h = __model_proof_output!(p.forward(&h))?;
         }
         let (cos, sin) = rope_tables(h.device(), t, self.head_dim, ROPE_MAX_PERIOD)?;
         let mask = banded_causal_mask(h.device(), t, self.context)?;
@@ -754,7 +774,7 @@ impl CodecStage {
             h = layer.forward(&h, &cos, &sin, &mask)?;
         }
         if let Some(p) = &self.output_proj {
-            h = p.forward(&h)?;
+            h = __model_proof_output!(p.forward(&h))?;
         }
         // (B, T, D) -> (B, D, T)
         h.transpose(1, 2)?.contiguous()
@@ -773,7 +793,7 @@ impl CodecStage {
         // (B, D, T) -> (B, T, D)
         let mut h = x.transpose(1, 2)?.contiguous()?;
         if let Some(p) = &self.input_proj {
-            h = p.forward(&h)?;
+            h = __model_proof_output!(p.forward(&h))?;
         }
         // The stage's full RoPE tables; each chunk slices its own absolute-position rows out of them.
         let (cos, sin) = rope_tables(h.device(), t, self.head_dim, ROPE_MAX_PERIOD)?;
@@ -798,7 +818,7 @@ impl CodecStage {
             h = Tensor::cat(&outs, 1)?; // [1, T, d_model]
         }
         if let Some(p) = &self.output_proj {
-            h = p.forward(&h)?;
+            h = __model_proof_output!(p.forward(&h))?;
         }
         // (B, T, D) -> (B, D, T)
         h.transpose(1, 2)?.contiguous()
@@ -827,7 +847,7 @@ impl CodecStage {
         })?;
         let mut h = x.transpose(1, 2)?.contiguous()?;
         if let Some(p) = &self.input_proj {
-            h = p.forward(&h)?;
+            h = __model_proof_output!(p.forward(&h))?;
         }
         let (cos, sin) = rope_tables_range(
             h.device(),
@@ -840,7 +860,7 @@ impl CodecStage {
             h = layer.forward_streaming(&h, &cos, &sin, self.context, cache)?;
         }
         if let Some(p) = &self.output_proj {
-            h = p.forward(&h)?;
+            h = __model_proof_output!(p.forward(&h))?;
         }
         state.position = next_position;
         h.transpose(1, 2)?.contiguous()
@@ -956,7 +976,7 @@ impl RlfqEncoder {
 
     /// Encode `e` `[1, output_dim, T]` (the encoder's last hidden state) → `nq` code rows `[nq][T]`.
     fn encode(&self, e: &Tensor) -> CandleResult<Vec<Vec<u32>>> {
-        let mut residual = self.input_proj.forward(e)?; // [1, rvq_dim, T]
+        let mut residual = __model_proof_output!(self.input_proj.forward(e))?; // [1, rvq_dim, T]
         let mut codes: Vec<Vec<u32>> = Vec::with_capacity(self.nq);
         for i in 0..self.nq {
             // Nearest code by argmin ‖e − c‖² over L2-normalized vectors, which equals argmax cosine:
@@ -1873,6 +1893,7 @@ mod tests {
     /// [`moss_audio_codec_chunked_encode_matches_single_shot`](../../tests/conformance.rs) gate assert
     /// end-to-end. Widening `chunk` (the shipped default is a full `context`) shrinks the gap further.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chunked_stage_matches_single_shot() {
         let dev = Device::Cpu;
         // input_dim≠d_model≠output_dim so both projections engage; head_dim=4; 3 layers; context=5.
@@ -1914,12 +1935,18 @@ mod tests {
             var > 1e-4,
             "degenerate stage output (var {var:.3e}) — test would be vacuous"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED codec::tests::chunked_stage_matches_single_shot"
+        );
     }
 
     /// A one-window fixture exercises the chunked attention implementation without changing its
     /// reduction shape. This is the compatibility boundary for ordinary short realtime utterances:
     /// chunked decode must retain the prior single-shot bytes exactly, not merely within tolerance.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chunked_decoder_fixture_is_byte_identical_to_single_shot() {
         let dev = Device::Cpu;
         let spec = StageSpec {
@@ -1942,6 +1969,9 @@ mod tests {
             single.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             "a one-window chunk must preserve the prior single-shot bytes"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED codec::tests::chunked_decoder_fixture_is_byte_identical_to_single_shot");
     }
 
     /// Retaining stage state across request blocks must reproduce the existing one-shot chunked
@@ -1951,6 +1981,7 @@ mod tests {
     /// same RoPE rows and causal windows. The production one-shot/streaming tests below still require
     /// exact bytes because those routes deliberately share the same block-major state machine.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn retained_decoder_state_matches_one_shot_chunked_blocks() {
         let dev = Device::Cpu;
         let spec = StageSpec {
@@ -2020,6 +2051,9 @@ mod tests {
             "resetting causal state changed output by only {reset_diff:.3e}; equivalence tolerance \
              would not discriminate the missing-state mutation"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED codec::tests::retained_decoder_state_matches_one_shot_chunked_blocks");
     }
 
     /// Production-level normal-budget identity gate for sc-21686. Both sides traverse the actual
@@ -2028,6 +2062,7 @@ mod tests {
     /// path reduced attention at context-sized widths and therefore matched that mutation rather than
     /// the live canonical path.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn one_shot_and_streaming_share_the_canonical_four_stage_schedule() {
         let dev = Device::Cpu;
         let codec = synthetic_four_stage_codec(&dev);
@@ -2104,6 +2139,9 @@ mod tests {
             reset_state_output, one_shot,
             "dropping the four-stage causal state must fail the identity gate"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED codec::tests::one_shot_and_streaming_share_the_canonical_four_stage_schedule");
     }
 
     /// Production-level early-EOS identity gate for sc-21686. Every actual completion length from two
@@ -2112,6 +2150,7 @@ mod tests {
     /// and the streaming chunker. The scalar-eight and wrong-one-shot mutations are load-bearing: the
     /// former collapses every case to one full-track chunk, while the latter changes exact bytes.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn early_eos_requests_share_one_canonical_four_stage_schedule() {
         let dev = Device::Cpu;
         let codec = synthetic_four_stage_codec(&dev);
@@ -2243,6 +2282,9 @@ mod tests {
                 .to_string();
             assert!(error.contains("partition must be in 1..=8"), "{error}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED codec::tests::early_eos_requests_share_one_canonical_four_stage_schedule");
     }
 
     /// The model advertises a 40-minute (30,000-frame) realtime surface. The canonical production
@@ -2281,6 +2323,7 @@ mod tests {
     /// i.e. no cross-chunk history — the classic streaming bug) must NOT match single-shot, so the
     /// passing test above is genuinely constraining the implementation.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chunked_stage_without_cross_chunk_state_diverges() {
         let dev = Device::Cpu;
         let spec = StageSpec {
@@ -2303,7 +2346,7 @@ mod tests {
         // failed to carry absolute position + KV state — and must diverge from single-shot.
         let chunk = 4usize;
         let mut h = x.transpose(1, 2).unwrap().contiguous().unwrap();
-        h = stage.input_proj.as_ref().unwrap().forward(&h).unwrap();
+        h = __model_proof_output!(stage.input_proj.as_ref().unwrap().forward(&h)).unwrap();
         for layer in &stage.layers {
             let mut outs: Vec<Tensor> = Vec::new();
             let mut p = 0;
@@ -2322,7 +2365,7 @@ mod tests {
             }
             h = Tensor::cat(&outs, 1).unwrap();
         }
-        h = stage.output_proj.as_ref().unwrap().forward(&h).unwrap();
+        h = __model_proof_output!(stage.output_proj.as_ref().unwrap().forward(&h)).unwrap();
         let broken = h.transpose(1, 2).unwrap().contiguous().unwrap();
         let diff = max_abs_diff(&full, &broken);
         assert!(
@@ -2330,5 +2373,8 @@ mod tests {
             "the state-reset streaming bug did NOT diverge (diff {diff:.3e}) — the equivalence test \
              would be vacuous"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED codec::tests::chunked_stage_without_cross_chunk_state_diverges");
     }
 }

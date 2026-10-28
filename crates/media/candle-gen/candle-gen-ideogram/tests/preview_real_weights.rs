@@ -31,6 +31,15 @@
 //! Every input is **required** by the row that uses it: a row that early-returns on an unset variable
 //! still reports SUCCESS, and in a run log a skipped gate is indistinguishable from one that ran and
 //! proved something. Asking for `--ignored` is already the opt-in.
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -603,5 +612,10 @@ fn ideogram_preview_frames_evolve_toward_the_final_image() {
         live.width,
         live.height,
         &format!("{label}-final.png"),
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED ideogram_preview_frames_evolve_toward_the_final_image"
     );
 }

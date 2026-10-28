@@ -28,6 +28,7 @@ pub fn load_pth_f32_filtered(
     path: impl AsRef<Path>,
     keep: impl Fn(&str) -> bool,
 ) -> Result<HashMap<String, Array>> {
+    let path = path.as_ref();
     let mut archive = PthArchive::open(path)?;
     let mut out = HashMap::new();
     archive.visit_state_dict(keep, |name, tensor| {
@@ -37,7 +38,12 @@ pub fn load_pth_f32_filtered(
         out.insert(name, Array::from_slice(&floats, &shape));
         Ok(())
     })?;
-    Ok(out)
+    gen_core::__model_input_result!(
+        Ok(out),
+        "mlx-gen::pth::load_pth_f32_filtered",
+        ModelWeights,
+        &[path]
+    )
 }
 
 #[cfg(test)]

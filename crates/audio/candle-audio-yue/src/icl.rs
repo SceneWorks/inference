@@ -208,7 +208,7 @@ impl SemanticEncoder {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor, AudioError> {
-        let mut x = self.conv.forward(x)?;
+        let mut x = __model_proof_output!(self.conv.forward(x))?;
         for (units, down) in &self.blocks {
             for (c1, c2) in units {
                 let y = c2.forward(&c1.forward(&x.elu(1.0)?)?.elu(1.0)?)?;
@@ -414,11 +414,10 @@ impl XcodecEncoder {
             return Ok(None);
         }
         let e = Tensor::cat(&[&acoustic, &semantic], 1)?;
-        let prior = self
-            .fc_prior
-            .forward(&e.transpose(1, 2)?.contiguous()?)?
-            .transpose(1, 2)?
-            .contiguous()?;
+        let prior =
+            __model_proof_output!(self.fc_prior.forward(&e.transpose(1, 2)?.contiguous()?))?
+                .transpose(1, 2)?
+                .contiguous()?;
         Ok(Some(EncodeStages {
             hubert_mean: sem_in,
             semantic,
@@ -753,6 +752,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn production_load_encodes_a_staged_checkpoint_instead_of_refusing() {
         let snap = tiny_snapshot();
         let enc = load(&assets(snap.path())).expect("production encoder loads staged weights");
@@ -771,9 +771,13 @@ mod tests {
             codes.ids.iter().any(|&id| id != codes.ids[0]),
             "a real encode varies over the clip"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED icl::tests::production_load_encodes_a_staged_checkpoint_instead_of_refusing");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn frame_counts_agree_across_the_padded_re_encode_branch() {
         let snap = tiny_snapshot();
         let enc = XcodecEncoder::load(&snap.path().join(CHECKPOINT), &Device::Cpu).unwrap();
@@ -796,9 +800,13 @@ mod tests {
             let y = enc.acoustic.encode(&x, &|| false).unwrap().unwrap();
             assert_eq!(y.dim(2).unwrap(), acoustic_frames(n), "{n}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED icl::tests::frame_counts_agree_across_the_padded_re_encode_branch");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chunked_sample_rate_stages_match_the_whole_clip_encode() {
         let snap = tiny_snapshot();
         let whole = XcodecEncoder::load(&snap.path().join(CHECKPOINT), &Device::Cpu)
@@ -862,9 +870,13 @@ mod tests {
             diff <= 1e-5 * peak,
             "query blocks: max|Δ| {diff} vs peak {peak}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED icl::tests::chunked_sample_rate_stages_match_the_whole_clip_encode");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dual_track_interleaves_vocals_first_and_windows_at_100_per_second() {
         let snap = tiny_snapshot();
         let enc = XcodecEncoder::load(&snap.path().join(CHECKPOINT), &Device::Cpu).unwrap();
@@ -886,9 +898,13 @@ mod tests {
         // int(0.1·50·2) = 10 .. int(0.4·50·2) = 40 of the interleave: frames 5..20.
         let want: Vec<u32> = (5..20).flat_map(|f| [vi[f], ii[f]]).collect();
         assert_eq!(codes.ids, want);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED icl::tests::dual_track_interleaves_vocals_first_and_windows_at_100_per_second");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn single_track_windows_at_50_per_second_after_a_stereo_downmix() {
         let snap = tiny_snapshot();
         let enc = XcodecEncoder::load(&snap.path().join(CHECKPOINT), &Device::Cpu).unwrap();
@@ -906,9 +922,13 @@ mod tests {
         };
         let codes = enc.encode(&reference, &CancelFlag::new()).unwrap();
         assert_eq!(codes.ids, all[5..15]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED icl::tests::single_track_windows_at_50_per_second_after_a_stereo_downmix");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn encode_refuses_mismatched_stems_empty_windows_and_honors_cancel() {
         let snap = tiny_snapshot();
         let enc = XcodecEncoder::load(&snap.path().join(CHECKPOINT), &Device::Cpu).unwrap();
@@ -939,6 +959,9 @@ mod tests {
             enc.encode(&dual(6_400, 6_400), &cancel),
             Err(gen_core::Error::Canceled)
         ));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED icl::tests::encode_refuses_mismatched_stems_empty_windows_and_honors_cancel");
     }
 
     #[test]

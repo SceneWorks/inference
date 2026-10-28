@@ -69,6 +69,7 @@ fn peak_rel(got: &[f32], want: &[f32]) -> f32 {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn one_step_matches_the_torch_oracle() {
     let g = fixture("iris_depth_train_golden.safetensors");
     let batch = golden_batch(&g);
@@ -183,6 +184,11 @@ fn one_step_matches_the_torch_oracle() {
     let want1 = host_f32(g.require("loss1"))[0];
     eprintln!("loss1: {l1} vs {want1}");
     assert!(((l1 - want1) / want1).abs() <= 1e-3);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED depth_train_parity::one_step_matches_the_torch_oracle"
+    );
 }
 
 #[test]
@@ -219,6 +225,7 @@ fn tensor_loss_matches_the_host_reference() {
 /// generation trainer's trunk / pixel regions around the widened backbone. f32: the gradients are
 /// the plain graph's; bf16: the same loss bit for bit and gradients within the declared bf16 bound.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn activation_checkpointing_gradients_equal_the_plain_graph() {
     use candle_gen::candle_core::DType;
     use candle_gen::gen_core::iris::train::ac::AcPolicy;
@@ -258,4 +265,7 @@ fn activation_checkpointing_gradients_equal_the_plain_graph() {
     let (b_loss_ac, b_full, _) = case(DType::BF16, AcPolicy::Full);
     assert_eq!(b_loss.to_bits(), b_loss_ac.to_bits(), "bf16 loss");
     crate::common::assert_ac_bf16_noise_only("depth", &f_none, &b_none, &b_full);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_parity::activation_checkpointing_gradients_equal_the_plain_graph");
 }

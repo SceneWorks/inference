@@ -45,6 +45,15 @@
 //! Device code is behind `cfg(feature = "cuda")`; a CPU or Metal build compiles the codec, the
 //! capability floors, the kernel descriptors and the fused primitives' input checks only.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod cublaslt;
 pub mod decode_attention;
 pub mod flux3_quant;

@@ -20,6 +20,16 @@
 //! returns a float32 relative-log-depth map, not an image. [`depth::load`] resolves only the
 //! `depth/` export and returns a `gen_core::iris::depth::IrisDepthEstimator`.
 //!
+//! ## Quantized tiers (sc-26266)
+//!
+//! `iris_3b` loads at bf16 (the release's autocast policy) and at the affine `q8` / `q4` tiers,
+//! which are quantized **at load** from the same dense release — there is no converted artifact.
+//! A tier is a whole-pipeline contract: the Qwen3-VL tower's attention/MLP projections
+//! ([`IrisTextEncoder::load_quantized`]) and every backbone projection ([`load_backbone_quantized`],
+//! [`nn::ProjectionLayout`]) pack at the selected width. Embeddings, norms, the text position table
+//! and the sub-group-wide pixel heads stay dense. The depth and restoration tasks and every trainer
+//! ship the dense tier only.
+//!
 //! ## Frozen upstream
 //!
 //! See `UPSTREAM.md` (revisions, resource layout, the generation coverage table, fixtures and
@@ -31,28 +41,53 @@
 pub mod adapters;
 pub mod depth;
 pub mod dit;
+pub mod ios_pricing;
 pub mod memory_strategy;
 pub mod model;
 pub mod nn;
+pub mod packed;
 pub mod pipeline;
 pub mod restoration;
+pub(crate) mod retention;
 pub mod solver;
+pub mod stream;
 pub mod text_encoder;
+#[cfg(feature = "training")]
 pub mod train;
 
-pub use dit::{IrisDiT, TextBatch};
+#[cfg(all(test, target_os = "macos"))]
+mod anchor_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod packed_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_proofs;
+#[cfg(all(test, target_os = "macos", debug_assertions))]
+mod quantum_tests;
+#[cfg(test)]
+mod reachable_sizes;
+#[cfg(all(test, target_os = "macos"))]
+mod stream_tests;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/common/metal_guard.rs"]
+pub(crate) mod test_metal_guard;
+
+pub use dit::{Execution, IrisDiT, TextBatch};
 pub use mlx_gen::gen_core::iris::{
     IrisTask, TEXT_ENCODER_COMPONENT, TEXT_ENCODER_REPO, TEXT_ENCODER_REVISION,
     UPSTREAM_CODE_REVISION, UPSTREAM_WEIGHTS_REPO, UPSTREAM_WEIGHTS_REVISION,
 };
 pub use model::{
-    compute_dtype, descriptor, load, load_backbone, load_backbone_with_adapters, Iris3b, MODEL_ID,
+    compute_dtype, descriptor, load, load_backbone, load_backbone_quantized,
+    load_backbone_with_adapters, Iris3b, MODEL_ID,
 };
+pub use nn::{BackboneQuant, ProjectionLayout, QUANT_GROUP_SIZE};
 pub use pipeline::{
     denoise, encode, noise, noise_batch, preview_image, to_image, to_images, Conditioning,
 };
 pub use restoration::IrisRestorer;
-pub use text_encoder::{IrisTextEncoder, TextConditioning};
+pub use text_encoder::{
+    text_encoder_quant_group, text_encoder_quant_spec, IrisTextEncoder, TextConditioning,
+};
 
 /// Add the MLX Iris-3B generator, its generation (sc-25685) and depth (sc-25687) trainers and the
 /// restoration transform to an explicit media registry builder, with the memory-strategy contract,
@@ -69,11 +104,24 @@ pub use text_encoder::{IrisTextEncoder, TextConditioning};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model::REGISTRATION)
+    // The three trainers and their training-only deps (MLX distributed / JACCL, dataset image
+    // decode, checkpoint state) are the default-on `training` feature (sc-26265), so an
+    // inference-only graph compiles none of them.
+    #[cfg(feature = "training")]
+    let registry = registry
         .register_trainer(train::REGISTRATION)
         .register_trainer(train::depth::REGISTRATION)
-        .register_trainer(train::restore::REGISTRATION)
+        .register_trainer(train::restore::REGISTRATION);
+    register_inference_providers(registry)
+}
+
+/// Register every Iris inference route, never trainers, even if Cargo unifies `training` on.
+/// Registration does not claim a device fit: admission owns that decision for each mode.
+pub fn register_inference_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::REGISTRATION)
         .register_transform(restoration::REGISTRATION)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_composed_memory_strategy(memory_strategy::DEPTH_MEMORY_REGISTRATION)
@@ -122,7 +170,16 @@ mod tests {
             .trainers()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(trainers, ["iris_3b", "iris_3b_depth", "iris_3b_restore"]);
+        let expected_trainers: &[&str] = if cfg!(feature = "training") {
+            &["iris_3b", "iris_3b_depth", "iris_3b_restore"]
+        } else {
+            &[]
+        };
+        assert_eq!(trainers, expected_trainers);
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

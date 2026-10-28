@@ -1477,7 +1477,13 @@ pub(crate) fn native_import_residency(device: &Device) -> CandleCodecResidency {
 /// (sc-9410) and z-image's `component_is_packed` (sc-9408).
 pub(crate) fn read_packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
     let path = dir.join("config.json");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/candle-gen/candle-gen-krea/src/loader.rs::read_packed_config::std::fs::read_to_string@77173",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(t) => t,
         // No config.json at all → legitimate dense / single-file fixture tier.
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2161,6 +2167,7 @@ mod tests {
     /// forward reproduces the affine grid (proving the group-64 repack + threading is correct, not a
     /// silent dense fallback).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
@@ -2193,6 +2200,8 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-64 packed vs grid cosine {cos:.6}");
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged");
         Ok(())
     }
 
@@ -2201,6 +2210,7 @@ mod tests {
     /// configured external cache root instead of requiring a write beside the model.
     #[cfg(unix)]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_krea_loads_from_a_cold_read_only_snapshot() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2244,6 +2254,8 @@ mod tests {
         assert!(cosine(&packed.forward(&x)?, &dense.forward(&x)?) > 0.99999);
 
         drop(weights);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::packed_krea_loads_from_a_cold_read_only_snapshot");
         Ok(())
     }
 
@@ -2272,6 +2284,7 @@ mod tests {
     /// The packed-detecting **embedding** loader fires on a group-64 packed `embed_tokens` triple and
     /// reproduces its affine grid rows (the future-proof path — the Krea tier keeps this table dense).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn embedding_detect_group64() -> Result<()> {
         let dev = Device::Cpu;
         let (vocab, hidden) = (128usize, 128usize);
@@ -2299,6 +2312,8 @@ mod tests {
             .max_all()?
             .to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "packed embedding deviates from the grid");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::embedding_detect_group64");
         Ok(())
     }
 
@@ -2308,6 +2323,7 @@ mod tests {
     /// triple — and its forward must reproduce the overlay weight exactly. This is the seam that lets a
     /// LoRA merge into a packed tier: the adapted projection loads dense, the rest stays packed.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn overlay_shadows_packed_base_for_adapter_compose() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
@@ -2337,7 +2353,7 @@ mod tests {
             "an overlaid (adapter-merged) weight must take the dense path, shadowing the packed triple"
         );
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let want = Linear::new(merged, None).forward(&x)?;
+        let want = __model_proof_output!(Linear::new(merged, None).forward(&x))?;
         let dev_max = (lin.forward(&x)?.sub(&want)?)
             .abs()?
             .max_all()?
@@ -2346,6 +2362,8 @@ mod tests {
             dev_max, 0.0,
             "overlay forward must equal the merged dense weight"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::overlay_shadows_packed_base_for_adapter_compose");
         Ok(())
     }
 
@@ -2399,6 +2417,7 @@ mod tests {
     /// reconstructs the affine grid from the packed triple. This is what lets the Krea pose-control lane
     /// run on the q8/q4 base (GPU-proven — q8 ≈ bf16, q4 pose-locked with mild haze).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_dequantizes_packed_tier() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
@@ -2424,8 +2443,8 @@ mod tests {
             "linear() on a packed tier must reconstruct the affine grid, not cast the u32 codes"
         );
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let want = Linear::new(grid, None).forward(&x)?;
-        let dev_max = (lin.forward(&x)?.sub(&want)?)
+        let want = __model_proof_output!(Linear::new(grid, None).forward(&x))?;
+        let dev_max = (__model_proof_output!(lin.forward(&x))?.sub(&want)?)
             .abs()?
             .max_all()?
             .to_scalar::<f32>()?;
@@ -2433,6 +2452,8 @@ mod tests {
             dev_max < 1e-4,
             "packed linear forward must match the dense grid (max dev {dev_max})"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::linear_dequantizes_packed_tier");
         Ok(())
     }
 
@@ -2612,6 +2633,7 @@ mod tests {
     /// forward applies the online `RHT(x)` so it reproduces `X·Wᵀ` for the **canonical un-rotated** `W`
     /// (not the stored `W·R`). There is no `.bias`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn convrot_detect_fires_and_reconstructs_canonical_weight() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
@@ -2635,7 +2657,7 @@ mod tests {
         // Without the rotation this would be ~0.1 (the sc-9300 NO-GO); the sc-9601 leg lifts it to ~1.
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let got = lin.forward(&x)?.to_dtype(DType::F32)?;
-        let want = Linear::new(ref_w, None).forward(&x)?;
+        let want = __model_proof_output!(Linear::new(ref_w, None).forward(&x))?;
         let cos = cosine(&got, &want);
         assert!(
             cos > 0.99,
@@ -2660,6 +2682,8 @@ mod tests {
         );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::convrot_detect_fires_and_reconstructs_canonical_weight");
         Ok(())
     }
 
@@ -3541,6 +3565,7 @@ mod tests {
     /// forward: nothing is dequantized into a dense `[out, in]` weight, the projection is still an
     /// NVFP4 leg afterwards, and `clear_adapters` is bit-exact because the base was never mutated.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn nvfp4_projection_hosts_an_additive_lora_and_removal_restores_the_base() -> Result<()> {
         let (_tmp, mut proj, out_f, in_f) = packed_nvfp4_to_q();
         assert!(
@@ -3598,12 +3623,15 @@ mod tests {
             "removing the adapter must restore the EXACT base output"
         );
         assert!(proj.nvfp4().is_some());
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::nvfp4_projection_hosts_an_additive_lora_and_removal_restores_the_base");
         Ok(())
     }
 
     /// **AC#2 — an inadmissible adapter fails at install, and the NVFP4 base is never converted to
     /// another numeric regime to make one fit** (sc-21483).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn nvfp4_projection_refuses_bad_adapters_and_every_requantization() -> Result<()> {
         let (_tmp, mut proj, out_f, in_f) = packed_nvfp4_to_q();
         let dev = Device::Cpu;
@@ -3648,6 +3676,8 @@ mod tests {
             assert!(error.contains("cannot be re-quantized"), "{error}");
         }
         assert!(proj.nvfp4().is_some(), "the base is still NVFP4");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::nvfp4_projection_refuses_bad_adapters_and_every_requantization");
         Ok(())
     }
 
@@ -3656,6 +3686,7 @@ mod tests {
     /// this host (not the skipped-key report the dense/packed hosts produce, because NVFP4 has no
     /// fallback and would otherwise render silently un-adapted).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn install_additive_drives_and_guards_an_nvfp4_projection() -> Result<()> {
         use crate::adapters::{AdditiveDit, AdditiveProj};
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
@@ -3743,6 +3774,8 @@ mod tests {
             dit.proj.nvfp4().is_some(),
             "the base is untouched by the refusal"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::install_additive_drives_and_guards_an_nvfp4_projection");
         Ok(())
     }
 
@@ -4237,6 +4270,7 @@ mod tests {
     /// stays on the plain **Dense** arm and the loaded weight is byte-for-byte the on-disk dense weight —
     /// NOT an inverse-rotated `W·Rᵀ`. The contrast: `from_convrot_file` reports rotation ON.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn from_native_file_loads_dense_without_rotation() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
@@ -4273,7 +4307,7 @@ mod tests {
         );
         // And its forward equals the un-rotated dense linear (the reconstruction a rotation would break).
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let want = Linear::new(ref_wq, None).forward(&x)?;
+        let want = __model_proof_output!(Linear::new(ref_wq, None).forward(&x))?;
         let dev_max = (lin.forward(&x)?.sub(&want)?)
             .abs()?
             .max_all()?
@@ -4288,6 +4322,8 @@ mod tests {
         assert_eq!(normw.dims(), &[out_dim]);
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::from_native_file_loads_dense_without_rotation");
         Ok(())
     }
 

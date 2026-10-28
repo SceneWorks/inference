@@ -106,6 +106,64 @@ impl QuantizedEmbedding {
     }
 }
 
+/// Group-wise affine quantization whose integer codes are chosen against the scales and biases
+/// **as stored** (sc-26266).
+///
+/// MLX's `quantize` derives each group's grid in f32, rounds every element to it, and only then
+/// casts the scale and bias to the weight's dtype. For a 16-bit weight the stored grid is
+/// therefore not the grid the codes were rounded to: a bf16 scale is off by up to 2⁻⁹ of
+/// itself, which at code 255 is half a quantization step on its own, and the bf16 bias (the
+/// group's edge value) shifts the whole group by up to a quarter step. At 8 bits that is ~1.6 x
+/// the rounding error the bytes pay for (measured on the Iris-3B and Qwen3-VL-4B projections:
+/// 0.86 % relative weight error against 0.55 % with the codes recomputed); at 4 bits the
+/// step is 17 x wider and the mismatch is noise.
+///
+/// This keeps MLX's per-group `scales` / `biases` exactly (same dtype, same values, so the
+/// layout and the resident bytes are `quantize`'s) and re-rounds every element against them:
+/// `q = clip(round((w − bias) / scale), 0, 2^bits − 1)`, packed in MLX's layout (element `j`
+/// of each 32-bit word at bits `[j·bits, (j + 1)·bits)`). The result is a drop-in for
+/// `quantize`'s triple (`dequantize` / `quantized_matmul` read it unchanged). `bits` must
+/// divide 32 and `group_size` the last axis.
+pub fn quantize_on_stored_grid(
+    weight: &Array,
+    group_size: i32,
+    bits: i32,
+) -> Result<(Array, Array, Array)> {
+    let shape = weight.shape().to_vec();
+    let inner = shape.last().copied().unwrap_or(0);
+    if !matches!(bits, 2 | 4 | 8) || group_size <= 0 || inner % group_size != 0 {
+        return Err(crate::error::Error::Config(format!(
+            "quantize_on_stored_grid: {bits}-bit groups of {group_size} cannot pack a weight of \
+             shape {shape:?}"
+        )));
+    }
+    let (_, scales, biases) = quantize(weight, group_size, bits)?;
+    let lead = &shape[..shape.len() - 1];
+    let grouped = |tail: &[i32]| -> Vec<i32> { lead.iter().chain(tail).copied().collect() };
+    let groups = inner / group_size;
+    let w = weight
+        .as_dtype(Dtype::Float32)?
+        .reshape(&grouped(&[groups, group_size]))?;
+    let s = scales
+        .as_dtype(Dtype::Float32)?
+        .reshape(&grouped(&[groups, 1]))?;
+    let b = biases
+        .as_dtype(Dtype::Float32)?
+        .reshape(&grouped(&[groups, 1]))?;
+    let top = ((1u32 << bits) - 1) as f32;
+    let codes = mlx_rs::ops::clip(&w.subtract(&b)?.divide(&s)?.round(None)?, (0.0f32, top))?
+        .as_dtype(Dtype::Uint32)?;
+    // Disjoint bit fields, so the weighted sum is the bitwise OR (and never overflows a word).
+    let per_word = 32 / bits;
+    let place: Vec<u32> = (0..per_word).map(|j| 1u32 << (bits * j)).collect();
+    let packed = codes
+        .reshape(&grouped(&[inner / per_word, per_word]))?
+        .multiply(Array::from_slice(&place, &[per_word]))?
+        .sum_axis(-1, false)?
+        .as_dtype(Dtype::Uint32)?;
+    Ok((packed, scales, biases))
+}
+
 /// Cast a stored affine quantization parameter to the model's compute dtype.
 ///
 /// MLX's affine `quantized_matmul` produces `promote_types(x, scales)` (and `dequantize` the scale
@@ -187,6 +245,25 @@ impl QuantizedLinear {
         })
     }
 
+    /// [`quantize`](Self::quantize) with every code rounded to the stored scales and biases
+    /// ([`quantize_on_stored_grid`]): the same layout and bytes, a lower weight error.
+    pub fn quantize_on_stored_grid(
+        weight: &Array,
+        group_size: i32,
+        bits: i32,
+        bias: Option<Array>,
+    ) -> Result<Self> {
+        let (w, scales, biases) = quantize_on_stored_grid(weight, group_size, bits)?;
+        Ok(Self {
+            weight: w,
+            scales,
+            biases,
+            group_size,
+            bits,
+            bias,
+        })
+    }
+
     /// Forward pass: `x @ dequant(weight).t() (+ bias)`.
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let y = quantized_matmul(
@@ -221,7 +298,97 @@ mod tests {
     use super::*;
     use crate::primitives::nn::{embed, input_ids, linear};
 
+    fn relative_error(got: &Array, want: &Array) -> f64 {
+        let want = want.as_dtype(Dtype::Float32).unwrap();
+        let got = got.as_dtype(Dtype::Float32).unwrap();
+        let fro =
+            |a: &Array| f64::from(a.square().unwrap().sum(None).unwrap().item::<f32>()).sqrt();
+        fro(&got.subtract(&want).unwrap()) / fro(&want)
+    }
+
+    /// Dequantize with the scales and biases widened to f32 — what `quantized_matmul` computes
+    /// in (it never rounds the dequantized weight to the scale dtype, as `dequantize` does).
+    fn dequantized(words: &Array, scales: &Array, biases: &Array, bits: i32) -> Array {
+        let f = |a: &Array| a.as_dtype(Dtype::Float32).unwrap();
+        dequantize(words, f(scales), Some(&f(biases)), 64, bits).unwrap()
+    }
+
+    fn seeded(shape: &[i32], seed: u64) -> Array {
+        let key = mlx_rs::random::key(seed).unwrap();
+        mlx_rs::random::normal::<f32>(shape, None, None, Some(&key)).unwrap()
+    }
+
+    /// sc-26266: `quantize_on_stored_grid` packs in MLX's layout — on an f32 weight (whose f32
+    /// scales are the grid MLX rounded to) it reproduces `quantize`'s words exactly — and on a
+    /// bf16 weight its q8 packing matches the f32-grid optimum where MLX's lands ~1.5 x above.
+    ///
+    /// *Mutations that red this:* a wrong bit order or word width (words differ); rounding to the
+    /// f32 grid (the bf16 q8 ratio).
     #[test]
+    fn stored_grid_packing_is_mlx_layout_and_reaches_the_f32_grid_optimum() {
+        for bits in [4, 8] {
+            let w = seeded(&[64, 256], 7 + bits as u64);
+            let (mlx_words, ..) = quantize(&w, 64, bits).unwrap();
+            let (words, scales, biases) = quantize_on_stored_grid(&w, 64, bits).unwrap();
+            assert_eq!(words.dtype(), Dtype::Uint32);
+            assert_eq!(words.shape(), mlx_words.shape());
+            let same = words
+                .eq(&mlx_words)
+                .unwrap()
+                .all(None)
+                .unwrap()
+                .item::<bool>();
+            assert!(same, "q{bits}: the f32 packing differs from MLX's words");
+
+            let bf16 = w.as_dtype(Dtype::Bfloat16).unwrap();
+            let optimum = relative_error(&dequantized(&words, &scales, &biases, bits), &w);
+            let (words, scales, biases) = quantize_on_stored_grid(&bf16, 64, bits).unwrap();
+            assert_eq!(scales.dtype(), Dtype::Bfloat16);
+            let stored = relative_error(&dequantized(&words, &scales, &biases, bits), &bf16);
+            let (words, scales, biases) = quantize(&bf16, 64, bits).unwrap();
+            let computed = relative_error(&dequantized(&words, &scales, &biases, bits), &bf16);
+            eprintln!(
+                "q{bits}: f32 grid {optimum:.4e}, stored grid {stored:.4e}, MLX {computed:.4e}"
+            );
+            assert!(
+                stored <= 1.05 * optimum,
+                "q{bits}: stored grid {stored} vs optimum {optimum}"
+            );
+            if bits == 8 {
+                assert!(
+                    computed > 1.3 * optimum,
+                    "MLX's q8 bf16 packing is already optimal"
+                );
+            }
+        }
+    }
+
+    /// A `QuantGrid::Stored` spec reaches the load-time quantizer (`Projection::load`).
+    ///
+    /// *Mutation that reds this:* `Projection::load_with_bias` ignoring `QuantSpec::grid`.
+    #[test]
+    fn a_stored_grid_spec_packs_projections_on_the_stored_grid() {
+        use crate::primitives::projection::{Projection, QuantGrid, QuantSpec};
+        let w = seeded(&[32, 128], 3).as_dtype(Dtype::Bfloat16).unwrap();
+        let spec = QuantSpec {
+            grid: QuantGrid::Stored,
+            ..QuantSpec::q8()
+        };
+        let Projection::Quantized(q) = Projection::load(w.clone(), Some(spec)).unwrap() else {
+            panic!("not quantized")
+        };
+        let (words, ..) = quantize_on_stored_grid(&w, 64, 8).unwrap();
+        assert!(q
+            .weight
+            .eq(&words)
+            .unwrap()
+            .all(None)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn quantized_embedding_gathers_rows_without_expanding_the_table() {
         let dense = Array::from_slice(
             &(0..4 * 64)
@@ -249,6 +416,8 @@ mod tests {
             .iter()
             .zip(expected)
             .all(|(left, right)| (*left - *right).abs() <= f32::EPSILON));
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::quant::tests::quantized_embedding_gathers_rows_without_expanding_the_table");
     }
 
     /// Quantize→dequantize should round-trip within the affine grid's tolerance.
@@ -273,6 +442,7 @@ mod tests {
 
     /// Quantized matmul should approximate the dense linear it replaces.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn quantized_matmul_approximates_linear_q8() {
         let n = 4 * 64;
         let wdata: Vec<f32> = (0..n).map(|i| ((i * 7 % 13) as f32 / 13.0) - 0.5).collect();
@@ -287,5 +457,7 @@ mod tests {
         for (a, b) in dense.iter().zip(&quant) {
             assert!((a - b).abs() < 0.05, "{a} vs {b}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::quant::tests::quantized_matmul_approximates_linear_q8");
     }
 }

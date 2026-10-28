@@ -95,8 +95,8 @@ impl QEmbedding {
     /// Index-select the embedding rows for `indexes`.
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(e) => e.forward(indexes),
-            Self::Packed(e) => e.forward(indexes),
+            Self::Dense(e) => __model_proof_output!(e.forward(indexes)),
+            Self::Packed(e) => __model_proof_output!(e.forward(indexes)),
         }
     }
 
@@ -160,13 +160,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q8_is_near_lossless() {
         quant_roundtrip(Quant::Q8, 0.999);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::q8_is_near_lossless");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q4_stays_coherent() {
         quant_roundtrip(Quant::Q4, 0.95);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::q4_stays_coherent");
     }
 
     #[test]
@@ -235,6 +243,7 @@ mod tests {
     /// the projection must load quantized via the **dequant-dense** (sc-7702-safe) arm — the packed
     /// forward flux2 uses (no dense staging) — and its forward must match the affine grid.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_packed_survives_to_out_remap() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -282,12 +291,15 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::linear_detect_packed_survives_to_out_remap");
         Ok(())
     }
 
     /// `quantize_onto` is a **no-op** on a packed projection — an MLX-packed weight must never be
     /// double-quantized. The projection stays quantized (dequant-dense) and its forward is unchanged.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quantize_onto_is_noop_on_packed() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
@@ -312,12 +324,15 @@ mod tests {
             dev_max, 0.0,
             "no-op quantize_onto changed the packed forward"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::quantize_onto_is_noop_on_packed");
         Ok(())
     }
 
     /// The packed-detecting embedding loader fires on `{base}.scales` and reproduces the affine grid
     /// rows (the dev Mistral TE `embed_tokens` is packed in the q4/q8 tiers).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn embedding_detect_packed() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -350,6 +365,8 @@ mod tests {
             "packed embedding deviates from the affine grid"
         );
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::embedding_detect_packed");
         Ok(())
     }
 }

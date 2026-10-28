@@ -1589,6 +1589,7 @@ mod tests {
     /// The renderer boundary cannot be reached without the ~56 GB dual-expert stack; it is asserted
     /// in `tests/conformance.rs`, with the rest of the real-weight progress contract.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_conditioning_phase_opens_before_the_planner_load_on_both_routes() {
         let root = weightless_snapshot_root();
         let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
@@ -1626,5 +1627,7 @@ mod tests {
                 events[0]
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED bernini::tests::the_conditioning_phase_opens_before_the_planner_load_on_both_routes");
     }
 }

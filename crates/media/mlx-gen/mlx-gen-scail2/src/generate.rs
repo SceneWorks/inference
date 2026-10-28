@@ -850,6 +850,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn public_generate_rejects_geometry_before_adapter_io() {
         let image = Image {
             width: 1,
@@ -902,6 +903,8 @@ mod tests {
             err.contains("non-zero multiples of 32") && err.contains("1280×730"),
             "geometry must be the first error, got: {err}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED generate::tests::public_generate_rejects_geometry_before_adapter_io");
     }
 
     /// sc-15445: SCAIL-2 shares Krea's half-tile quality policy, not Wan's restored product overlap.

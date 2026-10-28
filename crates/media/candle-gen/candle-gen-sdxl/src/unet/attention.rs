@@ -399,9 +399,17 @@ impl BasicTransformerBlock {
 
     fn forward(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let xs = (self.attn1.forward(&self.norm1.forward(xs)?, None)? + xs)?;
-        let xs = (self.attn2.forward(&self.norm2.forward(&xs)?, context)? + xs)?;
-        self.ff.forward(&self.norm3.forward(&xs)?)? + xs
+        let xs = (self
+            .attn1
+            .forward(&__model_proof_output!(self.norm1.forward(xs))?, None)?
+            + xs)?;
+        let xs = (self
+            .attn2
+            .forward(&__model_proof_output!(self.norm2.forward(&xs))?, context)?
+            + xs)?;
+        self.ff
+            .forward(&__model_proof_output!(self.norm3.forward(&xs))?)?
+            + xs
     }
 
     fn visit_lora_mut(
@@ -760,15 +768,13 @@ impl Module for AttentionBlock {
         let in_dtype = xs.dtype();
         let residual = xs;
         let (batch, channel, height, width) = xs.dims4()?;
-        let xs = self
-            .group_norm
-            .forward(xs)?
+        let xs = __model_proof_output!(self.group_norm.forward(xs))?
             .reshape((batch, channel, height * width))?
             .transpose(1, 2)?;
 
-        let query_proj = self.query.forward(&xs)?;
-        let key_proj = self.key.forward(&xs)?;
-        let value_proj = self.value.forward(&xs)?;
+        let query_proj = __model_proof_output!(self.query.forward(&xs))?;
+        let key_proj = __model_proof_output!(self.key.forward(&xs))?;
+        let value_proj = __model_proof_output!(self.value.forward(&xs))?;
 
         let query_states = self
             .transpose_for_scores(query_proj)?
@@ -806,9 +812,7 @@ impl Module for AttentionBlock {
         let xs = xs.to_dtype(in_dtype)?;
         let xs = xs.transpose(1, 2)?.contiguous()?;
         let xs = xs.flatten_from(D::Minus2)?;
-        let xs = self
-            .proj_attn
-            .forward(&xs)?
+        let xs = __model_proof_output!(self.proj_attn.forward(&xs))?
             .t()?
             .reshape((batch, channel, height, width))?;
         (xs + residual)? / self.config.rescale_output_factor
@@ -829,29 +833,25 @@ mod vae_attention_budget_tests {
         let in_dtype = xs.dtype();
         let residual = xs;
         let (batch, channel, height, width) = xs.dims4()?;
-        let xs = attn
-            .group_norm
-            .forward(xs)?
+        let xs = __model_proof_output!(attn.group_norm.forward(xs))?
             .reshape((batch, channel, height * width))?
             .transpose(1, 2)?;
 
         let query_states = attn
-            .transpose_for_scores(attn.query.forward(&xs)?)?
+            .transpose_for_scores(__model_proof_output!(attn.query.forward(&xs))?)?
             .to_dtype(DType::F32)?;
         let key_states = attn
-            .transpose_for_scores(attn.key.forward(&xs)?)?
+            .transpose_for_scores(__model_proof_output!(attn.key.forward(&xs))?)?
             .to_dtype(DType::F32)?;
         let value_states = attn
-            .transpose_for_scores(attn.value.forward(&xs)?)?
+            .transpose_for_scores(__model_proof_output!(attn.value.forward(&xs))?)?
             .to_dtype(DType::F32)?;
         let scale = f64::powf(attn.channels as f64 / attn.num_heads as f64, -0.25);
         let scores = (query_states * scale)?.matmul(&(key_states.t()? * scale)?)?;
         let xs = nn::ops::softmax(&scores, D::Minus1)?.matmul(&value_states)?;
         let xs = xs.to_dtype(in_dtype)?.transpose(1, 2)?.contiguous()?;
         let xs = xs.flatten_from(D::Minus2)?;
-        let xs = attn
-            .proj_attn
-            .forward(&xs)?
+        let xs = __model_proof_output!(attn.proj_attn.forward(&xs))?
             .t()?
             .reshape((batch, channel, height, width))?;
         (xs + residual)? / attn.config.rescale_output_factor
@@ -930,6 +930,7 @@ mod vae_attention_budget_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vae_mid_attention_chunks_and_matches_the_small_shape_pre_budget_oracle() {
         let device = Device::Cpu;
         let attention = vae_attention(&device);
@@ -978,6 +979,9 @@ mod vae_attention_budget_tests {
             1,
             "the nearby in-budget mutation is single-pass"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED unet::attention::vae_attention_budget_tests::vae_mid_attention_chunks_and_matches_the_small_shape_pre_budget_oracle");
     }
 }
 
@@ -992,6 +996,7 @@ mod ip_tests {
     /// untouched); a positive scale changes the output; clearing the tokens reverts it. This pins the
     /// `o += ip_scale·sdpa(q, k_ip, v_ip)` injection that the whole InstantID identity path rides on.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cross_attention_ip_branch_is_gated_and_scaled() {
         let dev = Device::Cpu;
         let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &dev);
@@ -1046,6 +1051,9 @@ mod ip_tests {
             maxdiff(&xa.forward(&xs, Some(&ctx)).unwrap(), &base) < 1e-6,
             "clearing the IP tokens reverts to base"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED unet::attention::ip_tests::cross_attention_ip_branch_is_gated_and_scaled");
     }
 
     /// sc-9424 (F-054 sibling): the IP K/V precomputed once in `set_ip` and reused across steps must be
@@ -1055,6 +1063,7 @@ mod ip_tests {
     /// that reprojects the tokens with the same weights. Also asserts `set_ip` populates the cache and
     /// `set_ip(None)` clears it, so the cache is scoped to a single render.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn ip_kv_cache_is_bit_identical_across_steps() {
         let dev = Device::Cpu;
         let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &dev);
@@ -1120,12 +1129,14 @@ mod ip_tests {
             let base = xa.attention(&query, &key, &value).unwrap();
             let key_ip = xa
                 .reshape_heads_to_batch_dim(
-                    &xa.to_k_ip.as_ref().unwrap().forward(&ip_tokens).unwrap(),
+                    &__model_proof_output!(xa.to_k_ip.as_ref().unwrap().forward(&ip_tokens))
+                        .unwrap(),
                 )
                 .unwrap();
             let value_ip = xa
                 .reshape_heads_to_batch_dim(
-                    &xa.to_v_ip.as_ref().unwrap().forward(&ip_tokens).unwrap(),
+                    &__model_proof_output!(xa.to_v_ip.as_ref().unwrap().forward(&ip_tokens))
+                        .unwrap(),
                 )
                 .unwrap();
             let ip_out = xa.attention(&query, &key_ip, &value_ip).unwrap();
@@ -1142,6 +1153,9 @@ mod ip_tests {
 
         xa.set_ip(None, 0.0).unwrap();
         assert!(xa.ip_kv.is_none(), "set_ip(None) must clear the cache");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED unet::attention::ip_tests::ip_kv_cache_is_bit_identical_across_steps");
     }
 }
 
@@ -1209,6 +1223,7 @@ mod packed_tests {
     /// Build a fully-packed `SpatialTransformer` (linear projection, depth 1) and assert every Linear
     /// loaded packed (attn, FF, proj_in/out) while the norms are dense, then forward `[B,C,H,W]`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn spatial_transformer_packed_detect_and_forward() {
         let dev = Device::Cpu;
         // in_channels == inner_dim so `use_linear_projection` shapes line up; group 64 divides 128.
@@ -1314,5 +1329,8 @@ mod packed_tests {
             finite,
             "packed SpatialTransformer forward produced non-finite values"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED unet::attention::packed_tests::spatial_transformer_packed_detect_and_forward");
     }
 }

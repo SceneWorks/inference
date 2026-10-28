@@ -20,7 +20,9 @@ use mlx_gen::{
 
 use crate::inpaint::InpaintBlend;
 use crate::long_prompt::ChunkedTokens;
-use crate::sampler::{AncestralEuler, EulerSampler};
+#[cfg(any(test, feature = "training"))]
+use crate::sampler::AncestralEuler;
+use crate::sampler::EulerSampler;
 use crate::text_encoder::ClipTextEncoder;
 use crate::unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 use crate::vae::{Autoencoder, SdxlLatentDecoder};
@@ -619,10 +621,67 @@ fn forward_eps(
     ip: Option<(&Array, f32)>,
     plan: crate::plan::SdxlForwardPlan<'_>,
 ) -> Result<Array> {
+    // Preserve the sampler's actual dtype, including promoted F32 img2img/noise state.
+    // Header pricing follows this same operand; bounded execution must not change arithmetic.
+    let x_cast = ios_unet_input(x_unet)?;
+    mlx_gen::sampler::diagnostic_sampling_tensor(
+        "sdxl",
+        "forward-input-before-cast",
+        0,
+        x_unet.shape()[0] as u64,
+        x_unet,
+    );
+    mlx_gen::sampler::diagnostic_sampling_tensor(
+        "sdxl",
+        "forward-input-after-cast-pending",
+        0,
+        x_cast.shape()[0] as u64,
+        &x_cast,
+    );
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sdxl",
+        "forward-cfg-half",
+        &[
+            ("schema", 1),
+            ("half", plan.cfg_row.map_or(0, |row| row as u64 + 1)),
+            ("control_branches", controls.len() as u64),
+        ],
+    );
+    let x_unet = &x_cast;
+    if let Some((tokens, _)) = ip {
+        crate::quantum::diagnostic_owned_tensors(
+            "ip-forward-token-owner",
+            0,
+            std::iter::once(tokens),
+        );
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "sdxl",
+            "ip-forward-token-layout",
+            0,
+            tokens.shape()[0] as u64,
+            tokens,
+        );
+    }
+    let mut pending_control = crate::quantum::ControlMergeWork::default();
     let combined: Option<ControlResiduals> = {
         let mut acc: Option<ControlResiduals> = None;
-        for cc in controls {
-            let res = cc.controlnet.forward(
+        for (branch, cc) in controls.iter().enumerate() {
+            mlx_gen::ios_quantum::diagnostic_metadata(
+                "sdxl",
+                "control-branch-enter",
+                &[
+                    ("schema", 1),
+                    ("branch", branch as u64),
+                    ("cfg_half", plan.cfg_row.map_or(0, |row| row as u64 + 1)),
+                    ("rows", x_unet.shape()[0] as u64),
+                    ("pending_down_logical_upper_bytes", pending_control.down),
+                    ("pending_mid_logical_upper_bytes", pending_control.mid),
+                ],
+            );
+            if let Some(previous) = &acc {
+                previous.diagnostic_ownership("control-acc-before-branch", branch as u64);
+            }
+            let res = cc.controlnet.forward_planned(
                 x_unet,
                 &cc.cond_embed,
                 timestep,
@@ -630,20 +689,42 @@ fn forward_eps(
                 pooled,
                 time_ids,
                 cc.scale,
+                plan,
             )?;
+            res.diagnostic_ownership("control-branch-return", branch as u64);
             acc = Some(match acc {
                 None => res,
-                Some(prev) => prev.add(&res)?,
+                Some(prev) => {
+                    prev.diagnostic_ownership("control-merge-previous", branch as u64);
+                    res.diagnostic_ownership("control-merge-current", branch as u64);
+                    let summed = prev.add(&res)?;
+                    pending_control.record_outputs(&summed.down, &summed.mid)?;
+                    // At this point prev/res are still genuinely source-owned, while summed is
+                    // a lazy DAG. Do not relabel its future payload as an already-held buffer.
+                    summed.diagnostic_ownership("control-merge-pending", branch as u64);
+                    summed
+                }
             });
         }
-        acc
+        match acc {
+            Some(res) => {
+                res.diagnostic_ownership("control-before-cast", controls.len() as u64);
+                let cast = ControlResiduals {
+                    down: res.down.iter().map(ios_unet_input).collect::<Result<_>>()?,
+                    mid: ios_unet_input(&res.mid)?,
+                };
+                cast.diagnostic_ownership("control-cast-pending", controls.len() as u64);
+                Some(cast)
+            }
+            None => None,
+        }
     };
     // One planned call for all four (control × ip) combinations. The historical four-way dispatch
     // over `forward_with_*` is preserved *in those wrappers*, which every non-ladder caller still
     // uses; routing the production denoise through the single planned entry point is what makes
     // rungs 3 and 4 reach EVERY advertised route — plain t2i, CFG, control, MultiControlNet, IP,
     // InstantID's ip+control — rather than the subset a per-route wiring would have covered.
-    unet.forward_planned(
+    unet.forward_planned_with_control_work(
         x_unet,
         timestep,
         conditioning,
@@ -652,7 +733,99 @@ fn forward_eps(
         combined.as_ref(),
         ip,
         plan,
+        pending_control,
     )
+}
+
+/// Row `k` of a CFG-batched `[cond, uncond]` tensor, or the tensor itself when it carries a single
+/// row shared by both halves (a batch-1 conditioning broadcast across the guided pair).
+fn cfg_row(a: &Array, k: i32) -> Result<Array> {
+    if a.shape().first() == Some(&2) {
+        Ok(a.take_axis(Array::from_slice(&[k], &[1]), 0)?)
+    } else {
+        Ok(a.clone())
+    }
+}
+
+/// One guided step's `(eps_text, eps_neg)` pair under the request's CFG batching (sc-26268).
+///
+/// * [`CfgBatching::Batched`](mlx_gen::gen_core::CfgBatching::Batched) — the historical
+///   `[x, x]` doubled-batch forward, split by row afterwards. Byte-identical to every earlier
+///   release: it is the same op graph the three denoise loops each spelled inline.
+/// * [`CfgBatching::Sequential`](mlx_gen::gen_core::CfgBatching::Sequential) — two batch-1
+///   forwards over the one-row latent, conditional then unconditional. Each half receives the
+///   pair's conditioning-only inputs whole (`conditioning`, `pooled`, `time_ids`, the ControlNet
+///   encoder, the IP-Adapter tokens) and keeps its own row after projecting them
+///   ([`SdxlForwardPlan::cfg_row`](crate::plan::SdxlForwardPlan::cfg_row)), so it is
+///   byte-identical to its batched row; the ControlNet conditioning embedding, added to the latent
+///   rather than projected, is sliced up front. Each half is evaluated before the next starts, so
+///   the guided step holds one row's latent activations at a time — the high-water the shared
+///   `CfgBatching` domain exists to offer a constrained device.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn guided_eps_pair(
+    unet: &UNet2DConditionModel,
+    x_in: &Array,
+    timestep: f32,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    controls: &[ControlContext],
+    cn_enc: &Array,
+    ip: Option<(&Array, f32)>,
+    plan: crate::plan::SdxlForwardPlan<'_>,
+) -> Result<(Array, Array)> {
+    if plan.cfg_batching.is_batched() {
+        let x_unet = concatenate_axis(&[x_in, x_in], 0)?;
+        let eps = forward_eps(
+            unet,
+            &x_unet,
+            timestep,
+            conditioning,
+            pooled,
+            time_ids,
+            controls,
+            cn_enc,
+            ip,
+            plan,
+        )?;
+        let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
+        return Ok((row(0)?, row(1)?));
+    }
+    let half = |k: i32| -> Result<Array> {
+        let row_controls = controls
+            .iter()
+            .map(|cc| {
+                Ok(ControlContext {
+                    controlnet: cc.controlnet,
+                    cond_embed: cfg_row(&cc.cond_embed, k)?,
+                    scale: cc.scale,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // The conditioning-only inputs go in WHOLE: the forward projects them at the pair's batch
+        // and keeps row `k` (`SdxlForwardPlan::cfg_row`), so every kernel sees the row count the
+        // batched forward gave it. Only `cond_embed` — added to the latent stem, never projected —
+        // is sliced here.
+        let eps = forward_eps(
+            unet,
+            x_in,
+            timestep,
+            conditioning,
+            pooled,
+            time_ids,
+            &row_controls,
+            cn_enc,
+            ip,
+            plan.with_cfg_row(Some(k)),
+        )?;
+        // Materialize this half before the other one is built, so the two forwards' activations
+        // are never live together — the point of the sequential mode.
+        eps.eval()?;
+        Ok(eps)
+    };
+    let eps_text = half(0)?;
+    let eps_neg = half(1)?;
+    Ok((eps_text, eps_neg))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -676,6 +849,19 @@ fn denoise_core(
     // unchanged, matching the reference's `int(num_steps · strength)` loop count. Guards the
     // degenerate schedule and the σ=0 ancestral step that would otherwise NaN.
     if steps == 0 {
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sdxl",
+            "discrete-zero-denoise",
+            &[
+                ("schema", 1),
+                ("steps", 0),
+                (
+                    "state_dtype",
+                    mlx_gen::sampler::sampling_dtype_code(latents.dtype()),
+                ),
+                ("state_elements", latents.size() as u64),
+            ],
+        );
         return Ok(latents);
     }
     // sc-2963 (rollout of sc-2957): fuse the UNet's SiLU activations via `mx.compile` — bit-exact in
@@ -701,6 +887,36 @@ fn denoise_core(
         // for Lightning and Kolors Euler. Preview the same tensor the U-Net sees: this preserves the
         // ancestral path byte-for-byte while keeping every discrete sampler in the fit's domain.
         let x_in = d.sampler.scale_model_input(&latents, i)?;
+        // These are actual borrowed loop bindings, before the existing forward/eval barriers.
+        // Logical metadata deliberately makes no readiness or freed-parent backing claim.
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "sdxl",
+            "discrete-state",
+            i as u64,
+            1,
+            &latents,
+        );
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "sdxl",
+            "discrete-scaled-input",
+            i as u64,
+            1,
+            &x_in,
+        );
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sdxl",
+            "discrete-epoch",
+            &[
+                ("schema", 1),
+                ("evaluation", i as u64),
+                ("steps", steps as u64),
+                ("cfg_on", u64::from(cfg_on)),
+                ("cfg_batched", u64::from(d.plan.cfg_batching.is_batched())),
+                ("inpaint", u64::from(inpaint.is_some())),
+                ("control_branches", controls.len() as u64),
+                ("ip", u64::from(ip.is_some())),
+            ],
+        );
         crate::preview::emit_nhwc_preview(
             preview,
             &preview_counter,
@@ -708,28 +924,20 @@ fn denoise_core(
             preview_sigmas[i],
             &x_in,
         );
-        let x_unet = if cfg_on {
-            concatenate_axis(&[&x_in, &x_in], 0)?
-        } else {
-            x_in
-        };
         let timestep = d.sampler.timestep(i);
-        let eps = forward_eps(
-            d.unet,
-            &x_unet,
-            timestep,
-            conditioning,
-            pooled,
-            time_ids,
-            controls,
-            cn_enc,
-            ip,
-            d.plan,
-        )?;
         let eps = if cfg_on {
-            let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
-            let eps_text = row(0)?;
-            let eps_neg = row(1)?;
+            let (eps_text, eps_neg) = guided_eps_pair(
+                d.unet,
+                &x_in,
+                timestep,
+                conditioning,
+                pooled,
+                time_ids,
+                controls,
+                cn_enc,
+                ip,
+                d.plan,
+            )?;
             // `eps_neg + cfg·(eps_text − eps_neg)` via the shared gen-core `cfg` over `MlxLatentOps`
             // (epic 7434 P3, sc-7443). The dtype-preserving `MlxLatentOps::axpy` casts the scale to the
             // eps dtype, so CFG runs in the compute dtype (fp16) byte-identically to the retired hand
@@ -738,19 +946,60 @@ fn denoise_core(
             // proven by `guidance_ops_tests::cfg_half_precision_is_byte_identical_and_preserves_dtype`.)
             gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?
         } else {
-            eps
+            forward_eps(
+                d.unet,
+                &x_in,
+                timestep,
+                conditioning,
+                pooled,
+                time_ids,
+                controls,
+                cn_enc,
+                ip,
+                d.plan,
+            )?
         };
+        mlx_gen::sampler::diagnostic_sampling_tensor("sdxl", "discrete-epsilon", i as u64, 1, &eps);
+        // sc-26270: the CFG combine above, the sampler update and the inpaint blend materialize
+        // together in the per-step eval below — one guarded iOS quantum, checked before the update's
+        // graph is built (the combine's is lazy, unallocated). A pass-through off device.
+        mlx_gen::ios_quantum::before(
+            crate::quantum::SAMPLER_STEP,
+            crate::quantum::sampler_step_bytes(&latents, inpaint.is_some()),
+        )?;
         latents = d.sampler.step(&eps, &latents, i)?;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "sdxl",
+            "discrete-update-pending",
+            i as u64,
+            1,
+            &latents,
+        );
         // Legacy inpaint blend (sc-3057): pin the kept region to the init noised to this step's σ,
         // keep the repaint region freely denoised. No RNG draw → ancestral stream unperturbed.
         if let Some(b) = inpaint {
             latents = b.blend(&latents, i)?;
+            mlx_gen::sampler::diagnostic_sampling_tensor(
+                "sdxl",
+                "discrete-blend-pending",
+                i as u64,
+                1,
+                &latents,
+            );
         }
         // Force evaluation each step (the reference's per-step `mx.eval`). Beyond bounding the lazy
         // graph, this materializes the global-RNG state split between steps so the ancestral noise
         // stream is byte-identical to the reference — leaving it lazy across all steps perturbs the
         // draws and re-introduces the chaotic divergence (sc-2400 S5).
         latents.eval()?;
+        mlx_gen::ios_quantum::finish(crate::quantum::SAMPLER_STEP, &[&latents])?;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "sdxl",
+            "discrete-update-after-barrier",
+            i as u64,
+            1,
+            &latents,
+        );
         on_progress(Progress::Step {
             current: i as u32 + 1,
             total,
@@ -844,6 +1093,7 @@ pub fn denoise_curated_with_preview(
     let cfg_on = cfg > 1.0;
     let cn_enc = control_encoder.unwrap_or(conditioning);
     let preview_counter = mlx_gen::preview::PreviewCounter::new(sigmas);
+    let mut evaluation = 0u64;
     mlx_gen::run_curated_sampler_with_latent_hook(
         sampler_name,
         ms,
@@ -858,40 +1108,49 @@ pub fn denoise_curated_with_preview(
         |x_in, timestep| {
             // `x_in` is the c_in-scaled latent (f32); cast to the U-Net compute dtype, then CFG-batch.
             let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
-            let x_unet = if cfg_on {
-                concatenate_axis(&[&x16, &x16], 0)?
-            } else {
-                x16
-            };
-            let eps = forward_eps(
-                unet,
-                &x_unet,
-                timestep,
-                conditioning,
-                pooled,
-                time_ids,
-                controls,
-                cn_enc,
-                ip,
-                plan,
-            )?;
+            let current = evaluation;
+            evaluation += 1;
+            diagnostic_curated_input(current, timestep, cfg_on, false, plan, x_in, &x16);
             // CFG combine via the shared `gen_core::guidance::cfg` over `MlxLatentOps` (the sc-7443
             // migration `denoise_core` already carries, F-082): byte-identical to the retired hand
             // `eps_neg + cfg·(eps_text − eps_neg)` form — the dtype-preserving `axpy` casts the
             // scale to the eps dtype so the blend runs in the compute dtype (fp16).
-            if cfg_on {
-                let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
-                let eps_text = row(0)?;
-                let eps_neg = row(1)?;
-                Ok(gen_core::guidance::cfg(
-                    &MlxLatentOps,
-                    &eps_text,
-                    &eps_neg,
-                    cfg,
-                )?)
+            let eps = if cfg_on {
+                let (eps_text, eps_neg) = guided_eps_pair(
+                    unet,
+                    &x16,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    controls,
+                    cn_enc,
+                    ip,
+                    plan,
+                )?;
+                gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?
             } else {
-                Ok(eps)
-            }
+                forward_eps(
+                    unet,
+                    &x16,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    controls,
+                    cn_enc,
+                    ip,
+                    plan,
+                )?
+            };
+            mlx_gen::sampler::diagnostic_sampling_tensor(
+                "sdxl",
+                "curated-epsilon",
+                current,
+                1,
+                &eps,
+            );
+            Ok(eps)
         },
     )
 }
@@ -966,6 +1225,7 @@ pub fn denoise_cfgpp_with_preview(
     let _compile_glue = crate::CompileGlueGuard::enable();
     let cn_enc = control_encoder.unwrap_or(conditioning);
     let preview_counter = mlx_gen::preview::PreviewCounter::new(sigmas);
+    let mut evaluation = 0u64;
     mlx_gen::run_cfgpp_sampler_with_latent_hook(
         base_sampler_name,
         ms,
@@ -979,10 +1239,12 @@ pub fn denoise_cfgpp_with_preview(
         |x_in, timestep| {
             // Identical forward to `denoise_curated`; CFG++ always CFG-batches (cfg_on guaranteed).
             let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
-            let x_unet = concatenate_axis(&[&x16, &x16], 0)?;
-            let eps = forward_eps(
+            let current = evaluation;
+            evaluation += 1;
+            diagnostic_curated_input(current, timestep, true, true, plan, x_in, &x16);
+            let (eps_text, eps_neg) = guided_eps_pair(
                 unet,
-                &x_unet,
+                &x16,
                 timestep,
                 conditioning,
                 pooled,
@@ -993,13 +1255,58 @@ pub fn denoise_cfgpp_with_preview(
                 plan,
             )?;
             // guided = plain CFG combine (the trajectory anchor); uncond = eps_neg (the renoise branch).
-            let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
-            let eps_text = row(0)?;
-            let eps_neg = row(1)?;
             let guided = gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?;
+            mlx_gen::sampler::diagnostic_sampling_tensor(
+                "sdxl",
+                "curated-epsilon",
+                current,
+                1,
+                &guided,
+            );
+            mlx_gen::sampler::diagnostic_sampling_tensor(
+                "sdxl",
+                "cfgpp-unconditional-epsilon",
+                current,
+                1,
+                &eps_neg,
+            );
             Ok((guided, eps_neg))
         },
     )
+}
+
+/// Actual callback arguments on either curated route. Evaluation is the real callback ordinal,
+/// including correctors/midpoints; solver-owned history/outer holders come from the existing
+/// shared solver observations. These borrowed logical facts never establish storage disjointness.
+fn diagnostic_curated_input(
+    evaluation: u64,
+    timestep: f32,
+    cfg_on: bool,
+    cfg_pp: bool,
+    plan: crate::plan::SdxlForwardPlan<'_>,
+    raw: &Array,
+    compute: &Array,
+) {
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sdxl",
+        "curated-callback",
+        &[
+            ("schema", 1),
+            ("evaluation", evaluation),
+            ("timestep_bits", timestep.to_bits() as u64),
+            ("cfg_on", u64::from(cfg_on)),
+            ("cfg_pp", u64::from(cfg_pp)),
+            ("cfg_batched", u64::from(plan.cfg_batching.is_batched())),
+        ],
+    );
+    mlx_gen::sampler::diagnostic_sampling_tensor("sdxl", "curated-model-input", evaluation, 1, raw);
+    mlx_gen::sampler::diagnostic_sampling_tensor(
+        "sdxl",
+        "curated-compute-input",
+        evaluation,
+        1,
+        compute,
+    );
 }
 
 /// Seed the global RNG and sample the prior latents `[1, height/8, width/8, 4]` (NHWC, f32).
@@ -1083,17 +1390,54 @@ pub fn encode_init_latents(
     target_width: u32,
     target_height: u32,
 ) -> Result<Array> {
+    encode_init_latents_tiled(vae, image, target_width, target_height, None, None)
+}
+
+/// [`encode_init_latents`] under the request's bounded-decode rung (sc-26270): when the rung
+/// selected a native spatial tiling, the encode runs [`Autoencoder::encode_tiled`] at the same
+/// pixel tile edge (the encoder twin of the tiled decode); without one it is the whole-image encode
+/// — which on iOS is itself the bounded encode ([`Autoencoder::encode_mean`]).
+pub fn encode_init_latents_tiled(
+    vae: &Autoencoder,
+    image: &Image,
+    target_width: u32,
+    target_height: u32,
+    tiling: Option<&mlx_gen::tiling::TilingConfig>,
+    cancel: Option<&CancelFlag>,
+) -> Result<Array> {
     let nhwc = preprocess_init_image(image, target_width, target_height)?;
-    vae.encode_mean(&nhwc)
+    let latent = match tiling.and_then(|cfg| cfg.spatial.as_ref()) {
+        Some(spatial) => vae.encode_tiled(&nhwc, spatial.tile_px, cancel)?,
+        None => vae.encode_mean(&nhwc)?,
+    };
+    ios_unet_input(&latent)
+}
+
+/// Preserve the historical init/sampler/ControlNet arithmetic on every platform. A boundary
+/// must not narrow a promoted F32 owner: latent rounding is amplified by the nonlinear decode.
+/// Curated samplers still perform their original pre-CFG compute cast at their own call sites.
+pub(crate) fn ios_unet_input(value: &Array) -> Result<Array> {
+    Ok(value.clone())
 }
 
 /// Convert a VAE-decoded NHWC tensor `[1, H, W, 3]` (≈`[-1, 1]`) to an RGB8 [`Image`]:
 /// `clip(x·0.5 + 0.5, 0, 1) · 255` (the vendored `StableDiffusion.decode` + txt2image recipe).
 pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
-    let half = scalar(0.5);
-    let x = add(&multiply(decoded, &half)?, &half)?;
-    let x = minimum(&maximum(&x, scalar(0.0))?, scalar(1.0))?;
-    let x = round(&multiply(&x, scalar(255.0))?, 0)?;
+    // sc-26270: the full-resolution clamp/scale/round chain is one guarded iOS quantum; a
+    // pass-through off device. Counted: ONE f32 image-sized buffer — the first scale's output (or
+    // a half-precision VAE's lazy f32 output cast, which that scale then donates into); every
+    // later op of the chain donates its single-consumer operand (measured). Plus its page.
+    let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+    let x = mlx_gen::ios_quantum::run(
+        crate::quantum::DECODED_TO_IMAGE,
+        crate::quantum::decoded_to_image_bytes(decoded),
+        || {
+            let half = scalar(0.5);
+            let x = add(&multiply(decoded, &half)?, &half)?;
+            let x = minimum(&maximum(&x, scalar(0.0))?, scalar(1.0))?;
+            Ok(round(&multiply(&x, scalar(255.0))?, 0)?)
+        },
+    )?;
     let sh = x.shape();
     // One image per call (the pipeline loops with B==1): reject B>1 instead of silently keeping only
     // batch 0, and size in usize / flatten via -1 to avoid the u32/i32 product overflow (F-053).
@@ -1147,18 +1491,12 @@ pub fn decode_image(
 /// different geometries.
 ///
 /// **On SDXL that branch is unreachable with `tiling` set, and the reason is worth stating rather
-/// than implying.** An earlier version of this comment said `memory_strategy::decode_tiling` "returns
-/// `None` on a PiD request"; it does not. Since SC-15525 it returns `Err` **unconditionally** whenever
-/// `GenerationMemory::tile_vae_decode` is set, PiD or not, because rung 2 is declared `Missing` on
-/// this provider. So a `use_pid` request that also sets `tile_vae_decode` is refused at
-/// `Sdxl::generate_impl` and never reaches here — where before SC-15525 it would have fallen through
-/// to the student's own auto-planning.
-///
-/// That is deliberate. A request that asked for a bounded decode and silently got the student's
-/// auto-plan instead would be executing a strategy the selector did not choose, which is the exact
-/// false-green the shared contract forbids; refusing is the only honest answer while the native rung
-/// is `Missing`. A PiD request that does **not** set the flag is completely unaffected and still gets
-/// the student's auto-planning, which is the pre-SC-15525 behaviour.
+/// than implying.** `memory_strategy::decode_tiling_for_contract` validates a bounded decode against
+/// the route it runs (sc-26268, `mlx_gen_pid::DecodeRoutes`): a `use_pid` request reaches here with
+/// `tiling` set only at the student's own measured geometry, which the student's `decode_tiled`
+/// executes; a native edge on the PiD route is refused before generate. A PiD request that does
+/// **not** set the flag is completely unaffected and still gets the student's auto-planning, which is
+/// the pre-SC-15525 behaviour.
 ///
 /// `cancel` gives the decode a cancellation point it has never had: it is a dominant fraction of an
 /// SDXL render's wall clock, and the shared tile loop checks between tiles.
@@ -1189,6 +1527,7 @@ pub fn decode_image_tiled(
 /// as inference does, runs the plain [`denoise`] with the configured `guidance`. `conditioning`/`pooled`
 /// are the pre-encoded **CFG batch** (`[2, …]` = positive then empty-negative), so the denoise loop's
 /// classifier-free guidance has both streams. No progress/cancel plumbing — the caller drives cadence.
+#[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_sample(
     unet: &UNet2DConditionModel,
@@ -1225,6 +1564,366 @@ pub(crate) fn render_sample(
 mod tests {
     use super::*;
     use mlx_gen::{AlphaSchedule, LightningSampler};
+
+    /// `cfg_row` takes row `k` of a CFG-batched `[cond, uncond]` tensor and passes a single shared
+    /// row through untouched — the slicing every sequential-CFG input (conditioning, pooled,
+    /// time ids, ControlNet embedding/encoder, IP tokens) goes through.
+    #[test]
+    fn cfg_row_splits_a_guided_pair_and_shares_a_single_row() {
+        let _cpu = crate::test_device::cpu_only();
+        let pair = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        assert_eq!(cfg_row(&pair, 0).unwrap().as_slice::<f32>(), &[1.0, 2.0]);
+        assert_eq!(cfg_row(&pair, 1).unwrap().as_slice::<f32>(), &[3.0, 4.0]);
+        assert_eq!(cfg_row(&pair, 0).unwrap().shape(), &[1, 2]);
+        let shared = Array::from_slice(&[5.0f32, 6.0], &[1, 2]);
+        assert_eq!(cfg_row(&shared, 1).unwrap().as_slice::<f32>(), &[5.0, 6.0]);
+    }
+
+    /// The tiny-U-Net inputs for one guided step: a latent and a distinct `[cond, uncond]` pair in
+    /// every CFG-batched input, so a mode that mixed up rows would fail.
+    fn guided_inputs() -> (Array, Array, Array, Array) {
+        use crate::test_support::{TINY_CONTEXT_DIM, TINY_POOLED_DIM};
+        let ramp = |shape: &[i32], phase: f32| {
+            let n = shape.iter().product::<i32>();
+            let v = (0..n)
+                .map(|i| ((i as f32 + phase) * 0.173).sin() * 0.5)
+                .collect::<Vec<_>>();
+            Array::from_slice(&v, shape)
+        };
+        (
+            ramp(&[1, 8, 8, 4], 0.0),
+            ramp(&[2, 5, TINY_CONTEXT_DIM], 11.0),
+            ramp(&[2, TINY_POOLED_DIM], 29.0),
+            text_time_ids(2),
+        )
+    }
+
+    /// The devices × dtypes the sequential-CFG identity is held on: the CPU at f32 (where a lone
+    /// `[1, K]` GEMV and row 0 of the `[2, K]` GEMM differ in the last ulps) and the default
+    /// device at f16 (Metal: `[1, K]` vs `[2, K]` and the 77- vs 154-row text-memory projections
+    /// pick different kernels, ~1e-3 of peak apart). Both differed before sc-26268's fix (M5 Max:
+    /// 1.8e-6 and 3.2e-3 of peak; 0 and 0 after).
+    fn cfg_identity_cells() -> [(bool, mlx_rs::Dtype); 2] {
+        [
+            (true, mlx_rs::Dtype::Float32),
+            (false, mlx_rs::Dtype::Float16),
+        ]
+    }
+
+    /// The tiny U-Net at `dtype` (weights cast before construction, like a real f16 load).
+    fn tiny_unet_at(dtype: mlx_rs::Dtype) -> UNet2DConditionModel {
+        use crate::test_support::{tiny_unet_config, tiny_unet_weights};
+        let mut w = tiny_unet_weights(7).unwrap();
+        w.cast_all(dtype).unwrap();
+        UNet2DConditionModel::from_weights(&w, &tiny_unet_config()).unwrap()
+    }
+
+    /// Run `f` on the CPU (`cpu = true`) or the process default device.
+    fn on_device<T>(cpu: bool, f: impl FnOnce() -> T) -> T {
+        let _guard = cpu.then(crate::test_device::cpu_only);
+        f()
+    }
+
+    fn rel(a: &[u32], b: &[u32]) -> f32 {
+        let (a, b): (Vec<f32>, Vec<f32>) = (
+            a.iter().map(|v| f32::from_bits(*v)).collect(),
+            b.iter().map(|v| f32::from_bits(*v)).collect(),
+        );
+        let peak = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        a.iter()
+            .zip(&b)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()))
+            / peak
+    }
+
+    /// Whether this backend computes every **latent-path** op of the tiny U-Net row-exactly
+    /// between a one-row and a two-row batch — each dense projection of its 4×4 (16-token)
+    /// attention level and each 3×3/1×1 convolution of its two levels, with random data at
+    /// `dtype`. It probes MLX itself, never the code under test, so a defect in the CFG split
+    /// cannot lower the bar it is held to. True for both cells on Apple M5; a CPU BLAS that blocks
+    /// by row count (hosted CI's M1) makes it false.
+    fn latent_path_is_row_exact(dtype: mlx_rs::Dtype) -> bool {
+        let rnd = |shape: &[i32], seed: u64| {
+            let key = random::key(seed).unwrap();
+            random::normal::<f32>(shape, None, None, Some(&key))
+                .unwrap()
+                .as_dtype(dtype)
+                .unwrap()
+        };
+        let pair_row0_matches = |one: Array, two: Array| {
+            let two = two.take_axis(Array::from_slice(&[0], &[1]), 0).unwrap();
+            bits(&one) == bits(&two)
+        };
+        let linears = [(64, 64), (64, 256), (256, 64)].into_iter().all(|(k, n)| {
+            let (x1, w) = (rnd(&[1, 16, k], 1), rnd(&[n, k], 2));
+            let x2 = concatenate_axis(&[&x1, &rnd(&[1, 16, k], 3)], 0).unwrap();
+            let wt = w.transpose().unwrap();
+            pair_row0_matches(
+                mlx_rs::ops::matmul(&x1, &wt).unwrap(),
+                mlx_rs::ops::matmul(&x2, &wt).unwrap(),
+            )
+        });
+        // (spatial, in, out, kernel, stride): conv_in/out, the resnets' 3×3s and 1×1 shortcuts
+        // over both levels' (skip-concatenated) widths, and the stride-2 downsampler.
+        let convs = [
+            (8, 4, 32, 3, 1),
+            (8, 32, 32, 3, 1),
+            (8, 32, 32, 3, 2),
+            (8, 32, 4, 3, 1),
+            (4, 32, 64, 3, 1),
+            (4, 64, 64, 3, 1),
+            (4, 128, 64, 3, 1),
+            (4, 96, 64, 3, 1),
+            (8, 96, 32, 3, 1),
+            (8, 64, 32, 3, 1),
+            (4, 32, 64, 1, 1),
+            (4, 128, 64, 1, 1),
+            (4, 96, 64, 1, 1),
+            (8, 96, 32, 1, 1),
+            (8, 64, 32, 1, 1),
+        ]
+        .into_iter()
+        .all(|(hw, cin, cout, k, stride)| {
+            let (x1, w) = (rnd(&[1, hw, hw, cin], 4), rnd(&[cout, k, k, cin], 5));
+            let x2 = concatenate_axis(&[&x1, &rnd(&[1, hw, hw, cin], 6)], 0).unwrap();
+            let pad = k / 2;
+            let conv = |x: &Array| {
+                mlx_rs::ops::conv2d(x, &w, (stride, stride), (pad, pad), None, None).unwrap()
+            };
+            pair_row0_matches(conv(&x1), conv(&x2))
+        });
+        linears && convs
+    }
+
+    /// The sequential-CFG identity check: **byte for byte** wherever the backend's latent path is
+    /// row-exact ([`latent_path_is_row_exact`] — both cells on Apple M5, which is where the pre-fix
+    /// code was measured RED). Elsewhere the latent GEMMs legitimately differ by row count (the
+    /// reassociation `CfgBatching` admits), so the halves are held to that class instead: 1e-5 of
+    /// peak at f32, 1e-2 at f16 — the backend then cannot tell a conditioning-path deviation from
+    /// its own reassociation, and the eprintln says so.
+    fn assert_cfg_identity(
+        label: &str,
+        dtype: mlx_rs::Dtype,
+        exact: bool,
+        batched: &[u32],
+        sequential: &[u32],
+    ) {
+        let delta = rel(batched, sequential);
+        if exact {
+            assert!(batched == sequential, "{label}: moved by {delta:.3e}");
+        } else {
+            let bound = if dtype == mlx_rs::Dtype::Float32 {
+                1e-5
+            } else {
+                1e-2
+            };
+            eprintln!(
+                "{label}: this backend's latent path is not row-exact; held to {bound:.0e} of peak \
+                 (measured {delta:.3e}) instead of byte identity"
+            );
+            assert!(
+                delta <= bound,
+                "{label}: moved by {delta:.3e} (bound {bound:.0e})"
+            );
+        }
+    }
+
+    fn bits(a: &Array) -> Vec<u32> {
+        let a = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        a.eval().unwrap();
+        a.as_slice::<f32>().iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// One guided step's pair under `batching`, with optional IP-Adapter tokens.
+    fn guided_pair_bits(
+        unet: &UNet2DConditionModel,
+        dtype: mlx_rs::Dtype,
+        ip_tokens: Option<&Array>,
+        batching: gen_core::CfgBatching,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let (x, conditioning, pooled, time_ids) = guided_inputs();
+        let at = |a: &Array| a.as_dtype(dtype).unwrap();
+        let (x, conditioning, pooled) = (at(&x), at(&conditioning), at(&pooled));
+        let tokens = ip_tokens.cloned();
+        let ip = tokens.as_ref().map(|t| (t, 0.7_f32));
+        let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
+        let (text, neg) = (
+            crate::test_device::record_model_inference_device(),
+            guided_eps_pair(
+                unet,
+                &x,
+                500.0,
+                &conditioning,
+                &pooled,
+                &time_ids,
+                &[],
+                &conditioning,
+                ip,
+                plan,
+            ),
+        )
+            .1
+            .unwrap();
+        assert_eq!(text.shape(), x.shape());
+        assert_eq!(neg.shape(), x.shape());
+        (bits(&text), bits(&neg))
+    }
+
+    /// sc-26268: **sequential CFG** (two batch-1 forwards) is **byte-identical** to the batched
+    /// `[cond, uncond]` forward — each half is exactly its batched row: the per-row split is right
+    /// (the conditional half is row 0, the unconditional half row 1), nothing couples the rows,
+    /// and every conditioning-only projection (time/`text_time` embedding, each resnet's
+    /// `time_emb_proj`, each cross-attention `to_k`/`to_v`) runs at the pair's row count
+    /// ([`SdxlForwardPlan::cfg_row`](crate::plan::SdxlForwardPlan::cfg_row)).
+    ///
+    /// Before that fix the halves sliced their conditioning to one row first, so those projections
+    /// ran a `[1, K]` (and 77-row) product where the batched pair ran `[2, K]` (154 rows): ~1e-6 of
+    /// peak on the CPU at f32, ~3e-3 at f16 on Metal — which CFG × 7 and the ancestral noise grew
+    /// into a 255/255 pixel on the real SDXL q4 render (`low_memory_compositions_q4`).
+    #[ignore = "model inference; explicit model-proof workflow"]
+    #[test]
+    fn sequential_cfg_is_byte_identical_to_the_batched_guided_pair() {
+        for (cpu, dtype) in cfg_identity_cells() {
+            on_device(cpu, || {
+                let unet = tiny_unet_at(dtype);
+                let exact = latent_path_is_row_exact(dtype);
+                let pair = |batching| guided_pair_bits(&unet, dtype, None, batching);
+                let (bt, bn) = pair(gen_core::CfgBatching::Batched);
+                let (st, sn) = pair(gen_core::CfgBatching::Sequential);
+                let label = |half: &str| format!("cpu={cpu} {dtype:?}: {half} half");
+                assert_cfg_identity(&label("conditional"), dtype, exact, &bt, &st);
+                assert_cfg_identity(&label("unconditional"), dtype, exact, &bn, &sn);
+                // Non-vacuity: the two halves genuinely differ, so a mode that returned one row
+                // twice (or swapped them) cannot pass the comparisons above.
+                assert!(
+                    bt != bn,
+                    "the guided pair must carry two distinct conditionings"
+                );
+            });
+        }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::sequential_cfg_is_byte_identical_to_the_batched_guided_pair");
+    }
+
+    /// The same identity with the **IP-Adapter** decoupled cross-attention installed: its
+    /// `to_k_ip`/`to_v_ip` over the `[image tokens, zeros]` pair are conditioning-only projections
+    /// too, and a sequential half must run them at the pair's batch as well.
+    #[ignore = "model inference; explicit model-proof workflow"]
+    #[test]
+    fn sequential_cfg_is_byte_identical_with_the_ip_adapter() {
+        use crate::test_support::TINY_CONTEXT_DIM;
+        for (cpu, dtype) in cfg_identity_cells() {
+            on_device(cpu, || {
+                let mut unet = tiny_unet_at(dtype);
+                // One `[hidden, ctx]` pair per cross-attention, in install order (down → up →
+                // mid): four, all at the tiny U-Net's 64-wide attention level.
+                let ramp = |rows: i32, phase: f32| {
+                    let n = rows * TINY_CONTEXT_DIM;
+                    let v = (0..n)
+                        .map(|i| ((i as f32 + phase) * 0.311).cos() * 0.2)
+                        .collect::<Vec<_>>();
+                    Array::from_slice(&v, &[rows, TINY_CONTEXT_DIM])
+                        .as_dtype(dtype)
+                        .unwrap()
+                };
+                let pairs = [64; 4]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &h)| (ramp(h, i as f32), ramp(h, 50.0 + i as f32)))
+                    .collect();
+                unet.install_ip_adapter(pairs).unwrap();
+                // A single image token: its per-half projection would be a `[1, ctx]` GEMV where
+                // the pair runs a `[2, ctx]` GEMM — the row count whose kernels round differently
+                // on both devices, so a half that projected only its own row is observable.
+                let tokens = concatenate_axis(
+                    &[
+                        &ramp(1, 3.0).reshape(&[1, 1, TINY_CONTEXT_DIM]).unwrap(),
+                        &Array::zeros::<f32>(&[1, 1, TINY_CONTEXT_DIM])
+                            .unwrap()
+                            .as_dtype(dtype)
+                            .unwrap(),
+                    ],
+                    0,
+                )
+                .unwrap();
+                let exact = latent_path_is_row_exact(dtype);
+                let pair = |batching| guided_pair_bits(&unet, dtype, Some(&tokens), batching);
+                let batched = pair(gen_core::CfgBatching::Batched);
+                let sequential = pair(gen_core::CfgBatching::Sequential);
+                let label = |half: &str| format!("cpu={cpu} {dtype:?}: IP {half} half");
+                assert_cfg_identity(
+                    &label("conditional"),
+                    dtype,
+                    exact,
+                    &batched.0,
+                    &sequential.0,
+                );
+                assert_cfg_identity(
+                    &label("unconditional"),
+                    dtype,
+                    exact,
+                    &batched.1,
+                    &sequential.1,
+                );
+                // Non-vacuity: the IP branch is live (it moves the conditional half).
+                let plain = guided_pair_bits(&unet, dtype, None, gen_core::CfgBatching::Batched);
+                assert!(plain.0 != batched.0, "the IP branch must change the output");
+            });
+        }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::sequential_cfg_is_byte_identical_with_the_ip_adapter");
+    }
+
+    /// The whole ancestral denoise loop under sequential CFG reproduces the batched loop's final
+    /// latent **byte for byte** — the production route (`denoise_core`) actually consumes the
+    /// plan's batching, and the identity survives the guidance combine and the ancestral noise.
+    #[ignore = "model inference; explicit model-proof workflow"]
+    #[test]
+    fn sequential_cfg_denoise_is_byte_identical_to_the_batched_denoise() {
+        for (cpu, dtype) in cfg_identity_cells() {
+            on_device(cpu, || {
+                let unet = tiny_unet_at(dtype);
+                let (x, conditioning, pooled, time_ids) = guided_inputs();
+                let at = |a: &Array| a.as_dtype(dtype).unwrap();
+                let (x, conditioning, pooled) = (at(&x), at(&conditioning), at(&pooled));
+                let inner = EulerSampler::new_with_dtype(
+                    &crate::config::DiffusionConfig::sdxl_base(),
+                    true,
+                    dtype,
+                )
+                .unwrap();
+                let run = |batching| {
+                    random::seed(42).unwrap();
+                    let sampler = AncestralEuler::new(&inner, 2, inner.max_time()).unwrap();
+                    let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
+                    let d = Denoiser::with_plan(&unet, &sampler, plan);
+                    let out = (
+                        crate::test_device::record_model_inference_device(),
+                        denoise(
+                            &d,
+                            x.clone(),
+                            &conditioning,
+                            &pooled,
+                            &time_ids,
+                            5.0,
+                            &CancelFlag::new(),
+                            &mut |_| {},
+                        ),
+                    )
+                        .1
+                        .unwrap();
+                    bits(&out)
+                };
+                let batched = run(gen_core::CfgBatching::Batched);
+                let sequential = run(gen_core::CfgBatching::Sequential);
+                let exact = latent_path_is_row_exact(dtype);
+                let label = format!("cpu={cpu} {dtype:?}: denoise");
+                assert_cfg_identity(&label, dtype, exact, &batched, &sequential);
+            });
+        }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::sequential_cfg_denoise_is_byte_identical_to_the_batched_denoise");
+    }
 
     /// F-071: the init and control preprocessors share the resize/validate/layout helper and differ
     /// only in normalization — init maps `[0,255]→[-1,1]`, control maps `[0,255]→[0,1]`. Use a

@@ -398,8 +398,23 @@ fn convert_back(tensor: &Tensor) -> Result<Vec<u8>> {
 }
 
 pub fn load<P: AsRef<Path>>(filename: P, device: &Device) -> Result<HashMap<String, Tensor>> {
-    let data = std::fs::read(filename.as_ref())?;
-    load_buffer(&data[..], device)
+    #[cfg(feature = "model-inference-proof")]
+    let __input_path = filename.as_ref();
+    let data = std::fs::read(__model_input_select!(filename.as_ref(), __input_path))?;
+    __model_input_inspect!(load_buffer(&data[..], device), |_| {
+        if std::env::var_os("MODEL_INFERENCE_CASE_FQN").is_some() {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(&data);
+            crate::model_input_proof::record_inputs(
+                "candle-core::safetensors::load",
+                crate::model_input_proof::InputRole::TensorInput,
+                &[crate::model_input_proof::InputIdentity::same_read_buffer(
+                    Some(__input_path),
+                    digest.into(),
+                )],
+            );
+        }
+    })
 }
 
 pub fn load_buffer(data: &[u8], device: &Device) -> Result<HashMap<String, Tensor>> {
@@ -445,6 +460,12 @@ impl MmapedSafetensors {
                 Ok::<_, Error>(SafeTensors_(st))
             },
         )?;
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_input_proof::record_reader_paths(
+            "candle-core::safetensors::MmapedSafetensors::new",
+            crate::model_input_proof::InputRole::TensorInput,
+            &[p],
+        );
         Ok(Self {
             safetensors: vec![safetensors],
             routing: None,
@@ -459,10 +480,14 @@ impl MmapedSafetensors {
     ///
     /// The unsafe is inherited from [`memmap2::MmapOptions`].
     pub unsafe fn multi<P: AsRef<Path>>(paths: &[P]) -> Result<Self> {
+        #[cfg(feature = "model-inference-proof")]
+        let mut __input_paths = Vec::with_capacity(paths.len());
         let mut routing = HashMap::new();
         let mut safetensors = vec![];
         for (index, p) in paths.iter().enumerate() {
             let p = p.as_ref();
+            #[cfg(feature = "model-inference-proof")]
+            __input_paths.push(p);
             let file = std::fs::File::open(p).map_err(|e| Error::from(e).with_path(p))?;
             let file = memmap2::MmapOptions::new()
                 .map(&file)
@@ -480,6 +505,12 @@ impl MmapedSafetensors {
             }
             safetensors.push(data)
         }
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_input_proof::record_reader_paths(
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            crate::model_input_proof::InputRole::TensorInput,
+            &__input_paths,
+        );
         Ok(Self {
             safetensors,
             routing: Some(routing),
@@ -546,6 +577,12 @@ pub struct BufferedSafetensors {
 impl BufferedSafetensors {
     /// Creates a wrapper around a binary buffer and deserialize the safetensors header.
     pub fn new(buffer: Vec<u8>) -> Result<Self> {
+        #[cfg(feature = "model-inference-proof")]
+        let __input_digest: Option<[u8; 32]> =
+            std::env::var_os("MODEL_INFERENCE_CASE_FQN").map(|_| {
+                use sha2::Digest;
+                sha2::Sha256::digest(&buffer).into()
+            });
         let safetensors = yoke::Yoke::<SafeTensors_<'static>, Vec<u8>>::try_attach_to_cart(
             buffer,
             |data: &[u8]| {
@@ -553,6 +590,16 @@ impl BufferedSafetensors {
                 Ok::<_, Error>(SafeTensors_(st))
             },
         )?;
+        #[cfg(feature = "model-inference-proof")]
+        if let Some(digest) = __input_digest {
+            crate::model_input_proof::record_inputs(
+                "candle-core::safetensors::BufferedSafetensors::new",
+                crate::model_input_proof::InputRole::TensorInput,
+                &[crate::model_input_proof::InputIdentity::same_read_buffer(
+                    None, digest,
+                )],
+            );
+        }
         Ok(Self { safetensors })
     }
 

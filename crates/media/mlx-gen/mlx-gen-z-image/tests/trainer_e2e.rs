@@ -46,7 +46,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights"]
 fn z_image_trainer_trains_and_writes_adapter() {
     // Tiny synthetic dataset: two solid-colour swatches + captions, written as PNGs.
     let tmp_guard = tempfile::tempdir().unwrap();
@@ -184,10 +184,15 @@ fn z_image_trainer_trains_and_writes_adapter() {
         "[trainer] e2e OK — adapter written to {}, reloaded onto {n_targets} targets, forward finite",
         out.adapter_path.display()
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::z_image_trainer_trains_and_writes_adapter"
+    );
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights"]
 fn z_image_trainer_lokr_trains_and_reloads() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
@@ -308,6 +313,11 @@ fn z_image_trainer_lokr_trains_and_reloads() {
     println!(
         "[trainer-lokr] e2e OK — reloaded LoKr applied to {n_targets} targets, forward finite"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::z_image_trainer_lokr_trains_and_reloads"
+    );
 }
 
 /// sc-5637 — preview samples. A short run with `sample_every`/`sample_prompts` set must emit
@@ -318,7 +328,7 @@ fn z_image_trainer_lokr_trains_and_reloads() {
 /// per-cadence inference cheap. Run:
 ///   cargo test -p mlx-gen-z-image --release --test integration -- --ignored --nocapture trainer_e2e::z_image_trainer_emits_preview_samples
 #[test]
-#[ignore = "needs real Z-Image weights"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights"]
 fn z_image_trainer_emits_preview_samples() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
@@ -407,5 +417,10 @@ fn z_image_trainer_emits_preview_samples() {
     println!(
         "[trainer-samples] e2e OK — {} previews: {samples:?}",
         samples.len()
+    );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::z_image_trainer_emits_preview_samples"
     );
 }

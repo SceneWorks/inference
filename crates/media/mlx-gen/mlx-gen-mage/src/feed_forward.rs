@@ -204,6 +204,7 @@ mod tests {
     /// parity suite's SwiGLU probe rests on. At x = 2, `gelu_tanh ≈ 1.9546`, `gelu ≈ 1.9545` and
     /// `silu ≈ 1.7616`: the SiLU swap is a ~10 % error per FFN, the erf swap ~1e-4.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_activations_are_measurably_different() {
         let x = Array::from_slice(&[2.0f32, -1.0], &[1, 2]);
         let g = ffn(FfnActivation::GeluApproximate).forward(&x).unwrap();
@@ -227,5 +228,7 @@ mod tests {
             (g[0] - s[0]).abs() > 0.15,
             "SiLU must be far from gelu-approximate"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feed_forward::tests::the_activations_are_measurably_different");
     }
 }

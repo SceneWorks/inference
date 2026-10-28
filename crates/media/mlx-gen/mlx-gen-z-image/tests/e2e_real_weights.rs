@@ -96,7 +96,7 @@ fn assert_golden_schedule_is_production(
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + local golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + local golden"]
 fn e2e_text_encoder_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let num_valid: i32 = g.metadata("num_valid").unwrap().parse().unwrap();
@@ -136,10 +136,13 @@ fn e2e_text_encoder_matches_golden() {
         "✓ text encoder: cap_feats {:?} matches the fork golden (peak-rel {peak_rel:.2e})",
         cap.shape()
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_text_encoder_matches_golden");
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + local golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + local golden"]
 fn e2e_transformer_single_forward_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
@@ -166,10 +169,13 @@ fn e2e_transformer_single_forward_matches_golden() {
         "single transformer forward diverged at real resolution: peak_rel {pr:.2e}"
     );
     println!("✓ transformer single forward matches golden");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_transformer_single_forward_matches_golden");
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + local golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + local golden"]
 fn e2e_denoise_loop_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
@@ -197,10 +203,13 @@ fn e2e_denoise_loop_matches_golden() {
     // ~3.2e-1 (small-tensor peak sensitivity); dump the dense golden at 1024² like the Q goldens.
     assert!(pr < 1e-1, "final latents diverged: peak_rel {pr:.2e}");
     println!("✓ denoise loop matches golden (peak-rel {pr:.2e})");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_denoise_loop_matches_golden");
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + local golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + local golden"]
 fn e2e_vae_and_image_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let vae = load_vae(&snapshot()).unwrap();
@@ -248,12 +257,17 @@ fn e2e_vae_and_image_matches_golden() {
     let pr = peak_rel(&decoded, golden);
     println!("vae: decoded peak_rel={pr:.2e} shape={:?}", decoded.shape());
     assert!(pr < 4.5e-2, "VAE decode diverged: peak_rel {pr:.2e}");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_vae_and_image_matches_golden"
+    );
 }
 
 /// The integration proof: the full prompt→image pipeline through the **public** Generator API
 /// (`provider_registry().load("z_image_turbo", …).generate(req)`), compared to the fork's golden render.
 #[test]
-#[ignore = "needs real Z-Image weights + local golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + local golden"]
 fn e2e_full_pipeline_generates_fox() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let snap = snapshot();
@@ -354,6 +368,9 @@ fn e2e_full_pipeline_generates_fox() {
         differ < img.pixels.len() / 20,
         "full-pipeline image diverges: {differ} pixels"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_full_pipeline_generates_fox");
 }
 
 /// sc-2532: the Q4/Q8 **transformer**-isolation diagnostic. Quantize the Rust transformer
@@ -532,20 +549,30 @@ fn q8_packing_byte_identical_to_fork() {
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + Q8 golden @1024² (QUANTIZE=8 ZIMAGE_W=1024 ZIMAGE_H=1024 dump_z_image_golden.py)"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + Q8 golden @1024² (QUANTIZE=8 ZIMAGE_W=1024 ZIMAGE_H=1024 dump_z_image_golden.py)"]
 fn transformer_q8_pipeline_matches_fork() {
     // Measured (1024², fox, seed 42) AFTER sc-2604: latent mean_rel 3.6e-3, px>8 0.028% (was
     // 2.0e-2 / 0.78% when the f32 checkpoint was quantized as f32 — see `quantize` in adapters.rs).
     // Now at the dense-path floor; thresholds catch a regression to the old f32-quantize residual.
     q_pipeline_matches_fork(Q8_GOLDEN, 8, 1e-2, 0.005);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::transformer_q8_pipeline_matches_fork"
+    );
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + Q4 golden @1024² (QUANTIZE=4 ZIMAGE_W=1024 ZIMAGE_H=1024 dump_z_image_golden.py)"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + Q4 golden @1024² (QUANTIZE=4 ZIMAGE_W=1024 ZIMAGE_H=1024 dump_z_image_golden.py)"]
 fn transformer_q4_pipeline_matches_fork() {
     // Measured (1024², fox, seed 42) AFTER sc-2604: latent mean_rel 4.5e-3, px>8 0.137% (was
     // 1.6e-2 / 0.64% with the f32-quantize bug). Now at the dense-path floor.
     q_pipeline_matches_fork(Q4_GOLDEN, 4, 1e-2, 0.005);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::transformer_q4_pipeline_matches_fork"
+    );
 }
 
 /// sc-2532: the **full public product path** — `load("z_image_turbo", spec.with_quant(Q)).generate()`
@@ -619,17 +646,23 @@ fn q_full_generate_renders(golden_path: &str, quant: mlx_gen::Quant, bits: i32, 
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + Q8 golden @1024² (QUANTIZE=8 ZIMAGE_W=1024 ZIMAGE_H=1024)"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + Q8 golden @1024² (QUANTIZE=8 ZIMAGE_W=1024 ZIMAGE_H=1024)"]
 fn q8_full_generate_renders() {
     // Measured (1024²) AFTER sc-2604: 0.024% px>8 vs fork-Q8 (whole-model quant: transformer + text
     // encoder + VAE — all f32 on disk, all fixed by the bf16-cast-before-quantize). Was 0.81%.
     q_full_generate_renders(Q8_GOLDEN, mlx_gen::Quant::Q8, 8, 0.005);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::q8_full_generate_renders");
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + Q4 golden @1024² (QUANTIZE=4 ZIMAGE_W=1024 ZIMAGE_H=1024)"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + Q4 golden @1024² (QUANTIZE=4 ZIMAGE_W=1024 ZIMAGE_H=1024)"]
 fn q4_full_generate_renders() {
     // Measured (1024²) AFTER sc-2604: 0.088% px>8 vs fork-Q4 (whole-model quant). Was 0.73%
     // (transformer-only-dense-TE was ~18%, fixed in sc-2532; the f32-quantize residual in sc-2604).
     q_full_generate_renders(Q4_GOLDEN, mlx_gen::Quant::Q4, 4, 0.005);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::q4_full_generate_renders");
 }

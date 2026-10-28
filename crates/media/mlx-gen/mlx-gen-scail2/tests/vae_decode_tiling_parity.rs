@@ -239,4 +239,6 @@ fn scail2_tiled_decode_tracks_single_pass() {
          under-predicting and `mlx.minMemoryGb` cannot be trusted",
         gib(new_peak)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_tiling_parity::scail2_tiled_decode_tracks_single_pass");
 }

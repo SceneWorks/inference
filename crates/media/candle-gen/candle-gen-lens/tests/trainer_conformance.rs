@@ -76,4 +76,7 @@ fn lens_trainer_satisfies_gen_core_contract() {
         },
         &profile,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_conformance::lens_trainer_satisfies_gen_core_contract");
 }

@@ -252,6 +252,9 @@ fn z_image_trainer_lora_trains_reloads_and_renders() {
     assert_reloads(&out.adapter_path, AdapterKind::Lora, n_targets);
     render_finite_with_adapter(&out.adapter_path, AdapterKind::Lora);
     println!("[zimage-lora] e2e OK — {n_targets} targets reload + merge, render finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::z_image_trainer_lora_trains_reloads_and_renders");
 }
 
 /// Gradient checkpointing (sc-5246): the **same** LoRA recipe with `gradient_checkpointing = true`
@@ -297,6 +300,9 @@ fn z_image_trainer_gradient_checkpointing_trains_and_reloads() {
     assert_reloads(&out.adapter_path, AdapterKind::Lora, n_targets);
     render_finite_with_adapter(&out.adapter_path, AdapterKind::Lora);
     println!("[zimage-ckpt] e2e OK — gradient-checkpointed train converges, {n_targets} targets reload + render");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::z_image_trainer_gradient_checkpointing_trains_and_reloads");
 }
 
 /// LoKr: trains + converges, writes a LoKr adapter (with `decomposeFactor`), and reloads.
@@ -327,6 +333,11 @@ fn z_image_trainer_lokr_trains_and_reloads() {
     assert_reloads(&out.adapter_path, AdapterKind::Lokr, n_targets);
     render_finite_with_adapter(&out.adapter_path, AdapterKind::Lokr);
     println!("[zimage-lokr] e2e OK — {n_targets} targets reload + merge, render finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::z_image_trainer_lokr_trains_and_reloads"
+    );
 }
 
 /// sc-8650: with a sample cadence set, the trainer renders preview images from the **in-progress
@@ -337,6 +348,8 @@ fn z_image_trainer_lokr_trains_and_reloads() {
 fn z_image_trainer_emits_preview_samples() {
     if !snapshot().exists() {
         eprintln!("skipping: set Z_IMAGE_SNAPSHOT (or populate the HF cache)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-z-image/tests/trainer_e2e.rs:338 (z_image_trainer_emits_preview_samples): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     }
     let tmp_guard = tempfile::tempdir().unwrap();
@@ -414,6 +427,9 @@ fn z_image_trainer_emits_preview_samples() {
             img.width, img.height
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::z_image_trainer_emits_preview_samples");
 }
 
 /// Launch-portable determinism: the same seed produces the same adapter, run to run (the achievable
@@ -463,6 +479,11 @@ fn z_image_trainer_same_seed_is_reproducible() {
         );
     }
     println!("[zimage-det] e2e OK — same seed reproduces the adapter bit-for-bit");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::z_image_trainer_same_seed_is_reproducible"
+    );
 }
 
 /// Load a generator with `adapter_path` merged and run a tiny `generate`, asserting a finite,

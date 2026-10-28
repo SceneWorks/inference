@@ -91,17 +91,22 @@ impl SanaForwardPlan {
 /// `slice_axis`, which carries no such constraint, IS imported from there rather than copied.
 #[cfg(test)]
 mod cross_attn_probe {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::cell::Cell;
 
-    pub(super) static LAST_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+    // Per test thread: libtest runs tests in parallel, and a process-wide counter let one test's
+    // cross-attention overwrite another's reading between its call and its assert.
+    thread_local! {
+        pub(super) static LAST_CHUNK_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
 
-    /// Chunks run by the most recent cross-attention call (`1` = the unchunked path).
+    /// Chunks run by the most recent cross-attention call on this thread (`1` = the unchunked
+    /// path).
     pub(crate) fn last_chunk_count() -> usize {
-        LAST_CHUNK_COUNT.load(Ordering::Relaxed)
+        LAST_CHUNK_COUNT.with(Cell::get)
     }
 
     pub(crate) fn reset() {
-        LAST_CHUNK_COUNT.store(0, Ordering::Relaxed);
+        LAST_CHUNK_COUNT.with(|c| c.set(0));
     }
 }
 
@@ -110,7 +115,7 @@ pub(crate) use cross_attn_probe::{last_chunk_count, reset as reset_chunk_count};
 
 #[cfg(test)]
 fn record_chunk_count(n: usize) {
-    cross_attn_probe::LAST_CHUNK_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+    cross_attn_probe::LAST_CHUNK_COUNT.with(|c| c.set(n));
 }
 
 #[cfg(not(test))]
@@ -499,6 +504,11 @@ impl GluMbConv {
         })
     }
 
+    /// Expanded channels (`2 · hidden`) from the loaded tensors.
+    fn ff_channels(&self) -> u64 {
+        2 * self.hidden as u64
+    }
+
     /// `x` is NHWC `[B, H, W, inner]`. Returns NHWC `[B, H, W, out]`.
     fn forward(&self, x: &Array) -> Result<Array> {
         let h = self.conv_inverted.forward(x)?;
@@ -522,7 +532,148 @@ pub(crate) struct SanaBlock {
     norm_eps: f32,
 }
 
+/// Bytes of a stored tensor's copy promoted to `activation`: its elements at the activation width
+/// when it is stored narrower (MLX promotes a mixed-dtype op's narrower operand), else 0.
+fn promoted_bytes(stored: &Array, activation: Dtype) -> u64 {
+    promoted_elements_bytes(stored.size() as u64, stored.dtype(), activation)
+}
+
+fn dtype_width(d: Dtype) -> u64 {
+    match d {
+        Dtype::Float16 | Dtype::Bfloat16 => 2,
+        _ => 4,
+    }
+}
+
+fn promoted_elements_bytes(elements: u64, stored: Dtype, activation: Dtype) -> u64 {
+    if stored != activation && dtype_width(stored) < dtype_width(activation) {
+        elements * dtype_width(activation)
+    } else {
+        0
+    }
+}
+
+/// Block quantum from the CONFIGURATION alone (no tensors): the geometry of the iOS synthetic
+/// primitive probe, whose only weight is the F16 inverted 1x1 conv `[2·hidden, dim]` — so exactly
+/// that one promoted f32 copy is charged. A LOADED block is priced by `SanaBlock::quantum`, which
+/// sums every promoted copy the real block makes (its three GLUMBConv convolutions and eight
+/// attention projections are all live together); never price a real block from this.
+pub fn configured_block_quantum(
+    cfg: &SanaTransformerConfig,
+    batch: i32,
+    h: i32,
+    w: i32,
+    caption_tokens: i32,
+    budget: AttentionBudget,
+) -> crate::quantum::SanaBlockQuantum {
+    let dim = cfg.inner_dim() as u64;
+    let hidden = (cfg.mlp_ratio * cfg.inner_dim() as f32) as u64;
+    let tokens = h.saturating_mul(w);
+    crate::quantum::SanaBlockQuantum {
+        batch: batch as u64,
+        tokens: tokens as u64,
+        dim,
+        self_heads: cfg.num_attention_heads as u64,
+        self_head_dim: cfg.attention_head_dim as u64,
+        caption_tokens: caption_tokens as u64,
+        cross_heads: cfg.num_cross_attention_heads as u64,
+        query_rows: budget
+            .query_block(batch, cfg.num_cross_attention_heads, tokens, caption_tokens)
+            .min(tokens) as u64,
+        ff_channels: 2 * hidden,
+        qk_norm: cfg.qk_norm,
+        element_bytes: 4,
+        weight_bytes: 2 * hidden * dim * 4,
+    }
+}
+
 impl SanaBlock {
+    /// The promoted copies of attn1's q/k/v when dense and stored narrower: the packed
+    /// `[3·inner, in]` matrix when the pack is engaged (one matmul), else all three projections
+    /// (three matmuls in one quantum, each copy held until its matmul completes). The projections
+    /// share attn1 `to_out`'s storage dtype (one checkpoint, one tier).
+    fn qkv_promoted_bytes(&self, activation: Dtype) -> Option<u64> {
+        let facts = self.attn1.qkv.part_facts(QkvPart::Q);
+        if facts.is_quantized {
+            return None;
+        }
+        let stored = self.attn1.to_out.dense_weight()?.0.dtype();
+        let elements = |shape: &[i32]| shape.iter().map(|d| *d as u64).product::<u64>();
+        let qkv = match self.attn1.qkv.packed_shape() {
+            Some(shape) => elements(&shape),
+            None => [QkvPart::Q, QkvPart::K, QkvPart::V]
+                .into_iter()
+                .map(|part| elements(&self.attn1.qkv.part_facts(part).base_shape))
+                .sum(),
+        };
+        Some(promoted_elements_bytes(qkv, stored, activation))
+    }
+
+    /// The block quantum from THIS block's loaded tensors and the request, not production
+    /// constants. `activation` is the trunk's compute dtype (the latent's).
+    ///
+    /// Weight copies are SUMMED over the block, not maxed. Every op of the block — attn1's q/k/v
+    /// and `to_out`, attn2's four projections, the three GLUMBConv convolutions — is one graph
+    /// evaluated by the quantum's single `eval`, and MLX encodes ahead of execution: a promoted
+    /// copy is allocated when its cast is encoded and released only when the command buffer (Metal)
+    /// or queued task (CPU) of the matmul/conv consuming it completes. Nothing inside the block
+    /// synchronizes, so in op order every copy can be encoded before the first consumer retires —
+    /// the SDXL retention model. Proven at a weight-dominated shape (F16 weights, f32 activations,
+    /// wide `dim`, four tokens) in `quantum_proofs::trunk_quanta_track_their_measured_peaks`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn quantum(
+        &self,
+        batch: i32,
+        h: i32,
+        w: i32,
+        caption_tokens: i32,
+        budget: AttentionBudget,
+        activation: Dtype,
+    ) -> crate::quantum::SanaBlockQuantum {
+        let dim = self.scale_shift_table.shape()[1] as u64;
+        let tokens = h.saturating_mul(w);
+        let self_heads = self.attn1.heads as u64;
+        let linears = [
+            &self.attn2.to_q,
+            &self.attn2.to_k,
+            &self.attn2.to_v,
+            &self.attn2.to_out,
+            &self.attn1.to_out,
+        ];
+        let weight_bytes = [
+            &self.ff.conv_inverted,
+            &self.ff.conv_depth,
+            &self.ff.conv_point,
+        ]
+        .into_iter()
+        .map(|conv| promoted_bytes(&conv.w, activation))
+        .chain(
+            linears
+                .into_iter()
+                .filter_map(|lin| lin.dense_weight())
+                .map(|(w, _)| promoted_bytes(w, activation)),
+        )
+        .chain(self.qkv_promoted_bytes(activation))
+        .fold(0u64, u64::saturating_add);
+        let width = dtype_width(activation);
+        crate::quantum::SanaBlockQuantum {
+            batch: batch as u64,
+            tokens: tokens as u64,
+            dim,
+            self_heads,
+            self_head_dim: dim / self_heads.max(1),
+            caption_tokens: caption_tokens as u64,
+            cross_heads: self.attn2.heads as u64,
+            query_rows: budget
+                .query_block(batch, self.attn2.heads, tokens, caption_tokens)
+                .min(tokens) as u64,
+            ff_channels: self.ff.ff_channels(),
+            qk_norm: self.attn1.norm_q.is_some(),
+            element_bytes: width,
+            weight_bytes,
+        }
+    }
+
     pub(crate) fn load(w: &Weights, prefix: &str, cfg: &SanaTransformerConfig) -> Result<Self> {
         Ok(Self {
             scale_shift_table: w.require(&format!("{prefix}.scale_shift_table"))?.clone(),
@@ -550,31 +701,41 @@ impl SanaBlock {
     ) -> Result<Array> {
         let dim = self.scale_shift_table.shape()[1];
         let b = hidden.shape()[0];
-        // 1. Modulation: scale_shift_table[None] + temb.reshape(B,6,-1)  → chunk(6) along axis 1.
-        let ss = self.scale_shift_table.reshape(&[1, 6, dim])?;
-        let modg = add(&ss, &temb.reshape(&[b, 6, dim])?)?; // [B,6,dim]
-        let mc = split_sections(&modg, &[1, 2, 3, 4, 5], 1)?; // 6 × [B,1,dim]
-        let chunk = |i: usize| -> Result<Array> { Ok(mc[i].reshape(&[b, 1, dim])?) };
-        let (shift_msa, scale_msa, gate_msa) = (chunk(0)?, chunk(1)?, chunk(2)?);
-        let (shift_mlp, scale_mlp, gate_mlp) = (chunk(3)?, chunk(4)?, chunk(5)?);
+        let scratch = crate::quantum::block_bytes(self.quantum(
+            b,
+            h,
+            w,
+            caption.shape()[1],
+            budget,
+            hidden.dtype(),
+        ));
+        mlx_gen::ios_quantum::run(crate::quantum::labels::BLOCK, scratch, || {
+            // 1. Modulation: scale_shift_table[None] + temb.reshape(B,6,-1)  → chunk(6) along axis 1.
+            let ss = self.scale_shift_table.reshape(&[1, 6, dim])?;
+            let modg = add(&ss, &temb.reshape(&[b, 6, dim])?)?; // [B,6,dim]
+            let mc = split_sections(&modg, &[1, 2, 3, 4, 5], 1)?; // 6 × [B,1,dim]
+            let chunk = |i: usize| -> Result<Array> { Ok(mc[i].reshape(&[b, 1, dim])?) };
+            let (shift_msa, scale_msa, gate_msa) = (chunk(0)?, chunk(1)?, chunk(2)?);
+            let (shift_mlp, scale_mlp, gate_mlp) = (chunk(3)?, chunk(4)?, chunk(5)?);
 
-        // 2. Self linear-attention.
-        let norm_h = layer_norm(hidden, None, None, self.norm_eps)?;
-        let norm_h = modulate(&norm_h, &scale_msa, &shift_msa)?;
-        let attn_out = self.attn1.forward(&norm_h)?;
-        let hidden = add(hidden, &multiply(&gate_msa, &attn_out)?)?;
+            // 2. Self linear-attention.
+            let norm_h = layer_norm(hidden, None, None, self.norm_eps)?;
+            let norm_h = modulate(&norm_h, &scale_msa, &shift_msa)?;
+            let attn_out = self.attn1.forward(&norm_h)?;
+            let hidden = add(hidden, &multiply(&gate_msa, &attn_out)?)?;
 
-        // 3. Cross-attention (no pre-norm in SANA — attn2 reads `hidden` directly).
-        let cross = self.attn2.forward(&hidden, caption, caption_mask, budget)?;
-        let hidden = add(&cross, &hidden)?;
+            // 3. Cross-attention (no pre-norm in SANA — attn2 reads `hidden` directly).
+            let cross = self.attn2.forward(&hidden, caption, caption_mask, budget)?;
+            let hidden = add(&cross, &hidden)?;
 
-        // 4. Mix-FFN. norm2 → modulate → un-flatten to [B,H,W,dim] → GLUMBConv → flatten → gate.
-        let norm_h = layer_norm(&hidden, None, None, self.norm_eps)?;
-        let norm_h = modulate(&norm_h, &scale_mlp, &shift_mlp)?;
-        let grid = norm_h.reshape(&[b, h, w, dim])?; // [B,N,dim] → NHWC (channels-last)
-        let ff = self.ff.forward(&grid)?;
-        let ff = ff.reshape(&[b, h * w, dim])?;
-        Ok(add(&hidden, &multiply(&gate_mlp, &ff)?)?)
+            // 4. Mix-FFN. norm2 → modulate → un-flatten to [B,H,W,dim] → GLUMBConv → flatten → gate.
+            let norm_h = layer_norm(&hidden, None, None, self.norm_eps)?;
+            let norm_h = modulate(&norm_h, &scale_mlp, &shift_mlp)?;
+            let grid = norm_h.reshape(&[b, h, w, dim])?; // [B,N,dim] → NHWC (channels-last)
+            let ff = self.ff.forward(&grid)?;
+            let ff = ff.reshape(&[b, h * w, dim])?;
+            Ok(add(&hidden, &multiply(&gate_mlp, &ff)?)?)
+        })
     }
 }
 
@@ -667,9 +828,184 @@ impl SanaTransformer {
         self
     }
 
+    /// The promoted copies of the dense linears the entry / output quanta run, SUMMED: each quantum
+    /// is one graph under one `eval`, and a copy lives until its consuming matmul's command buffer
+    /// (or CPU task) completes, so with MLX's encode-ahead they can all be live together (see
+    /// [`SanaBlock::quantum`]).
+    fn promoted_linear_bytes(linears: &[&AdaptableLinear], activation: Dtype) -> u64 {
+        linears
+            .iter()
+            .filter_map(|lin| lin.dense_weight())
+            .map(|(w, _)| promoted_bytes(w, activation))
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// The entry quantum (patchify, timestep/guidance embedding, caption projection) for this
+    /// trunk's loaded tensors and the request. Excludes the previous step's lazy sampler update,
+    /// which the call site adds as [`mlx_gen::ios_quantum::sampler_step_bytes`].
+    pub(crate) fn entry_quantum(
+        &self,
+        latent_shape: &[i32],
+        caption_shape: &[i32],
+        caption_dtype: Dtype,
+        activation: Dtype,
+    ) -> crate::quantum::SanaEntryQuantum {
+        let p = self.cfg.patch_size.max(1);
+        let mut linears = vec![
+            &self.ts_embedder_1,
+            &self.ts_embedder_2,
+            &self.time_linear,
+            &self.caption_proj_1,
+            &self.caption_proj_2,
+        ];
+        if let Some((g1, g2)) = &self.guidance_embedder {
+            linears.push(g1);
+            linears.push(g2);
+        }
+        let weight_bytes = Self::promoted_linear_bytes(&linears, activation)
+            .saturating_add(promoted_bytes(&self.patch_embed.w, activation));
+        crate::quantum::SanaEntryQuantum {
+            batch: latent_shape[0] as u64,
+            latent_channels: latent_shape[1] as u64,
+            tokens: (latent_shape[2] / p) as u64 * (latent_shape[3] / p) as u64,
+            patch: p as u64,
+            dim: self.cfg.inner_dim() as u64,
+            caption_tokens: caption_shape[1] as u64,
+            caption_channels: caption_shape[2] as u64,
+            caption_element_bytes: dtype_width(caption_dtype),
+            element_bytes: dtype_width(activation),
+            weight_bytes,
+        }
+    }
+
+    /// The output quantum (modulated norm, `proj_out`, unpatchify).
+    pub(crate) fn output_quantum(
+        &self,
+        batch: i32,
+        tokens: i32,
+        activation: Dtype,
+    ) -> crate::quantum::SanaOutputQuantum {
+        let p = self.cfg.patch_size as u64;
+        crate::quantum::SanaOutputQuantum {
+            batch: batch as u64,
+            tokens: tokens as u64,
+            dim: self.cfg.inner_dim() as u64,
+            out_features: p * p * self.cfg.out_channels as u64,
+            element_bytes: dtype_width(activation),
+            weight_bytes: Self::promoted_linear_bytes(&[&self.proj_out], activation),
+        }
+    }
+
+    /// The entry quantum's body: patchify, the timestep (+ Sprint guidance) embedding and the
+    /// caption projection. Returns `(hidden [B,N,dim], caption [B,M,dim], temb [B,6·dim],
+    /// embedded_timestep [B,dim])`.
+    pub(crate) fn entry(
+        &self,
+        latent_nchw: &Array,
+        caption: &Array,
+        timestep: &Array,
+        guidance: Option<&Array>,
+    ) -> Result<(Array, Array, Array, Array)> {
+        let cfg = &self.cfg;
+        let dim = cfg.inner_dim();
+        let lsh = latent_nchw.shape();
+        let b = lsh[0];
+        let p = cfg.patch_size;
+        let (ph, pw) = (lsh[2] / p, lsh[3] / p);
+        let dt = latent_nchw.dtype();
+        // 1. Patch embed (NHWC). [B,C,H,W] → NHWC → conv → [B,ph,pw,dim] → tokens [B,N,dim].
+        let x = latent_nchw.transpose_axes(&[0, 2, 3, 1])?; // NHWC
+        let x = self.patch_embed.forward(&x)?; // [B,ph,pw,dim]
+        let hidden = x.reshape(&[b, ph * pw, dim])?;
+
+        // 2. Timestep embedding → embedded_timestep [B,dim] and modulation temb [B,6·dim].
+        let ts_proj = timestep_sincos(timestep, 256, 10_000.0, 0.0)?.as_dtype(dt)?; // [B,256]
+        let timesteps_emb = self
+            .ts_embedder_2
+            .forward(&silu(&self.ts_embedder_1.forward(&ts_proj)?)?)?; // [B,dim]
+                                                                       // Sprint: conditioning = timesteps_emb + guidance_emb (the guidance scalar through the same
+                                                                       // sincos(256) projection + a parallel MLP). embedded_timestep (the output-modnorm input) is
+                                                                       // this combined conditioning, exactly as diffusers `SanaCombinedTimestepGuidanceEmbeddings`.
+        let emb =
+            match (&self.guidance_embedder, guidance) {
+                (Some((g1, g2)), Some(g)) => {
+                    let g_proj = timestep_sincos(g, 256, 10_000.0, 0.0)?.as_dtype(dt)?;
+                    let guidance_emb = g2.forward(&silu(&g1.forward(&g_proj)?)?)?;
+                    add(&timesteps_emb, &guidance_emb)?
+                }
+                (None, None) => timesteps_emb,
+                // F-092: the two remaining combinations are contract violations that previously fell into
+                // the `_ => timesteps_emb` arm and SILENTLY dropped the guidance conditioning. Surface them:
+                // a Sprint trunk (embedder loaded) MUST be given a guidance scalar, and a base trunk must
+                // NOT (the caller mis-routed the request).
+                (Some(_), None) => return Err(Error::Msg(
+                    "sana: guidance_embeds trunk requires a guidance scalar, but none was supplied"
+                        .into(),
+                )),
+                (None, Some(_)) => return Err(Error::Msg(
+                    "sana: a guidance scalar was supplied but this trunk has no guidance embedder \
+                     (base AdaLN-single config)"
+                        .into(),
+                )),
+            };
+        let temb = self.time_linear.forward(&silu(&emb)?)?; // [B,6·dim]
+
+        // 3. Caption projection + RMSNorm.
+        let cap = self.caption_proj_1.forward(caption)?;
+        let cap = self.caption_proj_2.forward(&gelu_tanh(&cap)?)?;
+        let cap = cap.reshape(&[b, -1, dim])?;
+        let caption = rms_norm(&cap, &self.caption_norm, cfg.caption_norm_eps)?;
+        Ok((hidden, caption, temb, emb))
+    }
+
+    /// The output quantum's body: `SanaModulatedNorm(embedded_timestep)` → `proj_out` →
+    /// unpatchify to `[B, out_channels, H, W]`.
+    pub(crate) fn output(
+        &self,
+        hidden: &Array,
+        emb: &Array,
+        b: i32,
+        ph: i32,
+        pw: i32,
+    ) -> Result<Array> {
+        let cfg = &self.cfg;
+        let dim = cfg.inner_dim();
+        let p = cfg.patch_size;
+        let ss = self.scale_shift_table.reshape(&[1, 2, dim])?;
+        let modg = add(&ss, &emb.reshape(&[b, 1, dim])?)?; // [B,2,dim]
+        let parts = split_sections(&modg, &[1], 1)?; // 2 × [B,1,dim]
+        let shift = parts[0].reshape(&[b, 1, dim])?;
+        let scale = parts[1].reshape(&[b, 1, dim])?;
+        // F-092: use the config eps, not a hardcoded `1e-6`. (For every shipped SANA config
+        // `cfg.norm_eps == 1e-6`, so this is a no-op cleanup that removes the divergence risk.)
+        let normed = layer_norm(hidden, None, None, cfg.norm_eps)?;
+        let one = scalar(1.0).as_dtype(scale.dtype())?;
+        let hidden = add(&multiply(&normed, &add(&scale, &one)?)?, &shift)?;
+
+        let out = self.proj_out.forward(&hidden)?; // [B,N, p·p·out_channels]
+                                                   // unpatchify: [B,ph,pw,p,p,out_c] → permute(0,5,1,3,2,4) → [B,out_c,ph·p,pw·p].
+        let oc = cfg.out_channels;
+        let out = out.reshape(&[b, ph, pw, p, p, oc])?;
+        let out = out.transpose_axes(&[0, 5, 1, 3, 2, 4])?;
+        let out = out.reshape(&[b, oc, ph * p, pw * p])?;
+        Ok(out)
+    }
+
     /// The number of `transformer_blocks` this trunk runs — the rung-4 plan's `n_blocks`.
     pub(crate) fn n_blocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_block_stream(&self) -> bool {
+        self.block_stream.is_some()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_storage_witnesses(&self) -> Vec<&Array> {
+        std::iter::once(&self.caption_norm)
+            .chain(self.blocks.iter().map(|b| &b.scale_shift_table))
+            .collect()
     }
 
     /// Forward one denoise step.
@@ -731,61 +1067,71 @@ impl SanaTransformer {
         cancel: &CancelFlag,
     ) -> Result<Array> {
         let cfg = &self.cfg;
-        let dim = cfg.inner_dim();
         let lsh = latent_nchw.shape();
         let (b, height, width) = (lsh[0], lsh[2], lsh[3]);
         let p = cfg.patch_size;
         let (ph, pw) = (height / p, width / p);
         let dt = latent_nchw.dtype();
-
-        // 1. Patch embed (NHWC). [B,C,H,W] → NHWC → conv → [B,ph,pw,dim] → tokens [B,N,dim].
-        let x = latent_nchw.transpose_axes(&[0, 2, 3, 1])?; // NHWC
-        let x = self.patch_embed.forward(&x)?; // [B,ph,pw,dim]
-        let mut hidden = x.reshape(&[b, ph * pw, dim])?;
-
-        // 2. Timestep embedding → embedded_timestep [B,dim] and modulation temb [B,6·dim].
-        let ts_proj = timestep_sincos(timestep, 256, 10_000.0, 0.0)?.as_dtype(dt)?; // [B,256]
-        let timesteps_emb = self
-            .ts_embedder_2
-            .forward(&silu(&self.ts_embedder_1.forward(&ts_proj)?)?)?; // [B,dim]
-                                                                       // Sprint: conditioning = timesteps_emb + guidance_emb (the guidance scalar through the same
-                                                                       // sincos(256) projection + a parallel MLP). embedded_timestep (the output-modnorm input) is
-                                                                       // this combined conditioning, exactly as diffusers `SanaCombinedTimestepGuidanceEmbeddings`.
-        let emb =
-            match (&self.guidance_embedder, guidance) {
-                (Some((g1, g2)), Some(g)) => {
-                    let g_proj = timestep_sincos(g, 256, 10_000.0, 0.0)?.as_dtype(dt)?;
-                    let guidance_emb = g2.forward(&silu(&g1.forward(&g_proj)?)?)?;
-                    add(&timesteps_emb, &guidance_emb)?
-                }
-                (None, None) => timesteps_emb,
-                // F-092: the two remaining combinations are contract violations that previously fell into
-                // the `_ => timesteps_emb` arm and SILENTLY dropped the guidance conditioning. Surface them:
-                // a Sprint trunk (embedder loaded) MUST be given a guidance scalar, and a base trunk must
-                // NOT (the caller mis-routed the request).
-                (Some(_), None) => return Err(Error::Msg(
-                    "sana: guidance_embeds trunk requires a guidance scalar, but none was supplied"
-                        .into(),
-                )),
-                (None, Some(_)) => return Err(Error::Msg(
-                    "sana: a guidance scalar was supplied but this trunk has no guidance embedder \
-                     (base AdaLN-single config)"
-                        .into(),
-                )),
-            };
-        let temb = self.time_linear.forward(&silu(&emb)?)?; // [B,6·dim]
-
-        // 3. Caption projection + RMSNorm.
-        let cap = self.caption_proj_1.forward(caption)?;
-        let cap = self.caption_proj_2.forward(&gelu_tanh(&cap)?)?;
-        let cap = cap.reshape(&[b, -1, dim])?;
-        let caption = rms_norm(&cap, &self.caption_norm, cfg.caption_norm_eps)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sana",
+            "native-trunk",
+            &[
+                ("schema", 1),
+                ("batch", b as u64),
+                ("height", height as u64),
+                ("width", width as u64),
+                ("channels", lsh[1] as u64),
+                ("caption_tokens", caption.shape()[1] as u64),
+                ("caption_width", caption.shape()[2] as u64),
+                ("layers", self.blocks.len() as u64),
+                ("dim", cfg.inner_dim() as u64),
+                ("patch", p as u64),
+                ("qk_norm", u64::from(cfg.qk_norm)),
+                ("guidance_embeds", u64::from(cfg.guidance_embeds)),
+                ("dtype", mlx_gen::sampler::sampling_dtype_code(dt)),
+                ("caption_mask", u64::from(caption_mask.is_some())),
+                ("streamed", u64::from(plan.window.is_some())),
+                (
+                    "query_rows",
+                    plan.attention.query_block(
+                        b,
+                        cfg.num_cross_attention_heads,
+                        ph * pw,
+                        caption.shape()[1],
+                    ) as u64,
+                ),
+            ],
+        );
+        // The previous step's CFG combine + sampler update is lazy and materializes here.
+        mlx_gen::ios_quantum::before(
+            crate::quantum::labels::ENTRY,
+            crate::quantum::entry_bytes(self.entry_quantum(
+                latent_nchw.shape(),
+                caption.shape(),
+                caption.dtype(),
+                dt,
+            ))
+            .saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(
+                latent_nchw.size() as u64,
+            )),
+        )?;
+        let (mut hidden, caption, temb, emb) =
+            self.entry(latent_nchw, caption, timestep, guidance)?;
+        mlx_gen::ios_quantum::finish(
+            crate::quantum::labels::ENTRY,
+            &[&hidden, &caption, &temb, &emb],
+        )?;
 
         // 4. Transformer blocks. The caption padding mask (if any) applies unchanged to every block's
         // attn2 — the per-token caption projection above preserves the M (=300) axis it indexes.
         hidden = match plan.window {
             None => {
                 for block in &self.blocks {
+                    // Observe cancellation before constructing each subsequent block quantum.
+                    if cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
                     hidden = block.forward(
                         &hidden,
                         &caption,
@@ -812,23 +1158,16 @@ impl SanaTransformer {
         };
 
         // 5. Output: SanaModulatedNorm(embedded_timestep) → proj_out → unpatchify.
-        let ss = self.scale_shift_table.reshape(&[1, 2, dim])?;
-        let modg = add(&ss, &emb.reshape(&[b, 1, dim])?)?; // [B,2,dim]
-        let parts = split_sections(&modg, &[1], 1)?; // 2 × [B,1,dim]
-        let shift = parts[0].reshape(&[b, 1, dim])?;
-        let scale = parts[1].reshape(&[b, 1, dim])?;
-        // F-092: use the config eps, not a hardcoded `1e-6`. (For every shipped SANA config
-        // `cfg.norm_eps == 1e-6`, so this is a no-op cleanup that removes the divergence risk.)
-        let normed = layer_norm(&hidden, None, None, cfg.norm_eps)?;
-        let one = scalar(1.0).as_dtype(scale.dtype())?;
-        let hidden = add(&multiply(&normed, &add(&scale, &one)?)?, &shift)?;
-
-        let out = self.proj_out.forward(&hidden)?; // [B,N, p·p·out_channels]
-                                                   // unpatchify: [B,ph,pw,p,p,out_c] → permute(0,5,1,3,2,4) → [B,out_c,ph·p,pw·p].
-        let oc = cfg.out_channels;
-        let out = out.reshape(&[b, ph, pw, p, p, oc])?;
-        let out = out.transpose_axes(&[0, 5, 1, 3, 2, 4])?;
-        Ok(out.reshape(&[b, oc, ph * p, pw * p])?)
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        mlx_gen::ios_quantum::before(
+            crate::quantum::labels::OUTPUT,
+            crate::quantum::output_bytes(self.output_quantum(b, ph * pw, hidden.dtype())),
+        )?;
+        let out = self.output(&hidden, &emb, b, ph, pw)?;
+        mlx_gen::ios_quantum::finish(crate::quantum::labels::OUTPUT, &[&out])?;
+        Ok(out)
     }
 
     /// Rung 4: walk the 20 `transformer_blocks` in windows, rebuilding each window's weights from the
@@ -880,6 +1219,9 @@ impl SanaTransformer {
                 let mut cur = state;
                 for index in range {
                     let block = stream.materialize(view, index)?;
+                    if cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
                     cur = block.forward(&cur, caption, caption_mask, temb, h, w, budget)?;
                 }
                 Ok(cur)
@@ -937,6 +1279,51 @@ mod tests {
         (CrossAttn::load(&weights, "attn2", &cfg).unwrap(), cfg)
     }
 
+    /// sc-16780: the quantum floor's FFN geometry comes from the loaded GLUMBConv, here at a
+    /// non-production `mlp_ratio = 3` where a fixed `5 * dim` expansion would be wrong.
+    #[test]
+    fn glumbconv_quantum_geometry_uses_loaded_nondefault_expansion() {
+        let cfg = SanaTransformerConfig {
+            num_attention_heads: 2,
+            attention_head_dim: 8,
+            mlp_ratio: 3.0,
+            ..SanaTransformerConfig::sana_1600m()
+        };
+        let inner = cfg.inner_dim();
+        let hidden = 48;
+        let mut map = std::collections::HashMap::new();
+        let zeros = |shape: &[i32]| Array::zeros::<f32>(shape).unwrap();
+        map.insert(
+            "ff.conv_inverted.weight".to_string(),
+            zeros(&[2 * hidden, inner, 1, 1]),
+        );
+        map.insert("ff.conv_inverted.bias".to_string(), zeros(&[2 * hidden]));
+        map.insert(
+            "ff.conv_depth.weight".to_string(),
+            zeros(&[2 * hidden, 1, 3, 3]),
+        );
+        map.insert("ff.conv_depth.bias".to_string(), zeros(&[2 * hidden]));
+        map.insert(
+            "ff.conv_point.weight".to_string(),
+            zeros(&[inner, hidden, 1, 1]),
+        );
+        let ff = GluMbConv::load(&Weights::from_map(map), "ff", &cfg).unwrap();
+        let channels = ff.ff_channels();
+        assert_eq!(channels, 96);
+        assert_ne!(channels, 5 * inner as u64);
+        // The tensor-free configured quantum (rung-4 fallback, iOS primitive probe) prices the
+        // configured expansion and charges the promoted F16 inverted conv `[2·hidden, dim]` f32.
+        let configured = configured_block_quantum(&cfg, 1, 8, 8, 300, AttentionBudget::UNBOUNDED);
+        assert_eq!(configured.ff_channels, channels);
+        assert_eq!(configured.weight_bytes, channels * inner as u64 * 4);
+        assert_eq!(
+            (configured.dim, configured.tokens, configured.caption_tokens),
+            (16, 64, 300)
+        );
+        assert_eq!(configured.cross_heads, cfg.num_cross_attention_heads as u64);
+        assert_eq!(configured.query_rows, 64);
+    }
+
     pub(super) fn tokens(b: i32, n: i32, inner: i32, seed: f32) -> Array {
         Array::from_slice(
             &(0..b * n * inner)
@@ -952,6 +1339,7 @@ mod tests {
     /// so the chunk-count probe is asserted alongside it. Both `qk_norm` variants are covered because
     /// the norm is applied before the head split and therefore before any chunk boundary.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn chunked_cross_attention_is_bit_exact_and_actually_chunks() {
         for qk_norm in [false, true] {
             let (attn, _cfg) = cross_attn(4, 16, qk_norm);
@@ -994,6 +1382,10 @@ mod tests {
                 );
             }
         }
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::chunked_cross_attention_is_bit_exact_and_actually_chunks");
     }
 
     /// **The masked path must narrow nothing.** SANA's caption mask is `[B, 1, 1, M]` — broadcast
@@ -1002,6 +1394,7 @@ mod tests {
     /// swamp the conditioning. The bit-exactness assertion above covers the first; this pins that the
     /// mask is load-bearing at all, so "bit-exact" is not being satisfied by two identical no-ops.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_caption_mask_changes_the_chunked_result() {
         let (attn, _cfg) = cross_attn(4, 16, false);
         let x = tokens(1, 64, 16, 0.1);
@@ -1020,6 +1413,10 @@ mod tests {
             unmasked.as_slice::<f32>(),
             "the caption padding mask must reach the chunked kernel"
         );
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::the_caption_mask_changes_the_chunked_result");
     }
 
     /// **The sibling families' 64 Mi operating point is inert at every advertised SANA geometry.**
@@ -1105,6 +1502,7 @@ mod query_row_boundary_tests {
     /// the epic's standard one: the DOMAIN excludes the degenerate case, and that exclusion is
     /// checked over the whole advertised size range rather than at one convenient point.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_single_query_row_chunk_is_not_bit_exact_and_the_domain_cannot_reach_one() {
         // The exactness boundary, on the smallest shape that exhibits it.
         let (attn, _) = super::tests::cross_attn(4, 16, false);
@@ -1176,5 +1574,391 @@ mod query_row_boundary_tests {
             "the narrowest published chunk width moved; re-measure the exactness boundary before \
              publishing the new budget"
         );
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::query_row_boundary_tests::a_single_query_row_chunk_is_not_bit_exact_and_the_domain_cannot_reach_one");
+    }
+}
+
+/// Measured-peak proofs of the counted trunk quanta ([`crate::quantum::block_bytes`],
+/// [`crate::quantum::entry_bytes`], [`crate::quantum::output_bytes`]) on the MLX CPU device with
+/// Metal trapped, in a child process: REAL modules built from F16 weights (the shipped storage) at
+/// f32 activations (the latent's dtype), at small shapes where activations dominate weights, one
+/// shape per phase that can dominate (self-attention, cross-attention unchunked and rung-3 chunked,
+/// Mix-FFN), base and Sprint (qk-norm).
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod quantum_proofs {
+    use super::*;
+    use crate::quantum::MAX_RATIO;
+    use mlx_gen::ios_quantum::{assert_tracks_measured, measured_peak_bytes};
+    use std::collections::HashMap;
+
+    fn rand(shape: &[i32], seed: u64) -> Array {
+        mlx_rs::random::normal::<f32>(shape, None, None, Some(&mlx_rs::random::key(seed).unwrap()))
+            .unwrap()
+            .multiply(scalar(0.05))
+            .unwrap()
+    }
+
+    pub(crate) struct Builder {
+        pub(crate) map: HashMap<String, Array>,
+        pub(crate) seed: u64,
+        pub(crate) dtype: Dtype,
+    }
+    impl Builder {
+        fn put(&mut self, key: String, shape: &[i32]) {
+            self.seed += 1;
+            let a = rand(shape, self.seed).as_dtype(self.dtype).unwrap();
+            a.eval().unwrap();
+            self.map.insert(key, a);
+        }
+        fn lin(&mut self, key: &str, out: i32, inp: i32, bias: bool) {
+            self.put(format!("{key}.weight"), &[out, inp]);
+            if bias {
+                self.put(format!("{key}.bias"), &[out]);
+            }
+        }
+        pub(crate) fn block(&mut self, p: &str, cfg: &SanaTransformerConfig) {
+            let d = cfg.inner_dim();
+            let hidden = (cfg.mlp_ratio * d as f32) as i32;
+            self.put(format!("{p}.scale_shift_table"), &[6, d]);
+            for leaf in ["to_q", "to_k", "to_v"] {
+                self.lin(&format!("{p}.attn1.{leaf}"), d, d, false);
+                self.lin(&format!("{p}.attn2.{leaf}"), d, d, true);
+            }
+            self.lin(&format!("{p}.attn1.to_out.0"), d, d, true);
+            self.lin(&format!("{p}.attn2.to_out.0"), d, d, true);
+            if cfg.qk_norm {
+                for a in ["attn1", "attn2"] {
+                    self.put(format!("{p}.{a}.norm_q.weight"), &[d]);
+                    self.put(format!("{p}.{a}.norm_k.weight"), &[d]);
+                }
+            }
+            self.put(
+                format!("{p}.ff.conv_inverted.weight"),
+                &[2 * hidden, d, 1, 1],
+            );
+            self.put(format!("{p}.ff.conv_inverted.bias"), &[2 * hidden]);
+            self.put(format!("{p}.ff.conv_depth.weight"), &[2 * hidden, 1, 3, 3]);
+            self.put(format!("{p}.ff.conv_depth.bias"), &[2 * hidden]);
+            self.put(format!("{p}.ff.conv_point.weight"), &[d, hidden, 1, 1]);
+        }
+        pub(crate) fn trunk(&mut self, cfg: &SanaTransformerConfig) {
+            let d = cfg.inner_dim();
+            let p = cfg.patch_size;
+            self.put(
+                "patch_embed.proj.weight".into(),
+                &[d, cfg.in_channels, p, p],
+            );
+            self.put("patch_embed.proj.bias".into(), &[d]);
+            let ts = if cfg.guidance_embeds {
+                self.lin("time_embed.guidance_embedder.linear_1", d, 256, true);
+                self.lin("time_embed.guidance_embedder.linear_2", d, d, true);
+                "time_embed.timestep_embedder"
+            } else {
+                "time_embed.emb.timestep_embedder"
+            };
+            self.lin(&format!("{ts}.linear_1"), d, 256, true);
+            self.lin(&format!("{ts}.linear_2"), d, d, true);
+            self.lin("time_embed.linear", 6 * d, d, true);
+            self.lin("caption_projection.linear_1", d, cfg.caption_channels, true);
+            self.lin("caption_projection.linear_2", d, d, true);
+            self.put("caption_norm.weight".into(), &[d]);
+            self.put("scale_shift_table".into(), &[2, d]);
+            self.lin("proj_out", p * p * cfg.out_channels, d, true);
+        }
+        pub(crate) fn weights(&self) -> Weights {
+            Weights::from_map(self.map.clone())
+        }
+    }
+
+    pub(crate) fn cfg(heads: i32, hd: i32, mlp_ratio: f32, qk_norm: bool) -> SanaTransformerConfig {
+        SanaTransformerConfig {
+            num_attention_heads: heads,
+            attention_head_dim: hd,
+            num_cross_attention_heads: heads,
+            cross_attention_head_dim: hd,
+            num_layers: 0,
+            mlp_ratio,
+            caption_channels: 96,
+            guidance_embeds: qk_norm,
+            qk_norm,
+            ..SanaTransformerConfig::sana_1600m()
+        }
+    }
+
+    /// Runs per measurement; the proofs assert against the WORST (largest) peak. MLX's CPU executor
+    /// releases buffers asynchronously, so one run's peak varies; never throttled (no memory limit).
+    pub(crate) const RUNS: usize = 5;
+
+    /// The worst measured peak of [`RUNS`] unthrottled runs of `run`.
+    pub(crate) fn worst_peak(mut run: impl FnMut() -> Result<Vec<Array>>) -> u64 {
+        (0..RUNS)
+            .map(|_| measured_peak_bytes(&mut run).unwrap())
+            .max()
+            .unwrap()
+    }
+
+    /// Print every proof's ratio, then assert them all (so one run reports every site).
+    fn ratio(proofs: &mut Vec<(String, u64, u64)>, label: &str, formula: u64, measured: u64) {
+        println!(
+            "[{label}] formula {formula} measured {measured} ratio {:.3}",
+            formula as f64 / measured as f64
+        );
+        proofs.push((label.to_string(), formula, measured));
+    }
+
+    #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
+    fn trunk_quanta_track_their_measured_peaks() {
+        const CHILD: &str = "SANA_TRUNK_QUANTUM_PROOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "transformer::quantum_proofs::trunk_quanta_track_their_measured_peaks",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        assert!(crate::test_metal_guard::metal_forbidden());
+        // Two 512-row query chunks: the chunked scores still dominate a narrow-FFN block.
+        let chunked = AttentionBudget::from_score_elements(4 * 512 * 300, true);
+        // (label, mlp_ratio, caption tokens, budget): which phase dominates.
+        let mut proofs = Vec::new();
+        let mut superseded = Vec::new();
+        // (qk_norm, activation-dominated, caption dtype, formula, measured) of every entry proof.
+        let mut entries = Vec::new();
+        // (label, heads, head_dim, mlp_ratio, side, caption tokens, budget). The last case is
+        // WEIGHT-dominated: F16 weights at dim 512 against f32 activations over 2x2 = 4 tokens, so
+        // the block's promoted weight copies (~13 MB) dwarf every activation (~8 KB each) and the
+        // proof sees whether they are live together (summed) or one at a time.
+        let cases = [
+            ("cross", 4, 16, 2.5, 32, 300, AttentionBudget::UNBOUNDED),
+            ("cross rung-3", 4, 16, 0.25, 32, 300, chunked),
+            ("ffn", 4, 16, 2.5, 32, 8, AttentionBudget::UNBOUNDED),
+            (
+                "self-attention",
+                4,
+                16,
+                0.25,
+                32,
+                4,
+                AttentionBudget::UNBOUNDED,
+            ),
+            (
+                "weight copies",
+                8,
+                64,
+                2.5,
+                2,
+                4,
+                AttentionBudget::UNBOUNDED,
+            ),
+        ];
+        for qk_norm in [false, true] {
+            for (name, heads, head_dim, mlp_ratio, side, caption_tokens, budget) in cases {
+                let cfg = cfg(heads, head_dim, mlp_ratio, qk_norm);
+                let d = cfg.inner_dim();
+                let mut b = Builder {
+                    map: HashMap::new(),
+                    seed: 900,
+                    dtype: Dtype::Float16,
+                };
+                b.block("blk", &cfg);
+                let block = SanaBlock::load(&b.weights(), "blk", &cfg).unwrap();
+                let (h, w) = (side, side);
+                let hidden = rand(&[1, h * w, d], 1);
+                let caption = rand(&[1, caption_tokens, d], 2);
+                let mask = Array::ones::<f32>(&[1, caption_tokens]).unwrap();
+                let temb = rand(&[1, 6 * d], 3);
+                mlx_rs::transforms::eval([&hidden, &caption, &mask, &temb]).unwrap();
+                let q = block.quantum(1, h, w, caption_tokens, budget, Dtype::Float32);
+                if name == "cross rung-3" {
+                    assert!(q.query_rows < q.tokens, "the rung-3 case must chunk: {q:?}");
+                }
+                let measured = worst_peak(|| {
+                    Ok(vec![block.forward(
+                        &hidden,
+                        &caption,
+                        Some(&mask),
+                        &temb,
+                        h,
+                        w,
+                        budget,
+                    )?])
+                });
+                ratio(
+                    &mut proofs,
+                    &format!("SANA block {name} qk_norm={qk_norm}"),
+                    crate::quantum::block_bytes(q),
+                    measured,
+                );
+                if name == "weight copies" {
+                    // The superseded pricing (only the largest single copy) under-prices this
+                    // shape: more than one copy is live at once.
+                    let largest = [
+                        &block.ff.conv_inverted.w,
+                        &block.ff.conv_depth.w,
+                        &block.ff.conv_point.w,
+                    ]
+                    .into_iter()
+                    .map(|w| promoted_bytes(w, Dtype::Float32))
+                    .max()
+                    .unwrap();
+                    superseded.push((
+                        format!("SANA block {name} qk_norm={qk_norm}"),
+                        crate::quantum::block_bytes(crate::quantum::SanaBlockQuantum {
+                            weight_bytes: largest,
+                            ..q
+                        }),
+                        measured,
+                    ));
+                }
+            }
+
+            // Entry and output quanta of a whole (blockless) trunk, at a bf16 caption (Gemma's
+            // dtype) and an f32 one; activation-dominated (dim 64, 32x32 latent, 300 caption
+            // tokens) and weight-dominated (dim 512, 2x2 latent, 4 caption tokens: the entry's
+            // promoted projection copies, ~7 MB, dwarf its activations).
+            for (scale, heads, head_dim, side, caption_tokens) in
+                [("", 4, 16, 32, 300), (" weight copies", 8, 64, 2, 4)]
+            {
+                let cfg = cfg(heads, head_dim, 2.5, qk_norm);
+                let mut b = Builder {
+                    map: HashMap::new(),
+                    seed: 1900,
+                    dtype: Dtype::Float16,
+                };
+                b.trunk(&cfg);
+                let trunk = SanaTransformer::from_weights(&b.weights(), cfg.clone()).unwrap();
+                for caption_dtype in [Dtype::Bfloat16, Dtype::Float32] {
+                    let latent = rand(&[1, cfg.in_channels, side, side], 4);
+                    let caption = rand(&[1, caption_tokens, cfg.caption_channels], 5)
+                        .as_dtype(caption_dtype)
+                        .unwrap();
+                    let t = Array::from_slice(&[500.0f32], &[1]);
+                    let g = Array::from_slice(&[0.45f32], &[1]);
+                    mlx_rs::transforms::eval([&latent, &caption, &t, &g]).unwrap();
+                    let guidance = qk_norm.then_some(&g);
+                    let measured = worst_peak(|| {
+                        let (a, b, c, d) = trunk.entry(&latent, &caption, &t, guidance)?;
+                        Ok(vec![a, b, c, d])
+                    });
+                    let entry = trunk.entry_quantum(
+                        latent.shape(),
+                        caption.shape(),
+                        caption_dtype,
+                        Dtype::Float32,
+                    );
+                    let label =
+                        format!("SANA entry{scale} qk_norm={qk_norm} caption={caption_dtype:?}");
+                    entries.push((
+                        qk_norm,
+                        scale.is_empty(),
+                        caption_dtype,
+                        crate::quantum::entry_bytes(entry),
+                        measured,
+                    ));
+                    ratio(
+                        &mut proofs,
+                        &label,
+                        crate::quantum::entry_bytes(entry),
+                        measured,
+                    );
+                    if !scale.is_empty() {
+                        let mut linears = vec![
+                            &trunk.ts_embedder_1,
+                            &trunk.ts_embedder_2,
+                            &trunk.time_linear,
+                            &trunk.caption_proj_1,
+                            &trunk.caption_proj_2,
+                        ];
+                        if let Some((g1, g2)) = &trunk.guidance_embedder {
+                            linears.push(g1);
+                            linears.push(g2);
+                        }
+                        let largest = linears
+                            .into_iter()
+                            .map(|lin| {
+                                promoted_bytes(lin.dense_weight().unwrap().0, Dtype::Float32)
+                            })
+                            .chain([promoted_bytes(&trunk.patch_embed.w, Dtype::Float32)])
+                            .max()
+                            .unwrap();
+                        superseded.push((
+                            label,
+                            crate::quantum::entry_bytes(crate::quantum::SanaEntryQuantum {
+                                weight_bytes: largest,
+                                ..entry
+                            }),
+                            measured,
+                        ));
+                    }
+                    let (hidden, _, _, emb) = trunk.entry(&latent, &caption, &t, guidance).unwrap();
+                    mlx_rs::transforms::eval([&hidden, &emb]).unwrap();
+                    let measured =
+                        worst_peak(|| Ok(vec![trunk.output(&hidden, &emb, 1, side, side)?]));
+                    ratio(
+                        &mut proofs,
+                        &format!("SANA output{scale} qk_norm={qk_norm}"),
+                        crate::quantum::output_bytes(trunk.output_quantum(
+                            1,
+                            side * side,
+                            Dtype::Float32,
+                        )),
+                        measured,
+                    );
+                }
+            }
+        }
+        // The bf16 caption's f32 widening copy is released before gelu's chain (the caption term's
+        // peak): at the chain-dominated shape a bf16 and an f32 caption peak alike, so their
+        // formulas must not differ by more than the measurement does (a page of slack). Pricing
+        // the copy on top of the chain over-counts it (CI: 1.524x).
+        for &(qk, dominated, dtype, formula, measured) in &entries {
+            if !dominated || dtype != Dtype::Bfloat16 {
+                continue;
+            }
+            let &(_, _, _, f32_formula, f32_measured) = entries
+                .iter()
+                .find(|e| e.0 == qk && e.1 && e.2 == Dtype::Float32)
+                .unwrap();
+            assert!(
+                formula.abs_diff(f32_formula) <= measured.abs_diff(f32_measured) + 16384,
+                "qk_norm={qk}: the bf16 caption is priced {formula} vs f32 {f32_formula}, but they \
+                 measure {measured} vs {f32_measured}"
+            );
+        }
+        // Every proof against the same report threshold: the weight-dominated block's ratio
+        // (~1.6-1.8: the CPU's 11-task window retires the attention projections' copies the
+        // device still holds) is reported, not excused.
+        for (label, formula, measured) in proofs {
+            let _ = assert_tracks_measured(&label, formula, measured, MAX_RATIO);
+        }
+        // Discrimination: pricing only the largest copy (the pre-fix model) is BELOW the measured
+        // peak at the weight-dominated shapes.
+        assert_eq!(superseded.len(), 6);
+        for (label, single, measured) in superseded {
+            println!("[{label}] largest-copy-only formula {single} measured {measured}");
+            assert!(
+                single < measured,
+                "{label}: the largest-copy-only pricing ({single} B) must under-price the \
+                 measured peak ({measured} B), or this shape cannot tell the models apart"
+            );
+        }
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED transformer::quantum_proofs::trunk_quanta_track_their_measured_peaks");
+        }
     }
 }

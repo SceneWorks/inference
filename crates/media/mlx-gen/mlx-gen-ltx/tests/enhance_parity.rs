@@ -99,6 +99,8 @@ fn run_smoke(dir: &PathBuf, sampler: SampleParams) -> String {
 fn censored_enhancer_produces_nonempty_cleaned_rewrite() {
     let dir = gemma_dir().expect("set $LTX_GEMMA_DIR or have the HF gemma-3-12b-it-bf16 snapshot");
     run_smoke(&dir, SampleParams::censored(0.7));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED enhance_parity::censored_enhancer_produces_nonempty_cleaned_rewrite");
 }
 
 /// Heavy: exercises the **uncensored** sampler shape (pure temperature, no repetition penalty) on the
@@ -110,4 +112,6 @@ fn censored_enhancer_produces_nonempty_cleaned_rewrite() {
 fn uncensored_sampler_shape_smoke() {
     let dir = gemma_dir().expect("set $LTX_GEMMA_DIR or have the HF gemma-3-12b-it-bf16 snapshot");
     run_smoke(&dir, SampleParams::uncensored(0.7));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED enhance_parity::uncensored_sampler_shape_smoke");
 }

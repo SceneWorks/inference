@@ -18,6 +18,15 @@
 //! ```
 #![cfg(feature = "cuda")]
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 mod common;
 
 use candle_llm::decode::graph::{census_step, cuda_graphs_policy_guard};
@@ -157,6 +166,9 @@ fn ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3() {
     assert_eq!(graphs_mtp.record.cuda_graphs.fallback_reason, None);
     assert_eq!(graphs_mtp.record.report(true).graph_path, "captured");
     assert_eq!(graphs_mtp.record.host_syncs_per_verify_step(), Some(1.0));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3");
 }
 
 /// The census of a real 27B decode step (1 token) and verify step (4 tokens, all-position
@@ -233,4 +245,7 @@ fn qwen38_27b_step_census() {
             None => eprintln!("[cuda_graphs] 27B {name} step: the recording was abandoned"),
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen38_27b_step_census");
 }

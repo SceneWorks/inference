@@ -216,6 +216,7 @@ mod tests {
 }"#;
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn pads_to_max_length() {
         let tmp = tempdir();
         let (cfg, te, tok) = tiny_encoder(tmp.path());
@@ -233,9 +234,13 @@ mod tests {
         assert_eq!(out.dim(0).unwrap(), 1);
         assert_eq!(out.dim(1).unwrap(), cfg.max_length);
         assert_eq!(out.dtype(), DType::F32);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encode::tests::pads_to_max_length");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn empty_prompt_produces_valid_padded_uncond() {
         let tmp = tempdir();
         let (cfg, te, tok) = tiny_encoder(tmp.path());
@@ -246,9 +251,13 @@ mod tests {
         // The uncond embedding is finite (no OOB gather garbage / NaN).
         let flat: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
         assert!(flat.iter().all(|v| v.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encode::tests::empty_prompt_produces_valid_padded_uncond");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn deterministic_for_fixed_prompt() {
         let tmp = tempdir();
         let (cfg, te, tok) = tiny_encoder(tmp.path());
@@ -275,9 +284,15 @@ mod tests {
         let av: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
         let bv: Vec<f32> = b.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(av, bv);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED text_encode::tests::deterministic_for_fixed_prompt"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn out_dtype_bf16_matches_trainer_path() {
         // The trainer loads the encoder at bf16 and upcasts to f32; here we exercise the dtype param
         // directly: an f32 encoder cast to bf16 output yields a bf16, 512-padded tensor.
@@ -287,6 +302,9 @@ mod tests {
             umt5_encode_padded(&tok, &cfg, &te, "hello", &Device::Cpu, DType::BF16, "t").unwrap();
         assert_eq!(out.dtype(), DType::BF16);
         assert_eq!(out.dim(1).unwrap(), cfg.max_length);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encode::tests::out_dtype_bf16_matches_trainer_path");
     }
 
     #[test]

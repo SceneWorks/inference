@@ -121,6 +121,8 @@ fn eva_encoder_matches_torch_f32() {
     println!("id_cond_vit: peak-rel {peak:.3e} mean-rel {mean:.3e} cos {cos:.6}");
     assert!(cos > 0.9995, "id_cond_vit cosine {cos:.6}");
     assert!(mean < 1.2e-2, "id_cond_vit mean-rel {mean:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED eva_clip_parity::eva_encoder_matches_torch_f32");
 }
 
 #[test]
@@ -137,6 +139,8 @@ fn eva_encoder_bf16_floor() {
     let (peak, mean) = rel_errors(&out.id_cond_vit, g.require("id_cond_vit").unwrap());
     println!("bf16 id_cond_vit: cos {cos:.6} peak-rel {peak:.3e} mean-rel {mean:.3e}");
     assert!(cos > 0.99, "bf16 id_cond_vit cosine {cos:.6}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED eva_clip_parity::eva_encoder_bf16_floor");
 }
 
 #[test]

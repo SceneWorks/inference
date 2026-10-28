@@ -301,9 +301,14 @@ fn run_draft_suite(target: CausalLm, draft: CausalLm, tok: Tokenizer) {
 fn draft_speculative_llama() {
     let Some((target, draft, tok)) = load_draft_target("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in draft_speculative_llama; see preceding skip diagnostic",
+        );
         return;
     };
     run_draft_suite(target, draft, tok);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED speculative::draft_speculative_llama");
 }
 
 #[test]
@@ -311,9 +316,14 @@ fn draft_speculative_llama() {
 fn draft_speculative_qwen3() {
     let Some((target, draft, tok)) = load_draft_target("MLX_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set MLX_LLM_QWEN3_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in draft_speculative_qwen3; see preceding skip diagnostic",
+        );
         return;
     };
     run_draft_suite(target, draft, tok);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED speculative::draft_speculative_qwen3");
 }
 
 /// Two models with different vocabularies (SmolLM2 vs Qwen3) must be rejected as a draft/target pair.
@@ -325,6 +335,7 @@ fn draft_speculative_rejects_vocab_mismatch() {
         load_from("MLX_LLM_QWEN3_MODEL"),
     ) else {
         eprintln!("skip: set both MLX_LLM_TEST_MODEL and MLX_LLM_QWEN3_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in draft_speculative_rejects_vocab_mismatch; see preceding skip diagnostic");
         return;
     };
     assert_ne!(a.model.config().vocab_size, b.model.config().vocab_size);
@@ -339,6 +350,10 @@ fn draft_speculative_rejects_vocab_mismatch() {
         &mut |_| {},
     );
     assert!(err.is_err(), "mismatched vocab must error");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED speculative::draft_speculative_rejects_vocab_mismatch"
+    );
 }
 
 #[test]
@@ -346,9 +361,14 @@ fn draft_speculative_rejects_vocab_mismatch() {
 fn prompt_lookup_llama() {
     let Some(fx) = load_from("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in prompt_lookup_llama; see preceding skip diagnostic",
+        );
         return;
     };
     run_suite(fx);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED speculative::prompt_lookup_llama");
 }
 
 #[test]
@@ -356,7 +376,12 @@ fn prompt_lookup_llama() {
 fn prompt_lookup_qwen3() {
     let Some(fx) = load_from("MLX_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set MLX_LLM_QWEN3_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in prompt_lookup_qwen3; see preceding skip diagnostic",
+        );
         return;
     };
     run_suite(fx);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED speculative::prompt_lookup_qwen3");
 }

@@ -189,4 +189,7 @@ fn all_edit_variants_match_torch_and_mlx_oracles() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED edit_parity::all_edit_variants_match_torch_and_mlx_oracles");
 }

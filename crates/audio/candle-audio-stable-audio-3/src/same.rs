@@ -1293,9 +1293,7 @@ impl SameAutoencoder {
                 traces.push(block_trace);
             }
         }
-        x = self
-            .encoder_out
-            .forward(&x.transpose(1, 2)?)?
+        x = __model_proof_output!(self.encoder_out.forward(&x.transpose(1, 2)?))?
             .transpose(1, 2)?;
         x = self.bottleneck.encode(&x)?;
         Ok((x, traces))
@@ -1456,10 +1454,7 @@ impl SameAutoencoder {
         let mut x =
             self.bottleneck
                 .decode_with_noise(latents, training, regularization_noise, None)?;
-        x = self
-            .decoder_in
-            .forward(&x.transpose(1, 2)?)?
-            .transpose(1, 2)?;
+        x = __model_proof_output!(self.decoder_in.forward(&x.transpose(1, 2)?))?.transpose(1, 2)?;
         let mut traces = Vec::new();
         for (index, block) in self.decoder.iter().enumerate() {
             let kind = SameNoiseKind::DecoderTokens { stage: index };

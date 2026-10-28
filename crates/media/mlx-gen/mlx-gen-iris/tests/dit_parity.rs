@@ -24,10 +24,14 @@ fn masks(flat: Vec<i32>, rows: usize) -> Vec<Vec<i32>> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn backbone_and_pixel_head_match_upstream_in_fp32() {
     cpu_process(
         "dit_parity::backbone_and_pixel_head_match_upstream_in_fp32",
-        backbone_and_pixel_head_match_upstream_in_fp32_body,
+        || {
+            backbone_and_pixel_head_match_upstream_in_fp32_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::backbone_and_pixel_head_match_upstream_in_fp32");
+        },
     );
 }
 
@@ -60,10 +64,14 @@ fn backbone_and_pixel_head_match_upstream_in_fp32_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn bf16_compute_stays_within_bf16_distance_of_fp32() {
     cpu_process(
         "dit_parity::bf16_compute_stays_within_bf16_distance_of_fp32",
-        bf16_compute_stays_within_bf16_distance_of_fp32_body,
+        || {
+            bf16_compute_stays_within_bf16_distance_of_fp32_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::bf16_compute_stays_within_bf16_distance_of_fp32");
+        },
     );
 }
 

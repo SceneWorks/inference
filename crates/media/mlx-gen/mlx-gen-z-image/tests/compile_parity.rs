@@ -75,6 +75,7 @@ fn control_cfg() -> ZImageTransformerConfig {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn compiled_glue_bit_identical_to_eager_base() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -107,9 +108,13 @@ fn compiled_glue_bit_identical_to_eager_base() {
          (0.32.0 non-NAX drift is ≤~2.5 ULP; this is larger)",
         COMPILED_GLUE_F32_WHOLE_FWD_ULP_TOL
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED compile_parity::compiled_glue_bit_identical_to_eager_base");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn compiled_glue_bit_identical_to_eager_control() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -145,4 +150,7 @@ fn compiled_glue_bit_identical_to_eager_control() {
          (0.32.0 non-NAX drift is ≤~2.5 ULP; this is larger)",
         COMPILED_GLUE_F32_WHOLE_FWD_ULP_TOL
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED compile_parity::compiled_glue_bit_identical_to_eager_control");
 }

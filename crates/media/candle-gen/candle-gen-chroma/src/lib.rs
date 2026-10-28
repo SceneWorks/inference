@@ -20,6 +20,15 @@
 //! fallback rather than the candle backend silently dropping a control (the false-capability trap,
 //! exactly as the SDXL / FLUX / Z-Image slices did). `backend` is `"candle"` and `mac_only` is `false`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 mod beta;
 mod config;
 mod memory_strategy;

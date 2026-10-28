@@ -50,6 +50,7 @@ fn tiny_vision_config() -> PixtralVisionConfig {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn pixtral_vision_tower_and_projector_match_reference() {
     let w = Weights::from_file(FIXTURE).unwrap();
@@ -87,4 +88,6 @@ fn pixtral_vision_tower_and_projector_match_reference() {
         close(&got, want_proj, 1e-2, 1e-2),
         "Mistral3 projector output diverged from the PyTorch reference"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vision_parity::pixtral_vision_tower_and_projector_match_reference");
 }

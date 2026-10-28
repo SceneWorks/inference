@@ -21,11 +21,9 @@ from scripts.ci import moss_fixture_cpu as shared
 from scripts.ci.moss_cuda_unit import UnitFailure, supervise
 
 LANE = "llm-decoder-fixture"
-DISPATCH_CHOICES = ("all", "windows-cuda", "windows-gpu-diagnostic", "moss-edit-cuda", "moss-edit-metal",
-                    "moss-cuda-unit", "moss-cpu-fixture", "moss-metal-fixture", LANE)
-DISPATCH_INPUT_CHOICES = {"lanes": DISPATCH_CHOICES, "test_suite": ("routine", "exhaustive"),
-                          "synthetic_w4a8": ("none", "cuda", "mlx", "both")}
-IGNORE_REASON = "real model decoder execution; requires explicit manual CI lanes=llm-decoder-fixture"
+DISPATCH_CHOICES = ("moss-cpu-fixture", "moss-metal-fixture", "llm-decoder-fixture", "moss-cuda-unit")
+DISPATCH_INPUT_CHOICES = {"lanes": DISPATCH_CHOICES}
+IGNORE_REASON = "model inference; explicit model-proof workflow"
 CASES = {
     "candle": (
         "models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache",
@@ -40,20 +38,19 @@ COMPILER_SECONDS = 2700
 
 
 def validate_dispatch(event_name: str, event: dict) -> str | None:
-    """Reject unknown/mixed selectors before affected runtime lanes or this job's toolchain."""
+    """Bind the reusable caller's profile or this workflow's direct choice to one lane."""
     if event_name != "workflow_dispatch":
         return None
     inputs = event.get("inputs", {})
-    if not isinstance(inputs, dict) or set(inputs) - DISPATCH_INPUT_CHOICES.keys():
-        raise UnitFailure("select only one lanes choice; unexpected/conflicting dispatch selectors")
-    for name, options in DISPATCH_INPUT_CHOICES.items():
-        value = inputs.get(name, options[0])
-        if not isinstance(value, str) or value not in options:
-            raise UnitFailure(f"select exactly one declared {name} choice; mixed or unknown selectors are forbidden")
-    choice = inputs.get("lanes", "all")
-    if choice not in ("all", "windows-cuda") and (
-            inputs.get("test_suite", "routine") != "routine" or inputs.get("synthetic_w4a8", "none") != "none"):
-        raise UnitFailure("select only one dedicated profile; conflicting dispatch selectors")
+    if not isinstance(inputs, dict):
+        raise UnitFailure("dispatch selectors are malformed")
+    if "lanes" in inputs and "profile" in inputs:
+        raise UnitFailure("select only one fixture profile")
+    choice = inputs.get("lanes", inputs.get("profile"))
+    if not isinstance(choice, str) or choice not in DISPATCH_CHOICES:
+        raise UnitFailure("select exactly one declared fixture profile")
+    if os.environ.get("MOSS_FIXTURE_SELECTED_LANE") != choice:
+        raise UnitFailure("selected reusable-workflow profile differs from dispatch")
     return choice
 
 
@@ -74,7 +71,8 @@ def venue(backend: str) -> dict:
     if (event_name != "workflow_dispatch" or os.environ.get("GITHUB_REPOSITORY") != "SceneWorks/inference"
             or not re.fullmatch(r"[0-9a-f]{40}", head) or os.environ.get("GITHUB_SHA") != head
             or os.environ.get("GITHUB_WORKFLOW_SHA") != head
-            or not workflow.startswith("SceneWorks/inference/.github/workflows/ci.yml@")
+            or not workflow.startswith(("SceneWorks/inference/.github/workflows/moss-model-fixtures.yml@",
+                                            "SceneWorks/inference/.github/workflows/real-weights.yml@"))
             or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
             or os.environ.get("RUNNER_OS") != ("macOS" if backend == "mlx" else "Linux")):
         raise UnitFailure("decoder proof source/workflow/host identity differs from the admitted narrow route")
@@ -83,7 +81,7 @@ def venue(backend: str) -> dict:
     version = subprocess.check_output(["rustc", "--version"], text=True, encoding="utf-8").strip()
     if channel is None or not version.startswith("rustc " + channel[1] + " "):
         raise UnitFailure("decoder proof requires the repository-pinned Rust toolchain")
-    paths = ["Cargo.lock", "rust-toolchain.toml", ".github/workflows/ci.yml",
+    paths = ["Cargo.lock", "rust-toolchain.toml", ".github/workflows/moss-model-fixtures.yml",
              "scripts/ci/llm_decoder_fixture.py", SOURCES[backend]]
     if backend == "mlx":
         paths.append("crates/llm/mlx-llm/src/primitives/kv_cache.rs")

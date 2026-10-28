@@ -35,6 +35,15 @@
 //!
 //! [`StaticKvCache`]: candle_llm::primitives::StaticKvCache
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 mod common;
 
 use candle_llm::decode::{
@@ -151,6 +160,9 @@ fn ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv() {
          {record:?}",
         reference.tokens.len()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv");
 }
 
 #[test]
@@ -248,6 +260,9 @@ fn ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback() 
         addresses.len(),
         preallocated.total_bytes()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ac3_static_kv_device_pointers_are_stable_across_the_fixture_and_a_rollback");
 }
 
 /// **Diagnostic only — not the AC1 gate.** The static path against the pre-S4 `expanded`
@@ -390,6 +405,11 @@ fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
             gap_b / top_ulp
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED teacher_forced_static_vs_attn_kv_logit_parity_report"
+    );
 }
 
 /// sc-24140 (item 2 of the feature-end review): a Qwen3.8-27B request whose speculation is off
@@ -549,4 +569,7 @@ fn provider_off_path_is_token_identical_to_the_reference_loop() {
     assert_eq!(engine.thinking, reference.thinking);
     assert_eq!(engine.usage, reference.usage);
     assert_eq!(engine.finish_reason, reference.finish_reason);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider_off_path_is_token_identical_to_the_reference_loop");
 }

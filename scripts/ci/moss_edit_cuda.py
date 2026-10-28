@@ -22,12 +22,15 @@ FLUX = 'candle-gen-flux2'
 ARMS = (
     ('edit', MOSS, ['transformer::edit::tests::frozen_edit_', '--skip', '_cpu'], {
         'transformer::edit::tests::frozen_edit_oracle_cuda',
-        'transformer::edit::tests::frozen_edit_strict_f32_sampler_cuda'}, set()),
+        'transformer::edit::tests::frozen_edit_strict_f32_sampler_cuda'}, {
+        'transformer::edit::tests::frozen_edit_oracle_cuda',
+        'transformer::edit::tests::frozen_edit_strict_f32_sampler_cuda'}),
     ('layout', MOSS, ['transformer::attention_layout_tests::production_attention_cuda_accepts_ordinary_and_dmd_layouts', '--exact'], {
         'transformer::attention_layout_tests::production_attention_cuda_accepts_ordinary_and_dmd_layouts'}, {
         'transformer::attention_layout_tests::production_attention_cuda_accepts_ordinary_and_dmd_layouts'}),
     ('encoder', FLUX, ['vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda', '--exact'], {
-        'vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda'}, set()),
+        'vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda'}, {
+        'vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda'}),
 )
 MAX_LOG = 16 * 1024 * 1024
 GPU_UUID = 'GPU-e4b79931-7be6-f216-460a-f5405cfafffe'
@@ -214,7 +217,7 @@ def execute(env, out, *, runner=run_owned, source_check=None):
         identity = device_identity(output)
         binary = checked_binary(binaries[package], target)
         gpu_env = dict(env, CUDA_VISIBLE_DEVICES=GPU_UUID, CUDA_DEVICE_ORDER='PCI_BUS_ID', SCENEWORKS_GPU_ID='1', REQUIRE_SM120='1', CARGO_NET_OFFLINE='true')
-        execution_flags = ['--include-ignored'] if expected_ignored else []
+        execution_flags = ['--ignored']
         code, output = runner([binary, *filters, *execution_flags, '--test-threads', '1', '--nocapture'], gpu_env, out, label + '-tests', 600)
         results.append({'arm': label, 'binarySha256': binaries[package]['sha256'], 'expectedTests': sorted(expected), 'declaredIgnoredTests': sorted(expected_ignored),
                         'returncode': code, 'passed': successful_cases(code, output, expected),

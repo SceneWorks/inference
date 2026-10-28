@@ -131,6 +131,9 @@ fn assert_coherent(img: &Image, label: &str) {
 fn base_txt2img_cfg_off_runs() {
     let Some(base) = base_snap() else {
         eprintln!("skipping: no Kolors snapshot (set KOLORS_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in base_txt2img_cfg_off_runs; see preceding skip diagnostic",
+        );
         return;
     };
     let generator = mlx_gen_kolors::provider_registry()
@@ -144,6 +147,8 @@ fn base_txt2img_cfg_off_runs() {
         GenerationOutput::Images(mut v) => assert_coherent(&v.pop().unwrap(), "base txt2img"),
         other => panic!("expected Images, got {other:?}"),
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED cfg_off_smoke::base_txt2img_cfg_off_runs");
 }
 
 /// ControlNet-pose (one conditioned mode) at `guidance = 1.0`: the conditioned denoise assembly must
@@ -153,6 +158,7 @@ fn base_txt2img_cfg_off_runs() {
 fn controlnet_pose_cfg_off_runs() {
     let (Some(base), Some(cn)) = (base_snap(), cn_snap()) else {
         eprintln!("skipping: need KOLORS_SNAPSHOT + KOLORS_CONTROLNET");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in controlnet_pose_cfg_off_runs; see preceding skip diagnostic");
         return;
     };
     let generator = mlx_gen_kolors::provider_registry()
@@ -171,4 +177,6 @@ fn controlnet_pose_cfg_off_runs() {
         GenerationOutput::Images(mut v) => assert_coherent(&v.pop().unwrap(), "controlnet pose"),
         other => panic!("expected Images, got {other:?}"),
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED cfg_off_smoke::controlnet_pose_cfg_off_runs");
 }

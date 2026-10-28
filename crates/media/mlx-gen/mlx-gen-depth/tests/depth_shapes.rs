@@ -8,6 +8,9 @@
 //! fusion stage, and the head's upsample-to-input. The architecture (key names, factor logic, fusion
 //! ordering) is what these lock; numeric fidelity is the real-weight smoke's job.
 
+#[path = "common/model_inference_device.rs"]
+mod model_inference_device;
+
 use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
@@ -131,6 +134,7 @@ fn synth_weights(cfg: &DepthAnythingConfig) -> Weights {
     w
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn backbone_captures_four_states_of_expected_shape() {
     let cfg = tiny_cfg();
@@ -148,8 +152,11 @@ fn backbone_captures_four_states_of_expected_shape() {
             "each captured hidden is [B, grid²+1, hidden] (CLS included)"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED backbone_captures_four_states_of_expected_shape");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn full_forward_produces_input_resolution_depth() {
     let cfg = tiny_cfg();
@@ -173,8 +180,11 @@ fn full_forward_produces_input_resolution_depth() {
         vals.iter().all(|&v| v >= 0.0),
         "relative-depth head is ReLU → non-negative"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED full_forward_produces_input_resolution_depth");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn estimate_control_returns_input_dims_grayscale() {
     let cfg = tiny_cfg();
@@ -193,6 +203,8 @@ fn estimate_control_returns_input_dims_grayscale() {
         out.chunks(3).all(|p| p[0] == p[1] && p[1] == p[2]),
         "depth control image is grayscale broadcast to RGB"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED estimate_control_returns_input_dims_grayscale");
 }
 
 #[test]
@@ -269,4 +281,6 @@ fn real_weight_smoke() {
         &[518, 518],
         "native depth resolution is 518²"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weight_smoke");
 }

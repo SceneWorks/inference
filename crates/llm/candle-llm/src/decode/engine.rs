@@ -1232,6 +1232,7 @@ mod tests {
     // ---- Parity: every proposer, every K, equals the token-at-a-time driver and the reference ----
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn mtp_engine_is_token_identical_to_the_step_driver_for_k_1_to_5() {
         let (_cfg, model, mtp) = text_model_with_mtp();
         let config = greedy(24);
@@ -1279,6 +1280,9 @@ mod tests {
             assert_eq!(run.record.generated_tokens, 24);
         }
         assert!(any_rejection, "the fixture must reject some drafts");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::mtp_engine_is_token_identical_to_the_step_driver_for_k_1_to_5");
     }
 
     // ---- The pre-engine `qwen_mtp` loop's contract, carried over ----
@@ -1393,6 +1397,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn degenerate_fixtures_reproduce_the_pre_engine_loop_counters() {
         let config = GenerationConfig {
             max_new_tokens: 7,
@@ -1435,9 +1440,13 @@ mod tests {
         assert_eq!(accepted.stats.proposed, 4);
         assert_eq!(accepted.stats.accepted, 4);
         assert_eq!(accepted.stats.forwards, 3);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::degenerate_fixtures_reproduce_the_pre_engine_loop_counters");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prompt_last_logits_and_predictor_warmup_match_full_projection() {
         let (target, mtp) = degenerate_fixture(true);
         let prompt = [2, 3, 4];
@@ -1508,9 +1517,13 @@ mod tests {
             via_ids.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             warm_next.flatten_all().unwrap().to_vec1::<f32>().unwrap()
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::prompt_last_logits_and_predictor_warmup_match_full_projection");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn equal_embedding_multimodal_prefill_matches_the_text_engine_run() {
         // The provider's multimodal MTP path: a caller prefill from (here: plain token) embeddings
         // under interleaved M-RoPE with all three position rows equal, the predictor warmed from
@@ -1571,9 +1584,13 @@ mod tests {
             Some(1.0)
         );
         assert_eq!(multimodal.stats, text.stats);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::equal_embedding_multimodal_prefill_matches_the_text_engine_run");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn ngram_engine_is_token_identical_to_the_step_driver() {
         let (_cfg, model) = text_model();
         let config = greedy(24);
@@ -1587,9 +1604,13 @@ mod tests {
             assert_eq!(run.record.host_syncs_per_verify_step(), Some(1.0));
             assert!(run.stats.proposed > 0, "the repetitive prompt must draft");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::ngram_engine_is_token_identical_to_the_step_driver");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn draft_model_engine_is_token_identical_to_the_step_driver() {
         let (_cfg, model) = text_model();
         let config = greedy(20);
@@ -1623,9 +1644,13 @@ mod tests {
             other_accepted > 0 && other_rejected > 0,
             "{other_accepted}/{other_rejected}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::draft_model_engine_is_token_identical_to_the_step_driver");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn no_proposer_is_the_step_driver_and_reports_proposer_none() {
         // `generate_step` is this engine with no proposer (sc-24140): one loop, one record
         // convention — the prefill in `prefill_forwards`, every later forward a verify step.
@@ -1670,6 +1695,9 @@ mod tests {
         );
         assert_eq!(record.host_syncs, 12, "one sync per token");
         assert_eq!(run.record.host_syncs_per_verify_step(), Some(1.0));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::no_proposer_is_the_step_driver_and_reports_proposer_none");
     }
 
     // ---- A caller sampler draws every token of the one loop (E8, sc-24446) ----
@@ -1710,6 +1738,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_caller_sampler_draws_every_token_of_the_token_at_a_time_loop() {
         let (_cfg, model) = text_model();
         let with = |config: &GenerationConfig, sampler: &mut Recording| {
@@ -1762,6 +1791,9 @@ mod tests {
         assert_eq!(stopped.output.tokens, Vec::<i32>::new());
         assert_eq!(stopped.output.finish_reason, FinishReason::StopToken);
         assert_eq!(fixed.histories, vec![PROMPT.len()]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_caller_sampler_draws_every_token_of_the_token_at_a_time_loop");
     }
 
     // ---- Every host decision is recorded; a degenerate row commits its argmax (sc-24140) ----
@@ -1859,6 +1891,7 @@ mod tests {
     // path); stochastic runs add a shaped-distribution copy per draft (`2K + 1`, pinned in
     // `stochastic_runs_are_seed_deterministic_and_bounded`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn penalized_and_constrained_verify_steps_cost_one_sync_per_draft_plus_one() {
         let (_cfg, model, mtp) = text_model_with_mtp();
         let mut config = greedy(16);
@@ -1916,6 +1949,9 @@ mod tests {
             run.record.verify_host_syncs,
             run.stats.verify_steps as u64 + run.stats.proposed as u64
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::penalized_and_constrained_verify_steps_cost_one_sync_per_draft_plus_one");
     }
 
     // ---- Rollback: direct when the cache can, replay otherwise ----
@@ -2126,6 +2162,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_cache_with_per_position_rollback_never_replays_and_a_step_start_cache_replays_once() {
         let model = Ramp {
             vocab: 7,
@@ -2228,12 +2265,16 @@ mod tests {
             assert_eq!(run_qwen.record.target_forwards_per_verify_step(), Some(1.0));
             assert_eq!(run_qwen.record.replay_forwards, 0);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_cache_with_per_position_rollback_never_replays_and_a_step_start_cache_replays_once");
     }
 
     /// sc-24446 (defect A): the engine's own prompt prefill is a prefill — on the hybrid it takes
     /// no per-token Gated DeltaNet step and writes one ring slot per linear layer whatever the
     /// draft depth — so a long prompt's greedy run is the same with and without drafts.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_engine_prefill_rings_only_the_final_state_at_every_draft_depth() {
         use crate::primitives::gated_delta::counters;
         let (cfg, qwen) = text_model();
@@ -2262,6 +2303,9 @@ mod tests {
         .output
         .tokens;
         assert_eq!(lookup, plain);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_engine_prefill_rings_only_the_final_state_at_every_draft_depth");
     }
 
     /// Proposes the ramp continuation after `cur`, `len` drafts wide **regardless of
@@ -2378,6 +2422,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_stochastic_draft_model_hands_over_its_own_q_per_draft() {
         // sc-24436 E1: each stochastic draft's `q` is the draft model's own shaped distribution
         // at its position — the sampler's candidates over a fresh draft prefill of everything
@@ -2440,6 +2485,9 @@ mod tests {
             "a stochastic draft is not a point mass: {:?}",
             proposal.dists
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_stochastic_draft_model_hands_over_its_own_q_per_draft");
     }
 
     #[test]
@@ -2529,6 +2577,7 @@ mod tests {
     // ---- Stochastic: seed-deterministic, and the decision preserves the target distribution ----
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn stochastic_runs_are_seed_deterministic_and_bounded() {
         let (_cfg, model, mtp) = text_model_with_mtp();
         let config = stochastic(20);
@@ -2550,6 +2599,9 @@ mod tests {
         let via_ngram = run(&model, &mut n, &PROMPT, &config, 3);
         assert_eq!(via_ngram.record.proposer, ProposerKind::PromptLookup);
         assert_eq!(via_ngram.record.host_syncs_per_verify_step(), Some(1.0));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::stochastic_runs_are_seed_deterministic_and_bounded");
     }
 
     #[test]
@@ -2621,6 +2673,7 @@ mod tests {
     // ---- The stream contract: stop tokens, caller stop, cancellation, cache consistency ----
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn stop_token_caller_stop_and_cancellation_follow_the_stream_contract() {
         let (_cfg, model, mtp) = text_model_with_mtp();
         let config = greedy(24);
@@ -2715,9 +2768,13 @@ mod tests {
         let none = run(&model, &mut proposer, &PROMPT, &greedy(0), 3);
         assert!(none.output.tokens.is_empty());
         assert_eq!(none.record.host_syncs, 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::stop_token_caller_stop_and_cancellation_follow_the_stream_contract");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cancellation_mid_verify_leaves_a_caller_owned_cache_consistent() {
         // Cancel from inside the commit of a verify step: the engine returns Cancelled and the
         // caller's cache holds no position that is not in the committed history, so the caller
@@ -2782,6 +2839,9 @@ mod tests {
                 assert_eq!(next, full[cancel_at]);
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::cancellation_mid_verify_leaves_a_caller_owned_cache_consistent");
     }
 
     /// A target whose `forward_step` fires a cancel as its `at`-th forward returns — a cancel
@@ -2821,6 +2881,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cancellation_inside_the_verify_forward_commits_nothing_of_that_step() {
         // The old loop checked the flag right after the verify forward; the engine must too: a
         // cancel that lands during a step's verify forward returns Cancelled with only the tokens
@@ -2886,9 +2947,13 @@ mod tests {
             let next = crate::primitives::sampler::argmax_device(&next).unwrap();
             assert_eq!(next, full[n], "at={at}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::cancellation_inside_the_verify_forward_commits_nothing_of_that_step");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prefilled_prompt_equals_the_token_prompt() {
         let (_cfg, model, mtp) = text_model_with_mtp();
         let config = greedy(16);
@@ -2923,6 +2988,9 @@ mod tests {
         assert_eq!(via_prefilled.output.tokens, via_tokens.output.tokens);
         assert_eq!(via_prefilled.stats, via_tokens.stats);
         assert_eq!(via_prefilled.record.kv_cache, via_tokens.record.kv_cache);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::prefilled_prompt_equals_the_token_prompt");
     }
 
     // ---- `auto`'s acceptance monitor (sc-24446) ----
@@ -3241,6 +3309,7 @@ mod tests {
     /// still records where it was demoted — `speculative_demoted_at` agrees with the monitor's
     /// demoting decision.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_demotion_on_the_runs_last_step_is_recorded() {
         let (_cfg, model) = text_model();
         let config = greedy(DEMOTED_AT);
@@ -3261,6 +3330,9 @@ mod tests {
         );
         assert_eq!(run.stats.demoted_at, Some(DEMOTED_AT));
         assert_eq!(report.speculative_demoted_at, Some(DEMOTED_AT as u64));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_demotion_on_the_runs_last_step_is_recorded");
     }
 
     fn assert_forward_accounting(label: &str, run: &SpeculativeRun) {
@@ -3277,6 +3349,7 @@ mod tests {
     /// rest of the run is the engine's ordinary token-at-a-time steps: the reference loop's greedy
     /// tokens, the demotion on the record and its report, the forward accounting intact.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn auto_demotes_a_losing_proposer_to_the_plain_steps() {
         let (_cfg, model) = text_model();
         let config = greedy(40);
@@ -3315,6 +3388,9 @@ mod tests {
         assert_eq!(hidden.len(), run.stats.forwards);
         assert!(hidden[..1 + WINDOW].iter().all(|&h| h), "{hidden:?}");
         assert!(hidden[1 + WINDOW..].iter().all(|&h| !h), "{hidden:?}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::auto_demotes_a_losing_proposer_to_the_plain_steps");
     }
 
     /// E5 (sc-24446): prompt lookup under `auto` is demoted on Candle below its measured
@@ -3323,6 +3399,7 @@ mod tests {
     /// 3 drafts per 16-verify window (0.1875) is demoted at its first window too, one accepting 4
     /// (0.25) is kept to the end.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn auto_demotes_prompt_lookup_on_candle_below_its_threshold() {
         let (_cfg, model) = text_model();
         let vocab = model.vocab_size();
@@ -3359,6 +3436,9 @@ mod tests {
             }
             assert_forward_accounting("partial", &run);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::auto_demotes_prompt_lookup_on_candle_below_its_threshold");
     }
 
     /// sc-24446 (rolling windows): a proposer that pays for its first window and then stops
@@ -3366,6 +3446,7 @@ mod tests {
     /// passed), and not never (the one-shot decision kept it) — and the run's tokens are still the
     /// reference loop's, the steps after the demotion plain.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_late_loser_is_demoted_at_its_first_failing_window() {
         let (_cfg, model) = text_model();
         let config = greedy(96);
@@ -3388,12 +3469,16 @@ mod tests {
         let hidden = logged.hidden.into_inner();
         assert!(hidden[..1 + 2 * WINDOW].iter().all(|&h| h), "{hidden:?}");
         assert!(hidden[1 + 2 * WINDOW..].iter().all(|&h| !h), "{hidden:?}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_late_loser_is_demoted_at_its_first_failing_window");
     }
 
     /// The edges of the demotion: a budget one token past the demotion point (the first plain
     /// step draws the last token), and a stop token drawn by the first step after the demotion —
     /// each the reference loop's output, the demotion recorded.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_first_plain_step_honours_the_budget_and_a_stop_token_it_draws() {
         let (_cfg, model) = text_model();
         let vocab = model.vocab_size();
@@ -3435,12 +3520,16 @@ mod tests {
         assert_eq!(run.output.finish_reason, FinishReason::StopToken);
         assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
         assert_forward_accounting("stop", &run);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_first_plain_step_honours_the_budget_and_a_stop_token_it_draws");
     }
 
     /// A seeded stochastic run across a demotion draws exactly the plain seeded run's tokens: a
     /// proposer that never drafts makes every verify step the ordinary draw from the same seeded
     /// stream, before the demotion and after it.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_seeded_stochastic_run_across_a_demotion_is_the_plain_seeded_run() {
         let (_cfg, model) = text_model();
         let config = stochastic(40);
@@ -3455,10 +3544,14 @@ mod tests {
             Some(DEMOTED_AT as u64)
         );
         assert_eq!(empty.proposals, WINDOW);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_seeded_stochastic_run_across_a_demotion_is_the_plain_seeded_run");
     }
 
     /// A proposer at or above its break-even is never demoted under `auto`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn auto_keeps_a_proposer_that_pays_for_itself() {
         let (_cfg, model) = text_model();
         let config = greedy(112);
@@ -3479,11 +3572,15 @@ mod tests {
         );
         // Every step proposes but one the budget clamped to no drafts.
         assert!(right.proposals + 1 >= run.stats.verify_steps);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::auto_keeps_a_proposer_that_pays_for_itself");
     }
 
     /// An explicit `{proposer, depth}` is the caller's choice: no monitor, so a losing proposer
     /// runs to the end — every step but the budget-clamped last proposes — and nothing demotes.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn an_explicit_proposer_request_is_never_demoted() {
         use core_llm::{Speculative, SpeculativeProposer};
         let (_cfg, model) = text_model();
@@ -3500,6 +3597,9 @@ mod tests {
         assert_eq!(run.output.tokens, expected);
         assert_eq!(run.record.speculative_demoted_at, None);
         assert_eq!(wrong.proposals, run.stats.verify_steps - 1);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::an_explicit_proposer_request_is_never_demoted");
     }
 
     /// The plain probe's length: its steps run without a proposal before the first window.
@@ -3512,6 +3612,7 @@ mod tests {
     /// probe — no proposal, the proposer caught up on the probed tokens before its first proposal
     /// — and both decode the reference loop's tokens; the report carries the decision's inputs.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_timed_auto_weighs_the_requests_own_verify_cost() {
         let (_cfg, model) = text_model();
         let vocab = model.vocab_size();
@@ -3566,6 +3667,9 @@ mod tests {
         assert!(d.gain().unwrap() > 1.4, "{d:?}");
         assert_eq!(cheap.caught_up.len(), 1);
         assert!(cheap.proposals + 1 >= run.stats.verify_steps - PROBE);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_timed_auto_weighs_the_requests_own_verify_cost");
     }
 
     /// The timed monitor on Candle prompt lookup: a lookup accepting nothing is demoted on its
@@ -3574,6 +3678,7 @@ mod tests {
     /// static 0.21 would have demoted both) — and, being history-only, needs no hidden rows to
     /// catch up.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_timed_lookup_is_judged_on_its_measured_cost() {
         let (_cfg, model) = text_model();
         let vocab = model.vocab_size();
@@ -3599,6 +3704,9 @@ mod tests {
                 vec![(expected[..PROBE].to_vec(), None, PROMPT.len() as i32)]
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_timed_lookup_is_judged_on_its_measured_cost");
     }
 
     /// sc-24446 (cuda-campaign-b4): on the deterministic decode clock a clear loser — measured
@@ -3610,6 +3718,7 @@ mod tests {
     /// early — at its first window's end. A winner
     /// (Qwen3.8-like: mal 1.0 at r = 1.71, gain 1.17) is never demoted. The reference loop's tokens throughout.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never() {
         let (_cfg, model) = text_model();
         let vocab = model.vocab_size();
@@ -3663,12 +3772,16 @@ mod tests {
             (d.basis, d.demoted),
             (core_llm::DemotionBasis::Measured, false)
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never");
     }
 
     /// The real MTP head through a timed run: the plain probe, the head's catch-up on the probed
     /// tokens, then its proposals — the reference loop's tokens throughout, and (the random
     /// head never pays, its verify dear) a measured demotion.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_timed_mtp_head_catches_up_after_the_probe() {
         let (_cfg, model, mtp) = text_model_with_mtp();
         let config = greedy(48);
@@ -3690,12 +3803,16 @@ mod tests {
             core_llm::DemotionBasis::Measured
         );
         assert_forward_accounting("mtp timed", &run);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_timed_mtp_head_catches_up_after_the_probe");
     }
 
     /// `MtpProposer::catch_up` leaves the head where proposing on each probed token would have
     /// (its draft step for `cur`, then a commit without accepted drafts): the next draft step's
     /// logits match.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them() {
         let (_cfg, model, mtp) = text_model_with_mtp();
         let device = model.device().clone();
@@ -3778,11 +3895,15 @@ mod tests {
             gap > 1e-3,
             "fixture premise: the probed tokens change the head's state"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them");
     }
 
     /// The MTP head (a proposer that wants the target's hidden rows) demotes the same way: the
     /// rest of the run is plain steps with the reference loop's greedy tokens.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_demoted_mtp_head_decodes_the_rest_plainly() {
         let (_cfg, model, mtp) = text_model_with_mtp();
         let config = greedy(40);
@@ -3797,5 +3918,8 @@ mod tests {
         assert_eq!(run.record.speculative_demoted_at, Some(DEMOTED_AT as u64));
         assert_eq!(run.record.proposer, ProposerKind::Mtp);
         assert_forward_accounting("mtp", &run);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_demoted_mtp_head_decodes_the_rest_plainly");
     }
 }

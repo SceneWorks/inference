@@ -258,6 +258,8 @@ fn the_three_published_alphas_fold_at_one_and_one_sixteenth() {
         "…and it must NOT equal the alpha = rank fallback (which would give 1.0), got \
          {vs_rank_fallback}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo_lora::the_three_published_alphas_fold_at_one_and_one_sixteenth");
 }
 
 /// **The fold scalar is dtype-matched — and only an assertion on the INSTALLED adapter can see it.**
@@ -336,6 +338,10 @@ fn the_user_strength_multiplies_the_alpha_fold() {
     );
     let off = max_abs(&probe_residual(&cfg, &a8, 0.0, &x));
     assert_eq!(off, 0.0, "a scale-0 adapter must be exactly inert");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED turbo_lora::the_user_strength_multiplies_the_alpha_fold"
+    );
 }
 
 /// **Coverage.** Every module of a published-shaped file resolves, on both stacks — including the
@@ -706,6 +712,8 @@ fn a_peft_blob_rank_disagreeing_with_the_factors_is_refused() {
         "…and the blob alpha must WIN over DEFAULT_LORA_ALPHA, which would have given 1.0; got \
          {ratio}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo_lora::a_peft_blob_rank_disagreeing_with_the_factors_is_refused");
 }
 
 // ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
@@ -1177,6 +1185,7 @@ fn assert_twin_equivalence(spelling: AlphaSpelling) {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
 }
 
 /// One `#[test]` per alpha spelling, for both the residual gate and the emitted-alpha gate.
@@ -1826,6 +1835,10 @@ fn the_real_turbo_lora_folds_onto_the_real_dit() {
     assert_eq!(resolve_alpha(&w).unwrap(), 8.0);
     assert_eq!(alpha_rank_fold(8.0, 128.0), 0.0625);
     println!("[turbo e2e] EXAMINED the real DiT at fold 0.0625");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED turbo_lora::the_real_turbo_lora_folds_onto_the_real_dit"
+    );
 }
 
 // ─── sc-18729: the measured render ─────────────────────────────────────────────────────────────
@@ -2567,7 +2580,15 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
 
     let dit_dir = trainer_dit_path();
     let config_path = dit_dir.join("config.json");
-    let config_text = std::fs::read_to_string(&config_path)
+    let config_text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&config_path),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/turbo_lora.rs::manual_metal_exact_h3_trainer_runtime_receipt::std::fs::read_to_string@111922",
+Configuration,
+&config_path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .unwrap_or_else(|error| panic!("read {}: {error}", config_path.display()));
     let config_sha256 = sha256_of(&config_path);
     let cfg = MiniMaxH3DitConfig::from_diffusers_json(&config_text)
@@ -2721,5 +2742,9 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
         "SC21028_TRAINER_RUNTIME_CORRECTNESS backend=mlx probe={} \
          observed_vs_independent_expected_relative_max_abs={:.6e} limit={:.6e}",
         probe, residual_correctness_rel_max, SC21028_RUNTIME_RESIDUAL_REL_MAX
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED turbo_lora::manual_metal_exact_h3_trainer_runtime_receipt"
     );
 }

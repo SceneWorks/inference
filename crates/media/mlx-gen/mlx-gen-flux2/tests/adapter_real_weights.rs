@@ -180,12 +180,20 @@ fn assert_matches_golden(kind: &str, my_kind: AdapterKind) {
 #[ignore = "needs real FLUX.2-klein-9b weights + adapter golden"]
 fn lora_render_matches_fork_golden() {
     assert_matches_golden("lora", AdapterKind::Lora);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED adapter_real_weights::lora_render_matches_fork_golden"
+    );
 }
 
 #[test]
 #[ignore = "needs real FLUX.2-klein-9b weights + adapter golden"]
 fn lokr_render_matches_fork_golden() {
     assert_matches_golden("lokr", AdapterKind::Lokr);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED adapter_real_weights::lokr_render_matches_fork_golden"
+    );
 }
 
 /// (3) A scale-0 adapter is a bit-exact no-op vs the no-adapter render.
@@ -200,6 +208,8 @@ fn scale_zero_adapter_is_noop() {
     let differ = base.iter().zip(&zero).filter(|(a, b)| a != b).count();
     println!("flux2 scale-0 adapter no-op: {differ} px differ from the no-adapter render");
     assert_eq!(differ, 0, "scale-0 adapter must be a bit-exact no-op");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapter_real_weights::scale_zero_adapter_is_noop");
 }
 
 /// The single installed LoRA's `(a, b)` arrays, or panic.

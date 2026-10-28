@@ -873,6 +873,7 @@ fn tiny_weights_packed(cfg: &NaDiffusionDecoderConfig) -> Weights {
 ///
 /// This is the load path sc-18775's q4/q8 tiers depend on: before it existed the whole component was
 /// emitted dense under a `no-mlx-port` exemption, and the tier's 834 MB stayed bf16 inside a "q4".
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_packed_decoder_binds_its_triples_and_tracks_the_dense_one() {
     let cfg = packable_config();
@@ -906,6 +907,8 @@ fn a_packed_decoder_binds_its_triples_and_tracks_the_dense_one() {
         "8-bit quantization moved the decode by {delta} against a mean magnitude of {scale} — that \
          is a mis-bound projection, not quantization error"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_packed_decoder_binds_its_triples_and_tracks_the_dense_one");
 }
 
 /// Declaring the file dense while it carries `.scales` is refused, by name.
@@ -962,6 +965,7 @@ fn a_width_disagreement_between_config_and_weights_is_a_load_error() {
     );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn decode_returns_the_pixel_geometry_the_latent_implies() {
     let (decoder, cfg) = tiny_decoder();
@@ -981,8 +985,11 @@ fn decode_returns_the_pixel_geometry_the_latent_implies() {
     );
     assert_eq!(out.shape(), &[1, 3, 17, 4 * scale[1], 4 * scale[2]]);
     assert!(max_abs(&out).is_finite());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::decode_returns_the_pixel_geometry_the_latent_implies");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_mis_shaped_noise_canvas_is_refused_with_the_shape_it_wanted() {
     let (decoder, cfg) = tiny_decoder();
@@ -990,8 +997,11 @@ fn a_mis_shaped_noise_canvas_is_refused_with_the_shape_it_wanted() {
     let wrong = probe(&[1, 3, 16, 48, 48], 43, 1.0);
     let err = decoder.decode(&latent, &wrong).unwrap_err().to_string();
     assert!(err.contains("noise_shape"), "got: {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_mis_shaped_noise_canvas_is_refused_with_the_shape_it_wanted");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_below_floor_latent_is_padded_up_and_cropped_back() {
     // The latent floor is 3x3x3 for this ladder; a 1x2x2 latent must still decode, at the geometry
@@ -1009,8 +1019,11 @@ fn a_below_floor_latent_is_padded_up_and_cropped_back() {
     let scale = cfg.pixel_scale();
     assert_eq!(out.shape(), &[1, 3, 1, 2 * scale[1], 2 * scale[2]]);
     assert!(max_abs(&out).is_finite());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_below_floor_latent_is_padded_up_and_cropped_back");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn seeded_decode_is_reproducible() {
     let (decoder, cfg) = tiny_decoder();
@@ -1023,8 +1036,11 @@ fn seeded_decode_is_reproducible() {
         max_abs(&subtract(&a, &c).unwrap()) > 1e-6,
         "a new seed must move the noise"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::seeded_decode_is_reproducible");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn an_under_haloed_tiling_is_refused_rather_than_smeared() {
     let (decoder, cfg) = tiny_decoder();
@@ -1084,8 +1100,11 @@ fn an_under_haloed_tiling_is_refused_rather_than_smeared() {
         Ok(_) => panic!("a split axis' overlap must be smaller than its tile"),
     };
     assert!(err.contains("axis 2"), "got: {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::an_under_haloed_tiling_is_refused_rather_than_smeared");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_single_covering_tile_is_bit_identical_to_an_untiled_decode() {
     // The tiled driver must be the untiled one plus a blend — not a second implementation. With a
@@ -1109,8 +1128,11 @@ fn a_single_covering_tile_is_bit_identical_to_an_untiled_decode() {
     assert_eq!(tiled.shape(), untiled.shape());
     let delta = max_abs(&subtract(&tiled, &untiled).unwrap());
     assert!(delta < 1e-5, "single-tile decode differs by {delta:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_single_covering_tile_is_bit_identical_to_an_untiled_decode");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_tiled_interior_matches_the_untiled_decode() {
     // Split the width axis only, then compare the region of the first tile whose whole stage-4/5
@@ -1165,8 +1187,11 @@ fn a_tiled_interior_matches_the_untiled_decode() {
         (0.5..2.0).contains(&ratio),
         "tiled output magnitude drifted by {ratio:.3}, which is what an unnormalised blend does"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_tiled_interior_matches_the_untiled_decode");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_heavy_overlap_tiling_is_still_normalised_to_the_right_level() {
     // With `2 * overlap > tile` the trapezoid ramps meet inside a tile and multiply, so the masks
@@ -1204,6 +1229,8 @@ fn a_heavy_overlap_tiling_is_still_normalised_to_the_right_level() {
         "heavy-overlap blend rescaled the picture by {ratio:.4} — the weight normalisation is not \
          doing its job"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_heavy_overlap_tiling_is_still_normalised_to_the_right_level");
 }
 
 #[test]
@@ -1240,6 +1267,7 @@ fn the_blend_weight_profile_sums_to_one_everywhere() {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_euler_loop_runs_for_a_multi_step_velocity_checkpoint() {
     // The released checkpoint is single-step x0, but the sampler is not hardcoded to it: a `v`
@@ -1272,6 +1300,8 @@ fn the_euler_loop_runs_for_a_multi_step_velocity_checkpoint() {
     let x0 = NaDiffusionDecoder::from_weights(&w, &x0_cfg, None).unwrap();
     let other = x0.decode(&latent, &noise).unwrap();
     assert!(max_abs(&subtract(&out, &other).unwrap()) > 1e-6);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::the_euler_loop_runs_for_a_multi_step_velocity_checkpoint");
 }
 
 #[test]
@@ -1280,6 +1310,7 @@ fn the_single_step_schedule_is_one_timestep_at_one() {
     assert_eq!(decoder.timesteps(), vec![1.0]);
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_timestep_embedding_is_a_function_of_the_scaled_timestep() {
     // `timestep_scale_multiplier` is 1000 in the released config; folding it in at the wrong place
@@ -1309,9 +1340,12 @@ fn the_timestep_embedding_is_a_function_of_the_scaled_timestep() {
         .unwrap(),
     );
     assert_eq!(delta, 0.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::the_timestep_embedding_is_a_function_of_the_scaled_timestep");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn swiglu_token_tiling_changes_nothing() {
     // The hidden buffer is tiled to bound peak memory; each token is independent, so the tiled and
     // untiled results must be identical, not merely close.
@@ -1329,6 +1363,10 @@ fn swiglu_token_tiling_changes_nothing() {
     assert_eq!(tiled.shape(), &[1, tokens, dim]);
     let delta = max_abs(&subtract(tiled.reshape(&[tokens, dim]).unwrap(), &whole).unwrap());
     assert_eq!(delta, 0.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::swiglu_token_tiling_changes_nothing"
+    );
 }
 
 #[test]
@@ -1352,6 +1390,7 @@ fn the_per_channel_statistics_are_undone_before_the_first_projection() {
     assert!(max_abs(&subtract(&got, &identity).unwrap()) > 1e-3);
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_pixel_shuffle_upsample_drops_the_duplicate_frame_only_at_the_origin() {
     let w = {
@@ -1379,6 +1418,8 @@ fn the_pixel_shuffle_upsample_drops_the_duplicate_frame_only_at_the_origin() {
     };
     let spatial = PixelShuffleUpsample::load(&w2, "up", [1, 2, 2], None).unwrap();
     assert_eq!(spatial.forward(&x, true).unwrap().shape(), &[1, 3, 4, 4, 4]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::the_pixel_shuffle_upsample_drops_the_duplicate_frame_only_at_the_origin");
 }
 
 #[test]

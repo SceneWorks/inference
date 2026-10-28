@@ -1,0 +1,149 @@
+name: iOS simulator SANA runtime boundary
+
+# E8: never called by PR/push CI. The iOS simulator cannot execute MLX Metal inference;
+# this witnesses build/install/launch and an explicit unsupported-runtime response only.
+# CI_IMPACT: one separately dispatched no-model job, no added PR/push cost; cold iOS SDK compile
+# cost is host dependent (unknown). Pinned job-local XcodeGen adds
+# 4,286,070 download bytes plus a version probe; no Homebrew/global install. Timeout: 240 minutes.
+on:
+  workflow_call:
+    inputs:
+      simulator:
+        required: true
+        type: string
+      snapshot:
+        required: false
+        type: string
+        default: ''
+      source_sha:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      simulator:
+        description: Exact iPhone simulator model name available on whichever Mac runner claims the job
+        required: true
+        type: string
+      snapshot:
+        description: Legacy carrier field; ignored by the model-free runtime-boundary check
+        required: false
+        type: string
+      source_sha:
+        description: Exact 40-hex source SHA bound to this validation
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-boundary:
+    name: Build, install and launch with explicit unsupported MLX runtime
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, macOS, ARM64, nax]
+    timeout-minutes: 240
+    env:
+      SIMULATOR_SELECTOR: ${{ inputs.simulator }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      SMOKE_BUNDLE_ID: com.michaeltrefry.SceneWorksSmokeSim${{ github.run_id }}a${{ github.run_attempt }}
+      CARGO_BUILD_JOBS: '4'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_STRIP: none
+      CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Require an allowed Mac and exact simulator dispatch identity
+        shell: bash
+        run: |
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && ( "$RUNNER_NAME" == nax-macos || "$RUNNER_NAME" == nax-macos-2 ) && "$RUNNER_OS" == macOS && "$RUNNER_ARCH" == ARM64 ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+          [[ "$SIMULATOR_SELECTOR" == iPhone\ * ]]
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        id: checkout
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Provision the pinned job-local project generator after checkout
+        shell: bash
+        run: |
+          command -v python3.12
+          python3.12 -I scripts/ci/provision_simulator_xcodegen.py
+      - name: Select an available iPhone runtime on the claiming runner
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ios-simulator-sana"
+          python3.12 -I scripts/ci/ios_simulator_sana_device.py select \
+            --selector "$SIMULATOR_SELECTOR" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --receipt "$RUNNER_TEMP/ios-simulator-sana/selected-template.json"
+      - name: Verify selected native host SDK and linker before cross build
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ios-simulator-sana"
+          HOST_LLD="$(rustc --print sysroot)/lib/rustlib/aarch64-apple-darwin/bin/rust-lld"
+          test -x "$HOST_LLD"
+          export HOST_LLD
+          python3.12 -I - "$RUNNER_TEMP/ios-simulator-sana/sdk-preflight.json" <<'PY'
+          import json, os, pathlib, sys
+          sys.path.insert(0, str(pathlib.Path.cwd()))
+          from scripts.ci.native_darwin_sdk import select_sdk
+          linker = os.environ['HOST_LLD']
+          # Cargo --target keeps host proc-macro units separate: host RUSTFLAGS do not reach them.
+          # The target-specific LINKER setting does; do not set global RUSTFLAGS on the iOS target.
+          flags = ['-C', 'linker=' + linker]
+          probe_env = dict(os.environ, CARGO_ENCODED_RUSTFLAGS='\x1f'.join(flags))
+          sdk, receipt = select_sdk(['rustc'], probe_env, root=pathlib.Path.cwd())
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(receipt, sort_keys=True) + '\n')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+              output.write('SDKROOT=' + sdk + '\n')
+              output.write('CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=' + linker + '\n')
+          print('selected native host SDK:', sdk)
+          PY
+      - name: Create a disposable simulator from the selected iPhone template
+        shell: bash
+        run: |
+          python3.12 -I scripts/ci/ios_simulator_sana_device.py create \
+            --selected "$RUNNER_TEMP/ios-simulator-sana/selected-template.json" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --receipt "$RUNNER_TEMP/ios-simulator-sana/owned-simulator.json"
+      - name: Build and install simulator-only host without launching
+        shell: bash
+        run: |
+          rustup target add aarch64-apple-ios-sim
+          scripts/ios/run_smoke.sh --simulator "$SIMULATOR_UDID" --simulator-runtime-boundary --install-only
+      - name: Verify one supervised unsupported-runtime response
+        shell: bash
+        run: |
+          python3.12 -I scripts/ci/ios_simulator_sana.py \
+            --simulator "$SIMULATOR_UDID" --bundle-id "$SMOKE_BUNDLE_ID" \
+            --source-sha "$SOURCE_SHA" \
+            --owned-receipt "$RUNNER_TEMP/ios-simulator-sana/owned-simulator.json" \
+            --policy scripts/ci/ios-simulator-sana-policy.json \
+            --output "$RUNNER_TEMP/ios-simulator-sana/result"
+      - name: Retire only this workflow attempt's disposable simulator
+        if: always()
+        shell: bash
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ios-simulator-sana"
+          receipt="$RUNNER_TEMP/ios-simulator-sana/owned-simulator.json"
+          output="$RUNNER_TEMP/ios-simulator-sana/simulator-cleanup.json"
+          if [[ ! -e "$receipt" ]]; then
+            printf '%s\n' '{"status":"no-owned-simulator-receipt","resource_cleanup_performed":false,"model_validation":"not-established"}' > "$output"
+          elif [[ "$CHECKOUT_OUTCOME" != success ]]; then
+            printf '%s\n' '{"status":"cleanup-refused","reason":"checkout-unavailable","resource_cleanup_performed":false,"model_validation":"not-established"}' > "$output"
+            exit 1
+          else
+            python3.12 -I scripts/ci/ios_simulator_sana_device.py cleanup \
+              --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+              --receipt "$receipt" --output "$output"
+          fi
+      - name: Upload runtime-boundary result and refusal logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-simulator-sana-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/ios-simulator-sana
+          if-no-files-found: error

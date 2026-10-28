@@ -461,6 +461,7 @@ mod hidden_state_pinning_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_returns_exactly_num_layers_plus_one_hidden_states() {
         let dev = device();
         for num_layers in [1usize, 2, 3, 5] {
@@ -478,9 +479,13 @@ mod hidden_state_pinning_tests {
                  smoke render"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma::hidden_state_pinning_tests::forward_returns_exactly_num_layers_plus_one_hidden_states");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn hidden_state_zero_is_exactly_the_scaled_embedding_lookup() {
         let dev = device();
         let cfg = tiny_cfg(2);
@@ -500,9 +505,13 @@ mod hidden_state_pinning_tests {
             max_abs_diff(&hiddens[0], &want) < 5e-3,
             "hidden_states[0] must be exactly the scaled embedding lookup (index 0 pinning)"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma::hidden_state_pinning_tests::hidden_state_zero_is_exactly_the_scaled_embedding_lookup");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn only_the_last_hidden_state_carries_the_final_norm() {
         // Two models identical except `norm.weight` (the FINAL norm, applied once after the last
         // layer). If it's wired to exactly one slot (the last), perturbing it must change
@@ -537,5 +546,8 @@ mod hidden_state_pinning_tests {
             max_abs_diff(&hiddens_a[last], &hiddens_b[last]) > 1e-3,
             "perturbing the FINAL norm must change the LAST hidden state (the final-norm slot)"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma::hidden_state_pinning_tests::only_the_last_hidden_state_carries_the_final_norm");
     }
 }

@@ -353,4 +353,8 @@ fn real_training_memory_probe() {
         res.adapter_path.display()
     );
     assert!(res.final_loss.is_finite());
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_memory_probe::real_training_memory_probe");
 }

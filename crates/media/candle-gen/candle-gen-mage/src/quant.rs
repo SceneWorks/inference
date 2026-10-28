@@ -176,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q8_is_closer_than_q4_and_both_are_nonconstant() {
         let input = Tensor::from_vec(
             (0..3 * 32)
@@ -210,6 +211,9 @@ mod tests {
         let q8 = error(Quant::Q8);
         let q4 = error(Quant::Q4);
         assert!(q8 < q4, "q8 error {q8} must be below q4 error {q4}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::q8_is_closer_than_q4_and_both_are_nonconstant");
     }
 
     #[test]

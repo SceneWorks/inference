@@ -78,6 +78,7 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
     max_diff / peak
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn t2i_denoise_matches_reference() {
     let (w, case) = crate::compact_fixture::load(CASE_FIXTURE);
@@ -128,6 +129,8 @@ fn t2i_denoise_matches_reference() {
         rel < 2e-2,
         "T2I final-frame peak-rel {rel:.3e} exceeds 2e-2"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2i_parity::t2i_denoise_matches_reference");
 }
 
 /// sc-22738 — the T2I denoise loop brackets its steps with the two lifecycle boundaries the
@@ -136,6 +139,7 @@ fn t2i_denoise_matches_reference() {
 /// step. Driven through the production reporter on the synthetic fixture so the exact ordered
 /// stream is pinned: deleting either emit in `T2iModel::denoise`, or moving one across the loop,
 /// changes this sequence.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn t2i_denoise_emits_its_phase_boundaries_around_the_loop() {
     use mlx_gen::gen_core::{LoadPhase, Progress};
@@ -192,4 +196,6 @@ fn t2i_denoise_emits_its_phase_boundaries_around_the_loop() {
         events, expected,
         "the denoise phase opens before step 1 and the decode phase after step {num_steps}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2i_parity::t2i_denoise_emits_its_phase_boundaries_around_the_loop");
 }

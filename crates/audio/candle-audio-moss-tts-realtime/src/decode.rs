@@ -509,6 +509,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn ar_loop_emits_inrange_rvq_frames_and_is_deterministic() {
         let dec = tiny_decoder();
         let rvq = dec.cfg.rvq;
@@ -541,9 +542,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(a.frames, b.frames, "greedy AR decode is reproducible");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::ar_loop_emits_inrange_rvq_frames_and_is_deterministic");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cancel_stops_the_ar_loop_promptly() {
         let dec = tiny_decoder();
         let rvq = dec.cfg.rvq;
@@ -564,6 +569,11 @@ mod tests {
             seen.get() <= 3,
             "cancel is honored within a frame, not after the 100-frame budget"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::cancel_stops_the_ar_loop_promptly"
+        );
     }
 
     /// The streamed text tokens (the delay-pattern beyond the prefill, sc-13570) must actually be
@@ -571,6 +581,7 @@ mod tests {
     /// frames passed to `Backbone::step`, rather than hoping different conditioning happens to cross
     /// a discrete sampling boundary on every CPU implementation.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_text_is_consumed_by_the_ar_loop() {
         let dec = tiny_decoder();
         let rvq = dec.cfg.rvq;
@@ -641,6 +652,9 @@ mod tests {
             with_stream.frames, again.frames,
             "seeded AR decode over a streamed prompt is reproducible"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::streamed_text_is_consumed_by_the_ar_loop");
     }
 
     /// A minimal WordLevel tokenizer where `<|audio_pad|>` is an added special token with id 7 (= the

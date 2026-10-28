@@ -244,3 +244,6 @@ mod q4_diagnostic;
 #[cfg(test)]
 #[path = "../tests/lora_real_weights.rs"]
 mod q4_real_weights_support;
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

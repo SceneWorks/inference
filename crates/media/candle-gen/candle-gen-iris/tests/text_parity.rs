@@ -49,6 +49,7 @@ fn template_pieces_tokenize_like_upstream() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn windows_masks_and_layer_states_match_upstream() {
     // The build's device: on the CUDA lane the tower runs the release's bf16 on the real kernels.
     let te = encoder_on(&device());
@@ -92,9 +93,13 @@ fn windows_masks_and_layer_states_match_upstream() {
             assert!(host_f32(&tail).iter().all(|v| *v == 0.0), "{name}: pads");
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED text_parity::windows_masks_and_layer_states_match_upstream");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn empty_negative_prompt_is_the_training_null() {
     let te = encoder();
     let golden = fixture("iris_text_golden.safetensors");
@@ -105,6 +110,11 @@ fn empty_negative_prompt_is_the_training_null() {
         &null.states.squeeze(0).unwrap(),
         golden.require("null/embeddings"),
         4e-2,
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED text_parity::empty_negative_prompt_is_the_training_null"
     );
 }
 

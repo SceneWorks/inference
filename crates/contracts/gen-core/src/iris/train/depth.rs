@@ -1149,14 +1149,19 @@ pub struct DepthSample {
 /// and its validity (see the module docs).
 pub fn load_depth_sample(item: &TrainingItem) -> Result<DepthSample> {
     let spec = DepthItemSpec::from_item(item)?;
-    let img = image::open(&item.image_path)
-        .map_err(|e| {
-            Error::Msg(format!(
-                "iris depth training: decode {}: {e}",
-                item.image_path.display()
-            ))
-        })?
-        .to_rgb8();
+    let img = crate::__model_input_result!(
+        image::open(&item.image_path),
+        "crates/contracts/gen-core/src/iris/train/depth.rs::load_depth_sample/image::open",
+        Reference,
+        &[&item.image_path]
+    )
+    .map_err(|e| {
+        Error::Msg(format!(
+            "iris depth training: decode {}: {e}",
+            item.image_path.display()
+        ))
+    })?
+    .to_rgb8();
     let (width, height) = (img.width() as usize, img.height() as usize);
     let plane = read_plane(&spec.path)?;
     let same = |p: &Plane, what: &str, path: &Path| -> Result<()> {

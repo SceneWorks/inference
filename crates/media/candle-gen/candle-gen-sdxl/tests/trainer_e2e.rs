@@ -235,6 +235,9 @@ fn sdxl_trainer_lora_trains_reloads_and_renders() {
     // Round-trip 2 — full generate with the adapter merged: a finite, correctly-sized image.
     render_finite_with_adapter(&out.adapter_path, AdapterKind::Lora);
     println!("[sdxl-lora] e2e OK — {n_targets} targets reload + merge, render finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_trainer_lora_trains_reloads_and_renders");
 }
 
 /// LoKr: trains + converges, writes a LoKr adapter (with `decomposeFactor`), and reloads.
@@ -263,6 +266,9 @@ fn sdxl_trainer_lokr_trains_and_reloads() {
     assert_reloads(&out.adapter_path, AdapterKind::Lokr, n_targets);
     render_finite_with_adapter(&out.adapter_path, AdapterKind::Lokr);
     println!("[sdxl-lokr] e2e OK — {n_targets} targets reload + merge, render finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_trainer_lokr_trains_and_reloads");
 }
 
 /// The gradient-checkpointing path trains + converges + reloads identically (sc-5165 #3 on real data).
@@ -287,6 +293,9 @@ fn sdxl_trainer_gradient_checkpointing_converges() {
         .count();
     assert_reloads(&out.adapter_path, AdapterKind::Lora, n_targets);
     println!("[sdxl-gc] e2e OK — checkpointed training converged + reloads");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_trainer_gradient_checkpointing_converges");
 }
 
 /// Launch-portable determinism: the same seed produces the same adapter, run to run (the achievable
@@ -338,6 +347,11 @@ fn sdxl_trainer_same_seed_is_reproducible() {
         );
     }
     println!("[sdxl-det] e2e OK — same seed reproduces the adapter bit-for-bit");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_trainer_same_seed_is_reproducible"
+    );
 }
 
 /// sc-8650: with a sample cadence set, the trainer renders preview images from the **in-progress
@@ -349,6 +363,8 @@ fn sdxl_trainer_same_seed_is_reproducible() {
 fn sdxl_trainer_emits_preview_samples() {
     if !snapshot().exists() {
         eprintln!("skipping: no SDXL snapshot (set SDXL_SNAPSHOT)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sdxl/tests/trainer_e2e.rs:350 (sdxl_trainer_emits_preview_samples): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     }
     let tmp_guard = tempfile::tempdir().unwrap();
@@ -421,6 +437,9 @@ fn sdxl_trainer_emits_preview_samples() {
             img.width, img.height
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_trainer_emits_preview_samples");
 }
 
 /// Load a generator with `adapter_path` merged and run a tiny `generate`, asserting a finite,

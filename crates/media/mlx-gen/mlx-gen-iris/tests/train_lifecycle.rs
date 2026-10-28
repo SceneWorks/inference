@@ -143,11 +143,12 @@ fn assert_same_files(a: &Path, b: &Path) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn gen_core_trainer_conformance() {
-    cpu_process(
-        "train_lifecycle::gen_core_trainer_conformance",
-        gen_core_trainer_conformance_body,
-    );
+    cpu_process("train_lifecycle::gen_core_trainer_conformance", || {
+        gen_core_trainer_conformance_body();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::gen_core_trainer_conformance");
+    });
 }
 
 fn gen_core_trainer_conformance_body() {
@@ -240,10 +241,14 @@ fn resume_case(mut cfg: TrainingConfig, name: &str) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn full_muon_cancel_and_resume_reproduce_the_uninterrupted_run() {
     cpu_process(
         "train_lifecycle::full_muon_cancel_and_resume_reproduce_the_uninterrupted_run",
-        full_muon_cancel_and_resume_reproduce_the_uninterrupted_run_body,
+        || {
+            full_muon_cancel_and_resume_reproduce_the_uninterrupted_run_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::full_muon_cancel_and_resume_reproduce_the_uninterrupted_run");
+        },
     );
 }
 
@@ -257,10 +262,14 @@ fn full_muon_cancel_and_resume_reproduce_the_uninterrupted_run_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run() {
     cpu_process(
         "train_lifecycle::lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run",
-        lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run_body,
+        || {
+            lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run");
+        },
     );
 }
 
@@ -313,10 +322,14 @@ fn lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn resume_identity_retention_and_new_phase() {
     cpu_process(
         "train_lifecycle::resume_identity_retention_and_new_phase",
-        resume_identity_retention_and_new_phase_body,
+        || {
+            resume_identity_retention_and_new_phase_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::resume_identity_retention_and_new_phase");
+        },
     );
 }
 
@@ -369,10 +382,14 @@ fn resume_identity_retention_and_new_phase_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn cached_and_on_the_fly_conditioning_train_identically() {
     cpu_process(
         "train_lifecycle::cached_and_on_the_fly_conditioning_train_identically",
-        cached_and_on_the_fly_conditioning_train_identically_body,
+        || {
+            cached_and_on_the_fly_conditioning_train_identically_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::cached_and_on_the_fly_conditioning_train_identically");
+        },
     );
 }
 
@@ -517,10 +534,14 @@ fn adapter_round_trip(network: NetworkType, compute: Dtype) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lora_adapter_exports_and_loads_through_the_provider() {
     cpu_process(
         "train_lifecycle::lora_adapter_exports_and_loads_through_the_provider",
-        lora_adapter_exports_and_loads_through_the_provider_body,
+        || {
+            lora_adapter_exports_and_loads_through_the_provider_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::lora_adapter_exports_and_loads_through_the_provider");
+        },
     );
 }
 
@@ -529,10 +550,14 @@ fn lora_adapter_exports_and_loads_through_the_provider_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lokr_adapter_exports_and_loads_through_the_provider() {
     cpu_process(
         "train_lifecycle::lokr_adapter_exports_and_loads_through_the_provider",
-        lokr_adapter_exports_and_loads_through_the_provider_body,
+        || {
+            lokr_adapter_exports_and_loads_through_the_provider_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::lokr_adapter_exports_and_loads_through_the_provider");
+        },
     );
 }
 
@@ -543,10 +568,14 @@ fn lokr_adapter_exports_and_loads_through_the_provider_body() {
 /// Under bf16 training the base is bf16: the adapter must still reach the forward as a residual
 /// (a delta merged into the bf16 weight would round away) and match the provider's bf16 install.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn bf16_lora_adapter_exports_and_loads_through_the_provider() {
     cpu_process(
         "train_lifecycle::bf16_lora_adapter_exports_and_loads_through_the_provider",
-        bf16_lora_adapter_exports_and_loads_through_the_provider_body,
+        || {
+            bf16_lora_adapter_exports_and_loads_through_the_provider_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::bf16_lora_adapter_exports_and_loads_through_the_provider");
+        },
     );
 }
 
@@ -555,10 +584,14 @@ fn bf16_lora_adapter_exports_and_loads_through_the_provider_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn bf16_lokr_adapter_exports_and_loads_through_the_provider() {
     cpu_process(
         "train_lifecycle::bf16_lokr_adapter_exports_and_loads_through_the_provider",
-        bf16_lokr_adapter_exports_and_loads_through_the_provider_body,
+        || {
+            bf16_lokr_adapter_exports_and_loads_through_the_provider_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::bf16_lokr_adapter_exports_and_loads_through_the_provider");
+        },
     );
 }
 
@@ -568,10 +601,14 @@ fn bf16_lokr_adapter_exports_and_loads_through_the_provider_body() {
 
 /// The shared contract: empty `sample_prompts` disables sampling whatever `sample_every` says.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn empty_sample_prompts_render_no_previews() {
     cpu_process(
         "train_lifecycle::empty_sample_prompts_render_no_previews",
-        empty_sample_prompts_render_no_previews_body,
+        || {
+            empty_sample_prompts_render_no_previews_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::empty_sample_prompts_render_no_previews");
+        },
     );
 }
 
@@ -598,10 +635,14 @@ fn empty_sample_prompts_render_no_previews_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn exported_full_model_loads_and_generates_in_the_provider() {
     cpu_process(
         "train_lifecycle::exported_full_model_loads_and_generates_in_the_provider",
-        exported_full_model_loads_and_generates_in_the_provider_body,
+        || {
+            exported_full_model_loads_and_generates_in_the_provider_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::exported_full_model_loads_and_generates_in_the_provider");
+        },
     );
 }
 
@@ -688,10 +729,14 @@ fn exported_full_model_loads_and_generates_in_the_provider_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn random_init_x_prediction_trains_and_its_export_records_the_objective() {
     cpu_process(
         "train_lifecycle::random_init_x_prediction_trains_and_its_export_records_the_objective",
-        random_init_x_prediction_trains_and_its_export_records_the_objective_body,
+        || {
+            random_init_x_prediction_trains_and_its_export_records_the_objective_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::random_init_x_prediction_trains_and_its_export_records_the_objective");
+        },
     );
 }
 
@@ -793,10 +838,14 @@ fn a_trainer_load_without_the_text_encoder_is_refused() {
 /// `text_dropout` substitutes the CFG null for the dropped rows: at probability 1 every row is the
 /// null, so two datasets differing only in their captions train identically — and at 0 they do not.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn caption_dropout_substitutes_the_null_conditioning() {
     cpu_process(
         "train_lifecycle::caption_dropout_substitutes_the_null_conditioning",
-        caption_dropout_substitutes_the_null_conditioning_body,
+        || {
+            caption_dropout_substitutes_the_null_conditioning_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::caption_dropout_substitutes_the_null_conditioning");
+        },
     );
 }
 
@@ -828,10 +877,14 @@ fn caption_dropout_substitutes_the_null_conditioning_body() {
 /// `train/lr.py`'s warmup ramps from exactly 0: the first optimizer step of a warmed-up run runs at
 /// lr 0 and leaves the (zero-decay) weights untouched; without warmup the same step moves them.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn warmup_starts_the_schedule_at_zero() {
     cpu_process(
         "train_lifecycle::warmup_starts_the_schedule_at_zero",
-        warmup_starts_the_schedule_at_zero_body,
+        || {
+            warmup_starts_the_schedule_at_zero_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::warmup_starts_the_schedule_at_zero");
+        },
     );
 }
 
@@ -862,10 +915,14 @@ fn warmup_starts_the_schedule_at_zero_body() {
 /// The preview renderer is the provider's sampler: on the same backbone, prompt, steps, CFG and
 /// seed it reproduces the catalog generator's image exactly.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn preview_renderer_matches_the_provider() {
     cpu_process(
         "train_lifecycle::preview_renderer_matches_the_provider",
-        preview_renderer_matches_the_provider_body,
+        || {
+            preview_renderer_matches_the_provider_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::preview_renderer_matches_the_provider");
+        },
     );
 }
 

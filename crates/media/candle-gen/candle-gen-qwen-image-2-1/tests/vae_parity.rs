@@ -29,6 +29,7 @@ const ENCODER_TOL: f32 = 1e-5;
 const DECODER_TOL: f32 = 1e-5;
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_stage_of_encode_and_decode_matches_upstream() {
     let w = Fixture::open("qwen21_vae.safetensors");
     let vae = load_vae(&tiny_snapshot(), &Device::Cpu).unwrap();
@@ -91,6 +92,9 @@ fn every_stage_of_encode_and_decode_matches_upstream() {
         let split = vae.decode_tail(&vae.decode_head(&z).unwrap()).unwrap();
         assert_close(&format!("{case}/head_then_tail"), &split, &decoded, 0.0);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_parity::every_stage_of_encode_and_decode_matches_upstream");
 }
 
 /// The bounded decode tiles only the spatially local tail (the head with its global attention runs
@@ -116,6 +120,7 @@ fn every_stage_of_encode_and_decode_matches_upstream() {
 /// two engines' seam terms agree to the printed precision — the halo is the tiling geometry's, not
 /// either backend's.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn tiled_decode_matches_the_single_pass_up_to_the_seam_term() {
     use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
     use candle_gen::gen_core::CancelFlag;
@@ -167,6 +172,9 @@ fn tiled_decode_matches_the_single_pass_up_to_the_seam_term() {
         LatentDecoder::decode_tiled(&vae, &normalised, &cfg, Some(&cancel)),
         Err(CandleError::Canceled)
     ));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_parity::tiled_decode_matches_the_single_pass_up_to_the_seam_term");
 }
 
 /// `GenerationMemory::tile_vae_decode` is what selects the bounded decode at render time, and the

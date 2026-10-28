@@ -1607,6 +1607,7 @@ mod tests {
     /// norm and corrupts every channel before `proj_out`, so this asserts BOTH the returned tuple
     /// AND the net application `norm(x)·(1+scale) + shift`.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn ada_ln_continuous_chunk_order_is_scale_then_shift() {
         let hidden = 4;
         // Deliberately asymmetric so a scale/shift swap can never coincidentally pass.
@@ -1672,6 +1673,8 @@ mod tests {
             differs,
             "test cannot distinguish correct from swapped scale/shift"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::ada_ln_continuous_chunk_order_is_scale_then_shift");
     }
 
     /// Build an [`AdaLnZeroX`] whose 9·hidden projection is a pure bias (zero weight) so `forward`
@@ -1701,6 +1704,7 @@ mod tests {
     /// would silently mis-modulate the `attn2` branch (the #1 M2 parity risk). Each chunk gets a
     /// distinct constant so any permutation is caught.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn ada_ln_zero_x_chunk_order_matches_diffusers() {
         let hidden = 3;
         // 9 distinct constants, one per chunk, in diffusers order.
@@ -1752,5 +1756,7 @@ mod tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::ada_ln_zero_x_chunk_order_matches_diffusers");
     }
 }

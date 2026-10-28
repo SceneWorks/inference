@@ -2351,6 +2351,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn klein_request_residency_preserves_warm_and_staged_materialization() {
         use std::sync::{Arc, Mutex};
 
@@ -2495,9 +2496,12 @@ mod tests {
                 "cancellation must preserve the warm pair"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED model::tests::klein_request_residency_preserves_warm_and_staged_materialization");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn klein_request_windows_reject_incompatible_loads_before_component_work() {
         let spec = deferred_klein_spec();
         let req = GenerationRequest {
@@ -2557,6 +2561,8 @@ mod tests {
                 "{axis}: {error}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED model::tests::klein_request_windows_reject_incompatible_loads_before_component_work");
     }
 
     fn dev_tier_spec(root: &Path, packed_bits: Option<i32>, requested: Option<Quant>) -> LoadSpec {
@@ -3172,6 +3178,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn generate_without_weights_errors_not_loaded() {
         let model = Flux2::new_for_tests(Flux2Variant::Klein9b);
         let req = GenerationRequest {
@@ -3181,6 +3188,8 @@ mod tests {
         let mut progress = |_p: Progress| {};
         let err = model.generate(&req, &mut progress).unwrap_err().to_string();
         assert!(err.contains("not loaded"));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED model::tests::generate_without_weights_errors_not_loaded");
     }
 
     #[test]

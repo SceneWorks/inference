@@ -805,6 +805,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn packed_linear_and_inverse_embedding_match_dense_operator_oracles() {
         let width = 128i32;
         let rows = 2i32;
@@ -867,6 +868,8 @@ pub(crate) mod tests {
             .all_close(&expected, 1e-5, 1e-5, None)
             .unwrap()
             .item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::prism::tests::packed_linear_and_inverse_embedding_match_dense_operator_oracles");
     }
 
     #[test]

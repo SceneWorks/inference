@@ -261,6 +261,8 @@ fn fl2va_renders_all_four_conditioning_shapes() {
         "FL2VA FIRST LIGHT: all four shapes rendered at {evaluations} steps. Note this step count \
          gates REACHABILITY, not quality — `first_light.rs` is the quality run."
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fl2va_first_light::fl2va_renders_all_four_conditioning_shapes");
 }
 
 fn load_generator(

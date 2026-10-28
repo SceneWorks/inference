@@ -172,20 +172,36 @@ impl MiniMaxH3Tokenizer {
     /// map from `tokenizer/tokenizer_config.json`.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let dir = root.as_ref().join("tokenizer");
-        let cfg = std::fs::read_to_string(dir.join("tokenizer_config.json")).map_err(|e| {
+        #[cfg(feature = "model-inference-proof")]
+        let __model_input_config_path = dir.join("tokenizer_config.json");
+        let cfg = mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(dir.join("tokenizer_config.json")),
+            std::fs::read_to_string(&__model_input_config_path)
+        )
+        .map_err(|e| {
             Error::Msg(format!(
                 "minimax-h3 tokenizer: read {}: {e}",
                 dir.join("tokenizer_config.json").display()
             ))
         })?;
-        Self::from_files(dir.join("tokenizer.json"), &cfg)
+        mlx_gen::gen_core::__model_input_result!(
+            Self::from_files(dir.join("tokenizer.json"), &cfg),
+            "mlx-gen-minimax-h3::text_encoder::MiniMaxH3Tokenizer::from_snapshot/configuration",
+            Configuration,
+            &[&__model_input_config_path]
+        )
     }
 
     /// Load from an explicit `tokenizer.json` path plus the text of a `tokenizer_config.json`.
     /// Split out so the derivation is testable without a snapshot.
     pub fn from_files(tokenizer_json: impl AsRef<Path>, tokenizer_config: &str) -> Result<Self> {
-        let mut inner = Tokenizer::from_file(tokenizer_json.as_ref())
-            .map_err(|e| Error::Msg(format!("minimax-h3 tokenizer: load tokenizer.json: {e}")))?;
+        #[cfg(feature = "model-inference-proof")]
+        let __model_input_tokenizer_path = tokenizer_json.as_ref();
+        let mut inner = mlx_gen::gen_core::__model_input_choose!(
+            Tokenizer::from_file(tokenizer_json.as_ref()),
+            Tokenizer::from_file(__model_input_tokenizer_path)
+        )
+        .map_err(|e| Error::Msg(format!("minimax-h3 tokenizer: load tokenizer.json: {e}")))?;
 
         let cfg: serde_json::Value = serde_json::from_str(tokenizer_config).map_err(|e| {
             Error::Msg(format!("minimax-h3 tokenizer: parse tokenizer_config: {e}"))
@@ -224,7 +240,12 @@ impl MiniMaxH3Tokenizer {
             |t| inner.token_to_id(t).map(|id| id as i32),
             next_free_id,
         );
-        Ok(Self { inner, specials })
+        mlx_gen::gen_core::__model_input_result!(
+            Ok(Self { inner, specials }),
+            "mlx-gen-minimax-h3::text_encoder::MiniMaxH3Tokenizer::from_files/tokenizer",
+            Tokenizer,
+            &[__model_input_tokenizer_path]
+        )
     }
 
     /// The derived special-token id map.

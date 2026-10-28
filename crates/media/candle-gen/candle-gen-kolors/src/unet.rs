@@ -313,14 +313,14 @@ impl KolorsUNet {
         // 1. time embedding.
         let emb = (Tensor::ones(bsize, xs.dtype(), device)? * timestep)?;
         let emb = self.time_proj.forward(&emb)?;
-        let emb = self.time_embedding.forward(&emb)?;
+        let emb = __model_proof_output!(self.time_embedding.forward(&emb))?;
 
         // SDXL `text_time` added conditioning: sinusoidal time_ids (flattened) ++ pooled → add_embedding.
         let (b, n_ids) = time_ids.dims2()?;
         let time_ids_emb = self.add_time_proj.forward(&time_ids.flatten_all()?)?; // [b·6, 256]
         let time_ids_emb = time_ids_emb.reshape((b, n_ids * 256))?; // [b, 1536]
         let add_in = Tensor::cat(&[pooled, &time_ids_emb], D::Minus1)?; // [b, 5632]
-        let aug_emb = self.add_embedding.forward(&add_in)?;
+        let aug_emb = __model_proof_output!(self.add_embedding.forward(&add_in))?;
         let emb = (emb + aug_emb)?;
 
         // 2. pre-process.
@@ -341,9 +341,11 @@ impl KolorsUNet {
         }
 
         // 4. mid.
-        let mut xs = self
-            .mid_block
-            .forward(&xs, Some(&emb), Some(encoder_hidden_states))?;
+        let mut xs = __model_proof_output!(self.mid_block.forward(
+            &xs,
+            Some(&emb),
+            Some(encoder_hidden_states)
+        ))?;
 
         // 5. up.
         let mut upsample_size = None;
@@ -388,6 +390,7 @@ mod tests {
     /// (sc-9040 / F-056). Assert that projecting once and reusing across N steps is BIT-IDENTICAL to
     /// re-projecting per step, so the hoist cannot change any pixel.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn encoder_hid_proj_is_step_invariant_bit_identical() -> candle_gen::candle_core::Result<()> {
         let dev = Device::Cpu;
         // A tiny stand-in for the 4096→2048 projection with fixed, deterministic weights + bias,
@@ -406,11 +409,11 @@ mod tests {
         let context = Tensor::randn(0f32, 1f32, (2, 3, in_dim), &dev)?;
 
         // Hoisted: project ONCE up front.
-        let hoisted = proj.forward(&context)?;
+        let hoisted = __model_proof_output!(proj.forward(&context))?;
 
         // Per-step: re-project every "step"; each result must be byte-identical to the hoisted one.
         for _step in 0..5 {
-            let per_step = proj.forward(&context)?;
+            let per_step = __model_proof_output!(proj.forward(&context))?;
             let diff = (&per_step - &hoisted)?
                 .abs()?
                 .max_all()?
@@ -420,6 +423,8 @@ mod tests {
                 "encoder_hid_proj must be step-invariant (bit-identical)"
             );
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED unet::tests::encoder_hid_proj_is_step_invariant_bit_identical");
         Ok(())
     }
 }

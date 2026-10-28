@@ -40,6 +40,15 @@
 //! still reports SUCCESS, and in a run log a skipped gate is indistinguishable from one that ran and
 //! proved something. Asking for `--ignored` is already the opt-in.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -427,6 +436,9 @@ fn pulid_preview_frames_evolve_toward_the_final_image() {
     let size = env_u32("PULID_PREVIEW_SIZE", 1024);
     // 0.90 against a measured +0.962 on this lane - 97% of the fit-derived 0.991 ceiling.
     assert_pulid_previews_converge("pulid-flux-euler", None, steps, size, 0.90, 2.0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pulid_preview_frames_evolve_toward_the_final_image");
 }
 
 /// Exactly one frame per **outer** solver step on a multi-eval solver — PuLID threads the curated
@@ -446,4 +458,7 @@ fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
         "heun must evaluate more than once per outer step or this row proves nothing about the \
          preview counter's dedup ({events} events for {steps} steps)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED a_multi_eval_solver_emits_one_frame_per_outer_step");
 }

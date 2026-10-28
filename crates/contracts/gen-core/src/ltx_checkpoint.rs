@@ -1376,7 +1376,13 @@ pub fn declared_model_version(root: impl AsRef<Path>) -> Result<Option<String>> 
     }
     let manifest = root.join(SPLIT_MANIFEST_FILE);
     if manifest.exists() {
-        let text = std::fs::read_to_string(&manifest)?;
+        let text = crate::__model_input_choose!(
+            std::fs::read_to_string(&manifest),
+            crate::model_input_proof::read_configuration_to_string_for(
+                &manifest,
+                "gen-core::ltx_checkpoint::declared_model_version"
+            )
+        )?;
         let value: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx: parse {}: {e}", manifest.display())))?;
         if let Some(version) = value

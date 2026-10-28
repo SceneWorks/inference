@@ -84,8 +84,8 @@ impl QEmbedding {
     /// Index-select the embedding rows for `indexes`.
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(e) => e.forward(indexes),
-            Self::Packed(e) => e.forward(indexes),
+            Self::Dense(e) => __model_proof_output!(e.forward(indexes)),
+            Self::Packed(e) => __model_proof_output!(e.forward(indexes)),
         }
     }
 
@@ -110,6 +110,7 @@ mod tests {
     /// dense linear built from the SAME affine grid the pack represents — bit-exact (the Q4 → Q4_1
     /// repack is lossless, both forwards dequant-to-dense-matmul). Uses an `input_proj`-style shape.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_qlinear_matches_dense_grid() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
@@ -131,12 +132,17 @@ mod tests {
             cos > 0.99999,
             "group-64 packed vs affine-grid cosine {cos:.6}"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qlinear_matches_dense_grid"
+        );
         Ok(())
     }
 
     /// A group-64 packed `QEmbedding` reproduces the affine grid rows exactly, dequantized to the
     /// requested dtype (the future-proof path for a DiT tier that ever packs `embed_image_indicator`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_qembedding_matches_dense_grid() -> Result<()> {
         let dev = Device::Cpu;
         let (vocab, hidden) = (64usize, 128usize);
@@ -156,6 +162,10 @@ mod tests {
         assert_eq!(
             dev_max, 0.0,
             "group-64 packed embedding deviates from the grid"
+        );
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qembedding_matches_dense_grid"
         );
         Ok(())
     }

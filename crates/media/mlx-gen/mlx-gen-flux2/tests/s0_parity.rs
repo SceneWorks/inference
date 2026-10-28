@@ -67,6 +67,7 @@ fn schedule_matches_fork() {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn rope_table_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
@@ -78,6 +79,8 @@ fn rope_table_matches_fork() {
     assert_eq!(sin.shape(), want_sin.shape());
     assert!(close(&cos, want_cos, 1e-4, 1e-4), "RoPE cos diverged");
     assert!(close(&sin, want_sin, 1e-4, 1e-4), "RoPE sin diverged");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED s0_parity::rope_table_matches_fork");
 }
 
 #[test]

@@ -206,6 +206,7 @@ fn staged_generate(root: &Path, req: &GenerationRequest) -> (Vec<Image>, usize) 
 fn scail2_staged_peak_stays_below_umt5_plus_dit_coresidence() {
     let Some(root) = model_dir() else {
         eprintln!("skip: no SCAIL2_MODEL_DIR and no SceneWorks/scail2-mlx in the HF cache");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in scail2_staged_peak_stays_below_umt5_plus_dit_coresidence; see preceding skip diagnostic");
         return;
     };
     if !root.join("dit.safetensors").exists() || !root.join("t5_encoder.safetensors").exists() {
@@ -213,6 +214,7 @@ fn scail2_staged_peak_stays_below_umt5_plus_dit_coresidence() {
             "skip: missing dit.safetensors / t5_encoder.safetensors under {}",
             root.display()
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in scail2_staged_peak_stays_below_umt5_plus_dit_coresidence; see preceding skip diagnostic");
         return;
     }
 
@@ -287,4 +289,6 @@ fn scail2_staged_peak_stays_below_umt5_plus_dit_coresidence() {
          staging may not be freeing the UMT5 / DiT",
         saved as f64 / GIB,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::scail2_staged_peak_stays_below_umt5_plus_dit_coresidence");
 }

@@ -69,8 +69,14 @@ impl BooguConfig {
     /// values; the validated invariants (RoPE-sum, double ≤ total) are checked here.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let path = root.as_ref().join("transformer").join("config.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Msg(format!("boogu: read {}: {e}", path.display())))?;
+        let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-boogu/src/config.rs::from_snapshot::std::fs::read_to_string@2856",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+        .map_err(|e| Error::Msg(format!("boogu: read {}: {e}", path.display())))?;
         let v: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("boogu: parse {}: {e}", path.display())))?;
         Self::from_json(&v)

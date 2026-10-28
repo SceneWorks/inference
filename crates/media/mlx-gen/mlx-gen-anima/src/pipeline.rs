@@ -29,6 +29,9 @@ use crate::vae::QwenVae;
 /// `sampler` overrides it; any curated flow solver (euler, dpmpp_2m, …) is valid.
 pub const DEFAULT_SAMPLER: &str = "er_sde";
 
+/// The dtype the production denoise runs the DiT in (the iOS pricing prices its quanta at it).
+pub(crate) const DIT_DTYPE: Dtype = Dtype::Bfloat16;
+
 /// The Anima sigma schedule: `linspace(1.0, 1/N, N)` (**NOT** the diffusers default) time-shifted by
 /// the static `shift=3.0` (`3σ / (1 + 2σ)`), with the trailing terminal `0.0` the flow sampler
 /// integrates to. Length `N + 1`, descending.
@@ -70,14 +73,19 @@ pub fn anima_schedule(scheduler: Option<&str>, steps: usize) -> Vec<f32> {
 /// Seeded initial latent noise `[1, 16, 1, H/8, W/8]` (f32 standard normal), the 5-D Cosmos latent.
 fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
     let key = random::key(seed)?;
-    let shape = [
+    let shape = latent_shape(width, height);
+    Ok(random::normal::<f32>(&shape[..], None, None, Some(&key))?)
+}
+
+/// The `[1, 16, 1, H/8, W/8]` latent a `width`x`height` render denoises and decodes (f32).
+pub(crate) fn latent_shape(width: u32, height: u32) -> [i32; 5] {
+    [
         1,
         VAE_CHANNELS as i32,
         1,
         (height / VAE_COMPRESSION) as i32,
         (width / VAE_COMPRESSION) as i32,
-    ];
-    Ok(random::normal::<f32>(&shape[..], None, None, Some(&key))?)
+    ]
 }
 
 /// Per-generation options.
@@ -496,26 +504,94 @@ pub(crate) fn denoise_loop_bounded(
     attention: AttentionPlan<'_>,
     window: Option<BlockWindow<'_>>,
 ) -> Result<Array> {
-    let sigmas = anima_schedule(scheduler, steps);
-    let previews = AnimaPreview::new(preview, &sigmas);
+    // Canonical factory/schedule plan shared with Turbo's header-only sampling projection.
+    // Low-level parity hooks retain their historical unknown-name fallback; real requests already
+    // passed the descriptor floor before reaching this function.
+    let selected = mlx_gen::sampler::canonical_solver(Some(sampler), mlx_gen::Solver::Euler);
+    let request = mlx_gen::GenerationRequest {
+        sampler: Some(selected.name().into()),
+        scheduler: scheduler
+            .filter(|name| mlx_gen::Scheduler::from_name(name).is_some())
+            .map(str::to_owned),
+        steps: Some(steps.max(1) as u32),
+        guidance: Some(guidance),
+        ..Default::default()
+    };
+    let native = anima_sigmas(steps);
+    let mut defaults = crate::sampling::defaults();
+    defaults.guidance = uncond.map(|_| guidance);
+    let sampling = mlx_gen::sampler::flow_sampling::ResolvedFlowSampling::resolve(
+        &request,
+        defaults,
+        &native,
+        SIGMA_SHIFT.ln(),
+        TimestepConvention::Sigma,
+    )?;
+    let sigmas = sampling.sigmas();
+    let previews = AnimaPreview::new(preview, sigmas);
     let guidance = Array::from_slice(&[guidance], &[1]);
+    let mut forwards = 0u64;
     let predict = |x: &Array, sigma: f32| -> Result<Array> {
         let s = Array::from_slice(&[sigma], &[1]);
+        forwards += 1;
+        let rows = x.shape().first().copied().unwrap_or(0) as u64;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "anima",
+            "forward_argument",
+            forwards,
+            rows,
+            x,
+        );
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "anima",
+            "forward",
+            &[
+                ("evaluation", forwards),
+                ("rows", rows),
+                ("conditioned", 1),
+                (
+                    "compute_dtype_parameter",
+                    mlx_gen::sampler::sampling_dtype_code(dit_dtype),
+                ),
+            ],
+        );
         let v_cond = dit.forward_bounded(x, &s, cond, dit_dtype, attention, window)?;
         let v = match uncond {
             // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
             Some(u) => {
+                forwards += 1;
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    "anima",
+                    "forward",
+                    &[
+                        ("evaluation", forwards),
+                        ("rows", rows),
+                        ("conditioned", 0),
+                        (
+                            "compute_dtype_parameter",
+                            mlx_gen::sampler::sampling_dtype_code(dit_dtype),
+                        ),
+                    ],
+                );
                 let v_u = dit.forward_bounded(x, &s, u, dit_dtype, attention, window)?;
                 add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
             }
             None => v_cond,
         };
         // Integrate in f32 (the reference keeps latents f32).
-        Ok(v.as_dtype(Dtype::Float32)?)
+        let result = v.as_dtype(Dtype::Float32)?;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "anima",
+            "forward_return",
+            forwards,
+            rows,
+            &result,
+        );
+        Ok(result)
     };
     run_anima_sampler(
-        Some(sampler),
-        &sigmas,
+        Some(sampling.solver().name()),
+        sigmas,
         init.clone(),
         seed,
         cancel,
@@ -818,7 +894,7 @@ impl AnimaHeavy {
             sampler,
             scheduler,
             seed,
-            Dtype::Bfloat16,
+            DIT_DTYPE,
             preview,
             cancel,
             on_progress,
@@ -909,6 +985,7 @@ impl StagedHeavy for AnimaHeavy {
 /// The conditioner forward here is the sc-10522 correctness point: the DiT + conditioner adapters must
 /// already be installed on `dit`/`conditioner` (the trainer re-installs the current factors before each
 /// cadence), so this reflects the conditioner adapters' training — it is NOT a cached output.
+#[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_preview(
     dit: &CosmosDiT,
@@ -951,6 +1028,7 @@ pub(crate) fn render_preview(
 /// weights-free (no-VAE) test can drive the exact production path and prove the conditioner is live —
 /// if this ever regressed to a cached conditioner output, the latent would stop responding to the
 /// conditioner adapters (the sc-10522 trap) and the guard test reddens.
+#[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_preview_latent(
     dit: &CosmosDiT,
@@ -990,6 +1068,7 @@ pub(crate) fn render_preview_latent(
 /// (+ optional `uncond_enc` for CFG). The sampling half of [`render_preview_latent`], factored so the
 /// live path and the guard test share one integrator and differ ONLY in whether `cond` was produced
 /// live or (the trap) reused stale.
+#[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_latent_with_enc(
     dit: &CosmosDiT,

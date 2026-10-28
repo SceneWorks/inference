@@ -538,6 +538,8 @@ fn ltx_staged_peak_stays_below_te_plus_dit_coresidence() {
              q4/no-audio baseline, and activation memory scales with geometry)"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::ltx_staged_peak_stays_below_te_plus_dit_coresidence");
 }
 
 #[test]

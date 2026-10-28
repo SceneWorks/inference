@@ -164,6 +164,12 @@ impl DualClip {
                 g_tok_file.display()
             ))
         })?;
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::record_reader_paths(
+            "candle-gen-sdxl::training::DualClip::load/tokenizers",
+            candle_gen::gen_core::model_input_proof::InputRole::Tokenizer,
+            &[&l_tok_file, &g_tok_file],
+        );
         let l = stable_diffusion::build_clip_transformer(
             l_cfg,
             snapshot_file(root, l_weights)?,
@@ -1320,6 +1326,7 @@ mod tests {
     /// (block-recompute) must reproduce the dense `loss.backward()` grads (mod float reassociation),
     /// over a real SDXL-shaped UNet with nonzero LoRA factors so every adapter `Var` carries signal.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dense_and_checkpoint_grads_match() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -1403,12 +1410,18 @@ mod tests {
             }
         }
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED training::tests::dense_and_checkpoint_grads_match"
+        );
     }
 
     /// sc-24828: subject-masked loss on both backward paths. An all-ones map is the unweighted loss;
     /// an all-zero map zeroes the loss AND every adapter gradient (dense and checkpointed — a path
     /// that dropped the weight would train on the background); a half map matches across paths.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -1483,6 +1496,9 @@ mod tests {
             "dense {dense} vs checkpoint {ckpt}"
         );
         assert!(trainer_descriptor().techniques.subject_mask_loss);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 
     /// sc-24828 × sc-2127: with masked loss on and two buckets, each cached latent carries a weight
@@ -1546,6 +1562,7 @@ mod tests {
     ///  2. `preview_latents` runs the curated sampler end-to-end over a tiny SDXL-shaped UNet (CFG on)
     ///     and returns a finite latent of the exact `[1, 4, lat_h, lat_w]` shape the decode expects.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn preview_uses_curated_sampler() {
         assert!(
             candle_gen::curated_sampler_names().contains(&"ddim"),
@@ -1579,6 +1596,9 @@ mod tests {
             flat.iter().all(|v| v.is_finite()),
             "curated preview latents must be finite"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::preview_uses_curated_sampler");
     }
 
     /// `sample_timestep` is deterministic in its seed and lands in `[0, NUM_TRAIN_TIMESTEPS)`.
@@ -1755,11 +1775,54 @@ mod tests {
             noise: Tensor,
         }
 
+        /// `N(0, std²)` of shape `dims` from the seeded `rng`.
+        fn randn_seeded(rng: &mut StdRng, std: f32, dims: &[usize]) -> Tensor {
+            let n = dims.iter().product();
+            let v: Vec<f32> = candle_gen::seeded_normal_vec(rng, n)
+                .into_iter()
+                .map(|x| x * std)
+                .collect();
+            Tensor::from_vec(v, dims, &Device::Cpu).unwrap()
+        }
+
+        /// Seeded: candle's CPU backend ignores `Device::set_seed`, so `Tensor::randn` and the
+        /// `VarMap` init draw from the process-global RNG. About 1 draw in 400 (macOS: 22 of 9,000)
+        /// pushed the tiny random TAESDXL decoder's output outside `[0, 1]` at every pixel. Its
+        /// final clamp then zeroed every adapter gradient, and the depth test failed
+        /// intermittently in CI. Every tensor here now comes from one `StdRng`. Random-init base
+        /// vars are redrawn in name order (the map is a `HashMap`) at candle-nn's own init scale:
+        /// Kaiming-normal weights `√(2/fan_in)` and `±1/√fan_in` biases (std `1/√(3·fan_in)`).
+        /// Constant-init vars (norm γ/β) are left as they are.
         fn fixture() -> Fixture {
             let dev = Device::Cpu;
+            let mut rng = StdRng::seed_from_u64(0x5d71_2123);
             let vm = VarMap::new();
-            let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-            let mut unet = tiny_unet(vb);
+            let mut unet = tiny_unet(VarBuilder::from_varmap(&vm, DType::F32, &dev));
+            {
+                let data = vm.data().lock().unwrap();
+                let fan_in = |dims: &[usize]| dims[1..].iter().product::<usize>() as f32;
+                let mut names: Vec<&String> = data.keys().collect();
+                names.sort();
+                for name in names {
+                    let v = &data[name];
+                    let vals = v
+                        .as_tensor()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    if vals.iter().all(|x| *x == vals[0]) {
+                        continue;
+                    }
+                    let std = if v.dims().len() >= 2 {
+                        (2.0 / fan_in(v.dims())).sqrt()
+                    } else {
+                        let w = &data[&format!("{}weight", name.strip_suffix("bias").unwrap())];
+                        (3.0 * fan_in(w.dims())).sqrt().recip()
+                    };
+                    v.set(&randn_seeded(&mut rng, std, v.dims())).unwrap();
+                }
+            }
             // Same target set as the dense-vs-checkpoint gate (the time embedding is a detached
             // per-step constant on the checkpointed path).
             let paths: Vec<String> = unet
@@ -1770,15 +1833,15 @@ mod tests {
                 .collect();
             let set = build_lora_targets(&mut unet, &paths, 4, 8.0, 7, &dev).unwrap();
             for v in &set.vars {
-                v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                v.set(&randn_seeded(&mut rng, 0.02, v.as_tensor().dims()))
                     .unwrap();
             }
             Fixture {
                 unet,
                 vars: set.vars,
-                x0: Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap(),
-                cond: Tensor::randn(0f32, 1f32, (1, 7, 64), &dev).unwrap(),
-                noise: Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap(),
+                x0: randn_seeded(&mut rng, 1.0, &[1, 4, 8, 8]),
+                cond: randn_seeded(&mut rng, 1.0, &[1, 7, 64]),
+                noise: randn_seeded(&mut rng, 1.0, &[1, 4, 8, 8]),
             }
         }
 
@@ -1867,6 +1930,7 @@ mod tests {
         /// no diffusion term, total == aux and a nonzero finite LoRA B gradient. Mutations: compute
         /// the diffusion term unconditionally ⇒ red; drop `aux` in the checkpointed segment ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_only_step_trains_the_adapter_through_depth_alone() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1901,12 +1965,16 @@ mod tests {
                     "ckpt={ckpt}: no LoRA B gradient from the depth term"
                 );
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_only_step_trains_the_adapter_through_depth_alone");
         }
 
         /// The loop trains an aux-only step at the plan's remapped timestep and keeps the sampled one
         /// on a diffusion step / without a path. Mutation: return the sampled `t` on an aux step ⇒
         /// red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_steps_train_at_the_planned_timestep() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1917,6 +1985,9 @@ mod tests {
             assert!(!a2.unwrap().diffusion());
             assert!((599..=900).contains(&t2), "aux-only step at {t2}");
             assert_eq!(plan_timestep(&StepSample::plain(0, 0), 100).unwrap().0, 100);
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_steps_train_at_the_planned_timestep");
         }
 
         /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
@@ -1962,6 +2033,7 @@ mod tests {
         /// Mutations: swap the parameterisation in `step_loss` (e.g. `VPrediction`) ⇒ red; drop the
         /// gain (`aux_loss` instead of `aux_loss_gained`, or `aux_gain` → `1`) ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_term_is_the_gained_depth_loss_of_the_recovered_x0() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -2009,11 +2081,15 @@ mod tests {
                 }
             }
             assert!(checked > 0, "no material aux gradient to compare");
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_term_is_the_gained_depth_loss_of_the_recovered_x0");
         }
 
         /// (c) Depth off is bit-identical to the pre-epic-2123 dense step (reproduced verbatim).
         /// Mutation: perturb the `None` combine ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn depth_off_is_bit_identical_to_the_legacy_step() {
             let f = fixture();
             let (l, g) = run(&f, 500, false, None);
@@ -2030,6 +2106,9 @@ mod tests {
             for v in &f.vars {
                 assert_eq!(grad_bits(&g, v), grad_bits(&lg, v));
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::depth_off_is_bit_identical_to_the_legacy_step");
         }
 
         fn depth_on() -> TrainingConfig {

@@ -101,6 +101,15 @@
 //! `generate_from_prefill` reference too, so a Qwen3-8B baseline exists) in `bf16`, `q8` and `q4`
 //! — the formats the pre-epic loaders already had; NVFP4 postdates it.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -1198,7 +1207,15 @@ fn greedy_config(new_tokens: usize) -> GenerationConfig {
 /// modern HF layouts ship, else the key embedded in `tokenizer_config.json`) and tokenize it.
 fn render_prompt(snapshot: &Path, user: &str) -> Vec<i32> {
     let tokenizer = Tokenizer::from_file(snapshot.join("tokenizer.json")).expect("tokenizer.json");
-    let template = match std::fs::read_to_string(snapshot.join("chat_template.jinja")) {
+    let template = match candle_llm::__model_input_reader!(
+        std::fs::read_to_string(snapshot.join("chat_template.jinja")),
+        "crates/llm/candle-llm/tests/decode_bench.rs::render_prompt::std::fs::read_to_string@48029",
+        Tokenizer,
+        snapshot.join("chat_template.jinja"),
+        |__model_input_path| std::fs::read_to_string(__model_input_path),
+        origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected,
+        when = |__value: &String| !__value.trim().is_empty()
+    ) {
         Ok(source) if !source.trim().is_empty() => JinjaChatTemplate::new(source),
         _ => JinjaChatTemplate::from_tokenizer_config_file(snapshot.join("tokenizer_config.json"))
             .expect("tokenizer_config.json chat template"),
@@ -1215,9 +1232,18 @@ fn render_prompt(snapshot: &Path, user: &str) -> Vec<i32> {
 }
 
 fn load(snapshot: &Path, device: &Device, format: &str) -> (Qwen35Model, Option<Qwen35Mtp>) {
-    let config: Value =
-        serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json")).unwrap())
-            .unwrap();
+    let config: Value = serde_json::from_str(
+        &candle_llm::__model_input_reader!(
+            std::fs::read_to_string(snapshot.join("config.json")),
+            "crates/llm/candle-llm/tests/decode_bench.rs::load::std::fs::read_to_string@48780",
+            Configuration,
+            snapshot.join("config.json"),
+            |__model_input_path| std::fs::read_to_string(__model_input_path),
+            origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let cfg = Qwen35Config::from_json(&config).expect("qwen3_5 config");
     let weights = Weights::from_dir(snapshot, device).expect("load weights");
     let prefix = if weights.contains("model.language_model.embed_tokens.weight") {
@@ -1301,9 +1327,19 @@ fn run_causal_reference(
 /// Whether the snapshot is a llama-family (`CausalLm`) checkpoint rather than a Qwen3.5/3.6/3.8
 /// hybrid — decided from `config.json` by the same dispatch the provider uses.
 fn is_causal_snapshot(snapshot: &Path) -> bool {
-    let config: Value =
-        serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json")).unwrap())
-            .unwrap();
+    let config: Value = serde_json::from_str(
+        &candle_llm::__model_input_reader!(
+std::fs::read_to_string(snapshot.join("config.json")),
+"crates/llm/candle-llm/tests/decode_bench.rs::is_causal_snapshot::std::fs::read_to_string@51931",
+Configuration,
+snapshot.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected
+)
+        .unwrap(),
+    )
+    .unwrap();
     !matches!(
         candle_llm::config::Architecture::from_config(&config),
         Ok(candle_llm::config::Architecture::Qwen35)
@@ -2409,4 +2445,7 @@ fn decode_bench() {
     }
     std::fs::write(&output, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
     eprintln!("[decode_bench] wrote {}", output.display());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED decode_bench");
 }

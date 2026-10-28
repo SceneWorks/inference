@@ -112,6 +112,8 @@ fn upsampler_matches_reference() {
     // reduction, a dropped f32 island) pass as rounding.
     assert_eq!(mr, 0.0, "upsampler mean_rel {mr:.3e} is not bit-identical");
     assert_eq!(pr, 0.0, "upsampler peak_rel {pr:.3e} is not bit-identical");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED upsampler_parity::upsampler_matches_reference");
 }
 
 // =================================================================================================
@@ -194,6 +196,8 @@ fn ltx_2_5_spatial_upsampler_matches_reference() {
     let got = golden_parity(&up, SPATIAL_2_5_GOLDEN, "ltx25 spatial upsampler");
     // Spatial is the frame-preserving branch: `H,W` double, `F` does not move.
     assert_eq!(got.shape(), &[1, 128, 3, 12, 12]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED upsampler_parity::ltx_2_5_spatial_upsampler_matches_reference");
 }
 
 #[test]
@@ -203,6 +207,8 @@ fn ltx_2_5_temporal_upsampler_matches_reference() {
     let got = golden_parity(&up, TEMPORAL_2_5_GOLDEN, "ltx25 temporal upsampler");
     // 9 latent frames in, 2·9−1 = 17 out, spatial untouched.
     assert_eq!(got.shape(), &[1, 128, 17, 6, 6]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED upsampler_parity::ltx_2_5_temporal_upsampler_matches_reference");
 }
 
 #[test]
@@ -234,6 +240,8 @@ fn ltx_2_5_temporal_upsampler_reproduces_the_reference_frame_counts() {
             "{frames_in} -> {frames_out} breaks n % 8 == 1"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED upsampler_parity::ltx_2_5_temporal_upsampler_reproduces_the_reference_frame_counts");
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -475,6 +483,7 @@ fn assert_matches_config_compares_block_count_and_channels_not_just_the_mode() {
 }
 
 /// `PixelShuffle1d(2)` over an odd channel count would otherwise reshape into a wrong-sized view.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_temporal_pixel_shuffle_refuses_an_indivisible_channel_count() {
     let mut map = synthetic_map(true);
@@ -489,9 +498,12 @@ fn the_temporal_pixel_shuffle_refuses_an_indivisible_channel_count() {
         .to_string();
     assert!(err.contains("PixelShuffle1d(2)"), "{err}");
     assert!(err.contains("129"), "{err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED upsampler_parity::the_temporal_pixel_shuffle_refuses_an_indivisible_channel_count");
 }
 
 /// The spatial twin of the guard above (the candle port has both).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_spatial_pixel_shuffle_refuses_an_indivisible_channel_count() {
     let mut map = synthetic_map(false);
@@ -505,8 +517,11 @@ fn the_spatial_pixel_shuffle_refuses_an_indivisible_channel_count() {
     };
     assert!(err.contains("PixelShuffle(2)"), "{err}");
     assert!(err.contains("257"), "{err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED upsampler_parity::the_spatial_pixel_shuffle_refuses_an_indivisible_channel_count");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn temporal_upsampling_produces_2n_minus_1_frames_and_keeps_n_mod_8_eq_1() {
     let up = synthetic_upsampler(true);
@@ -528,8 +543,11 @@ fn temporal_upsampling_produces_2n_minus_1_frames_and_keeps_n_mod_8_eq_1() {
         assert_eq!(&out.shape()[3..], &[3, 3]);
         assert_eq!(out.shape()[1], 8, "channels round-trip through final_conv");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED upsampler_parity::temporal_upsampling_produces_2n_minus_1_frames_and_keeps_n_mod_8_eq_1");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn spatial_upsampling_doubles_hw_and_leaves_the_frame_count_alone() {
     let up = synthetic_upsampler(false);
@@ -541,4 +559,6 @@ fn spatial_upsampling_doubles_hw_and_leaves_the_frame_count_alone() {
         assert_eq!(out.shape(), &[1, 8, frames, 6, 6], "{frames} frames");
         assert_eq!(up.output_frames(frames as usize).unwrap(), frames as usize);
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED upsampler_parity::spatial_upsampling_doubles_hw_and_leaves_the_frame_count_alone");
 }

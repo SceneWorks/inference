@@ -122,7 +122,8 @@ fn max_delta(a: &[u8], b: &[u8]) -> u32 {
 }
 
 #[test]
-#[ignore = "needs one exact SDXL-family q4 snapshot and Metal"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs one exact SDXL-family q4 snapshot and Metal"]
 fn production_latent_quality_admission() {
     let resolved_route = std::env::var("SDXL_QUALITY_ENTRY")
         .expect("SDXL_QUALITY_ENTRY must name the catalog route");
@@ -186,8 +187,11 @@ fn production_latent_quality_admission() {
                 sampler: sampler.clone(),
                 ..Default::default()
             };
-            let (output, mut samples) = model
-                .generate_decode_quality(&request, &tiling, &mut |_| {})
+            let (output, mut samples) = (
+                crate::common::record_model_inference_device(),
+                model.generate_decode_quality(&request, &tiling, &mut |_| {}),
+            )
+                .1
                 .expect("production denoise and decode comparison");
             assert_eq!(
                 samples.len(),
@@ -243,4 +247,6 @@ fn production_latent_quality_admission() {
             mlx_rs::memory::clear_cache();
         }
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED decode_quality_admission::production_latent_quality_admission");
 }

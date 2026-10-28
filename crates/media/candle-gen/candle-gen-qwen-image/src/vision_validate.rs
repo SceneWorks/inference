@@ -158,4 +158,7 @@ fn real_weight_vision_language() {
         "vision content does not propagate into the conditioning (Δ={diff:.6}) — splice may be broken"
     );
     println!("Qwen2.5-VL vision-language validation PASS ✅");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vision_validate::real_weight_vision_language");
 }

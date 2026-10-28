@@ -108,7 +108,13 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
     // Flat checkpoint: load every shard into one map, pack the backbone Linears, write one file. The
     // shared `quantize_map` shape guard additionally skips the 1-D norms and 4-D vision convs; the
     // `is_backbone_linear` predicate keeps the 2-D dense heads (embed/lm_head/fm_head) dense.
-    let map = load_dir_map(src_root)?;
+    let map = mlx_gen::gen_core::__model_input_choose!(
+        load_dir_map(src_root),
+        mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+            "sensenova/converter-ordinary/source",
+            || load_dir_map(src_root),
+        )
+    )?;
     let packed = quantize_map(map, bits, GROUP_SIZE, is_backbone_linear)?;
     save_map(&dst_root.join(PACKED_WEIGHTS_FILE), &packed)?;
 
@@ -159,8 +165,22 @@ pub fn prequantize_fast_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> 
     // against the config — the same `7·layers + 2` the loader's `load_fast` asserts at merge time.
     let cfg = NeoChatConfig::from_dir(src_root)?;
     let lora_path = resolve_distill_lora(None, src_root)?;
-    let lora = Weights::from_file(&lora_path)?;
-    let mut map = load_dir_map(src_root)?;
+    let lora = mlx_gen::gen_core::__model_input_choose!(
+        Weights::from_file(&lora_path),
+        mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+            "sensenova/converter-fast/distill",
+            || Weights::from_file(&lora_path),
+        )
+    )?;
+    let mut map = mlx_gen::gen_core::__model_input_choose!(
+        crate::loader::load_raw_with_companion(src_root, Some(&lora_path))
+            .map(Weights::into_tensors),
+        mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+            "sensenova/converter-fast/source",
+            || crate::loader::load_raw_with_companion(src_root, Some(&lora_path))
+                .map(Weights::into_tensors),
+        )
+    )?;
     let applied = merge_distill_into_map(&mut map, &lora)?;
     let expected = cfg.llm.num_hidden_layers * 7 + 2;
     if applied != expected {

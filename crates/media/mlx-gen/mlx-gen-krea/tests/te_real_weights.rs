@@ -59,6 +59,8 @@ fn te_matches_real_reference() {
     let c = cosine(&hiddens, want);
     println!("Krea 2 real-weight TE parity cosine = {c:.7}");
     assert!(c > 0.98, "real-weight TE cosine {c:.7} <= 0.98");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_real_weights::te_matches_real_reference");
 }
 
 #[test]

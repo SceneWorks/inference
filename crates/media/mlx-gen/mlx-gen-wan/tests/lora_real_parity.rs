@@ -81,15 +81,18 @@ fn lora_spec(path: PathBuf, expert: MoeExpert) -> AdapterSpec {
 fn wan_a14b_lora_real_weight_e2e_matches_reference() {
     let Some(model_dir) = env_path("WAN_A14B_MODEL_DIR") else {
         eprintln!("skip: set WAN_A14B_MODEL_DIR to the converted A14B model dir");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_a14b_lora_real_weight_e2e_matches_reference; see preceding skip diagnostic");
         return;
     };
     let Some(fixture) = env_path("WAN_LORA_FIXTURE") else {
         eprintln!("skip: set WAN_LORA_FIXTURE (run tools/dump_lora_real_fixtures.py first)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_a14b_lora_real_weight_e2e_matches_reference; see preceding skip diagnostic");
         return;
     };
     let (Some(lora_high), Some(lora_low)) = (env_path("WAN_LORA_HIGH"), env_path("WAN_LORA_LOW"))
     else {
         eprintln!("skip: set WAN_LORA_HIGH and WAN_LORA_LOW to the MoE high/low LoRA pair");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_a14b_lora_real_weight_e2e_matches_reference; see preceding skip diagnostic");
         return;
     };
 
@@ -221,4 +224,6 @@ fn wan_a14b_lora_real_weight_e2e_matches_reference() {
         effect_mr > 1e-2,
         "LoRA had no visible effect vs bare (mean_rel={effect_mr:.4e}) — merge may be a no-op"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lora_real_parity::wan_a14b_lora_real_weight_e2e_matches_reference");
 }

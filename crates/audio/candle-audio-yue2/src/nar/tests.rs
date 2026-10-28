@@ -210,6 +210,7 @@ fn compare_evaluations(
 /// noise: every evaluation's input state and velocity, the exact timestep schedule, the chunks,
 /// each chunk's AR sequence, progress, and the final latents.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn synthetic_synthesis_matches_upstream() {
     let meta = meta();
     let r = reference();
@@ -282,6 +283,9 @@ fn synthetic_synthesis_matches_upstream() {
         "all synthetic cases: max |Δ| {:.3e}, rel L2 {:.3e}",
         total.max_abs, total.rel_l2
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::synthetic_synthesis_matches_upstream");
 }
 
 /// Tiled vs untiled on the same model: the tile only splits the query rows of an otherwise
@@ -296,6 +300,7 @@ const TILING_MAX_ABS: f32 = 1e-5;
 /// call) and AR offload leave the latents (within [`TILING_MAX_ABS`]) and the stage identity
 /// unchanged, and match the upstream run that tiled by 5 rows with `offload_ar=True`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn tiling_budget_and_offload_do_not_change_the_latents() {
     let meta = meta();
     let r = reference();
@@ -365,6 +370,9 @@ fn tiling_budget_and_offload_do_not_change_the_latents() {
             assert!(!nar.lm().ar_offloaded(), "restored after the synthesis");
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::tiling_budget_and_offload_do_not_change_the_latents");
 }
 
 /// Reference attention in F64 over every key (grouped-query: head `h` reads KV head `h / groups`).
@@ -435,6 +443,7 @@ fn every_query_tile_attends_every_key() {
 /// cache reused by later evaluations still yields the same velocity (no evaluation sees another's
 /// keys).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cached_velocity_equals_upstream_joint_forward() {
     let meta = meta();
     let r = reference();
@@ -469,10 +478,14 @@ fn cached_velocity_equals_upstream_joint_forward() {
         }
     }
     worst.assert_within(SYNTH_MAX_ABS, SYNTH_REL_L2, "cached vs joint");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::cached_velocity_equals_upstream_joint_forward");
 }
 
 /// Upstream `CachedNAR` with `nar_cond_end = 5`: only the first five AR keys are visible.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn text_only_visibility_matches_upstream() {
     let meta = meta();
     let r = reference();
@@ -510,11 +523,15 @@ fn text_only_visibility_matches_upstream() {
     spread.merge(Spread::of(&host(&latents), &host(&r["cond_end_5/final"])));
     eprintln!("cond_end_5: max |Δ| {:.3e}", spread.max_abs);
     spread.assert_within(SYNTH_MAX_ABS, SYNTH_REL_L2, "cond_end_5");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::text_only_visibility_matches_upstream");
 }
 
 /// The song's noise is one tensor: each chunk starts from exactly its rows, whatever the chunking;
 /// the seeded draw is a standard normal, prefix-stable in the frame count, and seed-dependent.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn song_noise_is_drawn_once_and_sliced_per_chunk() {
     let mut nar = synthetic::model(1.0);
     let prefix: Vec<u32> = u32s(&meta()["cases"][0]["prefix"]);
@@ -569,12 +586,16 @@ fn song_noise_is_drawn_once_and_sliced_per_chunk() {
     let mut bad = vec![0.0; 64 * 2];
     bad[70] = f32::NAN;
     assert!(SongNoise::injected(bad, 2).is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::song_noise_is_drawn_once_and_sliced_per_chunk");
 }
 
 /// A long song over many original chunks is exactly the concatenation of its chunks solved one
 /// by one ([`solve_chunk`] with each chunk's AR sequence and noise rows), every frame is produced,
 /// and the chunk ranges tile the song with no gap or overlap.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn long_song_is_the_concatenation_of_its_original_chunks() {
     let mut nar = synthetic::model(1.0);
     let prefix: Vec<u32> = u32s(&meta()["cases"][0]["prefix"]);
@@ -623,6 +644,9 @@ fn long_song_is_the_concatenation_of_its_original_chunks() {
         pieces.extend(host(&latents));
     }
     assert_eq!(out.latents.values(), pieces.as_slice());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::long_song_is_the_concatenation_of_its_original_chunks");
 }
 
 fn try_synthesize(
@@ -649,6 +673,7 @@ fn try_synthesize(
 
 /// Explicit refusals instead of truncation or a silent default.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn invalid_requests_are_refused() {
     let mut nar = synthetic::model(1.0);
     let nar = &mut nar;
@@ -720,12 +745,16 @@ fn invalid_requests_are_refused() {
         assert_eq!(polls.get(), 2, "{query_tile:?}: refused before the prefill");
         assert!(!nar.lm().ar_offloaded());
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::invalid_requests_are_refused");
 }
 
 /// Cancellation at every bounded boundary — before a chunk's prefill, between prefill forwards,
 /// before the first and the midpoint evaluation, between chunks — returns `Canceled`, leaves the
 /// AR path restored (offload on), and leaves the model producing exactly what it produced before.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cancellation_releases_resources_and_leaves_the_model_intact() {
     let mut nar = synthetic::model(1.0);
     // A prefix longer than one prefill forward, so a poll happens between prefill forwards.
@@ -782,12 +811,16 @@ fn cancellation_releases_resources_and_leaves_the_model_intact() {
     assert_eq!(after.latents, reference.latents);
     let mut cache = nar.lm().new_cache(4).unwrap();
     nar.lm().prefill(&[1, 2, 3], &mut cache, || Ok(())).unwrap();
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::cancellation_releases_resources_and_leaves_the_model_intact");
 }
 
 /// The offload transition: while offloaded every AR entry point refuses (never silently computes
 /// on host copies), a synthesis refuses to start on a model left offloaded, and a restore brings
 /// back exactly the same AR function.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn ar_offload_transitions_are_explicit_and_reversible() {
     let mut nar = synthetic::model(1.0);
     let ids = [151_643u32, 40, 1234, 99];
@@ -823,6 +856,9 @@ fn ar_offload_transitions_are_explicit_and_reversible() {
     nar.restore_ar().unwrap();
     nar.restore_ar().unwrap(); // idempotent
     assert_eq!(prefill(nar.lm()).unwrap(), before);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::ar_offload_transitions_are_explicit_and_reversible");
 }
 
 /// The stage identity names everything the latents are a function of — and nothing else.
@@ -956,6 +992,7 @@ fn score_elements_bound_one_calls_score_tile() {
 /// restored on the way (the model is not left refusing its AR path, and still synthesizes the
 /// same latents).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_panic_mid_solve_still_restores_the_ar_path() {
     struct Boom;
     impl SynthesisObserver for Boom {
@@ -1014,6 +1051,11 @@ fn a_panic_mid_solve_still_restores_the_ar_path() {
     )
     .0;
     assert_eq!(after.latents, before.latents);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::a_panic_mid_solve_still_restores_the_ar_path"
+    );
 }
 
 /// A restore failure is appended to the error that caused it, never substituted for it.
@@ -1041,6 +1083,7 @@ fn a_failed_restore_keeps_the_original_error() {
 /// are **exactly** `CONTEXT` — the model's whole position range — and a one-frame tail chunk. A
 /// chunk one position longer is refused rather than truncated.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn chunks_at_the_released_context_limit() {
     let mut nar = synthetic::model(1.0);
     let prefix: Vec<u32> = u32s(&meta()["cases"][0]["prefix"]);
@@ -1096,6 +1139,9 @@ fn chunks_at_the_released_context_limit() {
     };
     let err = solve_chunk(&mut nar, &chunk, 1, &options, 0, 1, hooks).unwrap_err();
     assert!(err.to_string().contains("positions"), "{err}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::chunks_at_the_released_context_limit");
 }
 
 /// The offload transition on a real accelerator, where it actually moves memory (on the CPU it
@@ -1103,6 +1149,7 @@ fn chunks_at_the_released_context_limit() {
 /// `--features metal` test run; compiled out of the CPU lanes.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn ar_offload_moves_exactly_the_ar_weights_on_a_gpu() {
     #[cfg(feature = "cuda")]
     let device = Device::new_cuda(0).expect("a CUDA device");
@@ -1185,4 +1232,7 @@ fn ar_offload_moves_exactly_the_ar_weights_on_a_gpu() {
     );
     let again = run(&mut nar, &prefix, &codes, &noise, 2, context, &offload).0;
     assert_eq!(again.latents.values(), moved.latents.values());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nar::tests::ar_offload_moves_exactly_the_ar_weights_on_a_gpu");
 }

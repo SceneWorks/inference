@@ -65,7 +65,8 @@ fn px_frac(a: &[u8], b: &[u8], thr: i32) -> f32 {
 }
 
 #[test]
-#[ignore = "diagnostic: accumulate from my OWN prior (generate's exact flow), compare each step"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "diagnostic: accumulate from my OWN prior (generate's exact flow), compare each step"]
 fn accumulate_from_own_prior() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let steps: usize = g.metadata("steps").unwrap().parse().unwrap();
@@ -82,7 +83,12 @@ fn accumulate_from_own_prior() {
             Some(g.metadata("negative").unwrap()),
         )
         .unwrap();
-    let (conditioning, pooled) = encode_conditioning(&te1, &te2, &tokens).unwrap();
+    let (conditioning, pooled) = (
+        crate::common::record_model_inference_device(),
+        encode_conditioning(&te1, &te2, &tokens),
+    )
+        .1
+        .unwrap();
     let time_ids = text_time_ids(pooled.shape()[0]);
     let unet = load_unet_dtype(&snap, DT).unwrap();
     let sampler = EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, DT).unwrap();
@@ -104,8 +110,11 @@ fn accumulate_from_own_prior() {
         .enumerate()
     {
         let x_unet = mlx_rs::ops::concatenate_axis(&[&lat, &lat], 0).unwrap();
-        let eps = unet
-            .forward(&x_unet, t, &conditioning, &pooled, &time_ids)
+        let eps = (
+            crate::common::record_model_inference_device(),
+            unet.forward(&x_unet, t, &conditioning, &pooled, &time_ids),
+        )
+            .1
             .unwrap();
         let r = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0).unwrap();
         let (et, en) = (r(0), r(1));
@@ -125,10 +134,13 @@ fn accumulate_from_own_prior() {
             peak_rel(&lat, g.require(&format!("step{i}_latents")).unwrap())
         );
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::accumulate_from_own_prior");
 }
 
 #[test]
-#[ignore = "diagnostic: does the mlx-rs global normal stream match the reference draw-for-draw?"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "diagnostic: does the mlx-rs global normal stream match the reference draw-for-draw?"]
 fn rng_stream_matches() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -151,6 +163,8 @@ fn rng_stream_matches() {
             &s.as_slice::<f32>()[..3]
         );
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::rng_stream_matches");
 }
 
 /// Per-step localization gate: teacher-force each step with the golden's previous latent and assert
@@ -158,7 +172,8 @@ fn rng_stream_matches() {
 /// step, and the ancestral-RNG draw) is bit-exact; the public `full_pipeline_generates_fox` then
 /// confirms the accumulated render is pixel-parity (sc-2400 S5).
 #[test]
-#[ignore = "needs the real SDXL snapshot + e2e golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + e2e golden"]
 fn denoise_per_step_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let steps: usize = g.metadata("steps").unwrap().parse().unwrap();
@@ -179,7 +194,12 @@ fn denoise_per_step_matches_golden() {
             },
         )
         .unwrap();
-    let (conditioning, pooled) = encode_conditioning(&te1, &te2, &tokens).unwrap();
+    let (conditioning, pooled) = (
+        crate::common::record_model_inference_device(),
+        encode_conditioning(&te1, &te2, &tokens),
+    )
+        .1
+        .unwrap();
     let time_ids = text_time_ids(pooled.shape()[0]);
     let unet = load_unet_dtype(&snap, DT).unwrap();
     let sampler = EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, DT).unwrap();
@@ -204,8 +224,11 @@ fn denoise_per_step_matches_golden() {
                 .unwrap()
         };
         let x_unet = mlx_rs::ops::concatenate_axis(&[&input, &input], 0).unwrap();
-        let eps = unet
-            .forward(&x_unet, t, &conditioning, &pooled, &time_ids)
+        let eps = (
+            crate::common::record_model_inference_device(),
+            unet.forward(&x_unet, t, &conditioning, &pooled, &time_ids),
+        )
+            .1
             .unwrap();
         let r = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0).unwrap();
         let (et, en) = (r(0), r(1));
@@ -233,10 +256,13 @@ fn denoise_per_step_matches_golden() {
     println!(
         "✓ every denoise step is bit-exact to the reference (worst per-step peak_rel {worst:.3e})"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::denoise_per_step_matches_golden");
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + e2e golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + e2e golden"]
 fn full_pipeline_generates_fox() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let prompt = g.metadata("prompt").unwrap().to_string();
@@ -263,13 +289,16 @@ fn full_pipeline_generates_fox() {
         ..Default::default()
     };
     let mut last = 0u32;
-    let out = model
-        .generate(&req, &mut |p| {
+    let out = (
+        crate::common::record_model_inference_device(),
+        model.generate(&req, &mut |p| {
             if let Progress::Step { current, total } = p {
                 assert_eq!(total, steps);
                 last = last.max(current);
             }
-        })
+        }),
+    )
+        .1
         .unwrap();
     assert_eq!(last, steps, "expected {steps} step events");
 
@@ -331,4 +360,6 @@ fn full_pipeline_generates_fox() {
          check the prior op order, sigma table, and sinusoidal embeddings)",
         frac8 * 100.0
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::full_pipeline_generates_fox");
 }

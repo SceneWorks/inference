@@ -127,15 +127,22 @@ impl StarVector8bAdapter {
             )));
         }
         let features = features.to_dtype(self.fc_weight.dtype())?;
-        let hidden = silu(&linear(&features, &self.fc_weight, Some(&self.fc_bias))?)?;
-        let hidden = linear(&hidden, &self.proj_weight, Some(&self.proj_bias))?;
+        let hidden = silu(&__model_proof_output!(linear(
+            &features,
+            &self.fc_weight,
+            Some(&self.fc_bias)
+        ))?)?;
+        let hidden =
+            __model_proof_output!(linear(&hidden, &self.proj_weight, Some(&self.proj_bias)))?;
         let width = IMAGE_TOKENS * DECODER_HIDDEN;
         let flat = hidden.reshape((batch, width))?;
         let weight = self.norm_weight.reshape(width)?;
         let bias = self.norm_bias.reshape(width)?;
-        Ok(layer_norm(&flat, &weight, &bias, 1e-5)?
-            .reshape((batch, IMAGE_TOKENS, DECODER_HIDDEN))?
-            .to_dtype(dtype)?)
+        Ok(
+            __model_proof_output!(layer_norm(&flat, &weight, &bias, 1e-5))?
+                .reshape((batch, IMAGE_TOKENS, DECODER_HIDDEN))?
+                .to_dtype(dtype)?,
+        )
     }
 }
 
@@ -560,8 +567,14 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 }
 
 fn validate_snapshot(dir: &Path) -> Result<()> {
-    let config: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)
-        .map_err(|error| Error::Config(format!("StarVector-8B config.json: {error}")))?;
+    let config: Value = serde_json::from_str(&crate::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/llm/candle-llm/src/starvector_8b.rs::validate_snapshot::std::fs::read_to_string@22842",
+ArtifactInput,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?)
+    .map_err(|error| Error::Config(format!("StarVector-8B config.json: {error}")))?;
     if !exact_config(&config) {
         return Err(Error::Config(format!(
             "expected exact {SNAPSHOT_REPOSITORY}@{SNAPSHOT_REVISION} config"
@@ -1015,5 +1028,8 @@ mod tests {
             || Box::new(CandleStarVector8bProvider::load(&spec).unwrap()),
             &profile,
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance");
     }
 }

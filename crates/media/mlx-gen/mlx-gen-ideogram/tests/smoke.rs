@@ -76,4 +76,6 @@ fn smoke_generates_image() {
         .save(&out)
         .unwrap();
     println!("wrote {}", out.display());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED smoke::smoke_generates_image");
 }

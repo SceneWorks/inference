@@ -119,6 +119,7 @@ fn run_tiny(w: &Weights, arch: &Sd3Arch, h: i32, ww: i32, ctx_seq: i32) -> Array
     out
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiny_mmdit_x_forward_square_grid_shape_and_finite() {
     let arch = tiny_mmdit_x_arch();
@@ -139,8 +140,11 @@ fn tiny_mmdit_x_forward_square_grid_shape_and_finite() {
         std > 0.0,
         "MMDiT-X predicted latent is not degenerate (std={std})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED medium_transformer::tiny_mmdit_x_forward_square_grid_shape_and_finite");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiny_mmdit_x_forward_nonsquare_grid_exercises_centered_pos_embed_crop() {
     let arch = tiny_mmdit_x_arch();
@@ -151,6 +155,8 @@ fn tiny_mmdit_x_forward_nonsquare_grid_exercises_centered_pos_embed_crop() {
     let (finite, _mean, std) = host_stats(&out);
     assert!(finite, "non-square MMDiT-X predicted latent is finite");
     assert!(std > 0.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED medium_transformer::tiny_mmdit_x_forward_nonsquare_grid_exercises_centered_pos_embed_crop");
 }
 
 /// The load-bearing M2 behavioral test: a dual-attention block's `attn2` residual must genuinely
@@ -158,6 +164,7 @@ fn tiny_mmdit_x_forward_nonsquare_grid_exercises_centered_pos_embed_crop() {
 /// dual block (so the `attn2` residual contributes exactly 0), and assert the output DIFFERS from the
 /// full-weight forward. A regression that drops the `attn2` path entirely (treats a dual block as
 /// plain) would produce the zeroed-`attn2` output for the full weights → this test would catch it.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn dual_attention_residual_changes_output() {
     let arch = tiny_mmdit_x_arch();
@@ -193,11 +200,16 @@ fn dual_attention_residual_changes_output() {
         "zeroing attn2.to_out on the dual blocks must change the output (max|Δ|={max_abs_diff}); \
          the attn2 residual is not being applied"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED medium_transformer::dual_attention_residual_changes_output"
+    );
 }
 
 /// A plain-MMDiT arch (`dual_attention_layers = 0`) must be byte-for-byte the Large topology: no
 /// `attn2` consulted. Reuses the Large tiny arch shape but exercised through the M2 code path to
 /// confirm the dual-attention extension did not regress the plain block.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn plain_blocks_still_run_when_no_dual_layers() {
     let mut arch = tiny_mmdit_x_arch();
@@ -207,6 +219,8 @@ fn plain_blocks_still_run_when_no_dual_layers() {
     assert_eq!(out.shape(), &[1, arch.out_channels as i32, 16, 16]);
     let (finite, _m, std) = host_stats(&out);
     assert!(finite && std > 0.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED medium_transformer::plain_blocks_still_run_when_no_dual_layers");
 }
 
 #[test]
@@ -397,6 +411,8 @@ fn real_weight_medium_forward_shape_finite_stats() {
         std > 1e-3 && std < 1e3,
         "real-weight Medium predicted latent has a sane spread (std={std})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED medium_transformer::real_weight_medium_forward_shape_finite_stats");
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -434,6 +450,10 @@ fn numeric_parity_vs_diffusers_medium() {
     assert!(
         cos >= 0.99,
         "predicted noise cosine vs diffusers {cos} < 0.99"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED medium_transformer::numeric_parity_vs_diffusers_medium"
     );
 }
 

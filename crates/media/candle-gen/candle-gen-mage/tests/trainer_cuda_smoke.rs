@@ -147,16 +147,25 @@ fn run(kind: NetworkType, full: bool) {
 #[ignore = "needs MAGE_BASE_TRAIN_SNAPSHOT and explicitly scheduled CUDA"]
 fn mage_base_lora_real_cuda() {
     run(NetworkType::Lora, false);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::mage_base_lora_real_cuda");
 }
 
 #[test]
 #[ignore = "needs MAGE_BASE_TRAIN_SNAPSHOT and explicitly scheduled CUDA"]
 fn mage_base_lokr_real_cuda() {
     run(NetworkType::Lokr, false);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::mage_base_lokr_real_cuda");
 }
 
 #[test]
 #[ignore = "needs MAGE_BASE_TRAIN_SNAPSHOT and explicitly scheduled CUDA"]
 fn mage_base_full_real_cuda() {
     run(NetworkType::Lora, true);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::mage_base_full_real_cuda");
 }

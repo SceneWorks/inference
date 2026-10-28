@@ -98,6 +98,7 @@ fn save(img: &Image, name: &str) {
 fn turbo_curated_sampler_coherence_survey() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: set BOOGU_TURBO_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in turbo_curated_sampler_coherence_survey; see preceding skip diagnostic");
         return;
     };
     let pipe = BooguPipeline::from_snapshot(&root).expect("load boogu turbo");
@@ -175,4 +176,6 @@ fn turbo_curated_sampler_coherence_survey() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo_curated_smoke::turbo_curated_sampler_coherence_survey");
 }

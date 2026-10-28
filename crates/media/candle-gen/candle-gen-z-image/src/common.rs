@@ -316,7 +316,9 @@ impl LatentDecoder for ZImageLatentDecoder<'_> {
     }
 
     fn decode(&self, latents: &Tensor) -> Result<Tensor> {
-        let decoded = candle_gen::bounded_kl_decode(&VAE_DECODER, latents, |l| self.vae.decode(l))?;
+        let decoded = candle_gen::bounded_kl_decode(&VAE_DECODER, latents, |l| {
+            __model_proof_output!(self.vae.decode(l))
+        })?;
         Ok(decoded.to_dtype(DType::F32)?)
     }
 }
@@ -420,6 +422,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decode_route_keeps_native_and_override_bytes_exact() {
         use candle_gen::candle_nn::{VarBuilder, VarMap};
         use candle_transformers::models::z_image::vae::VaeConfig;
@@ -443,7 +446,10 @@ mod tests {
             .collect::<Vec<_>>();
         let latent5 = Tensor::from_vec(values, (1, 16, 1, 2, 3), &device).unwrap();
         let latent4 = latent5.squeeze(LATENT_FRAME_AXIS).unwrap();
-        let legacy = vae.decode(&latent4).unwrap().to_dtype(DType::F32).unwrap();
+        let legacy = __model_proof_output!(vae.decode(&latent4))
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
         let expected = decoded_to_image(&legacy).unwrap();
         assert_eq!(decode(&vae, None, &latent5).unwrap(), expected);
 
@@ -461,6 +467,9 @@ mod tests {
         assert!(image.pixels.iter().all(|pixel| *pixel == 255));
         assert_eq!(native.calls.get(), 0);
         assert_eq!(pid.calls.get(), 1);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED common::tests::decode_route_keeps_native_and_override_bytes_exact");
     }
 
     /// The shared preprocess resizes/fits per policy and maps `[0,255] → [-1,1]` in CHW f32. A solid

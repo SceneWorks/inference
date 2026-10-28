@@ -42,14 +42,31 @@
 
 pub(crate) mod block_stream;
 pub mod config;
+/// The tiny CPU fixture the base-rev (`91ffb4a81`) goldens were generated from, shared verbatim
+/// with the generator (see `golden_fixture_items.rs`).
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod golden_fixture {
+    use crate::config::{BlockType, DcAeConfig, SanaTransformerConfig};
+    use crate::pipeline::SanaConditioning;
+    use mlx_gen::Image;
+    use mlx_rs::Array;
+    use std::collections::HashMap;
+    include!("golden_fixture_items.rs");
+}
 pub mod convert;
 pub mod dc_ae;
+pub mod ios_pricing;
 pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod preview;
 pub(crate) mod quant;
+pub mod quantum;
+pub mod sampling;
 pub mod scm;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+pub(crate) mod test_metal_guard;
 pub mod text_encoder;
 pub mod transformer;
 
@@ -163,3 +180,7 @@ mod explicit_registry_tests {
         }
     }
 }
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

@@ -160,7 +160,7 @@ impl MultiheadAttention {
 
     fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> CResult<Tensor> {
         let (b, l, width) = x.dims3()?;
-        let qkv = self.in_proj.forward(x)?; // (B, L, 3·width)
+        let qkv = __model_proof_output!(self.in_proj.forward(x))?; // (B, L, 3·width)
         let q = qkv.narrow(D::Minus1, 0, width)?;
         let k = qkv.narrow(D::Minus1, width, width)?;
         let v = qkv.narrow(D::Minus1, 2 * width, width)?;
@@ -174,7 +174,7 @@ impl MultiheadAttention {
         let attn = softmax_last_dim(&attn)?;
         let out = attn.matmul(&v)?; // (B, H, L, hd)
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, l, width))?;
-        self.out_proj.forward(&out)
+        __model_proof_output!(self.out_proj.forward(&out))
     }
 }
 
@@ -204,10 +204,14 @@ impl ResidualAttentionBlock {
     }
 
     fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> CResult<Tensor> {
-        let x = (x + self.attn.forward(&self.ln_1.forward(x)?, mask)?)?;
-        let h = self
+        let x = (x + self
+            .attn
+            .forward(&__model_proof_output!(self.ln_1.forward(x))?, mask)?)?;
+        let h = __model_proof_output!(self
             .c_proj
-            .forward(&quick_gelu(&self.c_fc.forward(&self.ln_2.forward(&x)?)?)?)?;
+            .forward(&quick_gelu(&__model_proof_output!(self
+                .c_fc
+                .forward(&__model_proof_output!(self.ln_2.forward(&x))?))?)?))?;
         x + h
     }
 }
@@ -269,7 +273,7 @@ impl VisionTower {
     /// `ln_post`. Returns the post-`ln_post` sequence `(B, 730, width)`.
     fn hidden_states(&self, pixels: &Tensor) -> CResult<Tensor> {
         let b = pixels.dim(0)?;
-        let x = self.conv1.forward(pixels)?; // (B, width, 27, 27)
+        let x = __model_proof_output!(self.conv1.forward(pixels))?; // (B, width, 27, 27)
         let x = x.flatten_from(2)?.transpose(1, 2)?.contiguous()?; // (B, 729, width)
         let cls = self
             .class_embedding
@@ -277,11 +281,11 @@ impl VisionTower {
             .broadcast_as((b, 1, VISION_WIDTH))?;
         let x = Tensor::cat(&[&cls, &x], 1)?; // (B, 730, width)
         let x = x.broadcast_add(&self.positional_embedding.unsqueeze(0)?)?;
-        let mut x = self.ln_pre.forward(&x)?;
+        let mut x = __model_proof_output!(self.ln_pre.forward(&x))?;
         for blk in &self.blocks {
             x = blk.forward(&x, None)?;
         }
-        self.ln_post.forward(&x)
+        __model_proof_output!(self.ln_post.forward(&x))
     }
 }
 
@@ -379,7 +383,7 @@ impl DfnClipEncoder {
     /// `text_projection`, no EOT pooling). Ids must be `CONTEXT_LENGTH`-wide (see [`tokenize`]).
     pub fn encode_text(&self, token_ids: &Tensor) -> CResult<Tensor> {
         let l = token_ids.dim(D::Minus1)?;
-        let x = self.text.token_embedding.forward(token_ids)?; // (B, L, width)
+        let x = __model_proof_output!(self.text.token_embedding.forward(token_ids))?; // (B, L, width)
         let pos = self
             .text
             .positional_embedding
@@ -390,7 +394,7 @@ impl DfnClipEncoder {
         for blk in &self.text.blocks {
             x = blk.forward(&x, Some(&mask))?;
         }
-        let x = self.text.ln_final.forward(&x)?;
+        let x = __model_proof_output!(self.text.ln_final.forward(&x))?;
         l2_normalize(&x)
     }
 }

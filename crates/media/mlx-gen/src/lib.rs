@@ -44,6 +44,9 @@ pub mod coherence;
 pub mod convrot_int8;
 pub mod error;
 pub mod img2img;
+pub mod ios_anchor_law;
+pub mod ios_pricing;
+pub mod ios_quantum;
 pub mod logical_weights;
 pub mod memory;
 pub mod mllm;
@@ -157,3 +160,10 @@ pub use transform::{
     InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,
     TransformRequest,
 };
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

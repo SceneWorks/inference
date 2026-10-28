@@ -14,6 +14,10 @@ use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 
+/// The input-pixel tile edge of the bounded encode on iOS (sc-26433, as SDXL's): every
+/// full-resolution encoder convolution works on at most this many pixels a side (plus its halo).
+pub const IOS_ENCODE_TILE_PX: i32 = 256;
+
 /// Per-up-block `(num_resnet_layers, add_upsample)`.
 #[derive(Debug, Clone)]
 pub struct VaeDecoderConfig {
@@ -81,8 +85,46 @@ impl Decoder {
     /// changing the whole image. Cheap at latent resolution, so running it full adds no meaningful
     /// memory over the single-pass decode.
     pub fn forward_pre_upsample(&self, latents: &Array) -> Result<Array> {
-        let h = self.conv_in.forward(latents)?;
+        self.forward_pre_upsample_with(latents, 0, |x| self.conv_in.forward(x))
+    }
+
+    /// [`Self::forward_pre_upsample`] whose `conv_in` quantum runs `conv_in` (`build`, which may
+    /// first derive its input — the latent de-normalization) at `extra_bytes` on top of the
+    /// convolution's price ([`mlx_gen::ios_quantum::single_conv_bytes`] over `latents`).
+    pub(crate) fn forward_pre_upsample_with(
+        &self,
+        latents: &Array,
+        extra_bytes: u64,
+        build: impl FnOnce(&Array) -> Result<Array>,
+    ) -> Result<Array> {
+        let h = self.conv_in_quantum(latents, extra_bytes, build)?;
         self.mid_block.forward(&h)
+    }
+
+    /// The decoder's `conv_in` (`build`) as one bounded iOS quantum, priced by
+    /// [`mlx_gen::ios_quantum::single_conv_bytes`] over `latents` at the f32 width it runs at, plus
+    /// `extra_bytes`.
+    pub(crate) fn conv_in_quantum(
+        &self,
+        latents: &Array,
+        extra_bytes: u64,
+        build: impl FnOnce(&Array) -> Result<Array>,
+    ) -> Result<Array> {
+        crate::quantum::conv_quantum(
+            crate::quantum::VAE_DECODE_IN,
+            |backend| {
+                let call = mlx_gen::ios_quantum::ConvCall::new(
+                    &crate::quantum::nhwc(latents),
+                    latents.item_size().max(4) as u64,
+                    self.conv_in.weight(),
+                    1,
+                    1,
+                );
+                mlx_gen::ios_quantum::single_conv_bytes(&call, 0, 0, backend)
+                    .saturating_add(extra_bytes)
+            },
+            || build(latents),
+        )
     }
 
     /// The dense **upsample tail**: `up_blocks → conv_norm_out → SiLU → conv_out`. Convolutions are
@@ -95,9 +137,40 @@ impl Decoder {
         for up in &self.up_blocks {
             h = up.forward(&h)?;
         }
-        h = self.conv_norm_out.forward(&h)?;
-        h = silu(&h)?;
-        self.conv_out.forward(&h)
+        self.out_quantum(&h)
+    }
+
+    /// `(conv_in, mid block, up blocks, conv_out)` (the iOS pricing walks them).
+    pub(crate) fn parts(&self) -> (&ConvLayer, &UNetMidBlock, &[UpDecoderBlock], &ConvLayer) {
+        (
+            &self.conv_in,
+            &self.mid_block,
+            &self.up_blocks,
+            &self.conv_out,
+        )
+    }
+
+    /// The output GroupNorm + SiLU + `conv_out` as one bounded iOS quantum
+    /// ([`mlx_gen::ios_quantum::norm_conv_bytes`]).
+    pub(crate) fn out_quantum(&self, h: &Array) -> Result<Array> {
+        crate::quantum::conv_quantum(
+            crate::quantum::VAE_DECODE_OUT,
+            |backend| {
+                let call = mlx_gen::ios_quantum::ConvCall::new(
+                    &crate::quantum::nhwc(h),
+                    h.item_size() as u64,
+                    self.conv_out.weight(),
+                    1,
+                    1,
+                );
+                mlx_gen::ios_quantum::norm_conv_bytes(&call, backend)
+            },
+            || {
+                let h = self.conv_norm_out.forward(h)?;
+                let h = silu(&h)?;
+                self.conv_out.forward(&h)
+            },
+        )
     }
 
     /// Layer-wise bounded tail with full-image GroupNorm statistics (sc-19753).
@@ -234,7 +307,56 @@ impl Vae {
         } else {
             image.clone()
         };
-        let h = encoder.forward(&image4)?; // [1, 2C, H/8, W/8]
+        // iOS: the bounded encode at `IOS_ENCODE_TILE_PX` (an image that fits one tile takes the
+        // whole-image encode); everywhere else the historical whole-image encode, byte for byte.
+        let (h, w) = (image4.shape()[2], image4.shape()[3]);
+        if mlx_gen::ios_quantum::enabled() && (h > IOS_ENCODE_TILE_PX || w > IOS_ENCODE_TILE_PX) {
+            return self.encode_tiled(&image4, IOS_ENCODE_TILE_PX, None);
+        }
+        encoder.forward_then(&image4, Self::latent_mean_bytes(&image4), |h| {
+            self.latent_mean(h)
+        })
+    }
+
+    /// The bounded encode ([`Encoder::forward_tiled_then`]) of an NCHW image at `tile_px` input
+    /// pixels a side, mapped to latent space like [`Self::encode`].
+    pub(crate) fn encode_tiled(
+        &self,
+        image4: &Array,
+        tile_px: i32,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        let encoder = self.encoder.as_ref().ok_or_else(|| {
+            Error::Msg("z_image VAE encoder not loaded (img2img unavailable)".into())
+        })?;
+        encoder.forward_tiled_then(
+            image4,
+            tile_px,
+            cancel,
+            Self::latent_mean_bytes(image4),
+            |h| self.latent_mean(h),
+        )
+    }
+
+    /// The latent mean's price inside the encoder's output-head quantum: the selected half and the
+    /// two affine products (`[B, C, h, w]`, f32) for an image of `image4`'s shape.
+    pub(crate) fn latent_mean_bytes(image4: &Array) -> u64 {
+        let sh4 = image4.shape();
+        3 * crate::quantum::tb(
+            4,
+            &[
+                crate::quantum::u(sh4[0]),
+                crate::quantum::u(crate::pipeline::LATENT_CHANNELS),
+                crate::quantum::u(sh4[2] / 8),
+                crate::quantum::u(sh4[3] / 8),
+            ],
+        )
+    }
+
+    /// The encoder output's distribution mean (first half of the channels) mapped into latent space,
+    /// `(mean - shift) * scaling`.
+    pub(crate) fn latent_mean(&self, h: Array) -> Result<Array> {
+        // h: [1, 2C, H/8, W/8]
         if h.shape()[1] % 2 != 0 {
             return Err(Error::Msg(format!(
                 "z-image vae encode: expected an even (2C: mean|logvar) channel count, got {}",
@@ -259,14 +381,10 @@ impl Vae {
         } else {
             latents.clone()
         };
-        let scaled = add(
-            &multiply(
-                &latents4,
-                Array::from_slice(&[1.0 / self.scaling_factor], &[1]),
-            )?,
-            Array::from_slice(&[self.shift_factor], &[1]),
-        )?;
-        let decoded = self.decoder.forward(&scaled)?;
+        // `decode_pre_upsample` (de-normalize → conv_in → mid-block) then the upsample tail is exactly
+        // `decoder.forward` over the de-normalized latent, split so each stage is an iOS quantum.
+        let head = self.decode_pre_upsample(&latents4)?;
+        let decoded = self.decoder.forward_upsample_tail(&head)?;
         let d = decoded.shape();
         Ok(decoded.reshape(&[d[0], d[1], 1, d[2], d[3]])?) // restore frame axis
     }
@@ -281,14 +399,32 @@ impl Vae {
         } else {
             latents.clone()
         };
-        let scaled = add(
-            &multiply(
-                &latents4,
-                Array::from_slice(&[1.0 / self.scaling_factor], &[1]),
-            )?,
-            Array::from_slice(&[self.shift_factor], &[1]),
-        )?;
-        self.decoder.forward_pre_upsample(&scaled)
+        let h = self.decode_in_quantum(&latents4)?;
+        self.decoder.mid_block.forward(&h)
+    }
+
+    /// The latent de-normalization's price over `elements` latent elements: its two latent-sized
+    /// products (f32 — the scalars promote).
+    pub(crate) fn denorm_bytes(elements: u64) -> u64 {
+        2 * crate::quantum::tb(4, &[elements])
+    }
+
+    /// The latent de-normalization (`z/scale + shift`) and the decoder's `conv_in` as one iOS
+    /// quantum: the convolution's price plus the de-normalization's two latent-sized products (f32 —
+    /// the scalars promote).
+    pub(crate) fn decode_in_quantum(&self, latents4: &Array) -> Result<Array> {
+        let denorm_bytes = Self::denorm_bytes(latents4.size() as u64);
+        self.decoder
+            .conv_in_quantum(latents4, denorm_bytes, |latents4| {
+                let scaled = add(
+                    &multiply(
+                        latents4,
+                        Array::from_slice(&[1.0 / self.scaling_factor], &[1]),
+                    )?,
+                    Array::from_slice(&[self.shift_factor], &[1]),
+                )?;
+                self.decoder.conv_in.forward(&scaled)
+            })
     }
 
     /// **Tiled** decode (sc-13571, GitHub #1658) for a memory-bounded large-image decode. The single-pass
@@ -335,6 +471,11 @@ impl Vae {
             .forward_upsample_tail_tiled(&head4, tile_edge, cancel)?;
         let os = out4.shape();
         Ok(out4.reshape(&[os[0], os[1], 1, os[2], os[3]])?)
+    }
+
+    /// The img2img encoder, when loaded (the iOS pricing and accounting proofs).
+    pub(crate) fn encoder(&self) -> Option<&Encoder> {
+        self.encoder.as_ref()
     }
 
     pub fn decoder(&self) -> &Decoder {

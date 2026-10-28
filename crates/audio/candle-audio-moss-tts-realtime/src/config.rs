@@ -107,7 +107,12 @@ impl MossTtsRealtimeConfig {
         let path = dir.join("config.json");
         let text = std::fs::read_to_string(&path)
             .map_err(|e| AudioError::Msg(format!("read {}: {e}", path.display())))?;
-        Self::from_json(&text)
+        candle_audio::gen_core::__model_input_result!(
+            Self::from_json(&text),
+            "candle-audio-moss-tts-realtime::config::MossTtsRealtimeConfig::from_dir",
+            Configuration,
+            &[&path]
+        )
     }
 
     /// Parse a `config.json` document.

@@ -108,10 +108,16 @@ fn run(kind: NetworkType) {
 #[ignore = "needs ANIMA_TRAIN_SNAPSHOT and explicitly scheduled CUDA"]
 fn anima_base_lora_real_cuda() {
     run(NetworkType::Lora);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::anima_base_lora_real_cuda");
 }
 
 #[test]
 #[ignore = "needs ANIMA_TRAIN_SNAPSHOT and explicitly scheduled CUDA"]
 fn anima_base_lokr_real_cuda() {
     run(NetworkType::Lokr);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::anima_base_lokr_real_cuda");
 }

@@ -89,4 +89,6 @@ fn memory_encoder_matches_oracle() {
     let co = cosine(&out_occ.features, &expected_occ);
     println!("occlusion-add: cosine={co:.7}");
     assert!(co > 0.999, "occlusion-add cosine {co}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_parity::memory_encoder_matches_oracle");
 }

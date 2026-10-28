@@ -27,16 +27,31 @@ pub struct Conditioning {
 /// negative prompt run through the same template — `""` is the training-dropout null — and is only
 /// encoded when CFG is on.
 pub fn encode(te: &IrisTextEncoder, params: &GenerationParams) -> Result<Conditioning> {
+    encode_in(te, params, None, &CancelFlag::default())
+}
+
+/// [`encode`] with a streamed tower's layer window (rung 4) and the request's cancel flag.
+pub fn encode_in(
+    te: &IrisTextEncoder,
+    params: &GenerationParams,
+    layer_window: Option<usize>,
+    cancel: &CancelFlag,
+) -> Result<Conditioning> {
     let mut warnings = Vec::new();
     let mut cond = Vec::with_capacity(params.prompts.len());
     for prompt in &params.prompts {
-        let (c, warning) = te.encode_with_policy(prompt, params.caption_overflow)?;
+        let (c, warning) =
+            te.encode_with_policy_in(prompt, params.caption_overflow, layer_window, cancel)?;
         warnings.extend(warning);
         cond.push(c);
     }
     let uncond = if params.uses_cfg() {
-        let (u, warning) =
-            te.encode_with_policy(&params.negative_prompt, params.caption_overflow)?;
+        let (u, warning) = te.encode_with_policy_in(
+            &params.negative_prompt,
+            params.caption_overflow,
+            layer_window,
+            cancel,
+        )?;
         warnings.extend(warning);
         Some(u)
     } else {
@@ -79,9 +94,69 @@ pub fn denoise(
     noise: &Array,
     params: &GenerationParams,
     cancel: &CancelFlag,
-    mut on_step: impl FnMut(usize),
+    on_step: impl FnMut(usize),
     preview: &PreviewSink,
 ) -> Result<Array> {
+    denoise_budgeted(
+        dit,
+        flow,
+        conditioning,
+        noise,
+        params,
+        cancel,
+        on_step,
+        preview,
+        mlx_gen::AttentionBudget::UNBOUNDED,
+    )
+}
+
+/// Solver with a bounded-attention forward, leaving the legacy/training API unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_budgeted(
+    dit: &IrisDiT,
+    flow: &FlowConfig,
+    conditioning: &Conditioning,
+    noise: &Array,
+    params: &GenerationParams,
+    cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+    preview: &PreviewSink,
+    budget: mlx_gen::AttentionBudget,
+) -> Result<Array> {
+    denoise_in(
+        dit,
+        flow,
+        conditioning,
+        noise,
+        params,
+        cancel,
+        on_step,
+        preview,
+        budget,
+        None,
+        false,
+    )
+}
+
+/// [`denoise_budgeted`] with rung 4's backbone window (`None`: a streamed backbone's whole-stack
+/// window; a resident backbone ignores it) and rung 3's per-row pixel stage
+/// ([`crate::dit::Execution`]).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_in(
+    dit: &IrisDiT,
+    flow: &FlowConfig,
+    conditioning: &Conditioning,
+    noise: &Array,
+    params: &GenerationParams,
+    cancel: &CancelFlag,
+    mut on_step: impl FnMut(usize),
+    preview: &PreviewSink,
+    budget: mlx_gen::AttentionBudget,
+    window: Option<usize>,
+    pixel_rows: bool,
+) -> Result<Array> {
+    let plan_metadata = params.plan_metadata()?;
+    mlx_gen::ios_quantum::before(crate::solver::PLAN_QUANTUM, plan_metadata.host_bytes()?)?;
     let plan = params.plan()?;
     let rows = conditioning.cond.len();
     if rows == 0 || noise.shape()[0] as usize != rows {
@@ -123,7 +198,9 @@ pub fn denoise(
         .chain(std::iter::once(0.0))
         .collect();
     let counter = PreviewCounter::new(&sigmas);
+    mlx_gen::ios_quantum::finish(crate::solver::PLAN_QUANTUM, &[])?;
     let patch = dit.config().patch_size;
+    let mut evaluations = 0u64;
     let x = sample(
         noise,
         &plan,
@@ -135,15 +212,55 @@ pub fn denoise(
                 Some(batch) if params.cfg_at(step) => {
                     let xb = concatenate_axis(&[x, x], 0)?;
                     let tb = Array::from_slice(&vec![t; 2 * rows], &[2 * rows as i32]);
-                    let out = dit.forward(&xb, &tb, batch)?;
+                    evaluations += 1;
+                    mlx_gen::ios_quantum::diagnostic_metadata(
+                        crate::model::MODEL_ID,
+                        "forward",
+                        &[
+                            ("evaluation", evaluations),
+                            ("rows", xb.shape()[0] as u64),
+                            ("conditioning_rows", batch.states.shape()[0] as u64),
+                            ("guided", 1),
+                            ("input_f32", u64::from(xb.dtype() == mlx_rs::Dtype::Float32)),
+                        ],
+                    );
+                    let out = dit.forward_exec(
+                        &xb,
+                        &tb,
+                        batch,
+                        crate::dit::Execution {
+                            plan: mlx_gen::AttentionPlan::budgeted(budget).with_cancel(cancel),
+                            window,
+                            pixel_rows,
+                        },
+                    )?;
                     let halves = out.split(2, 0)?;
                     cfg_combine(&halves[0], &halves[1], params.cfg_scale)
                 }
-                _ => dit.forward(
-                    x,
-                    &Array::from_slice(&vec![t; rows], &[rows as i32]),
-                    &cond_text,
-                ),
+                _ => {
+                    evaluations += 1;
+                    mlx_gen::ios_quantum::diagnostic_metadata(
+                        crate::model::MODEL_ID,
+                        "forward",
+                        &[
+                            ("evaluation", evaluations),
+                            ("rows", x.shape()[0] as u64),
+                            ("conditioning_rows", cond_text.states.shape()[0] as u64),
+                            ("guided", 0),
+                            ("input_f32", u64::from(x.dtype() == mlx_rs::Dtype::Float32)),
+                        ],
+                    );
+                    dit.forward_exec(
+                        x,
+                        &Array::from_slice(&vec![t; rows], &[rows as i32]),
+                        &cond_text,
+                        crate::dit::Execution {
+                            plan: mlx_gen::AttentionPlan::budgeted(budget).with_cancel(cancel),
+                            window,
+                            pixel_rows,
+                        },
+                    )
+                }
             }
         },
         |i, x0| {
@@ -153,7 +270,19 @@ pub fn denoise(
             });
         },
     )?;
-    Ok(clip(&x, (-1.0f32, 1.0f32))?)
+    // Do not leave the final clamp lazy across the denoise/decode boundary: it allocates while
+    // this solve still holds its text batches, and belongs to the denoise's live set.
+    let solved = mlx_gen::ios_quantum::run(
+        crate::solver::FINALIZE_QUANTUM,
+        crate::solver::final_clamp_scratch(x.size() as u64),
+        || Ok(clip(&x, (-1.0f32, 1.0f32))?),
+    )?;
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        crate::model::MODEL_ID,
+        "solve_complete",
+        &[("evaluations", evaluations), ("steps", plan.len() as u64)],
+    );
+    Ok(solved)
 }
 
 /// The exact RGB decode of a pixel-space prediction (`(x + 1)/2`, clamped) as a preview projection.

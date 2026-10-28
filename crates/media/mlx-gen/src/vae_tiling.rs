@@ -67,12 +67,17 @@ impl GlobalGroupNorm {
         }
 
         let group_size = channels / groups;
-        let grouped = x
-            .reshape(&[batch, height, width, groups, group_size])?
-            .transpose_axes(&[0, 3, 1, 2, 4])?;
-        let mean = grouped.mean_axes(&[2, 3, 4], Some(true))?;
-        let variance = grouped.var_axes(&[2, 3, 4], Some(true), None)?;
-        let inv_std = rsqrt(&add(&variance, scalar(eps))?)?;
+        let (mean, inv_std) = if x.dtype() == mlx_rs::Dtype::Float16 {
+            half_precision_group_stats(x, groups, eps, HALF_STATS_CHUNK_ELEMS)?
+        } else {
+            let grouped = x
+                .reshape(&[batch, height, width, groups, group_size])?
+                .transpose_axes(&[0, 3, 1, 2, 4])?;
+            let mean = grouped.mean_axes(&[2, 3, 4], Some(true))?;
+            let variance = grouped.var_axes(&[2, 3, 4], Some(true), None)?;
+            let inv_std = rsqrt(&add(&variance, scalar(eps))?)?;
+            (mean, inv_std)
+        };
         mean.eval()?;
         inv_std.eval()?;
 
@@ -103,8 +108,82 @@ impl GlobalGroupNorm {
         let normalized = multiply(&subtract(&grouped, &self.mean)?, &self.inv_std)?
             .transpose_axes(&[0, 2, 3, 1, 4])?
             .reshape(&[batch, height, width, self.channels])?;
-        Ok(add(&multiply(&normalized, &self.weight)?, &self.bias)?)
+        let out = add(&multiply(&normalized, &self.weight)?, &self.bias)?;
+        // f16 statistics are held at f32 (see `half_precision_group_stats`); hand the crop back at
+        // its own dtype so the following convolution stays at the decoder's compute width.
+        if tile.dtype() == mlx_rs::Dtype::Float16 && out.dtype() != tile.dtype() {
+            Ok(out.as_dtype(tile.dtype())?)
+        } else {
+            Ok(out)
+        }
     }
+}
+
+/// Elements one statistics pass reads per evaluated row chunk (16 Mi, a 64 MiB f32 transient).
+const HALF_STATS_CHUNK_ELEMS: i64 = 1 << 24;
+
+/// Per-batch/per-group mean and inverse standard deviation of an **f16** NHWC activation, accumulated
+/// at f32 over bounded row chunks (sc-26268).
+///
+/// An f16 variance taken in place is not safe: `var_axes` squares the activation, and a decoder
+/// activation of magnitude ≥ 256 squares past f16's 65 504 ceiling. The dense decode never meets that,
+/// because `nn::group_norm` reduces through MLX's fused layer norm, which accumulates at f32. This
+/// matches it. Upcasting the whole activation would materialize a full-resolution f32 copy (512 MiB
+/// for SDXL's 128-channel layer at 1024²) — exactly the transient a bounded decode exists to avoid —
+/// so both passes (mean, then the centred second moment, the numerically stable two-pass form) walk
+/// row chunks of at most [`HALF_STATS_CHUNK_ELEMS`] elements. f32 and bf16 callers never reach this,
+/// so their statistics are byte-identical to before.
+fn half_precision_group_stats(
+    x: &Array,
+    groups: i32,
+    eps: f32,
+    chunk_elems: i64,
+) -> Result<(Array, Array)> {
+    let shape = x.shape();
+    let (batch, height, width, channels) = (shape[0], shape[1], shape[2], shape[3]);
+    let group_size = channels / groups;
+    let row_elems = i64::from(width) * i64::from(channels) * i64::from(batch);
+    let rows_per_chunk = (chunk_elems / row_elems.max(1)).clamp(1, i64::from(height)) as i32;
+    let count = f64::from(height) * f64::from(width) * f64::from(group_size);
+    let chunks = (0..height)
+        .step_by(rows_per_chunk as usize)
+        .map(|y0| (y0, (y0 + rows_per_chunk).min(height)))
+        .collect::<Vec<_>>();
+    let grouped_f32 = |y0: i32, y1: i32| -> Result<Array> {
+        Ok(slice_axis(x, 1, y0, y1)?
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .reshape(&[batch, y1 - y0, width, groups, group_size])?
+            .transpose_axes(&[0, 3, 1, 2, 4])?)
+    };
+    let mut sum: Option<Array> = None;
+    for &(y0, y1) in &chunks {
+        let part = grouped_f32(y0, y1)?.sum_axes(&[2, 3, 4], Some(true))?;
+        let next = match sum.take() {
+            Some(acc) => add(&acc, &part)?,
+            None => part,
+        };
+        next.eval()?;
+        sum = Some(next);
+    }
+    let sum = sum.ok_or_else(|| Error::Msg("global group norm: empty activation".into()))?;
+    let mean = divide(&sum, scalar(count as f32))?;
+    mean.eval()?;
+    let mut centred: Option<Array> = None;
+    for &(y0, y1) in &chunks {
+        let deviation = subtract(&grouped_f32(y0, y1)?, &mean)?;
+        let part = multiply(&deviation, &deviation)?.sum_axes(&[2, 3, 4], Some(true))?;
+        let next = match centred.take() {
+            Some(acc) => add(&acc, &part)?,
+            None => part,
+        };
+        next.eval()?;
+        centred = Some(next);
+    }
+    let centred =
+        centred.ok_or_else(|| Error::Msg("global group norm: empty activation".into()))?;
+    let variance = divide(&centred, scalar(count as f32))?;
+    let inv_std = rsqrt(&add(&variance, scalar(eps))?)?;
+    Ok((mean, inv_std))
 }
 
 /// Apply one NHWC 3×3/pad-1 convolution with bounded spatial work and exact convolution halos.
@@ -121,6 +200,36 @@ pub fn tiled_conv2d_3x3_nhwc(
     max_tile_edge: i32,
     cancel: Option<&CancelFlag>,
     preprocess: impl Fn(&Array) -> Result<Array>,
+) -> Result<Array> {
+    tiled_conv2d_3x3_impl(x, weight, bias, max_tile_edge, cancel, preprocess, false)
+}
+
+/// The same spatial cores and halos as [`tiled_conv2d_3x3_nhwc`], with each convolution computed
+/// at f32 and each cropped output core cast back to the input's storage dtype BEFORE assembly.
+/// This prevents f16 intermediate accumulation overflow for unnormalized, high-range decoder
+/// activations (e.g. SDXL's upsample convolution). Only a single tile is promoted, never the full
+/// activation/output. Norm/activation preprocessing retains its original arithmetic width.
+/// The f32 weight/bias views are shared by all tiles in this call.
+pub fn tiled_conv2d_3x3_nhwc_f32_accum(
+    x: &Array,
+    weight: &Array,
+    bias: Option<&Array>,
+    max_tile_edge: i32,
+    cancel: Option<&CancelFlag>,
+    preprocess: impl Fn(&Array) -> Result<Array>,
+) -> Result<Array> {
+    tiled_conv2d_3x3_impl(x, weight, bias, max_tile_edge, cancel, preprocess, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tiled_conv2d_3x3_impl(
+    x: &Array,
+    weight: &Array,
+    bias: Option<&Array>,
+    max_tile_edge: i32,
+    cancel: Option<&CancelFlag>,
+    preprocess: impl Fn(&Array) -> Result<Array>,
+    f32_accum: bool,
 ) -> Result<Array> {
     let shape = x.shape();
     if shape.len() != 4 {
@@ -141,11 +250,38 @@ pub fn tiled_conv2d_3x3_nhwc(
     }
     let (batch, height, width) = (shape[0], shape[1], shape[2]);
     let out_channels = weight_shape[0];
+    let wide_weight = f32_accum
+        .then(|| weight.as_dtype(mlx_rs::Dtype::Float32))
+        .transpose()?;
+    let wide_bias = if f32_accum {
+        bias.map(|b| b.as_dtype(mlx_rs::Dtype::Float32))
+            .transpose()?
+    } else {
+        None
+    };
+    let weight = wide_weight.as_ref().unwrap_or(weight);
+    let bias = wide_bias.as_ref().or(bias);
+    let convolve = |tile: &Array| -> Result<Array> {
+        let tile = preprocess(tile)?;
+        let tile = if f32_accum {
+            tile.as_dtype(mlx_rs::Dtype::Float32)?
+        } else {
+            tile
+        };
+        crate::nn::conv2d(&tile, weight, bias, 1, 1)
+    };
+    let to_storage = |a: Array| -> Result<Array> {
+        if f32_accum {
+            Ok(a.as_dtype(x.dtype())?)
+        } else {
+            Ok(a)
+        }
+    };
     if height <= max_tile_edge && width <= max_tile_edge {
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(Error::Canceled);
         }
-        return crate::nn::conv2d(&preprocess(x)?, weight, bias, 1, 1);
+        return to_storage(convolve(x)?);
     }
 
     const HALO: i32 = 1;
@@ -168,13 +304,19 @@ pub fn tiled_conv2d_3x3_nhwc(
 
             let tile = slice_axis(x, 1, input_y0, input_y1)?;
             let tile = slice_axis(&tile, 2, input_x0, input_x1)?;
-            let tile = preprocess(&tile)?;
-            let convolved = crate::nn::conv2d(&tile, weight, bias, 1, 1)?;
+            let convolved = convolve(&tile)?;
             let crop_y0 = y0 - input_y0;
             let crop_x0 = x0 - input_x0;
             let core = slice_axis(&convolved, 1, crop_y0, crop_y0 + (y1 - y0))?;
             let core = slice_axis(&core, 2, crop_x0, crop_x0 + (x1 - x0))?;
+            // Cast per core, not after concatenate: the full assembled image stays at storage width.
+            let core = to_storage(core)?;
             core.eval()?;
+            // iOS: synchronize and drain each core before the next tile's graph is built (a no-op
+            // off device, where `core.eval()` above is the whole barrier).
+            if crate::ios_quantum::enabled() {
+                crate::ios_quantum::finish("tiled conv core", &[&core])?;
+            }
             cores.push(core);
             x0 = x1;
         }
@@ -456,9 +598,35 @@ pub fn tiled_decode_with_hooks(
     plan: &TilePlan,
     axes: [i32; 3],
     cancel: Option<&CancelFlag>,
+    decode_tile: impl FnMut(&Array) -> Result<Array>,
+    materialize: impl FnMut(&[&Array]) -> Result<()>,
+    release: impl FnMut(),
+) -> Result<Array> {
+    tiled_decode_with_finalizer(
+        denorm,
+        plan,
+        axes,
+        cancel,
+        decode_tile,
+        materialize,
+        release,
+        |_| Ok(()),
+    )
+}
+
+/// [`tiled_decode_with_hooks`] plus `before_finalize`, called once with the folded output after the
+/// last tile and BEFORE the normalizer/maximum/division/contiguous graph is constructed. Its error
+/// returns without building that final graph. Cancellation is also observed at this boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn tiled_decode_with_finalizer(
+    denorm: &Array,
+    plan: &TilePlan,
+    axes: [i32; 3],
+    cancel: Option<&CancelFlag>,
     mut decode_tile: impl FnMut(&Array) -> Result<Array>,
     mut materialize: impl FnMut(&[&Array]) -> Result<()>,
     mut release: impl FnMut(),
+    before_finalize: impl FnOnce(&Array) -> Result<()>,
 ) -> Result<Array> {
     let [t_ax, h_ax, w_ax] = axes;
     let mut coverage = AxisCoverage::new(plan);
@@ -601,16 +769,168 @@ pub fn tiled_decode_with_hooks(
     }
 
     let output = t_acc.ok_or_else(|| Error::Msg("vae tiled decode: plan had no tiles".into()))?;
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(Error::Canceled);
+    }
+    before_finalize(&output)?;
     let normalizer = coverage.normalizer(output.shape().len(), axes)?;
     // sc-12748: int64-safe contiguity (the assembled output can exceed i32::MAX — a single-dim
     // reshape(-1) would raise; `array::contiguous` flattens via a 2-D split instead).
     crate::array::contiguous(&divide(&output, &maximum(&normalizer, scalar(1e-8))?)?)
 }
 
+/// The encoder's asymmetric-pad stride-2 downsample (`pad (0,1)·(0,1)` then a 3x3 stride-2 pad-0
+/// convolution) over output cores of at most `tile` pixels a side, as the bounded encode runs it
+/// (sc-26270). Output pixel `r` reads padded input rows `2r ..= 2r + 2`, so a core `[y0, y1)` reads
+/// input rows `[2·y0, 2·y1]`: the crop is cut from the unpadded input and zero-padded at the bottom
+/// / right edge only where it reaches the padding row or column — the exact halo, so every output
+/// pixel convolves exactly the values the whole-image call does. Each core is evaluated (and, on
+/// iOS, synchronized) before the next tile is built; rows are assembled, then the image. One tiled
+/// iOS stage `stage_label` ([`crate::ios_quantum::downsample_stage_bytes`]); every tile is checked
+/// as `tile_label` before its graph ([`crate::ios_quantum::downsample_tile_bytes`]). The guards are
+/// pass-throughs off device. Shared by the SDXL and Z-Image bounded encodes.
+pub fn downsample_tiled_nhwc(
+    x: &Array,
+    weight: &Array,
+    bias: &Array,
+    tile: i32,
+    cancel: Option<&CancelFlag>,
+    stage_label: &str,
+    tile_label: &str,
+) -> Result<Array> {
+    use crate::attention::slice_axis;
+    let s = x.shape();
+    let (h, w) = (s[1], s[2]);
+    // Padded extent H+1, k3, stride 2, pad 0.
+    let (oh, ow) = ((h - 2) / 2 + 1, (w - 2) / 2 + 1);
+    let core = tile.max(1);
+    let act = crate::ios_quantum::element_bytes(x);
+    crate::ios_quantum::before(
+        stage_label,
+        crate::ios_quantum::downsample_stage_bytes(&[s[0], oh, ow, weight.shape()[0]], act),
+    )?;
+    let mut rows = Vec::new();
+    let mut y0 = 0;
+    while y0 < oh {
+        let y1 = (y0 + core).min(oh);
+        let (in_y0, need_h) = (2 * y0, 2 * (y1 - y0) + 1);
+        let have_h = need_h.min(h - in_y0);
+        let mut cores = Vec::new();
+        let mut x0 = 0;
+        while x0 < ow {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(Error::Canceled);
+            }
+            let x1 = (x0 + core).min(ow);
+            let (in_x0, need_w) = (2 * x0, 2 * (x1 - x0) + 1);
+            let have_w = need_w.min(w - in_x0);
+            let crop_shape = [s[0], need_h, need_w, s[3]];
+            crate::ios_quantum::before(
+                tile_label,
+                crate::ios_quantum::downsample_tile_bytes(
+                    &crop_shape,
+                    act,
+                    weight,
+                    crate::ios_quantum::Backend::current(),
+                ),
+            )?;
+            let crop = slice_axis(&slice_axis(x, 1, in_y0, have_h)?, 2, in_x0, have_w)?;
+            let crop = pad(
+                &crop,
+                &[(0, 0), (0, need_h - have_h), (0, need_w - have_w), (0, 0)][..],
+                None,
+                None,
+            )?;
+            let out = crate::nn::conv2d(&crop, weight, Some(bias), 2, 0)?;
+            out.eval()?;
+            crate::ios_quantum::finish("tiled conv core", &[&out])?;
+            cores.push(out);
+            x0 = x1;
+        }
+        let refs: Vec<&Array> = cores.iter().collect();
+        let row = mlx_rs::ops::concatenate_axis(&refs, 2)?;
+        row.eval()?;
+        rows.push(row);
+        y0 = y1;
+    }
+    let refs: Vec<&Array> = rows.iter().collect();
+    let out = mlx_rs::ops::concatenate_axis(&refs, 1)?;
+    out.eval()?;
+    crate::ios_quantum::finish(stage_label, &[&out])?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tiling::{AxisTile, SpatialTiling, TemporalTiling, TilingConfig, VaeTiling};
+
+    #[test]
+    fn f32_accumulated_tiles_keep_half_storage_and_full_image_geometry() {
+        struct Restore(mlx_rs::Device);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&self.0);
+            }
+        }
+        let _restore = Restore(mlx_rs::Device::try_default().unwrap());
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
+        let x = Array::from_slice(
+            &(0..9 * 11 * 4).map(|i| (i % 7) as f32).collect::<Vec<_>>(),
+            &[1, 9, 11, 4],
+        )
+        .as_dtype(mlx_rs::Dtype::Float16)
+        .unwrap();
+        let weight = Array::from_slice(
+            &(0..3 * 3 * 3 * 4)
+                .map(|i| if i % 2 == 0 { 0.125f32 } else { -0.125 })
+                .collect::<Vec<_>>(),
+            &[3, 3, 3, 4],
+        )
+        .as_dtype(mlx_rs::Dtype::Float16)
+        .unwrap();
+        let bias = Array::from_slice(&[0.25f32; 3], &[3])
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let reference = crate::nn::conv2d(
+            &x.as_dtype(mlx_rs::Dtype::Float32).unwrap(),
+            &weight.as_dtype(mlx_rs::Dtype::Float32).unwrap(),
+            Some(&bias.as_dtype(mlx_rs::Dtype::Float32).unwrap()),
+            1,
+            1,
+        )
+        .unwrap()
+        .as_dtype(mlx_rs::Dtype::Float16)
+        .unwrap()
+        .as_dtype(mlx_rs::Dtype::Float32)
+        .unwrap();
+        // Non-tiled fast path, ragged and minimal cores. Each output must be half BEFORE
+        // assembly, not a full-image f32 intermediate cast by the caller afterwards.
+        for edge in [32, 8, 5, 3] {
+            let got =
+                tiled_conv2d_3x3_nhwc_f32_accum(&x, &weight, Some(&bias), edge, None, |tile| {
+                    Ok(tile.clone())
+                })
+                .unwrap();
+            assert_eq!(got.dtype(), mlx_rs::Dtype::Float16);
+            assert_eq!(got.shape(), &[1, 9, 11, 3]);
+            assert_eq!(
+                got.as_dtype(mlx_rs::Dtype::Float32)
+                    .unwrap()
+                    .as_slice::<f32>(),
+                reference.as_slice::<f32>()
+            );
+        }
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        assert!(matches!(
+            tiled_conv2d_3x3_nhwc_f32_accum(&x, &weight, Some(&bias), 8, Some(&cancel), |tile| Ok(
+                tile.clone()
+            )),
+            Err(Error::Canceled)
+        ));
+    }
 
     /// Two non-overlapping tiles along the temporal axis with all-ones masks and an identity decode must
     /// exactly reconstruct the input — exercising slice/mask/pad placement and accumulation for a given
@@ -862,6 +1182,73 @@ mod tests {
             disposition: ToggleDisposition::Applied,
             count: 1,
         }));
+    }
+
+    #[test]
+    fn half_precision_group_stats_accumulate_at_f32_without_overflow() {
+        // Weights-free numerics on the CPU device; restored for the next test in the binary.
+        struct Restore(mlx_rs::Device);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&self.0);
+            }
+        }
+        let _restore = Restore(mlx_rs::Device::try_default().expect("default device"));
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
+        // Magnitudes past 256 square beyond f16's 65 504 ceiling: an in-place f16 variance would be
+        // inf. Every row-chunk size — one row, a ragged split, the whole activation — must land on
+        // the f32 reference statistics, and `apply` must hand the crop back at f16.
+        let (batch, height, width, channels, groups) = (1, 7, 5, 8, 4);
+        let count = (batch * height * width * channels) as usize;
+        let values = (0..count)
+            .map(|i| ((i as f32) * 0.37).sin() * 300.0 + 40.0)
+            .collect::<Vec<_>>();
+        let x32 = Array::from_slice(&values, &[batch, height, width, channels]);
+        let x16 = x32.as_dtype(mlx_rs::Dtype::Float16).unwrap();
+        let weight = Array::ones::<f32>(&[channels]).unwrap();
+        let bias = Array::zeros::<f32>(&[channels]).unwrap();
+        // The reference: the f32 path over the f16-rounded activation.
+        let reference = GlobalGroupNorm::new(
+            &x16.as_dtype(mlx_rs::Dtype::Float32).unwrap(),
+            &weight,
+            &bias,
+            groups,
+            1e-5,
+        )
+        .unwrap();
+        let row = i64::from(width * channels);
+        for chunk in [row, row * 3, row * i64::from(height) * 4] {
+            let (mean, inv_std) = half_precision_group_stats(&x16, groups, 1e-5, chunk).unwrap();
+            assert_eq!(mean.dtype(), mlx_rs::Dtype::Float32);
+            for (got, want) in [(&mean, &reference.mean), (&inv_std, &reference.inv_std)] {
+                let got = got.flatten(None, None).unwrap();
+                let want = want.flatten(None, None).unwrap();
+                for (g, w) in got.as_slice::<f32>().iter().zip(want.as_slice::<f32>()) {
+                    assert!(g.is_finite(), "chunk {chunk}: non-finite statistic");
+                    assert!(
+                        (g - w).abs() <= 1e-4 * w.abs().max(1e-3),
+                        "chunk {chunk}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+        let norm = GlobalGroupNorm::new(&x16, &weight, &bias, groups, 1e-5).unwrap();
+        let applied = norm.apply(&x16).unwrap();
+        assert_eq!(applied.dtype(), mlx_rs::Dtype::Float16);
+        let applied = applied.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let expected = reference
+            .apply(&x16.as_dtype(mlx_rs::Dtype::Float32).unwrap())
+            .unwrap();
+        let max_delta = applied
+            .subtract(&expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(max_delta < 5e-3, "f16 apply drifted {max_delta}");
     }
 
     /// sc-19753: layer-wise convolution tiling must use the dense activation's GroupNorm
@@ -1267,6 +1654,81 @@ mod tests {
             x.as_slice::<f32>()[0..4],
             "offset 4 holds x row 0 again"
         );
+    }
+
+    /// sc-16780: the final normalizer/maximum/division/contiguous graph is built only after a
+    /// separate pre-finalization check on the completed fold, and a refusal returns no output.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn finalizer_runs_once_after_the_last_tile_and_refuses_before_normalization() {
+        const CHILD: &str = "MLX_TILED_FINALIZER_CPU_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vae_tiling::tests::finalizer_runs_once_after_the_last_tile_and_refuses_before_normalization",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
+        assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal());
+        let (denorm, plan, axes) = ragged_video_plan();
+        let tiles = plan.t.len() * plan.h.len() * plan.w.len();
+        let events = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let refused = tiled_decode_with_finalizer(
+            &denorm,
+            &plan,
+            axes,
+            None,
+            |tile| {
+                events.borrow_mut().push("tile");
+                seam_bearing_decode(tile)
+            },
+            |accumulators| {
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
+                Ok(())
+            },
+            || {},
+            |output| {
+                assert_eq!(output.shape()[axes[0] as usize], plan.out_f);
+                assert_eq!(output.shape()[axes[1] as usize], plan.out_h);
+                assert_eq!(output.shape()[axes[2] as usize], plan.out_w);
+                events.borrow_mut().push("finalize");
+                Err(Error::Unsupported("final headroom".into()))
+            },
+        );
+        assert!(matches!(refused, Err(Error::Unsupported(ref m)) if m == "final headroom"));
+        let events = events.into_inner();
+        assert_eq!(events.len(), tiles + 1);
+        assert_eq!(events.last(), Some(&"finalize"));
+        assert_eq!(events.iter().filter(|e| **e == "finalize").count(), 1);
+
+        let cancel = CancelFlag::new();
+        let canceled = tiled_decode_with_finalizer(
+            &denorm,
+            &plan,
+            axes,
+            Some(&cancel),
+            seam_bearing_decode,
+            |accumulators| {
+                cancel.cancel();
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
+                Ok(())
+            },
+            || {},
+            |_| panic!("cancelled decode must not reach finalization"),
+        );
+        assert!(matches!(canceled, Err(Error::Canceled)));
     }
 
     /// sc-18320: the point of the fold. A full-output-shaped accumulator must not exist until the
@@ -1755,6 +2217,127 @@ mod tests {
             flat[(3 * out_hw as i64 * out_hw as i64 - 1) as usize],
             0.0,
             "last (>2^31) elem"
+        );
+    }
+
+    /// [`crate::ios_quantum::tile_bytes`] against the measured peak of one tile's graph exactly as
+    /// [`tiled_conv2d_3x3_nhwc`] / [`tiled_conv2d_3x3_nhwc_f32_accum`] build it (the halo crop sliced
+    /// from an NHWC transposed view of an NCHW activation, the optional GlobalGroupNorm + SiLU
+    /// preprocess, the optional f32 promotion, the biased convolution, the core crop and its cast
+    /// back): the worst of 5 stalled runs ([`crate::ios_quantum::measured_peak_bytes`]) must be
+    /// covered, within 1.5x. f32 and f16, normalized and raw, crops from 23% to 100% of the row
+    /// width, equal and widening channels.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "macos")]
+    fn tile_formula_tracks_the_measured_tile() {
+        const CHILD: &str = "IOS_CAPTURE_IN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vae_tiling::tests::tile_formula_tracks_the_measured_tile",
+                    "--nocapture",
+                    "--include-ignored",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ios_quantum::{tile_bytes, Backend, TileSource};
+        use mlx_rs::Dtype::{Float16 as H, Float32 as F};
+        let silu = |t: &Array| -> Result<Array> { Ok(multiply(t, mlx_rs::ops::sigmoid(t)?)?) };
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
+        assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal());
+        let rnd = |shape: &[i32], seed: u64, dtype: mlx_rs::Dtype| {
+            let a = mlx_rs::random::normal::<f32>(
+                shape,
+                None,
+                None,
+                Some(&mlx_rs::random::key(seed).unwrap()),
+            )
+            .unwrap()
+            .as_dtype(dtype)
+            .unwrap();
+            a.eval().unwrap();
+            a
+        };
+        // (full edge, crop edge, cin, cout, storage dtype, normalized, f32_accum)
+        for &(full, crop, c, cout, dtype, normalized, f32_accum) in &[
+            (288, 258, 32, 32, F, true, false),
+            (288, 130, 32, 32, F, true, false),
+            (288, 66, 32, 32, F, true, false),
+            (144, 130, 64, 64, F, true, false),
+            (144, 66, 64, 64, F, true, false),
+            (288, 258, 32, 64, F, true, false),
+            (130, 130, 32, 32, F, true, false),
+            (288, 258, 32, 32, F, false, false),
+            (288, 66, 32, 32, F, false, false),
+            (288, 130, 64, 32, F, false, false),
+            (288, 258, 32, 32, H, true, true),
+            (288, 66, 32, 32, H, true, true),
+            (288, 130, 32, 32, H, true, false),
+            (288, 130, 32, 32, H, false, true),
+        ] {
+            let act = if dtype == H { 2 } else { 4 };
+            let x = rnd(&[1, c, full, full], 1, dtype)
+                .transpose_axes(&[0, 2, 3, 1])
+                .unwrap();
+            let w = rnd(&[cout, 3, 3, c], 2, dtype);
+            let b = rnd(&[cout], 3, dtype);
+            let norm =
+                GlobalGroupNorm::new(&x, &rnd(&[c], 4, dtype), &rnd(&[c], 5, dtype), 32, 1e-6)
+                    .unwrap();
+            let (wide_w, wide_b) = (w.as_dtype(F).unwrap(), b.as_dtype(F).unwrap());
+            mlx_rs::transforms::eval([&wide_w, &wide_b]).unwrap();
+            let mut measured = 0;
+            for _ in 0..5 {
+                measured = measured.max(
+                    crate::ios_quantum::measured_peak_bytes(|| {
+                        let tile = slice_axis(&slice_axis(&x, 1, 0, crop)?, 2, 0, crop)?;
+                        let tile = if normalized {
+                            silu(&norm.apply(&tile)?)?
+                        } else {
+                            tile
+                        };
+                        let out = if f32_accum {
+                            crate::nn::conv2d(&tile.as_dtype(F)?, &wide_w, Some(&wide_b), 1, 1)?
+                        } else {
+                            crate::nn::conv2d(&tile, &w, Some(&b), 1, 1)?
+                        };
+                        let core = slice_axis(&slice_axis(&out, 1, 1, crop - 1)?, 2, 1, crop - 1)?;
+                        Ok(vec![if f32_accum {
+                            core.as_dtype(dtype)?
+                        } else {
+                            core
+                        }])
+                    })
+                    .unwrap(),
+                );
+            }
+            let source = TileSource {
+                full_width: full,
+                normalized,
+            };
+            let formula = tile_bytes(
+                &[1, crop, crop, c],
+                source,
+                act,
+                &w,
+                f32_accum,
+                Backend::Cpu,
+            );
+            let label = format!(
+                "tile {crop}² of {full}² {c}->{cout} act {act} normalized {normalized} f32_accum {f32_accum}"
+            );
+            println!("{label}: formula {formula} B, measured {measured} B");
+            crate::ios_quantum::assert_tracks_measured(&label, formula, measured, 1.5);
+        }
+        eprintln!(
+            "IOS_CAPTURE_BODY_COMPLETED vae_tiling::tests::tile_formula_tracks_the_measured_tile"
         );
     }
 }

@@ -79,7 +79,7 @@ impl Conv {
     /// first 430 output rows. The ≤512² stages — and every parity fixture — stay the
     /// byte-identical single pass; the 1024² and 2048² full-resolution convs chunk.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(self.inner.forward(&x.contiguous()?)?)
+        Ok(__model_proof_output!(self.inner.forward(&x.contiguous()?))?)
     }
 }
 
@@ -109,7 +109,10 @@ impl ChannelNorm {
         let x32 = x.to_dtype(DType::F32)?;
         let norm = x32.sqr()?.sum_keepdim(1)?.sqrt()?.maximum(NORM_EPS)?;
         let normalized = x32.broadcast_div(&norm)?;
-        Ok(normalized.broadcast_mul(&self.gamma)?.to_dtype(dtype)?)
+        __model_proof_output!(Ok(__model_proof_output!(
+            normalized.broadcast_mul(&self.gamma)
+        )?
+        .to_dtype(dtype)?))
     }
 }
 

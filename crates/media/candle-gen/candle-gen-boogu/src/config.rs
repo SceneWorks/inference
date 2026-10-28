@@ -66,7 +66,12 @@ impl BooguConfig {
             .map_err(|e| CandleError::Msg(format!("boogu: read {}: {e}", path.display())))?;
         let v: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| CandleError::Msg(format!("boogu: parse {}: {e}", path.display())))?;
-        Self::from_json(&v)
+        candle_gen::gen_core::__model_input_result!(
+            Self::from_json(&v),
+            "candle-gen-boogu::config::BooguConfig::from_snapshot/configuration",
+            Configuration,
+            &[&path]
+        )
     }
 
     /// Build from an already-parsed `config.json` value.

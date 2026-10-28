@@ -92,7 +92,9 @@ impl Embed {
 
     /// `[B, T, ENC_DIM]` → (scaled hidden `[B, T, ENC_DIM]`, pos_emb `[1, 2T−1, ENC_DIM]`).
     fn forward(&self, x: &Tensor) -> CandleResult<(Tensor, Tensor)> {
-        let x = self.norm.forward(&self.linear.forward(x)?)?;
+        let x = __model_proof_output!(self
+            .norm
+            .forward(&__model_proof_output!(self.linear.forward(x))?))?;
         let x = (x * self.xscale)?;
         let pe = rel_pos_emb(x.dim(1)?, x.device())?;
         Ok((x, pe))
@@ -142,18 +144,18 @@ impl RelSelfAttn {
                 .contiguous()
         };
         // q kept in (B, T, H, d_k) for the bias adds; k/v in (B, H, T, d_k).
-        let q = self
-            .linear_q
-            .forward(x)?
-            .reshape((b, t, ENC_HEADS, ENC_HEAD_DIM))?;
-        let k = to_heads(&self.linear_k.forward(x)?)?;
-        let v = to_heads(&self.linear_v.forward(x)?)?;
+        let q = __model_proof_output!(self.linear_q.forward(x))?.reshape((
+            b,
+            t,
+            ENC_HEADS,
+            ENC_HEAD_DIM,
+        ))?;
+        let k = to_heads(&__model_proof_output!(self.linear_k.forward(x))?)?;
+        let v = to_heads(&__model_proof_output!(self.linear_v.forward(x))?)?;
 
         // Positional projection: [1, 2T-1, D] -> [1, H, 2T-1, d_k].
         let p_len = pos_emb.dim(1)?;
-        let p = self
-            .linear_pos
-            .forward(pos_emb)?
+        let p = __model_proof_output!(self.linear_pos.forward(pos_emb))?
             .reshape((1, p_len, ENC_HEADS, ENC_HEAD_DIM))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -161,8 +163,12 @@ impl RelSelfAttn {
         // (q + bias) broadcast over time, then to (B, H, T, d_k).
         let bias_u = self.pos_bias_u.reshape((1, 1, ENC_HEADS, ENC_HEAD_DIM))?;
         let bias_v = self.pos_bias_v.reshape((1, 1, ENC_HEADS, ENC_HEAD_DIM))?;
-        let q_u = q.broadcast_add(&bias_u)?.transpose(1, 2)?.contiguous()?; // [B, H, T, d_k]
-        let q_v = q.broadcast_add(&bias_v)?.transpose(1, 2)?.contiguous()?;
+        let q_u = __model_proof_output!(q.broadcast_add(&bias_u))?
+            .transpose(1, 2)?
+            .contiguous()?; // [B, H, T, d_k]
+        let q_v = __model_proof_output!(q.broadcast_add(&bias_v))?
+            .transpose(1, 2)?
+            .contiguous()?;
 
         let scale = 1.0 / (ENC_HEAD_DIM as f64).sqrt();
         let matrix_ac = q_u.matmul(&k.transpose(2, 3)?.contiguous()?)?; // [B, H, T, T]
@@ -174,7 +180,7 @@ impl RelSelfAttn {
             .matmul(&v)? // [B, H, T, d_k]
             .transpose(1, 2)?
             .reshape((b, t, ENC_DIM))?;
-        self.linear_out.forward(&ctx)
+        __model_proof_output!(self.linear_out.forward(&ctx))
     }
 }
 
@@ -192,7 +198,9 @@ impl FeedForward {
         })
     }
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        self.w2.forward(&self.w1.forward(x)?.silu()?)
+        __model_proof_output!(self
+            .w2
+            .forward(&__model_proof_output!(self.w1.forward(x))?.silu()?))
     }
 }
 
@@ -217,9 +225,11 @@ impl ConformerLayer {
     fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> CandleResult<Tensor> {
         let att = self
             .self_attn
-            .forward(&self.norm_mha.forward(x)?, pos_emb)?;
+            .forward(&__model_proof_output!(self.norm_mha.forward(x))?, pos_emb)?;
         let x = (x + att)?;
-        let ff = self.feed_forward.forward(&self.norm_ff.forward(&x)?)?;
+        let ff = self
+            .feed_forward
+            .forward(&__model_proof_output!(self.norm_ff.forward(&x))?)?;
         x + ff
     }
 }
@@ -244,11 +254,11 @@ impl PreLookahead {
         let h = x.transpose(1, 2)?.contiguous()?; // [B, C, T]
                                                   // look-ahead: right-pad by PRE_LOOKAHEAD, conv1 (k=4) -> length preserved, leaky-relu.
         let h = h.pad_with_zeros(2, 0, PRE_LOOKAHEAD)?;
-        let h = self.conv1.forward(&h)?;
+        let h = __model_proof_output!(self.conv1.forward(&h))?;
         let h = candle_nn::ops::leaky_relu(&h, 0.01)?;
         // causal: left-pad by 2, conv2 (k=3) -> length preserved.
         let h = h.pad_with_zeros(2, 2, 0)?;
-        let h = self.conv2.forward(&h)?;
+        let h = __model_proof_output!(self.conv2.forward(&h))?;
         let h = h.transpose(1, 2)?.contiguous()?; // [B, T, C]
         x + h
     }
@@ -279,7 +289,7 @@ impl UpLayer {
         // bit-identical shared helper instead.
         let up = nearest_upsample1d(x, UP_STRIDE)?; // [B, C, 2T]
         let up = up.pad_with_zeros(2, UP_STRIDE * 2, 0)?; // left-pad 4 -> [B, C, 2T+4]
-        self.conv.forward(&up) // k=5 -> [B, C, 2T]
+        __model_proof_output!(self.conv.forward(&up)) // k=5 -> [B, C, 2T]
     }
 }
 
@@ -333,7 +343,7 @@ impl UpsampleConformerEncoder {
         for layer in &self.up_encoders {
             x = layer.forward(&x, &pos_emb)?;
         }
-        self.after_norm.forward(&x)
+        __model_proof_output!(self.after_norm.forward(&x))
     }
 }
 
@@ -389,6 +399,7 @@ mod tests {
     /// Wire the whole encoder from synthetic weights and confirm the 25→50 Hz upsample ratio and
     /// the 512-wide output. Real weights are exercised by the `#[ignore]`d conformance test.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn encoder_upsamples_25hz_to_50hz_with_synthetic_weights() {
         let dev = Device::Cpu;
         let varmap = VarMap::new();
@@ -407,6 +418,9 @@ mod tests {
             .unwrap()
             .iter()
             .all(|v| v.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED flow_encoder::tests::encoder_upsamples_25hz_to_50hz_with_synthetic_weights");
     }
 
     /// Materialize every `flow.encoder.*` tensor at its real shape.

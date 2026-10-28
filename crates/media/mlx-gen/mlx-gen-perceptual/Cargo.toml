@@ -17,3 +17,6 @@ mlx-gen-body = { path = "../mlx-gen-body" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-depth/model-inference-proof", "mlx-gen-face/model-inference-proof", "mlx-gen-body/model-inference-proof"]

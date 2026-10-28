@@ -22,9 +22,18 @@ pub fn snapshot_from_env(var: &str) -> Option<std::path::PathBuf> {
 /// Load the decoder (dense, device compute dtype) and, when the checkpoint carries the complete
 /// native MTP layout, the predictor.
 pub fn load(snapshot: &Path, device: &Device) -> (Qwen35Model, Option<Qwen35Mtp>) {
-    let config: Value =
-        serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json")).unwrap())
-            .unwrap();
+    let config: Value = serde_json::from_str(
+        &candle_llm::__model_input_reader!(
+            std::fs::read_to_string(snapshot.join("config.json")),
+            "crates/llm/candle-llm/tests/common/qwen35.rs::load::std::fs::read_to_string@1090",
+            Configuration,
+            snapshot.join("config.json"),
+            |__model_input_path| std::fs::read_to_string(__model_input_path),
+            origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let cfg = Qwen35Config::from_json(&config).expect("qwen3_5 config");
     let weights = Weights::from_dir(snapshot, device).expect("load weights");
     let prefix = if weights.contains("model.language_model.embed_tokens.weight") {
@@ -42,7 +51,15 @@ pub fn load(snapshot: &Path, device: &Device) -> (Qwen35Model, Option<Qwen35Mtp>
 /// else the key embedded in `tokenizer_config.json`) and tokenize it.
 pub fn render_chat_prompt(snapshot: &Path, user: &str) -> Vec<i32> {
     let tokenizer = Tokenizer::from_file(snapshot.join("tokenizer.json")).expect("tokenizer.json");
-    let template = match std::fs::read_to_string(snapshot.join("chat_template.jinja")) {
+    let template = match candle_llm::__model_input_reader!(
+std::fs::read_to_string(snapshot.join("chat_template.jinja")),
+"crates/llm/candle-llm/tests/common/qwen35.rs::render_chat_prompt::std::fs::read_to_string@2137",
+Tokenizer,
+snapshot.join("chat_template.jinja"),
+|__model_input_path| std::fs::read_to_string(__model_input_path),
+origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected,
+when = |__value: &String| !__value.trim().is_empty()
+) {
         Ok(source) if !source.trim().is_empty() => JinjaChatTemplate::new(source),
         _ => JinjaChatTemplate::from_tokenizer_config_file(snapshot.join("tokenizer_config.json"))
             .expect("tokenizer_config.json chat template"),

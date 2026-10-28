@@ -10,13 +10,12 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
-    ActivationMemoryAnchor, Capabilities, ConditioningKind, Error, FlowMatchEuler,
-    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, ActivationMemoryAnchor,
+    Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
+    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
+    Residency, Result, StagedHeavy, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
-use mlx_rs::Dtype;
 use std::path::Path;
 
 use crate::loader;
@@ -64,7 +63,7 @@ pub const PID_BACKBONE: &str = "zimage-turbo";
 /// scheduler port.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        encoder_contract: Some(crate::active_encoder_contract()),
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -332,7 +331,7 @@ pub fn load_from_comfyui_components(
     tokenizer_root: impl AsRef<Path>,
 ) -> Result<Box<dyn Generator>> {
     let text_encoder_file = text_encoder_file.as_ref();
-    let text_encoder = crate::ENCODER_CONTRACT.validate_comfyui_source_against_base(
+    let text_encoder = crate::active_encoder_contract().validate_comfyui_source_against_base(
         &WeightsSource::File(text_encoder_file.to_owned()),
         tokenizer_root.as_ref(),
     )?;
@@ -350,7 +349,7 @@ pub fn load_from_comfyui_checkpoint(
 ) -> Result<Box<dyn Generator>> {
     let checkpoint = gen_core::PinnedWeightsFile::pin(checkpoint_file.as_ref())?;
     let tokenizer = checkpoint.read_unchanged(|path| {
-        crate::ENCODER_CONTRACT.validate_embedded_comfyui_file_against_base(
+        crate::active_encoder_contract().validate_embedded_comfyui_file_against_base(
             path,
             &[
                 "conditioner.embedders.0.transformer.",
@@ -446,14 +445,16 @@ fn build_residency_with_source(
 
 /// The `z_image_turbo` precision-override / single-file rejection messages, shared by the
 /// [`build_residency`] dispatch and the `Sequential` [`resolve_precision_and_root`] guard.
-const PRECISION_ERROR: &str = "z_image_turbo: only dense bf16 is wired in the Rust port; the text \
+pub(crate) const PRECISION_ERROR: &str =
+    "z_image_turbo: only dense bf16 is wired in the Rust port; the text \
      encoder already runs f32 internally (drop the precision override)";
-const FILE_ERROR: &str = "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
+pub(crate) const FILE_ERROR: &str =
+    "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
      transformer/ vae/), not a single .safetensors file";
 
 /// Precision guard + snapshot-dir resolution (rejecting a single-file source), shared by
 /// [`build_residency`]'s per-phase loaders (sc-10839, sc-11126).
-fn resolve_precision_and_root<'a>(
+pub(crate) fn resolve_precision_and_root<'a>(
     spec: &'a LoadSpec,
     precision_msg: &str,
     file_msg: &str,
@@ -607,6 +608,18 @@ impl ZImageTurbo {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            MODEL_ID,
+            "request",
+            &[
+                ("schema", 1),
+                ("serial_count", req.count as u64),
+                ("forward_rows", 1),
+                ("requested_width", req.width as u64),
+                ("requested_height", req.height as u64),
+                ("requested_steps", req.steps.unwrap_or(DEFAULT_STEPS) as u64),
+            ],
+        );
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
@@ -659,7 +672,7 @@ impl ZImageTurbo {
                 if is_img2img {
                     Ok(cap)
                 } else {
-                    Ok(cap.as_dtype(Dtype::Bfloat16)?)
+                    pipeline::caption_cast_quantum(&cap)
                 }
             },
             // Materialize `cap` while the encoder is still alive (Sequential only) — MLX is lazy, so an
@@ -679,13 +692,8 @@ impl ZImageTurbo {
                 // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and
                 // seed-independent. An unset `req.scheduler` keeps this native schedule byte-exact
                 // (epic 7114 N1); a curated name re-shapes the σ schedule over the same `shift=3.0`.
-                let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-                let resolved_sigmas = resolve_flow_schedule(
-                    req.scheduler.as_deref(),
-                    SCHEDULE_SHIFT.ln(),
-                    steps,
-                    &native.sigmas,
-                );
+                let sampling = crate::sampling::resolve_full(req)?;
+                let resolved_sigmas = sampling.sigmas().to_vec();
                 // PiD decode overlay (sc-7846) + `from_ldm` early-stop (sc-8048): mint a decoder when
                 // `use_pid` is set AND an overlay was loaded, else `None` → the native VAE. The
                 // `(capture_sigma, keep)` fold truncates the denoise to the achieved-σ step; the clean
@@ -711,7 +719,7 @@ impl ZImageTurbo {
                     None
                 };
 
-                let sampler_name = req.sampler.as_deref();
+                let sampler_name = Some(sampling.solver().name());
                 let latents = pipeline::denoise_batch(
                     &scheduler,
                     clean.as_ref(),
@@ -819,7 +827,7 @@ pub(crate) fn component_footprint(
             ))
         }
     };
-    let selected = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let selected = crate::active_encoder_contract().source_for_load(spec, root)?;
     let text_encoder = selected.read_unchanged(|source| {
         Ok::<u64, gen_core::Error>(match source {
             WeightsSource::Dir(path) | WeightsSource::File(path) => {

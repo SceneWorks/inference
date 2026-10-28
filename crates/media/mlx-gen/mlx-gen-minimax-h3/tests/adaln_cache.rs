@@ -278,6 +278,8 @@ fn the_cache_reproduces_the_reference_modulation_table() {
             name,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::the_cache_reproduces_the_reference_modulation_table");
 }
 
 /// **The acceptance criterion.** A whole run through the precomputed table equals the same run
@@ -308,6 +310,8 @@ fn the_precomputed_path_reproduces_the_naive_per_step_run() {
             "{steps} steps: the precomputed path diverges from the naive one by {peak:.3e}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::the_precomputed_path_reproduces_the_naive_per_step_run");
 }
 
 /// The residual the mutations below have to clear. Printed on every run and asserted to stay well
@@ -325,6 +329,10 @@ fn precompute_residual_bounds_the_mutation_floor() {
         peak * 10.0 < MUTATION_FLOOR,
         "the residual {peak:.3e} is within 10x of the mutation floor {MUTATION_FLOOR:.1e}; the \
          mutation tests would be reporting jitter"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED adaln_cache::precompute_residual_bounds_the_mutation_floor"
     );
 }
 
@@ -403,6 +411,8 @@ fn a_cache_from_another_schedule_is_stale_and_observably_wrong() {
         peak > MUTATION_FLOOR,
         "a stale cache moved the output only {peak:.3e} — the parity test could not see it"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::a_cache_from_another_schedule_is_stale_and_observably_wrong");
 }
 
 /// Using step `i-1`'s remap at step `i` — the classic off-by-one in a cached loop. Every index
@@ -447,6 +457,10 @@ fn a_step_off_by_one_in_the_remap_is_observable() {
     assert!(
         peak > MUTATION_FLOOR,
         "a one-step-stale remap moved the output only {peak:.3e}"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED adaln_cache::a_step_off_by_one_in_the_remap_is_observable"
     );
 }
 
@@ -495,6 +509,8 @@ fn skipping_the_local_to_global_remap_is_observable() {
         peak > MUTATION_FLOOR,
         "skipping the remap moved the output only {peak:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::skipping_the_local_to_global_remap_is_observable");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -539,6 +555,10 @@ fn the_cache_is_keyed_by_the_whole_schedule() {
             a.key()
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED adaln_cache::the_cache_is_keyed_by_the_whole_schedule"
+    );
 }
 
 /// The cache does not grow with resolution or duration — only with the schedule. Same schedule,
@@ -574,6 +594,8 @@ fn the_cache_size_tracks_the_schedule_and_nothing_else() {
         small.bytes(),
         big.bytes()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::the_cache_size_tracks_the_schedule_and_nothing_else");
 }
 
 /// Two of the four row classes are the SAME timestep at every step, so the global union is far
@@ -668,6 +690,8 @@ fn an_evicted_block_still_runs_but_cannot_project() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("already been evicted"), "{e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::an_evicted_block_still_runs_but_cannot_project");
 }
 
 /// **The recorded decision.** A sampler whose evaluation timesteps are not enumerable up front is
@@ -698,6 +722,8 @@ fn resident_residency_refuses_to_precompute_and_evict() {
     blocks[0]
         .modulation(f.require("in.temb").unwrap())
         .expect("Resident keeps the projection");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::resident_residency_refuses_to_precompute_and_evict");
 }
 
 /// The other half of the exclusion: a timestep the schedule was not built with is a typed error,

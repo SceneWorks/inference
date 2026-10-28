@@ -717,6 +717,7 @@ mod tests {
     /// hand-written `uncond + ω·(cond − uncond)` over two [`PackedForward::velocity`] forwards — pins
     /// the mode-dispatch plumbing to the validated forward seam (no real weights / no conditioning).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn t2v_mode_matches_manual_cfg() {
         let w = load("s5_low.safetensors");
         let cfg = tiny_cfg();
@@ -775,6 +776,8 @@ mod tests {
         .unwrap();
         assert_eq!(got.shape(), noisy.shape());
         assert_eq!(max_abs(&got, &want), 0.0, "t2v must equal manual CFG");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED forward::tests::t2v_mode_matches_manual_cfg");
     }
 
     /// F-021: the video-only guidance combo (`Combos::v`) must carry EVERY conditioning video,
@@ -811,6 +814,7 @@ mod tests {
     /// pins the `sample_one_step` stream/source routing to the validated `velocity` seam + the
     /// (separately torch-validated) combine math. Distinct streams make a wrong routing show up.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn vae_txt_vit_dispatch_matches_manual() {
         let w = load("s5_low.safetensors");
         let cfg = tiny_cfg();
@@ -947,11 +951,16 @@ mod tests {
             vec![Vec::<f64>::new()],
             "the empty wvae set must reuse the target-only embedding"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED forward::tests::vae_txt_vit_dispatch_matches_manual"
+        );
     }
 
     /// A conditioning source extends the packed sequence but the sliced target velocity keeps the
     /// target's shape — pins the assemble/slice geometry with a source present.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn conditioning_source_preserves_target_shape() {
         let w = load("s5_low.safetensors");
         let cfg = tiny_cfg();
@@ -977,6 +986,8 @@ mod tests {
             noisy.shape(),
             "target velocity keeps target shape"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED forward::tests::conditioning_source_preserves_target_shape");
     }
 
     #[test]

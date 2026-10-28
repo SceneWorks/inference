@@ -114,6 +114,7 @@ fn opts(seed: u64) -> TurboOptions {
 fn raw_img2img_strength_sweep_is_coherent_and_cfg_driven() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: no KREA_RAW_DIR and no cached SceneWorks/krea-2-raw-mlx q8 turnkey");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in raw_img2img_strength_sweep_is_coherent_and_cfg_driven; see preceding skip diagnostic");
         return;
     };
     eprintln!("loading Krea 2 Raw (q8) from {}", root.display());
@@ -192,4 +193,6 @@ fn raw_img2img_strength_sweep_is_coherent_and_cfg_driven() {
         is_coherent(&hi),
         "strength 0.9 Raw CFG img2img must remain a coherent image, not mush/noise"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED raw_img2img_real_weights::raw_img2img_strength_sweep_is_coherent_and_cfg_driven");
 }

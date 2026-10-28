@@ -92,7 +92,13 @@ pub(crate) fn packed_config_at(
     sub: &str,
 ) -> Result<Option<candle_gen::quant::PackedConfig>> {
     let path = root.join(sub).join("config.json");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/candle-gen/candle-gen-z-image/src/pipeline.rs::packed_config_at::std::fs::read_to_string@6340",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(text) => text,
         Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -2100,6 +2106,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn constrained_request_pipeline_seam_returns_typed_canceled_without_output() {
         use candle_gen::candle_core::Device;
         use candle_gen::candle_nn::{VarBuilder, VarMap};
@@ -2135,6 +2142,9 @@ mod tests {
         assert!(matches!(error, CandleError::Canceled));
         let contract_error: gen_core::Error = error.into();
         assert!(matches!(contract_error, gen_core::Error::Canceled));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::constrained_request_pipeline_seam_returns_typed_canceled_without_output");
     }
 
     struct DropTag {

@@ -111,6 +111,10 @@ fn chatglm_f32_hidden_states_match_reference() {
     // marginally higher because right-padding lands the "last token" on a PAD position (a deterministic
     // but noisier pad-query-row state). 5e-3 sits above the floor, far below any real defect.
     run_gate(Dtype::Float32, "", 5e-3);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED chatglm_parity::chatglm_f32_hidden_states_match_reference"
+    );
 }
 
 #[test]
@@ -119,4 +123,8 @@ fn chatglm_f16_hidden_states_match_reference() {
     // fp16 Rust vs fp16 reference — the production dtype (Kolors `torch_dtype=float16`). fp16 drift
     // accumulates over 28 layers; the floor tolerance mirrors the Gemma bf16 gate.
     run_gate(Dtype::Float16, "f16_", 2e-2);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED chatglm_parity::chatglm_f16_hidden_states_match_reference"
+    );
 }

@@ -359,6 +359,7 @@ fn fault_params(seed: u64, frames: usize, phase: MemoryPhase, authorized: bool) 
 /// This is the behavioural discriminator for the convention: under the previous entry convention the
 /// fault fired before the first AR step, so `seen` was empty. Hoisting the fault back above
 /// `generate_latents` makes the `Progress::Step` assertion fail.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_authorized_denoise_fault_refuses_after_the_ar_denoise_has_run() {
     let cfg = tiny_cfg();
@@ -395,6 +396,8 @@ fn the_authorized_denoise_fault_refuses_after_the_ar_denoise_has_run() {
         !seen.contains(&Progress::Decoding),
         "the fault must precede the decode boundary: {seen:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::the_authorized_denoise_fault_refuses_after_the_ar_denoise_has_run");
 }
 
 /// sc-22738 (coordinator decision): the authorized Decode fault refuses at the decode phase's
@@ -412,6 +415,7 @@ fn the_authorized_denoise_fault_refuses_after_the_ar_denoise_has_run() {
 ///
 /// Together with the first half (the fault does fire, after `Progress::Decoding`) and the source-text
 /// ordering test in `t2v.rs`, that pins fault-after-decode rather than fault-before-decode.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_authorized_decode_fault_refuses_after_the_vae_decode_has_run() {
     let cfg = tiny_cfg();
@@ -474,9 +478,12 @@ fn the_authorized_decode_fault_refuses_after_the_vae_decode_has_run() {
          `{error}` — a calibration-fault error here means the fault fired BEFORE the decode (the \
          entry convention)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::the_authorized_decode_fault_refuses_after_the_vae_decode_has_run");
 }
 
 /// sc-22738: a phase selection WITHOUT the harness authorization is inert — the clip renders.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn an_unauthorized_phase_selection_renders_the_clip_normally() {
     let cfg = tiny_cfg();
@@ -507,12 +514,15 @@ fn an_unauthorized_phase_selection_renders_the_clip_normally() {
         .unwrap_or_else(|error| panic!("{phase:?} must render normally: {error}"));
         assert_eq!(video_frames(&out).len(), 4 * 2, "{phase:?}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::an_unauthorized_phase_selection_renders_the_clip_normally");
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────────────────────
 
 /// Full pipeline e2e: tiny UMT5 context → tiny DiT AR latents → tiny z16 VAE decode → assembled clip
 /// of the correct shape (frames = 4·num_latent_frames; each frame 8·latent × 8·latent).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn t2v_pipeline_produces_a_clip_of_correct_shape() {
     let cfg = tiny_cfg();
@@ -564,9 +574,12 @@ fn t2v_pipeline_produces_a_clip_of_correct_shape() {
         saw_decoding,
         "the pipeline must emit Progress::Decoding before the VAE decode"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::t2v_pipeline_produces_a_clip_of_correct_shape");
 }
 
 /// Determinism: identical seed ⇒ byte-identical clip; a different seed ⇒ a different clip.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn t2v_pipeline_is_seed_deterministic() {
     let cfg = tiny_cfg();
@@ -606,11 +619,14 @@ fn t2v_pipeline_is_seed_deterministic() {
         a.iter().zip(&c).any(|(fa, fc)| fa.pixels != fc.pixels),
         "a different seed must change the clip"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::t2v_pipeline_is_seed_deterministic");
 }
 
 /// The reused z16 Wan VAE decode is **T → 4·T temporal, ×8 spatial** on a small latent, and the
 /// pipeline's decode+assemble seam surfaces exactly that geometry as a clip.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn vae_decode_is_4x_temporal_8x_spatial() {
     use mlx_gen_krea_realtime::decode_latents_to_video;
     let vae = tiny_vae();
@@ -631,12 +647,15 @@ fn vae_decode_is_4x_temporal_8x_spatial() {
         (6 * 8, 5 * 8),
         "×8 spatial upsample (W=6·8, H=5·8)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::vae_decode_is_4x_temporal_8x_spatial");
 }
 
 /// The z16 decode over-delivers (latent count is `(f−1)/4+1` but the decode is `4·T_lat`), so a
 /// requested output count not ≡ 1 (mod 4) must be trimmed back to exactly that count by dropping the
 /// **leading** excess — never inventing frames when the request exceeds the decoded count.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn decode_trims_leading_frames_to_requested_count() {
     use mlx_gen_krea_realtime::decode_latents_to_video;
     let vae = tiny_vae();
@@ -665,11 +684,14 @@ fn decode_trims_leading_frames_to_requested_count() {
         16,
         "over-request returns all decoded frames, no padding"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::decode_trims_leading_frames_to_requested_count");
 }
 
 /// End-to-end plumbing: `generate_t2v_from_components` threads the requested output count into the decode
 /// trim, so the assembled clip is exactly the requested (non-multiple-of-4) frame count the real
 /// `generate_t2v` passes down from `job.num_frames`.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn t2v_pipeline_trims_to_requested_frame_count() {
     let cfg = tiny_cfg();
@@ -698,6 +720,10 @@ fn t2v_pipeline_trims_to_requested_frame_count() {
         video_frames(&out).len(),
         13,
         "the pipeline returns exactly the requested output frame count"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::t2v_pipeline_trims_to_requested_frame_count"
     );
 }
 
@@ -734,6 +760,7 @@ fn tiny_clip(seed: u64, frames: usize) -> Vec<Image> {
 /// clip has the correct shape (`4·(F_ref + num_latent)` frames of 32×32), the reference still changes
 /// the decoded clip vs a same-seed t2v clip (the still influences generation), and the run is
 /// deterministic.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn i2v_pipeline_conditions_on_the_reference_and_has_correct_shape() {
     let cfg = tiny_cfg();
@@ -811,11 +838,14 @@ fn i2v_pipeline_conditions_on_the_reference_and_has_correct_shape() {
     for (a, b) in i2v_frames.iter().zip(video_frames(&i2v_again)) {
         assert_eq!(a.pixels, b.pixels, "same seed ⇒ byte-identical i2v clip");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::i2v_pipeline_conditions_on_the_reference_and_has_correct_shape");
 }
 
 /// **v2v** component pipeline: VAE-encode a source clip → strength-controlled generate → decode. The
 /// clip has the correct shape, the source and the strength both influence the decoded clip
 /// (strength=0 vs strength=1 differ), and the run is deterministic.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn v2v_pipeline_conditions_on_source_and_strength() {
     let cfg = tiny_cfg();
@@ -887,6 +917,8 @@ fn v2v_pipeline_conditions_on_source_and_strength() {
             "same seed + strength ⇒ byte-identical v2v clip"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::v2v_pipeline_conditions_on_source_and_strength");
 }
 
 // ── SC-20684: phase boundaries return freed buffers from MLX's allocator cache ──────────────────
@@ -895,6 +927,7 @@ const PHASE_RELEASE_CHILD: &str = "KREA_PHASE_RELEASE_CHILD";
 
 /// MLX's active/cache counters are process-wide and this binary runs tests on parallel threads, so
 /// the measurement runs alone in a child process of this same test binary.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn phase_boundaries_release_the_text_encoder_and_the_denoise_cache() {
     if std::env::var_os(PHASE_RELEASE_CHILD).is_none() {
@@ -983,4 +1016,6 @@ fn phase_boundaries_release_the_text_encoder_and_the_denoise_cache() {
         "the decode must return the denoise's cached buffers before the VAE runs: {} cached bytes",
         get_cache_memory()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2v_pipeline::phase_boundaries_release_the_text_encoder_and_the_denoise_cache");
 }

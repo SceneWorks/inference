@@ -428,7 +428,13 @@ pub fn load_captured_case(
 ) -> Result<KvCase> {
     let bytes = std::fs::read(path)?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    let (arrays, metadata) = Array::load_safetensors_with_metadata(path)
+    let (arrays, metadata) = crate::__model_input_reader!(
+Array::load_safetensors_with_metadata(path),
+"crates/llm/mlx-llm/src/primitives/kv_candidates/compare.rs::load_captured_case::Array::load_safetensors_with_metadata@16563",
+TensorInput,
+path,
+|__model_input_path| Array::load_safetensors_with_metadata(__model_input_path)
+)
         .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", path.display())))?;
     let tensors: BTreeMap<String, Array> = arrays.into_iter().collect();
     let metadata: BTreeMap<String, String> = metadata.into_iter().collect();

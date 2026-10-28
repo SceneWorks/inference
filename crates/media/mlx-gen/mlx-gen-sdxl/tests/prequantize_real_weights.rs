@@ -70,7 +70,8 @@ fn build_tier_only() {
 }
 
 #[test]
-#[ignore = "needs a real SDXL snapshot; builds a packed tier + renders (set SC8746_SRC/OUT/BITS)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL snapshot; builds a packed tier + renders (set SC8746_SRC/OUT/BITS)"]
 fn prequantize_turnkey_loads_packed_and_renders() {
     let Some(src) = sdxl_snapshot() else {
         eprintln!("skip: no SDXL snapshot (set SC8746_SRC or populate the HF cache)");
@@ -134,8 +135,11 @@ fn prequantize_turnkey_loads_packed_and_renders() {
         guidance: Some(6.0),
         ..Default::default()
     };
-    let img = match generator
-        .generate(&req, &mut |_| {})
+    let img = match (
+        crate::common::record_model_inference_device(),
+        generator.generate(&req, &mut |_| {}),
+    )
+        .1
         .expect("packed generate succeeds")
     {
         GenerationOutput::Images(mut v) => {
@@ -169,4 +173,6 @@ fn prequantize_turnkey_loads_packed_and_renders() {
         let _ = std::fs::remove_dir_all(&out);
         println!("  removed {} (set SC8746_KEEP to retain)", out.display());
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED prequantize_real_weights::prequantize_turnkey_loads_packed_and_renders");
 }

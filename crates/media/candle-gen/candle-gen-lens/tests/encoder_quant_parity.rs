@@ -42,12 +42,16 @@ fn cosine(a: &Tensor, b: &Tensor) -> Result<f32> {
 fn worst_capture_cosine(quant: GgmlDType) -> Result<Option<f32>> {
     let Ok(te_dir) = std::env::var("LENS_TEXT_ENCODER_DIR") else {
         eprintln!("SKIP: set LENS_TEXT_ENCODER_DIR to the Lens text_encoder snapshot dir");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/encoder_quant_parity.rs:45 (worst_capture_cosine): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return Ok(None);
     };
     let goldens_path = std::env::var("LENS_GOLDENS")
         .unwrap_or_else(|_| ".scratch/gptoss-goldens/gptoss_goldens.safetensors".to_string());
     if !std::path::Path::new(&goldens_path).exists() {
         eprintln!("SKIP: goldens not found at {goldens_path} (run scripts/dump_gptoss_goldens.py)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/encoder_quant_parity.rs:49 (worst_capture_cosine): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return Ok(None);
     }
 
@@ -92,9 +96,15 @@ fn worst_capture_cosine(quant: GgmlDType) -> Result<Option<f32>> {
     let input_ids = input_ids.reshape((1, seq))?;
 
     let caps = encoder.capture(&input_ids, &DEFAULT_SELECTED_LAYERS)?;
+    #[cfg(feature = "model-inference-proof")]
+    if caps.len() != DEFAULT_SELECTED_LAYERS.len() {
+        crate::model_proof::missing_required_work("learned capture output does not cover the complete source-requested DEFAULT_SELECTED_LAYERS");
+    }
     let mut worst = 1f32;
     for (cap, &layer) in caps.iter().zip(DEFAULT_SELECTED_LAYERS.iter()) {
         let Some(golden) = goldens.get(&format!("cap_{layer:02}")) else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/encoder_quant_parity.rs:98 (worst_capture_cosine): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             continue;
         };
         let c = cosine(&cap.squeeze(0)?, golden)?;
@@ -123,6 +133,8 @@ fn encoder_q8_matches_reference() -> Result<()> {
         );
         eprintln!("Q8 PASS");
     }
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED encoder_quant_parity::encoder_q8_matches_reference");
     Ok(())
 }
 
@@ -138,5 +150,7 @@ fn encoder_q4_matches_reference() -> Result<()> {
         );
         eprintln!("Q4 PASS");
     }
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED encoder_quant_parity::encoder_q4_matches_reference");
     Ok(())
 }

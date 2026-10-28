@@ -19,6 +19,7 @@ fn check(name: &str, got: &[f32], want: &[f32], tol: f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn handoff_matches_reference_f32() {
     let dev = Device::Cpu;
     let g = Golden::load("handoff_golden");
@@ -75,4 +76,7 @@ fn handoff_matches_reference_f32() {
         &g.f32("out.wotxt_wovit"),
         5e-3,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED handoff_parity::handoff_matches_reference_f32");
 }

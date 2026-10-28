@@ -175,9 +175,15 @@ impl VisionEncoderLayer {
     fn attention(&self, x: &Tensor) -> Result<Tensor> {
         let (b, n, _) = x.dims3()?;
         let in_dtype = x.dtype();
-        let q = self.to_heads(&self.q.forward(x)?)?.to_dtype(DType::F32)?;
-        let k = self.to_heads(&self.k.forward(x)?)?.to_dtype(DType::F32)?;
-        let v = self.to_heads(&self.v.forward(x)?)?.to_dtype(DType::F32)?;
+        let q = self
+            .to_heads(&__model_proof_output!(self.q.forward(x))?)?
+            .to_dtype(DType::F32)?;
+        let k = self
+            .to_heads(&__model_proof_output!(self.k.forward(x))?)?
+            .to_dtype(DType::F32)?;
+        let v = self
+            .to_heads(&__model_proof_output!(self.v.forward(x))?)?
+            .to_dtype(DType::F32)?;
         let scores = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)? * self.scale)?;
         let probs = softmax(&scores, D::Minus1)?;
         let o = probs.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?;
@@ -185,20 +191,22 @@ impl VisionEncoderLayer {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, n, self.num_heads * self.head_dim))?;
-        self.out.forward(&o).map_err(Into::into)
+        __model_proof_output!(self.out.forward(&o)).map_err(Into::into)
     }
 
     /// `x`: `[B, N, D]`. Pre-norm attention residual, then pre-norm MLP residual.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = self.attention(&self.ln1.forward(x)?)?;
+        let y = self.attention(&__model_proof_output!(self.ln1.forward(x))?)?;
         let x = (x + y)?;
-        let y = self.fc1.forward(&self.ln2.forward(&x)?)?;
+        let y = __model_proof_output!(self
+            .fc1
+            .forward(&__model_proof_output!(self.ln2.forward(&x))?))?;
         let y = if self.quick_gelu {
             quick_gelu(&y)?
         } else {
             y.gelu_erf()?
         };
-        let y = self.fc2.forward(&y)?;
+        let y = __model_proof_output!(self.fc2.forward(&y))?;
         Ok((x + y)?)
     }
 }
@@ -261,7 +269,7 @@ impl ClipVisionEncoder {
         let num_pos = self.position_embedding.dim(0)?;
         let pos = self.position_embedding.reshape((1, num_pos, self.hidden))?;
         let x = x.broadcast_add(&pos)?;
-        self.pre_ln.forward(&x).map_err(Into::into)
+        __model_proof_output!(self.pre_ln.forward(&x)).map_err(Into::into)
     }
 
     /// The **penultimate** hidden state `[B, num_positions, hidden]` — the IP-Adapter "plus" image
@@ -386,6 +394,7 @@ mod tests {
     /// embeddings, `pre_layrnorm`, and the bidirectional encoder layers (both gelu variants). Numerical
     /// parity vs the real OpenCLIP weights is the GPU validation; this pins the port's structure.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn penultimate_shape_and_finite() {
         let dev = Device::Cpu;
         // A tiny ViT: hidden 32, 3 layers, 4 heads, patch 2, 8px → grid 4 → 17 tokens.
@@ -406,12 +415,18 @@ mod tests {
         assert_eq!(out.dims(), &[2, cfg.num_positions(), cfg.hidden]);
         let vals = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(vals.iter().all(|v| v.is_finite()), "penultimate not finite");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED vision_encoder::tests::penultimate_shape_and_finite"
+        );
     }
 
     /// `last_hidden` runs the full tower (one more layer than `penultimate`) to a finite
     /// `[B, num_positions, hidden]`, and differs from `penultimate` (the extra layer transforms the
     /// state) — the XLabs FLUX IP-Adapter's pooled-embedding path (sc-5872).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn last_hidden_runs_full_tower() {
         let dev = Device::Cpu;
         let cfg = VisionConfig {
@@ -442,11 +457,17 @@ mod tests {
             max_diff > 1e-4,
             "last_hidden should differ from penultimate"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED vision_encoder::tests::last_hidden_runs_full_tower"
+        );
     }
 
     /// The quick-gelu variant also forwards to a finite penultimate (exercises the `x·sigmoid(1.702x)`
     /// path used by the ViT-L towers).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quick_gelu_variant_forwards() {
         let dev = Device::Cpu;
         let cfg = VisionConfig {
@@ -470,6 +491,11 @@ mod tests {
             .unwrap()
             .iter()
             .all(|v| v.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED vision_encoder::tests::quick_gelu_variant_forwards"
+        );
     }
 
     /// A wrong-variant config (layer-count mismatch) is rejected loudly.

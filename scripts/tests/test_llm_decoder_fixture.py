@@ -22,13 +22,16 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class DecoderRoutingTests(unittest.TestCase):
     def workflow(self):
+        return yaml.load((ROOT / ".github/workflows/moss-model-fixtures.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+    def ordinary_workflow(self):
         return yaml.load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
     def test_each_real_decoder_test_is_ignored_and_registered_without_a_population_gate(self):
         for backend, names in decoder.CASES.items():
             text = (ROOT / decoder.SOURCES[backend]).read_text(encoding="utf-8")
             ignored = set(re.findall(r'#\[ignore = "' + re.escape(decoder.IGNORE_REASON) + r'"\]\s*fn (\w+)\s*\(', text))
-            self.assertEqual(ignored, {name.rsplit("::", 1)[-1] for name in names})
+            self.assertTrue({name.rsplit("::", 1)[-1] for name in names} <= ignored)
             self.assertTrue(names)
             self.assertEqual(len(names), len(set(names)))
             self.assertTrue(all(name.startswith("models::qwen35::tests::") for name in names))
@@ -36,35 +39,22 @@ class DecoderRoutingTests(unittest.TestCase):
         self.assertEqual(set(declared), set(decoder.DISPATCH_INPUT_CHOICES))
         for name, choices in decoder.DISPATCH_INPUT_CHOICES.items():
             self.assertEqual(tuple(declared[name]["options"]), choices)
-            self.assertEqual(declared[name]["default"], choices[0])
+            self.assertTrue(declared[name]["required"])
 
     def test_mixed_or_unknown_dispatch_selectors_are_rejected_before_compilation(self):
         for choice in decoder.DISPATCH_CHOICES:
-            self.assertEqual(decoder.validate_dispatch("workflow_dispatch", {"inputs": {"lanes": choice}}), choice)
-        for event in [
-            {"inputs": {"lanes": "llm-decoder-fixture,moss-metal-fixture"}},
-            {"inputs": {"lanes": "all llm-decoder-fixture"}},
-            {"inputs": {"lanes": ["llm-decoder-fixture", "all"]}},
-            {"inputs": {"lanes": "llm-decoder-fixture", "backend": "cuda"}},
-            {"inputs": {"lanes": "unknown"}},
-        ]:
-            with self.subTest(event=event), self.assertRaisesRegex(UnitFailure, "selector|select"):
-                decoder.validate_dispatch("workflow_dispatch", event)
-        for lane in decoder.DISPATCH_CHOICES:
-            self.assertEqual(decoder.validate_dispatch("workflow_dispatch", {"inputs": {
-                "lanes": lane, "test_suite": "routine", "synthetic_w4a8": "none"}}), lane)
-        for suite in decoder.DISPATCH_INPUT_CHOICES["test_suite"]:
-            for synthetic in decoder.DISPATCH_INPUT_CHOICES["synthetic_w4a8"]:
-                for lane in ("all", "windows-cuda"):
-                    self.assertEqual(decoder.validate_dispatch("workflow_dispatch", {"inputs": {
-                        "lanes": lane, "test_suite": suite, "synthetic_w4a8": synthetic}}), lane)
-        for inputs in ({"test_suite": "unknown"}, {"synthetic_w4a8": ["mlx", "cuda"]},
-                       {"lanes": decoder.LANE, "synthetic_w4a8": "mlx"},
-                       {"lanes": "moss-cpu-fixture", "test_suite": "exhaustive"}):
-            with self.subTest(inputs=inputs), self.assertRaisesRegex(UnitFailure, "selector|select"):
-                decoder.validate_dispatch("workflow_dispatch", {"inputs": inputs})
+            with mock.patch.dict(os.environ, {"MOSS_FIXTURE_SELECTED_LANE": choice}):
+                self.assertEqual(decoder.validate_dispatch("workflow_dispatch", {"inputs": {"lanes": choice}}), choice)
+                self.assertEqual(decoder.validate_dispatch("workflow_dispatch", {"inputs": {"profile": choice}}), choice)
+                for malformed in ({"lanes": choice, "profile": choice}, {"lanes": "unknown"},
+                                  {"profile": "unknown"}, {"lanes": [choice]}, {"lanes": "all"}):
+                    with self.subTest(malformed=malformed), self.assertRaises(UnitFailure):
+                        decoder.validate_dispatch("workflow_dispatch", {"inputs": malformed})
+                with mock.patch.dict(os.environ, {"MOSS_FIXTURE_SELECTED_LANE": "moss-cuda-unit"}):
+                    if choice != "moss-cuda-unit":
+                        with self.assertRaises(UnitFailure):
+                            decoder.validate_dispatch("workflow_dispatch", {"inputs": {"lanes": choice}})
         self.assertIsNone(decoder.validate_dispatch("pull_request", {"inputs": {"lanes": "invalid"}}))
-
     def test_only_narrow_hosted_rows_activate_and_guards_precede_toolchain(self):
         workflow = self.workflow()
         job = workflow["jobs"][decoder.LANE]
@@ -81,22 +71,12 @@ class DecoderRoutingTests(unittest.TestCase):
         upload = next(s for s in steps if s.get("name") == "Upload exact-head shared decoder evidence")
         self.assertEqual(upload["if"], "always()")
         self.assertEqual(upload["with"]["if-no-files-found"], "error")
-        helper = moss_tests.HostedCpuRoutingTests("test_exact_manual_choice_and_only_two_fixed_hosted_rows")
-        selected = helper.select(helper.selector(), "workflow_dispatch", decoder.LANE)
-        self.assertEqual({key for key,value in selected.items() if value == "true"}, {"workspace"})
-        addition = '\nelif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "llm-decoder-fixture" ]]; then\n  python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"'
-        selector = helper.selector()
-        self.assertEqual(selector.count(addition), 1)
-        before = selector.replace(addition, "")
-        for event, ref in [("pull_request", "branch"), ("push", "branch"), ("push", "tag"), ("merge_group", "branch")]:
-            self.assertEqual(helper.select(selector, event, decoder.LANE, ref), helper.select(before, event, decoder.LANE, ref))
-        changes = workflow["jobs"]["changes"]["steps"]
-        root_guard = next(i for i,s in enumerate(changes) if s.get("name") == "Validate explicit dispatch selectors before affected runtime lanes")
-        select = next(i for i,s in enumerate(changes) if s.get("id") == "select")
-        self.assertLess(root_guard, select)
-
+        self.assertNotIn(decoder.LANE, self.ordinary_workflow()["jobs"])
+        bridge = yaml.load((ROOT / ".github/workflows/real-weights.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)["jobs"]["moss-fixture-bridge"]
+        self.assertIn("inputs.profile == 'llm-decoder-fixture'", bridge["if"])
+        self.assertEqual(bridge["uses"], "./.github/workflows/moss-model-fixtures.yml")
     def test_ordinary_package_tests_keep_compilation_but_never_include_ignored(self):
-        jobs = self.workflow()["jobs"]
+        jobs = self.ordinary_workflow()["jobs"]
         for job, package in [("candle-cpu-test", "candle-llm"), ("macos-metal", "mlx-llm")]:
             commands = [step.get("run", "") for step in jobs[job]["steps"]]
             self.assertTrue(any("cargo test" in command and "-p " + package in command for command in commands))
@@ -109,17 +89,13 @@ class DecoderRoutingTests(unittest.TestCase):
                                 and "--all-targets" in step["run"] for step in jobs[job]["steps"]))
 
     def test_requested_matrix_skip_or_failure_never_makes_gate_green(self):
-        gate = self.workflow()["jobs"]["gate"]
-        self.assertIn(decoder.LANE, gate["needs"])
-        for result in ["success", "skipped", "failure", "cancelled"]:
-            env = dict(os.environ, RESULTS="success skipped", REQUIRE_MOSS_CUDA_UNIT="false",
-                       REQUIRE_MOSS_CPU_FIXTURE="false", REQUIRE_MOSS_METAL_FIXTURE="false",
-                       REQUIRE_LLM_DECODER_FIXTURE="true", LLM_DECODER_FIXTURE_RESULT=result)
-            proc = subprocess.run(["bash", "-c", gate["steps"][0]["run"]], env=env, capture_output=True)
-            self.assertEqual(proc.returncode == 0, result == "success")
-
-
-class DecoderEvidenceTests(unittest.TestCase):
+        workflow = self.workflow()
+        job = workflow["jobs"][decoder.LANE]
+        self.assertEqual(job["strategy"]["fail-fast"], "false")
+        self.assertNotIn("continue-on-error", job)
+        self.assertEqual(job["timeout-minutes"], "120")
+        self.assertEqual(set(workflow["on"]), {"workflow_call", "workflow_dispatch"})
+        self.assertNotIn(decoder.LANE, self.ordinary_workflow()["jobs"]["gate"]["needs"])
     def test_resource_metadata_missing_zero_or_wrong_cannot_pass(self):
         good = {"observed_peak_child_rss_bytes": 1234, "observed_elapsed_seconds": 0.5,
                 "configured_rss_cap_bytes": decoder.shared.RSS_CAP,

@@ -69,7 +69,15 @@ fn ladder_preserves_identity_quality_and_reduces_request_peak() {
         face_dir: Some(WeightsSource::Dir(face_dir.clone())),
     });
 
-    let source = image::open(env("PULID_REFERENCE_IMAGE"))
+    let source = mlx_gen::gen_core::__model_input_reader!(
+image::open(env("PULID_REFERENCE_IMAGE")),
+"crates/media/mlx-gen/mlx-gen-pulid/tests/shared_memory_ladder_real_weights.rs::ladder_preserves_identity_quality_and_reduces_request_peak::image::open@2511",
+Reference,
+env("PULID_REFERENCE_IMAGE"),
+|__model_input_path| image::open(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .expect("reference image")
         .to_rgb8();
     let face = mlx_gen::media::Image {
@@ -307,4 +315,6 @@ fn ladder_preserves_identity_quality_and_reduces_request_peak() {
     );
     println!("PULID_STREAMED_IDENTITY_CHANGED_BYTES {changed}");
     zero_scope.finish(MemoryRunOutcome::Complete).unwrap();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::ladder_preserves_identity_quality_and_reduces_request_peak");
 }

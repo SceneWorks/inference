@@ -175,7 +175,17 @@ pub fn token_grid(width: u32, height: u32) -> (usize, usize) {
 /// behaviour.
 pub fn project_raw_latents(latents: &Tensor) -> Result<Image> {
     check_raw_layout(latents)?;
-    candle_gen::preview::project_latents(latents, &RGB_FACTORS, RGB_BIAS)
+    __model_proof_select!(
+        candle_gen::preview::project_latents(latents, &RGB_FACTORS, RGB_BIAS),
+        candle_gen::preview::project_latents_observing(
+            latents,
+            &RGB_FACTORS,
+            RGB_BIAS,
+            |__learned_rgb| {
+                __model_proof_device!(__learned_rgb);
+            },
+        )
+    )
 }
 
 /// Project the sampler's **packed token** latent `[1, ⌈H/16⌉·⌈W/16⌉, 64]` by running the decode's own
@@ -315,12 +325,16 @@ mod tests {
     /// A zero latent projects to the fit's intercept — the one place the committed bias is directly
     /// observable, so a typo in [`RGB_BIAS`] cannot pass.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_zero_latent_projects_to_the_fit_intercept() {
         let image = project_raw_latents(&zeros((1, 16, 2, 3))).unwrap();
         assert_eq!((image.width, image.height), (3, 2));
         // 0.49590346·255 = 126.5, 0.49263495·255 = 125.6, 0.48248762·255 = 123.0
         let expect: Vec<u8> = [126, 126, 123].repeat(6);
         assert_eq!(image.pixels, expect);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::a_zero_latent_projects_to_the_fit_intercept");
     }
 
     /// A latent from another family's space must be rejected rather than projected against a
@@ -379,16 +393,23 @@ mod tests {
     /// shared projection casts to f32 up front, so this seam must accept it rather than panicking in
     /// the matmul.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn projection_accepts_a_bf16_latent() {
         let latents = zeros((1, 16, 2, 2)).to_dtype(DType::BF16).unwrap();
         let image = project_raw_latents(&latents).unwrap();
         assert_eq!(image.pixels[..3], [126, 126, 123]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::projection_accepts_a_bf16_latent"
+        );
     }
 
     /// The frame is at **native VAE-latent** resolution — twice the token grid in each axis, because
     /// the 2×2 unpack runs before the projection. A preview at half the true resolution is exactly what
     /// projecting the token grid as if it were spatial would produce.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_projection_is_native_latent_resolution_not_token_grid_resolution() {
         for (w, h) in [(64u32, 64u32), (128, 64), (48, 32), (1024, 768)] {
             let image = project_packed_tokens(&packed_zeros(w, h), w, h).unwrap();
@@ -400,6 +421,9 @@ mod tests {
             );
             assert_ne!((image.width, image.height), (cols as u32, rows as u32));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::packed_projection_is_native_latent_resolution_not_token_grid_resolution");
     }
 
     /// The packed seam is exactly "the decode's own unpack → the raw projector": same bytes, no second
@@ -408,6 +432,7 @@ mod tests {
     /// [`crate::decode_latents`] calls — over a non-trivial latent, so a hand-rolled fold that
     /// transposed the patch axes could not agree.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_packed_recovery_is_the_one_the_decode_uses() {
         let (width, height) = (80u32, 48u32);
         let (rows, cols) = token_grid(width, height);
@@ -448,6 +473,9 @@ mod tests {
             via_packed.pixels, scrambled.pixels,
             "the 2x2 unpack must actually change the projected frame"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::the_packed_recovery_is_the_one_the_decode_uses");
     }
 
     /// The token grid is `flux::sampling::unpack`'s own `ceil(·/16)` arithmetic, including for a size
@@ -543,6 +571,7 @@ mod tests {
     /// Euler evaluates once per step: an N-step render emits exactly N frames, 1..=N, each carrying
     /// `total == N`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn euler_emits_exactly_one_numbered_frame_per_step() {
         for steps in [1usize, 4, 8] {
             let (sink, captured) = collecting_sink();
@@ -563,6 +592,9 @@ mod tests {
                 "{steps}-step Euler render"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::euler_emits_exactly_one_numbered_frame_per_step");
     }
 
     /// The candle-specific hazard the shared counter exists for: heun and dpmpp_sde evaluate the
@@ -570,6 +602,7 @@ mod tests {
     /// evaluation count is asserted to exceed the step count first, so a solver that silently fell back
     /// to Euler could not make this pass vacuously.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn multi_eval_solvers_still_emit_exactly_one_frame_per_outer_step() {
         for name in ["heun", "dpmpp_sde"] {
             let steps = 6usize;
@@ -602,11 +635,15 @@ mod tests {
                 "{name} must still emit exactly one frame per outer step"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::multi_eval_solvers_still_emit_exactly_one_frame_per_outer_step");
     }
 
     /// Every emitted frame is a native-latent-resolution RGB8 image of the running trajectory — `H/8`,
     /// i.e. twice the token grid, because the unpack runs before the projection.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn emitted_frames_are_native_latent_resolution_rgb8() {
         let (sink, captured) = collecting_sink();
         let hook = hook(&sink, 128, 64);
@@ -625,6 +662,9 @@ mod tests {
             assert_eq!((frame.image.width, frame.image.height), (16, 8));
             assert_eq!(frame.image.pixels.len(), 16 * 8 * 3);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::emitted_frames_are_native_latent_resolution_rgb8");
     }
 
     // --- What the hook is allowed to see ----------------------------------------------------------
@@ -633,6 +673,7 @@ mod tests {
     /// true-CFG branch: it fuses a two-leg batch internally and returns one blended velocity. The
     /// unconditional half never becomes the running latent, so it can never be projected.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cfg_never_exposes_the_unconditional_half_to_the_preview() {
         let (sink, _captured) = collecting_sink();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -665,6 +706,9 @@ mod tests {
                 .all(|dims| dims == &[1, SEQ, PACKED_LATENT_CHANNELS]),
             "the hook must only ever see the single unfused conditional latent, got {seen:?}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::cfg_never_exposes_the_unconditional_half_to_the_preview");
     }
 
     /// The identity/control hazard in this family's own shape, and this story's PuLID criterion:
@@ -675,6 +719,7 @@ mod tests {
     /// sequence axis and slices the target tokens back out — the shape that WOULD leak if a route
     /// handed the joint tensor to the driver.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn injected_conditioning_never_reaches_the_previewed_latent() {
         let (sink, captured) = collecting_sink();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -716,6 +761,9 @@ mod tests {
         {
             assert_eq!((width, height), (WIDTH / 8, HEIGHT / 8));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::injected_conditioning_never_reaches_the_previewed_latent");
     }
 
     // --- Decorative by contract -------------------------------------------------------------------
@@ -723,6 +771,7 @@ mod tests {
     /// An inert sink must be byte-identical to no hook at all, and an ACTIVE sink must be too — the
     /// preview reads the latent and never writes it.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn an_inert_sink_is_byte_identical_to_an_unhooked_render() {
         let s = sigmas(6);
         let start =
@@ -747,6 +796,9 @@ mod tests {
         let active = run(None, &s, start, Some(&active_hook), velocity).unwrap();
         assert_eq!(bytes(&bare), bytes(&active));
         assert_eq!(candle_gen::lock_recover(&captured).len(), 6);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::an_inert_sink_is_byte_identical_to_an_unhooked_render");
     }
 
     /// A projection failure loses its frame and never fails the render. The realistic shape of that

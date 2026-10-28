@@ -9,6 +9,15 @@
 //! `cargo test -p <crate> --test integration -- <name>::`.
 
 // --- shared modules (hand-maintained; preserved by regen) ---
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 // --- generated modules (do not edit) ---
 
 mod common;
@@ -57,6 +66,12 @@ mod generator_contract;
 
 #[path = "memory_strategy.rs"]
 mod memory_strategy;
+
+#[path = "quant_real_weights.rs"]
+mod quant_real_weights;
+
+#[path = "quant_tiers.rs"]
+mod quant_tiers;
 
 #[path = "real_weights.rs"]
 mod real_weights;

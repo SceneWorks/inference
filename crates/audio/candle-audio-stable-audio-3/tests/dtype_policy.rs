@@ -43,6 +43,16 @@
 //! CUDA-specific kernel difference — which is precisely why the numbers above are not treated as
 //! sufficient to enable it there.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device};
@@ -511,4 +521,7 @@ fn half_precision_draws_from_the_same_distribution_as_full_precision() {
         }
     }
     assert_within_envelope("medium F16 vs F32", &full_character, &half_character);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED half_precision_draws_from_the_same_distribution_as_full_precision");
 }

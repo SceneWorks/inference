@@ -81,6 +81,8 @@ const EDGE: u32 = 1024;
 fn snapshot_root() -> Option<PathBuf> {
     let Ok(p) = std::env::var("SC11045_SANA_SNAPSHOT") else {
         eprintln!("[sc-11045] SC11045_SANA_SNAPSHOT unset; skipping");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs:84 (snapshot_root): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return None;
     };
     let p = PathBuf::from(p);
@@ -88,6 +90,8 @@ fn snapshot_root() -> Option<PathBuf> {
         Some(p)
     } else {
         eprintln!("[sc-11045] SC11045_SANA_SNAPSHOT={p:?} is not a directory; skipping");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs:87 (snapshot_root): Present env pointing to a non-directory produces implicit None and drops all selected real SANA NN cases.");
         None
     }
 }
@@ -99,6 +103,8 @@ fn nvfp4_device() -> Option<Device> {
         Ok(d @ Device::Cuda(_)) => d,
         _ => {
             eprintln!("[sc-11045] no CUDA device; skipping");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs:102 (nvfp4_device): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return None;
         }
     };
@@ -116,6 +122,8 @@ fn nvfp4_device() -> Option<Device> {
                 "[sc-11045] device not sm_120 ({:?}); skipping — NVFP4 is Blackwell-only (SC#4)",
                 lt.compute_cap().ok()
             );
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs:114 (nvfp4_device): Implicit None on ineligible/error capability probe silently bypasses selected learned GPU cases just like explicit no-device return.");
             None
         }
     }
@@ -248,8 +256,16 @@ fn run_denoise(
 #[test]
 #[ignore = "real-weight GPU test: needs the Sana-1.6B snapshot + an sm_120 device"]
 fn nvfp4_sana_dit_real_denoise_no_nan_and_parity_vs_dense() {
-    let Some(dev) = nvfp4_device() else { return };
-    let Some(root) = snapshot_root() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs:251 (nvfp4_sana_dit_real_denoise_no_nan_and_parity_vs_dense): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
+        return;
+    };
+    let Some(root) = snapshot_root() else {
+        #[cfg(feature = "model-inference-proof")]
+                                            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs:252 (nvfp4_sana_dit_real_denoise_no_nan_and_parity_vs_dense): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
+        return;
+    };
 
     let (cond, uncond) = encode_conditioning(&root, &dev);
     let w = trunk_weights(&root, &dev);
@@ -415,6 +431,9 @@ fn nvfp4_sana_dit_real_denoise_no_nan_and_parity_vs_dense() {
             "{label}: latent cosine {cos:.5} is the sc-7702 collapse signature, not quantization noise"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_sana_dit_gpu::nvfp4_sana_dit_real_denoise_no_nan_and_parity_vs_dense");
 }
 
 // ==============================================================================================
@@ -447,8 +466,16 @@ fn nvfp4_sana_dit_real_denoise_no_nan_and_parity_vs_dense() {
 #[test]
 #[ignore = "real-weight GPU bench: needs the Sana-1.6B snapshot + an exclusive sm_120 device"]
 fn nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4() {
-    let Some(dev) = nvfp4_device() else { return };
-    let Some(root) = snapshot_root() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs:450 (nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
+        return;
+    };
+    let Some(root) = snapshot_root() else {
+        #[cfg(feature = "model-inference-proof")]
+                                            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs:451 (nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
+        return;
+    };
 
     let (cond, uncond) = encode_conditioning(&root, &dev);
     let w = trunk_weights(&root, &dev);
@@ -513,6 +540,9 @@ fn nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4() {
         t_dense / t_mixed,
     );
     assert!(t_dense > 0.0 && t_w4a16 > 0.0 && t_w4a4 > 0.0 && t_mixed > 0.0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_sana_dit_gpu::nvfp4_sana_dit_real_throughput_dense_vs_w4a16_vs_w4a4");
 }
 
 // ==============================================================================================
@@ -670,8 +700,16 @@ fn nvfp4_sana_dit_real_model_vram_footprint() {
 #[test]
 #[ignore = "real-weight GPU test: needs the Sana-1.6B snapshot + an sm_120 device"]
 fn nvfp4_sana_dit_real_activation_outlier_sparsity() {
-    let Some(dev) = nvfp4_device() else { return };
-    let Some(root) = snapshot_root() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs:673 (nvfp4_sana_dit_real_activation_outlier_sparsity): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
+        return;
+    };
+    let Some(root) = snapshot_root() else {
+        #[cfg(feature = "model-inference-proof")]
+                                            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/nvfp4_sana_dit_gpu.rs:674 (nvfp4_sana_dit_real_activation_outlier_sparsity): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
+        return;
+    };
 
     let (cond, uncond) = encode_conditioning(&root, &dev);
     let w = trunk_weights(&root, &dev);
@@ -791,4 +829,7 @@ fn nvfp4_sana_dit_real_activation_outlier_sparsity() {
         summaries.iter().all(|s| s.partition_holds()),
         "a summarized layer reports the partition broken"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_sana_dit_gpu::nvfp4_sana_dit_real_activation_outlier_sparsity");
 }

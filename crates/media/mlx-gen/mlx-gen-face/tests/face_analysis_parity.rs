@@ -194,4 +194,6 @@ fn face_analysis_end_to_end() {
         "face_features_image diverged from torch: {:.4}%",
         ffi_frac * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED face_analysis_parity::face_analysis_end_to_end");
 }

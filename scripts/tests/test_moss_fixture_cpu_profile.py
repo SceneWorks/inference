@@ -18,6 +18,8 @@ from scripts.ci.moss_cuda_unit import UnitFailure
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
+MODEL_WORKFLOW = ROOT / ".github/workflows/moss-model-fixtures.yml"
+BRIDGE_WORKFLOW = ROOT / ".github/workflows/real-weights.yml"
 CPU_BRANCH = '''          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cpu-fixture" ]]; then
             python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"
 '''
@@ -26,6 +28,9 @@ CPU_BRANCH = '''          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISP
 class HostedCpuRoutingTests(unittest.TestCase):
     def workflow(self):
         return yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+    def model_workflow(self):
+        return yaml.load(MODEL_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
     def selector(self):
         return next(step["run"] for step in self.workflow()["jobs"]["changes"]["steps"]
@@ -70,50 +75,41 @@ class HostedCpuRoutingTests(unittest.TestCase):
             return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
 
     def test_exact_manual_choice_and_only_two_fixed_hosted_rows(self):
-        workflow = self.workflow()
-        self.assertEqual(workflow["on"]["workflow_dispatch"]["inputs"]["lanes"]["options"],
-                         list(decoder.DISPATCH_CHOICES))
-        self.assertEqual(set(workflow["on"]["workflow_dispatch"]["inputs"]), set(decoder.DISPATCH_INPUT_CHOICES))
+        workflow = self.model_workflow()
+        self.assertEqual(workflow["on"]["workflow_dispatch"]["inputs"]["lanes"]["options"], list(decoder.DISPATCH_CHOICES))
+        self.assertEqual(workflow["on"]["workflow_call"]["inputs"]["lanes"], {"required": "true", "type": "string"})
         job = workflow["jobs"]["moss-cpu-fixture"]
         self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cpu-fixture'")
         self.assertEqual(job["strategy"]["matrix"], {"include": [
             {"backend": "candle", "runner": "ubuntu-latest"}, {"backend": "mlx", "runner": "macos-15"}]})
         self.assertEqual(job["runs-on"], "${{ matrix.runner }}")
-        self.assertEqual(job["strategy"]["fail-fast"], "false")
         self.assertEqual(job["timeout-minutes"], "120")
         self.assertNotIn("continue-on-error", job)
-        run = next(s for s in job["steps"] if s.get("name") == "Run actual CPU fixture and assertion mutations")
+        run = next(step for step in job["steps"] if step.get("name") == "Run actual CPU fixture and assertion mutations")
         self.assertEqual(run["run"], "python3 scripts/ci/moss_fixture_cpu_profile.py ${{ matrix.backend }}")
         self.assertNotIn("if", run)
-
     def test_cpu_profile_disables_every_cuda_selfhosted_and_broad_metal_lane(self):
-        selected = self.select(self.selector(), "workflow_dispatch", "moss-cpu-fixture")
-        self.assertEqual({name for name, value in selected.items() if value == "true"}, {"workspace"})
-        for name in ("windows_cuda", "macos_metal", "moss_cuda_unit", "candle_cpu", "real_weights"):
-            self.assertEqual(selected[name], "false")
-        jobs = self.workflow()["jobs"]
-        self.assertIn("workflow_dispatch", jobs["macos-nax"]["if"])
-        self.assertIn("needs.changes.outputs.macos_metal == 'true'", jobs["macos-nax"]["if"])
-        for name in ("windows-cuda-check", "windows-cuda"):
-            self.assertIn("needs.changes.outputs.windows_cuda == 'true'", jobs[name]["if"])
-        self.assertIn("inputs.lanes == 'moss-cuda-unit'", jobs["moss-cuda-unit"]["if"])
-
+        manual = self.model_workflow()["jobs"]
+        self.assertNotIn("moss-cpu-fixture", self.workflow()["jobs"])
+        self.assertEqual(manual["moss-cpu-fixture"]["if"], "github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cpu-fixture'")
+        for name in ("moss-metal-fixture", "llm-decoder-fixture", "moss-cuda-unit"):
+            self.assertNotIn("inputs.lanes == 'moss-cpu-fixture'", manual[name]["if"])
+        self.assertEqual(manual["moss-cpu-fixture"]["strategy"]["matrix"]["include"], [
+            {"backend": "candle", "runner": "ubuntu-latest"}, {"backend": "mlx", "runner": "macos-15"}])
     def test_existing_manual_pr_push_tag_and_merge_routes_are_unchanged(self):
-        source = WORKFLOW.read_text(encoding="utf-8")
-        self.assertEqual(source.count(CPU_BRANCH), 1)
-        # YAML removes common indentation from run blocks; remove the exact new branch only.
-        addition = '\nelif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cpu-fixture" ]]; then\n  python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"'
-        current = self.selector()
-        self.assertEqual(current.count(addition), 1)
-        previous = current.replace(addition, "")
-        for event, lanes, ref in (("workflow_dispatch", "all", "branch"),
-                                  ("workflow_dispatch", "windows-cuda", "branch"),
-                                  ("workflow_dispatch", "moss-cuda-unit", "branch"),
-                                  ("pull_request", "", "branch"), ("push", "", "branch"),
-                                  ("push", "", "tag"), ("merge_group", "", "branch")):
-            with self.subTest(event=event, lanes=lanes, ref=ref):
-                self.assertEqual(self.select(current, event, lanes, ref), self.select(previous, event, lanes, ref))
-
+        ordinary = self.workflow()
+        manual = self.model_workflow()
+        bridge = yaml.load(BRIDGE_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        self.assertEqual(set(ordinary["on"]["workflow_dispatch"]["inputs"]), {"lanes"})
+        self.assertNotIn("moss-cpu-fixture", ordinary["jobs"])
+        self.assertEqual(set(manual["on"]), {"workflow_call", "workflow_dispatch"})
+        job = bridge["jobs"]["moss-fixture-bridge"]
+        self.assertEqual(job["needs"], "validate-selection")
+        self.assertEqual(job["uses"], "./.github/workflows/moss-model-fixtures.yml")
+        self.assertEqual(job["with"], {"lanes": "${{ inputs.profile }}"})
+        for choice in decoder.DISPATCH_CHOICES:
+            self.assertIn(f"inputs.profile == '{choice}'", job["if"])
+            self.assertIn(choice, bridge["on"]["workflow_dispatch"]["inputs"]["profile"]["options"])
     def test_path_route_equivalence_works_in_actual_depth_one_detached_checkout(self):
         # Start at a true depth-one boundary, then create our own available parent/nonempty diff.
         # No historical repository SHA, network fetch, or broader CI checkout is needed.
@@ -145,15 +141,15 @@ class HostedCpuRoutingTests(unittest.TestCase):
             self.assertNotEqual({name for name, value in selected.items() if value == "true"}, expected)
 
     def test_requested_matrix_skip_or_failure_cannot_turn_aggregate_green(self):
-        job = self.workflow()["jobs"]["gate"]
-        self.assertIn("moss-cpu-fixture", job["needs"])
-        gate = job["steps"][0]["run"]
-        for result, success in (("success", True), ("skipped", False), ("failure", False), ("cancelled", False)):
-            env = dict(os.environ, RESULTS="success skipped", REQUIRE_MOSS_CUDA_UNIT="false",
-                       MOSS_CUDA_UNIT_RESULT="skipped", REQUIRE_MOSS_CPU_FIXTURE="true", MOSS_CPU_FIXTURE_RESULT=result)
-            run = subprocess.run(["bash", "-c", gate], env=env, capture_output=True)
-            self.assertEqual(run.returncode == 0, success)
-
+        manual = self.model_workflow()["jobs"]
+        cpu = manual["moss-cpu-fixture"]
+        self.assertEqual(cpu["strategy"]["fail-fast"], "false")
+        self.assertNotIn("continue-on-error", cpu)
+        self.assertEqual(cpu["timeout-minutes"], "120")
+        upload = next(step for step in cpu["steps"] if step.get("name") == "Upload exact-head CPU evidence (not a pass by artifact existence)")
+        self.assertEqual(upload["if"], "always()")
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        self.assertNotIn("moss-cpu-fixture", self.workflow()["jobs"]["gate"]["needs"])
     def test_literal_story_push_transport_route_and_changed_trigger_refusal(self):
         proof = profile.push_route_proof()
         self.assertTrue(proof["matches_push_trigger"])
@@ -617,38 +613,25 @@ class MossManualPolicyTests(unittest.TestCase):
             fixture.verify(ignored, "exact::model")
 
     def test_narrow_metal_route_and_gate_never_activate_from_ordinary_or_other_choices(self):
-        helper = HostedCpuRoutingTests("test_exact_manual_choice_and_only_two_fixed_hosted_rows")
-        workflow = helper.workflow()
-        job = workflow["jobs"]["moss-metal-fixture"]
+        manual = yaml.load(MODEL_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        ordinary = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        job = manual["jobs"]["moss-metal-fixture"]
         self.assertEqual(job["runs-on"], "macos-15")
         self.assertEqual(job["timeout-minutes"], "120")
         self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-metal-fixture'")
-        self.assertEqual({k for k,v in helper.select(helper.selector(), "workflow_dispatch", "moss-metal-fixture").items() if v == "true"}, {"workspace"})
         self.assertEqual(next(s["run"] for s in job["steps"] if s.get("name") == "Run only original Metal author model proofs"),
                          "python3 scripts/ci/moss_fixture_cpu_profile.py mlx --metal-only")
-        for ordinary in ["candle-cpu-test", "macos-metal"]:
-            for step in workflow["jobs"][ordinary]["steps"]:
-                self.assertNotIn("moss_fixture_cpu", step.get("run", ""))
-                self.assertNotIn("--include-ignored", step.get("run", ""))
-        for ordinary, package in [("candle-cpu-lint", "candle-gen-moss-image"), ("macos-metal", "mlx-gen-moss-image")]:
-            compile_only = next(step["run"] for step in workflow["jobs"][ordinary]["steps"]
+        self.assertNotIn("moss-metal-fixture", ordinary["jobs"])
+        for name in ("candle-cpu-test", "macos-metal"):
+            for step in ordinary["jobs"][name]["steps"]:
+                self.assertNotIn("moss_fixture_cpu_profile.py", step.get("run", ""))
+        for name, package in (("candle-cpu-lint", "candle-gen-moss-image"), ("macos-metal", "mlx-gen-moss-image")):
+            compile_only = next(step["run"] for step in ordinary["jobs"][name]["steps"]
                                 if step.get("name") == "Compile and lint opt-in MOSS model tests without execution")
             self.assertEqual(compile_only, f"cargo clippy --locked --all-targets -j 1 -p {package} --features test-support -- -D warnings")
-        gate = workflow["jobs"]["gate"]
-        self.assertIn("moss-metal-fixture", gate["needs"])
-        for result in ["success", "skipped", "failure", "cancelled"]:
-            env = dict(os.environ, RESULTS="success skipped", REQUIRE_MOSS_CUDA_UNIT="false", REQUIRE_MOSS_CPU_FIXTURE="false",
-                       REQUIRE_MOSS_METAL_FIXTURE="true", MOSS_METAL_FIXTURE_RESULT=result)
-            run = subprocess.run(["bash", "-c", gate["steps"][0]["run"]], env=env, capture_output=True)
-            self.assertEqual(run.returncode == 0, result == "success")
-        addition = '\nelif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-metal-fixture" ]]; then\n  python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"'
-        current = helper.selector()
-        self.assertEqual(current.count(addition), 1)
-        previous = current.replace(addition, "")
-        for event, ref in [("pull_request", "branch"), ("push", "branch"), ("push", "tag"), ("merge_group", "branch")]:
-            with self.subTest(event=event, ref=ref):
-                self.assertEqual(helper.select(current, event, "moss-metal-fixture", ref),
-                                 helper.select(previous, event, "moss-metal-fixture", ref))
+        upload = next(step for step in job["steps"] if step.get("name") == "Upload exact-head Metal evidence (not a pass by artifact existence)")
+        self.assertEqual(upload["if"], "always()")
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
 
     def test_metal_guard_observes_but_never_forces_original_device_or_stream(self):
         source = (ROOT / "crates/media/mlx-gen/mlx-gen-moss-image/src/test_support.rs").read_text(encoding="utf-8")
@@ -698,9 +681,9 @@ class MossManualPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);event=root/"event.json"
             event.write_text(json.dumps({"inputs":{"lanes":"all"}}),encoding="utf-8")
-            with mock.patch.dict(os.environ,{"GITHUB_EVENT_PATH":str(event)}), mock.patch.object(profile,"venue",return_value={}), mock.patch.object(
+            with mock.patch.dict(os.environ,{"GITHUB_EVENT_PATH":str(event), "MOSS_FIXTURE_SELECTED_LANE":"moss-metal-fixture"}), mock.patch.object(profile,"venue",return_value={}), mock.patch.object(
                     fixture,"source_stamp",return_value={"head":"a"*40}), mock.patch.object(profile,"compile_binary") as compile_:
-                with self.assertRaisesRegex(UnitFailure,"narrow explicit manual choice"):
+                with self.assertRaisesRegex(UnitFailure,"fixture selection differs|narrow explicit manual choice"):
                     profile.run_metal(root/"evidence")
                 compile_.assert_not_called()
 
@@ -719,7 +702,7 @@ class MossManualPolicyTests(unittest.TestCase):
                 if mode == "wrong-device": actual[0]["device_contract_observation"] = None
                 if mode == "wrong-source": actual[0]["source"] = {}
                 listing = "\n".join(name+": test" for name in profile.METAL_MODEL_TESTS)
-                with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH":str(event)}), mock.patch.object(profile, "venue", return_value={"head":"a"*40}), mock.patch.object(
+                with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH":str(event), "MOSS_FIXTURE_SELECTED_LANE":"moss-metal-fixture"}), mock.patch.object(profile, "venue", return_value={"head":"a"*40}), mock.patch.object(
                         fixture,"source_stamp",return_value=stamp), mock.patch.object(profile,"compile_binary",return_value=(root/"binary",{"binary_sha256":"c"*64})), mock.patch.object(
                         profile,"supervise",return_value=listing), mock.patch.object(fixture,"CpuOwner") as owner, mock.patch.object(profile,"independent_tests",return_value=actual):
                     owner.return_value.collect.return_value = {}

@@ -36,6 +36,7 @@ fn config_from_meta(g: &Golden) -> VisionConfig {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn vision_tower_matches_reference_f32() {
     let dev = Device::Cpu;
     let g = Golden::load("vision_tower_golden");
@@ -53,6 +54,11 @@ fn vision_tower_matches_reference_f32() {
     assert!(
         rel < 5e-3,
         "vision tower within the f32 matmul floor (rel {rel:.3e})"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED vision_tower_parity::vision_tower_matches_reference_f32"
     );
 }
 
@@ -73,6 +79,7 @@ fn grid_from(g: &Golden) -> Vec<[usize; 3]> {
 /// inputs unchanged. It asserts the forward both *runs* (no dtype fault) and returns the weight dtype.
 /// The bf16 production dtype itself is covered by the CUDA leg below.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn vision_tower_casts_inputs_to_weight_dtype_f64_on_cpu() {
     let dev = Device::Cpu;
     let g = Golden::load("vision_tower_golden");
@@ -103,6 +110,9 @@ fn vision_tower_casts_inputs_to_weight_dtype_f64_on_cpu() {
         rel < 5e-3,
         "f64 vision tower within the f32 matmul floor (rel {rel:.3e})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vision_tower_parity::vision_tower_casts_inputs_to_weight_dtype_f64_on_cpu");
 }
 
 /// sc-11150 (F-080), CUDA leg: the true production dtype. Build the tower from **bf16** weights (as
@@ -111,6 +121,7 @@ fn vision_tower_casts_inputs_to_weight_dtype_f64_on_cpu() {
 /// (where bf16 matmul is supported) and returns bf16 within the bf16 rounding floor.
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn vision_tower_bf16_weights_f32_inputs_on_cuda() {
     let dev = Device::new_cuda(0).expect("cuda device 0");
     let g = Golden::load("vision_tower_golden");
@@ -139,4 +150,7 @@ fn vision_tower_bf16_weights_f32_inputs_on_cuda() {
         rel < 5e-2,
         "bf16 vision tower within the bf16 rounding floor (rel {rel:.3e})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vision_tower_parity::vision_tower_bf16_weights_f32_inputs_on_cuda");
 }

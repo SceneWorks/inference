@@ -12,7 +12,7 @@ use mlx_rs::{
 
 use crate::attention::ZImageAttention;
 use crate::feed_forward::FeedForward;
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
@@ -93,6 +93,11 @@ pub struct ZImageTransformerBlock {
 }
 
 impl ZImageTransformerBlock {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_storage_witness(&self) -> &Array {
+        &self.attention_norm1
+    }
+
     /// Load a block from weights under `prefix` (e.g. `"transformer.layers.0"`, or `"w"` for
     /// the standalone parity fixture). Keys mirror the Python `tree_flatten` layout.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: ZImageBlockConfig) -> Result<Self> {
@@ -157,6 +162,69 @@ impl ZImageTransformerBlock {
         Ok(())
     }
 
+    /// Every projection the block forward runs (attention q/k/v/out, the SwiGLU FFN, the adaLN
+    /// modulation), for the iOS quantum's weight-copy and adapter accounting.
+    pub(crate) fn projections(&self) -> [&AdaptableLinear; 8] {
+        let a = &self.attention;
+        let f = &self.feed_forward;
+        [
+            &a.to_q,
+            &a.to_k,
+            &a.to_v,
+            &a.to_out,
+            &f.w1,
+            &f.w2,
+            &f.w3,
+            &self.ada_ln,
+        ]
+    }
+
+    /// The block's counted iOS quantum price over `x` (`[B, T, D]`) with RoPE table `freqs_cis`
+    /// under `plan` ([`crate::quantum::dit_block_bytes`] + the dense weights' stream-width copies +
+    /// live adapter residuals), on `backend`.
+    pub(crate) fn quantum_scratch(
+        &self,
+        x: &Array,
+        freqs_cis: &Array,
+        plan: AttentionPlan<'_>,
+        backend: mlx_gen::ios_quantum::Backend,
+    ) -> u64 {
+        dit_block_scratch(
+            &self.attention,
+            &self.feed_forward,
+            Some(&self.ada_ln),
+            x,
+            freqs_cis,
+            plan,
+            backend,
+        )
+    }
+
+    /// [`Self::forward_budgeted`] as one iOS execution quantum: the headroom check runs BEFORE the
+    /// block's graph is constructed and the result is materialized before return (a pass-through
+    /// everywhere except a physical iOS device or the CPU diagnostic fixture). `extra_bytes` is what
+    /// the caller's quantum adds around the forward (a streamed block's read, a control hint).
+    pub(crate) fn forward_quantum(
+        &self,
+        x: &Array,
+        freqs_cis: &Array,
+        t_emb: &Array,
+        plan: AttentionPlan<'_>,
+        extra_bytes: u64,
+        then: impl FnOnce(Array) -> Result<Array>,
+    ) -> Result<Array> {
+        let scratch = if mlx_gen::ios_quantum::enabled() {
+            self.quantum_scratch(x, freqs_cis, plan, mlx_gen::ios_quantum::Backend::current())
+        } else {
+            0
+        };
+        mlx_gen::ios_quantum::run(
+            crate::quantum::DIT_BLOCK,
+            scratch.saturating_add(extra_bytes),
+            || then(self.forward_budgeted(x, freqs_cis, t_emb, plan)?),
+        )
+    }
+
     /// The unbounded block forward — byte-identical to the pre-SC-15615 path.
     pub fn forward(&self, x: &Array, freqs_cis: &Array, t_emb: &Array) -> Result<Array> {
         self.forward_budgeted(x, freqs_cis, t_emb, AttentionPlan::UNBOUNDED)
@@ -188,6 +256,9 @@ impl ZImageTransformerBlock {
         let attn_out = self.attention.forward_budgeted(&s1, freqs_cis, plan)?;
         let attn_normed = rms_norm(&attn_out, &self.attention_norm2, self.eps)?;
         let x1 = gated(x, &gate_msa, &attn_normed)?;
+        // iOS: the attention half is materialized before the MLP half is built, so the block's
+        // quantum holds the larger half, not both (a no-op off device).
+        crate::quantum::barrier(&[&x1, &scale_mlp, &gate_mlp])?;
 
         // Modulated SwiGLU FFN residual.
         let s2 = multiply(&rms_norm(&x1, &self.ffn_norm1, self.eps)?, &scale_mlp)?;
@@ -195,6 +266,74 @@ impl ZImageTransformerBlock {
         let ffn_normed = rms_norm(&ffn_out, &self.ffn_norm2, self.eps)?;
         gated(&x1, &gate_mlp, &ffn_normed)
     }
+}
+
+/// The shared block pricing of an adaLN block and a context block (they share attention and FFN):
+/// [`crate::quantum::dit_block_bytes`] with each half's projections' largest stream-width weight copy
+/// and adapter residual chain (`modulation`: the adaLN projection, run with the attention half).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dit_block_scratch(
+    attention: &crate::attention::ZImageAttention,
+    feed_forward: &FeedForward,
+    modulation: Option<&AdaptableLinear>,
+    x: &Array,
+    freqs_cis: &Array,
+    plan: AttentionPlan<'_>,
+    backend: mlx_gen::ios_quantum::Backend,
+) -> u64 {
+    let sh = x.shape();
+    let (b, t) = (sh[0], sh[1]);
+    let (heads, head_dim) = attention.head_geometry();
+    let element_bytes = (x.item_size().max(freqs_cis.item_size())) as u64;
+    let u = crate::quantum::u;
+    let rows = plan.budget.query_block(b, heads, t, t).min(t);
+    let shape = crate::quantum::DitBlockShape {
+        batch: u(b),
+        tokens: u(t),
+        dim: attention.to_out.base_shape().first().map_or(0, |&d| u(d)),
+        heads: u(heads),
+        head_dim: u(head_dim),
+        ff: feed_forward.w1.base_shape().first().map_or(0, |&d| u(d)),
+        query_rows: u(rows),
+        element_bytes,
+        adaln: modulation.is_some(),
+    };
+    let token_rows = u(b).saturating_mul(u(t));
+    let extra = |lins: &[&AdaptableLinear]| {
+        crate::quantum::promoted_weight_bytes(lins, element_bytes).saturating_add(
+            crate::quantum::adapter_bytes(lins, token_rows, element_bytes),
+        )
+    };
+    let mut attention_lins = vec![
+        &attention.to_q,
+        &attention.to_k,
+        &attention.to_v,
+        &attention.to_out,
+    ];
+    attention_lins.extend(modulation);
+    crate::quantum::dit_block_bytes(
+        shape,
+        backend,
+        crate::compile_glue(),
+        extra(&attention_lins),
+        extra(&[&feed_forward.w1, &feed_forward.w2, &feed_forward.w3]),
+    )
+}
+
+pub(crate) fn adapter_target_paths() -> Vec<String> {
+    let mut out = Vec::new();
+    out.push("adaLN_modulation.0".to_owned());
+    out.extend(
+        crate::attention::ADAPTER_TARGET_PATHS
+            .iter()
+            .map(|path| format!("attention.{path}")),
+    );
+    out.extend(
+        crate::feed_forward::ADAPTER_TARGET_PATHS
+            .iter()
+            .map(|path| format!("feed_forward.{path}")),
+    );
+    out
 }
 
 impl AdaptableHost for ZImageTransformerBlock {
@@ -208,9 +347,6 @@ impl AdaptableHost for ZImageTransformerBlock {
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        let mut out = vec!["adaLN_modulation.0".to_string()];
-        out.extend(prefixed_paths("attention", &self.attention));
-        out.extend(prefixed_paths("feed_forward", &self.feed_forward));
-        out
+        adapter_target_paths()
     }
 }

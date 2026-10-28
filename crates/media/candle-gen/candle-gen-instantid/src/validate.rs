@@ -285,4 +285,7 @@ fn real_weight_instantid() {
         );
     }
     eprintln!("Phase 5 PASS ✅");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED validate::real_weight_instantid");
 }

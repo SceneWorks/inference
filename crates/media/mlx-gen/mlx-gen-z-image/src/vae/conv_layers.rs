@@ -25,10 +25,46 @@ impl ConvLayer {
         })
     }
 
+    /// The `[out, 3, 3, in]` NHWC weight (for the iOS convolution accounting).
+    pub(crate) fn weight(&self) -> &Array {
+        &self.w
+    }
+
     pub fn forward(&self, x_nchw: &Array) -> Result<Array> {
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?; // NHWC
         let h = conv2d(&x, &self.w, Some(&self.b), 1, 1)?;
         Ok(h.transpose_axes(&[0, 3, 1, 2])?) // NCHW
+    }
+
+    /// The 3×3 convolution layer-wise tiled with exact halos (the bounded encode's `conv_in`): one
+    /// tiled iOS stage, every tile checked before its graph. NCHW I/O.
+    pub(crate) fn forward_tiled(
+        &self,
+        x_nchw: &Array,
+        tile_edge: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
+        let labels = &crate::quantum::ENCODE_LABELS;
+        crate::quantum::before_tiled_stage(
+            labels.stage,
+            x.shape(),
+            x.item_size() as u64,
+            &self.w,
+            false,
+        )?;
+        let source = mlx_gen::ios_quantum::TileSource {
+            full_width: x.shape()[2],
+            normalized: false,
+        };
+        let h = tiled_conv2d_3x3_nhwc(&x, &self.w, Some(&self.b), tile_edge, cancel, |tile| {
+            crate::quantum::before_tile(labels.tile, tile, source, &self.w)?;
+            Ok(tile.clone())
+        })?;
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_gen::ios_quantum::finish(labels.stage, &[&h])?;
+        }
+        Ok(h.transpose_axes(&[0, 3, 1, 2])?)
     }
 
     /// Final VAE `GroupNorm → SiLU → conv_out`, preserving full-image normalization while bounding
@@ -44,10 +80,27 @@ impl ConvLayer {
             return Err(Error::Canceled);
         }
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
+        // iOS: the tiled output convolution is one stage; each tile is checked on its own.
+        let labels = &crate::quantum::DECODE_LABELS;
+        crate::quantum::before_tiled_stage(
+            labels.stage,
+            x.shape(),
+            x.item_size() as u64,
+            &self.w,
+            false,
+        )?;
         let global = GlobalGroupNorm::new(&x, &norm.weight, &norm.bias, GN_GROUPS, GN_EPS)?;
+        let source = mlx_gen::ios_quantum::TileSource {
+            full_width: x.shape()[2],
+            normalized: true,
+        };
         let h = tiled_conv2d_3x3_nhwc(&x, &self.w, Some(&self.b), tile_edge, cancel, |tile| {
+            crate::quantum::before_tile(labels.tile, tile, source, &self.w)?;
             silu(&global.apply(tile)?)
         })?;
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_gen::ios_quantum::finish(labels.stage, &[&h])?;
+        }
         Ok(h.transpose_axes(&[0, 3, 1, 2])?)
     }
 }

@@ -21,8 +21,8 @@ composed routes.
 | BoundedDecode | not applicable (pixel space) | not applicable | not applicable |
 | BoundedAttention | implemented (64 Mi score elements) | missing | missing |
 | BoundedTransformerResidency | missing | missing | missing |
-| Witnessed load surfaces | bf16 × {resident, sequential} × eager | same | same |
-| Resident bytes (materialized snapshot) | text tower (`model.language_model.*` + untied `lm_head`, at the production device's tower dtype) + backbone (projections at the compute dtype, norm gains / modulation tables / text position table at f32) + adapter overlays | `empty_prompt.safetensors` (f32) + backbone and reducer | `empty_prompt.safetensors` (f32) + backbone |
+| Witnessed load surfaces | {bf16, q8, q4} × {resident, sequential} × eager (sc-26266) | bf16 × {resident, sequential} × eager | same as depth |
+| Resident bytes (materialized snapshot) | text tower (`model.language_model.*` + untied `lm_head`, at the production device's tower dtype; attention/MLP projections as GGML blocks at a quantized tier) + backbone (projections at the compute dtype — GGML blocks over the padded input at a quantized tier — norm gains / modulation tables / text position table at f32) + adapter overlays | `empty_prompt.safetensors` (f32) + backbone and reducer | `empty_prompt.safetensors` (f32) + backbone |
 
 Differences from the MLX twin, both deliberate:
 
@@ -56,7 +56,7 @@ Two request-side rules follow from the contract:
 ### What bounded attention does to the image
 
 Chunking computes the same attention to GEMM-order f32 rounding. On the FP32 path a bounded render
-equals the unbounded one to within one RGB8 level. Under the bf16 policy — the only tier witnessed —
+equals the unbounded one to within one RGB8 level. Under the bf16 policy (and the q8 / q4 tiers, which compute under it)
 every projection re-rounds to bf16, so the render is not bit-identical. Declared bound, held on the
 miniature snapshot on Candle CPU over three seeds and three binding budgets: no channel moves by
 more than **8 RGB8 levels** and the mean absolute change is at most **1.0 level** (observed on arm64
@@ -67,6 +67,46 @@ loader's recorded dtypes and installed residuals, registry conformance, load ref
 tests (no kernel launch exceeds its budget), and `tests/memory_strategy.rs` (a staged selection on a
 warm generator loads the two components in staged order and renders the identical image; an admitted
 budget reaches the kernels; the bf16 bound above).
+
+## Quantized tiers (sc-26266)
+
+`iris_3b` loads at bf16 and at the `q8` / `q4` tiers (`LoadSpec::quantize`, descriptor
+`supported_quants: [Q8, Q4]`), quantized **at load** from the same dense release — nothing
+converted is shipped or written, the MLX twin's convention. The tier semantics are the MLX twin's
+(see *Quantized tiers* in its `UPSTREAM.md`); only the storage differs:
+
+* **Backbone** (`load_backbone_quantized`, `nn::ProjectionLayout`): every projection at least one
+  64-wide group wide is held as GGML `Q8_0` / `Q4_0` (32-wide blocks, 8.5 / 4.5 bits per weight —
+  the cost of MLX's group-64 affine scales and biases), quantized on the host straight from the
+  checkpoint's f32 values and placed on the device. The 6826-wide SwiGLU down projections are
+  zero-padded to 6848 (exact) and packed — on an adapted load too, as on MLX: the packed base reads
+  the padded input and the adapter residuals the unpadded one (`nn::Linear::forward`), so the tier's
+  layout and pricing do not depend on the adapters. The 3-, 12- and 16-wide pixel and pooling heads,
+  the norms, the modulation biases and the text position table stay dense.
+* **Text tower** (`IrisTextEncoder::load_quantized`): every attention/MLP projection of the
+  Qwen3-VL language tower is quantized by the shared decoder (`candle_llm` `QuantSpec::q8` /
+  `QuantSpec::q4` — `Q8_0`, and `Q4_K` where its 256-wide super-block divides, `Q4_0` otherwise, both
+  4.5 bits per weight). The shards are staged on the host and installed on the device tensor by
+  tensor, so the dense tower never occupies the device beside the packed one. The tied embedding
+  and the norms stay in the tower dtype. A tower whose projection widths are not multiples of the
+  32-wide block (the released miniature's 48-wide MLP) has no quantized tier — a typed refusal.
+* **No activation is quantized.** Both components dequantize the resident blocks to the activation
+  dtype per forward and multiply densely (the shared `DequantDense` forward, sc-7702; on the tower
+  `QuantSpec::with_dequantized_forward`). candle's `QMatMul` would quantize the activation to
+  per-32 `q8_1` on CUDA, where one outlier channel flushes its block — and the tower's hidden
+  states are the conditioning itself.
+* A quantized tier runs under the bf16 compute policy only (`Precision::Fp32` + a tier and NVFP4
+  are typed refusals, shared by `load` and every contract factory).
+
+Header-priced resident weights of the release (the contract's own pricing, before candle's
+512-element CUDA row padding per packed tensor): backbone 5.57 / 2.96 / 1.57 GiB, text tower 7.49 /
+4.32 / 2.63 GiB, together 13.06 / 7.28 / 4.20 GiB for bf16 / q8 / q4 (0.558 x and 0.322 x of bf16)
+— the MLX twin's figures. Verification: `memory_strategy` unit tests (quantized pricing recomputed
+from the headers, adapted pricing, tier handshake, witnessed surfaces), `tests/quant_tiers.rs` on
+the miniature (Candle CPU, every tier: measured resident bytes equal to the contract, image /
+conditioning distance to the dense tier, the production load at both residency policies) and the
+`#[ignore]`d `tests/quant_real_weights.rs` (measured resident ratios on the release; 512² bf16 /
+q8 / q4 renders from one seed: coherence + composition; no pixel-distance bound, per the MLX twin's measured bf16 floor) on the CUDA lane.
 
 ## The folded tape (training, sc-25690)
 

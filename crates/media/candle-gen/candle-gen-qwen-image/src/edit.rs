@@ -311,7 +311,13 @@ pub(crate) fn load_transformer(
 /// an Edit-2511 render to the 2509 single-timestep modulation on a damaged snapshot (sc-9010 / F-073).
 fn read_zero_cond_t(root: &Path) -> Result<bool> {
     let path = root.join("transformer/config.json");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/candle-gen/candle-gen-qwen-image/src/edit.rs::read_zero_cond_t::std::fs::read_to_string@16169",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(t) => t,
         // Absent config ⇒ documented default (2509 / original Edit).
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -2198,5 +2204,8 @@ mod tests {
             img.width,
             img.height
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED edit::tests::qwen_edit_probed_generate_for_offload_ab");
     }
 }

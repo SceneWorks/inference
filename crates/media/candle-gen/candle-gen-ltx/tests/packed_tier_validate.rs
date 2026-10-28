@@ -89,6 +89,8 @@ fn assert_frame_coherent(img: &Image, tag: &str) {
 fn render_tier(env: &str, tag: &str) {
     let Ok(dir) = std::env::var(env) else {
         eprintln!("SKIP {tag}: set {env} to the packed tier subdir (e.g. …/q4)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-ltx/tests/packed_tier_validate.rs:92 (render_tier): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&dir)));
@@ -147,6 +149,11 @@ fn render_tier(env: &str, tag: &str) {
 #[ignore = "needs LTX_PACKED_Q4 (packed q4 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
 fn packed_q4_renders_coherent_video() {
     render_tier("LTX_PACKED_Q4", "q4");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q4_renders_coherent_video"
+    );
 }
 
 /// SC-20772's exact Candle q4 I2V memory cell. This is intentionally separate from the generic
@@ -234,6 +241,11 @@ fn packed_q4_i2v_memory_route_renders() {
     assert_eq!(fps, 24);
     assert_eq!(frames.len(), 97);
     assert_frame_coherent(&frames[0], "q4-i2v#0");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q4_i2v_memory_route_renders"
+    );
 }
 
 /// SC-20773's ordered first/last-frame counterpart. The provider VAE-encodes both keyframes at
@@ -333,6 +345,9 @@ fn packed_q4_first_last_memory_route_renders() {
     assert_eq!(frames.len(), 97);
     assert_frame_coherent(&frames[0], "q4-first-last#0");
     assert_frame_coherent(frames.last().expect("last frame"), "q4-first-last#last");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q4_first_last_memory_route_renders");
 }
 
 /// SC-20775's two-clip bridge witness. It exercises the packed q4 CUDA loader with the two
@@ -437,6 +452,9 @@ fn packed_q4_video_bridge_memory_route_renders() {
     assert_eq!(frames.len(), 97);
     assert_frame_coherent(&frames[0], "q4-bridge#0");
     assert_frame_coherent(frames.last().expect("last frame"), "q4-bridge#last");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q4_video_bridge_memory_route_renders");
 }
 
 /// SC-20775's single-clip extend witness — the bridge witness above covers two ordered IC-LoRA
@@ -526,6 +544,9 @@ fn packed_q4_extend_clip_memory_route_renders() {
     assert_eq!(frames.len(), 97);
     assert_frame_coherent(&frames[0], "q4-extend#0");
     assert_frame_coherent(frames.last().expect("last frame"), "q4-extend#last");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q4_extend_clip_memory_route_renders");
 }
 
 /// sc-20799's replace-person witness. `replace_person` is the only admitted route whose carrier is
@@ -637,6 +658,9 @@ fn packed_q4_replace_person_memory_route_renders() {
     assert_eq!(frames.len(), 97);
     assert_frame_coherent(&frames[0], "q4-replace-person#0");
     assert_frame_coherent(frames.last().expect("last frame"), "q4-replace-person#last");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q4_replace_person_memory_route_renders");
 }
 
 /// The q8 packed tier renders a coherent short video (double-quant Q8_0 path); only runs when the q8
@@ -646,6 +670,11 @@ fn packed_q4_replace_person_memory_route_renders() {
 #[ignore = "needs LTX_PACKED_Q8 (packed q8 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
 fn packed_q8_renders_coherent_video() {
     render_tier("LTX_PACKED_Q8", "q8");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q8_renders_coherent_video"
+    );
 }
 
 // =================================================================================================
@@ -1895,6 +1924,9 @@ mod ltx25_real_packed_forward {
             hi < 1.0e4,
             "stage-4 features reach {hi:.1}; U32 codes reinterpreted as floats blow up like this"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::ltx25_real_packed_forward::the_real_q4_diff_vae_decoder_loads_packed_and_forwards");
     }
 
     /// The pre-fix behaviour, pinned as a refusal: loading the real packed q4 decoder **without**
@@ -1950,6 +1982,9 @@ mod ltx25_real_packed_forward {
             Tensor::randn(0f32, 1f32, (1, cfg.in_channels, t, h, w), &device).expect("latent");
         let (features, _) = decoder.stage_features(&latent).expect("dense forward");
         assert!(max_abs(&features).is_finite());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::ltx25_real_packed_forward::the_real_bf16_diff_vae_decoder_still_loads_dense");
     }
 }
 

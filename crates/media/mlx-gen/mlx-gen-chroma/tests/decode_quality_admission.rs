@@ -232,4 +232,6 @@ fn production_latent_quality_admission() {
             mlx_rs::memory::clear_cache();
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED decode_quality_admission::production_latent_quality_admission");
 }

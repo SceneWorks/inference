@@ -106,4 +106,7 @@ fn decode_matches_reference() {
         peak < 0.10,
         "peak_rel {peak} above the attention-normalizer precision ceiling"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED decode_parity::decode_matches_reference");
 }

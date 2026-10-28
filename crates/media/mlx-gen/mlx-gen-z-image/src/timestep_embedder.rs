@@ -46,6 +46,12 @@ impl TimestepEmbedder {
         Ok(())
     }
 
+    /// The two MLP widths (`linear1`, `linear2` out-features), for the iOS embed quantum's price.
+    pub(crate) fn widths(&self) -> [u64; 2] {
+        [&self.linear1, &self.linear2]
+            .map(|lin| lin.base_shape().first().map_or(0, |&d| d.max(0) as u64))
+    }
+
     /// `t`: `(B,)` → `(B, out)`.
     pub fn forward(&self, t: &Array) -> Result<Array> {
         let mut t_freq = self.timestep_embedding(t)?;
@@ -81,14 +87,23 @@ impl TimestepEmbedder {
     }
 }
 
+pub(crate) const ADAPTER_TARGET_PATHS: &[&str] = &["mlp.0", "mlp.2"];
+pub(crate) fn adapter_header_path(path: &[&str]) -> Option<&'static str> {
+    match path {
+        ["mlp", "0"] => Some("mlp.0"),
+        ["mlp", "2"] => Some("mlp.2"),
+        _ => None,
+    }
+}
+
 impl AdaptableHost for TimestepEmbedder {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         // Trained-file naming follows the fork's `t_embedder.mlp.{0,2}` (diffusers `Sequential`
         // indices) — index 0 is the first Linear (`linear1`), index 2 the second (`linear2`); the
         // SiLU at index 1 has no weights.
-        match path {
-            ["mlp", "0"] => Some(&mut self.linear1),
-            ["mlp", "2"] => Some(&mut self.linear2),
+        match adapter_header_path(path)? {
+            "mlp.0" => Some(&mut self.linear1),
+            "mlp.2" => Some(&mut self.linear2),
             _ => None,
         }
     }

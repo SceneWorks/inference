@@ -30,7 +30,13 @@ fn env_dir(name: &str) -> PathBuf {
 fn decode_photo() -> Image {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../mlx-gen/_vendor/mage_flow/assets/dog.jpg");
-    let rgb = image::open(path).expect("the repo photo decodes").to_rgb8();
+    let rgb = candle_gen::gen_core::__model_input_reader!(
+        image::open(path),
+        "crates/media/candle-gen/candle-gen-iris/tests/depth_real_weights.rs::decode_photo/image::open",
+        Reference,
+        path,
+        |__model_input_path| image::open(__model_input_path)
+    ).expect("the repo photo decodes").to_rgb8();
     Image {
         width: rgb.width(),
         height: rgb.height(),
@@ -193,4 +199,7 @@ fn real_depth_matches_the_upstream_reference() {
     assert!(r >= 0.9995, "pearson {r}");
     assert!(mean <= 1e-2, "mean |Δ| {mean}");
     assert!(max_abs <= 0.15, "max |Δ| {max_abs}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_real_weights::real_depth_matches_the_upstream_reference");
 }

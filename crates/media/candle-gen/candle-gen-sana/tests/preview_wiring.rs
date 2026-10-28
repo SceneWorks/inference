@@ -180,6 +180,7 @@ fn run_base(sampler: Option<&str>, steps: usize, preview: &PreviewHook<'_>) -> (
 /// Euler evaluates once per outer step, so the base lane emits exactly one frame per step, numbered
 /// `1..=steps` with `total == steps`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_base_lane_emits_one_frame_per_euler_step() {
     let steps = 6usize;
     let (sink, frames) = collecting_sink();
@@ -199,6 +200,9 @@ fn the_base_lane_emits_one_frame_per_euler_step() {
             .map(|n| (n, steps as u32))
             .collect::<Vec<_>>()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_wiring::the_base_lane_emits_one_frame_per_euler_step");
 }
 
 /// **One frame per outer step on a multi-eval solver**, proven non-vacuous first.
@@ -209,6 +213,7 @@ fn the_base_lane_emits_one_frame_per_euler_step() {
 /// asserting the frames collapsed to exactly the outer steps — a solver that turned out to evaluate
 /// once per step would make the frame-count assertion prove nothing about dedup.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_multi_eval_solver_still_emits_one_frame_per_outer_step() {
     let steps = 5usize;
     let (sink, frames) = collecting_sink();
@@ -238,12 +243,16 @@ fn a_multi_eval_solver_still_emits_one_frame_per_outer_step() {
             .map(|n| (n, steps as u32))
             .collect::<Vec<_>>()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_wiring::a_multi_eval_solver_still_emits_one_frame_per_outer_step");
 }
 
 /// **CFG never reaches the preview.** Base SANA runs the cond and uncond trunk forwards *inside*
 /// `denoise_cfg`'s predict closure and blends them before the solver advances, so every latent the
 /// hook sees is one batch-1 tensor in the trunk's own channel width — never a fused `[2, …]` pair.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_base_preview_never_sees_a_fused_unconditional_half() {
     let config = tiny_base_config();
     let (sink, _frames) = collecting_sink();
@@ -261,11 +270,15 @@ fn the_base_preview_never_sees_a_fused_unconditional_half() {
             "the base hook must see one batch-1 latent, not a fused cond/uncond batch"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_wiring::the_base_preview_never_sees_a_fused_unconditional_half");
 }
 
 /// N1 for the base seam: an inert sink leaves the denoised latent byte-identical to an active one at
 /// the same seed, and does no projection at all.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_base_lane_is_byte_identical_under_an_inert_sink() {
     let seen = Arc::new(Mutex::new(Vec::new()));
 
@@ -287,6 +300,9 @@ fn the_base_lane_is_byte_identical_under_an_inert_sink() {
         values(&watched),
         "an active preview sink must not change a single denoised value"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_wiring::the_base_lane_is_byte_identical_under_an_inert_sink");
 }
 
 // ── The Sprint lane: `denoise_sprint` → `run_scm_sampler` ─────────────────────────────────────────
@@ -321,6 +337,7 @@ fn run_sprint(steps: usize, preview: &PreviewHook<'_>) -> (Tensor, Tensor) {
 /// The `steps == 1` row is the one the story names explicitly: one frame, `current == 1`, `total == 1`,
 /// no division by zero and no stall.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_sprint_lane_emits_one_frame_per_scm_step_including_the_single_step_schedule() {
     for steps in [1usize, 2, 3, 4] {
         let (sink, frames) = collecting_sink();
@@ -341,11 +358,15 @@ fn the_sprint_lane_emits_one_frame_per_scm_step_including_the_single_step_schedu
             "{steps}-step Sprint numbering"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_wiring::the_sprint_lane_emits_one_frame_per_scm_step_including_the_single_step_schedule");
 }
 
 /// The single-step schedule, called out on its own because it is the degenerate case: `ScmScheduler`
 /// reports `is_single_step()`, the driver skips the renoise, and the counter's `total` is 1.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_single_step_sprint_render_emits_exactly_one_frame_and_does_not_stall() {
     let scheduler = ScmScheduler::new(1);
     assert!(scheduler.is_single_step());
@@ -363,6 +384,9 @@ fn a_single_step_sprint_render_emits_exactly_one_frame_and_does_not_stall() {
         values(&out).iter().all(|v| v.is_finite()),
         "a single-step Sprint render must produce a finite latent"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_wiring::a_single_step_sprint_render_emits_exactly_one_frame_and_does_not_stall");
 }
 
 /// **The `σ_data` scale the Sprint projector has to undo**, measured against the caller's own seed
@@ -372,6 +396,7 @@ fn a_single_step_sprint_render_emits_exactly_one_frame_and_does_not_stall() {
 /// tensor, which is why `crate::preview::sprint_hook` carries `1/σ_data`. If this row ever fails
 /// because the driver stopped pre-scaling, the correction must go with it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_scm_driver_hands_the_hook_the_sigma_data_scaled_latent() {
     let (sink, _frames) = collecting_sink();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -392,10 +417,14 @@ fn the_scm_driver_hands_the_hook_the_sigma_data_scaled_latent() {
     );
     // And it is genuinely different from the unscaled seed, or the correction would be a no-op.
     assert_ne!(seen[0].1, values(&seed_latents));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_wiring::the_scm_driver_hands_the_hook_the_sigma_data_scaled_latent");
 }
 
 /// N1 for the SCM seam: an inert sink leaves the denoised latent byte-identical and projects nothing.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_sprint_lane_is_byte_identical_under_an_inert_sink() {
     let seen = Arc::new(Mutex::new(Vec::new()));
 
@@ -408,11 +437,15 @@ fn the_sprint_lane_is_byte_identical_under_an_inert_sink() {
     assert_eq!(candle_gen::lock_recover(&seen).len(), 4);
 
     assert_eq!(values(&quiet), values(&watched));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_wiring::the_sprint_lane_is_byte_identical_under_an_inert_sink");
 }
 
 /// A projector that always fails costs neither render anything — previews are decorative on both
 /// drivers, and a projection error is swallowed rather than surfaced.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_failing_projector_never_fails_either_render() {
     let (base_sink, base_frames) = collecting_sink();
     let base_hook = PreviewHook::new(&base_sink, |_: &Tensor| {
@@ -429,4 +462,7 @@ fn a_failing_projector_never_fails_either_render() {
     let (sprint_out, _) = run_sprint(4, &sprint_hook);
     assert!(values(&sprint_out).iter().all(|v| v.is_finite()));
     assert!(candle_gen::lock_recover(&sprint_frames).is_empty());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_wiring::a_failing_projector_never_fails_either_render");
 }

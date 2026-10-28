@@ -179,10 +179,10 @@ impl Snake {
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let ax = x.broadcast_mul(&self.alpha)?;
+        let ax = __model_proof_output!(x.broadcast_mul(&self.alpha))?;
         let sin2 = ax.sin()?.sqr()?;
         let denom = self.alpha.affine(1.0, 1e-9)?; // α + 1e-9
-        x.broadcast_add(&sin2.broadcast_div(&denom)?)
+        __model_proof_output!(x.broadcast_add(&__model_proof_output!(sin2.broadcast_div(&denom))?))
     }
 }
 
@@ -310,10 +310,10 @@ impl ConvRnnF0Predictor {
     fn forward(&self, mel: &Tensor) -> CandleResult<Tensor> {
         let mut x = mel.clone();
         for conv in &self.condnet {
-            x = conv.forward(&x)?.elu(1.0)?;
+            x = __model_proof_output!(conv.forward(&x))?.elu(1.0)?;
         }
         let x = x.transpose(1, 2)?.contiguous()?; // [1, T, 512]
-        let x = self.classifier.forward(&x)?; // [1, T, 1]
+        let x = __model_proof_output!(self.classifier.forward(&x))?; // [1, T, 1]
         x.squeeze(D::Minus1)?.abs() // [1, T]
     }
 }
@@ -538,7 +538,7 @@ impl HiftGenerator {
         let s_stft = Tensor::from_vec(s_stft_host, (1, SOURCE_CH, tt), &self.device)?;
 
         // Upsample trunk with source injection.
-        let mut x = self.conv_pre.forward(&mel)?; // [1, 512, T]
+        let mut x = __model_proof_output!(self.conv_pre.forward(&mel))?; // [1, 512, T]
         for i in 0..3 {
             x = leaky_relu(&x, LRELU_SLOPE)?;
             x = self.ups[i].forward(&x)?;
@@ -555,7 +555,7 @@ impl HiftGenerator {
             x = (xs / 3.0)?;
         }
         x = leaky_relu(&x, LRELU_SLOPE_DEFAULT)?;
-        let x = self.conv_post.forward(&x)?.contiguous()?; // [1, 18, T']
+        let x = __model_proof_output!(self.conv_post.forward(&x))?.contiguous()?; // [1, 18, T']
         let t_prime = x.dim(2)?;
 
         // iSTFT head: split into exp-magnitude (bins 0..9) and sin-phase (bins 9..18).
@@ -852,6 +852,7 @@ mod tests {
 
     /// `Snake` computes `x + (1/α)·sin(αx)²` (α = 1 here): 0 at x = 0, matches the closed form.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn snake_activation_matches_closed_form() {
         let dev = Device::Cpu;
         let ch = 2usize;
@@ -877,6 +878,11 @@ mod tests {
                 got[i]
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED hift::tests::snake_activation_matches_closed_form"
+        );
     }
 
     // -------------------------------------------------------------------------------------------
@@ -887,6 +893,7 @@ mod tests {
     /// `[80, T]` mel to a finite `[480·T]` waveform, exercising the weight-norm reconstruction,
     /// the transposed-conv upsample trunk, source injection, MRF resblocks, and the iSTFT head.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decode_maps_mel_to_480x_waveform_on_synthetic_weights() {
         let dev = Device::Cpu;
         let varmap = VarMap::new();
@@ -913,6 +920,9 @@ mod tests {
         // Deterministic under a fixed seed.
         let wav2 = hift.decode(&mel, 20260719).unwrap();
         assert_eq!(v, wav2.to_vec1::<f32>().unwrap());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED hift::tests::decode_maps_mel_to_480x_waveform_on_synthetic_weights");
     }
 
     // ---- synthetic-weight materializers (shapes exactly match mel2wav.*) ----

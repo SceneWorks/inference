@@ -169,6 +169,7 @@ fn latent_sha(result: &Value) -> String {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_full_request_publishes_every_artifact() {
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -256,9 +257,15 @@ fn a_full_request_publishes_every_artifact() {
     assert_eq!(config["model_dtype"], "float32");
     assert_eq!(config["generation"]["ode_steps"], 2);
     assert_eq!(config["decoder_release"], "standard");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED run::tests::a_full_request_publishes_every_artifact"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn plan_only_then_restored_stages_equal_the_one_shot_run() {
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -313,9 +320,13 @@ fn plan_only_then_restored_stages_equal_the_one_shot_run() {
     );
     assert_eq!(outcome.samples, one_shot.audio.samples());
     assert_eq!(rec.count(Stage::Semantic, StageEvent::Started), 1);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::plan_only_then_restored_stages_equal_the_one_shot_run");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_decoder_switch_decodes_the_same_verified_latent_without_touching_the_source() {
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -415,9 +426,13 @@ fn a_decoder_switch_decodes_the_same_verified_latent_without_touching_the_source
     });
     assert!(matches!(err, Err(RunError::Corrupt { .. })), "{err:?}");
     assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::a_decoder_switch_decodes_the_same_verified_latent_without_touching_the_source");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn resume_reuses_only_the_matching_completed_stages() {
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -474,9 +489,13 @@ fn resume_reuses_only_the_matching_completed_stages() {
         run(&engine, &input, &s, &RunOutput::fresh(&dir)).0,
         Err(RunError::Exists(_))
     ));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::resume_reuses_only_the_matching_completed_stages");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn resume_rejects_mismatched_and_corrupt_work_without_overwriting_it() {
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -601,9 +620,13 @@ fn resume_rejects_mismatched_and_corrupt_work_without_overwriting_it() {
         matches!(err, Err(RunError::IdentityMismatch { what: "plan", .. })),
         "{err:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::resume_rejects_mismatched_and_corrupt_work_without_overwriting_it");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_tampered_synthesis_checkpoint_is_rejected() {
     // Latents rewritten together with their sidecar (so `AcousticLatents::load` accepts them) and
     // the checkpoint's digests are refused: the checkpoint recorded another latent identity.
@@ -639,9 +662,15 @@ fn a_tampered_synthesis_checkpoint_is_rejected() {
     assert!(matches!(err, Err(RunError::Corrupt { .. })), "{err:?}");
     assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
     assert!(!dir.exists());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED run::tests::a_tampered_synthesis_checkpoint_is_rejected"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cancellation_at_any_stage_publishes_nothing_complete() {
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -701,6 +730,9 @@ fn cancellation_at_any_stage_publishes_nothing_complete() {
         Err(RunError::Engine(gen_core::Error::Canceled))
     ));
     assert!(!out.exists());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::cancellation_at_any_stage_publishes_nothing_complete");
 }
 
 #[test]
@@ -780,6 +812,7 @@ fn published_source(engine: &Yue2Engine, root: &Path) -> PathBuf {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cached_decode_never_writes_into_beside_or_above_its_source() {
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -824,6 +857,9 @@ fn a_cached_decode_never_writes_into_beside_or_above_its_source() {
     });
     r.unwrap();
     assert_eq!(snapshot(&source), before);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::a_cached_decode_never_writes_into_beside_or_above_its_source");
 }
 
 #[test]
@@ -1027,6 +1063,7 @@ fn every_stage_identity_binds_every_input_it_depends_on() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cached_decode_refuses_a_source_generated_by_another_model() {
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -1043,9 +1080,13 @@ fn a_cached_decode_refuses_a_source_generated_by_another_model() {
     });
     assert!(matches!(r, Err(RunError::Invalid(_))), "{r:?}");
     assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::a_cached_decode_refuses_a_source_generated_by_another_model");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_unpublished_result_in_an_interrupted_run_is_refused_and_left_alone() {
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -1076,9 +1117,13 @@ fn an_unpublished_result_in_an_interrupted_run_is_refused_and_left_alone() {
         "the interrupted run is left as it was"
     );
     assert!(!dir.exists());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::an_unpublished_result_in_an_interrupted_run_is_refused_and_left_alone");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cached_decode_refuses_latents_the_source_did_not_record() {
     // Forged latents with a consistent sidecar and consistent result.json digests pass
     // `verify_run` and `AcousticLatents::load`; only the latent identity the source recorded tells.
@@ -1103,9 +1148,13 @@ fn a_cached_decode_refuses_latents_the_source_did_not_record() {
     });
     assert!(matches!(r, Err(RunError::Corrupt { .. })), "{r:?}");
     assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::a_cached_decode_refuses_latents_the_source_did_not_record");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn checkpointed_latents_from_another_source_are_refused() {
     // The same values re-attributed to another source, with the checkpoint's digests and its
     // recorded latent identity both updated: only the "produced by this synthesis" check tells.
@@ -1143,9 +1192,13 @@ fn checkpointed_latents_from_another_source_are_refused() {
     assert!(matches!(r, Err(RunError::Corrupt { .. })), "{r:?}");
     assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
     assert!(!dir.exists());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::checkpointed_latents_from_another_source_are_refused");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_working_directory_is_claimed_by_one_run_at_a_time() {
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -1180,6 +1233,9 @@ fn a_working_directory_is_claimed_by_one_run_at_a_time() {
     assert!(!dir.join(LOCK_FILE).exists());
     assert!(!work.exists());
     verify_run(&dir, None).unwrap();
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED run::tests::a_working_directory_is_claimed_by_one_run_at_a_time");
 }
 
 #[test]

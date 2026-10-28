@@ -25,3 +25,12 @@ pub fn snapshot_opt() -> Option<PathBuf> {
     let p = std::env::var("SDXL_SNAPSHOT").ok()?;
     Some(PathBuf::from(p))
 }
+
+#[cfg(target_os = "macos")]
+#[path = "../../../mlx-gen-iris/tests/common/metal_guard.rs"]
+mod model_proof_device;
+
+pub fn record_model_inference_device() {
+    #[cfg(target_os = "macos")]
+    model_proof_device::record_model_inference_device();
+}

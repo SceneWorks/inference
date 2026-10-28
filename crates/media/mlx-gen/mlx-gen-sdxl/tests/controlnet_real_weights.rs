@@ -62,7 +62,8 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
 }
 
 #[test]
-#[ignore = "needs xinsir tile-CN weights + the controlnet golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs xinsir tile-CN weights + the controlnet golden"]
 fn controlnet_residuals_match_diffusers() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let sample = nchw_to_nhwc(g.require("sample").unwrap()); // [1,64,64,4]
@@ -85,10 +86,13 @@ fn controlnet_residuals_match_diffusers() {
     let timestep = g.require("timestep").unwrap().as_slice::<f32>()[0];
 
     let cn = ControlNet::from_weights(&cn_weights(), &UNetConfig::sdxl_base()).unwrap();
-    let res = cn
-        .forward(
+    let res = (
+        crate::common::record_model_inference_device(),
+        cn.forward(
             &sample, &control, timestep, &encoder_x, &text_emb, &time_ids, 1.0,
-        )
+        ),
+    )
+        .1
         .unwrap();
 
     assert_eq!(res.down.len(), 9, "expected 9 down residuals");
@@ -115,6 +119,8 @@ fn controlnet_residuals_match_diffusers() {
         mid_rel < 2e-2,
         "ControlNet mid residual beyond the deep-path floor: {mid_rel:.3e}"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED controlnet_real_weights::controlnet_residuals_match_diffusers");
 }
 
 fn base_snapshot() -> PathBuf {
@@ -153,7 +159,8 @@ fn gradient(w: u32, h: u32) -> Image {
 /// branch draws no RNG, so it must reproduce plain img2img byte-for-byte (proves the load + dispatch
 /// + `forward_with_control` wiring + the scale knob).
 #[test]
-#[ignore = "needs the SDXL base snapshot + xinsir tile-CN"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the SDXL base snapshot + xinsir tile-CN"]
 fn controlnet_scale_zero_equals_img2img() {
     let model = mlx_gen_sdxl::load(
         &LoadSpec::new(WeightsSource::Dir(base_snapshot()))
@@ -178,7 +185,13 @@ fn controlnet_scale_zero_equals_img2img() {
             ..Default::default()
         }
     };
-    let run = |req: &GenerationRequest| match model.generate(req, &mut |_| {}).unwrap() {
+    let run = |req: &GenerationRequest| match (
+        crate::common::record_model_inference_device(),
+        model.generate(req, &mut |_| {}),
+    )
+        .1
+        .unwrap()
+    {
         GenerationOutput::Images(mut v) => v.remove(0),
         _ => unreachable!(),
     };
@@ -200,6 +213,8 @@ fn controlnet_scale_zero_equals_img2img() {
         plain.pixels.len()
     );
     assert_eq!(diff, 0, "ControlNet at scale=0 must equal plain img2img");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED controlnet_real_weights::controlnet_scale_zero_equals_img2img");
 }
 
 /// sc-3378 (provider-level MultiControlNet): two **identical** control branches (same tile-CN, same
@@ -210,7 +225,8 @@ fn controlnet_scale_zero_equals_img2img() {
 /// `ControlContext` → `denoise_multi_control` residual sum. (A second *different* checkpoint would need
 /// a diffusers golden; this invariant validates the sum exactly with the one cached checkpoint.)
 #[test]
-#[ignore = "needs the SDXL base snapshot + xinsir tile-CN"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the SDXL base snapshot + xinsir tile-CN"]
 fn multicontrolnet_two_branches_sum_equals_single() {
     let init = gradient(512, 512);
     let req = |conds: Vec<Conditioning>| {
@@ -234,8 +250,11 @@ fn multicontrolnet_two_branches_sum_equals_single() {
         kind: ControlKind::Other("tile".to_string()),
         scale: Some(scale),
     };
-    let run = |model: &dyn mlx_gen::Generator, req: &GenerationRequest| match model
-        .generate(req, &mut |_| {})
+    let run = |model: &dyn mlx_gen::Generator, req: &GenerationRequest| match (
+        crate::common::record_model_inference_device(),
+        model.generate(req, &mut |_| {}),
+    )
+        .1
         .unwrap()
     {
         GenerationOutput::Images(mut v) => v.remove(0),
@@ -273,4 +292,6 @@ fn multicontrolnet_two_branches_sum_equals_single() {
         diff, 0,
         "MultiControlNet: two branches summing to the same total scale must equal a single branch"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED controlnet_real_weights::multicontrolnet_two_branches_sum_equals_single");
 }

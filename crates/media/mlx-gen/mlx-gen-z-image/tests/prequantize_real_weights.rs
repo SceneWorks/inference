@@ -24,7 +24,7 @@ fn turbo_snapshot() -> Option<PathBuf> {
 }
 
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image-Turbo snapshot; builds a packed tier (set SC8670_SRC/OUT/BITS)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image-Turbo snapshot; builds a packed tier (set SC8670_SRC/OUT/BITS)"]
 fn prequantize_turnkey_loads_packed_and_renders() {
     let Some(src) = turbo_snapshot() else {
         eprintln!(
@@ -119,4 +119,7 @@ fn prequantize_turnkey_loads_packed_and_renders() {
         let _ = std::fs::remove_dir_all(&out);
         println!("  removed {} (set SC8670_KEEP to retain)", out.display());
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED prequantize_real_weights::prequantize_turnkey_loads_packed_and_renders");
 }

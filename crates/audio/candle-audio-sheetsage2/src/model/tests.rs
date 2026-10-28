@@ -64,6 +64,7 @@ fn error(ours: &Tensor, theirs: &Tensor) -> (f32, f32) {
 /// fail: skip the LoRA merge (relative error ≈ 1), drop the GRN's `+ x` residual, use natural log
 /// instead of log10 in the dB step, or reverse `rotate_half`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn encoder_states_match_upstream() {
     let _serial = crate::test_lock();
     let model = tiny_model();
@@ -97,6 +98,9 @@ fn encoder_states_match_upstream() {
         max_abs, 0.0,
         "streamed layer mix must equal the materialized one"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED model::tests::encoder_states_match_upstream");
 }
 
 /// Greedy decoding under the grammar reproduces upstream's tokens exactly, and **every** step's raw
@@ -110,6 +114,7 @@ fn encoder_states_match_upstream() {
 /// the grammar-unmasked argmax, drop the self-attention KV cache (attend only to the new token), or
 /// freeze the positions after the prefix.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn greedy_tokens_and_every_step_match_upstream() {
     let _serial = crate::test_lock();
     let model = tiny_model();
@@ -151,6 +156,9 @@ fn greedy_tokens_and_every_step_match_upstream() {
         assert!(relative <= 1e-4, "step {i}: relative {relative:.3e}");
     }
     println!("{} steps, worst relative {worst:.3e}", steps.len());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED model::tests::greedy_tokens_and_every_step_match_upstream");
 }
 
 /// Incremental decoding (cached self-attention K/V, cached cross-attention K/V, positions offset by
@@ -161,6 +169,7 @@ fn greedy_tokens_and_every_step_match_upstream() {
 /// Mutations that must fail: drop the self-attention KV cache, or freeze the positions after the
 /// prefix.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cached_steps_equal_a_full_recompute() {
     let _serial = crate::test_lock();
     let model = tiny_model();
@@ -195,6 +204,9 @@ fn cached_steps_equal_a_full_recompute() {
         assert!(relative <= 5e-5, "step {k}: relative {relative:.3e}");
     }
     println!("{} steps, worst relative {worst:.3e}", incremental.len());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED model::tests::cached_steps_equal_a_full_recompute");
 }
 
 /// A checkpoint that is not float32, has an extra tensor, or pairs with a different parent

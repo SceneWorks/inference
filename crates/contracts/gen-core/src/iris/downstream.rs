@@ -86,6 +86,24 @@ impl TaskExport {
     /// else may be staged. A text encoder, any component, the generation checkpoint or another
     /// task's export is a typed [`Error::Unsupported`] naming the wrong-task artifact.
     pub fn from_spec(spec: &LoadSpec, task: IrisTask, model_id: &str) -> Result<Self> {
+        Self::from_spec_impl(spec, task, model_id, None)
+    }
+
+    pub fn from_spec_observed(
+        spec: &LoadSpec,
+        task: IrisTask,
+        model_id: &str,
+        observer: &mut crate::weightsmeta::SourceMetadataObserver<'_>,
+    ) -> Result<Self> {
+        Self::from_spec_impl(spec, task, model_id, Some(observer))
+    }
+
+    fn from_spec_impl(
+        spec: &LoadSpec,
+        task: IrisTask,
+        model_id: &str,
+        observer: Option<&mut crate::weightsmeta::SourceMetadataObserver<'_>>,
+    ) -> Result<Self> {
         if task == IrisTask::Generation {
             return Err(Error::Msg(format!(
                 "{model_id}: the generation task is not a downstream export"
@@ -117,22 +135,59 @@ impl TaskExport {
                 )))
             }
         };
-        Self::from_dir(&dir, task, model_id)
+        Self::from_dir_impl(&dir, task, model_id, observer)
     }
 
     /// [`Self::from_spec`] on a directory.
     pub fn from_dir(dir: &Path, task: IrisTask, model_id: &str) -> Result<Self> {
+        Self::from_dir_impl(dir, task, model_id, None)
+    }
+
+    fn from_dir_impl(
+        dir: &Path,
+        task: IrisTask,
+        model_id: &str,
+        mut observer: Option<&mut crate::weightsmeta::SourceMetadataObserver<'_>>,
+    ) -> Result<Self> {
         let name = task.name();
         let subdir = task.backbone_subdir();
         let resource = format!("{name} export");
         super::require_dir(dir, model_id, &resource)?;
         let config_path = dir.join(BACKBONE_CONFIG_FILE);
         super::require_file(&config_path, model_id, &resource)?;
-        let bytes = std::fs::read(&config_path)
-            .map_err(|e| Error::Msg(format!("iris: read {}: {e}", config_path.display())))?;
+        let bytes = if let Some(observe) = observer.as_deref_mut() {
+            use std::io::Read as _;
+            let io = |e| Error::Msg(format!("iris: read {}: {e}", config_path.display()));
+            let mut file = std::fs::File::open(&config_path).map_err(io)?;
+            let length = file.metadata().map_err(io)?.len();
+            observe(crate::weightsmeta::SourceMetadataRead::Input(length))?;
+            let length = usize::try_from(length).map_err(|_| {
+                Error::Unsupported("Iris guarded config input length overflow".into())
+            })?;
+            // Exact original length, not read_to_end: concurrent growth cannot expand an
+            // admitted Vec before the retained identity check gets to reject the replacement.
+            let mut bytes = vec![0; length];
+            file.read_exact(&mut bytes).map_err(io)?;
+            let mut extra = [0u8; 1];
+            if file.read(&mut extra).map_err(io)? != 0 {
+                return Err(Error::Unsupported(
+                    "Iris guarded config changed during read".into(),
+                ));
+            }
+            bytes
+        } else {
+            std::fs::read(&config_path)
+                .map_err(|e| Error::Msg(format!("iris: read {}: {e}", config_path.display())))?
+        };
+        if let Some(observe) = observer.as_deref_mut() {
+            observe(crate::weightsmeta::SourceMetadataRead::Yaml(&bytes))?;
+        }
         let text = String::from_utf8(bytes.clone()).map_err(|_| {
             Error::Msg(format!("iris: {} is not UTF-8 text", config_path.display()))
         })?;
+        if let Some(observe) = observer.as_deref_mut() {
+            observe(crate::weightsmeta::SourceMetadataRead::YamlParse(&bytes))?;
+        }
         let settings = parse_task_settings(&text)
             .map_err(|e| Error::Msg(format!("iris: {}: {e}", config_path.display())))?;
         let settings = match settings {
@@ -158,7 +213,15 @@ impl TaskExport {
         for file in [BACKBONE_WEIGHTS_FILE, EMPTY_PROMPT_FILE] {
             super::require_file(&dir.join(file), model_id, &resource)?;
         }
-        check_weights_task_stamp(&dir.join(BACKBONE_WEIGHTS_FILE), task, model_id)?;
+        check_weights_task_stamp_observed(
+            &dir.join(BACKBONE_WEIGHTS_FILE),
+            task,
+            model_id,
+            observer.as_deref_mut(),
+        )?;
+        if let Some(observe) = observer {
+            observe(crate::weightsmeta::SourceMetadataRead::YamlParse(&bytes))?;
+        }
         let config = IrisConfig::parse(&text)
             .map_err(|e| Error::Msg(format!("iris: {}: {e}", config_path.display())))?;
         config.validate_supported()?;
@@ -166,13 +229,36 @@ impl TaskExport {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        Ok(Self {
-            task,
-            dir: dir.to_path_buf(),
-            config,
-            settings,
-            config_sha256,
-        })
+        crate::__model_input_choose!(
+            Ok(Self {
+                task,
+                dir: dir.to_path_buf(),
+                config,
+                settings,
+                config_sha256,
+            }),
+            (Ok(Self {
+                task,
+                dir: dir.to_path_buf(),
+                config,
+                settings,
+                config_sha256,
+            }))
+            .inspect(|observed: &Self| {
+                if let Some(sha256) =
+                    crate::model_input_proof::sha256_from_hex(&observed.config_sha256)
+                {
+                    crate::model_input_proof::record_inputs(
+                        "gen-core::iris::downstream::TaskExport::from_dir_impl",
+                        crate::model_input_proof::InputRole::Configuration,
+                        &[crate::model_input_proof::InputIdentity::same_read_buffer(
+                            Some(&config_path),
+                            sha256,
+                        )],
+                    );
+                }
+            })
+        )
     }
 
     pub fn weights_path(&self) -> PathBuf {
@@ -216,8 +302,14 @@ pub fn refuse_task_export(dir: &Path, model_id: &str) -> Result<()> {
 /// A trained export stamps its task in the `model.safetensors` metadata (`irisTask`, see
 /// `train::task_model_metadata`); the shipped release exports carry no stamp. A stamp naming another
 /// task is a typed refusal, so a mislabelled directory never loads as this task.
-fn check_weights_task_stamp(path: &Path, task: IrisTask, model_id: &str) -> Result<()> {
-    let Some(stamp) = weights_metadata(path)?.and_then(|m| m.get(super::ADAPTER_TASK_KEY).cloned())
+fn check_weights_task_stamp_observed(
+    path: &Path,
+    task: IrisTask,
+    model_id: &str,
+    observer: Option<&mut crate::weightsmeta::SourceMetadataObserver<'_>>,
+) -> Result<()> {
+    let Some(stamp) = weights_metadata_impl(path, observer)?
+        .and_then(|m| m.get(super::ADAPTER_TASK_KEY).cloned())
     else {
         return Ok(());
     };
@@ -236,6 +328,13 @@ fn check_weights_task_stamp(path: &Path, task: IrisTask, model_id: &str) -> Resu
 /// The `__metadata__` map of a safetensors file, read from its header only (`None` when the file is
 /// too short to hold a header or carries no metadata).
 pub fn weights_metadata(path: &Path) -> Result<Option<std::collections::HashMap<String, String>>> {
+    weights_metadata_impl(path, None)
+}
+
+fn weights_metadata_impl(
+    path: &Path,
+    mut observer: Option<&mut crate::weightsmeta::SourceMetadataObserver<'_>>,
+) -> Result<Option<std::collections::HashMap<String, String>>> {
     use std::io::Read as _;
     let io = |e: std::io::Error| Error::Msg(format!("iris: read {}: {e}", path.display()));
     let mut f = std::fs::File::open(path).map_err(io)?;
@@ -250,8 +349,17 @@ pub fn weights_metadata(path: &Path) -> Result<Option<std::collections::HashMap<
             path.display()
         )));
     }
+    if let Some(observe) = observer.as_deref_mut() {
+        observe(crate::weightsmeta::SourceMetadataRead::Input(n))?;
+    }
     let mut header = vec![0u8; n as usize];
     f.read_exact(&mut header).map_err(io)?;
+    if let Some(observe) = observer {
+        observe(crate::weightsmeta::SourceMetadataRead::Json {
+            file_bytes: f.metadata().map_err(io)?.len(),
+            bytes: &header,
+        })?;
+    }
     let v: serde_json::Value = serde_json::from_slice(&header)
         .map_err(|e| Error::Msg(format!("iris: {} header: {e}", path.display())))?;
     Ok(v.get("__metadata__").and_then(|m| m.as_object()).map(|m| {
@@ -322,11 +430,16 @@ impl EmptyPrompt {
                 path.display()
             )));
         }
-        Ok(Self {
-            embeddings,
-            shape: want,
-            mask,
-        })
+        crate::__model_input_result!(
+            Ok(Self {
+                embeddings,
+                shape: want,
+                mask,
+            }),
+            "gen-core::iris::downstream::EmptyPrompt::read",
+            TensorInput,
+            &[path]
+        )
     }
 
     /// Write the export layout (`embeddings` F32 `[1, T, L, D]`, `mask` BOOL `[1, T]`) to `path`
@@ -385,6 +498,57 @@ mod tests {
         std::fs::write(dir.join(BACKBONE_CONFIG_FILE), config).unwrap();
         std::fs::write(dir.join(BACKBONE_WEIGHTS_FILE), b"").unwrap();
         std::fs::write(dir.join(EMPTY_PROMPT_FILE), b"").unwrap();
+    }
+
+    #[test]
+    fn guarded_config_refusal_precedes_read_buffer_and_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        export(dir.path(), "not valid YAML: [");
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_owned()));
+        let mut calls = 0;
+        let error =
+            TaskExport::from_spec_observed(&spec, IrisTask::Depth, "iris_3b_depth", &mut |event| {
+                assert!(matches!(
+                    event,
+                    crate::weightsmeta::SourceMetadataRead::Input(_)
+                ));
+                calls += 1;
+                Err(Error::Unsupported("capacity sentinel".into()))
+            })
+            .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(ref reason) if reason == "capacity sentinel"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn guarded_task_stamp_uses_existing_header_read_before_config_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        export(dir.path(), DEPTH_CONFIG);
+        let raw = br#"{"__metadata__":{"irisTask":"depth"}}"#;
+        let mut bytes = (raw.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(raw);
+        std::fs::write(dir.path().join(BACKBONE_WEIGHTS_FILE), bytes).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_owned()));
+        let mut calls = Vec::new();
+        let checked =
+            TaskExport::from_spec_observed(&spec, IrisTask::Depth, "iris_3b_depth", &mut |event| {
+                calls.push(match event {
+                    crate::weightsmeta::SourceMetadataRead::Input(_) => 0,
+                    crate::weightsmeta::SourceMetadataRead::Yaml(_) => 1,
+                    crate::weightsmeta::SourceMetadataRead::YamlParse(_) => 3,
+                    crate::weightsmeta::SourceMetadataRead::Json { bytes, .. } => {
+                        assert_eq!(bytes, raw);
+                        2
+                    }
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, [0, 1, 3, 0, 2, 3]);
+        assert_eq!(
+            checked,
+            TaskExport::from_spec(&spec, IrisTask::Depth, "iris_3b_depth").unwrap()
+        );
     }
 
     #[test]

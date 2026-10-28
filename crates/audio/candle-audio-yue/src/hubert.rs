@@ -89,9 +89,9 @@ impl Layer {
                 .transpose(1, 2)?
                 .contiguous()
         };
-        let q = heads(self.q.forward(h)?)?;
-        let k = heads(self.k.forward(h)?)?;
-        let v = heads(self.v.forward(h)?)?;
+        let q = heads(__model_proof_output!(self.q.forward(h))?)?;
+        let k = heads(__model_proof_output!(self.k.forward(h))?)?;
+        let v = heads(__model_proof_output!(self.v.forward(h))?)?;
         let kt = k.transpose(2, 3)?.contiguous()?;
         let scale = (hd as f64).powf(-0.5);
         let mut parts = Vec::with_capacity(t.div_ceil(query_chunk));
@@ -105,9 +105,13 @@ impl Layer {
         let attn = Tensor::cat(&parts, 2)?
             .transpose(1, 2)?
             .reshape((b, t, c))?;
-        let h = self.ln.forward(&(h + self.out.forward(&attn)?)?)?;
-        let ff = self.ff_out.forward(&self.ff_in.forward(&h)?.gelu_erf()?)?;
-        self.final_ln.forward(&(h + ff)?)
+        let h = __model_proof_output!(self
+            .ln
+            .forward(&(h + __model_proof_output!(self.out.forward(&attn))?)?))?;
+        let ff = __model_proof_output!(self
+            .ff_out
+            .forward(&__model_proof_output!(self.ff_in.forward(&h))?.gelu_erf()?))?;
+        __model_proof_output!(self.final_ln.forward(&(h + ff)?))
     }
 }
 
@@ -305,7 +309,7 @@ impl Hubert {
                 .broadcast_add(&gb)?
                 .gelu_erf()?;
             for conv in &self.convs[1..] {
-                x = conv.forward(&x)?.gelu_erf()?;
+                x = __model_proof_output!(conv.forward(&x))?.gelu_erf()?;
             }
             parts.push(x);
         }
@@ -325,12 +329,14 @@ impl Hubert {
             .features(wave, chunk_frames)?
             .transpose(1, 2)?
             .contiguous()?;
-        let h = self.proj.forward(&self.proj_ln.forward(&x)?)?;
+        let h = __model_proof_output!(self
+            .proj
+            .forward(&__model_proof_output!(self.proj_ln.forward(&x))?))?;
 
-        let pos = self.pos_conv.forward(&h.transpose(1, 2)?.contiguous()?)?;
+        let pos = __model_proof_output!(self.pos_conv.forward(&h.transpose(1, 2)?.contiguous()?))?;
         let t = pos.dim(D::Minus1)? - self.pos_remove;
         let pos = pos.narrow(D::Minus1, 0, t)?.gelu_erf()?.transpose(1, 2)?;
-        let mut h = self.enc_ln.forward(&(h + pos)?)?;
+        let mut h = __model_proof_output!(self.enc_ln.forward(&(h + pos)?))?;
 
         let mut sum = h.clone();
         for layer in &self.layers {

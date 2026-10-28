@@ -1,5 +1,7 @@
 //! In-memory fused SDXL LDM/A1111 checkpoint component split and remap.
 
+pub(crate) mod pricing;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -32,18 +34,30 @@ fn component_map<'a>(
     }
 }
 
-fn squeeze_linear(value: Array) -> Result<Array> {
-    let dims: Vec<i32> = value
-        .shape()
+fn squeezed_dimensions<T: Copy + PartialEq + From<u8>>(shape: &[T]) -> Vec<T> {
+    shape
         .iter()
         .copied()
-        .filter(|&dim| dim != 1)
-        .collect();
+        .filter(|dim| *dim != T::from(1))
+        .collect()
+}
+
+fn squeeze_linear(value: Array) -> Result<Array> {
+    let dims = squeezed_dimensions(value.shape());
     if dims.len() == value.shape().len() {
         Ok(value)
     } else {
         Ok(value.reshape(&dims)?)
     }
+}
+
+/// Normalize a fused file through the SAME key-remap producer as the actual load, keeping every
+/// order-dependent alias group (each realizable native winner) beside the assignment-0 world.
+/// Transpose/squeeze/split are shape-only here; no source payload or Array is constructed.
+pub(crate) fn component_header_source(path: &Path) -> Result<pricing::FusedHeaderSource> {
+    let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(|error| Error::Msg(error.to_string()))?;
+    pricing::FusedHeaderSource::from_headers(headers)
 }
 
 pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {
@@ -107,6 +121,74 @@ pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {
         clip_bigg: Weights::from_map(clip_bigg),
         vae: Weights::from_map(vae),
     })
+}
+
+/// iOS pre-load floor (sc-26270) for constructing `components` out of the fused checkpoint at
+/// `path`: every tensor that remaps into one of them at its RESIDENT width after the load's cast
+/// (the VAE upcast to f32 by `load_vae_from_weights`; the U-Net and CLIP encoders cast to the
+/// compute dtype by `loader::cast_for_load` — a fused checkpoint is never packed), plus the largest
+/// such tensor's transient (its stored source and cast copy together, or one read). Restricted to
+/// the components this phase actually builds (a fused file also carries the others). Header-only;
+/// a no-op (no file read) off device.
+pub(crate) fn before_component_load(
+    label: &str,
+    path: &Path,
+    components: &[SdxlComponent],
+) -> Result<()> {
+    if !mlx_gen::ios_quantum::enabled() {
+        return Ok(());
+    }
+    let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(|e| Error::Msg(e.to_string()))?;
+    let floor = component_load_floor_from_headers(&headers, components)?;
+    mlx_gen::ios_quantum::before(label, floor)
+}
+
+/// Exact source-raw guard floor over every mapped source header in the selected actual component
+/// set, including overwritten aliases and full QKV sources. No model/Array/world enumeration.
+pub(crate) fn component_load_floor_from_headers(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    components: &[SdxlComponent],
+) -> Result<u64> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    let compute = match crate::model::DTYPE {
+        mlx_rs::Dtype::Float32 => (Stored::F32, 4u64),
+        mlx_rs::Dtype::Bfloat16 => (Stored::BF16, 2),
+        _ => (Stored::F16, 2),
+    };
+    let mut total = 0u64;
+    let mut largest = 0u64;
+    for header in headers {
+        let component = match remap_sdxl_ldm_key(&header.name) {
+            Some(
+                TensorRemap::Rename(component, _)
+                | TensorRemap::Transpose(component, _)
+                | TensorRemap::Squeeze(component, _)
+                | TensorRemap::SplitQkv(component, _),
+            ) => component,
+            None => continue,
+        };
+        if !components.contains(&component) {
+            continue;
+        }
+        let (target, width) = if component == SdxlComponent::Vae {
+            (Stored::F32, 4)
+        } else {
+            compute
+        };
+        if header.dtype == target {
+            total = total.saturating_add(header.data_bytes);
+            largest = largest.max(header.data_bytes);
+        } else {
+            let cast = header
+                .shape
+                .iter()
+                .fold(width, |a, &d| a.saturating_mul(d as u64));
+            total = total.saturating_add(cast);
+            largest = largest.max(cast.saturating_add(header.data_bytes));
+        }
+    }
+    Ok(total.saturating_add(largest))
 }
 
 #[cfg(test)]

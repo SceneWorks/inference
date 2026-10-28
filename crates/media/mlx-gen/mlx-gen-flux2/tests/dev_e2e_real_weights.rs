@@ -156,6 +156,10 @@ fn dev_txt2img_renders_coherent_image() {
         mean > 2.0 && mean < 253.0,
         "render pinned to an extreme: mean={mean:.2}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED dev_e2e_real_weights::dev_txt2img_renders_coherent_image"
+    );
 }
 
 // ---- sc-5919: FLUX.2-dev EDIT (single + multi reference) --------------------------------------
@@ -276,5 +280,9 @@ fn dev_edit_renders_coherent_image() {
     assert!(
         mean > 2.0 && mean < 253.0,
         "edit render pinned to an extreme: mean={mean:.2}"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED dev_e2e_real_weights::dev_edit_renders_coherent_image"
     );
 }

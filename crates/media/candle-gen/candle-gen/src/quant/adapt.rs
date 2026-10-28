@@ -100,7 +100,7 @@ impl Base {
                 let dt = x.dtype();
                 let w = l.weight().to_dtype(dt)?;
                 let b = l.bias().map(|b| b.to_dtype(dt)).transpose()?;
-                Linear::new(w, b).forward(x)
+                __model_proof_output!(Linear::new(w, b).forward(x))
             }
             Base::Packed(q) => q.forward(x),
             // NVFP4 already produces its output in the activation dtype (the packed weight is never
@@ -1796,6 +1796,7 @@ mod tests {
     /// ordinary-forward leg uses its production f32 regime; the bf16-resident leg is exercised through
     /// the public upcast entry point used for that storage dtype.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dense_scale_zero_skips_residual_exactly_in_forward_and_bf16_upcast() {
         let (out_dim, in_dim) = (16usize, 32usize);
         let x_f32 = deterministic_input(2, in_dim, DType::F32);
@@ -1854,6 +1855,9 @@ mod tests {
             &bare_upcast,
             "dense bf16 forward_upcast scale=0",
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::dense_scale_zero_skips_residual_exactly_in_forward_and_bf16_upcast");
     }
 
     /// sc-15444: Q8/Q4 int8-fast hosts can intentionally retain an f32 result for non-f32 inputs. A
@@ -1863,6 +1867,7 @@ mod tests {
     /// bf16 matmul, so f64 is the executable CPU proxy for the same `input dtype != host output dtype`
     /// boundary (the production bf16/CUDA path crosses that identical boundary).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quantized_hosts_preserve_output_dtype_and_exact_adapter_semantics() {
         let (out_dim, in_dim, rank) = (32usize, 32usize, 2usize);
         let x = deterministic_input(2, in_dim, DType::F64);
@@ -1921,6 +1926,9 @@ mod tests {
                 "positive live adapter must shift every host output upward"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::quantized_hosts_preserve_output_dtype_and_exact_adapter_semantics");
     }
 
     /// The hardware counterpart to the CPU dtype-boundary test: Metal supports bf16 dense matmul, so
@@ -1928,6 +1936,7 @@ mod tests {
     /// with the backend feature and is exercised by the macOS validation lane.
     #[cfg(feature = "metal")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn metal_bf16_dense_q8_q4_forwards_are_exact_at_the_adapter_seam() {
         let dev = Device::new_metal(0).unwrap();
         let (out_dim, in_dim, rank) = (32usize, 32usize, 2usize);
@@ -2039,6 +2048,9 @@ mod tests {
                 "Metal quantized bf16 live adapter upcast entry",
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::metal_bf16_dense_q8_q4_forwards_are_exact_at_the_adapter_seam");
     }
 
     /// `detect` recovers the logical dims from the packed `scales` shape and keeps the base packed.
@@ -2061,6 +2073,7 @@ mod tests {
     /// The dense arm of `linear_detect` is byte-identical to the legacy `candle_nn::linear` read — a
     /// dense checkpoint (no `.scales`) loads dense, unchanged; a `.scales` sibling fires the packed arm.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_dense_and_packed_arms() {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (32usize, 64usize);
@@ -2088,14 +2101,15 @@ mod tests {
         assert!(!dense.is_packed(), "no `.scales` ⇒ dense");
         let x = Tensor::randn(0f32, 1f32, (4usize, in_dim), &dev).unwrap();
         let want = Linear::new(w, Some(bias));
-        let dev_max = (dense.forward(&x).unwrap() - want.forward(&x).unwrap())
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap();
+        let dev_max = (dense.forward(&x).unwrap()
+            - __model_proof_output!(want.forward(&x)).unwrap())
+        .unwrap()
+        .abs()
+        .unwrap()
+        .max_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
         assert_eq!(
             dev_max, 0.0,
             "dense arm deviates from the legacy linear read"
@@ -2106,6 +2120,9 @@ mod tests {
             packed.is_packed(),
             "`.scales` ⇒ packed load, not a silent dense fallback"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::linear_detect_dense_and_packed_arms");
     }
 
     #[test]
@@ -2193,6 +2210,7 @@ mod tests {
     /// `δ = (alpha/rank)·scale·(up·down)` on a dense f32 base — the additive==folded identity (tight in
     /// f32), the core weight-level property (no GPU needed).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn additive_lora_matches_folded_dense() {
         let dev = Device::Cpu;
         let (out_dim, in_dim, rank) = (48usize, 64usize, 4usize);
@@ -2214,21 +2232,26 @@ mod tests {
         let folded = Linear::new((w + delta).unwrap(), None);
 
         let x = Tensor::randn(0f32, 1f32, (3usize, in_dim), &dev).unwrap();
-        let dev_max = (lin.forward(&x).unwrap() - folded.forward(&x).unwrap())
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap();
+        let dev_max = (lin.forward(&x).unwrap()
+            - __model_proof_output!(folded.forward(&x)).unwrap())
+        .unwrap()
+        .abs()
+        .unwrap()
+        .max_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
         assert!(dev_max < 1e-4, "additive vs folded deviates by {dev_max}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::additive_lora_matches_folded_dense");
     }
 
     /// A LoRA applied additively onto a **packed** base shifts the output, keeps the base **packed** (no
     /// dense weight materialized), and stays finite — the core acceptance on a quantized tier. A scale-0
     /// residual is an exact no-op (the mutation anchor: break the scale and this equality breaks).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn additive_lora_on_packed_shifts_stays_packed_and_scale0_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -2282,6 +2305,9 @@ mod tests {
             zero_dev, 0.0,
             "scale-0 residual must be an exact no-op on packed"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::additive_lora_on_packed_shifts_stays_packed_and_scale0_is_noop");
     }
 
     /// `clear_adapters` reverts an adapted projection to its **bare base** — the per-phase toggle-off a
@@ -2290,6 +2316,7 @@ mod tests {
     /// phase's adapter set is authoritative regardless of what the prior phase installed, and that the
     /// base weight is never disturbed by the toggle.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn clear_adapters_reverts_to_bare_base_and_repush_reinstalls() {
         let dev = Device::Cpu;
         let (out_dim, in_dim, rank) = (48usize, 64usize, 4usize);
@@ -2346,6 +2373,9 @@ mod tests {
             repush_shift > 1e-4 && (repush_shift - adapted_shift).abs() > 1e-6,
             "re-push installs a fresh residual at the new scale"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::clear_adapters_reverts_to_bare_base_and_repush_reinstalls");
     }
 
     /// The **acceptance parity** on a packed base, isolated from the base's own quant error: the
@@ -2354,6 +2384,7 @@ mod tests {
     /// leaving only the residual. This proves the LoRA is added **additively over the packed weight**
     /// (never folded into a re-quantized dense weight).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn additive_on_packed_adds_exact_residual_over_base() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -2383,6 +2414,9 @@ mod tests {
             dev_max < 1e-5,
             "packed residual != scale·(x·a)·b (max diff {dev_max})"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::additive_on_packed_adds_exact_residual_over_base");
     }
 
     /// `quantize` folds a **dense** base to packed in place (idempotent no-op if already packed), keeping
@@ -2390,6 +2424,7 @@ mod tests {
     /// folded-packed forward equals the packed base forward plus the same residual (f32 tol), and a
     /// second quantize on the now-packed base is an exact no-op (the additive residuals survive).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quantize_folds_dense_base_and_preserves_residual() {
         let dev = Device::Cpu;
         let (out_dim, in_dim, rank) = (64usize, 128usize, 4usize);
@@ -2439,6 +2474,9 @@ mod tests {
             noop, 0.0,
             "quantize on an already-packed base must be a no-op"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::quantize_folds_dense_base_and_preserves_residual");
     }
 
     // ---- Structured (deferred) LoKr — the Kronecker vec-trick ---------------------------------------
@@ -2462,6 +2500,7 @@ mod tests {
     /// Kronecker identity the whole port rests on, against candle's own `reconstruct_lokr_delta` fold.
     /// The built factors are the SMALL `[a,c]`/`[b,d]` matrices — the `[out,in]` delta is NEVER formed.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn structured_lokr_full_matches_reconstruct_delta() {
         let dev = Device::Cpu;
         let (a, b, c, d) = (2usize, 3, 4, 5);
@@ -2536,11 +2575,15 @@ mod tests {
             max_abs(&got) > 1e-2,
             "the LoKr residual must be materially non-zero"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::structured_lokr_full_matches_reconstruct_delta");
     }
 
     /// **Decomposed-factor parity.** Same identity for a low-rank LoKr (`w1_a·w1_b`, `w2_a·w2_b`): the
     /// inner products are materialized only as the SMALL `[a,c]`/`[b,d]` factors, never `[out,in]`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn structured_lokr_decomposed_matches_reconstruct_delta() {
         let dev = Device::Cpu;
         let (a, b, c, d, r) = (3usize, 2, 5, 4, 2);
@@ -2601,12 +2644,16 @@ mod tests {
             dev_max < 1e-4,
             "decomposed structured LoKr != materialized delta ({dev_max})"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::structured_lokr_decomposed_matches_reconstruct_delta");
     }
 
     /// Frozen factors prepare one compute-dtype view per installed residual and reuse it across
     /// forwards. The trainable residual deliberately contributes no cached preparation: its live
     /// leaves still transpose inside every eager graph.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn frozen_adapter_factors_prepare_once_per_compute_dtype() {
         let dev = Device::Cpu;
         let mut linear = AdaptLinear::from_dense(
@@ -2681,6 +2728,9 @@ mod tests {
         );
         linear.forward(&f32).unwrap();
         assert_eq!(linear.frozen_adapter_preparation_count(), 2);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::frozen_adapter_factors_prepare_once_per_compute_dtype");
     }
 
     /// **Acceptance parity on a PACKED base.** The structured LoKr installs on a packed q4 base, the
@@ -2688,6 +2738,7 @@ mod tests {
     /// reproduces `packed_forward + folded_delta` within quant tolerance. Also the mutation anchor: a
     /// scale-0 LoKr is an exact no-op.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn structured_lokr_on_packed_matches_folded_and_stays_packed() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -2767,6 +2818,9 @@ mod tests {
             zero_dev, 0.0,
             "scale-0 structured LoKr must be an exact no-op"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::structured_lokr_on_packed_matches_folded_and_stays_packed");
     }
 
     /// A tucker/CP `w2` (`lokr_t2`, conv-only) and a base that does not factor as `a·b × c·d` are both
@@ -2825,6 +2879,7 @@ mod tests {
     /// 5.4 GB copy per residual leg and the first denoise step never finished. This pins the flattened
     /// path's NUMERICS against a per-batch-slice reference, so the perf fix can't silently change the math.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn lora_residual_on_batched_activation_matches_per_slice_reference() {
         let dev = Device::Cpu;
         let (out_dim, in_dim, rank, scale) = (12usize, 16usize, 4usize, 0.7f64);
@@ -2842,7 +2897,7 @@ mod tests {
 
         for i in 0..n {
             let xi = x.narrow(0, i, 1).unwrap().reshape((s, in_dim)).unwrap();
-            let base = Linear::new(w.clone(), None).forward(&xi).unwrap();
+            let base = __model_proof_output!(Linear::new(w.clone(), None).forward(&xi)).unwrap();
             let res = (xi.matmul(&a).unwrap().matmul(&b).unwrap() * scale).unwrap();
             let want = (base + res).unwrap();
             let mine = got.narrow(0, i, 1).unwrap().reshape((s, out_dim)).unwrap();
@@ -2856,6 +2911,9 @@ mod tests {
                 .unwrap();
             assert!(d < 1e-5, "batch slice {i} diverged from the reference: {d}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::lora_residual_on_batched_activation_matches_per_slice_reference");
     }
 
     // ------------------------------------------------------------------------------------------
@@ -2906,6 +2964,7 @@ mod tests {
     /// restores the base output **exactly**: the packed weight was never mutated, so this is bit
     /// equality, not a tolerance.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn nvfp4_base_hosts_an_additive_lora_and_restores_exactly_on_removal() {
         let (out_dim, in_dim, rank) = (32, 64, 4);
         let mut host = nvfp4_host(out_dim, in_dim);
@@ -2951,11 +3010,15 @@ mod tests {
             "clearing the adapter must restore the exact base output"
         );
         assert!(host.is_nvfp4(), "the base regime survived the whole cycle");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::nvfp4_base_hosts_an_additive_lora_and_restores_exactly_on_removal");
     }
 
     /// AC#1 — a structured LoKr rides the same NVFP4 base through the Kronecker vec-trick, matching
     /// the reconstructed dense delta, and removal is again exact.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn nvfp4_base_hosts_a_structured_lokr_residual() {
         let (a, b, c, d) = (4usize, 8usize, 8usize, 8usize);
         let (out_dim, in_dim) = (a * b, c * d);
@@ -3025,6 +3088,9 @@ mod tests {
 
         host.clear_adapters();
         assert_eq!(flat(&host.forward(&x).unwrap()), flat(&bare));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::nvfp4_base_hosts_a_structured_lokr_residual");
     }
 
     /// **sc-11045 fix round (MAJOR 7, minor): the unchecked pushes delegate to the checked forms
@@ -3214,6 +3280,7 @@ mod tests {
     /// the base dtype) and refuses a packed base and a mis-shaped delta with an error, never a
     /// silent dequantize or skip.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn fold_dense_delta_adds_on_dense_and_refuses_packed() {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (2usize, 64usize);
@@ -3244,5 +3311,8 @@ mod tests {
             Err(CandleError::Unsupported(message)) => assert!(message.contains("packed")),
             other => panic!("a packed base must refuse the fold, got {other:?}"),
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapt::tests::fold_dense_delta_adds_on_dense_and_refuses_packed");
     }
 }

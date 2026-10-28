@@ -569,10 +569,11 @@ impl Block {
         let hf = (hf + a.to_dtype(DType::F32)?.broadcast_mul(&gate_msa)?)?;
 
         // 2. cross-attention (affine norm2, ungated)
-        let n = ln_no_affine(&hf, self.eps)?
-            .broadcast_mul(&self.norm2_w)?
-            .broadcast_add(&self.norm2_b)?
-            .to_dtype(dt)?;
+        let n = __model_proof_output!(__model_proof_output!(
+            ln_no_affine(&hf, self.eps)?.broadcast_mul(&self.norm2_w)
+        )?
+        .broadcast_add(&self.norm2_b))?
+        .to_dtype(dt)?;
         let a = self.attn2.forward_prepared(&n, cross_kv, None)?;
         let hf = (hf + a.to_dtype(DType::F32)?)?;
 
@@ -1166,6 +1167,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn observer_off_skips_retained_kv_byte_accounting() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1180,6 +1182,9 @@ mod tests {
             0,
             "inactive campaign must not compute retained K/V evidence bytes"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::observer_off_skips_retained_kv_byte_accounting");
     }
 
     /// Max-abs bound for a **chunked-vs-un-chunked SDPA** comparison (SC-15943). Query-row chunking is
@@ -1246,6 +1251,7 @@ mod tests {
     /// `patch_embed_tokens → forward_packed → unpatchify_tokens` composition — pins the additive seams
     /// to the validated monolithic forward (the many-crates-depend-on-it invariant).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_equals_seam_composition() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1269,12 +1275,18 @@ mod tests {
             0.0,
             "seam composition must equal forward"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::forward_equals_seam_composition"
+        );
     }
 
     /// The Candle work-count probe for SC-21692. Each projected text payload gets one K/V pair per
     /// block; scalar and TI2V-token denoise forwards reuse that request-scoped cache without another
     /// text K/V projection. The prepared result remains exactly pinned to the prior small CPU fixture.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_cross_kv_runs_once_per_payload_and_preserves_small_fixture_output() {
         let _probe_lock = lock_cross_kv_probe();
         let dev = Device::Cpu;
@@ -1324,9 +1336,13 @@ mod tests {
             cfg.num_layers * 2,
             "denoise repetition must not reproject text K/V"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::prepared_cross_kv_runs_once_per_payload_and_preserves_small_fixture_output");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn per_token_timestep_forward_reduces_to_scalar_and_honors_pinned_tokens() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1360,6 +1376,9 @@ mod tests {
             max_abs(&tokenized, &pinned) > 1e-5,
             "zero-timestep pinned tokens must change the modulation path"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::per_token_timestep_forward_reduces_to_scalar_and_honors_pinned_tokens");
     }
 
     /// A conditioning source concatenated on the token axis extends the packed sequence, but the sliced
@@ -1367,6 +1386,7 @@ mod tests {
     /// self-attention (the packed target-slice differs from the target-only forward), with the source-id
     /// RoPE shifting the result. Mirrors the mlx `conditioning_source_preserves_target_shape` intent.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_source_preserves_target_shape_and_couples() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1423,6 +1443,9 @@ mod tests {
             max_abs(&vel, &vel0) > 1e-6,
             "source-id RoPE (id 1 vs id 0) must change the coupled velocity"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::packed_source_preserves_target_shape_and_couples");
     }
 
     /// The ported sc-6217 query-row chunking (sc-12434): forcing a tiny scores budget must split the

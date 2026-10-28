@@ -761,6 +761,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn per_frame_shapes_per_variant() {
         for (cfg, up) in [
             (tiny(TaehvConfig::taew2_1()), 8),
@@ -775,9 +776,15 @@ mod tests {
             let v = px.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             assert!(v.iter().all(|x| (0.0..=1.0).contains(x)));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED train::taehv::tests::per_frame_shapes_per_variant"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn per_frame_decode_equals_the_reference_t1_clip_with_its_trim() {
         for cfg in [tiny(TaehvConfig::taew2_1()), tiny(TaehvConfig::taeltx2_3())] {
             let dec = load(&cfg, 5);
@@ -797,9 +804,13 @@ mod tests {
             let video = video.squeeze(1).unwrap();
             assert!(max_abs_diff(&fast, &video) < 1e-5, "{}", cfg.name);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::taehv::tests::per_frame_decode_equals_the_reference_t1_clip_with_its_trim");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn video_decode_grows_and_trims_and_memory_crosses_frames() {
         let cfg = tiny(TaehvConfig::taew2_1());
         let dec = load(&cfg, 6);
@@ -819,6 +830,9 @@ mod tests {
             .unwrap();
         let last = v.narrow(1, 8, 1).unwrap().squeeze(1).unwrap();
         assert!(max_abs_diff(&alone, &last) > 1e-2);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::taehv::tests::video_decode_grows_and_trims_and_memory_crosses_frames");
     }
 
     /// `decode_clip_last_frames` on `T = 2` clips is exactly the last frame of the reference
@@ -826,6 +840,7 @@ mod tests {
     /// predecessor's memory), one frame per clip. Mutations: keep the clip's first stage-2 frame
     /// (`f - 1` → `0`) ⇒ red; cut the cross-frame memory (MemBlocks run with `clips = n·t`) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn clip_last_frame_decode_equals_the_reference_clips_last_frame() {
         for cfg in [tiny(TaehvConfig::taew2_1()), tiny(TaehvConfig::taeltx2_3())] {
             let dec = load(&cfg, 8);
@@ -846,6 +861,9 @@ mod tests {
             let last = video.narrow(1, frames - 1, 1).unwrap().squeeze(1).unwrap();
             assert!(max_abs_diff(&fast, &last) < 1e-5, "{}", cfg.name);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::taehv::tests::clip_last_frame_decode_equals_the_reference_clips_last_frame");
     }
 
     /// A `T`-frame clip's working set grows with `T` (head + MemBlock stages run on every frame)
@@ -861,6 +879,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn per_frame_decode_backpropagates_to_its_input() {
         let cfg = tiny(TaehvConfig::taew2_2());
         let dec = load(&cfg, 7);
@@ -885,6 +904,9 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(mag > 0.0 && mag.is_finite());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::taehv::tests::per_frame_decode_backpropagates_to_its_input");
     }
 
     #[test]
@@ -907,6 +929,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::excessive_precision)]
+    #[ignore = "model inference; explicit model workflow only"]
     fn full_size_decode_matches_upstream_taehv_py_golden_values() {
         // Same golden values as the MLX twin, from the UPSTREAM reference (taehv.py @ 011dfc21,
         // `TAEHV(checkpoint_path=None, arch_name=name).double()`, `decode_video(parallel=True)`)
@@ -1071,5 +1094,8 @@ mod tests {
                 }
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::taehv::tests::full_size_decode_matches_upstream_taehv_py_golden_values");
     }
 }

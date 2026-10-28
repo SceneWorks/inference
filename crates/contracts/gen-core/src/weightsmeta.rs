@@ -245,8 +245,21 @@ pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<Stri
     })?;
     let mut header = vec![0_u8; header_len];
     file.read_exact(&mut header)?;
-    let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
-        .map_err(|error| {
+    crate::__model_input_result!(
+        safetensors_metadata_from_json(path, &header),
+        "gen-core::weightsmeta::safetensors_file_metadata",
+        Configuration,
+        &[path]
+    )
+}
+
+/// The metadata parser shared by file reads and guarded consumers of an already-held header.
+pub fn safetensors_metadata_from_json(
+    path: &Path,
+    header: &[u8],
+) -> Result<BTreeMap<String, String>> {
+    let json: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(header).map_err(|error| {
             Error::Msg(format!("safetensors header in {}: {error}", path.display()))
         })?;
     // An explicit `"__metadata__": null` means the same thing as an absent key, and is what the
@@ -587,23 +600,56 @@ pub struct SafetensorsFileLayout {
 /// `F8_E8M0` — is named, not fatal), checks each tensor's shape × dtype width against its declared
 /// byte range, and proves the payload region is contiguous and exactly covers the file. Reads the
 /// header only; never a tensor payload.
+/// Borrowed events at existing source read sites. Observers must check requested layouts before
+/// returning; the bytes variant borrows the original input and never creates a second buffer.
+pub enum SourceMetadataRead<'a> {
+    Input(u64),
+    Json { file_bytes: u64, bytes: &'a [u8] },
+    Yaml(&'a [u8]),
+    YamlParse(&'a [u8]),
+}
+pub type SourceMetadataObserver<'a> =
+    dyn for<'bytes> FnMut(SourceMetadataRead<'bytes>) -> Result<()> + 'a;
+
 pub fn safetensors_file_tensor_locations(path: impl AsRef<Path>) -> Result<SafetensorsFileLayout> {
-    let path = path.as_ref();
+    file_tensor_locations_impl(path.as_ref(), None)
+}
+
+pub fn safetensors_file_tensor_locations_observed(
+    path: impl AsRef<Path>,
+    observer: &mut SourceMetadataObserver<'_>,
+) -> Result<SafetensorsFileLayout> {
+    file_tensor_locations_impl(path.as_ref(), Some(observer))
+}
+
+fn file_tensor_locations_impl(
+    path: &Path,
+    observer: Option<&mut SourceMetadataObserver<'_>>,
+) -> Result<SafetensorsFileLayout> {
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
-    safetensors_reader_tensor_locations(&mut file, file_len, path)
+    reader_tensor_locations_impl(&mut file, file_len, path, observer)
 }
 
 /// Parse the same bounded, validated header from an already-open reader. `source` labels errors
 /// only; this function never opens it. The reader is left immediately after the header so callers
 /// can authenticate that exact prefix and remaining payload through one handle (sc-26325/F-280).
 pub fn safetensors_reader_tensor_locations(
-    mut reader: impl Read,
+    reader: impl Read,
     file_len: u64,
     source: impl AsRef<Path>,
 ) -> Result<SafetensorsFileLayout> {
+    reader_tensor_locations_impl(reader, file_len, source.as_ref(), None)
+}
+
+fn reader_tensor_locations_impl(
+    mut reader: impl Read,
+    file_len: u64,
+    source: &Path,
+    mut observer: Option<&mut SourceMetadataObserver<'_>>,
+) -> Result<SafetensorsFileLayout> {
     const MAX_HEADER_SIZE: u64 = 100_000_000;
-    let path = source.as_ref();
+    let path = source;
     let mut prefix = [0_u8; 8];
     reader.read_exact(&mut prefix)?;
     let header_len = u64::from_le_bytes(prefix);
@@ -631,8 +677,17 @@ pub fn safetensors_reader_tensor_locations(
             path.display()
         ))
     })?;
+    if let Some(observe) = observer.as_deref_mut() {
+        observe(SourceMetadataRead::Input(header_len as u64))?;
+    }
     let mut header = vec![0_u8; header_len];
     reader.read_exact(&mut header)?;
+    if let Some(observe) = observer {
+        observe(SourceMetadataRead::Json {
+            file_bytes: file_len,
+            bytes: &header,
+        })?;
+    }
     let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
         .map_err(|error| {
             Error::Msg(format!("safetensors header in {}: {error}", path.display()))
@@ -768,12 +823,17 @@ pub fn safetensors_reader_tensor_locations(
             expected_start - data_start
         )));
     }
-    Ok(SafetensorsFileLayout {
-        header_json: header,
-        data_start,
-        file_len,
-        tensors,
-    })
+    crate::__model_input_result!(
+        Ok(SafetensorsFileLayout {
+            header_json: header,
+            data_start,
+            file_len,
+            tensors,
+        }),
+        "gen-core::weightsmeta::file_tensor_locations_impl",
+        Configuration,
+        &[path]
+    )
 }
 
 /// The file-level `__metadata__._quantization_metadata` string of one safetensors file, if it
@@ -2531,5 +2591,55 @@ mod tests {
             materialized_path_bytes(bf16.parent().unwrap(), 4).unwrap(),
             8
         );
+    }
+}
+
+#[cfg(test)]
+mod observed_metadata_read_tests {
+    use super::*;
+
+    #[test]
+    fn observed_header_checks_input_then_parser_and_uses_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.safetensors");
+        let raw = br#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut file = (raw.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(raw);
+        file.extend_from_slice(&[0; 4]);
+        std::fs::write(&path, file).unwrap();
+        let mut calls = Vec::new();
+        let layout = safetensors_file_tensor_locations_observed(&path, &mut |event| {
+            match event {
+                SourceMetadataRead::Input(bytes) => calls.push((0, bytes)),
+                SourceMetadataRead::Json { bytes, .. } => {
+                    assert_eq!(bytes, raw);
+                    calls.push((1, bytes.len() as u64));
+                }
+                SourceMetadataRead::Yaml(_) | SourceMetadataRead::YamlParse(_) => {
+                    panic!("unexpected config observation")
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, [(0, raw.len() as u64), (1, raw.len() as u64)]);
+        assert_eq!(layout.header_json.as_slice(), &raw[..]);
+        assert_eq!(layout.tensors.len(), 1);
+    }
+
+    #[test]
+    fn capacity_refusal_precedes_header_buffer_and_json_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.safetensors");
+        // Deliberately invalid JSON: the capacity error MUST win at the earlier Input hook.
+        std::fs::write(&path, [1u64.to_le_bytes().as_slice(), b"{"].concat()).unwrap();
+        let mut calls = 0;
+        let error = safetensors_file_tensor_locations_observed(&path, &mut |_| {
+            calls += 1;
+            Err(Error::Unsupported("capacity sentinel".into()))
+        })
+        .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(ref reason) if reason == "capacity sentinel"));
+        assert_eq!(calls, 1);
     }
 }

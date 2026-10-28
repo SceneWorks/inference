@@ -553,9 +553,14 @@ fn dit_config(spec: Option<&LoadSpec>) -> Option<crate::config::MageFlowConfig> 
     [root.join("transformer"), root.to_path_buf()]
         .into_iter()
         .find_map(|dir| {
-            let json =
-                std::fs::read_to_string(dir.join(crate::transformer::TRANSFORMER_CONFIG_FILE))
-                    .ok()?;
+            let json = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join(crate::transformer::TRANSFORMER_CONFIG_FILE)),
+"crates/media/mlx-gen/mlx-gen-mage/src/model.rs::dit_config::std::fs::read_to_string@28598",
+ArtifactInput,
+dir.join(crate::transformer::TRANSFORMER_CONFIG_FILE),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+            .ok()?;
             crate::config::MageFlowConfig::from_transformer_config_json(&json).ok()
         })
 }
@@ -3421,6 +3426,8 @@ mod tests {
                 .expect("png writes");
             println!("[sc-15036] wrote {png}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED model::tests::finetune_then_render_through_load_finetuned");
     }
 
     #[test]

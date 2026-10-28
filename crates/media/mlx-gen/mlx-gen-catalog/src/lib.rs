@@ -1104,14 +1104,20 @@ mod tests {
         // sc-25900's `qwen_image_2_1_turbo` publishes the same full surface as `qwen_image_2_1`,
         // so it joins the 12-apiece group — 52 -> 53.
         //
+        // sc-26266 gives `iris_3b` the q8 / q4 tiers it now quantizes at load: three tiers under
+        // both policies, while the encoder-free `iris_3b_depth` and `iris_3b_restore` keep their
+        // one dense tier. Epic 16774's Iris rung 4 (streamed blocks) adds the deferred load shape
+        // to all three routes: `iris_3b` 3 tiers x 2 policies x 2 shapes — 12, depth and restore
+        // 1 x 2 x 2 — 4 apiece.
         // sc-26234's `flux3_klein` and sc-26239's `flux3_klein_base` each witness the dense tier
         // plus sc-26241's MLX affine q4/q8 tiers, eagerly materialized (no deferred FLUX3 load
         // shape), under both offload policies — 3 tiers x 2 policies = 6 apiece.
         // sc-24213's `supra2_img` publishes exactly one surface: the dense tier, resident, eager
         // (its loader refuses quantization, sequential offload and deferred materialization) — +1.
+        // MOSS Base and SFT each witness bf16 + resident + eager — one surface apiece.
         assert_eq!(
             surfaces.len(),
-            53 * 12 + 6 + 3 + 2 * 3 + 3 * 2 + 6 + 6 + 2 + 1
+            53 * 12 + 6 + 3 + 2 * 3 + 12 + 4 + 4 + 6 + 6 + 2 + 1
         );
         // The MLX catalog's only composed memory routes are Iris depth (a provider-specific API)
         // and Iris restoration (a transform): real routes with no gen-core generator registration.

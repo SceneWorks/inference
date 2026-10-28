@@ -106,7 +106,7 @@ impl AttnBlock {
 impl candle_gen::candle_core::Module for AttnBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let init_xs = xs;
-        let xs = xs.apply(&self.norm)?;
+        let xs = __model_proof_output!(xs.apply(&self.norm))?;
         let q = xs.apply(&self.q)?;
         let k = xs.apply(&self.k)?;
         let v = xs.apply(&self.v)?;
@@ -162,13 +162,12 @@ impl ResnetBlock {
 
 impl candle_gen::candle_core::Module for ResnetBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let h = xs
-            .apply(&self.norm1)?
+        let h = __model_proof_output!(__model_proof_output!(xs.apply(&self.norm1))?
             .apply(&candle_gen::candle_nn::Activation::Swish)?
             .apply(&self.conv1)?
-            .apply(&self.norm2)?
-            .apply(&candle_gen::candle_nn::Activation::Swish)?
-            .apply(&self.conv2)?;
+            .apply(&self.norm2))?
+        .apply(&candle_gen::candle_nn::Activation::Swish)?
+        .apply(&self.conv2)?;
         match self.nin_shortcut.as_ref() {
             None => xs + h,
             Some(c) => xs.apply(c)? + h,
@@ -304,12 +303,13 @@ impl candle_gen::candle_nn::Module for Encoder {
                 h = h.apply(ds)?
             }
         }
-        h.apply(&self.mid_block_1)?
+        __model_proof_output!(h
+            .apply(&self.mid_block_1)?
             .apply(&self.mid_attn_1)?
             .apply(&self.mid_block_2)?
-            .apply(&self.norm_out)?
-            .apply(&candle_gen::candle_nn::Activation::Swish)?
-            .apply(&self.conv_out)
+            .apply(&self.norm_out))?
+        .apply(&candle_gen::candle_nn::Activation::Swish)?
+        .apply(&self.conv_out)
     }
 }
 
@@ -393,7 +393,7 @@ impl candle_gen::candle_nn::Module for Decoder {
                 h = h.apply(us)?
             }
         }
-        h.apply(&self.norm_out)?
+        __model_proof_output!(h.apply(&self.norm_out))?
             .apply(&candle_gen::candle_nn::Activation::Swish)?
             .apply(&self.conv_out)
     }
@@ -481,6 +481,7 @@ mod parity_tests {
     use candle_transformers::models::flux::autoencoder as stock;
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_flux_ae_decode_matches_stock() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -507,5 +508,8 @@ mod parity_tests {
             diff < 1e-5,
             "vendored FLUX AE decode diverged from stock by {diff}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::native::parity_tests::vendored_flux_ae_decode_matches_stock");
     }
 }

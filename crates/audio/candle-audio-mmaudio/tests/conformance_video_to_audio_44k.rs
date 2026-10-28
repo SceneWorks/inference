@@ -13,6 +13,16 @@
 //! cargo test --locked -p candle-audio-mmaudio --test conformance_video_to_audio_44k -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 mod common;
 
 use std::path::PathBuf;
@@ -106,6 +116,9 @@ fn mmaudio_44k_video_to_audio_conformance() {
     gen_core_testkit::check_video_to_audio(g.as_ref(), &profile)
         .expect("MMAudio 44k passes the video→audio (Foley) contract");
     println!("check_video_to_audio (44k): PASS");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mmaudio_44k_video_to_audio_conformance");
 }
 
 /// The real-Foley DoD at 44.1 kHz: fixed clip + prompt + seed → non-empty, 44.1 kHz, mono, finite,
@@ -192,4 +205,7 @@ fn mmaudio_44k_synced_foley_wav() {
         .unwrap_or_else(|_| std::env::temp_dir().join("mmaudio_foley_44k.wav"));
     candle_audio::wav::write_wav_pcm16(&out_path, &track).expect("write WAV");
     println!("wrote {}", out_path.display());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mmaudio_44k_synced_foley_wav");
 }

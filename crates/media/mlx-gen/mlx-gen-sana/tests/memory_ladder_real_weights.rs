@@ -610,6 +610,10 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
         100.0 * spread,
         100.0 * SETTLE_TOLERANCE
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::identical_requests_reproduce_once_the_allocator_has_settled");
 }
 
 // ── Rung 3 ───────────────────────────────────────────────────────────────────────────────────────
@@ -721,6 +725,10 @@ fn attention_chunking_is_measured_at_the_dit_seam() {
          either narrow the domain to the one that was measured, or publish an ordering the order \
          permutation can actually support"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::attention_chunking_is_measured_at_the_dit_seam");
 }
 
 // ── Rung 4 ───────────────────────────────────────────────────────────────────────────────────────
@@ -800,6 +808,10 @@ fn the_withheld_rung_four_is_refused_by_the_production_path() {
             &mut |_| {},
         )
         .expect("the published rungs 1-3 composition must still render");
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_withheld_rung_four_is_refused_by_the_production_path");
 }
 
 /// **Which PHASE bears the request peak — measured, not inferred from a byte table.**
@@ -873,6 +885,10 @@ fn the_request_peak_bearing_phase_is_measured_not_assumed() {
         "the flat peak {smallest:.4} GiB is below the Gemma-2 weight floor {GEMMA_WEIGHT_GIB:.4} \
          GiB, so the conditioning phase cannot be what sets it"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_request_peak_bearing_phase_is_measured_not_assumed");
 }
 
 // ── Domain enforcement ───────────────────────────────────────────────────────────────────────────
@@ -945,6 +961,10 @@ fn the_published_domains_are_enforced_by_the_production_path() {
         silently_admitted.is_empty(),
         "the production path silently admitted these unpublished selections: {silently_admitted:?}"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_published_domains_are_enforced_by_the_production_path");
 }
 
 /// **Rung 4 is unavailable on an eager load, and the refusal reaches the production path.**
@@ -1150,6 +1170,10 @@ fn every_entry_exercises_every_implemented_rung_and_mints_evidence() {
         "every entry must mint one record per PUBLISHED rung — rung 4 is withheld, and a withheld \
          rung must not mint evidence that could select a fit"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::every_entry_exercises_every_implemented_rung_and_mints_evidence");
 }
 
 /// The numerical contract each rung declares, and the reason it is not uniform.
@@ -1445,6 +1469,10 @@ fn the_tiled_decode_drift_is_resampled_across_production_latents() {
         "the shipping tiled-decode route drifted meanD {worst_mean:.4} past its declared ceiling \
          {DECODE_TILING_MEAN_ABS_U8}; the declared parity contract no longer bounds the engine"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_tiled_decode_drift_is_resampled_across_production_latents");
 }
 
 /// The `q`-quantile of the absolute uint8 subpixel difference — the tail statistic that, unlike
@@ -1698,6 +1726,10 @@ fn the_published_decode_tile_domain_is_swept_against_the_whole_image_decode() {
             clear_cache();
         }
     }
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_published_decode_tile_domain_is_swept_against_the_whole_image_decode");
 }
 
 /// **A quality verdict is not a single image (SC-17743).**
@@ -1763,4 +1795,8 @@ fn output_preservation_is_resampled_across_production_latents() {
         "rung 3 claims EXACT preservation over its published domain ({class} over {deltas:?}); a \
          non-zero seed means it is an arithmetic change, not a memory schedule"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::output_preservation_is_resampled_across_production_latents");
 }

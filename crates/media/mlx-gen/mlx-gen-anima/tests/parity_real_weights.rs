@@ -247,7 +247,7 @@ fn assert_matches_summary(
 // ------------------------------------------------------------------------------------------------
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot + Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot + Metal"]
 fn stage2_qwen3_last_hidden_state() {
     let split = split_files().expect("Anima snapshot");
     let g = load_golden("qwen3_hidden_golden.json");
@@ -313,6 +313,11 @@ fn stage2_qwen3_last_hidden_state() {
     // in absolute terms between torch-CPU and MLX-Metal even on a correct port (the fp32 stages 3 & 4,
     // which share rms_norm/attention/linear, pass a per-element 1e-2 — proving the math is right).
     assert_sampled_rel_l2(&hidden, &g["last_hidden_state"], "stage2_qwen3", 1e-2, 3e-2);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED parity_real_weights::stage2_qwen3_last_hidden_state"
+    );
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -320,7 +325,7 @@ fn stage2_qwen3_last_hidden_state() {
 // ------------------------------------------------------------------------------------------------
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot + Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot + Metal"]
 fn stage3_conditioner_output() {
     let split = split_files().expect("Anima snapshot");
     let g = load_golden("conditioner_golden.json");
@@ -366,6 +371,9 @@ fn stage3_conditioner_output() {
     let active = out.take_axis(Array::from_slice(&rows, &[st]), 1).unwrap();
     // fp32 both sides -> the conditioner isolates cleanly: tight aggregate + tight per-element.
     assert_matches_summary(&active, &g["active"], "stage3_active", 1e-2, 5e-3, 1e-2);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED parity_real_weights::stage3_conditioner_output");
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -373,7 +381,7 @@ fn stage3_conditioner_output() {
 // ------------------------------------------------------------------------------------------------
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot + Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot + Metal"]
 fn stage4_dit_forward_block0_and_full() {
     let split = split_files().expect("Anima snapshot");
     let g = load_golden("dit_forward_golden.json");
@@ -412,6 +420,11 @@ fn stage4_dit_forward_block0_and_full() {
         .forward(&latent, &sigma, &encoder, Dtype::Float32)
         .unwrap();
     assert_matches_summary(&full, &g["full"], "stage4_full", 1e-2, 5e-3, 1e-2);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED parity_real_weights::stage4_dit_forward_block0_and_full"
+    );
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -575,7 +588,7 @@ fn sampled_rel_l2_value(got: &Array, g: &Value) -> f64 {
 // pre-DiT) — the pure bf16-vs-fp32 weight-precision difference before any trajectory amplification.
 // ------------------------------------------------------------------------------------------------
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot + Metal; SLOW (real 2B denoise x2 per variant)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot + Metal; SLOW (real 2B denoise x2 per variant)"]
 fn stage7_bf16_conditioning_offset_sc10577() {
     let split = split_files().expect("Anima snapshot");
     let g = load_golden("e2e_golden.json");
@@ -707,10 +720,13 @@ fn stage7_bf16_conditioning_offset_sc10577() {
          accumulation-dominated (confirms sc-10524)."
     );
     println!("=== end sc-10577 ===\n");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED parity_real_weights::stage7_bf16_conditioning_offset_sc10577");
 }
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot + Metal; SLOW (real 2B denoise x3 variants)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot + Metal; SLOW (real 2B denoise x3 variants)"]
 fn stage7_e2e_all_variants() {
     let split = split_files().expect("Anima snapshot");
     let g = load_golden("e2e_golden.json");
@@ -860,4 +876,7 @@ fn stage7_e2e_all_variants() {
 
         mlx_rs::memory::clear_cache();
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED parity_real_weights::stage7_e2e_all_variants");
 }

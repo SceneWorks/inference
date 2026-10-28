@@ -1,0 +1,35 @@
+{
+  "source_build_sha": "e49f5345bd254936f20c15c5ea84e76656faf01f",
+  "machine": "iPhone17,2",
+  "ios_version": "26.6.2",
+  "os_build": "23G90",
+  "observed_entitled_process_limit_bytes": 6442450944,
+  "observed_off_process_limit_bytes": 3539992576,
+  "model_admission_evidence": false,
+  "interpretation": "Current OS process-limit observations, not a safe working-set budget or a model-fit result.",
+  "original_receipt_directory": "phone-session/",
+  "sha256": {
+    "receipt.md": "5ff5ff6c45c5dbd4aacbc734b37eab71b41cae70f5c6ca9d18daacbce52bfff1",
+    "primitive-launch-only.jsonl": "f12703743b33f7e09ba64cb90190e21b20f1d046131f88081e3ceb73e39072cf",
+    "off-primitive.jsonl": "92445b10b7d8a12b80ad4629682697fe7defde92ddcd59be57988e977dacb835",
+    "restored-on-primitive.jsonl": "2c2fb4eb9fba07faa1e274d180ee27f4cb3f826229ee187ec40e9606e2d72c11",
+    "primitive-launch-only-report.txt": "f40835fc038fd06f9bb14f60756cb9a086bbdeb227b0e46119708e232a19ef59",
+    "primitive-launch-only-launch-memory.txt": "c2e0fe1399d277d76fe9e9b0132e05e2acfc5126072c067adb7bd38733473904",
+    "off-primitive-report.txt": "f6c559fe057fb4b00174b13cc340e04b28cf72d634756d674213a18e833a4979",
+    "off-primitive-launch-memory.txt": "afe7fa11ef55fec3a43c4405d129f4fe20c6cb7f4e76e16bdd56a9cec0904cb9",
+    "restored-on-primitive-report.txt": "86987eb84a857e3e6b3be559cd5878359b422249e25b97404ee83ae2cd2256ca",
+    "restored-on-primitive-launch-memory.txt": "c2e0fe1399d277d76fe9e9b0132e05e2acfc5126072c067adb7bd38733473904"
+  },
+  "original_relative_paths": {
+    "receipt.md": "receipt.md",
+    "primitive-launch-only.jsonl": "primitive-launch-only.jsonl",
+    "off-primitive.jsonl": "off-primitive.jsonl",
+    "restored-on-primitive.jsonl": "restored-on-primitive.jsonl",
+    "primitive-launch-only-report.txt": "primitive-launch-only.artifacts/recipe-9dcc8930f446331abccd27a16147d689d62d15744c3dfce7ed9842360c7c573b/report.txt",
+    "primitive-launch-only-launch-memory.txt": "primitive-launch-only.artifacts/recipe-9dcc8930f446331abccd27a16147d689d62d15744c3dfce7ed9842360c7c573b/launch-memory.txt",
+    "off-primitive-report.txt": "off-primitive.artifacts/recipe-9dcc8930f446331abccd27a16147d689d62d15744c3dfce7ed9842360c7c573b/report.txt",
+    "off-primitive-launch-memory.txt": "off-primitive.artifacts/recipe-9dcc8930f446331abccd27a16147d689d62d15744c3dfce7ed9842360c7c573b/launch-memory.txt",
+    "restored-on-primitive-report.txt": "restored-on-primitive.artifacts/recipe-9dcc8930f446331abccd27a16147d689d62d15744c3dfce7ed9842360c7c573b/report.txt",
+    "restored-on-primitive-launch-memory.txt": "restored-on-primitive.artifacts/recipe-9dcc8930f446331abccd27a16147d689d62d15744c3dfce7ed9842360c7c573b/launch-memory.txt"
+  }
+}

@@ -111,6 +111,8 @@ fn full_text_encoder_matches_reference() -> candle_gen::Result<()> {
         pr_emb < 6e-2,
         "video_embeddings peak_rel {pr_emb:.3e} too high"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED te_parity::full_text_encoder_matches_reference");
     Ok(())
 }
 
@@ -149,5 +151,7 @@ fn full_text_encoder_av_matches_reference() -> candle_gen::Result<()> {
     assert!(pr_ve < 6e-2, "video_embeddings peak_rel {pr_ve:.3e}");
     assert!(pr_af < 1.5e-2, "audio_features peak_rel {pr_af:.3e}");
     assert!(pr_ae < 6e-2, "audio_embeddings peak_rel {pr_ae:.3e}");
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED te_parity::full_text_encoder_av_matches_reference");
     Ok(())
 }

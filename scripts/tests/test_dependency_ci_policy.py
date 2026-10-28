@@ -13,7 +13,8 @@ import yaml
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 DENY = WORKFLOW.parents[2] / "deny.toml"
 METAL_CLIPPY = (
-    "cargo clippy --locked -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' "
+    "python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going "
+    "-p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' "
     "--all-targets --features metal -- -D warnings"
 )
 GOVERNANCE = "python3 scripts/ci/check_advisory_policy.py"
@@ -73,7 +74,7 @@ class DependencyCiPolicyTests(unittest.TestCase):
         self.assertNotIn("needs", job)
         self.assertEqual(
             job.get("if"),
-            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')",
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')",
             "dependency policy stays unconditional for verification events; only explicitly isolated manual dispatches skip",
         )
         self.assertNotIn("continue-on-error", job)

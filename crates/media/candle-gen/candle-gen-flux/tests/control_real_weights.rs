@@ -224,4 +224,7 @@ fn real_weight_control() {
         "FLUX.1-dev control validation PASS — outputs in {}",
         out_dir.display()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED control_real_weights::real_weight_control");
 }

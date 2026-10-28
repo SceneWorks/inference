@@ -826,6 +826,7 @@ mod instantid_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_instantid_folds_add_embedding_and_threads_ip() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -889,6 +890,9 @@ mod instantid_tests {
             maxdiff(&cleared, &base) < 1e-6,
             "clearing the IP tokens reverts to the no-IP output"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED unet::unet_2d::instantid_tests::forward_instantid_folds_add_embedding_and_threads_ip");
     }
 
     /// An install with the wrong number of K/V pairs (too few / too many) errors rather than leaving

@@ -141,7 +141,13 @@ fn validate_unique_tensor_names(files: &[PathBuf]) -> Result<()> {
 /// the shared [`PackedConfig`] parse so a future tier that ships the block is honoured verbatim
 /// (sc-9474).
 fn read_packed_group_size(dir: &Path) -> Option<usize> {
-    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let text = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/candle-gen/candle-gen-ideogram/src/loader.rs::read_packed_group_size::std::fs::read_to_string@7536",
+ArtifactInput,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     PackedConfig::from_config(&v).map(|c| c.group_size as usize)
 }
@@ -295,6 +301,7 @@ mod tests {
     /// `Dense`. The packed forward reproduces the affine grid (proving the group-64 default is applied,
     /// not a silent dense fallback over u32 codes).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_fires_without_config_block_and_leaves_dense_unchanged() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
@@ -331,6 +338,8 @@ mod tests {
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-64 packed vs grid cosine {cos:.6}");
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::linear_detect_fires_without_config_block_and_leaves_dense_unchanged");
         Ok(())
     }
 
@@ -362,6 +371,7 @@ mod tests {
     /// /`final_layer` biased projections) loads packed and its forward includes the bias — the packed
     /// path's own `.biases` (the affine group biases) is distinct from the projection's dense `.bias`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_linear_with_dense_bias() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
@@ -388,6 +398,8 @@ mod tests {
             cos > 0.99999,
             "packed+bias vs dense-grid+bias cosine {cos:.6}"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::packed_linear_with_dense_bias");
         Ok(())
     }
 }

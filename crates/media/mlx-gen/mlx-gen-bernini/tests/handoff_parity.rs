@@ -49,6 +49,7 @@ fn check(name: &str, got: &Array, want: &Array, tol: f32) {
     );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn handoff_matches_reference_f32() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
@@ -104,4 +105,6 @@ fn handoff_matches_reference_f32() {
         w.require("out.wotxt_wovit").unwrap(),
         5e-3,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED handoff_parity::handoff_matches_reference_f32");
 }

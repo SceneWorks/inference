@@ -27,6 +27,11 @@ pub trait LatentOps {
     /// The backend latent tensor (`mlx_rs::Array`, `candle_core::Tensor`, … / `Vec<f32>` in tests).
     type Latent: Clone;
 
+    /// Opt-in backend diagnostic hook at ACTUAL solver callbacks/updates. The default is NOOP;
+    /// metadata-only LatentOps implementations must not emit planned executions as observations.
+    /// Borrowed tensors/flags are inspected synchronously; no clone/eval/value capture is required.
+    fn observe_solver(&self, _event: super::solvers::SolverObservation<'_, Self::Latent>) {}
+
     /// `scale · x` — broadcast scalar multiply.
     fn scale(&self, x: &Self::Latent, scale: f32) -> Result<Self::Latent>;
 

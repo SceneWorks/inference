@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 113
+EXPECTED_MEMBER_COUNT = 116
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -25,18 +25,20 @@ INTERNAL_PACKAGES = {
     "core-llm",
     "core-llm-testkit",
     "mlx-gen-catalog",
+    "mlx-gen-ios-catalog",
     "mlx-llm",
     "candle-llm",
     "sceneworks-gen-core",
     "sceneworks-gen-core-testkit",
     "runtime-catalog",
     "runtime-macos",
+    "runtime-ios",
     "runtime-cpu",
     "runtime-cuda",
 }
 PINNED_WORKSPACE_DEPENDENCIES = {
-    "mlx-rs": ("pmetal-mlx-rs", "fe22998bf73e5e785d7659beb2f24d624b785bda"),
-    "mlx-sys": ("pmetal-mlx-sys", "fe22998bf73e5e785d7659beb2f24d624b785bda"),
+    "mlx-rs": ("pmetal-mlx-rs", "355e2ae4e81c13032233a4244e956bc3547f49e4"),
+    "mlx-sys": ("pmetal-mlx-sys", "355e2ae4e81c13032233a4244e956bc3547f49e4"),
     "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
@@ -71,11 +73,26 @@ FORBIDDEN_GRAPH_PACKAGES = {
     # make linker participation part of the supported runtime graph again.
     "inventory",
 }
+# sc-26265 (epic 16774 E6): the iPhone build compiles no trainer and no training-only perceptor.
+# Each root is resolved on its own for aarch64-apple-ios over normal edges with the features that
+# build would really activate (`cargo tree -p <root>`, not the workspace-unified `cargo metadata`
+# feature set, where mlx-gen-catalog's default-on `training` would mask every root). A single edge
+# that drops `default-features = false` (anima -> z-image, qwen-image -> wan, ...) turns this red.
+IOS_GRAPH_ROOTS = ("mlx-gen-ios-catalog", "runtime-ios")
+IOS_GRAPH_TARGET = "aarch64-apple-ios"
+IOS_FORBIDDEN_PACKAGES = {"mlx-gen-perceptual", "mlx-gen-depth"}
+# Any first-party MLX crate resolving with `training` on (anima, z-image, wan, qwen-image, and the
+# iris/sdxl crates should they ever join the iOS graph).
+IOS_FORBIDDEN_FEATURE = ("mlx-gen", "training")
 # Directory names whose subtrees are not part of this checkout's single workspace: the git store
 # and build output (.git, target), plus agent tooling that nests its own gitignored worktrees --
 # each a separate checkout carrying its own Cargo.lock/manifest (.claude, .codex). They must not
 # be swept into the single-lockfile / single-manifest invariants below.
-IGNORED_TREE_PARTS = frozenset({".git", "target", ".claude", ".codex"})
+#
+# `ios-host` is device-app scaffolding with its one Rust package explicitly in the root
+# workspace for identical SDK/capture compilation identity. Its membership and absence of a
+# nested workspace/lock are checked separately; source lints below still target runtime crates.
+IGNORED_TREE_PARTS = frozenset({".git", "target", ".claude", ".codex", "ios-host"})
 # The Rust-source lints below additionally skip `vendor/` subtrees: those are upstream crates
 # copied verbatim (candle-kernels, candle-core — each with a VENDORED.md) that a [patch] points
 # at, not first-party code, so a lint finding there could only be fixed by forking upstream.
@@ -434,6 +451,13 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "the behavior registration of the restoration contract (sc-25690): wired to each backend's "
         "own fixture and begin-request functions, as this family's RESTORE_MEMORY_REGISTRATION is "
         "to its contract. Not geometry."
+    ),
+    ("iris", "QUANT_GROUP_SIZE"): (
+        "the same number spelled through each backend's own crate (sc-26266): both are MLX's default "
+        "affine group size, 64 — mlx `mlx_gen::quant::DEFAULT_GROUP_SIZE`, candle "
+        "`candle_gen::quant::MLX_GROUP_SIZE` (the candle twin names it so the two backends pack the "
+        "same projections over the same padded widths). `_const_numbers` resolves same-crate names "
+        "only, so the two compare unequal by spelling whatever the value does."
     ),
     ("lens", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction — the candle value names the CUDA "
@@ -1042,14 +1066,90 @@ def _within_workspace(path: Path) -> bool:
     return IGNORED_TREE_PARTS.isdisjoint(path.relative_to(ROOT).parts)
 
 
-def check_filesystem() -> None:
+def check_ios_host_mlx_pin(root: Path) -> None:
+    """The device harness must use the root workspace's exact MLX pin."""
+    harness = root / "ios-host" / "smoke" / "Cargo.toml"
+    if not harness.is_file():
+        return
+    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    expected = workspace["workspace"]["dependencies"]["mlx-rs"]
+    actual = tomllib.loads(harness.read_text(encoding="utf-8"))["dependencies"]["mlx-rs"]
+    keys = ("package", "git", "rev")
+    if {k: actual.get(k) for k in keys} != {k: expected.get(k) for k in keys}:
+        fail(
+            f"ios-host/smoke pins mlx-rs {[actual.get(k) for k in keys]}, but the workspace pins "
+            f"{[expected.get(k) for k in keys]}; bump both together"
+        )
+
+
+def check_ios_host_shared_workspace(root: Path) -> None:
+    """Capture and the root SDK share Cargo's unit identity, workspace and single lockfile."""
+    directory = root / "ios-host" / "smoke"
+    manifest = directory / "Cargo.toml"
+    if not manifest.is_file():
+        return
+    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]
+    if "ios-host/smoke" not in workspace.get("members", []):
+        fail("ios-host/smoke must be an explicit root workspace member for SDK/capture identity")
+    if "ios-host/smoke" in workspace.get("exclude", []):
+        fail("ios-host/smoke cannot be excluded from the root SDK workspace")
+    if "workspace" in tomllib.loads(manifest.read_text(encoding="utf-8")):
+        fail("ios-host/smoke must not create a nested Cargo workspace")
+    if (directory / "Cargo.lock").exists():
+        fail("ios-host/smoke must share the root Cargo.lock, not retain a nested lock")
+
+
+
+# Published upstream lockfiles are retained as archive/source provenance, NOT independent
+# active workspace locks. Register only these exact excluded package paths and versions;
+# arbitrary nested locks, including any other vendor lock, remain errors.
+REGEX_CERTIFICATE_PACKAGES = {
+    "regex": ("vendor/clip-regex/regex", "1.13.0"),
+    "regex-automata": ("vendor/clip-regex/regex-automata", "0.4.15"),
+    "regex-syntax": ("vendor/clip-regex/regex-syntax", "0.8.11"),
+}
+
+
+def registered_regex_archive_locks(root_manifest: dict) -> set[Path]:
+    patches = root_manifest.get("patch", {}).get("crates-io", {})
+    if not any(name in patches for name in REGEX_CERTIFICATE_PACKAGES):
+        return set()
+    excludes = root_manifest.get("workspace", {}).get("exclude", [])
+    registered = set()
+    for name, (directory, version) in REGEX_CERTIFICATE_PACKAGES.items():
+        if patches.get(name, {}).get("path") != directory or directory not in excludes:
+            fail(f"{name} must patch to exactly excluded {directory}")
+        manifest_path = ROOT / directory / "Cargo.toml"
+        lock_path = ROOT / directory / "Cargo.lock"
+        if not manifest_path.is_file() or not lock_path.is_file():
+            fail(f"{directory} must retain its package manifest and upstream archive lock")
+        package = tomllib.loads(manifest_path.read_text(encoding="utf-8"))["package"]
+        if (package.get("name"), package.get("version")) != (name, version):
+            fail(f"{directory} must be {name} {version}, not {package}")
+        own_entries = [
+            item for item in tomllib.loads(lock_path.read_text(encoding="utf-8"))["package"]
+            if item.get("name") == name and "source" not in item
+        ]
+        if len(own_entries) != 1 or own_entries[0].get("version") != version:
+            fail(f"{directory}/Cargo.lock is not the upstream {name} {version} archive lock")
+        registered.add(Path(directory) / "Cargo.lock")
+    return registered
+
+
+def check_lockfile_inventory(root_manifest: dict) -> None:
     lockfiles = sorted(
         path.relative_to(ROOT)
         for path in ROOT.rglob("Cargo.lock")
         if _within_workspace(path)
     )
-    if lockfiles != [Path("Cargo.lock")]:
-        fail(f"expected only the root Cargo.lock, found: {lockfiles}")
+    expected = sorted({Path("Cargo.lock")} | registered_regex_archive_locks(root_manifest))
+    if lockfiles != expected:
+        fail(f"expected root and registered upstream archive locks {expected}, found: {lockfiles}")
+
+
+def check_filesystem() -> None:
+    root_manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    check_lockfile_inventory(root_manifest)
 
     workspace_manifests = []
     for manifest in ROOT.rglob("Cargo.toml"):
@@ -1094,8 +1194,10 @@ def check_graph(metadata: dict) -> None:
         manifest = Path(package["manifest_path"]).resolve()
         if package["source"] is not None:
             fail(f"workspace member {package['name']} unexpectedly has source {package['source']}")
-        if ROOT / "crates" not in manifest.parents:
-            fail(f"workspace member is outside crates/: {manifest}")
+        if ROOT / "crates" not in manifest.parents and not (
+            package["name"] == "ios-smoke" and manifest == ROOT / "ios-host/smoke/Cargo.toml"
+        ):
+            fail(f"workspace member is outside crates/ and the exact device harness: {manifest}")
 
     for name in sorted(INTERNAL_PACKAGES):
         matches = [package for package in packages if package["name"] == name]
@@ -1157,6 +1259,20 @@ def check_graph(metadata: dict) -> None:
         if not provenance.is_file() or revision not in provenance.read_text(encoding="utf-8"):
             fail(f"{vendor_dir}/VENDORED.md must record the upstream revision {revision}")
 
+    root_manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    if registered_regex_archive_locks(root_manifest):
+        for name, (directory, version) in REGEX_CERTIFICATE_PACKAGES.items():
+            matches = [package for package in packages if package["name"] == name]
+            if len(matches) != 1 or matches[0]["version"] != version:
+                fail(f"expected one reviewed {name} {version}, found {matches}")
+            package = matches[0]
+            if package["source"] is not None or Path(package["manifest_path"]).resolve() != ROOT / directory / "Cargo.toml":
+                fail(f"{name} must resolve to reviewed local {directory}")
+        for name, version in [("aho-corasick", "1.1.4"), ("memchr", "2.8.3")]:
+            matches = [package for package in packages if package["name"] == name]
+            if len(matches) != 1 or matches[0]["version"] != version:
+                fail(f"CLIP certificate requires reviewed {name} {version}, found {matches}")
+
     tokenizer_minors = {
         ".".join(package["version"].split(".")[:2])
         for package in packages
@@ -1164,6 +1280,51 @@ def check_graph(metadata: dict) -> None:
     }
     if tokenizer_minors != {"0.21", "0.22"}:
         fail(f"expected intentional tokenizers 0.21/0.22 split, found {tokenizer_minors}")
+
+
+def ios_root_graph(root: str, offline: bool) -> dict[str, set[str]]:
+    """Package name -> activated features for one root's normal-edge iOS build graph.
+
+    `cargo tree --target` only asks rustc for the target's cfg set, so it needs neither the iOS
+    standard library nor an SDK and runs on the Linux workspace lane.
+    """
+    command = [
+        "cargo", "tree", "--locked", "-p", root, "--target", IOS_GRAPH_TARGET,
+        "-e", "normal", "--prefix", "none", "--format", "{p}|{f}",
+    ]
+    if offline:
+        command.append("--offline")
+    result = subprocess.run(command, cwd=ROOT, check=False, capture_output=True)
+    if result.returncode:
+        sys.stderr.write(result.stderr.decode("utf-8", errors="replace"))
+        fail(f"cargo tree for {root} on {IOS_GRAPH_TARGET} failed with exit code {result.returncode}")
+    graph: dict[str, set[str]] = {}
+    for line in result.stdout.decode("utf-8").splitlines():
+        package, _, features = line.partition("|")
+        if not package.strip():
+            continue
+        name = package.split()[0]
+        enabled = {feature for feature in features.replace("(*)", "").strip().split(",") if feature}
+        graph.setdefault(name, set()).update(enabled)
+    if root not in graph:
+        fail(f"cargo tree for {root} on {IOS_GRAPH_TARGET} did not list the root itself")
+    return graph
+
+
+def check_ios_graph(offline: bool) -> None:
+    """No trainer and no training-only perceptor in any iOS root's build graph (sc-26265 / E6)."""
+    prefix, feature = IOS_FORBIDDEN_FEATURE
+    for root in IOS_GRAPH_ROOTS:
+        graph = ios_root_graph(root, offline)
+        forbidden = sorted(IOS_FORBIDDEN_PACKAGES & graph.keys())
+        if forbidden:
+            fail(f"{root} on {IOS_GRAPH_TARGET} reaches training-only packages: {forbidden}")
+        training = sorted(
+            name for name, features in graph.items()
+            if name.startswith(prefix) and feature in features
+        )
+        if training:
+            fail(f"{root} on {IOS_GRAPH_TARGET} enables `{feature}` on: {training}")
 
 
 def check_network_clients(metadata: dict) -> None:
@@ -3145,9 +3306,12 @@ def main() -> int:
 
     try:
         check_filesystem()
+        check_ios_host_mlx_pin(ROOT)
+        check_ios_host_shared_workspace(ROOT)
         metadata = cargo_metadata(args.offline)
         check_graph(metadata)
         check_network_clients(metadata)
+        check_ios_graph(args.offline)
         check_rust_sources(ROOT)
         check_pid_decode_route_adoption(metadata, ROOT)
         check_snapshot_path_derivation(ROOT)
@@ -3160,7 +3324,8 @@ def main() -> int:
     print(
         "workspace gate: OK "
         f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
-        "intentional tokenizer split, no network clients, no HF-cache references, "
+        "intentional tokenizer split, no network clients, no trainers in the iOS graph, "
+        "no HF-cache references, "
         "no $HOME-derived snapshot paths, no unguarded test temp roots, "
         "no cross-backend geometry drift)"
     )

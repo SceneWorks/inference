@@ -381,4 +381,6 @@ fn shared_ladder_terminal_result() {
         resident_peak as f64 / GIB,
         rung4_peak as f64 / GIB,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::shared_ladder_terminal_result");
 }

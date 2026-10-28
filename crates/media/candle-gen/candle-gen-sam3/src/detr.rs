@@ -245,7 +245,12 @@ impl DotScoring {
         // text_mlp residual + out-norm
         let t = self.text_mlp.forward(text)?;
         let t = t.add(text)?;
-        let t = layer_norm(&t, &self.text_mlp_out_w, &self.text_mlp_out_b, self.eps)?;
+        let t = __model_proof_output!(layer_norm(
+            &t,
+            &self.text_mlp_out_w,
+            &self.text_mlp_out_b,
+            self.eps
+        ))?;
         // masked mean over valid tokens. Valid positions need not be contiguous — the PVS path
         // (sc-6244) concatenates valid geometry-prompt tokens *after* the text padding, so weight by
         // the mask rather than assuming a leading valid run.
@@ -316,16 +321,16 @@ impl EncoderLayer {
         text_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         // vision self-attention (pos added to q/k, not v)
-        let h = layer_norm(x, &self.ln1_w, &self.ln1_b, self.eps)?;
+        let h = __model_proof_output!(layer_norm(x, &self.ln1_w, &self.ln1_b, self.eps))?;
         let hp = h.add(vis_pos)?;
         let a = self.self_attn.forward(&hp, &hp, &h, None)?;
         let x = x.add(&a)?;
         // text cross-attention
-        let h = layer_norm(&x, &self.ln2_w, &self.ln2_b, self.eps)?;
+        let h = __model_proof_output!(layer_norm(&x, &self.ln2_w, &self.ln2_b, self.eps))?;
         let a = self.cross_attn.forward(&h, text, text, text_mask)?;
         let x = x.add(&a)?;
         // FFN
-        let h = layer_norm(&x, &self.ln3_w, &self.ln3_b, self.eps)?;
+        let h = __model_proof_output!(layer_norm(&x, &self.ln3_w, &self.ln3_b, self.eps))?;
         let a = self.ffn.forward(&h)?;
         Ok(x.add(&a)?)
     }
@@ -389,22 +394,22 @@ impl DecoderLayer {
         let qp = hidden.add(query_pos_padded)?;
         let a = self.self_attn.forward(&qp, &qp, hidden, None)?;
         let x = hidden.add(&a)?;
-        let x = layer_norm(&x, &self.self_ln_w, &self.self_ln_b, self.eps)?;
+        let x = __model_proof_output!(layer_norm(&x, &self.self_ln_w, &self.self_ln_b, self.eps))?;
         // text cross-attention
         let qp = x.add(query_pos_padded)?;
         let a = self.text_attn.forward(&qp, text, text, text_mask)?;
         let x = x.add(&a)?;
-        let x = layer_norm(&x, &self.text_ln_w, &self.text_ln_b, self.eps)?;
+        let x = __model_proof_output!(layer_norm(&x, &self.text_ln_w, &self.text_ln_b, self.eps))?;
         // vision cross-attention with BoxRPB bias
         let qp = x.add(query_pos_padded)?;
         let kp = vision.add(vis_pos)?;
         let a = self.vis_attn.forward(&qp, &kp, vision, Some(rpb))?;
         let x = x.add(&a)?;
-        let x = layer_norm(&x, &self.vis_ln_w, &self.vis_ln_b, self.eps)?;
+        let x = __model_proof_output!(layer_norm(&x, &self.vis_ln_w, &self.vis_ln_b, self.eps))?;
         // FFN (post-norm)
         let a = self.ffn.forward(&x)?;
         let x = x.add(&a)?;
-        layer_norm(&x, &self.mlp_ln_w, &self.mlp_ln_b, self.eps)
+        __model_proof_output!(layer_norm(&x, &self.mlp_ln_w, &self.mlp_ln_b, self.eps))
     }
 
     fn quantize(&mut self, quant: Quant) -> Result<()> {

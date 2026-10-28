@@ -26,6 +26,7 @@ pub mod control_transformer_block;
 pub mod convert;
 pub mod feed_forward;
 pub mod final_layer;
+pub mod ios_pricing;
 // Shared memory-strategy contract adoption (SC-15449) + the SC-15615 rung-3 finding.
 pub mod loader;
 pub mod memory_strategy;
@@ -36,10 +37,28 @@ pub mod model_control;
 pub mod pipeline;
 pub mod preview;
 pub mod quant;
+pub mod sampling;
+// iOS execution-quantum labels and counted prices (epic 16774, sc-26433).
+#[cfg(all(test, target_os = "macos"))]
+mod ios_additivity_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod ios_pricing_tests;
+pub(crate) mod quantum;
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_proofs;
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_tests;
+#[cfg(test)]
+mod reachable_sizes;
 pub mod rope_embedder;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+pub(crate) mod test_metal_guard;
 pub mod text_encoder;
 pub mod timestep_embedder;
+#[cfg(feature = "training")]
 pub mod training;
+#[cfg(feature = "training")]
 mod training_adapter;
 pub mod transformer;
 pub mod transformer_block;
@@ -137,14 +156,14 @@ pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
 /// returns [`ENCODER_CONTRACT`]; tests may install a thread-local bounded receipt while executing
 /// the unchanged production callback/wiring.
 pub(crate) fn active_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(contract) = TEST_ENCODER_CONTRACT.get() {
         return contract;
     }
     ENCODER_CONTRACT
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 std::thread_local! {
     static TEST_ENCODER_CONTRACT: std::cell::Cell<Option<mlx_gen::gen_core::EncoderContract>> =
         const { std::cell::Cell::new(None) };
@@ -172,12 +191,14 @@ pub(crate) fn bounded_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
 
 /// Scoped, thread-local bounded contract override for tests that must execute production source
 /// admission, registry callbacks, or residency builders. Nested guards restore their predecessor.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct BoundedEncoderContractGuard {
     previous: Option<mlx_gen::gen_core::EncoderContract>,
+    // Dropping on another thread would restore the wrong TLS slot.
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for BoundedEncoderContractGuard {
     fn drop(&mut self) {
         TEST_ENCODER_CONTRACT.set(self.previous);
@@ -186,8 +207,88 @@ impl Drop for BoundedEncoderContractGuard {
 
 #[cfg(test)]
 pub(crate) fn scoped_bounded_encoder_contract() -> BoundedEncoderContractGuard {
+    scoped_encoder_contract(bounded_encoder_contract())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn scoped_encoder_contract(
+    contract: mlx_gen::gen_core::EncoderContract,
+) -> BoundedEncoderContractGuard {
     BoundedEncoderContractGuard {
-        previous: TEST_ENCODER_CONTRACT.replace(Some(bounded_encoder_contract())),
+        previous: TEST_ENCODER_CONTRACT.replace(Some(contract)),
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// Nondefault, dev-dependency-only fixture support. No production admission premise is approved.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use mlx_gen::gen_core::*;
+
+    const REQUIRED_TOKENS: &[EncoderRequiredToken] = &[
+        EncoderRequiredToken {
+            id: 0,
+            ..super::TOKENIZER_CONTRACT.required_tokens[0]
+        },
+        EncoderRequiredToken {
+            id: 1,
+            ..super::TOKENIZER_CONTRACT.required_tokens[1]
+        },
+        EncoderRequiredToken {
+            id: 2,
+            ..super::TOKENIZER_CONTRACT.required_tokens[2]
+        },
+    ];
+    const PROMPT_EXECUTIONS: &[EncoderPromptExecutionContract] = &[
+        EncoderPromptExecutionContract {
+            padding: EncoderPromptPadding::RightToMax { pad_token_id: 0 },
+            ..super::PROMPT_EXECUTIONS[0]
+        },
+        super::PROMPT_EXECUTIONS[1],
+    ];
+
+    /// A real 2560-wide, two-layer Qwen encoder with compact test-only token IDs.
+    /// Literal roles, behavior, output width and group-64 packing remain strict.
+    pub fn encoder_contract() -> EncoderContract {
+        EncoderContract {
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 64,
+            vocab_size: 64,
+            loaded_hidden_layers: 2,
+            max_position_embeddings: 512,
+            selected_hidden_layers: &[1],
+            bos_token_id: Some(0),
+            eos_token_id: Some(2),
+            tokenizer: EncoderTokenizerContract {
+                required_tokens: REQUIRED_TOKENS,
+                ..super::TOKENIZER_CONTRACT
+            },
+            prompt_executions: PROMPT_EXECUTIONS,
+            ..super::ENCODER_CONTRACT
+        }
+    }
+
+    /// Current contract for a fixture, descriptor, source key, price and actual TE loader alike.
+    pub fn active_encoder_contract() -> EncoderContract {
+        super::active_encoder_contract()
+    }
+
+    /// Non-Send/non-Sync RAII owner of this thread's override; nested scopes restore predecessors.
+    pub struct EncoderContractGuard {
+        _guard: super::BoundedEncoderContractGuard,
+    }
+
+    pub fn scoped_encoder_contract() -> EncoderContractGuard {
+        let contract = encoder_contract();
+        contract
+            .validate_definition()
+            .expect("valid compact Qwen fixture contract");
+        EncoderContractGuard {
+            _guard: super::scoped_encoder_contract(contract),
+        }
     }
 }
 
@@ -227,6 +328,7 @@ pub use pipeline::{
 };
 pub use rope_embedder::RopeEmbedder;
 pub use timestep_embedder::TimestepEmbedder;
+#[cfg(feature = "training")]
 pub use training::{LoraTarget, ZImageTurboTrainer};
 pub use transformer::{ZImageTransformer, ZImageTransformerConfig};
 pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
@@ -235,12 +337,33 @@ pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    let registry = register_turbo_control_generator(register_base_control_generator(
+        register_base_generator(register_turbo_generator(registry)),
+    ));
+    // The LoRA trainer and its perceptual/depth/dataset deps are the `training` feature, so an
+    // inference-only graph (the iOS bundle) compiles no trainer (sc-26265).
+    #[cfg(feature = "training")]
+    let registry = registry.register_trainer(training::REGISTRATION);
+    registry
+}
+
+/// The two Z-Image Turbo generators — `z_image_turbo` (text, image-to-image, LoRA/LoKr) and its
+/// Fun-Controlnet-Union control route `z_image_turbo_control` — with their complete memory
+/// registrations, and no trainer: the inference-only surface the iOS catalog ships (sc-26433).
+pub fn register_turbo_generators(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    register_turbo_control_generator(register_turbo_generator(registry))
+}
+
+/// Add `z_image_turbo` with its activation anchor and its complete memory-strategy registration
+/// (contract, weights-free fixture, behavior seam). No trainer.
+pub fn register_turbo_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
         .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
-        .register_generator(model_base::REGISTRATION)
-        .register_generator(model_base_control::REGISTRATION)
-        .register_generator(model_control::REGISTRATION)
         .register_memory_strategy(model::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -250,6 +373,14 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
+}
+
+/// Add the base `z_image` generator with its complete memory-strategy registration.
+pub fn register_base_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model_base::REGISTRATION)
         .register_memory_strategy(model_base::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -259,6 +390,14 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model_base::MEMORY_BEHAVIOR_REGISTRATION)
+}
+
+/// Add the base `z_image_control` generator with its complete memory-strategy registration.
+pub fn register_base_control_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model_base_control::REGISTRATION)
         .register_memory_strategy(model_base_control::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -271,6 +410,14 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model_base_control::MEMORY_BEHAVIOR_REGISTRATION)
+}
+
+/// Add `z_image_turbo_control` with its complete memory-strategy registration.
+pub fn register_turbo_control_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model_control::REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -283,7 +430,6 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
-        .register_trainer(training::REGISTRATION)
 }
 
 /// Build the complete explicit Z-Image MLX provider catalog.
@@ -446,7 +592,12 @@ mod explicit_registry_tests {
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        assert_eq!(explicit_trainers, ["z_image_turbo"]);
+        let expected_trainers: &[&str] = if cfg!(feature = "training") {
+            &["z_image_turbo"]
+        } else {
+            &[]
+        };
+        assert_eq!(explicit_trainers, expected_trainers);
     }
 
     /// The four `register_memory_strategy` calls are what makes the SC-15449 contract resolvable before
@@ -530,3 +681,7 @@ mod explicit_registry_tests {
         }
     }
 }
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

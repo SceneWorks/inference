@@ -92,6 +92,9 @@ fn arcface_cosine_parity() {
         min_cos >= 0.9999,
         "ArcFace embedding cosine {min_cos:.8} < 0.9999 vs glintr100 onnx"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED parity::arcface_cosine_parity");
 }
 
 /// SCRFD raw per-stride network outputs (score / bbox / kps) vs onnx — the detector-network gate.
@@ -130,4 +133,7 @@ fn scrfd_raw_output_parity() {
     }
     println!("SCRFD network parity worst max abs diff = {worst:.6}");
     assert!(worst < 5e-3, "SCRFD network diverged from onnx: {worst}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED parity::scrfd_raw_output_parity");
 }

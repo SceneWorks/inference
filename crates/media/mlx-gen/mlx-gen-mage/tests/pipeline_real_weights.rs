@@ -123,4 +123,6 @@ fn public_pipeline_matches_the_torch_render() {
         "public-pipeline parity failures:\n{}",
         failures.join("\n")
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline_real_weights::public_pipeline_matches_the_torch_render");
 }

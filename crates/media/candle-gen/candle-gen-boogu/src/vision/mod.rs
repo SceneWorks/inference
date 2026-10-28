@@ -280,8 +280,8 @@ impl Block {
     }
 
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let x = (x + self.attention(&self.norm1.forward(x)?, cos, sin)?)?;
-        &x + self.mlp(&self.norm2.forward(&x)?)?
+        let x = (x + self.attention(&__model_proof_output!(self.norm1.forward(x))?, cos, sin)?)?;
+        &x + self.mlp(&__model_proof_output!(self.norm2.forward(&x))?)?
     }
 }
 
@@ -318,10 +318,10 @@ impl Merger {
         let x = if self.postshuffle {
             // group merge-units first, then norm over hidden·merge².
             let g = x.reshape((merged, self.merged_dim))?;
-            self.norm.forward(&g)?
+            __model_proof_output!(self.norm.forward(&g))?
         } else {
             // norm over hidden per-patch, then group merge-units.
-            let n = self.norm.forward(x)?;
+            let n = __model_proof_output!(self.norm.forward(x))?;
             n.reshape((merged, self.merged_dim))?
         };
         self.fc2.forward(&self.fc1.forward(&x)?.gelu_erf()?)
@@ -547,7 +547,7 @@ impl VisionTower {
         let merged = plan.merged;
 
         // Patch embed + learned (interpolated) position embedding (all f32).
-        let h = self.patch_embed.forward(pixel_values)?;
+        let h = __model_proof_output!(self.patch_embed.forward(pixel_values))?;
         let pos = self.pos_embeds(&plan)?;
         let mut h = (h + pos)?;
 
@@ -796,6 +796,7 @@ mod tests {
     /// A silent dense fallback would instead have read the `[out, in/8]` code stream as the weight and
     /// failed the matmul outright.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_projection_loads_packed_and_recovers_its_geometry() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (192usize, 64usize);
@@ -816,6 +817,8 @@ mod tests {
             &[in_dim, out_dim],
             "the packed weight must recover the logical [out, in] geometry"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vision::tests::packed_projection_loads_packed_and_recovers_its_geometry");
         Ok(())
     }
 
@@ -894,6 +897,7 @@ mod tests {
     /// grid**, measured by relative max-abs deviation (never cosine — see [`rel_max_abs`]). Bias
     /// included, so the dense `{base}.bias` is proven to survive the packed arm.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_forward_matches_the_affine_grid() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
@@ -913,6 +917,8 @@ mod tests {
             drift < 1e-6,
             "packed vs affine-grid relative max-abs drift {drift:e} exceeds 1e-6"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vision::tests::packed_forward_matches_the_affine_grid");
         Ok(())
     }
 
@@ -960,6 +966,7 @@ mod tests {
     /// converter leaves that one tensor dense **by shape**. The per-tensor auto-detect covers it with
     /// no special case.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn mixed_tower_loads_packed_and_dense_projections_together() -> Result<()> {
         let p = TINY_PREFIX;
         let (h, f, o) = (TINY_HIDDEN, TINY_FFN, TINY_OUT);
@@ -1011,12 +1018,15 @@ mod tests {
             embeds.abs()?.sum_all()?.to_vec0::<f32>()?.is_finite(),
             "mixed-tower output must be finite"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vision::tests::mixed_tower_loads_packed_and_dense_projections_together");
         Ok(())
     }
 
     /// The all-dense tiny tower still loads with every projection dense and runs — the zero-diff
     /// baseline for the existing consumers (boogu's own tiers, krea, mage).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn fully_dense_tower_is_unchanged() -> Result<()> {
         let map = tiny_dense_map();
         let (_dir, w) = weights_from(&map, None, DType::BF16);
@@ -1034,6 +1044,8 @@ mod tests {
         }
         let (embeds, _) = tower.forward(&tiny_pixels(), &[[1, 2, 2]])?;
         assert_eq!(embeds.dims(), &[1, TINY_OUT]);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vision::tests::fully_dense_tower_is_unchanged");
         Ok(())
     }
 

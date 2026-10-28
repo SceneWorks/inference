@@ -207,6 +207,7 @@ fn assert_same(a: &Path, b: &Path) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_published_loss_term_moves_the_generator_update() {
     let tmp = tempfile::tempdir().unwrap();
     let items = clean_items(tmp.path(), 1);
@@ -280,6 +281,9 @@ fn every_published_loss_term_moves_the_generator_update() {
         rel < 1e-2,
         "the generator gradient is not the sum of its terms ({rel:e})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::every_published_loss_term_moves_the_generator_update");
 }
 
 fn psnr_lpips(trainer_dir: &Path, items: &[TrainingItem], export: &Path) -> (f64, f64) {
@@ -329,6 +333,7 @@ fn psnr_lpips(trainer_dir: &Path, items: &[TrainingItem], export: &Path) -> (f64
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn overfitting_a_few_pairs_improves_psnr_and_lpips() {
     let tmp = tempfile::tempdir().unwrap();
     let items = pair_items(tmp.path(), 2);
@@ -346,9 +351,13 @@ fn overfitting_a_few_pairs_improves_psnr_and_lpips() {
     eprintln!("PSNR {p0:.2} → {p1:.2} dB; LPIPS {l0:.4} → {l1:.4}");
     assert!(p1 > p0 + 1.0, "PSNR must improve: {p0} → {p1}");
     assert!(l1 < l0, "LPIPS must improve: {l0} → {l1}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::overfitting_a_few_pairs_improves_psnr_and_lpips");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit() {
     let tmp = tempfile::tempdir().unwrap();
     let items = clean_items(tmp.path(), 3);
@@ -412,9 +421,13 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit() {
     assert!(trainer()
         .train(&request(&items, other, &b), &mut |_| {})
         .is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse() {
     let tmp = tempfile::tempdir().unwrap();
     let items = clean_items(tmp.path(), 2);
@@ -486,6 +499,9 @@ fn the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse()
         GenerationResources::from_spec(&gen, "iris_3b"),
         Err(candle_gen::gen_core::Error::Unsupported(_))
     ));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse");
 }
 
 /// sc-25690: the restoration trainer's activation checkpointing (`gradient_checkpointing`) — the
@@ -494,6 +510,7 @@ fn the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse()
 /// bf16 generator (f32 critic, as the CPU backend requires): the same loss terms bit for bit and
 /// gradients within the declared bf16 bound.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn activation_checkpointing_gradients_equal_the_plain_graph() {
     use candle_gen_iris::train::model::checkpointed_regions;
     let tmp = tempfile::tempdir().unwrap();
@@ -550,11 +567,15 @@ fn activation_checkpointing_gradients_equal_the_plain_graph() {
         "bf16 loss terms"
     );
     crate::common::assert_ac_bf16_noise_only("restoration", &f_none, &b_none, &b_full);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::activation_checkpointing_gradients_equal_the_plain_graph");
 }
 
 /// sc-25690: a checkpointed restoration run is the plain run (f32): the trainer wires
 /// `gradient_checkpointing` into its generator step and the export moves by rounding only.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn activation_checkpointing_leaves_the_run_unchanged() {
     use candle_gen_iris::train::model::checkpointed_regions;
     let (data, a, b) = (
@@ -584,4 +605,7 @@ fn activation_checkpointing_leaves_the_run_unchanged() {
     }
     eprintln!("restoration: activation checkpointing vs plain: max |Δ| = {worst:.3e}");
     assert!(worst <= 1e-5, "{worst}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged");
 }

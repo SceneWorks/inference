@@ -544,6 +544,7 @@ mod padding_mask_tests {
     /// this fails: the valid tokens then attend the pad run, whose keys and values differ between
     /// the two variants.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn left_pad_ids_do_not_reach_the_valid_positions() {
         let device = Device::Cpu;
         let model = tiny_model(&device);
@@ -606,12 +607,16 @@ mod padding_mask_tests {
                 "extractor output at valid position {t} must not depend on the pad ids"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_te::padding_mask_tests::left_pad_ids_do_not_reach_the_valid_positions");
     }
 
     /// The mask is not a no-op dressed up as one: an encoder that attends the pad run produces
     /// *different* valid-position states from one that does not. Without this, the test above would
     /// also pass against a model whose attention ignored the mask entirely.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn attending_the_pad_run_actually_changes_the_valid_positions() {
         let device = Device::Cpu;
         let model = tiny_model(&device);
@@ -634,6 +639,9 @@ mod padding_mask_tests {
             "causal-only masking must measurably differ from causal+padding at the valid \
              positions (got {delta}) — otherwise the regression above proves nothing"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_te::padding_mask_tests::attending_the_pad_run_actually_changes_the_valid_positions");
     }
 }
 

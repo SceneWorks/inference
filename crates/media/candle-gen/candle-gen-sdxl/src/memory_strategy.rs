@@ -261,13 +261,21 @@ fn packed_bits(root: &Path) -> gen_core::Result<Option<u8>> {
     let mut result = None;
     for component in ["unet", "text_encoder", "text_encoder_2"] {
         let config = root.join(component).join("config.json");
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&config).map_err(|error| {
-                gen_core::Error::Msg(format!("sdxl: read {}: {error}", config.display()))
-            })?)
+        let value: serde_json::Value = serde_json::from_slice(
+            &candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&config),
+"crates/media/candle-gen/candle-gen-sdxl/src/memory_strategy.rs::packed_bits::std::fs::read@10655",
+ArtifactInput,
+&config,
+|__model_input_path| std::fs::read(__model_input_path)
+)
             .map_err(|error| {
-                gen_core::Error::Msg(format!("sdxl: parse {}: {error}", config.display()))
-            })?;
+                gen_core::Error::Msg(format!("sdxl: read {}: {error}", config.display()))
+            })?,
+        )
+        .map_err(|error| {
+            gen_core::Error::Msg(format!("sdxl: parse {}: {error}", config.display()))
+        })?;
         let bits =
             candle_gen::quant::PackedConfig::from_config(&value).map(|packed| packed.bits as u8);
         if result.is_some() && bits != result {

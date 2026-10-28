@@ -161,6 +161,10 @@ fn qwen_image_pid_decode_vs_vae() {
         pid_img.width,
         pid_dt / vae_dt.max(1e-3)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::qwen_image_pid_decode_vs_vae"
+    );
 }
 
 #[test]
@@ -257,6 +261,8 @@ fn qwen_image_pid_from_ldm_early_stop() {
         &format!("{dir}/qwen_pid_fromldm_{}.png", early_img.width),
     );
     eprintln!("wrote {dir}/qwen_pid_clean_*.png + qwen_pid_fromldm_*.png");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::qwen_image_pid_from_ldm_early_stop");
 }
 
 #[test]
@@ -280,4 +286,8 @@ fn use_pid_without_loaded_pid_errors() {
         .expect_err("use_pid without loaded PiD must error")
         .to_string();
     assert!(err.contains("no PiD decoder is loaded"), "got: {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::use_pid_without_loaded_pid_errors"
+    );
 }

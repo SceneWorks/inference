@@ -78,6 +78,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn all_three_layouts_materialize_identically() {
         let dev = Device::Cpu;
         let x = Tensor::from_vec(vec![1f32, 2., 3., 4.], (1, 2, 2), &dev).unwrap();
@@ -85,17 +86,20 @@ mod tests {
         for layout in ["folded", "legacy", "modern"] {
             let vb = VarBuilder::from_tensors(tensors(layout), DType::F32, &dev);
             outputs.push(
-                wn_conv1d(2, 2, 1, false, Conv1dConfig::default(), vb)
+                __model_proof_output!(wn_conv1d(2, 2, 1, false, Conv1dConfig::default(), vb)
                     .unwrap()
-                    .forward(&x)
-                    .unwrap()
-                    .to_vec3::<f32>()
-                    .unwrap(),
+                    .forward(&x))
+                .unwrap()
+                .to_vec3::<f32>()
+                .unwrap(),
             );
         }
         let expected = vec![vec![vec![30.0, 44.0], vec![45.0, 60.0]]];
         assert_eq!(outputs[0], expected);
         assert_eq!(outputs[1], expected);
         assert_eq!(outputs[2], expected);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED weight_norm::tests::all_three_layouts_materialize_identically");
     }
 }

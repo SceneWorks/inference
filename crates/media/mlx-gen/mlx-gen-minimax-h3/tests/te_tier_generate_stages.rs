@@ -131,6 +131,8 @@ fn rotate(
 fn every_stage_reports_its_own_high_water() {
     let frames = *LEGAL_FRAME_COUNTS.first().expect("legal frame counts") as u32;
     stage_the_render(frames);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_tier_generate_stages::every_stage_reports_its_own_high_water");
 }
 
 /// **The same handoff at the largest supported duration** (sc-17151's third acceptance clause).
@@ -144,6 +146,8 @@ fn every_stage_reports_its_own_high_water() {
 fn the_staged_handoff_holds_at_the_largest_supported_duration() {
     let frames = *LEGAL_FRAME_COUNTS.last().expect("legal frame counts") as u32;
     stage_the_render(frames);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_tier_generate_stages::the_staged_handoff_holds_at_the_largest_supported_duration");
 }
 
 fn stage_the_render(frames: u32) {
@@ -304,6 +308,7 @@ fn stage_the_render(frames: u32) {
             gb(peak)
         );
     }
+    crate::model_inference_device::record_model_inference_device();
 }
 
 // ── end of the measured region ────────────────────────────────────────────────────────────────

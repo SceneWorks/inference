@@ -613,6 +613,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn full_gguf_q4_q8_conversion_reloads_at_load_time_quantization_parity() {
         let hf_q: Vec<f32> = (0..64 * 64)
             .map(|i| ((i * 17 % 257) as f32 - 128.0) / 73.0)
@@ -678,6 +679,8 @@ mod tests {
             assert_eq!(config["hidden_size"], 64);
             assert_eq!(config["quantization"]["bits"], spec.bits);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED gguf::convert::tests::full_gguf_q4_q8_conversion_reloads_at_load_time_quantization_parity");
     }
 
     /// Drop-regression for this suite's fixture helper: the root leaves with the value. Flip

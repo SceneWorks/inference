@@ -38,9 +38,9 @@ impl PatchEmbed {
     /// torch `flatten(2).transpose(1,2)`).
     pub fn forward(&self, pixel_values: &Tensor) -> candle_core::Result<Tensor> {
         // stride = kernel = patch, no padding → [B, embed, grid, grid].
-        let y = pixel_values.conv2d(&self.proj_w, 0, self.patch, 1, 1)?;
+        let y = __model_proof_output!(pixel_values.conv2d(&self.proj_w, 0, self.patch, 1, 1))?;
         let b = self.proj_b.reshape((1, self.embed_dim, 1, 1))?;
-        let y = y.broadcast_add(&b)?;
+        let y = __model_proof_output!(y.broadcast_add(&b))?;
         let (bsz, e, g, _g) = y.dims4()?;
         // flatten(2).transpose(1,2): [B,embed,g,g] → [B,embed,g²] → [B,g²,embed].
         y.reshape((bsz, e, g * g))?.transpose(1, 2)?.contiguous()

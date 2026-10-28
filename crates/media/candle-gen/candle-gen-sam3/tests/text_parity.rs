@@ -117,4 +117,7 @@ fn text_encoder_matches_oracle() {
         worst > 0.999,
         "worst valid-token cosine {worst:.6} below 0.999"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED text_parity::text_encoder_matches_oracle");
 }

@@ -508,8 +508,11 @@ pub fn quantize_flux2_text_encoder(
 fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
     let src_cfg = src.join("config.json");
     let mut v: serde_json::Value = if src_cfg.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&src_cfg)?)
-            .map_err(|e| Error::Msg(format!("flux2: parse {}: {e}", src_cfg.display())))?
+        serde_json::from_str(&mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(&src_cfg),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string(&src_cfg)
+        )?)
+        .map_err(|e| Error::Msg(format!("flux2: parse {}: {e}", src_cfg.display())))?
     } else {
         serde_json::json!({})
     };

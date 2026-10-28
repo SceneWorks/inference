@@ -38,11 +38,13 @@ impl EncoderLayer {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = self.layer_norm1.forward(x)?;
+        let y = __model_proof_output!(self.layer_norm1.forward(x))?;
         let x = (x + self.attn.forward(&y)?)?;
-        let y = self.layer_norm2.forward(&x)?;
+        let y = __model_proof_output!(self.layer_norm2.forward(&x))?;
         // laion CLIP-ViT-H uses exact (erf) gelu.
-        let y = self.fc2.forward(&self.fc1.forward(&y)?.gelu_erf()?)?;
+        let y = __model_proof_output!(self
+            .fc2
+            .forward(&__model_proof_output!(self.fc1.forward(&y))?.gelu_erf()?))?;
         &x + y
     }
 }
@@ -80,16 +82,16 @@ impl Attention {
                 .transpose(1, 2)?
                 .contiguous()
         };
-        let q = split(self.q.forward(x)?)?;
-        let k = split(self.k.forward(x)?)?;
-        let v = split(self.v.forward(x)?)?;
+        let q = split(__model_proof_output!(self.q.forward(x))?)?;
+        let k = split(__model_proof_output!(self.k.forward(x))?)?;
+        let v = split(__model_proof_output!(self.v.forward(x))?)?;
         let attn = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * self.scale)?;
         let attn = softmax_last_dim(&attn)?;
         let out =
             attn.matmul(&v)?
                 .transpose(1, 2)?
                 .reshape((b, n, self.num_heads * self.head_dim))?;
-        self.out.forward(&out)
+        __model_proof_output!(self.out.forward(&out))
     }
 }
 
@@ -159,7 +161,7 @@ impl SvdImageEncoder {
         let dtype = self.patch_embedding.weight().dtype();
         let pixel_values = pixel_values.to_dtype(dtype)?;
         // Patch-embed: [B, 3, 224, 224] → [B, hidden, 16, 16] → [B, 256, hidden].
-        let patches = self.patch_embedding.forward(&pixel_values)?;
+        let patches = __model_proof_output!(self.patch_embedding.forward(&pixel_values))?;
         let (b, c, h, w) = patches.dims4()?;
         let patches = patches.reshape((b, c, h * w))?.transpose(1, 2)?; // [B, 256, hidden]
                                                                         // Prepend the CLS class_embedding → [B, 257, hidden].
@@ -169,14 +171,14 @@ impl SvdImageEncoder {
             .broadcast_as((b, 1, self.hidden_size))?;
         let x = Tensor::cat(&[&cls, &patches], 1)?;
         let mut x = x.broadcast_add(&self.position_embedding)?;
-        x = self.pre_layrnorm.forward(&x)?;
+        x = __model_proof_output!(self.pre_layrnorm.forward(&x))?;
         for layer in &self.layers {
             x = layer.forward(&x)?;
         }
         // CLS pool → post_layernorm → visual_projection.
         let cls = x.narrow(1, 0, 1)?.squeeze(1)?; // [B, hidden]
-        let pooled = self.post_layernorm.forward(&cls)?;
-        let embeds = self.visual_projection.forward(&pooled)?; // [B, proj]
+        let pooled = __model_proof_output!(self.post_layernorm.forward(&cls))?;
+        let embeds = __model_proof_output!(self.visual_projection.forward(&pooled))?; // [B, proj]
         embeds.to_dtype(DType::F32)
     }
 }

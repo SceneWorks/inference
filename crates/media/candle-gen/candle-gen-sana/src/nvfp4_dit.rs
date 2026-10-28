@@ -321,12 +321,12 @@ impl Proj {
             p.record(&self.name, self.act, x)?;
         }
         match &self.inner {
-            SanaProj::Packed(l) => l.forward(x),
+            SanaProj::Packed(l) => __model_proof_output!(l.forward(x)),
             SanaProj::Nvfp4(l) => {
                 if self.checked {
-                    l.forward_checked(x)
+                    __model_proof_output!(l.forward_checked(x))
                 } else {
-                    l.forward(x)
+                    __model_proof_output!(l.forward(x))
                 }
             }
         }

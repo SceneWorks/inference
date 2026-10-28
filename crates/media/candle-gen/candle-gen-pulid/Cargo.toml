@@ -52,6 +52,7 @@ candle-gen = { path = "../candle-gen", features = ["testkit"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
+model-inference-proof = ["candle-gen-face/model-inference-proof", "candle-gen-flux/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof"]
 # Pass the backend selection through to the core crate AND the composed provider crates so a downstream
 # `--features cuda`/`metal` selects the matching candle backend everywhere (one device, one resolution).
 default = []

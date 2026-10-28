@@ -20,6 +20,7 @@ rand = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [features]
+model-inference-proof = ["candle-gen/model-inference-proof"]
 default = []
 test-support = ["dep:sceneworks-gen-core-testkit", "candle-gen-flux2/test-support", "candle-llm/test-support"]
 cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-llm/cuda"]

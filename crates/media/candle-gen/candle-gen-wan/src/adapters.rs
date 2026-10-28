@@ -1021,6 +1021,7 @@ mod tests {
     /// same LoRA → the two DiT forwards match tightly (f32), on the *same* inputs. The sc-10094
     /// additive==folded acceptance, end-to-end through the vendored DiT (not just the bare `QLinear`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn install_additive_matches_merge_fold() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -1057,11 +1058,17 @@ mod tests {
             "additive DiT forward vs folded deviates by {dev_max}"
         );
         std::fs::remove_file(&lora).ok();
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::install_additive_matches_merge_fold"
+        );
     }
 
     /// A LoRA installs additively onto the tiny DiT and **shifts** the forward vs the un-adapted base
     /// (same inputs); the report accounts for every target with no host miss.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn install_additive_applies_and_shifts() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -1084,6 +1091,11 @@ mod tests {
             "additive LoRA did not shift the DiT forward ({shift})"
         );
         std::fs::remove_file(&lora).ok();
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::install_additive_applies_and_shifts"
+        );
     }
 
     #[test]

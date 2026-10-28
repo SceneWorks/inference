@@ -114,4 +114,6 @@ fn svd_vae_matches_diffusers() {
         "decode rel-L2 {d_l2} (peak-rel {d_rel}, max|Δ| {d_abs})"
     );
     assert!(d_rel < 5e-3, "decode peak-rel {d_rel} (max|Δ| {d_abs})");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::svd_vae_matches_diffusers");
 }

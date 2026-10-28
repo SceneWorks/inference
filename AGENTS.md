@@ -55,9 +55,54 @@ Review authors and remediation work must also follow the repository-wide
 
 Add focused unit tests near behavior and integration/conformance tests under the
 crate's `tests/` directory. Name Rust test files after the capability (for
-example, `tests/conformance.rs`) and Python tests `test_*.py`. Avoid requiring
-real weights or accelerator hardware for ordinary tests; those belong in the
-separate ignored or platform CI gates.
+example, `tests/conformance.rs`) and Python tests `test_*.py`.
+
+### Model execution is manual-only (PR and main policy)
+
+Normal pull-request and `main` CI **never executes model inference or training**.
+This includes learned NN module/block/layer forward or backward, generation, and
+training on tiny or synthetic fixtures: small weights do not make model execution
+a kernel or metadata test. Model implementations and tests may land on `main`,
+but their execution belongs to the explicit `model-inference-proofs.yml` workflow,
+not to ordinary CI and not to an automatic campaign at each pin change.
+
+- Keep all applicable test targets compiled and linted. Newly moved model tests
+  use unconditional `#[ignore = "model inference; explicit model-proof workflow"]`.
+  Existing unconditional ignores may retain their original prerequisite reasons
+  verbatim; registration and exact late BODY/device protocols are still required.
+  Do not replace model work with an early-return PASS or drop assertions/cases.
+- Raw matmul/conv/SDPA/norm/allocator operations, schema/math/tokenizer/header
+  checks, mocks, and cheap constructor/load-only checks remain ordinary tests.
+  A learned module's `.forward` is not exempt merely because its implementation
+  eventually calls one of those raw kernels. Heavy whole-model pack proofs are
+  explicit manual workloads too.
+- New or changed tests must be classified and registered in
+  `scripts/ci/model-inference-proofs.json` when model work is reachable. Ordinary
+  workflows must not override those ignores. The ordinary structural policy
+  check (`scripts/check_model_inference_policy.py`) enforces bidirectional source BODY/
+  registry coverage (plus new canonical tags) and rejects automatic model execution
+  paths, including runnable learned-model Rustdoc seams.
+- Manual proofs select exact registered cases/backends and explicit external
+  resource guards. Evidence records the exact source/fixture-model identity,
+  configuration, actual selected compute-device SET inside each work scope
+  (separate from host/default metadata), nonzero completed bodies/pass counts,
+  existing outputs/metrics/logs and duration. Missing assets, skipped bodies,
+  absent device observations, failed or partial children are **not proof**.
+- Preserve every test, assertion and supported model/tier/control surface.
+  Source inspection, compilation, test discovery, or ordinary CI success is not
+  a model-runtime PASS and does not waive epic/device acceptance criteria.
+  Proofs run only on explicit dispatch with queue-preserving physical resource
+  coordination; never cancel running inference to admit another dispatch.
+- The source-guarded Candle Iris rank entry is a **parent-only NN helper**: retain
+  its original unconditional ignore and exact same-executable child guard, register
+  its exact nested-rank parent bindings, and never fabricate a standalone helper
+  BODY. It is checked by compiled-ignore discovery but cannot be selected or accepted
+  as its own proof. Nested-rank successful-libtest-summary counts describe normal
+  test-process completion, not successful training: preserve original parent JSON,
+  `RankLost`/`SplitWorld`, and intentional rank-loss assertions. Failed libtest
+  summaries still reject the complete case; a pre-NN early return is not NN proof.
+
+See `docs/ios-device-runbook.md` for the explicit proof and evidence commands.
 
 ## Commit & Pull Request Guidelines
 

@@ -431,4 +431,6 @@ fn fit_preview_rgb() {
         }
         std::fs::write(dir.join("fit_report.txt"), report).unwrap();
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fit_preview_rgb::fit_preview_rgb");
 }

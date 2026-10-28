@@ -2084,6 +2084,118 @@ impl MemoryProviderContract {
         Ok(selection)
     }
 
+    /// Every selection this provider declares it can execute at `strategy` — the full product of
+    /// the parameter domains of every rung the strategy engages (the decode route's tile edges and
+    /// overlaps, the attention chunk sizes, the transformer window sizes and components) and, where
+    /// the provider implements staged residency but the strategy does not already engage it, the
+    /// optional phase eviction (`stage_residency: Some(true)`); each one
+    /// [`validate_selection`](Self::validate_selection)-checked; never empty (a strategy with no
+    /// declared parameters is its single parameterless selection).
+    ///
+    /// Ordered QUALITY FIRST, cheapest last: within each lever the most resident / largest value
+    /// first (unstaged before staged, the largest decode tile and overlap, the largest attention
+    /// chunk and transformer window, the narrowest window scope `Dit` → `TextEncoder` → `Both`),
+    /// the tile edge varying fastest, then the overlap, chunk, window size, component and staging.
+    /// A capture that refuses at one selection can therefore step to the next cheaper one at the
+    /// same size.
+    pub fn selection_space(
+        &self,
+        strategy: MemoryStrategy,
+        tier: MemoryNumericTier,
+        use_pid: bool,
+    ) -> crate::Result<Vec<MemorySelection>> {
+        // The representative validates the strategy itself (and its prerequisites) once.
+        let representative = self.representative_selection(strategy, tier, use_pid)?;
+        let descending = |mut v: Vec<u32>| {
+            v.sort_unstable_by(|a, b| b.cmp(a));
+            v.dedup();
+            v
+        };
+        let or_none = |v: Vec<u32>| -> Vec<Option<u32>> {
+            if v.is_empty() {
+                vec![None]
+            } else {
+                v.into_iter().map(Some).collect()
+            }
+        };
+        let (mut tiles, mut overlaps) = (vec![None], vec![None]);
+        if self.engages(strategy, MemoryStrategy::BoundedDecode) {
+            if let Some(routes) = &self.pid_decode_routes {
+                let route = if use_pid { &routes.pid } else { &routes.native };
+                tiles = or_none(descending(route.tile_edges.clone()));
+                overlaps = vec![Some(route.tile_overlap)];
+            } else if let Some(capability) = self.capability(MemoryStrategy::BoundedDecode) {
+                tiles = or_none(descending(capability.parameters.decode_tile_edges.clone()));
+                overlaps = or_none(descending(capability.parameters.decode_overlaps.clone()));
+            }
+        }
+        let mut chunks = vec![None];
+        if self.engages(strategy, MemoryStrategy::BoundedAttention) {
+            if let Some(capability) = self.capability(MemoryStrategy::BoundedAttention) {
+                chunks = or_none(descending(
+                    capability.parameters.attention_chunk_sizes.clone(),
+                ));
+            }
+        }
+        let (mut windows, mut components) = (vec![None], vec![None]);
+        if self.engages(strategy, MemoryStrategy::BoundedTransformerResidency) {
+            if let Some(capability) = self.capability(MemoryStrategy::BoundedTransformerResidency) {
+                windows = or_none(descending(
+                    capability.parameters.transformer_window_sizes.clone(),
+                ));
+                let mut declared = capability.parameters.transformer_window_components.clone();
+                declared.sort_unstable();
+                declared.dedup();
+                if !declared.is_empty() {
+                    components = declared.into_iter().map(Some).collect();
+                }
+            }
+        }
+        let mut stages = vec![representative.parameters.stage_residency];
+        if strategy != MemoryStrategy::Resident
+            && representative.parameters.stage_residency.is_none()
+            && !self.engages(strategy, MemoryStrategy::StagedResidency)
+            && matches!(
+                self.support(MemoryStrategy::StagedResidency),
+                Some(MemoryStrategySupport::Implemented)
+            )
+        {
+            stages.push(Some(true));
+        }
+        let mut out = Vec::new();
+        for &stage_residency in &stages {
+            for &component in &components {
+                for &window in &windows {
+                    for &chunk in &chunks {
+                        for &overlap in &overlaps {
+                            for &tile in &tiles {
+                                let selection = MemorySelection {
+                                    strategy,
+                                    parameters: MemoryStrategyParameters {
+                                        stage_residency,
+                                        decode_tile_edge: tile,
+                                        decode_overlap: overlap,
+                                        attention_chunk_size: chunk,
+                                        transformer_window_size: window,
+                                        transformer_window_component: component,
+                                    },
+                                    tier,
+                                };
+                                if self.validate_selection(&selection).is_ok() {
+                                    out.push(selection);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(representative);
+        }
+        Ok(out)
+    }
+
     /// What one rung-4 window materialization does for this provider (SC-16090), or `None` if the
     /// realization has not stated it.
     ///
@@ -3764,6 +3876,15 @@ pub trait MemoryRequestScope {
     /// Translate the selected strategy into the provider's existing request controls. This is the
     /// executable bridge for providers that predate the shared contract.
     fn configure_request(&mut self, request: &mut GenerationRequest) -> Result<()>;
+    /// Configure an ALREADY canonical, admission-bound immutable request. No
+    /// media/prompt clone and no fabricated metadata carrier is permitted.
+    /// Existing providers keep the old mutable contract unless they explicitly
+    /// implement this source-backed path; unsupported stops before generation.
+    fn configure_admitted_request(&mut self, _request: &GenerationRequest) -> Result<()> {
+        Err(Error::Unsupported(
+            "provider lifecycle does not support immutable admitted configuration".into(),
+        ))
+    }
     fn enter_phase(&mut self, phase: MemoryPhase) -> Result<()>;
     fn leave_phase(&mut self, phase: MemoryPhase) -> Result<()>;
     fn configure_decode(
@@ -6746,6 +6867,108 @@ mod tests {
             quant: None,
             component_precision_floors: &[],
         }
+    }
+
+    /// The selection space is the full validated product of the engaged rungs' declared domains,
+    /// quality first (largest tile / chunk / window, narrowest scope), the tile edge varying fastest.
+    #[test]
+    fn selection_space_is_the_declared_product_in_quality_order() {
+        let mut contract = adopted_contract();
+        for capability in &mut contract.strategies {
+            if capability.strategy == MemoryStrategy::BoundedTransformerResidency {
+                capability.parameters.transformer_window_components = vec![
+                    TransformerComponent::Both,
+                    TransformerComponent::Dit,
+                    TransformerComponent::TextEncoder,
+                ];
+            }
+        }
+        let mut widest = 0;
+        for strategy in MemoryStrategy::ALL {
+            let Ok(space) = contract.selection_space(strategy, bf16(), false) else {
+                assert!(contract
+                    .representative_selection(strategy, bf16(), false)
+                    .is_err());
+                continue;
+            };
+            assert!(!space.is_empty(), "{strategy:?}");
+            for selection in &space {
+                contract.validate_selection(selection).unwrap();
+            }
+            let domain = |s: MemoryStrategy, f: fn(&MemoryParameterRanges) -> usize| {
+                if contract.engages(strategy, s) {
+                    contract
+                        .capability(s)
+                        .map_or(1, |c| f(&c.parameters).max(1))
+                } else {
+                    1
+                }
+            };
+            let tiles = match (
+                &contract.pid_decode_routes,
+                contract.engages(strategy, MemoryStrategy::BoundedDecode),
+            ) {
+                (Some(routes), true) => routes.native.tile_edges.len().max(1),
+                _ => domain(MemoryStrategy::BoundedDecode, |p| {
+                    p.decode_tile_edges.len() * p.decode_overlaps.len().max(1)
+                }),
+            };
+            let expected = tiles
+                * domain(MemoryStrategy::BoundedAttention, |p| {
+                    p.attention_chunk_sizes.len()
+                })
+                * domain(MemoryStrategy::BoundedTransformerResidency, |p| {
+                    p.transformer_window_sizes.len() * p.transformer_window_components.len().max(1)
+                });
+            let staged = strategy != MemoryStrategy::Resident
+                && !contract.engages(strategy, MemoryStrategy::StagedResidency)
+                && matches!(
+                    contract.support(MemoryStrategy::StagedResidency),
+                    Some(MemoryStrategySupport::Implemented)
+                );
+            let expected = expected * if staged { 2 } else { 1 };
+            assert_eq!(space.len(), expected, "{strategy:?}: {space:?}");
+            if staged {
+                assert_eq!(space[0].parameters.stage_residency, None, "unstaged first");
+                assert_eq!(
+                    space[space.len() - 1].parameters.stage_residency,
+                    Some(true)
+                );
+            }
+            let first = space[0].parameters;
+            let last = space[space.len() - 1].parameters;
+            if let (Some(a), Some(b)) = (first.decode_tile_edge, last.decode_tile_edge) {
+                assert!(a >= b, "{strategy:?}: largest tile first");
+                if tiles > 1 {
+                    assert!(space[1].parameters.decode_tile_edge < first.decode_tile_edge);
+                }
+            }
+            if contract.engages(strategy, MemoryStrategy::BoundedTransformerResidency) {
+                assert_eq!(
+                    first.transformer_window_component,
+                    Some(TransformerComponent::Dit)
+                );
+                assert_eq!(
+                    last.transformer_window_component,
+                    Some(TransformerComponent::Both)
+                );
+            }
+            let mut keys: Vec<_> = space
+                .iter()
+                .map(|s| format!("{:?}", s.parameters))
+                .collect();
+            keys.dedup();
+            assert_eq!(
+                keys.len(),
+                space.len(),
+                "{strategy:?}: duplicate selections"
+            );
+            widest = widest.max(space.len());
+        }
+        assert!(
+            widest > 3,
+            "the fixture must exercise a multi-lever space ({widest})"
+        );
     }
 
     /// SC-15998: the graph itself, asserted edge by edge so a regression to the old rung-1 edge

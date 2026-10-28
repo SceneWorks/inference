@@ -1,5 +1,15 @@
 //! Frozen upstream, real-weight, end-to-end provider parity for `sc-14543`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::{Path, PathBuf};
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{
@@ -236,4 +246,9 @@ fn thirty_second_eight_step_provider_matches_frozen_torch() {
     assert!(audio_metrics.1 <= 0.1);
     assert!(audio_metrics.2 <= 0.001);
     assert_eq!(large_audio_deltas, 0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED thirty_second_eight_step_provider_matches_frozen_torch"
+    );
 }

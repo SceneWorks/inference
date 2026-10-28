@@ -13,11 +13,33 @@ pub struct UNetMidBlock {
 }
 
 impl UNetMidBlock {
+    /// A decoder-side mid block (the decoder's quantum labels).
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        Self::from_weights_labeled(w, prefix, &crate::quantum::DECODE_LABELS)
+    }
+
+    /// A mid block whose iOS quanta carry `labels` (the encoder's or the decoder's).
+    pub(crate) fn from_weights_labeled(
+        w: &Weights,
+        prefix: &str,
+        labels: &'static crate::quantum::VaeLabels,
+    ) -> Result<Self> {
         Ok(Self {
-            resnet0: ResnetBlock2D::from_weights(w, &format!("{prefix}.resnets.0"))?,
-            attention: VaeAttention::from_weights(w, &format!("{prefix}.attentions.0"))?,
-            resnet1: ResnetBlock2D::from_weights(w, &format!("{prefix}.resnets.1"))?,
+            resnet0: ResnetBlock2D::from_weights_labeled(
+                w,
+                &format!("{prefix}.resnets.0"),
+                labels,
+            )?,
+            attention: VaeAttention::from_weights_labeled(
+                w,
+                &format!("{prefix}.attentions.0"),
+                labels,
+            )?,
+            resnet1: ResnetBlock2D::from_weights_labeled(
+                w,
+                &format!("{prefix}.resnets.1"),
+                labels,
+            )?,
         })
     }
 
@@ -27,9 +49,15 @@ impl UNetMidBlock {
         self.attention.quantize(bits)
     }
 
+    /// The block's two resnets and its attention (the iOS pricing prices them).
+    pub(crate) fn parts(&self) -> (&ResnetBlock2D, &VaeAttention, &ResnetBlock2D) {
+        (&self.resnet0, &self.attention, &self.resnet1)
+    }
+
+    /// iOS: each resnet and the attention is one bounded quantum (pass-throughs off device).
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let h = self.resnet0.forward(x)?;
-        let h = self.attention.forward(&h)?;
-        self.resnet1.forward(&h)
+        let h = self.resnet0.forward_quantum(x)?;
+        let h = self.attention.forward_quantum(&h)?;
+        self.resnet1.forward_quantum(&h)
     }
 }

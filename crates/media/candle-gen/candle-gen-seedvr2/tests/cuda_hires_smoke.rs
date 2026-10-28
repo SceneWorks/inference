@@ -65,6 +65,8 @@ fn cuda_hires_upscale_not_black() {
         Ok(p) => p,
         Err(_) => {
             eprintln!("SKIP: set SEEDVR2_CKPT to a numz/SeedVR2_comfyUI checkpoint dir");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_hires_smoke.rs:68 (cuda_hires_upscale_not_black): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return;
         }
     };
@@ -108,4 +110,7 @@ fn cuda_hires_upscale_not_black() {
             "{tgt}² upscale not structurally faithful (corr={corr:.4})"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda_hires_smoke::cuda_hires_upscale_not_black");
 }

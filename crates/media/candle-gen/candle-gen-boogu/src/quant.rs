@@ -70,8 +70,8 @@ impl QLinear {
     /// dequant-on-forward `QLinear` (sc-7702).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Packed { linear, .. } => linear.forward(x),
+            Self::Dense(l) => __model_proof_output!(l.forward(x)),
+            Self::Packed { linear, .. } => __model_proof_output!(linear.forward(x)),
         }
     }
 
@@ -86,9 +86,9 @@ impl QLinear {
                 let dt = x.dtype();
                 let w = l.weight().to_dtype(dt)?;
                 let b = l.bias().map(|b| b.to_dtype(dt)).transpose()?;
-                Linear::new(w, b).forward(x)
+                __model_proof_output!(Linear::new(w, b).forward(x))
             }
-            Self::Packed { linear, .. } => linear.forward(x),
+            Self::Packed { linear, .. } => __model_proof_output!(linear.forward(x)),
         }
     }
 
@@ -169,8 +169,8 @@ impl QEmbedding {
     /// Index-select the embedding rows for `indexes`.
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(e) => e.forward(indexes),
-            Self::Packed(e) => e.forward(indexes),
+            Self::Dense(e) => __model_proof_output!(e.forward(indexes)),
+            Self::Packed(e) => __model_proof_output!(e.forward(indexes)),
         }
     }
 
@@ -236,6 +236,7 @@ mod tests {
     /// pack represents — bit-exact (the repack is lossless, both forwards dequant-to-dense-matmul). Uses
     /// the boogu tier's real `to_out.0` output-projection shape (3360×3360).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_qlinear_matches_dense_grid() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
@@ -254,6 +255,10 @@ mod tests {
         assert!(
             cos > 0.99999,
             "group-32 packed vs affine-grid cosine {cos:.6}"
+        );
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qlinear_matches_dense_grid"
         );
         Ok(())
     }
@@ -276,6 +281,7 @@ mod tests {
     /// A group-32 packed `QEmbedding` reproduces the affine grid rows exactly (the Qwen3-VL TE
     /// `embed_tokens` is packed in the q4 tier), dequantized to the requested dtype.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_qembedding_matches_dense_grid() -> Result<()> {
         let dev = Device::Cpu;
         let (vocab, hidden) = (64usize, 128usize);
@@ -295,6 +301,10 @@ mod tests {
         assert_eq!(
             dev_max, 0.0,
             "group-32 packed embedding deviates from the grid"
+        );
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qembedding_matches_dense_grid"
         );
         Ok(())
     }

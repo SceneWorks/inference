@@ -2119,6 +2119,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn additive_lora_matches_folded_merge_dense() {
         let tmp = tempfile::tempdir().unwrap();
         // ACCEPTANCE: the additive residual on a DENSE base == the folded merge, same output within
@@ -2187,6 +2188,8 @@ mod tests {
                 "additive adapter must change {name}'s output (non-degenerate)"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::tests::additive_lora_matches_folded_merge_dense");
     }
 
     /// A quant-sized host: `blocks.0.self_attn.q` is `[128, 64]` so its `in = 64` is a multiple of the
@@ -2222,6 +2225,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn additive_lora_on_quantized_base_no_error_and_nondegenerate() {
         let tmp = tempfile::tempdir().unwrap();
         // ACCEPTANCE: a LoRA applies on a Q4/Q8 PACKED base with NO error (the old model.rs:614
@@ -2283,9 +2287,12 @@ mod tests {
                 "Q{bits} additive adapter must change the packed base's output"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::tests::additive_lora_on_quantized_base_no_error_and_nondegenerate");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn additive_no_adapter_is_byte_identical() {
         let tmp = tempfile::tempdir().unwrap();
         // ACCEPTANCE: with NO adapters installed the forward is byte-identical to the bare base — the
@@ -2317,9 +2324,14 @@ mod tests {
                 .item::<bool>(),
             "empty additive install must leave the forward byte-identical"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED adapters::tests::additive_no_adapter_is_byte_identical"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn additive_scale_zero_is_bit_exact_noop() {
         let tmp = tempfile::tempdir().unwrap();
         // A strength-0 additive LoRA is a bit-exact no-op (the residual is `0·…`), mirroring the
@@ -2345,9 +2357,14 @@ mod tests {
             array_eq(got, &want, false).unwrap().item::<bool>(),
             "strength 0 must leave the additive forward bit-identical"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED adapters::tests::additive_scale_zero_is_bit_exact_noop"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn additive_lokr_matches_folded_merge_dense() {
         let tmp = tempfile::tempdir().unwrap();
         // The LoKr additive residual on a dense base matches the folded LoKr merge (same reconstructed
@@ -2380,6 +2397,8 @@ mod tests {
                 .item::<bool>(),
             "additive LoKr residual must match the folded LoKr merge (dense)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::tests::additive_lokr_matches_folded_merge_dense");
     }
 
     // ---- Structured (deferred) LoKr on a PACKED base (sc-10050) ----------------------------------
@@ -2420,6 +2439,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn structured_lokr_on_quantized_matches_dense_and_stays_packed() {
         let tmp = tempfile::tempdir().unwrap();
         // ACCEPTANCE (sc-10050): a peft LoKr applies on a Q4/Q8 PACKED base with NO error, NO full
@@ -2533,6 +2553,8 @@ mod tests {
                 "Q{bits} structured LoKr contribution must match the dense materialized-delta residual"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::tests::structured_lokr_on_quantized_matches_dense_and_stays_packed");
     }
 
     // ---- Packed-snapshot routing guard (sc-10045 / narrowed by sc-10050) ------------------------

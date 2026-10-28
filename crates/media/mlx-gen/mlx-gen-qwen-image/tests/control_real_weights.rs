@@ -122,6 +122,8 @@ fn control_loads_and_emits_hints() {
         m.is_finite() && m > 0.0,
         "output must be finite + non-zero, got {m}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_real_weights::control_loads_and_emits_hints");
 }
 
 #[test]
@@ -161,6 +163,8 @@ fn scale_zero_matches_base() {
         0.0,
         "control scale 0 must be bit-identical to base forward"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_real_weights::scale_zero_matches_base");
 }
 
 #[test]
@@ -198,6 +202,8 @@ fn scale_one_changes_output() {
         max_abs_diff(&base_out, &ctrl_out) > 0.0,
         "control scale 1 must change the output vs base (pose takes effect)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_real_weights::scale_one_changes_output");
 }
 
 #[test]
@@ -248,4 +254,6 @@ fn public_generate_runs() {
         img.pixels.iter().any(|&p| p != first),
         "decoded image is flat (degenerate render)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_real_weights::public_generate_runs");
 }

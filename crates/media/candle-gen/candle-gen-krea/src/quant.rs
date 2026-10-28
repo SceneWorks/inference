@@ -189,7 +189,7 @@ impl ConvRotInt8 {
             Some(b) => Some(b.to_dtype(in_dtype)?),
             None => None,
         };
-        Linear::new(w, bias).forward(&xr.to_dtype(in_dtype)?)
+        __model_proof_output!(Linear::new(w, bias).forward(&xr.to_dtype(in_dtype)?))
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -362,10 +362,10 @@ impl QLinear {
     /// residuals); int8-ConvRot to the cuBLASLt IGEMM (CUDA) or a dequant-dense matmul (CPU).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Adapt(l) => l.forward(x),
-            Self::ConvRotInt8(l) => l.forward(x),
-            Self::Nvfp4(l) => l.forward(x),
-            Self::Probed(l) => l.forward(x),
+            Self::Adapt(l) => __model_proof_output!(l.forward(x)),
+            Self::ConvRotInt8(l) => __model_proof_output!(l.forward(x)),
+            Self::Nvfp4(l) => __model_proof_output!(l.forward(x)),
+            Self::Probed(l) => __model_proof_output!(l.forward(x)),
         }
     }
 
@@ -614,8 +614,8 @@ impl QEmbedding {
     /// Index-select the embedding rows for `indexes`.
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(e) => e.forward(indexes),
-            Self::Packed(e) => e.forward(indexes),
+            Self::Dense(e) => __model_proof_output!(e.forward(indexes)),
+            Self::Packed(e) => __model_proof_output!(e.forward(indexes)),
         }
     }
 
@@ -693,6 +693,7 @@ mod tests {
     /// pack represents — bit-exact (the Q4 → Q4_1 repack is lossless, both forwards dequant-to-dense
     /// -matmul). Uses a `to_out.0`-style output-projection shape.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_qlinear_matches_dense_grid() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
@@ -712,12 +713,17 @@ mod tests {
             cos > 0.99999,
             "group-64 packed vs affine-grid cosine {cos:.6}"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qlinear_matches_dense_grid"
+        );
         Ok(())
     }
 
     /// A group-64 packed `QEmbedding` reproduces the affine grid rows exactly, dequantized to the
     /// requested dtype (the future-proof path for a tier that ever packs `embed_tokens`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_qembedding_matches_dense_grid() -> Result<()> {
         let dev = Device::Cpu;
         let (vocab, hidden) = (64usize, 128usize);
@@ -738,6 +744,10 @@ mod tests {
             dev_max, 0.0,
             "group-64 packed embedding deviates from the grid"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qembedding_matches_dense_grid"
+        );
         Ok(())
     }
 
@@ -746,6 +756,7 @@ mod tests {
     /// that eager leg is skipped, so a valid build must construct + forward without panicking, and
     /// malformed parts must be typed errors from the constructor (never a `.expect()`/panic).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn convrot_int8_constructor_is_typed_error_not_panic() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
@@ -776,6 +787,8 @@ mod tests {
             QLinear::convrot_int8(pc.q.clone(), pc.scale.clone(), G + 1, None, &dev).is_err(),
             "non-power-of-four group_size must be a typed error"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::convrot_int8_constructor_is_typed_error_not_panic");
         Ok(())
     }
 
@@ -783,6 +796,7 @@ mod tests {
     /// base forward is identical in each pair, so subtraction isolates the adapter contribution and
     /// proves the INT8-ConvRot route does not silently drop either advertised adapter kind.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn convrot_int8_applies_lora_and_lokr_without_replacing_int8_base() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim, group) = (4usize, 4usize, 4usize);
@@ -849,6 +863,8 @@ mod tests {
             "ConvRot LoKr residual drifted ({lokr_max})"
         );
         assert!(lora.is_convrot_int8() && lokr.is_convrot_int8());
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::convrot_int8_applies_lora_and_lokr_without_replacing_int8_base");
         Ok(())
     }
 
@@ -862,11 +878,14 @@ mod tests {
     /// legitimately `None`. Skips cleanly when no CUDA device is present.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn convrot_int8_cuda_forward_with_cpu_codes_matches_dequant_dense() -> Result<()> {
         let cuda = match Device::cuda_if_available(0) {
             Ok(d @ Device::Cuda(_)) => d,
             _ => {
                 eprintln!("[sc-11208] no CUDA device; skipping ConvRot int8 CUDA forward gate");
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/src/quant.rs:870 (convrot_int8_cuda_forward_with_cpu_codes_matches_dequant_dense): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
                 return Ok(());
             }
         };
@@ -924,6 +943,8 @@ mod tests {
             cos > 0.99 && rel < 0.1,
             "CUDA int8 IGEMM vs CPU dequant-dense: cosine {cos:.5}, rel-RMS {rel:.4}"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::convrot_int8_cuda_forward_with_cpu_codes_matches_dequant_dense");
         Ok(())
     }
 }

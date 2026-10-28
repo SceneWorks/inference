@@ -659,6 +659,7 @@ mod tests {
     /// and leaves the caller's cache exactly as the pre-engine loop did (same length, same
     /// next-step logits). A cancel set before the run stays typed.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn generate_on_the_engine_is_the_pre_engine_loop() {
         let (model, ids, idx) = fixture();
         let plan = AttentionPlan::UNBOUNDED;
@@ -745,12 +746,16 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED runtime::tests::generate_on_the_engine_is_the_pre_engine_loop");
     }
 
     /// An interleave text segment on the engine (`rollout_planned` with the segment's stops and
     /// remaining budget, as `t2i.rs` calls it) emits the pre-engine segment's tokens and ends the
     /// same way: on the same stop, or at the budget (`hit_max`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn interleave_segments_on_the_engine_are_the_pre_engine_loop() {
         let (model, ids, idx) = fixture();
         let (mut c, first, t_idx) = prefill(&model, &ids, &idx);
@@ -810,6 +815,9 @@ mod tests {
             }
         }
         assert!(stop_ends > 0 && budget_ends > 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED runtime::tests::interleave_segments_on_the_engine_are_the_pre_engine_loop");
     }
 
     /// sc-24446 behaviour change: the seeded stochastic rollout now draws through the shared
@@ -817,6 +825,7 @@ mod tests {
     /// stream, different seeds explore different streams, `top_k = 1` collapses to the greedy
     /// stream, and the first draw follows the shaped (temperature-softmax) distribution of its row.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn stochastic_rollouts_reproduce_per_seed_and_follow_the_shaped_distribution() {
         let (model, ids, idx) = fixture();
         let plan = AttentionPlan::UNBOUNDED;
@@ -890,12 +899,16 @@ mod tests {
             seen += usize::from(k > 0);
         }
         assert!(seen > 1, "the first row's draw is not degenerate");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED runtime::tests::stochastic_rollouts_reproduce_per_seed_and_follow_the_shaped_distribution");
     }
 
     /// The pipeline's cancel, set mid-rollout, is bridged onto the engine's flag: the engine
     /// finishes `Cancelled` right after the token it was emitting, the rollout returns the typed
     /// [`CandleError::Canceled`] (greedy and stochastic), and the lent cache comes back.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_mid_run_cancel_ends_the_rollout_typed() {
         let (model, ids, idx) = fixture();
         let (_, first, t_idx) = prefill(&model, &ids, &idx);
@@ -932,5 +945,8 @@ mod tests {
                 "{sampler:?}: the lent cache comes back"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED runtime::tests::a_mid_run_cancel_ends_the_rollout_typed");
     }
 }

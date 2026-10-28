@@ -212,7 +212,13 @@ impl MageTransformer {
     /// caller-provisioned local paths (the epic-13657 boundary enforced by `check-workspace.py`).
     pub fn load(transformer_dir: impl AsRef<Path>) -> Result<Self> {
         let dir = transformer_dir.as_ref();
-        let json = std::fs::read_to_string(dir.join(TRANSFORMER_CONFIG_FILE))?;
+        let json = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join(TRANSFORMER_CONFIG_FILE)),
+"crates/media/mlx-gen/mlx-gen-mage/src/transformer.rs::load::std::fs::read_to_string@9377",
+ArtifactInput,
+dir.join(TRANSFORMER_CONFIG_FILE),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
         let cfg = MageFlowConfig::from_transformer_config_json(&json)?;
         let mut weights = Weights::from_file(dir.join(TRANSFORMER_WEIGHTS_FILE))?;
         Self::from_weights_draining(&mut weights, cfg)
@@ -222,7 +228,13 @@ impl MageTransformer {
     /// stay lazy (the stream re-reads each per window) and only the non-block tensors materialize.
     pub(crate) fn load_streamed(transformer_dir: impl AsRef<Path>) -> Result<Self> {
         let dir = transformer_dir.as_ref();
-        let json = std::fs::read_to_string(dir.join(TRANSFORMER_CONFIG_FILE))?;
+        let json = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join(TRANSFORMER_CONFIG_FILE)),
+"crates/media/mlx-gen/mlx-gen-mage/src/transformer.rs::load_streamed::std::fs::read_to_string@10003",
+ArtifactInput,
+dir.join(TRANSFORMER_CONFIG_FILE),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
         let cfg = MageFlowConfig::from_transformer_config_json(&json)?;
         let mut weights = Weights::from_file(dir.join(TRANSFORMER_WEIGHTS_FILE))?;
         Self::from_weights_draining_with(&mut weights, cfg, true)
@@ -695,6 +707,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn linear_requires_its_bias() {
         let mut w = Weights::empty();
         w.insert("p.weight", Array::from_slice(&[1.0f32, 2.0], &[1, 2]));
@@ -705,6 +718,8 @@ mod tests {
         assert_eq!(lin.out_features(), 1);
         let x = Array::from_slice(&[1.0f32, 1.0], &[1, 2]);
         assert_eq!(lin.forward(&x).unwrap().as_slice::<f32>(), &[3.5]);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::linear_requires_its_bias");
     }
 
     #[test]

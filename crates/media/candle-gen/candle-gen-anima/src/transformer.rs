@@ -702,6 +702,7 @@ mod tests {
     /// the affine grid bit-exact on CPU; a dense sibling (no `.scales`) stays dense. Group size 64
     /// (Anima's tier), the `AdaptLinear::detect` default. This is the pack → load → forward CPU validation.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_dit_linear_loads_and_forwards_on_cpu() {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize); // in divisible by group 64
@@ -736,10 +737,16 @@ mod tests {
             None,
         );
         let x = Tensor::randn(0f32, 1f32, (4usize, in_dim), &dev).unwrap();
-        let cos = cosine(&packed.forward(&x).unwrap(), &grid_lin.forward(&x).unwrap());
+        let cos = cosine(
+            &packed.forward(&x).unwrap(),
+            &__model_proof_output!(grid_lin.forward(&x)).unwrap(),
+        );
         assert!(
             cos > 0.99999,
             "packed vs affine-grid cosine {cos:.6} (CPU dequant-dense)"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::packed_dit_linear_loads_and_forwards_on_cpu");
     }
 }

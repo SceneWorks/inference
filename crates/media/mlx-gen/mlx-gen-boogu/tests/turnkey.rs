@@ -104,4 +104,6 @@ fn assemble_turnkey_loads() {
         "[E9] OK — Q{bits} turnkey at {} loads + renders",
         dst.display()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turnkey::assemble_turnkey_loads");
 }

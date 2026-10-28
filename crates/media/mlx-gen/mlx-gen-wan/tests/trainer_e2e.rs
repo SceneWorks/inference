@@ -213,6 +213,8 @@ fn wan_t2v_a14b_trainer_trains_both_experts_and_reloads() {
         ".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16",
     );
     run_trainer_e2e("wan2_2_t2v_14b", snap, &moe_experts(), "adamw");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_t2v_a14b_trainer_trains_both_experts_and_reloads");
 }
 
 /// The dual-expert (high/low) reload spec for the A14B MoE trainers.
@@ -261,6 +263,10 @@ fn wan_t2v_a14b_trainer_gradient_checkpointing() {
         ".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16",
     );
     run_trainer_e2e_cfg("wan2_2_t2v_14b", snap, &moe_experts(), "adamw", true);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_t2v_a14b_trainer_gradient_checkpointing"
+    );
 }
 
 #[test]
@@ -272,6 +278,8 @@ fn wan_i2v_a14b_trainer_trains_both_experts_and_reloads() {
         ".cache/mlx-gen-models/wan2_2_i2v_a14b_mlx_bf16",
     );
     run_trainer_e2e("wan2_2_i2v_14b", snap, &moe_experts(), "adamw");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_i2v_a14b_trainer_trains_both_experts_and_reloads");
 }
 
 /// sc-4972 — the gradient-checkpointing path on the I2V-A14B MoE (dual-expert, channel-concat in_dim
@@ -285,6 +293,10 @@ fn wan_i2v_a14b_trainer_gradient_checkpointing() {
         ".cache/mlx-gen-models/wan2_2_i2v_a14b_mlx_bf16",
     );
     run_trainer_e2e_cfg("wan2_2_i2v_14b", snap, &moe_experts(), "adamw", true);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_i2v_a14b_trainer_gradient_checkpointing"
+    );
 }
 
 #[test]
@@ -296,6 +308,10 @@ fn wan_ti2v_5b_trainer_trains_dense_and_reloads() {
         ti2v_5b_snapshot(),
         &dense_expert(),
         "adamw",
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_ti2v_5b_trainer_trains_dense_and_reloads"
     );
 }
 
@@ -311,6 +327,10 @@ fn wan_ti2v_5b_trainer_gradient_checkpointing() {
         "adamw",
         true,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_ti2v_5b_trainer_gradient_checkpointing"
+    );
 }
 
 // sc-3048 — the ported Rose + Prodigy optimizers drive a real training run end-to-end (loss falls +
@@ -325,6 +345,8 @@ fn wan_ti2v_5b_trainer_rose_optimizer() {
         &dense_expert(),
         "rose",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_ti2v_5b_trainer_rose_optimizer");
 }
 
 #[test]
@@ -336,6 +358,8 @@ fn wan_ti2v_5b_trainer_prodigy_optimizer() {
         &dense_expert(),
         "prodigy",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_ti2v_5b_trainer_prodigy_optimizer");
 }
 
 /// sc-5637 — preview samples (one still frame). A short run with `sample_every`/`sample_prompts` set
@@ -427,6 +451,10 @@ fn wan_t2v_a14b_trainer_emits_preview_samples() {
             ".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16",
         ),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_t2v_a14b_trainer_emits_preview_samples"
+    );
 }
 
 #[test]
@@ -434,4 +462,8 @@ fn wan_t2v_a14b_trainer_emits_preview_samples() {
 fn wan_ti2v_5b_trainer_emits_preview_samples() {
     assert_eq!(mlx_gen_wan::MODEL_ID, "wan2_2_ti2v_5b");
     run_sample_smoke("wan2_2_ti2v_5b", ti2v_5b_snapshot());
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_ti2v_5b_trainer_emits_preview_samples"
+    );
 }

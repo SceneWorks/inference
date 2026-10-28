@@ -21,6 +21,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
+from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
+
 ROOT = Path(__file__).resolve().parents[2]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 REAL_WEIGHTS = ROOT / ".github" / "workflows" / "real-weights.yml"
@@ -30,8 +34,9 @@ MLX_SRC = ROOT / "crates/media/mlx-gen/mlx-gen-minimax-h3/src"
 CANDLE_SRC = ROOT / "crates/media/candle-gen/candle-gen-minimax-h3/src"
 MINIMUM_IGNORE_REASON = 20
 
-# Every H3 test that constructs or executes a complete model, a block stack, or the
-# production pipeline on synthetic fixtures. `module` is the test-file stem, because
+# Every H3 test below executes a learned model, module, or block on committed
+# fixtures, including attention/refiner/projection forwards previously left ordinary.
+# `module` is the test-file stem, because
 # the consolidated integration binary exposes each file as a module of that name.
 GATED = {
     "mlx": {
@@ -74,14 +79,19 @@ GATED = {
             "windowed_and_resident_stacks_agree",
             "the_two_residency_modes_are_mutually_exclusive",
             "the_windowed_adaln_precompute_matches_the_resident_one",
+            "the_windowed_te_matches_the_resident_one_on_the_fixture",
         ],
         "bounded_attention": [
             "a_bounded_plan_threads_the_whole_block_stack",
+            "a_bounded_plan_reaches_the_real_dit_attention_call",
         ],
         "dit_io": [
             "the_model_embeds_the_context_before_refining_it",
             "a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it",
             "the_whole_model_reproduces_the_reference_velocity",
+            "the_context_embedder_reproduces_the_reference_projection",
+            "the_output_norm_is_shift_then_scale_and_keyed_on_the_timestep_alone",
+            "the_timestep_mlp_reproduces_the_reference_embedding",
         ],
         "dit_parity": [
             "adaln_modulation_matches_the_reference",
@@ -93,6 +103,11 @@ GATED = {
             "every_block_weight_is_load_bearing",
             "parity_residuals_bound_the_mutation_floor",
             "weight_mapping_is_exhaustive_over_the_block_stack",
+            "attention_matches_the_reference_with_and_without_the_rotary",
+            "every_refiner_weight_is_load_bearing",
+            "qk_norm_runs_per_head_before_the_rotary",
+            "the_wrong_qkv_transform_breaks_parity",
+            "token_refiner_matches_the_reference",
         ],
         "pruned_adaln": [
             "native_pruned_adaln_matches_pinned_reference",
@@ -137,12 +152,21 @@ GATED = {
             "dit_agrees_with_the_mlx_lane",
             "the_dit_cross_backend_floor_is_also_the_mlx_lanes",
             "a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record",
+            "video_decode_agrees_with_the_mlx_lane",
+            "video_encode_agrees_with_the_mlx_lane",
+            "audio_decode_agrees_with_the_mlx_lane",
+            "the_cross_backend_floor_is_the_mlx_lanes_own_reduced_precision",
+            "the_cross_backend_gate_cannot_resolve_an_eps_misplacement",
+            "a_gated_ffn_half_swap_is_loud_against_the_mlx_record",
         ],
         "dit_io": [
             "the_model_embeds_the_context_before_refining_it",
             "the_whole_model_reproduces_the_reference_velocity",
             "forward_packed_rejects_an_out_of_range_adaln_index",
             "the_cached_modulation_path_reproduces_the_resident_one",
+            "the_context_embedder_reproduces_the_reference_projection",
+            "the_output_norm_is_shift_then_scale_and_keyed_on_the_timestep_alone",
+            "the_timestep_mlp_reproduces_the_reference_embedding",
         ],
         "dit_parity": [
             "adaln_modulation_matches_the_reference",
@@ -154,6 +178,11 @@ GATED = {
             "every_block_weight_is_load_bearing",
             "parity_residuals_bound_the_mutation_floor",
             "weight_mapping_is_exhaustive_over_the_block_stack",
+            "attention_matches_the_reference_with_and_without_the_rotary",
+            "every_refiner_weight_is_load_bearing",
+            "qk_norm_runs_per_head_before_the_rotary",
+            "the_wrong_qkv_transform_breaks_parity",
+            "token_refiner_matches_the_reference",
         ],
         "pruned_adaln": [
             "native_pruned_adaln_matches_pinned_reference",
@@ -178,6 +207,7 @@ GATED = {
             "a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check",
             "the_conversion_leaves_no_comfyui_module_behind",
             "clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknowns",
+            "the_render_seam_folds_the_staged_adapter_onto_the_dit",
         ],
     },
 }
@@ -212,9 +242,9 @@ LIB_ROUTES = [
     ("synthetic-w4a8-cuda", "candle", "dit::model::veda_controls_tests"),
 ]
 
-# Deliberately ordinary: source-traced to metadata (`MiniMaxH3Dit::names`,
-# `DitBlock::names`) or at most ONE transformer block — never the complete DiT, a
-# block stack, or the pipeline. The test below re-checks that boundary from source,
+# Deliberately ordinary: source-traced only to metadata (`MiniMaxH3Dit::names`,
+# `DitBlock::names`), with no learned forward. The test below re-checks that
+# boundary from source,
 # so one of these growing into a complete-model test reds this policy rather than
 # quietly re-entering ordinary CI.
 COMPONENT_ONLY = {
@@ -240,10 +270,14 @@ ROUTE_NAMES = {
     ("candle", "adaln_evict_memory"): ["the_evicted_adaln_weights_leave_the_cuda_pool"],
 }
 
-# Real-weight `#[ignore]`s that live in a module with a synthetic route. `--ignored`
-# alone would conscript them, so each route SKIPS them by name; the skip set is
+# Explicit exclusions sharing a synthetic route: prerequisite real-weight cases
+# and the source-traced prerecorded-velocity mock below. Each route SKIPS them
+# by name; the skip set is
 # pinned so a new skip (or a missing one) reds the policy.
 SKIPS = {
+    # Replay::forward returns stored fixture tensors; exclude this mock from the
+    # learned synthetic route regardless of its ordinary/ignored source status.
+    ("candle", "cross_backend"): ["joint_denoise_agrees_with_the_mlx_lane"],
     ("mlx", "turbo_lora"): [
         "published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas",
         "the_real_turbo_lora_folds_onto_the_real_dit",
@@ -597,7 +631,7 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
     def test_h3_gpu0_and_main_gpu1_keep_distinct_physical_identity(self) -> None:
         blocks = jobs(CI.read_text(encoding="utf-8"))
         main = blocks["windows-cuda"]
-        h3 = blocks["synthetic-w4a8-cuda"]
+        h3 = jobs(real_weights_inline_text())["synthetic-w4a8-cuda"]
         for body, index in ((main, "1"), (h3, "0")):
             self.assertIn(f"nvidia-smi -i {index} --query-gpu=index,uuid,name,pci.bus_id", body)
             self.assertIn(f"$fields[0] -ne '{index}'", body)
@@ -609,29 +643,28 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
         self.assertNotIn("- name: Prove H3", main)
         self.assertIn("- name: Prove H3 pruned AdaLN", h3)
         self.assertIn("H3_GEOMETRY_AUDIO_FULL_FORWARD backend=cuda cases=11", h3)
-        self.assertIn("inputs.synthetic_w4a8 == 'cuda'", h3)
+        self.assertIn("inputs.profile == 'synthetic-w4a8-cuda'", h3)
         self.assertIn("github.event_name == 'workflow_dispatch'", h3)
 
     def test_h3_and_moss_manual_queue_keys_both_preserve_each_run(self) -> None:
-        workflow = CI.read_text(encoding="utf-8")
-        expression = re.search(r"^  group: inference-ci-\$\{\{ (.+) \}\}$", workflow, re.M).group(1)
-        def key(event, synthetic, lane, run, suite="routine"):
-            values = {"github.event_name": event, "github.event.inputs.synthetic_w4a8": synthetic,
-                      "inputs.lanes": lane, "inputs.test_suite": suite, "github.run_id": run, "github.ref": "refs/pull/7/merge", "github.sha": "source-sha"}
-            rendered = expression
+        workflow = yaml.safe_load(real_weights_inline_text())
+        expression = workflow['concurrency']['group'].strip().removeprefix('${{').removesuffix('}}').strip()
+        def key(event, profile, run, attempt=1):
+            values = {"github.event_name": event, "inputs.profile": profile,
+                      "inputs.qwen_image_2_1_lora_runner": "rw-mage", "github.run_id": run, "github.run_attempt": attempt}
+            rendered = " ".join(expression.split())
             for name in sorted(values, key=len, reverse=True):
                 rendered = rendered.replace(name, repr(values[name]))
             rendered = rendered.replace("&&", " and ").replace("||", " or ")
             self.assertNotRegex(rendered, r"[A-Za-z_]\w*(?:\.\w+)+")
-            return eval(rendered, {"__builtins__": {}}, {"format": lambda template, value: template.format(value)})
-        for mode, lane in (("cuda", "windows-cuda"), ("mlx", "all"), ("both", "all"),
-                           ("none", "moss-edit-metal"), ("none", "moss-edit-cuda")):
-            self.assertNotEqual(key("workflow_dispatch", mode, lane, 1), key("workflow_dispatch", mode, lane, 2))
-        self.assertEqual(key("pull_request", "none", "all", 1), "refs/pull/7/merge")
-        self.assertEqual(key("push", "none", "all", 1), "source-sha")
-        self.assertEqual(key("workflow_dispatch", "none", "all", 1), "source-sha")
-        self.assertNotEqual(key("workflow_dispatch", "none", "all", 1, "exhaustive"), key("workflow_dispatch", "none", "all", 2, "exhaustive"))
-        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", workflow)
+            return eval(rendered, {"__builtins__": {}}, {"format": lambda template, *values: template.format(*values)})
+        for profile in ('synthetic-w4a8-cuda', 'synthetic-w4a8-mlx', 'synthetic-w4a8-both', 'moss-edit-metal', 'moss-edit-cuda'):
+            self.assertNotEqual(key('workflow_dispatch', profile, 1), key('workflow_dispatch', profile, 2))
+            self.assertNotEqual(key('workflow_dispatch', profile, 1, 1), key('workflow_dispatch', profile, 1, 2))
+        self.assertFalse(workflow['concurrency']['cancel-in-progress'])
+        ordinary = yaml.safe_load(CI.read_text(encoding='utf-8'))
+        self.assertEqual(ordinary['concurrency']['group'], "inference-ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}")
+        self.assertEqual(ordinary['concurrency']['cancel-in-progress'], "${{ github.event_name == 'pull_request' }}")
         library = (ROOT / "crates/contracts/gen-core/src/lib.rs").read_text(encoding="utf-8")
         for module in ("moss_image_edit", "pruned_adaln", "h3_adapter_memory", "h3_conditioning_memory", "h3_memory"):
             self.assertEqual(library.count(f"pub mod {module};"), 1, "both main and H3 contract exports must survive integration")
@@ -651,7 +684,7 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
             compact = re.sub(r"\s+", "", body)
             self.assertIn("completed.set(completed.get()+1)", compact)
             self.assertIn("assert_eq!(completed.get(),11,", compact)
-        workflow = CI.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         for backend, body in (("cuda", candle), ("metal", metal)):
             marker = f"H3_GEOMETRY_AUDIO_FULL_FORWARD backend={backend} cases=11"
             self.assertIn(marker, body)
@@ -757,43 +790,32 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                     )
 
     def test_ordinary_jobs_never_execute_h3_model_tests(self) -> None:
-        blocks = jobs(CI.read_text(encoding="utf-8"))
-        for job, text in blocks.items():
-            # Negative diagnostic exclusions mention workflow_dispatch too; they are NOT a
-            # manual-only gate. Require its positive equality in the actual job/step if field.
-            job_conditions = "\n".join(line for line in text.splitlines()
-                if line.startswith("    if:") or line.startswith("      (github.event_name"))
-            manual_job = "github.event_name == 'workflow_dispatch'" in job_conditions
+        for job, text in jobs(CI.read_text(encoding="utf-8")).items():
             for step in steps(text):
                 body = _strip_comment_lines(step)
-                if "minimax-h3" not in body or "--ignored" not in body:
-                    continue
                 with self.subTest(job=job, step=step.splitlines()[0]):
-                    self.assertTrue(manual_job,
-                        "an H3 model step belongs in a dedicated workflow_dispatch job, outside ordinary PR/main jobs")
+                    self.assertFalse("minimax-h3" in body and "--ignored" in body,
+                        "H3 learned execution belongs only in the separate model workflow, including manual dispatch")
 
-    def test_pruned_precision_proof_stays_in_dedicated_manual_route(self) -> None:
-        blocks = jobs(CI.read_text(encoding="utf-8"))
-        self.assertNotIn("--ignored", blocks["macos-metal"])
-        block = blocks["synthetic-w4a8-mlx"]
-        self.assertIn("github.event_name == 'workflow_dispatch'", block)
-        self.assertIn("inputs.synthetic_w4a8 == 'mlx'", block)
-        self.assertIn("inputs.synthetic_w4a8 == 'both'", block)
-        matching = [step for step in steps(block)
-            if "- name: Prove H3 pruned AdaLN complete model on Metal" in step]
-        self.assertEqual(len(matching), 1)
-        step = matching[0]
-        self.assertIn("set -euo pipefail", step)
-        self.assertIn("--ignored --nocapture", step)
-        self.assertIn("test result: ok. 4 passed; 0 failed; 0 ignored", step)
-        self.assertIn("test pruned_adaln::native_pruned_adaln_matches_pinned_reference ...", step)
-        self.assertIn("H3_PRUNED_ORACLE_DEVICE", step)
-        self.assertIn("H3_PRUNED_ORACLE block 0 modulation: max_abs=", step)
-        self.assertNotIn("continue-on-error", step)
-        self.assertNotIn("|| true", step)
+    def test_hosted_pruned_precision_step_is_explicit_and_positive(self) -> None:
+        workflow = jobs(real_weights_inline_text())
+        hosted = workflow["h3-pruned-hosted-metal"]
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", hosted)
+        self.assertIn("inputs.profile == 'synthetic-w4a8-mlx'", hosted)
+        self.assertIn("inputs.profile == 'synthetic-w4a8-both'", hosted)
+        hosted_step = [step for step in steps(hosted) if "- name: Check H3 precise pruned projection on hosted Metal (manual)" in step]
+        self.assertEqual(len(hosted_step), 1)
+        hosted_source = hosted_step[0]
+        for token in ("set -euo pipefail", "--ignored --exact --nocapture", "test result: ok. 1 passed; 0 failed; 0 ignored", "H3_PRUNED_ORACLE_DEVICE"):
+            self.assertIn(token, hosted_source)
+        native_step = [step for step in steps(workflow["synthetic-w4a8-mlx"]) if "- name: Prove H3 pruned AdaLN complete model on Metal" in step]
+        self.assertEqual(len(native_step), 1)
+        native_source = native_step[0]
+        for token in ("set -euo pipefail", "--ignored --nocapture", "test result: ok. 4 passed; 0 failed; 0 ignored", "H3_GEOMETRY_AUDIO_FULL_FORWARD backend=metal cases=11"):
+            self.assertIn(token, native_source)
 
     def test_manual_h3_routes_pin_exact_counts_and_names(self) -> None:
-        blocks = jobs(CI.read_text(encoding="utf-8"))
+        blocks = jobs(real_weights_inline_text())
         for job, backend, module in ROUTES:
             with self.subTest(job=job, backend=backend, module=module):
                 self.assertIn(job, blocks)
@@ -825,7 +847,7 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
 
                 path = test_root(backend) / f"{module}.rs"
                 ignored = [n for n, is_ignored in rust_tests(path).items() if is_ignored]
-                expected = len(ignored) - len(skips)
+                expected = len(set(ignored) - set(skips))
                 count = re.search(
                     r"test result: ok\. (\d+) passed; 0 failed; 0 ignored", step
                 )
@@ -836,7 +858,7 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                     expected,
                     int(count.group(1)),
                     f"{job}/{module} guard must equal its executable ignored bodies "
-                    f"({len(ignored)} ignored - {len(skips)} skipped)",
+                    f"({len(ignored)} ignored, explicit skip set {skips})",
                 )
                 self.assertGreaterEqual(expected, 1)
 
@@ -852,8 +874,26 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                             f"{job}/{module} does not name-guard {name}",
                         )
 
+    def test_cross_backend_mock_skip_is_required_and_cannot_hide_a_learned_case(self) -> None:
+        block = jobs(real_weights_inline_text())["synthetic-w4a8-cuda"]
+        step = next(step for step in steps(block) if "--test integration cross_backend::" in step)
+        required = SKIPS[("candle", "cross_backend")]
+        def exact_skip_set(body):
+            commands = cargo_test_commands(body)
+            return len(commands) == 2 and all(
+                sorted(re.findall(r"--skip\s+([A-Za-z0-9_]+)", command)) == sorted(required)
+                for command in commands
+            )
+        self.assertTrue(exact_skip_set(step))
+        mock = "joint_denoise_agrees_with_the_mlx_lane"
+        self.assertNotIn(mock, GATED["candle"]["cross_backend"])
+        self.assertFalse(exact_skip_set(step.replace(" --skip " + mock, "")))
+        learned = "video_decode_agrees_with_the_mlx_lane"
+        self.assertIn(learned, GATED["candle"]["cross_backend"])
+        self.assertFalse(exact_skip_set(step.replace(" --ignored", " --ignored --skip " + learned)))
+
     def test_manual_lib_h3_routes_pin_exact_counts_and_names(self) -> None:
-        blocks = jobs(CI.read_text(encoding="utf-8"))
+        blocks = jobs(real_weights_inline_text())
         for job, backend, key in LIB_ROUTES:
             spec = LIB_GATED[(backend, key)]
             with self.subTest(job=job, backend=backend, lib=key):
@@ -881,7 +921,7 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                     self.assertEqual(sorted(skips), sorted(parsed), f"{job}/{key} skip set drifted")
 
                 ignored = [n for n, v in rust_tests(spec["file"]).items() if v]
-                expected = len(ignored) - len(skips)
+                expected = len(set(ignored) - set(skips))
                 count = re.search(r"test result: ok\. (\d+) passed; 0 failed; 0 ignored", step)
                 self.assertIsNotNone(count, f"{job}/{key} has no exact execution-count guard")
                 self.assertEqual(expected, int(count.group(1)))
@@ -896,7 +936,7 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
             spec = LIB_GATED[(backend, key)]
             root = MLX_SRC if backend == "mlx" else CANDLE_SRC
             outer = list(spec["file"].relative_to(root).with_suffix("").parts)
-            block = jobs(CI.read_text(encoding="utf-8"))[job]
+            block = jobs(real_weights_inline_text())[job]
             for name in spec["names"]:
                 actual = "::".join(outer + enclosing_rust_modules(spec["file"], name) + [name])
                 self.assertEqual(spec["filter"] + name, actual,
@@ -907,7 +947,10 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
 
     def test_compiled_metadata_preflights_bind_every_runtime_name_and_count(self) -> None:
         seen = 0
-        for job, block in jobs(CI.read_text(encoding="utf-8")).items():
+        route_jobs = {job for job, _, _ in ROUTES + LIB_ROUTES} | {"h3-pruned-hosted-metal"}
+        for job, block in jobs(real_weights_inline_text()).items():
+            if job not in route_jobs:
+                continue
             for step in steps(block):
                 commands = [line for line in cargo_test_commands(step)
                     if "minimax-h3" in line and "--ignored" in line]
@@ -973,7 +1016,8 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
         self.assertIn("self_test=[bool]$SelfTest", script)
         self.assertIn("Invoke-InventorySelfTest $correct", script)
         for job in ("windows-cuda-check", "synthetic-w4a8-cuda"):
-            block = jobs(CI.read_text(encoding="utf-8"))[job]
+            source = CI.read_text(encoding="utf-8") if job == "windows-cuda-check" else real_weights_inline_text()
+            block = jobs(source)[job]
             self.assertEqual(block.count("run: ./scripts/ci/h3-native-test-list.ps1 -SelfTest"), 1)
             first_build = re.search(r"(?m)^          cargo (?:build|test|clippy)", block)
             self.assertIsNotNone(first_build)

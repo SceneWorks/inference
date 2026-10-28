@@ -460,6 +460,7 @@ fn greedy_cases() -> Vec<(&'static str, Vec<i32>)> {
 
 /// **AC1.** Every MoE family's greedy tokens are identical to the pre-change router's.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn moe_greedy_tokens_match_the_pre_change_router() {
     let cases = greedy_cases();
     if std::env::var("SC24440_WRITE_MOE_GREEDY").is_ok() {
@@ -500,6 +501,8 @@ fn moe_greedy_tokens_match_the_pre_change_router() {
             "{name}: greedy tokens diverged from the pre-change router"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moe_routing::moe_greedy_tokens_match_the_pre_change_router");
 }
 
 /// The same weights stored the way the bf16 Qwen3.5 release does: each expert's gate, up and
@@ -554,6 +557,7 @@ fn qwen35_quantized(
 /// The cut banks are exactly what a per-expert checkpoint of the same weights stacks, so the
 /// per-expert load is the pre-change computation: greedy tokens and every step's logits must be
 /// bit-identical, dense and at load-time Q8 / Q4.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_fused_gate_up_bank_decodes_identically_to_the_split_banks() {
     let (config, fused) = qwen35_moe_at(0x2444_6300, true);
@@ -578,6 +582,8 @@ fn a_fused_gate_up_bank_decodes_identically_to_the_split_banks() {
             "{quant:?}: greedy tokens"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED moe_routing::a_fused_gate_up_bank_decodes_identically_to_the_split_banks");
 }
 
 /// Save `weights` as a one-file snapshot under `dir` and reopen it lazily, as the provider does.
@@ -597,6 +603,7 @@ fn lazy_snapshot(dir: &std::path::Path, weights: &HashMap<String, Array>) -> Wei
 /// MUTATION: drop the shared expert from `SparseMoe::push_arrays`, or MLA's `kv_b_proj` from
 /// `LlamaLayer::arrays`, and the leftover assertion goes RED.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn materializing_group_by_group_consumes_every_source_and_decodes_identically() {
     let (q2, q2w) = qwen2_moe(WIDE, true, 0x2444_6401);
     let (ds, dsw) = deepseek_v2(0x2444_6402);
@@ -659,6 +666,8 @@ fn materializing_group_by_group_consumes_every_source_and_decodes_identically() 
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moe_routing::materializing_group_by_group_consumes_every_source_and_decodes_identically");
 }
 
 /// Whether MLX has materialized `a` — false while it is still an unevaluated graph node.
@@ -693,6 +702,7 @@ fn a_host_read_downstream_of_lazy_ids_evaluates_them() {
 /// input ids are still unevaluated after it returns. The old router read its probabilities back
 /// with `as_slice` once per MoE layer, which evaluated them.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn an_moe_decode_step_reads_nothing_back_to_the_host() {
     let (q2, q2w) = qwen2_moe(TINY, false, 0x2444_0001);
     let (q2n, q2nw) = qwen2_moe(WIDE, true, 0x2444_0002);
@@ -737,4 +747,6 @@ fn an_moe_decode_step_reads_nothing_back_to_the_host() {
         "qwen35_moe: the decode step read the device back to the host"
     );
     mlx_rs::transforms::eval([&logits]).unwrap();
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moe_routing::an_moe_decode_step_reads_nothing_back_to_the_host");
 }

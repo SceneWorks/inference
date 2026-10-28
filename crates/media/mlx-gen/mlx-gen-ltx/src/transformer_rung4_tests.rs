@@ -322,6 +322,7 @@ fn bits(a: &Array) -> Vec<f32> {
 /// itself: `block_stream`'s counters increment inside `LtxBlockStream::open` and `::materialize`,
 /// *after* the component file was parsed and *after* the exact `AvBlock` was assembled. A resident
 /// forward cannot move them, because a resident `AvDiT` holds no `LtxBlockStream` to call.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn only_the_streamed_loader_opens_windows_and_materializes_blocks() {
     let f = fixture();
@@ -375,10 +376,13 @@ fn only_the_streamed_loader_opens_windows_and_materializes_blocks() {
         observed.block_materializations, n_blocks as u64,
         "every block must be rebuilt exactly once per forward"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer::rung4_block_window_tests::only_the_streamed_loader_opens_windows_and_materializes_blocks");
 }
 
 /// The selected window must be the executed one. A window accepted and then ignored makes every
 /// calibration row describe a run that never happened.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_selected_window_is_the_executed_one() {
     let f = fixture();
@@ -397,11 +401,14 @@ fn the_selected_window_is_the_executed_one() {
         );
         assert_eq!(observed.block_materializations, n_blocks as u64);
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer::rung4_block_window_tests::the_selected_window_is_the_executed_one");
 }
 
 /// **AC3 — windowed output is bit-identical to unwindowed.** Exact equality, not a tolerance:
 /// windowing changes only WHEN a block's weights are materialized, never the arithmetic, so any
 /// difference at all is a real defect rather than accumulated float noise.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn windowed_output_is_bit_identical_to_unwindowed() {
     let f = fixture();
@@ -431,10 +438,13 @@ fn windowed_output_is_bit_identical_to_unwindowed() {
             "window {window}: audio velocity is not bit-identical to the resident stack"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer::rung4_block_window_tests::windowed_output_is_bit_identical_to_unwindowed");
 }
 
 /// DFR temporal rounds use the video-only reduction, so rung 4 must stream that path too rather
 /// than accepting the memory contract and then iterating only a resident block vector.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn windowed_video_only_output_is_bit_identical_to_unwindowed() {
     let f = fixture();
@@ -453,11 +463,14 @@ fn windowed_video_only_output_is_bit_identical_to_unwindowed() {
             "window {window}: video-only velocity is not bit-identical to the resident stack"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer::rung4_block_window_tests::windowed_video_only_output_is_bit_identical_to_unwindowed");
 }
 
 /// A ragged tail must not drop blocks. Window 3 over 4 blocks leaves a 1-block tail; losing it would
 /// silently skip a layer. The bit-identity test would catch that too — this one names the mechanism
 /// so the diagnosis is not "output differs somewhere".
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_ragged_tail_still_materializes_every_block() {
     let f = fixture();
@@ -470,6 +483,8 @@ fn a_ragged_tail_still_materializes_every_block() {
         block_stream_diagnostics().block_materializations,
         f.cfg.num_layers as u64
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer::rung4_block_window_tests::a_ragged_tail_still_materializes_every_block");
 }
 
 /// Rung 3 must reach the streamed path. The budget is recorded on the stream and replayed onto every

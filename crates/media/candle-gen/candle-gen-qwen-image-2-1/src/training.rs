@@ -1253,7 +1253,13 @@ fn encode_rgb_latents(vae: &QwenImage21Vae, rgb: Tensor) -> Result<Tensor> {
 /// Decode `path` as RGB8 — the **whole** picture, no crop: an edit target's encode source, decoded
 /// once however many bucket edges it trains at (sc-2127).
 fn decode_target_picture(path: &Path) -> Result<image::RgbImage> {
-    Ok(image::open(path)
+    Ok(candle_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs::decode_target_picture::image::open@65392",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+)
         .map_err(|e| Error::Msg(format!("{LABEL}: open image {}: {e}", path.display())))?
         .to_rgb8())
 }
@@ -1288,7 +1294,13 @@ fn rgb_resized_tensor(
 /// opaque case (`A = 255`, exactly what the render path's `Conditioning::Reference` widening
 /// produces), a file with alpha keeps it (the `Conditioning::ReferenceRgba` case).
 fn decode_reference(path: &Path) -> Result<RgbaImage> {
-    let rgba = image::open(path)
+    let rgba = candle_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs::decode_reference::image::open@66861",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+)
         .map_err(|e| {
             Error::Msg(format!(
                 "{LABEL}: decode reference image {}: {e}",
@@ -3893,6 +3905,7 @@ mod tests {
     /// AC: the loss decreases on a fixed batch under the real step (forward_train → MSE → grads →
     /// clip → AdamW), for LoRA and LoKr, dense and checkpointed.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn loss_decreases_over_steps_on_a_fixed_batch() {
         for (network, checkpoint) in [
             (NetworkType::Lora, false),
@@ -3921,6 +3934,9 @@ mod tests {
             );
             assert!(last < 0.9 * first, "{network:?}/{checkpoint}: {losses:?}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::loss_decreases_over_steps_on_a_fixed_batch");
     }
 
     fn grad_values(g: &GradStore, v: &Var) -> Vec<f32> {
@@ -3936,6 +3952,7 @@ mod tests {
     /// (and LoKr at a full and a low-rank `w2`), over the default block surface AND a surface
     /// including global targets (stitched through the retained pre-block forward).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn checkpointed_grads_match_dense_for_lora_and_lokr() {
         let with_globals: Vec<String> = [
             "attn.to_q",
@@ -3985,6 +4002,9 @@ mod tests {
                 assert!(max_rel < 1e-4, "{network:?} r{rank}: {max_rel:.2e}");
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::checkpointed_grads_match_dense_for_lora_and_lokr");
     }
 
     /// The bf16-GPU vs f32-CPU trap, on the CPU lane: candle's CPU backend has no BF16 matmul, so
@@ -3993,6 +4013,7 @@ mod tests {
     /// LoKr) and render a frozen preview without a dtype mismatch — the class of failure an f32-only
     /// CPU test cannot see.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_half_precision_dit_steps_and_previews_without_dtype_mismatch() {
         let vae = loader::load_vae(&tiny_snapshot(), &Device::Cpu).unwrap();
         let scheduler = loader::load_scheduler_config(&tiny_snapshot()).unwrap();
@@ -4046,6 +4067,9 @@ mod tests {
             }
             set_frozen(&mut dit, false).unwrap();
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::a_half_precision_dit_steps_and_previews_without_dtype_mismatch");
     }
 
     /// The training forward (composable attention ops) computes the function the render path runs
@@ -4053,6 +4077,7 @@ mod tests {
     /// and adapted, and the checkpoint pieces (`train_prelude` → `train_block`… → `train_head`)
     /// compose to the same velocity.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_training_forward_is_the_render_forward() {
         let mut dit = dit_at(DType::F32);
         let (x0, ctx, _) = fixed_batch(&dit);
@@ -4124,11 +4149,15 @@ mod tests {
             assert!(d_train < 1e-4, "edit adapted={adapted}: {d_train}");
             assert_eq!(d_pieces, 0.0, "edit pieces are the training forward");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::the_training_forward_is_the_render_forward");
     }
 
     /// A frozen preview builds no graph (no gradient reaches a factor through it), and thawing
     /// restores the live leaves.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn freezing_detaches_the_factors_and_thawing_restores_them() {
         let mut dit = dit_at(DType::F32);
         let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
@@ -4156,6 +4185,9 @@ mod tests {
         );
         let grads = live.backward().unwrap();
         assert!(set.vars.iter().all(|v| grads.get(v.as_tensor()).is_some()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::freezing_detaches_the_factors_and_thawing_restores_them");
     }
 
     // ── the whole run, through `Trainer::train` ─────────────────────────────────────────────
@@ -4228,6 +4260,7 @@ mod tests {
     /// through the sc-24157 host with no conversion and changes the DiT's velocity — for LoRA and
     /// LoKr (low-rank and full `w2`), with previews rendered from the in-progress adapter on the way.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn trained_adapters_match_the_mlx_layout_reload_strictly_and_change_the_velocity() {
         for (network, rank, kind) in [
             (NetworkType::Lora, 4, AdapterKind::Lora),
@@ -4318,6 +4351,9 @@ mod tests {
                 "{network:?} r{rank}: the adapter must change the output"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::trained_adapters_match_the_mlx_layout_reload_strictly_and_change_the_velocity");
     }
 
     fn network_type_name(network: NetworkType) -> &'static str {
@@ -4345,6 +4381,7 @@ mod tests {
     /// *Mutations that red this:* the reload dropping the `alpha/rank` scale (or using
     /// `rank/alpha`), the LoKr reload transposing `w2`, or `save_adapter` writing a stale alpha.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_saved_adapter_reloads_to_the_trainer_side_forward() {
         for (network, rank, kind) in [
             (NetworkType::Lora, 4, AdapterKind::Lora),
@@ -4425,12 +4462,16 @@ mod tests {
                 );
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::a_saved_adapter_reloads_to_the_trainer_side_forward");
     }
 
     /// AC: checkpoint + resume equals the straight run. A run interrupted after step 2 (its
     /// `save_every = 2` resume bundle written on the update boundary) and resumed to step 4 lands on
     /// the same factors as an uninterrupted 4-step run — with and without gradient accumulation.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn resume_round_trip_equals_the_straight_run() {
         for accum in [1u32, 2] {
             let dir = scratch("resume");
@@ -4553,6 +4594,9 @@ mod tests {
             let err = trainer().train(&req, &mut |_| {}).unwrap_err().to_string();
             assert!(err.contains("`edit` training run"), "{err}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::resume_round_trip_equals_the_straight_run");
     }
 
     /// A cancel before the first step writes nothing and surfaces the typed cancellation.
@@ -4621,7 +4665,12 @@ mod tests {
 
     /// The RGB8 [`Image`] of a PNG on disk — what a render request carries for a `Reference`.
     fn rgb_image(path: &Path) -> Image {
-        let img = image::open(path).unwrap().to_rgb8();
+        let img = candle_gen::gen_core::__model_input_result!(
+            image::open(path),
+            "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs::rgb_image/image::open",
+            Reference,
+            &[path]
+        ).unwrap().to_rgb8();
         Image {
             width: img.width(),
             height: img.height(),
@@ -4661,6 +4710,7 @@ mod tests {
     /// reference latent differs); `decode_references` reversing/sorting the paths (layout and
     /// latents differ); `item_branch` assembling at a different size than the render request.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn edit_training_assembles_the_render_paths_joint_sequence() {
         use crate::transformer::Segment as S;
         use candle_gen::gen_core::{Conditioning, GenerationRequest};
@@ -4782,6 +4832,9 @@ mod tests {
             swapped.layout, trained.layout,
             "reference order must be kept"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::edit_training_assembles_the_render_paths_joint_sequence");
     }
 
     /// An edit target keeps its aspect ratio — a 2:1 target trains as a 2:1 target block, not a
@@ -4791,6 +4844,7 @@ mod tests {
     /// *Mutation that reds this:* `edit_target_size` returning `(edge, edge)` for edit pairs, or
     /// `encode_item_target` centre-cropping an edit target.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_wide_edit_target_trains_as_a_wide_target_block() {
         use crate::transformer::Segment as S;
         let root = tiny_snapshot();
@@ -4848,6 +4902,9 @@ mod tests {
         );
         let square = encode_item_target(&vae, &captioned, edge, &dev).unwrap();
         assert_eq!(square.dim(1).unwrap(), (128 / 16) * (128 / 16));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::a_wide_edit_target_trains_as_a_wide_target_block");
     }
 
     /// sc-2127: each item caches one branch and one target latent per bucket edge, in edge order —
@@ -4858,6 +4915,7 @@ mod tests {
     /// *Mutations that red this:* `item_branches` building every layout at the first edge;
     /// `encode_item_targets` encoding every latent at one edge.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn an_item_caches_one_branch_and_latent_per_bucket_edge() {
         use crate::transformer::Segment as S;
         let root = tiny_snapshot();
@@ -4904,6 +4962,9 @@ mod tests {
                 "the two buckets train different grids"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::an_item_caches_one_branch_and_latent_per_bucket_edge");
     }
 
     /// sc-2127: a bucketed run trains end-to-end on the tiny snapshot — every step's cached entry
@@ -4915,6 +4976,7 @@ mod tests {
     /// 64 px latent then meets a 32 px layout and the step errors); caching only the first edge
     /// (the adapter equals the single-bucket run's).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_bucketed_run_trains_every_bucket_end_to_end() {
         use candle_gen::gen_core::ResolutionBucket;
         let dir = scratch("buckets");
@@ -4964,6 +5026,9 @@ mod tests {
             .iter()
             .any(|(k, t)| max_abs(&(f32(t) - f32(&single[k])).unwrap()) > 0.0);
         assert!(differs, "the 64 px bucket must change the trained factors");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::a_bucketed_run_trains_every_bucket_end_to_end");
     }
 
     /// A reference the Qwen3-VL processor would rebind (its fit leaves the pixel budget) is refused
@@ -5110,6 +5175,7 @@ mod tests {
     /// *Mutation that reds this:* the resume-mode scan matching the unstamped
     /// `.resume.safetensors` bundle (the edit resume is then refused as a text-to-image one).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn an_edit_resume_round_trip_equals_the_straight_run() {
         for accum in [1u32, 2] {
             let dir = scratch("edit_resume");
@@ -5178,6 +5244,9 @@ mod tests {
                 assert!(diff <= 1e-6, "accum {accum}: {key} differs by {diff}");
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::an_edit_resume_round_trip_equals_the_straight_run");
     }
 
     /// AC: edit training learns the **conditional** velocity, not one memorised sample — with a
@@ -5188,6 +5257,7 @@ mod tests {
     /// *Mutations that red this:* the step ignoring `references` (the two losses coincide);
     /// regressing onto the wrong target or not stepping the factors (the window does not fall).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn edit_loss_decreases_over_steps_and_depends_on_the_references() {
         let cfg = base_config();
         for checkpoint in [false, true] {
@@ -5253,6 +5323,9 @@ mod tests {
                  {losses:?}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::edit_loss_decreases_over_steps_and_depends_on_the_references");
     }
 
     /// sc-24828: subject-masked loss reaches both backward paths for text-to-image AND edit steps.
@@ -5260,6 +5333,7 @@ mod tests {
     /// gradient (dense and checkpointed — a path that dropped the weight would train on the
     /// background); a half map is strictly between and matches across paths.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         let mut dit = dit_at(DType::F32);
         let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
@@ -5328,6 +5402,9 @@ mod tests {
             );
         }
         assert!(trainer_descriptor().techniques.subject_mask_loss);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 
     /// sc-24828: the cached weight lines up token-for-token with the packed target latent, cropped
@@ -5465,6 +5542,7 @@ mod tests {
     /// The gradient-checkpointed joint backward is the dense one on an **edit** layout too: same
     /// loss, same grads — LoRA and LoKr, block and global targets.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn checkpointed_edit_grads_match_dense() {
         let with_globals: Vec<String> = ["attn.to_v", "img_mlp.proj", "img_in", "proj_out"]
             .iter()
@@ -5497,6 +5575,11 @@ mod tests {
                 assert!(max_rel < 1e-4, "{network:?}: {max_rel:.2e}");
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED training::tests::checkpointed_edit_grads_match_dense"
+        );
     }
 
     /// AC: the preflight prices an edit run's references — their cached latents (latent and train
@@ -5648,6 +5731,7 @@ mod tests {
     /// bare base, while the adapted edit render also differs from the adapted render without
     /// references (the references condition the adapted model).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_trained_edit_adapter_changes_the_edit_render() {
         use candle_gen::gen_core::{Conditioning, GenerationOutput, GenerationRequest};
 
@@ -5781,6 +5865,9 @@ mod tests {
             effect_gap > 0,
             "the adapter's effect on the render must depend on the references"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::a_trained_edit_adapter_changes_the_edit_render");
     }
 
     /// Epic 2123 depth anchoring (sc-24830) on the candle Qwen-Image 2.1 trainer: the tiny-snapshot
@@ -5867,6 +5954,7 @@ mod tests {
         /// unconditionally ⇒ red; drop `aux` in the checkpointed segment ⇒ red; keep the sampled
         /// `t` in `plan_t` on an aux step ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_only_step_trains_the_adapter_through_depth_alone() {
             let mut dit = dit_at(DType::F32);
             let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
@@ -5936,6 +6024,9 @@ mod tests {
                 }
             }
             assert_eq!(plan_t(&StepSample::plain(0, 0), 0.3).unwrap().0, 0.3);
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_only_step_trains_the_adapter_through_depth_alone");
         }
 
         /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
@@ -5977,6 +6068,7 @@ mod tests {
         /// block, recomputed independently (edit step). Mutation: `FlowX0MinusNoise` in
         /// `target_step_loss` ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
             let mut dit = dit_at(DType::F32);
             let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
@@ -6011,11 +6103,15 @@ mod tests {
                 .to_scalar::<f32>()
                 .unwrap();
             assert_eq!(l.aux.unwrap().to_bits(), want.to_bits());
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_term_is_the_depth_loss_of_the_recovered_x0");
         }
 
         /// (c) Depth off is bit-identical to the pre-epic-2123 dense step (reproduced verbatim).
         /// Mutation: perturb the `None` combine ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn depth_off_is_bit_identical_to_the_legacy_step() {
             let mut dit = dit_at(DType::F32);
             let set = install(&mut dit, NetworkType::Lora, 4, vec![]);
@@ -6037,6 +6133,9 @@ mod tests {
             for v in &set.vars {
                 assert_eq!(grad_bits(&g, v), grad_bits(&lg, v));
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::depth_off_is_bit_identical_to_the_legacy_step");
         }
 
         /// (d) E7: the perceptual footprint is 0 off and larger for Large DA2; it adds exactly to

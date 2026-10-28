@@ -811,6 +811,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn both_published_gguf_types_transcode_to_native_mlx_parity() {
         for kind in [PrismPackedKind::Pq2_0, PrismPackedKind::Ptq1_0] {
             let file = one_matrix(kind);
@@ -833,6 +834,8 @@ mod tests {
             let expected: f32 = rotated.iter().zip(dense).map(|(a, b)| a * b).sum();
             assert!((got.item::<f32>() - expected).abs() < 2e-3, "{kind:?}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED prism_gguf::tests::both_published_gguf_types_transcode_to_native_mlx_parity");
     }
 
     fn meta_string(name: &str, value: &str) -> Vec<u8> {
@@ -1062,6 +1065,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn direct_gguf_provider_loads_and_generates_for_both_packed_types() {
         for kind in [PrismPackedKind::Pq2_0, PrismPackedKind::Ptq1_0] {
             let file = tiny_provider_file(kind);
@@ -1078,5 +1082,7 @@ mod tests {
             let output = provider.generate(&request, &mut |_| {}).unwrap();
             assert_eq!(output.usage.generated_tokens, 2, "{kind:?}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED prism_gguf::tests::direct_gguf_provider_loads_and_generates_for_both_packed_types");
     }
 }

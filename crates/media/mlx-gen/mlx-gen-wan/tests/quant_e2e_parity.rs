@@ -85,6 +85,9 @@ fn run(bits: i32, prequantized: bool) {
         Some(p) if p.join("config.json").exists() => p,
         _ => {
             eprintln!("skip: set {dir_env} to the converted A14B model dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing(
+                "required work unavailable in run; see preceding skip diagnostic",
+            );
             return;
         }
     };
@@ -92,6 +95,9 @@ fn run(bits: i32, prequantized: bool) {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_A14B_QUANT_FIXTURE (run dump_quant_e2e_fixtures.py first)");
+            crate::model_inference_device::record_model_inference_prerequisite_missing(
+                "required work unavailable in run; see preceding skip diagnostic",
+            );
             return;
         }
     };
@@ -106,6 +112,9 @@ fn run(bits: i32, prequantized: bool) {
         eprintln!(
             "skip: {} not found (run dump_quant_e2e_fixtures.py)",
             fixture.display()
+        );
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in run; see preceding skip diagnostic",
         );
         return;
     }
@@ -261,12 +270,16 @@ fn run(bits: i32, prequantized: bool) {
 #[ignore = "needs the 54 GB converted Wan2.2-T2V-A14B checkpoint + dump_quant_e2e_fixtures.py"]
 fn wan_a14b_q4_e2e_matches_reference() {
     run(4, false);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_e2e_parity::wan_a14b_q4_e2e_matches_reference");
 }
 
 #[test]
 #[ignore = "needs the 54 GB converted Wan2.2-T2V-A14B checkpoint + dump_quant_e2e_fixtures.py"]
 fn wan_a14b_q8_e2e_matches_reference() {
     run(8, false);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_e2e_parity::wan_a14b_q8_e2e_matches_reference");
 }
 
 // --- Consume a pre-quantized snapshot (the low-peak production path: loads ~16 GB Q4 / 29 GB Q8
@@ -275,10 +288,14 @@ fn wan_a14b_q8_e2e_matches_reference() {
 #[ignore = "needs the pre-quantized A14B snapshot (dump_quant_snapshot.py) + dump_quant_e2e_fixtures.py"]
 fn wan_a14b_q4_prequantized_e2e_matches_reference() {
     run(4, true);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_e2e_parity::wan_a14b_q4_prequantized_e2e_matches_reference");
 }
 
 #[test]
 #[ignore = "needs the pre-quantized A14B snapshot (dump_quant_snapshot.py) + dump_quant_e2e_fixtures.py"]
 fn wan_a14b_q8_prequantized_e2e_matches_reference() {
     run(8, true);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_e2e_parity::wan_a14b_q8_prequantized_e2e_matches_reference");
 }

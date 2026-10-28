@@ -302,6 +302,7 @@ fn every_dit_linear_is_an_adapter_target_and_the_kohya_table_is_collision_free()
 }
 
 /// A LoRA on the dense DiT moves the velocity; scale 0 is byte-identical to no adapter.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_lora_residual_changes_the_dense_velocity() {
     let tmp = tempfile::tempdir().unwrap();
@@ -320,6 +321,8 @@ fn a_lora_residual_changes_the_dense_velocity() {
     let mut off = dense();
     apply_qwen_image_2_1_adapters(&mut off, &[lora(&file, 0.0)]).unwrap();
     assert_identical("dense/lora@0", &velocity(&off), &base);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::a_lora_residual_changes_the_dense_velocity");
 }
 
 /// On a packed DiT the adapter is a residual over the packed base: the base stays packed, the
@@ -348,20 +351,27 @@ fn assert_lora_moves_a_packed_dit(name: &str, build: Build) {
     assert_moved(&format!("{name}/lora"), &velocity(&model), &base);
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_lora_residual_changes_the_packed_q4_velocity_and_leaves_the_base_packed() {
     assert_lora_moves_a_packed_dit("q4", packed_q4);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::a_lora_residual_changes_the_packed_q4_velocity_and_leaves_the_base_packed");
 }
 
 /// The Q8 twin: 8-bit codes over the same packing, so an install that unpacked a Q8 base, or a
 /// residual that was lost against Q8's finer codes, shows here.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_lora_residual_changes_the_packed_q8_velocity_and_leaves_the_base_packed() {
     assert_lora_moves_a_packed_dit("q8", packed_q8);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::a_lora_residual_changes_the_packed_q8_velocity_and_leaves_the_base_packed");
 }
 
 /// LoKr on every base: a materialized delta over the dense DiT, the structured (never-materialized)
 /// Kronecker residual over the packed Q4 and Q8 ones — all move the velocity.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_lokr_residual_changes_the_velocity_on_dense_and_packed_q4_q8() {
     let tmp = tempfile::tempdir().unwrap();
@@ -382,10 +392,13 @@ fn a_lokr_residual_changes_the_velocity_on_dense_and_packed_q4_q8() {
         assert!(report.unmatched_paths.is_empty(), "{name}");
         assert_moved(&format!("{name}/lokr"), &velocity(&model), &base);
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::a_lokr_residual_changes_the_velocity_on_dense_and_packed_q4_q8");
 }
 
 /// Several files stack, each at its own strength: LoRA + LoKr + a kohya LoRA (which also reaches a
 /// global through the flattened table) all install, and the stack differs from each file alone.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn stacked_mixed_adapters_install_with_per_file_strengths() {
     let tmp = tempfile::tempdir().unwrap();
@@ -435,6 +448,8 @@ fn stacked_mixed_adapters_install_with_per_file_strengths() {
         &velocity(&stacked),
         &velocity(&restrength),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::stacked_mixed_adapters_install_with_per_file_strengths");
 }
 
 /// Keys that address no 2.1 Linear — here the 2512 dual-stream text-stream keys a 2512 LoRA would
@@ -525,6 +540,7 @@ fn snapshot_spec(root: PathBuf) -> LoadSpec {
 /// T2I: the adapter reaches the render, under both residency policies (Sequential rebuilds the DiT
 /// per request through the same `load_heavy`, so it must render the same adapted pixels), and a
 /// strength of zero is pixel-identical to no adapter.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn adapters_reach_the_t2i_route_under_both_residencies() {
     let tmp = tempfile::tempdir().unwrap();
@@ -558,9 +574,12 @@ fn adapters_reach_the_t2i_route_under_both_residencies() {
         off.pixels, plain.pixels,
         "strength 0 is byte-identical to no adapter"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::adapters_reach_the_t2i_route_under_both_residencies");
 }
 
 /// The reference/edit route renders through the same DiT, so it carries the adapter too.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn adapters_reach_the_reference_edit_route() {
     let tmp = tempfile::tempdir().unwrap();
@@ -590,12 +609,15 @@ fn adapters_reach_the_reference_edit_route() {
         adapted.pixels, plain.pixels,
         "the LoRA must change the reference render"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::adapters_reach_the_reference_edit_route");
 }
 
 /// The documented boundary — ten ordered references — carries the adapter too (sc-24163): the
 /// 10-reference edit render runs, and the LoRA changes it.
 ///
 /// *Mutation that reds this:* the reference/edit route denoising through an un-adapted DiT.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn adapters_reach_a_ten_reference_edit_render() {
     let tmp = tempfile::tempdir().unwrap();
@@ -626,6 +648,8 @@ fn adapters_reach_a_ten_reference_edit_render() {
         adapted.pixels, plain.pixels,
         "the LoRA must change the 10-reference render"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::adapters_reach_a_ten_reference_edit_render");
 }
 
 /// Convert the tiny snapshot into `tier` under `dir`.
@@ -674,14 +698,20 @@ fn assert_adapters_reach_a_packed_tier(tier: Tier) {
     );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn adapters_reach_a_packed_q4_tier() {
     assert_adapters_reach_a_packed_tier(Tier::Q4);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::adapters_reach_a_packed_q4_tier");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn adapters_reach_a_packed_q8_tier() {
     assert_adapters_reach_a_packed_tier(Tier::Q8);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::adapters_reach_a_packed_q8_tier");
 }
 
 /// The load path is strict under both residency policies: an unmatched key fails the load and the
@@ -1059,6 +1089,7 @@ fn spelled_lora(
 /// (`diffusion_model.`), kohya `lora_unet_` and the trainer's bare keys — applies over the globals
 /// and the underscore-ambiguous leaves, on the dense DiT and as a residual over a load-time Q4 / Q8
 /// one, landing on exactly the Linears it names.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn every_lora_spelling_applies_to_exactly_its_targets_on_dense_and_packed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1100,6 +1131,8 @@ fn every_lora_spelling_applies_to_exactly_its_targets_on_dense_and_packed() {
             assert_moved(&name, &velocity(&model), &base);
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::every_lora_spelling_applies_to_exactly_its_targets_on_dense_and_packed");
 }
 
 /// One third-party LyCORIS LoKr layout: its name, key spelling and factor set.
@@ -1166,6 +1199,7 @@ fn lycoris_lokr_file(
 /// keys, ai-toolkit's dotted `diffusion_model.…`, a Linear tucker `lokr_t2` — routes through
 /// `apply_lokr_thirdparty` and moves the velocity on the dense DiT and on a load-time Q4 / Q8 one,
 /// whichever kind the caller declared (the file carries no stamp to read it from).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn every_lycoris_lokr_layout_applies_on_dense_and_packed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1214,11 +1248,14 @@ fn every_lycoris_lokr_layout_applies_on_dense_and_packed() {
             }
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::every_lycoris_lokr_layout_applies_on_dense_and_packed");
 }
 
 /// A LyCORIS LoHa applies under its `lycoris_…`, kohya `lora_unet_…`, namespaced
 /// `diffusion_model.…` and raw PEFT `base_model.model.…` spellings — materialized over the dense
 /// DiT and over a load-time Q4 one alike (MLX has no LoHa refusal; candle folds it bf16-only).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn loha_applies_under_every_key_spelling_on_dense_and_packed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1248,6 +1285,8 @@ fn loha_applies_under_every_key_spelling_on_dense_and_packed() {
             assert_moved(&name, &velocity(&model), &base);
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::loha_applies_under_every_key_spelling_on_dense_and_packed");
 }
 
 /// The key / metadata layout the MLX trainer (sc-24159) writes — bare dotted keys; LoRA
@@ -1255,6 +1294,7 @@ fn loha_applies_under_every_key_spelling_on_dense_and_packed() {
 /// `lokr_w2_a`/`lokr_w2_b` (the trainer's `factorization(dim, -1)` split) under `networkType=lokr`
 /// with `rank`/`alpha`/`decomposeFactor` and the provenance stamp — applies on the dense DiT and
 /// over a load-time Q4 one. The candle twin pins the same layout loading there unconverted.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_trainer_output_layout_applies_on_dense_and_packed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1316,6 +1356,8 @@ fn the_trainer_output_layout_applies_on_dense_and_packed() {
             assert_moved(&name, &velocity(&model), &base);
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapters::the_trainer_output_layout_applies_on_dense_and_packed");
 }
 
 /// Files the DiT cannot serve are refused, never silently skipped: a LyCORIS LoKr whose module

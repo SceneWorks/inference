@@ -293,6 +293,7 @@ fn adaptive_pool_matches_the_reference() {
 /// Everything here is NCL, which is candle's conv layout *and* the reference's, so unlike the MLX
 /// sibling this port compares the reference's tensors without a transpose.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_trunk_matches_the_reference_stage_by_stage() {
     let g = fixture();
     let cfg = encode_fixture_config();
@@ -347,6 +348,9 @@ fn the_trunk_matches_the_reference_stage_by_stage() {
         TOL,
         "the whole DAC trunk",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::the_trunk_matches_the_reference_stage_by_stage");
 }
 
 /// The attention branch on its own — `attn(norm1(x))`, before the residual sum can hide it.
@@ -354,6 +358,7 @@ fn the_trunk_matches_the_reference_stage_by_stage() {
 /// This is the piece that carries the causal mask, the head **mean-pool** and the adaptive pool,
 /// and the reference dumps it separately for exactly that reason.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn attention_branch_matches_the_reference() {
     let g = fixture();
     let cfg = encode_fixture_config();
@@ -420,6 +425,9 @@ fn attention_branch_matches_the_reference() {
         "the attention branch and the block output are near-identical ({branch_gap:.3e}); the \
          residual assembly is not being exercised"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::attention_branch_matches_the_reference");
 }
 
 /// `AutoencoderKLMiniMaxH3Audio.encode`: trunk → `pre_block` → `mean_proj` / `logs_proj`.
@@ -427,6 +435,7 @@ fn attention_branch_matches_the_reference() {
 /// Both heads are checked, and `std = exp(logs)` with them: the pipeline only ever consumes
 /// `mode()`, so a wrong `logs_proj` would otherwise never be observed by anything.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn encode_matches_the_reference() {
     let g = fixture();
     let enc = encoder(&g);
@@ -470,12 +479,18 @@ fn encode_matches_the_reference() {
     // `_keep_in_fp32_modules` for that reason.
     assert_eq!(posterior.mean().dtype(), DType::F32);
     assert_eq!(posterior.std().dtype(), DType::F32);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::encode_matches_the_reference"
+    );
 }
 
 /// `encode` zero-pads on the RIGHT to a whole number of hops, so a clip that is not a multiple of
 /// the hop still produces `ceil(S / hop)` frames — and the same ones the reference's padded clip
 /// does.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn encode_right_pads_to_a_whole_hop() {
     let g = fixture();
     let enc = encoder(&g);
@@ -505,6 +520,9 @@ fn encode_right_pads_to_a_whole_hop() {
         peak > MUTATION_FLOOR,
         "the padded and unpadded clips encode identically ({peak:.3e}); the pad is untested"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::encode_right_pads_to_a_whole_hop");
 }
 
 /// Every model tensor must be consumed, and the declared name list must be exactly the fixture's.
@@ -605,6 +623,7 @@ fn a_mismatched_configuration_is_rejected() {
 /// The model is MONO. A stereo clip is two BATCH items, and a `[1, 2, samples]` packing — the
 /// plausible transposition — is rejected rather than encoded as something the model never saw.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn mis_packed_waveforms_are_rejected() {
     let g = fixture();
     let enc = encoder(&g);
@@ -625,6 +644,9 @@ fn mis_packed_waveforms_are_rejected() {
         let e = enc.encode(&bad).unwrap_err().to_string();
         assert!(e.contains("stereo is B = 2"), "{e}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::mis_packed_waveforms_are_rejected");
 }
 
 /// `normalize` is `(z − mean) / std` per channel, and composing it with the decode half's
@@ -633,6 +655,7 @@ fn mis_packed_waveforms_are_rejected() {
 /// Cross-checked against the *other* module's implementation rather than against a restatement of
 /// the same formula: the two are supposed to be inverses, and only running both can show it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn normalization_is_the_decoders_exact_inverse() {
     let g = fixture();
     let enc = encoder(&g);
@@ -690,6 +713,9 @@ fn normalization_is_the_decoders_exact_inverse() {
     assert!(enc
         .normalize(&Tensor::from_vec(vec![1.0f32], 1, &Device::Cpu).unwrap())
         .is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::normalization_is_the_decoders_exact_inverse");
 }
 
 /// The audio posterior's second parameter is a log **standard deviation** with **no clamp** — not
@@ -808,6 +834,7 @@ fn encode_with(g: &Golden, key: &str, replacement: Tensor) -> Tensor {
 /// This is also why `every_weight_role_is_load_bearing` mutates `weight_v` **affinely** rather than
 /// by a scale: a scale there would report "not read" for a tensor that is read correctly.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn weight_v_is_scale_invariant_and_weight_g_is_not() {
     let g = fixture();
     let baseline = encoder(&g)
@@ -847,6 +874,9 @@ fn weight_v_is_scale_invariant_and_weight_g_is_not() {
         peak > MUTATION_FLOOR,
         "scaling weight_g must move the output ({peak:.3e}); the gain is being dropped"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::weight_v_is_scale_invariant_and_weight_g_is_not");
 }
 
 /// **Mutation control: every distinct tensor ROLE in the encode path moves the output**, and each
@@ -860,6 +890,7 @@ fn weight_v_is_scale_invariant_and_weight_g_is_not() {
 /// construction (see `weight_v_is_scale_invariant_and_weight_g_is_not`), so a pure scale would
 /// report a correctly-read tensor as unread.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_weight_role_is_load_bearing() {
     let g = fixture();
     let baseline = encoder(&g)
@@ -904,4 +935,7 @@ fn every_weight_role_is_load_bearing() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_encode_parity::every_weight_role_is_load_bearing");
 }

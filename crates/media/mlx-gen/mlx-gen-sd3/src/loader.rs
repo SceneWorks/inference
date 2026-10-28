@@ -64,7 +64,13 @@ pub struct Sd3ClipPad {
 /// malformed config is an error: silently substituting eos would corrupt bigG conditioning.
 pub fn resolve_clip_pad_id(dir: &Path) -> Result<i32> {
     let cfg = dir.join("tokenizer_config.json");
-    let config = match std::fs::read_to_string(&cfg) {
+    let config = match mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&cfg),
+"crates/media/mlx-gen/mlx-gen-sd3/src/loader.rs::resolve_clip_pad_id::std::fs::read_to_string@3925",
+ArtifactInput,
+&cfg,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(config) => config,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(CLIP_EOS_ID),
         Err(error) => return Err(error.into()),
@@ -79,11 +85,17 @@ pub fn resolve_clip_pad_id(dir: &Path) -> Result<i32> {
     let Some(pad_str) = pad_str else {
         return Ok(CLIP_EOS_ID);
     };
-    Ok(std::fs::read_to_string(dir.join("vocab.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, i32>>(&s).ok())
-        .and_then(|vocab| vocab.get(&pad_str).copied())
-        .unwrap_or(CLIP_EOS_ID))
+    Ok(mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("vocab.json")),
+"crates/media/mlx-gen/mlx-gen-sd3/src/loader.rs::resolve_clip_pad_id::std::fs::read_to_string@4607",
+ArtifactInput,
+dir.join("vocab.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+    .ok()
+    .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, i32>>(&s).ok())
+    .and_then(|vocab| vocab.get(&pad_str).copied())
+    .unwrap_or(CLIP_EOS_ID))
 }
 
 /// Resolve BOTH CLIP encoders' pad ids for a snapshot (sc-9581): `tokenizer/` (L, eos=49407) and

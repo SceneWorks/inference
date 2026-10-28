@@ -96,6 +96,7 @@ fn vae(f: &Golden, token_drop: i32) -> MiniMaxH3VideoVae {
 /// One transformer block: RMSNorm pre-norms, non-affine q/k RMSNorm, 3-D partial RoPE, SwiGLU
 /// FFN and the two scaled residuals.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn transformer_block_matches_the_reference() {
     let f = fixture();
     let cfg = fixture_config(3);
@@ -131,11 +132,15 @@ fn transformer_block_matches_the_reference() {
         TOL,
         "transformer block",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::transformer_block_matches_the_reference");
 }
 
 /// The whole ViT decoder: token packing, `proj_in`, register tokens + zero CLS token, zeroed
 /// suffix position ids, 2 blocks, `norm_out`, `proj_out`, suffix truncation and patch unpacking.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn vit_decoder_matches_the_reference() {
     let f = fixture();
     let w = weights(model_map(&f));
@@ -147,10 +152,16 @@ fn vit_decoder_matches_the_reference() {
     // 5 latent frames × 4, 3×2 spatial × 2 -> [1, 3, 20, 6, 8].
     assert_eq!(got.dims(), &[1, 3, 20, 6, 8]);
     assert_parity(&got, &f.tensor("out.vit.video"), TOL, "ViT3DDecoder");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::vit_decoder_matches_the_reference"
+    );
 }
 
 /// `decode` = `post_quant_conv` (1×1×1 Conv3d, applied here as a pointwise linear) then the ViT.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn decode_clip_matches_the_reference() {
     let f = fixture();
     let got = vae(&f, 3)
@@ -161,6 +172,11 @@ fn decode_clip_matches_the_reference() {
         &f.tensor("out.decode.video"),
         TOL,
         "post_quant_conv + decoder",
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::decode_clip_matches_the_reference"
     );
 }
 
@@ -173,6 +189,7 @@ fn decode_clip_matches_the_reference() {
 /// cross-faded seam across 2 and 3 chunks. Each also exercises the 24-entry per-channel
 /// de-normalization, since `decode` applies it before chunking.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn temporal_decode_matches_the_reference() {
     let f = fixture();
     let vae = vae(&f, 3);
@@ -187,11 +204,17 @@ fn temporal_decode_matches_the_reference() {
         );
         assert_parity(&got, &want, TOL, &format!("decode_temporal({tokens})"));
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::temporal_decode_matches_the_reference"
+    );
 }
 
 /// `token_drop = 0` — the two-pass alignment path: no overlap, one split per chunk, chunks abut
 /// with no cross-fade.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn token_drop_zero_two_pass_matches_the_reference() {
     let f = fixture();
     let vae = vae(&f, 0);
@@ -210,11 +233,15 @@ fn token_drop_zero_two_pass_matches_the_reference() {
             &format!("drop0 decode_temporal({tokens})"),
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::token_drop_zero_two_pass_matches_the_reference");
 }
 
 /// The two drop settings must actually produce DIFFERENT decodes from the same latent — proof
 /// that `token_drop` is wired through rather than being an inert config field.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn token_drop_changes_the_decode() {
     let f = fixture();
     let latent = f.tensor("in.temporal5.latent");
@@ -228,6 +255,9 @@ fn token_drop_changes_the_decode() {
         "token_drop=3 and token_drop=0 decoded identically (peak rel {peak:.3e}); the chunk \
          plan is not reaching the tensor path"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::token_drop_changes_the_decode");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -237,6 +267,7 @@ fn token_drop_changes_the_decode() {
 /// The per-channel statistics must be APPLIED, not assumed unit. Decoding a latent directly
 /// (skipping de-normalization) must differ from decoding it properly.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn latent_denormalization_is_applied_per_channel() {
     let f = fixture();
     let vae = vae(&f, 3);
@@ -268,6 +299,9 @@ fn latent_denormalization_is_applied_per_channel() {
         peak > MUTATION_FLOOR,
         "decode ignored latents_mean/std (peak rel {peak:.3e})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::latent_denormalization_is_applied_per_channel");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -399,6 +433,7 @@ fn published_ffn_projection_is_value_then_gate() {
 /// `silu(b)·a` share sign structure. A `norm`, `std` or checksum assertion of any tolerance would
 /// pass here.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn reading_the_ffn_halves_gate_first_breaks_parity() {
     let f = fixture();
     let cfg = fixture_config(3);
@@ -440,6 +475,9 @@ fn reading_the_ffn_halves_gate_first_breaks_parity() {
         "the source-layout decode still matches the reference within {TOL:.0e} ({vs_ref:.3e}) — \
          the fixture is not in the converted layout"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::reading_the_ffn_halves_gate_first_breaks_parity");
 }
 
 /// The fixture must record which reference path produced it. A regeneration that reverts to
@@ -578,6 +616,7 @@ fn fixture_is_not_degenerate() {
 /// without changing the output, it is not actually wired into the graph and the parity test is
 /// not covering it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_weight_is_load_bearing() {
     let f = fixture();
     let latent = f.tensor("in.temporal7.latent");
@@ -663,6 +702,9 @@ fn every_weight_is_load_bearing() {
              it is either not wired into the graph or no longer observable here"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::every_weight_is_load_bearing");
 }
 
 /// The suffix tokens must sit at the rotary ORIGIN (zero position ids). If they inherited the
@@ -670,6 +712,7 @@ fn every_weight_is_load_bearing() {
 /// path by checking the register tokens influence the output at all, and that a decoder built
 /// with a different register-token count is rejected.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn register_tokens_participate_and_their_shape_is_checked() {
     let f = fixture();
     let cfg = fixture_config(3);
@@ -704,6 +747,9 @@ fn register_tokens_participate_and_their_shape_is_checked() {
     assert!(
         ViT3dDecoder::from_weights(&weights(model_map(&f)), "decoder", &bad, DType::F32).is_err()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::register_tokens_participate_and_their_shape_is_checked");
 }
 
 /// **How small a numeric divergence this fixture gate can actually resolve**, measured rather than
@@ -734,6 +780,7 @@ fn register_tokens_participate_and_their_shape_is_checked() {
 /// only that the displacement is visible above the noise, and prints where it lands relative to the
 /// gate.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_eps_displacement_the_size_of_a_misplaced_rms_epsilon_is_visible_but_under_the_gate() {
     let f = fixture();
     let want = f.tensor("out.vit.video");
@@ -768,12 +815,16 @@ fn an_eps_displacement_the_size_of_a_misplaced_rms_epsilon_is_visible_but_under_
         "the epsilon displacement ({peak:.3e}) is not distinguishable from the parity residual \
          ({residual:.3e}); `norm_eps` is not reaching the norms at all"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::an_eps_displacement_the_size_of_a_misplaced_rms_epsilon_is_visible_but_under_the_gate");
 }
 
 /// A config claiming a different rotary fraction must NOT reproduce the golden — the strongest
 /// available evidence that `rope_dim_ratio = 0.75` is genuinely load-bearing rather than a constant
 /// nobody reads.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_different_rotary_fraction_breaks_parity() {
     let f = fixture();
     let mut cfg = fixture_config(3);
@@ -794,6 +845,9 @@ fn a_different_rotary_fraction_breaks_parity() {
         "a different rotary fraction reproduced the golden (peak rel {peak:.3e}); the ratio is \
          not reaching the rotary"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::a_different_rotary_fraction_breaks_parity");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -815,6 +869,7 @@ fn a_different_rotary_fraction_breaks_parity() {
 /// which is what keeps every reference-backed decode assertion in this file valid across the
 /// tiling change.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn shipped_tiling_is_on_by_default_and_bit_inert_below_one_tile() {
     let f = fixture();
     let vae = vae(&f, 3);
@@ -834,6 +889,9 @@ fn shipped_tiling_is_on_by_default_and_bit_inert_below_one_tile() {
         flat(&untiled),
         "below one tile the tiled path must be BIT-identical"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::shipped_tiling_is_on_by_default_and_bit_inert_below_one_tile");
 }
 
 /// The plan the fixture canvas takes at a shrunk tile, against the reference's own `_split_tiles`.
@@ -867,6 +925,7 @@ fn the_fixture_canvas_tiles_into_the_reference_grid() {
 /// The decoder is a ViT whose attention is global over the whole clip, so a tile sees a strictly
 /// smaller context than the full canvas and cannot agree with it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_tile_smaller_than_the_canvas_changes_the_decode() {
     let f = fixture();
     let vae = vae(&f, 3);
@@ -886,10 +945,14 @@ fn a_tile_smaller_than_the_canvas_changes_the_decode() {
         peak > MUTATION_FLOOR,
         "a 2x3 tile grid moved the decode by only {peak:.3e}; the tiled path is not being taken"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::a_tile_smaller_than_the_canvas_changes_the_decode");
 }
 
 /// The `enable_tiling` / `disable_tiling` knobs select the paths they name.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_tiling_knobs_select_the_paths_they_name() {
     use candle_gen_minimax_h3::spatial_tiling::SpatialTiling;
     let f = fixture();
@@ -913,6 +976,9 @@ fn the_tiling_knobs_select_the_paths_they_name() {
     assert_eq!(flat(&built.decode_clip(&latent).unwrap()), untiled);
     let built_on = vae(&f, 3).with_tiling(SpatialTiling::square(4, 2));
     assert_eq!(flat(&built_on.decode_clip(&latent).unwrap()), tiled);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::the_tiling_knobs_select_the_paths_they_name");
 }
 
 /// **The latent-alignment guard is reachable from the public API**, not merely declared on
@@ -925,6 +991,7 @@ fn the_tiling_knobs_select_the_paths_they_name() {
 /// one alone fails here, and the aligned geometry is decoded to show the guard is not simply
 /// rejecting everything.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_tile_geometry_the_latent_grid_cannot_express_is_refused() {
     let f = fixture();
     let latent = f.tensor("in.decode.latent");
@@ -958,11 +1025,15 @@ fn a_tile_geometry_the_latent_grid_cannot_express_is_refused() {
 
     // The aligned geometry still decodes, so the guard rejects the misalignment and nothing else.
     assert!(vae(&f, 3).decode_clip_tiled(&latent, 4, 4, 2, 2).is_ok());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::a_tile_geometry_the_latent_grid_cannot_express_is_refused");
 }
 
 /// Tiling composes with the temporal chunking rather than replacing it: `decode` still produces the
 /// planned frame count at a canvas that tiles spatially.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn spatial_tiling_composes_with_the_temporal_chunk_plan() {
     let f = fixture();
     let mut vae = vae(&f, 3);
@@ -981,4 +1052,7 @@ fn spatial_tiling_composes_with_the_temporal_chunk_plan() {
         peak > MUTATION_FLOOR,
         "the spatial grid was not applied under chunking"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::spatial_tiling_composes_with_the_temporal_chunk_plan");
 }

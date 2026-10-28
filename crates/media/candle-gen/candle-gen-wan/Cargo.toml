@@ -29,6 +29,7 @@ sha2 = { workspace = true }
 candle-gen-perceptual = { path = "../candle-gen-perceptual" }
 
 [features]
+model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-perceptual/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-perceptual/cuda"]

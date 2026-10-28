@@ -39,6 +39,15 @@
 //! (`release/real-weight-models.toml`); it is a passed-in path, never derived.
 //! `DELTANET_RING_DRAFTS` is the comma list of draft widths the AC1 sweep covers (default `3`).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 mod common;
 
 use candle_core::{DType, Tensor};
@@ -318,4 +327,7 @@ fn ac1_verify_step_rollback_to_every_position_matches_a_fresh_decode() {
             "K={k}: the ring's checkpoint slots"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ac1_verify_step_rollback_to_every_position_matches_a_fresh_decode");
 }

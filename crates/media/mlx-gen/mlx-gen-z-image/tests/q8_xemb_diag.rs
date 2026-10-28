@@ -42,7 +42,7 @@ fn all_eq(a: &Array, b: &Array) -> bool {
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + tools/golden/q8_xemb_probe.safetensors (probe_q8_xemb_loaded.py)"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + tools/golden/q8_xemb_probe.safetensors (probe_q8_xemb_loaded.py)"]
 fn q8_xemb_loaded_vs_fork() {
     let g = Weights::from_file(PROBE).unwrap();
     let gs = g.metadata("group_size").unwrap().parse::<i32>().unwrap();
@@ -170,4 +170,7 @@ fn q8_xemb_loaded_vs_fork() {
         "  qmm(bf16-quantized)+bias vs fork xe_bare : peak/mean_rel={:?}",
         rel(&bare_bf16, f_bare)
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED q8_xemb_diag::q8_xemb_loaded_vs_fork");
 }

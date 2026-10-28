@@ -32,6 +32,16 @@
 //! | `unload_returns_the_weights_memory` | RSS 5,600 → 973 MiB after unload (baseline 961) | 7 s | — |
 //! | `a_recording_becomes_a_new_cover_after_the_transcriber_is_unloaded` | 20 s transcribed (119 s); RSS 827 MiB when the engine load began; 6.0 s cover, rms 0.128, verified run | 489 s | 22.4 GB (engine) |
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -215,6 +225,9 @@ fn encoder_states_match_the_reference() {
     }
     let receipt = transcriber.unload();
     assert!(receipt.released);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED encoder_states_match_the_reference");
 }
 
 fn committed_tokens(case: &str) -> String {
@@ -349,6 +362,9 @@ fn transcriptions_match_the_committed_token_oracles() {
     assert_eq!(artifact.readiness(true), Readiness::Ready);
     let receipt = transcriber.unload();
     assert!(receipt.released);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED transcriptions_match_the_committed_token_oracles");
 }
 
 /// The >300 s multi-window path: a 358.2 s array concatenated from the pinned arrays (recipe and
@@ -373,6 +389,9 @@ fn multi_window_song_matches_upstream() {
     let t = check_case(&transcriber, "long_multiwindow", samples);
     assert_eq!(t.stitched.records[1].prefix_tokens, 1124);
     transcriber.unload();
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED multi_window_song_matches_upstream");
 }
 
 /// Digital silence: upstream's tokens (a beat grid, no melody) are reproduced, and the review
@@ -385,6 +404,9 @@ fn silence_is_refused_as_a_cover_source() {
     assert!(matches!(t.review.melody_cover, Readiness::Refused(_)));
     assert!(matches!(t.review.full_cover, Readiness::Refused(_)));
     transcriber.unload();
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED silence_is_refused_as_a_cover_source");
 }
 
 /// Unloading returns the weights' memory to the system, measured as process RSS.
@@ -553,4 +575,7 @@ fn a_recording_becomes_a_new_cover_after_the_transcriber_is_unloaded() {
         std::fs::copy(outcome.run_dir.join("audio.wav"), &keep).unwrap();
         println!("wrote {keep}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED a_recording_becomes_a_new_cover_after_the_transcriber_is_unloaded");
 }

@@ -104,6 +104,7 @@ fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
 /// a port that normalized entirely in the input dtype would pass at f32 and drift at f16, which is
 /// the dtype the production fp16-fix VAE actually loads at.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn native_dense_decode_matches_the_stock_autoencoder_kl() {
     let device = Device::Cpu;
     for (dtype, bound) in [(DType::F32, 1e-5_f32), (DType::F16, 6e-3)] {
@@ -123,7 +124,7 @@ fn native_dense_decode_matches_the_stock_autoencoder_kl() {
         .unwrap();
 
         let z = latent(6, 7, dtype, &device);
-        let want = stock.decode(&z).unwrap();
+        let want = __model_proof_output!(stock.decode(&z)).unwrap();
         let got = native.decode(&z).unwrap();
         assert_eq!(got.dims(), want.dims(), "{dtype:?} geometry");
         let delta = max_abs(&got, &want);
@@ -132,6 +133,9 @@ fn native_dense_decode_matches_the_stock_autoencoder_kl() {
             "{dtype:?}: the ported decoder diverged from candle's AutoEncoderKL by max|delta|={delta:.3e}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_decoder_parity::native_dense_decode_matches_the_stock_autoencoder_kl");
 }
 
 /// The layer-wise bounded decode must track the dense decode, at f32 **and** at the f16 the
@@ -145,6 +149,7 @@ fn native_dense_decode_matches_the_stock_autoencoder_kl() {
 /// The companion `per_tile_normalization_is_observably_wrong` executes the defect on this same
 /// decoder, so the bounds below are known to discriminate rather than assumed to.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn bounded_decode_tracks_the_dense_decode() {
     let device = Device::Cpu;
     for (dtype, bound) in [(DType::F32, 2e-5_f32), (DType::F16, 6e-3)] {
@@ -174,6 +179,9 @@ fn bounded_decode_tracks_the_dense_decode() {
             "{dtype:?}: layer-wise bounded SDXL decode diverged from dense: max|delta|={delta:.3e}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_decoder_parity::bounded_decode_tracks_the_dense_decode");
 }
 
 /// The **executed** defect control for the bound above (sc-19753).
@@ -186,6 +194,7 @@ fn bounded_decode_tracks_the_dense_decode() {
 /// It also runs at both dtypes, because a bound loose enough for f16 is the easiest one to satisfy
 /// accidentally.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn per_tile_normalization_is_observably_wrong() {
     let device = Device::Cpu;
     for dtype in [DType::F32, DType::F16] {
@@ -214,6 +223,9 @@ fn per_tile_normalization_is_observably_wrong() {
              else the bounded-decode tolerance proves nothing: max|delta|={delta:.3e}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_decoder_parity::per_tile_normalization_is_observably_wrong");
 }
 
 /// An edge wide enough to hold the whole output takes the single-tile fall-through inside every
@@ -234,6 +246,7 @@ fn per_tile_normalization_is_observably_wrong() {
 /// would have re-buried a genuine dense/bounded divergence, so `GlobalGroupNorm` now divides and
 /// the honest invariant is exact equality.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_wide_edge_falls_through_to_the_dense_computation() {
     let device = Device::Cpu;
     let dtype = DType::F32;
@@ -253,6 +266,9 @@ fn a_wide_edge_falls_through_to_the_dense_computation() {
         "the single-tile fall-through must BE the dense computation, not merely approximate it: \
          max|delta|={delta:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_decoder_parity::a_wide_edge_falls_through_to_the_dense_computation");
 }
 
 #[test]

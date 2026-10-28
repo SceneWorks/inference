@@ -3,7 +3,7 @@
 
 Routine CI executes every default test except exact, reviewed exhaustive cases in
 test_suites.json. Explicit exhaustive validation executes every registered case,
-never `--ignored` (real-weight tests and dedicated numerical lanes are separate).
+using `--ignored --exact` only for registered bodies already ignored by the ordinary CI policy.
 Suite partitioning preserves Rust test bodies, ignore attributes, compilation
 targets and package scopes. The separate Iris CUDA fixture repair preserves its
 parent GPU1 binding; see docs/ci-test-suites.md for that necessary exception.
@@ -146,9 +146,9 @@ def listed(output: str) -> set[str]:
 
 def validate_cases(cases: list[dict], names: set[str], ignored: set[str]) -> set[str]:
     selected = {case["test"] for case in cases}
-    if selected - names or selected & ignored:
+    if selected - names or not ignored <= names:
         raise ValueError(
-            f"stale/ignored exhaustive cases: missing={selected - names}, ignored={selected & ignored}"
+            f"stale exhaustive cases: missing={selected - names}, invalid_ignored={ignored - names}"
         )
     # libtest --skip is a substring filter. Prove it excludes only exact registered
     # names instead of letting a new similarly named regression disappear silently.
@@ -163,6 +163,23 @@ def verify_result(output: str, passed: int, ignored: int) -> None:
     rows = SUMMARY.findall(output)
     if not rows or tuple(map(int, rows[-1][:3])) != (passed, 0, ignored):
         raise ValueError(f"libtest did not execute the expected cases ({passed} passed, {ignored} ignored)")
+
+
+def require_windows_gpu1_before_model_case() -> None:
+    """Refresh the exact physical GPU1 binding after compilation, just before execution."""
+    if sys.platform != "win32":
+        return
+    result = subprocess.run(
+        ["nvidia-smi", "-i", "1", "--query-gpu=index,uuid,memory.free", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, encoding="utf-8", timeout=15, check=True,
+    )
+    rows = result.stdout.strip().splitlines()
+    match = re.fullmatch(r"1, (GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}), ([0-9]+)", rows[0].strip()) if len(rows) == 1 else None
+    if (match is None or int(match[2]) <= 0
+            or os.environ.get("CUDA_VISIBLE_DEVICES", "").lower() != match[1].lower()
+            or os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID"
+            or os.environ.get("SCENEWORKS_GPU_ID") != "1"):
+        raise ValueError("physical GPU1 identity/free memory changed before exhaustive model execution")
 
 
 def execute(mode: str, command: list[str], cases: list[dict], deadline_seconds: int) -> None:
@@ -237,7 +254,7 @@ def execute(mode: str, command: list[str], cases: list[dict], deadline_seconds: 
                 result = run([binary, "--test-threads=1"] + args, remaining(900), **context)
                 print(result, flush=True)
                 count = len(names - ignored - selected)
-                verify_result(result, count, len(ignored))
+                verify_result(result, count, len(ignored - selected))
                 executed += count
             except (ValueError, RuntimeError, TimeoutError) as error:
                 if "--no-fail-fast" not in command:
@@ -246,7 +263,9 @@ def execute(mode: str, command: list[str], cases: list[dict], deadline_seconds: 
         else:
             for name in sorted(selected):
                 try:
-                    result = run([binary, "--exact", name, "--test-threads=1"], remaining(600), **context)
+                    require_windows_gpu1_before_model_case()
+                    filter_args = ["--ignored"] if name in ignored else []
+                    result = run([binary, "--exact", name, *filter_args, "--test-threads=1"], remaining(600), **context)
                     print(result, flush=True)
                     verify_result(result, 1, 0)
                     executed += 1

@@ -153,6 +153,10 @@ fn img2img_latent_prep_matches_fork() {
     let (bp, _) = rel(&blended, g.require("init_latents").unwrap());
     println!("flux2 img2img blend: peak_rel={bp:.6}");
     assert!(bp < 5e-3, "blended init latents diverged: peak_rel={bp}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::img2img_latent_prep_matches_fork"
+    );
 }
 
 /// The public img2img render: `load(quant).generate(Reference{strength})`.
@@ -195,6 +199,10 @@ fn full_img2img_generate_matches_fork() {
         px < 25.0,
         "img2img generate diverged from the fork composition: {px}% px>8"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::full_img2img_generate_matches_fork"
+    );
 }
 
 /// Gate 5: the **Q8** img2img render vs the fork's Q8 render. The quant scope/packing is already
@@ -221,5 +229,9 @@ fn q8_img2img_generate_matches_fork() {
     assert!(
         px < 70.0,
         "Q8 img2img generate not coherent: {px}% px>8 (scope/wiring bug?)"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::q8_img2img_generate_matches_fork"
     );
 }

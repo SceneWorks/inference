@@ -996,6 +996,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_streamed_projection_loads_prepared_device_format_sidecar() -> Result<()> {
         let device = Device::Cpu;
         let base = "transformer_blocks.0.attn.to_q";
@@ -1039,6 +1040,8 @@ mod tests {
         drop(direct);
         drop(sidecars);
         drop(weights);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::packed_streamed_projection_loads_prepared_device_format_sidecar");
         Ok(())
     }
 }

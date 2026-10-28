@@ -1680,6 +1680,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn actual_prepared_entrypoints_preserve_cfg_order_parity_and_materialization_counts() {
         let materializations = Arc::new(AtomicUsize::new(0));
         let transformer = executable_test_fixture(Arc::clone(&materializations)).unwrap();
@@ -1851,6 +1852,8 @@ mod tests {
             materializations.load(Ordering::Relaxed),
             transformer.num_blocks()
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::actual_prepared_entrypoints_preserve_cfg_order_parity_and_materialization_counts");
     }
 
     #[test]

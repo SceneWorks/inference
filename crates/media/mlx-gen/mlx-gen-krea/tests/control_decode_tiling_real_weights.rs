@@ -203,6 +203,8 @@ fn q4_1024_control_render_fits_emulated_24gib_budget() {
         "render peak {peak_gib:.2} GiB exceeded the emulated {safe:.2} GiB budget — tiling did not \
          bound the decode spike"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_decode_tiling_real_weights::q4_1024_control_render_fits_emulated_24gib_budget");
 }
 
 /// **(c)** — decode PARITY: the tiled Qwen-VAE decode must reconstruct the single-pass (untiled) decode
@@ -273,4 +275,6 @@ fn tiled_decode_matches_untiled_on_real_vae() {
         u.iter().any(|v| v.is_finite() && *v != u[0]),
         "untiled decode is constant/NaN — parity comparison would be vacuous"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_decode_tiling_real_weights::tiled_decode_matches_untiled_on_real_vae");
 }

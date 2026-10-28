@@ -49,3 +49,6 @@ mod explicit_registry_tests {
         assert_eq!(explicit, ["pulid_flux"]);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

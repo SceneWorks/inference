@@ -364,6 +364,7 @@ fn tiny_dcae_weights(cfg: &DcAeConfig) -> Weights {
 /// flag is pre-tripped, and a clean decode when it isn't. `DcAeEncoder::encode` carries the identical
 /// guard. The pre-tripped assertion would fail against a decode that ignored the flag.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn dcae_decode_honors_precancel() {
     let dcfg = tiny_dcae_config();
     let decoder = DcAeDecoder::from_weights(&tiny_dcae_weights(&dcfg), dcfg.clone())
@@ -389,9 +390,14 @@ fn dcae_decode_honors_precancel() {
         Err(Error::Canceled) => {}
         other => panic!("expected Err(Error::Canceled) on a pre-cancelled decode, got {other:?}"),
     }
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline_contract::dcae_decode_honors_precancel");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn pipeline_wires_trunk_scheduler_decode() {
     let tcfg = tiny_trunk_config();
     let trunk = SanaTransformer::from_weights(&tiny_trunk_weights(&tcfg), tcfg.clone())
@@ -494,9 +500,16 @@ fn pipeline_wires_trunk_scheduler_decode() {
         steps_seen >= 2,
         "flow sampler should report per-step progress"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED pipeline_contract::pipeline_wires_trunk_scheduler_decode"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn base_preview_observes_heun_outer_steps_only_and_is_output_inert() {
     let mut tcfg = tiny_trunk_config();
     tcfg.in_channels = 32;
@@ -566,6 +579,10 @@ fn base_preview_observes_heun_outer_steps_only_and_is_output_inert() {
     assert!(frames
         .windows(2)
         .any(|pair| pair[0].image.pixels != pair[1].image.pixels));
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline_contract::base_preview_observes_heun_outer_steps_only_and_is_output_inert");
 }
 
 /// Real-weight 1024px e2e. `#[ignore]`d: needs a `Sana_1600M_1024px_diffusers` snapshot
@@ -620,4 +637,8 @@ fn real_weight_1024_e2e() {
         "real-weight 1024² output is a constant fill — pipeline produced no signal"
     );
     println!("SANA real-weight 1024² gen OK: {} px", img.pixels.len());
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline_contract::real_weight_1024_e2e");
 }

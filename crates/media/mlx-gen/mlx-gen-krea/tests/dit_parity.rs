@@ -90,6 +90,7 @@ fn rope_matches_reference() {
 
 /// One `SingleStreamBlock`: DoubleSharedModulation (6-factor pre/post), the sigmoid-gated GQA
 /// attention with interleaved RoPE, and the SwiGLU FFN.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn single_block_matches_reference() {
     let w = load("single_block_golden.safetensors");
@@ -124,10 +125,13 @@ fn single_block_matches_reference() {
             .item::<bool>(),
         "single block diverged beyond 1e-2 (cosine {c:.7})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::single_block_matches_reference");
 }
 
 /// The `TextFusionTransformer`: layer-axis aggregation (attention across the stacked layers) →
 /// `projector` 12→1 collapse → token-axis refiner blocks.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn text_fusion_matches_reference() {
     let w = load("text_fusion_golden.safetensors");
@@ -155,6 +159,8 @@ fn text_fusion_matches_reference() {
             .item::<bool>(),
         "text_fusion diverged beyond 1e-2 (cosine {c:.7})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::text_fusion_matches_reference");
 }
 
 /// **sc-20644 — the adapter's declared logical shapes are the shapes the real module tree loads.**
@@ -205,6 +211,7 @@ fn declared_logical_shapes_match_the_reference_dit_header() {
 /// Full `SingleStreamDiT` forward: img patch-embed, the custom timestep embedding + shared modulation,
 /// text fusion + `txt_in`, the joint single-stream stack under 3-axis RoPE, the final layer, and
 /// unpatchify — end to end vs the reference velocity.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn dit_matches_reference() {
     let w = load("dit_golden.safetensors");
@@ -233,4 +240,6 @@ fn dit_matches_reference() {
             .item::<bool>(),
         "full-DiT velocity diverged beyond 2e-2 (cosine {c:.7})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::dit_matches_reference");
 }

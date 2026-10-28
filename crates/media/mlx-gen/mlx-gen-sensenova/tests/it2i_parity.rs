@@ -69,6 +69,7 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
         / peak
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn it2i_denoise_matches_reference() {
     let (w, case) = crate::compact_fixture::load(CASE_FIXTURE);
@@ -131,6 +132,8 @@ fn it2i_denoise_matches_reference() {
         rel < 2e-2,
         "it2i final-frame peak-rel {rel:.3e} exceeds 2e-2"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED it2i_parity::it2i_denoise_matches_reference");
 }
 
 /// sc-22738 — the it2i (edit / Character Studio / interleave-image) denoise loop brackets its
@@ -138,6 +141,7 @@ fn it2i_denoise_matches_reference() {
 /// prefills and before step 1, `Decoding` after the last step. Pinned on the synthetic fixture
 /// through the production reporter; deleting or moving either emit in `T2iModel::it2i_denoise`
 /// changes this sequence.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn it2i_denoise_emits_its_phase_boundaries_around_the_loop() {
     use mlx_gen::gen_core::{LoadPhase, Progress};
@@ -200,4 +204,6 @@ fn it2i_denoise_emits_its_phase_boundaries_around_the_loop() {
         events, expected,
         "the denoise phase opens before step 1 and the decode phase after step {num_steps}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED it2i_parity::it2i_denoise_emits_its_phase_boundaries_around_the_loop");
 }

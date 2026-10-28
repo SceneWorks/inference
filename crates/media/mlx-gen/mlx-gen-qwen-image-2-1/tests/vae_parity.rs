@@ -20,6 +20,7 @@ use crate::common::{assert_close, fixture, tiny_snapshot};
 const ENCODER_TOL: f32 = 1e-2;
 const DECODER_TOL: f32 = 1e-2;
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn every_stage_of_encode_and_decode_matches_upstream() {
     let w = fixture("qwen21_vae.safetensors");
@@ -85,6 +86,8 @@ fn every_stage_of_encode_and_decode_matches_upstream() {
         let split = vae.decode_tail(&vae.decode_head(&z).unwrap()).unwrap();
         assert_close(&format!("{case}/head_then_tail"), &split, &decoded, 0.0);
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::every_stage_of_encode_and_decode_matches_upstream");
 }
 
 /// The bounded decode tiles only the spatially local tail (the head with its global attention runs
@@ -102,6 +105,7 @@ fn every_stage_of_encode_and_decode_matches_upstream() {
 /// tail's activations to ~1e2, which magnifies any halo far beyond a trained VAE's): the 48 px
 /// overlap is held to **max 2e-1 / mean 1e-2**, the 32 px overlap to **max 3e-1 / mean 2e-2**.
 /// Measured on this fixture: see the printed lines (the `MEASURED` comment below records them).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiled_decode_matches_the_single_pass_up_to_the_seam_term() {
     use mlx_gen::gen_core::tiling::VaeTiling;
@@ -156,4 +160,6 @@ fn tiled_decode_matches_the_single_pass_up_to_the_seam_term() {
         LatentDecoder::decode_tiled(&vae, &normalised, &cfg, Some(&cancel)),
         Err(mlx_gen::Error::Canceled)
     ));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::tiled_decode_matches_the_single_pass_up_to_the_seam_term");
 }

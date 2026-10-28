@@ -124,7 +124,15 @@ fn real_weight_decode_produces_a_plausible_video() {
     );
 
     let cfg = MiniMaxH3VaeConfig::from_diffusers_json(
-        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        &mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_decode_produces_a_plausible_video::std::fs::read_to_string@5159",
+Configuration,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap(),
     )
     .unwrap();
     // bf16 is a DOWNCAST here, not the checkpoint's own dtype: `vae/` ships F32 (703 of 703
@@ -186,6 +194,8 @@ fn real_weight_decode_produces_a_plausible_video() {
          in {decode_ms} ms (std {spread:.4}, max |px| {max:.4}, checksum {checksum:.3e})",
         video.shape()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_decode_produces_a_plausible_video");
 }
 
 /// **The gate sc-17140 was missing** (sc-18740): decode the *same latent* the official diffusers
@@ -222,7 +232,15 @@ fn real_weight_decode_matches_the_official_diffusers_vae() {
     let dir = root.join("vae");
     let mut w = Weights::from_dir(&dir).unwrap();
     let cfg = MiniMaxH3VaeConfig::from_diffusers_json(
-        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        &mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_decode_matches_the_official_diffusers_vae::std::fs::read_to_string@10481",
+Configuration,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap(),
     )
     .unwrap();
     // f32 to keep the comparison about layout rather than about bf16 rounding. That is free, not
@@ -295,6 +313,8 @@ fn real_weight_decode_matches_the_official_diffusers_vae() {
          (cosine {cos:.6}). Norms are {n_got:.4} vs {n_want:.4} — note how little those move, \
          which is why no magnitude or checksum assertion can gate this."
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_decode_matches_the_official_diffusers_vae");
 }
 
 /// The multi-chunk path runs on real weights: 12 tokens span two chunks joined by the 5-frame
@@ -307,7 +327,15 @@ fn real_weight_multi_chunk_decode_blends_the_seam() {
     let dir = root.join("vae");
     let mut w = Weights::from_dir(&dir).unwrap();
     let cfg = MiniMaxH3VaeConfig::from_diffusers_json(
-        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        &mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_multi_chunk_decode_blends_the_seam::std::fs::read_to_string@13854",
+Configuration,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap(),
     )
     .unwrap();
     let vae = MiniMaxH3VideoVae::from_weights(&mut w, &cfg, Dtype::Bfloat16).unwrap();
@@ -331,6 +359,8 @@ fn real_weight_multi_chunk_decode_blends_the_seam() {
         "REAL-WEIGHT SMOKE: 12 tokens -> {:?} across 2 blended chunks (std {spread:.4})",
         video.shape()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_multi_chunk_decode_blends_the_seam");
 }
 
 // =============================================================================================
@@ -729,7 +759,15 @@ fn real_weight_encode_matches_the_official_diffusers_vae() {
     let dir = root.join("vae");
     let mut w = Weights::from_dir(&dir).unwrap();
     let cfg = MiniMaxH3VaeConfig::from_diffusers_json(
-        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        &mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_encode_matches_the_official_diffusers_vae::std::fs::read_to_string@35112",
+Configuration,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap(),
     )
     .unwrap();
     // f32 to keep the comparison about layout rather than about bf16 rounding. `vae/` is already
@@ -880,6 +918,8 @@ fn real_weight_encode_matches_the_official_diffusers_vae() {
          {} dropped, pad_reach {pad_reach}",
         cfg.token_drop
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_encode_matches_the_official_diffusers_vae");
 }
 
 // =============================================================================================
@@ -906,7 +946,15 @@ fn audio_source_dir(root: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn read(path: std::path::PathBuf) -> String {
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::read::std::fs::read_to_string@44312",
+Configuration,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
 /// The published documents must parse to exactly [`MiniMaxH3AudioVaeConfig::default`], and the
@@ -1142,6 +1190,8 @@ fn real_weight_audio_decode_produces_a_plausible_stereo_track() {
         track.sample_rate,
         gap / peak,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_audio_decode_produces_a_plausible_stereo_track");
 }
 
 // ── sc-17143: the Qwen3-VL-32B context extraction ────────────────────────────────────────────────
@@ -1488,6 +1538,8 @@ fn real_weight_te_context_matches_the_official_conditioner() {
         rel_max < 5e-2,
         "real-weight context differs from the official conditioner by {rel_max:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_te_context_matches_the_official_conditioner");
 }
 
 /// Load the first two shards (9.8 GB of the 66.7 GB component) and run a REAL forward at the
@@ -1575,6 +1627,8 @@ fn real_weight_te_forward_runs_at_the_published_geometry() {
          (std {spread:.4}, peak {peak:.4})",
         ctx.shape(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_te_forward_runs_at_the_published_geometry");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1677,7 +1731,15 @@ fn real_weight_dit_block_runs_one_forward() {
     let dir = root.join("transformer");
 
     let cfg = MiniMaxH3DitConfig::from_diffusers_json(
-        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        &mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_dit_block_runs_one_forward::std::fs::read_to_string@79396",
+Configuration,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap(),
     )
     .unwrap();
     assert_eq!(cfg.hidden_size, 5376);
@@ -1811,6 +1873,8 @@ fn real_weight_dit_block_runs_one_forward() {
          residual std {moved:.4})",
         out.shape(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_dit_block_runs_one_forward");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1890,7 +1954,15 @@ fn real_weight_tiled_decode_matches_the_official_diffusers_vae() {
     let dir = root.join("vae");
     let mut w = Weights::from_dir(&dir).unwrap();
     let cfg = MiniMaxH3VaeConfig::from_diffusers_json(
-        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        &mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_tiled_decode_matches_the_official_diffusers_vae::std::fs::read_to_string@89090",
+Configuration,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap(),
     )
     .unwrap();
     let vae = MiniMaxH3VideoVae::from_weights(&mut w, &cfg, Dtype::Float32).unwrap();
@@ -2010,6 +2082,8 @@ fn real_weight_tiled_decode_matches_the_official_diffusers_vae() {
         std_dev(want) > 1e-3,
         "the reference decode is ~constant; it would gate nothing"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_tiled_decode_matches_the_official_diffusers_vae");
 }
 
 /// The mirror assertion, on real weights: **below one tile the tiled and untiled paths agree
@@ -2035,7 +2109,15 @@ fn real_weight_tiling_is_inert_below_one_tile() {
     let dir = root.join("vae");
     let mut w = Weights::from_dir(&dir).unwrap();
     let cfg = MiniMaxH3VaeConfig::from_diffusers_json(
-        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        &mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_tiling_is_inert_below_one_tile::std::fs::read_to_string@95325",
+Configuration,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap(),
     )
     .unwrap();
     let vae = MiniMaxH3VideoVae::from_weights(&mut w, &cfg, Dtype::Float32).unwrap();
@@ -2083,4 +2165,8 @@ fn real_weight_tiling_is_inert_below_one_tile() {
     let rel = d / want.abs().unwrap().max(None).unwrap().item::<f32>();
     println!("REAL-WEIGHT SUB-TILE PARITY: rel-max-abs={rel:.3e} (tiling inert, delta 0)");
     assert!(rel < 1e-2, "the sub-tile decode diverges by {rel:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_tiling_is_inert_below_one_tile"
+    );
 }

@@ -141,4 +141,6 @@ fn every_rehost_tier_loads_from_the_hf_cache_shape() {
             started.elapsed().as_secs_f64()
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED klein_rehost_real_weights::every_rehost_tier_loads_from_the_hf_cache_shape");
 }

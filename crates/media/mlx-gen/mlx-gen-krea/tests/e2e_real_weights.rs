@@ -75,6 +75,9 @@ fn save(img: &Image, name: &str) {
 fn render(width: u32, height: u32) {
     let Some(root) = snapshot() else {
         eprintln!("skipping: set KREA_TURBO_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in render; see preceding skip diagnostic",
+        );
         return;
     };
 
@@ -136,10 +139,14 @@ fn render(width: u32, height: u32) {
 #[ignore = "needs the real Krea 2 Turbo snapshot (set KREA_TURBO_DIR)"]
 fn turbo_engine_renders_coherent_1024() {
     render(1024, 1024);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_engine_renders_coherent_1024");
 }
 
 #[test]
 #[ignore = "needs the real snapshot (KREA_TURBO_DIR); larger footprint — run if it fits"]
 fn turbo_engine_renders_coherent_2048() {
     render(2048, 2048);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_engine_renders_coherent_2048");
 }

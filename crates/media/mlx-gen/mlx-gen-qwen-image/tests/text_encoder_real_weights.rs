@@ -66,6 +66,8 @@ fn text_encoder_hidden_matches_fork() {
         peak < 2e-3,
         "text-encoder hidden peak-rel regressed: {peak:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder_real_weights::text_encoder_hidden_matches_fork");
 }
 
 #[test]
@@ -85,4 +87,6 @@ fn text_encoder_prompt_embeds_matches_fork() {
     println!("text-encoder prompt_embeds: peak-rel = {peak:.3e}, mean-rel = {mean:.3e}");
     assert!(mean < 1e-3, "prompt_embeds mean-rel regressed: {mean:.3e}");
     assert!(peak < 2e-3, "prompt_embeds peak-rel regressed: {peak:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder_real_weights::text_encoder_prompt_embeds_matches_fork");
 }

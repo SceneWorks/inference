@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 import yaml
 from scripts.ci import moss_edit_metal as gate
-from scripts.tests.test_windows_gpu1_diagnostic import selected_jobs
+from scripts.tests.test_windows_gpu1_diagnostic import selected_model_jobs
+from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
 
 
 class DirectExecutionTests(unittest.TestCase):
@@ -135,26 +136,24 @@ class OwnedProcessTests(unittest.TestCase):
 
 class WorkflowTests(unittest.TestCase):
     def test_only_selected_numerical_lane_runs_without_operator_inputs(self):
-        workflow = yaml.safe_load((gate.ROOT/'.github/workflows/ci.yml').read_text(encoding='utf-8'))
+        workflow = yaml.safe_load(real_weights_inline_text())
         inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-        self.assertEqual(set(inputs), {'lanes', 'synthetic_w4a8', 'test_suite'})
-        self.assertEqual(inputs['lanes']['default'], 'all')
-        self.assertEqual(inputs['synthetic_w4a8']['default'], 'none')
-        self.assertEqual(inputs['synthetic_w4a8']['options'], ['none', 'cuda', 'mlx', 'both'])
-        self.assertEqual(inputs['test_suite']['default'], 'routine')
-        self.assertEqual(inputs['test_suite']['options'], ['routine', 'exhaustive'])
-        self.assertTrue(all(not spec.get('required', False) for spec in inputs.values()))
+        self.assertEqual(inputs['profile']['default'], '')
+        self.assertTrue(inputs['profile']['required'])
+        self.assertLessEqual(len(inputs), 25)
+        self.assertNotIn('moss_cuda_admission', inputs)
         self.assertNotIn('moss-edit-metal-lease', workflow['jobs'])
-        for lane in ('moss-edit-metal', 'moss-edit-cuda'):
-            for selected in (True, False):
-                for fork in (True, False):
-                    for synthetic in ('none', 'cuda', 'mlx', 'both'):
-                        self.assertEqual(selected_jobs(workflow, 'workflow_dispatch', lane, selected=selected, fork=fork, synthetic=synthetic), {lane})
-            for event in ('push', 'pull_request', 'schedule', 'merge_group'):
-                self.assertNotIn(lane, selected_jobs(workflow, event, lane))
+        for profile in ('moss-edit-metal', 'moss-edit-cuda'):
+            self.assertIn(profile, inputs['profile']['options'])
+            self.assertEqual(selected_model_jobs(workflow, 'workflow_dispatch', profile), {profile})
+            self.assertEqual(workflow['jobs'][profile]['needs'], 'validate-selection')
+            for event in ('push', 'pull_request', 'schedule', 'merge_group', 'workflow_call'):
+                self.assertNotIn(profile, selected_model_jobs(workflow, event, profile))
+            for unrelated in ('all', 'media', '', profile + '-extra'):
+                self.assertNotIn(profile, selected_model_jobs(workflow, 'workflow_dispatch', unrelated))
             mutant = copy.deepcopy(workflow)
-            mutant['jobs'][lane]['if'] = mutant['jobs'][lane]['if'].replace(f"inputs.lanes == '{lane}'", 'True')
-            self.assertIn(lane, selected_jobs(mutant, 'workflow_dispatch', 'all'))
+            mutant['jobs'][profile]['if'] = mutant['jobs'][profile]['if'].replace(f"inputs.profile == '{profile}'", 'True')
+            self.assertIn(profile, selected_model_jobs(mutant, 'workflow_dispatch', 'all'))
         job = workflow['jobs']['moss-edit-metal']
         commands = '\n'.join(step.get('run', '') for step in job['steps'])
         self.assertIn('moss_edit_metal.py prepare', commands)

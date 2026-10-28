@@ -69,4 +69,6 @@ fn dynamic_multimask_matches_oracle() {
         "dyn iou ours {} vs {want_iou}",
         out.iou
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dynmask_parity::dynamic_multimask_matches_oracle");
 }

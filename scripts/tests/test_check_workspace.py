@@ -51,7 +51,9 @@ class WithinWorkspaceTests(unittest.TestCase):
         )
 
     def test_ignored_parts_cover_the_documented_set(self) -> None:
-        self.assertEqual(self.gate.IGNORED_TREE_PARTS, {".git", "target", ".claude", ".codex"})
+        self.assertEqual(
+            self.gate.IGNORED_TREE_PARTS, {".git", "target", ".claude", ".codex", "ios-host"}
+        )
 
 
 class RustCommentStrippingTests(unittest.TestCase):
@@ -2015,6 +2017,119 @@ class RootTrainTwinTests(unittest.TestCase):
         self.assertTrue(
             any("taehv.rs is missing" in v for v in self.gate._root_train_twin_violations(root))
         )
+
+
+class IosHostMlxPinTests(unittest.TestCase):
+    """sc-16780: the root-member iOS harness must build the workspace's MLX, not a stale fork rev."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def write(self, root: Path, harness_rev: str) -> None:
+        dep = '{ package = "pmetal-mlx-rs", git = "https://github.com/x/mlx-rs", rev = "%s" }'
+        (root / "Cargo.toml").write_text(
+            "[workspace]\n[workspace.dependencies]\nmlx-rs = " + dep % "aaa" + "\n",
+            encoding="utf-8",
+        )
+        (root / "ios-host" / "smoke").mkdir(parents=True)
+        (root / "ios-host" / "smoke" / "Cargo.toml").write_text(
+            "[package]\nname = \"x\"\n[dependencies]\nmlx-rs = " + dep % harness_rev + "\n",
+            encoding="utf-8",
+        )
+
+    def test_matching_pin_passes_and_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(Path(tmp), "aaa")
+            self.gate.check_ios_host_mlx_pin(Path(tmp))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(Path(tmp), "bbb")
+            with self.assertRaises(AssertionError):
+                self.gate.check_ios_host_mlx_pin(Path(tmp))
+
+
+class IosHostSharedWorkspaceTests(unittest.TestCase):
+    """SDK and capture use one Cargo package source composition and root lockfile."""
+
+    def setUp(self):
+        self.gate = load_gate_module()
+
+    def write(self, root, *, member=True, excluded=False, nested=False, own_lock=False):
+        (root / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ' + ('["ios-host/smoke"]' if member else '[]') + '\nexclude = '
+            + ('["ios-host/smoke"]' if excluded else '[]') + '\n', encoding='utf-8')
+        harness = root / "ios-host/smoke"
+        harness.mkdir(parents=True)
+        (harness / "Cargo.toml").write_text('[package]\nname = "ios-smoke"\n' + ('[workspace]\n' if nested else ''), encoding='utf-8')
+        if own_lock:
+            (harness / "Cargo.lock").write_text('version = 4\n', encoding='utf-8')
+
+    def test_shared_workspace_passes_and_each_drift_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.write(Path(directory))
+            self.gate.check_ios_host_shared_workspace(Path(directory))
+        for mutation in ({"member": False}, {"excluded": True}, {"nested": True}, {"own_lock": True}):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                self.write(Path(directory), **mutation)
+                with self.assertRaises(AssertionError):
+                    self.gate.check_ios_host_shared_workspace(Path(directory))
+
+    def test_real_harness_shares_root_workspace(self):
+        self.gate.check_ios_host_shared_workspace(self.gate.ROOT)
+
+
+class RegexArchiveLockTests(unittest.TestCase):
+    """Upstream archives never grant a blanket nested-lock or vendor-tree exclusion."""
+
+    def setUp(self):
+        self.gate = load_gate_module()
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.gate.ROOT = self.root
+        (self.root / "Cargo.lock").write_text("version = 4\n", encoding="utf-8")
+        self.manifest = {"workspace": {"exclude": []}, "patch": {"crates-io": {}}}
+        for name, (directory, version) in self.gate.REGEX_CERTIFICATE_PACKAGES.items():
+            root = self.root / directory
+            root.mkdir(parents=True)
+            (root / "Cargo.toml").write_text(f'[package]\nname = "{name}"\nversion = "{version}"\n', encoding="utf-8")
+            (root / "Cargo.lock").write_text(f'[[package]]\nname = "{name}"\nversion = "{version}"\n', encoding="utf-8")
+            self.manifest["workspace"]["exclude"].append(directory)
+            self.manifest["patch"]["crates-io"][name] = {"path": directory}
+
+    def test_accepts_only_exact_registered_archival_locks(self):
+        self.gate.check_lockfile_inventory(self.manifest)
+        self.assertTrue(self.gate._within_workspace(self.root / "vendor/clip-regex/regex/Cargo.lock"))
+
+    def test_rejects_arbitrary_additional_nested_lock(self):
+        extra = self.root / "vendor/another-package/Cargo.lock"
+        extra.parent.mkdir(parents=True)
+        extra.write_text("version = 4\n", encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory(self.manifest)
+
+    def test_rejects_unregistered_vendor_archive_paths(self):
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory({})
+
+    def test_rejects_changed_package_version(self):
+        (self.root / "vendor/clip-regex/regex/Cargo.toml").write_text('[package]\nname = "regex"\nversion = "1.13.1"\n', encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory(self.manifest)
+
+    def test_rejects_missing_specific_exclusion_or_different_patch_path(self):
+        self.manifest["workspace"]["exclude"].remove("vendor/clip-regex/regex")
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory(self.manifest)
+        self.manifest["workspace"]["exclude"].append("vendor/clip-regex/regex")
+        self.manifest["patch"]["crates-io"]["regex"]["path"] = "vendor/another-regex"
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory(self.manifest)
+
+    def test_rejects_changed_archival_own_package_version(self):
+        (self.root / "vendor/clip-regex/regex/Cargo.lock").write_text('[[package]]\nname = "regex"\nversion = "1.13.1"\n', encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory(self.manifest)
+
 
 if __name__ == "__main__":
     unittest.main()

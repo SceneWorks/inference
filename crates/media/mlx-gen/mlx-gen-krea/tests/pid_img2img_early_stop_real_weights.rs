@@ -267,4 +267,6 @@ fn krea_turbo_img2img_pid_from_ldm_early_stop() {
         &format!("{dir}/krea_img2img_pid_earlystop_{}.png", early.width),
     );
     eprintln!("wrote reference + clean + early-stop PNGs to {dir}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pid_img2img_early_stop_real_weights::krea_turbo_img2img_pid_from_ldm_early_stop");
 }

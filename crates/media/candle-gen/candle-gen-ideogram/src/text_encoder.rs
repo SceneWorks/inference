@@ -112,8 +112,8 @@ impl Attention {
         let q = self.q_proj.forward_upcast(x)?.reshape((b, s, nh, hd))?;
         let k = self.k_proj.forward_upcast(x)?.reshape((b, s, nkv, hd))?;
         let v = self.v_proj.forward_upcast(x)?.reshape((b, s, nkv, hd))?;
-        let q = self.q_norm.forward(&q)?.transpose(1, 2)?; // [B, nh, S, D]
-        let k = self.k_norm.forward(&k)?.transpose(1, 2)?; // [B, nkv, S, D]
+        let q = __model_proof_output!(self.q_norm.forward(&q))?.transpose(1, 2)?; // [B, nh, S, D]
+        let k = __model_proof_output!(self.k_norm.forward(&k))?.transpose(1, 2)?; // [B, nkv, S, D]
         let v = v.transpose(1, 2)?.contiguous()?;
 
         let (q, k) = rotary.apply(&q, &k)?;
@@ -188,10 +188,14 @@ impl DecoderLayer {
     }
 
     fn forward(&self, x: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
-        let h = (x + self
-            .attn
-            .forward(&self.input_ln.forward(x)?, rotary, mask)?)?;
-        &h + self.mlp.forward(&self.post_ln.forward(&h)?)?
+        let h = (x + self.attn.forward(
+            &__model_proof_output!(self.input_ln.forward(x))?,
+            rotary,
+            mask,
+        )?)?;
+        &h + self
+            .mlp
+            .forward(&__model_proof_output!(self.post_ln.forward(&h))?)?
     }
 }
 
@@ -364,6 +368,7 @@ mod tests {
     /// a dtype-mismatch error, so this goes RED — it is not a tautology that passes with the win ripped
     /// out. CPU-runnable precisely because the compute never leaves f32.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn bf16_store_prompt_embeds_is_bit_identical_to_f32_store() {
         let (map, cfg) = tiny_ideogram_te_map();
         let out_layers = [0usize, 1];
@@ -397,5 +402,8 @@ mod tests {
             a, b,
             "bf16-store prompt_embeds must be bit-identical to the f32-store forward"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::bf16_store_prompt_embeds_is_bit_identical_to_f32_store");
     }
 }

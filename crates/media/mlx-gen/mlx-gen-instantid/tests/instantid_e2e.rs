@@ -213,6 +213,8 @@ fn instantid_t2i_preserves_identity() {
         cos > 0.6,
         "fp16 identity not preserved: ArcFace-cosine {cos:.4} (expected ≳0.8 at 1024²/30 steps)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED instantid_e2e::instantid_t2i_preserves_identity");
 }
 
 // sc-3116 quant tests run at **512²**, not 1024²: the stock SDXL **quantized UNet collapses to a flat
@@ -229,6 +231,8 @@ fn instantid_t2i_q8_preserves_identity() {
         cos > 0.5,
         "Q8 identity not preserved: ArcFace-cosine {cos:.4}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED instantid_e2e::instantid_t2i_q8_preserves_identity");
 }
 
 #[test]
@@ -240,6 +244,8 @@ fn instantid_t2i_q4_preserves_identity() {
         cos > 0.45,
         "Q4 identity not preserved: ArcFace-cosine {cos:.4}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED instantid_e2e::instantid_t2i_q4_preserves_identity");
 }
 
 #[test]
@@ -309,6 +315,10 @@ fn instantid_pose_mode_preserves_identity() {
         cos > 0.3,
         "pose-mode identity not preserved: ArcFace-cosine {cos:.4} (full-body face is small; \
          expected a clear positive signal, sc-3380 face-restore recovers it further)"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED instantid_e2e::instantid_pose_mode_preserves_identity"
     );
 }
 
@@ -397,6 +407,10 @@ fn instantid_face_restore_improves_identity() {
         restored_cos > 0.55,
         "restored identity weak: ArcFace-cosine {restored_cos:.4} (expected a strong recovery)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED instantid_e2e::instantid_face_restore_improves_identity"
+    );
 }
 
 #[test]
@@ -457,6 +471,10 @@ fn instantid_view_angle_preserves_identity() {
         "view-angle identity not preserved: ArcFace-cosine {cos:.4} (a turned view reduces cosine \
          vs a frontal reference; expected a clear positive signal)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED instantid_e2e::instantid_view_angle_preserves_identity"
+    );
 }
 
 #[test]
@@ -471,6 +489,7 @@ fn instantid_user_lora_changes_output() {
         Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
         _ => {
             eprintln!("skipping: set INSTANTID_TEST_LORA to a real SDXL LoRA .safetensors path");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in instantid_user_lora_changes_output; see preceding skip diagnostic");
             return;
         }
     };
@@ -553,6 +572,8 @@ fn instantid_user_lora_changes_output() {
          InstantID UNet",
         frac * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED instantid_e2e::instantid_user_lora_changes_output");
 }
 
 #[test]
@@ -623,4 +644,6 @@ fn instantid_honors_cancellation() {
         (1..=2).contains(&steps_seen),
         "denoise should stop right after the cancel trip (saw step {steps_seen})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED instantid_e2e::instantid_honors_cancellation");
 }

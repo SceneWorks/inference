@@ -130,13 +130,31 @@ def push_route_proof(root: Path = ROOT) -> dict:
             "scope": "checked-in repository workflows, not external integrations", "workflows": proof}
 
 
+def dispatch_lane() -> str:
+    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+    inputs = event.get("inputs", {})
+    if not isinstance(inputs, dict) or ("lanes" in inputs and "profile" in inputs):
+        raise UnitFailure("ambiguous fixture dispatch selectors")
+    choice = inputs.get("lanes", inputs.get("profile"))
+    if choice != os.environ.get("MOSS_FIXTURE_SELECTED_LANE"):
+        raise UnitFailure("fixture selection differs from reusable-workflow binding")
+    return choice
+
+
 def venue(backend: str) -> dict:
     head = fixture.git_head()
     if (os.environ.get("GITHUB_REPOSITORY") != "SceneWorks/inference"
             or os.environ.get("GITHUB_SHA") != head or not re.fullmatch(r"[0-9a-f]{40}", head)
             or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+            or not os.environ.get("GITHUB_WORKFLOW_REF", "").startswith((
+                "SceneWorks/inference/.github/workflows/moss-model-fixtures.yml@",
+                "SceneWorks/inference/.github/workflows/real-weights.yml@"))
+            or os.environ.get("GITHUB_WORKFLOW_SHA") != head
             or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"):
         raise UnitFailure("profile requires exact-repository/current-head manual GitHub-hosted execution")
+    lane = dispatch_lane()
+    if lane not in (("moss-cpu-fixture", "moss-metal-fixture") if backend == "mlx" else ("moss-cpu-fixture",)):
+        raise UnitFailure("fixture backend does not match the selected manual profile")
     expected_os = "macOS" if backend == "mlx" else "Linux"
     if os.environ.get("RUNNER_OS") != expected_os:
         raise UnitFailure("backend does not match its fixed hosted OS row")
@@ -426,12 +444,11 @@ def run_metal(directory: Path) -> dict:
     baseline = None
     try:
         evidence.update(venue("mlx"))
-        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
-        if event.get("inputs", {}).get("lanes") != "moss-metal-fixture":
+        if dispatch_lane() != "moss-metal-fixture":
             raise UnitFailure("Metal proofs require the narrow explicit manual choice")
         if not METAL_MODEL_TESTS:
             raise UnitFailure("no original Metal model proofs registered")
-        evidence["dispatch_lanes"] = event["inputs"]["lanes"]
+        evidence["dispatch_lanes"] = "moss-metal-fixture"
         evidence["build_features"] = ["test-support"]
         baseline = fixture.source_stamp()
         inputs = ROOT / "crates/contracts/gen-core/tests/fixtures/moss_image/tiny_author"

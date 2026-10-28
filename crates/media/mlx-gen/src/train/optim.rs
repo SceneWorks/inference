@@ -189,7 +189,13 @@ impl TrainOptimizer {
     pub fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
         match self {
             TrainOptimizer::AdamW { opt, .. } => {
-                let (arrays, _) = crate::weights::load_safetensors_on_cpu(path)?;
+                let (arrays, _) = gen_core::__model_input_reader!(
+crate::weights::load_safetensors_on_cpu(path.as_ref()),
+"crates/media/mlx-gen/src/train/optim.rs::load_state::opt.state_mut().load_safetensors@9545",
+TensorInput,
+path.as_ref(),
+|__model_input_path| crate::weights::load_safetensors_on_cpu(__model_input_path)
+)?;
                 mlx_rs::transforms::eval_pending_loads(arrays.values())?;
                 *opt.state_mut() = <_ as OptimizerState>::unflatten(arrays)
                     .map_err(mlx_rs::error::IoError::from)?;
@@ -553,7 +559,13 @@ impl Prodigy {
     /// Rebuilds the per-parameter buffer map and the global scalars; the `{k}::exp_avg` keys carry the
     /// parameter identity (a `k` never ends in `::exp_avg`, so the base key is unambiguous).
     fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let (tensors, _meta) = crate::weights::load_safetensors_on_cpu(path)?;
+        let (tensors, _meta) = gen_core::__model_input_reader!(
+crate::weights::load_safetensors_on_cpu(path.as_ref()),
+"crates/media/mlx-gen/src/train/optim.rs::load_state::Array::load_safetensors_with_metadata@22532",
+TensorInput,
+path.as_ref(),
+|__model_input_path| crate::weights::load_safetensors_on_cpu(__model_input_path)
+)?;
         mlx_rs::transforms::eval_pending_loads(tensors.values())?;
         let scalar = |name: &str| -> Result<f32> {
             let a = tensors.get(name).ok_or_else(|| {

@@ -20,6 +20,15 @@
 //! (sc-6598: img2img/Remix `Reference` + mask inpaint `Mask`, via the FLUX.2 VAE encoder). `backend =
 //! "candle"`, `mac_only = false`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapters;
 pub mod config;
 pub mod loader;

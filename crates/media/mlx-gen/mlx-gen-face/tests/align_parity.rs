@@ -183,6 +183,8 @@ fn align_norm_crop_parity() {
         min_ref_cos >= 0.998,
         "native ArcFace diverged from onnx ReferenceEvaluator: {min_ref_cos}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED align_parity::align_norm_crop_parity");
 }
 
 /// Full native loop: SCRFD detect → norm_crop → ArcFace. Validates the alignment glue closes the
@@ -229,6 +231,8 @@ fn end_to_end_detect_align_embed() {
         min_ref_cos >= 0.998,
         "native detect→align→embed diverged from canonical math: {min_ref_cos}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED align_parity::end_to_end_detect_align_embed");
 }
 
 fn kps_l2(a: &[[f32; 2]; 5], b: &[[f32; 2]; 5]) -> f32 {

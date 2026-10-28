@@ -2289,6 +2289,7 @@ mod tests {
     /// fold path agree to f32 tolerance. Uses the native `blocks.0.attn.wq` spelling to also cover
     /// [`normalize_native_krea_path`].
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn resolve_lora_matches_fold_on_dense() {
         use candle_gen::candle_nn::Linear;
         use candle_gen::quant::AdaptLinear;
@@ -2331,12 +2332,18 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (2usize, in_dim), &dev).unwrap();
         let d = max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
         assert!(d < 1e-4, "resolved additive != folded ({d})");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::resolve_lora_matches_fold_on_dense"
+        );
     }
 
     /// **Additive == folded parity for a peft LoKr (sc-11105).** The structured factors
     /// [`resolve_lokr_file`] produces (full `(alpha/rank)·scale` baked) reproduce the folded LoKr delta
     /// on a dense base — the packed additive path equals the dense fold to f32 tolerance.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn resolve_lokr_matches_fold_on_dense() {
         use candle_gen::candle_nn::Linear;
         use candle_gen::quant::{AdaptLinear, LokrFactors};
@@ -2398,6 +2405,11 @@ mod tests {
         let dd = max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
         assert!(dd < 1e-4, "resolved additive LoKr != folded ({dd})");
         assert_eq!(skipped, 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::resolve_lokr_matches_fold_on_dense"
+        );
     }
 
     /// sc-21483 review (major #1). The ONE shared additive wrapper — `AdditiveProj for AdaptLinear`,
@@ -2506,6 +2518,7 @@ mod tests {
     /// covering the trait unification AND the widened surface in one shot. Each adapted forward equals the
     /// folded `x·(W + δ)ᵀ` to f32 tolerance (default alpha = rank ⇒ ratio 1).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn install_additive_drives_lora_and_adapt_leaves_wide_surface() {
         use candle_gen::candle_nn::{Linear, Module};
         use candle_gen::quant::AdaptLinear;
@@ -2609,6 +2622,9 @@ mod tests {
             i_diff < 1e-4,
             "AdaptLinear front-end leaf additive != fold ({i_diff})"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::install_additive_drives_lora_and_adapt_leaves_wide_surface");
     }
 
     /// The production installer must see INT8-ConvRot projections as real adapter hosts, not admit the

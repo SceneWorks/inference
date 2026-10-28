@@ -255,4 +255,6 @@ fn text_style_gain_control_sweep() {
         "\nsc-12009 control OK: g=1.0 no-op (MAD 0), g=1.75 MAD {mad_hi:.3} > g=0.5 MAD {mad_lo:.3} \
          (tap-reweight reaches the pose-control lane)."
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tap_reweight_control_real_weights::text_style_gain_control_sweep");
 }

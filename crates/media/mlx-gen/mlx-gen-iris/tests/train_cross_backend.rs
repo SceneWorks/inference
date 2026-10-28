@@ -140,10 +140,14 @@ fn check_trained_elsewhere(backend: &str) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn candle_trained_artifacts_load_and_match_on_mlx() {
     cpu_process(
         "train_cross_backend::candle_trained_artifacts_load_and_match_on_mlx",
-        candle_trained_artifacts_load_and_match_on_mlx_body,
+        || {
+            candle_trained_artifacts_load_and_match_on_mlx_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_cross_backend::candle_trained_artifacts_load_and_match_on_mlx");
+        },
     );
 }
 
@@ -153,10 +157,14 @@ fn candle_trained_artifacts_load_and_match_on_mlx_body() {
 
 /// The MLX-produced fixtures still load here (and their recorded forward is this backend's).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn mlx_trained_fixtures_match_their_recorded_forward() {
     cpu_process(
         "train_cross_backend::mlx_trained_fixtures_match_their_recorded_forward",
-        mlx_trained_fixtures_match_their_recorded_forward_body,
+        || {
+            mlx_trained_fixtures_match_their_recorded_forward_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_cross_backend::mlx_trained_fixtures_match_their_recorded_forward");
+        },
     );
 }
 
@@ -173,7 +181,12 @@ fn mlx_trained_fixtures_match_their_recorded_forward_body() {
 fn produce_cross_backend_fixtures() {
     cpu_process(
         "train_cross_backend::produce_cross_backend_fixtures",
-        produce_cross_backend_fixtures_body,
+        || {
+            produce_cross_backend_fixtures_body();
+            #[cfg(target_os = "macos")]
+            crate::common::metal_guard::record_model_inference_device();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_cross_backend::produce_cross_backend_fixtures");
+        },
     );
 }
 

@@ -21,6 +21,16 @@
 //! Every latent compared here is produced by the production entry points ([`Yue2Nar::load`] from a
 //! verified snapshot, then [`synthesize`]) from the reference's own injected noise.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -286,4 +296,7 @@ fn real_weight_synthesis_matches_upstream_and_memory_controls_are_invariant() {
         worst.max_abs,
         worst.rel_l2
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weight_synthesis_matches_upstream_and_memory_controls_are_invariant");
 }

@@ -53,6 +53,15 @@
 //!   llama_family -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 mod common;
 
 use candle_core::{DType, Device, Tensor};
@@ -292,6 +301,9 @@ fn ac1_ac2_engine_greedy_fixture_rows_against_speculative_off() {
         record.iter().filter(|r| r.divergence.is_none()).count(),
         record.len()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ac1_ac2_engine_greedy_fixture_rows_against_speculative_off");
 }
 
 #[test]
@@ -395,6 +407,9 @@ fn teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate() {
         violations, 0,
         "a verify-shaped forward changed the argmax at a position that was not a bf16 knife-edge"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate");
 }
 
 /// One free-running speculative row's record (sc-24140): its first divergence from the reference,
@@ -754,6 +769,9 @@ fn llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate() {
          disagreements, all at <= 1 bf16 ULP knife-edges",
         disagreements.len()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate");
 }
 
 /// Compare row 0 of `f` over an `M`-row input with `f` over that row alone.
@@ -845,6 +863,8 @@ fn op_isolation_survey_which_primitive_depends_on_the_row_count() {
     ] {
         let Some(w) = weights.get(key) else {
             eprintln!("[op-survey] {key}: absent from the snapshot");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/speculative_engine_parity.rs:848 (op_isolation_survey_which_primitive_depends_on_the_row_count): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             continue;
         };
         let w = w.to_dtype(dtype).unwrap();
@@ -951,4 +971,7 @@ fn op_isolation_survey_which_primitive_depends_on_the_row_count() {
     eprintln!(
         "[op-survey] projection GEMMs whose row 0 depends on the row count: {gemm_dependent:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED op_isolation_survey_which_primitive_depends_on_the_row_count");
 }

@@ -65,4 +65,6 @@ fn audio_vae_decode_matches_reference() {
     // f32 Rust vs f32 reference (same ops, same weights) → bit-tight.
     assert!(pr < 5e-4, "audio vae mel peak_rel {pr:.3e} too high");
     assert!(mr < 5e-4, "audio vae mel mean_rel {mr:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::audio_vae_decode_matches_reference");
 }

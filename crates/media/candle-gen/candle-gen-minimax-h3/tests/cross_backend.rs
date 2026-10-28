@@ -220,6 +220,7 @@ fn mlx_record_is_bound_to_these_fixtures() {
 
 /// Every video-side tensor the MLX lane recorded, reproduced here and compared directly.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn video_decode_agrees_with_the_mlx_lane() {
     let f = video();
     let r = record();
@@ -293,6 +294,11 @@ fn video_decode_agrees_with_the_mlx_lane() {
 
     assert_eq!(checked, 5, "every recorded video tensor must be compared");
     println!("VIDEO cross-backend worst peak-relative: {worst:.3e} (bound {CROSS_TOL:.0e})");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED cross_backend::video_decode_agrees_with_the_mlx_lane"
+    );
 }
 
 /// Every video **encode** tensor the MLX lane recorded, reproduced here and compared directly
@@ -305,6 +311,7 @@ fn video_decode_agrees_with_the_mlx_lane() {
 /// numbers, over the tiling, the asymmetric downsampler pad, the frame-isolated GroupNorm, the
 /// single-frame short circuit and the posterior clamp.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn video_encode_agrees_with_the_mlx_lane() {
     let f = video_encode();
     let r = record();
@@ -379,6 +386,11 @@ fn video_encode_agrees_with_the_mlx_lane() {
         "VIDEO ENCODE cross-backend worst peak-relative: {worst:.3e} (bound {CROSS_TOL:.0e}); \
          MLX's own tiled-vs-untiled separation {tiled_vs_untiled:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED cross_backend::video_encode_agrees_with_the_mlx_lane"
+    );
 }
 
 /// Every audio-side tensor the MLX lane recorded, reproduced here and compared directly.
@@ -387,6 +399,7 @@ fn video_encode_agrees_with_the_mlx_lane() {
 /// MLX works in NLC and transposes at the boundary, this port is NCL throughout. Agreement here is
 /// not two copies of one array layout agreeing with themselves.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn audio_decode_agrees_with_the_mlx_lane() {
     let f = audio();
     let r = record();
@@ -471,6 +484,11 @@ fn audio_decode_agrees_with_the_mlx_lane() {
 
     assert_eq!(checked, 5, "every recorded audio tensor must be compared");
     println!("AUDIO cross-backend worst peak-relative: {worst:.3e} (bound {CROSS_TOL:.0e})");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED cross_backend::audio_decode_agrees_with_the_mlx_lane"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -483,6 +501,7 @@ fn audio_decode_agrees_with_the_mlx_lane() {
 /// residual against the reference directly — and then measures candle's, and shows which of the two
 /// sets the bound. If the answer ever becomes "candle's", the module docs are wrong and this fails.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_cross_backend_floor_is_the_mlx_lanes_own_reduced_precision() {
     let f = video();
     let r = record();
@@ -525,6 +544,9 @@ fn the_cross_backend_floor_is_the_mlx_lanes_own_reduced_precision() {
         candle_vs_mlx < CROSS_TOL,
         "candle and mlx disagree by {candle_vs_mlx:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cross_backend::the_cross_backend_floor_is_the_mlx_lanes_own_reduced_precision");
 }
 
 /// **What this gate cannot see**, pinned with numbers.
@@ -542,6 +564,7 @@ fn the_cross_backend_floor_is_the_mlx_lanes_own_reduced_precision() {
 /// The class itself is covered by `candle_gen_minimax_h3::nn`'s
 /// `rms_norm_puts_epsilon_inside_the_square_root`, which pins the formulation structurally.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_cross_backend_gate_cannot_resolve_an_eps_misplacement() {
     let f = video();
     let r = record();
@@ -574,6 +597,9 @@ fn the_cross_backend_gate_cannot_resolve_an_eps_misplacement() {
          ({floor:.3e}). That is an improvement, but this file's docs claim the comparison cannot \
          resolve sub-1% divergences — re-state them before re-greening this."
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cross_backend::the_cross_backend_gate_cannot_resolve_an_eps_misplacement");
 }
 
 /// The other direction: a **layout** error is loud here, which is what makes this gate worth
@@ -584,6 +610,7 @@ fn the_cross_backend_gate_cannot_resolve_an_eps_misplacement() {
 /// cosine near 1 and the L2 norm unchanged to three digits, which is why no magnitude, cosine or
 /// checksum gate anywhere in this epic caught it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_gated_ffn_half_swap_is_loud_against_the_mlx_record() {
     let f = video();
     let r = record();
@@ -616,6 +643,9 @@ fn a_gated_ffn_half_swap_is_loud_against_the_mlx_record() {
         "the half-swap moved the decode by only {peak:.3e}; this cross-backend gate would not \
          catch the sc-18740 defect and should not be cited as covering it"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cross_backend::a_gated_ffn_half_swap_is_loud_against_the_mlx_record");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -744,6 +774,9 @@ fn dit_agrees_with_the_mlx_lane() {
 
     assert_eq!(checked, 8, "every recorded DiT tensor must be compared");
     println!("DIT cross-backend worst peak-relative: {worst:.3e} (bound {CROSS_TOL:.0e})");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cross_backend::dit_agrees_with_the_mlx_lane");
 }
 
 /// The **joint denoise loop's** output, both modalities, against the MLX lane's own run of the same
@@ -903,6 +936,9 @@ fn the_dit_cross_backend_floor_is_also_the_mlx_lanes() {
         "the two-order gap between this lane's own parity residual and the cross-backend floor has \
          closed; the 'cross-backend agreement is not numerical exactness' caveat must be re-stated"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cross_backend::the_dit_cross_backend_floor_is_also_the_mlx_lanes");
 }
 
 /// The other direction: a **layout** error is loud across backends too, which is what makes the
@@ -954,4 +990,7 @@ fn a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record() {
         "the half-swap moved the block by only {peak:.3e}; this cross-backend gate would not catch \
          the sc-18740 defect in the DiT and should not be cited as covering it"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cross_backend::a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record");
 }

@@ -480,6 +480,9 @@ fn t2i_preview_frames_evolve_toward_the_final_image() {
         &format!("t2i_{size}_s{steps}_final"),
     );
     assert_the_strip_converges("t2i ", &frames, &active, steps, size, size);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::t2i_preview_frames_evolve_toward_the_final_image");
 }
 
 /// The **edit** runtime gate. Same measurements as the base lane, plus the thing that is specific to
@@ -501,7 +504,15 @@ fn edit_preview_frames_evolve_toward_the_final_image() {
     let steps = env_u32("QWEN_PREVIEW_EDIT_STEPS", 12) as usize;
     let size = env_u32("QWEN_PREVIEW_EDIT_SIZE", 768);
 
-    let decoded = image::open(&reference_path)
+    let decoded = candle_gen::gen_core::__model_input_reader!(
+image::open(&reference_path),
+"crates/media/candle-gen/candle-gen-qwen-image/tests/preview_real_weights.rs::edit_preview_frames_evolve_toward_the_final_image::image::open@21988",
+Reference,
+&reference_path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .unwrap_or_else(|e| panic!("open {reference_path:?}: {e}"))
         .to_rgb8();
     let reference = Image {
@@ -602,6 +613,9 @@ fn edit_preview_frames_evolve_toward_the_final_image() {
         "the edit preview must track the image being generated, not the reference \
          (r(edited) {to_final:+.3} vs r(reference) {to_reference:+.3})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::edit_preview_frames_evolve_toward_the_final_image");
 }
 
 /// The **ControlNet/Fun** runtime gate. The third shipped lane, held to the same measurement as the
@@ -626,7 +640,15 @@ fn control_fun_preview_frames_evolve_toward_the_final_image() {
     // rather than inferred from the t2i row, because `QwenFunControlPaths` can name a different base.
     assert_is_the_fit_donor_vae("qwen-control", &qwen_base);
 
-    let decoded = image::open(&hint_path)
+    let decoded = candle_gen::gen_core::__model_input_reader!(
+image::open(&hint_path),
+"crates/media/candle-gen/candle-gen-qwen-image/tests/preview_real_weights.rs::control_fun_preview_frames_evolve_toward_the_final_image::image::open@27343",
+Reference,
+&hint_path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .unwrap_or_else(|e| panic!("open {hint_path:?}: {e}"))
         .to_rgb8();
     let (source_w, source_h) = (decoded.width(), decoded.height());
@@ -685,4 +707,7 @@ fn control_fun_preview_frames_evolve_toward_the_final_image() {
         &format!("control_{size}_s{steps}_final"),
     );
     assert_the_strip_converges("ctrl", &frames, &active, steps as u32, size, size);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::control_fun_preview_frames_evolve_toward_the_final_image");
 }

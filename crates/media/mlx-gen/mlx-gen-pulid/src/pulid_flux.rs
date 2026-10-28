@@ -879,6 +879,7 @@ mod tests {
     /// deleted, `generate` falls through into the zero-weight identity stack and fails with a
     /// non-`Unsupported` error, so this test FAILS.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn generate_without_prior_validate_rejects_hyper_typed_unsupported() {
         let model = weightless_pulid();
         let req = GenerationRequest {
@@ -900,6 +901,8 @@ mod tests {
             matches!(err, gen_core::Error::Unsupported(_)),
             "got: {err:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED pulid_flux::tests::generate_without_prior_validate_rejects_hyper_typed_unsupported");
     }
 
     /// Two reference faces are rejected, and an empty request is rejected as missing.

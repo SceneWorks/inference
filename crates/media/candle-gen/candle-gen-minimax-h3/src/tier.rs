@@ -319,7 +319,13 @@ impl MiniMaxH3TierPaths {
 /// `config.json`, or a `config.json` with no marker — the `bf16` tier).
 fn packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
     let path = dir.join("config.json");
-    let bytes = match std::fs::read(&path) {
+    let bytes = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/candle-gen/candle-gen-minimax-h3/src/tier.rs::packed_config::std::fs::read@19553",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {

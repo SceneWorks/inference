@@ -23,6 +23,16 @@
 //! Every waveform compared here is produced by the production entry points
 //! ([`decode_latents`] on a [`Yue2Vae::load`]ed verified component) — not a test-only forward.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -291,6 +301,9 @@ fn both_pinned_decoders_match_upstream_on_identical_cached_latents() {
         std::fs::read(cache.path().join("latent.npy")).unwrap(),
         npy_before
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED both_pinned_decoders_match_upstream_on_identical_cached_latents");
 }
 
 /// Upstream `[1, 2, S]` raw decoder output → the production layout: clamped, interleaved L/R.
@@ -381,6 +394,11 @@ fn halo_crop_tiling_matches_full_decode_on_a_long_latent() {
             "{key}: tiled vs upstream {tiled_up_max}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED halo_crop_tiling_matches_full_decode_on_a_long_latent"
+    );
 }
 
 /// The production tiling itself ([`DecodeOptions::production`], 224-frame cores from the default
@@ -433,6 +451,9 @@ fn production_tiling_matches_upstream_on_a_multi_tile_latent() {
         assert!(seam_max < WAVEFORM_MAX_ABS, "{key}: seams {seam_max}");
         assert!(snr > WAVEFORM_MIN_SNR_DB, "{key}: SNR {snr}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED production_tiling_matches_upstream_on_a_multi_tile_latent");
 }
 
 /// The native encoder (both released VAEs) reproduces upstream's posterior of the reference clip,
@@ -463,6 +484,9 @@ fn native_encoder_matches_upstream_for_both_vaes() {
             assert!(max < ENCODE_MAX_ABS, "encode_latents: {max}");
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED native_encoder_matches_upstream_for_both_vaes");
 }
 
 /// Tile-footprint probe behind `decode::TILE_BYTES_PER_FRAME` / `decode::TILE_RESERVE_BYTES`: one
@@ -477,6 +501,8 @@ fn tile_footprint_probe() {
     // `--ignored` run of this file does not fail on it.
     let Some(frames) = std::env::var_os("YUE2_VAE_PROBE_FRAMES") else {
         println!("tile_footprint_probe: set YUE2_VAE_PROBE_FRAMES=<frames> to measure");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/audio/candle-audio-yue2/tests/vae_real_weights.rs:480 (tile_footprint_probe): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let frames: usize = frames
@@ -508,4 +534,7 @@ fn tile_footprint_probe() {
     };
     let out = decode(&vae, &latents, options);
     assert_eq!(out.frames(), 1920 * frames - 64);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tile_footprint_probe");
 }

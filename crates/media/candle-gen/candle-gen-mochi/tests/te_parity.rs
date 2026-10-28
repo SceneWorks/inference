@@ -189,4 +189,7 @@ fn t5_encode_matches_golden() {
         neg_rel < 8e-2,
         "negative_prompt_embeds real-token peak_rel {neg_rel:.3e} too high"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED te_parity::t5_encode_matches_golden");
 }

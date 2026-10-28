@@ -44,7 +44,7 @@ impl TimestepEmbedding {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.lin1.forward(x)?.silu()?;
-        self.lin2.forward(&x)
+        let x = __model_proof_output!(self.lin1.forward(x))?.silu()?;
+        __model_proof_output!(self.lin2.forward(&x))
     }
 }

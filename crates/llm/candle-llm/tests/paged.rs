@@ -18,6 +18,15 @@
 //! computed in a different-length prefill and a bf16 GEMM is not perfectly `M`-invariant (the same
 //! sub-ULP limitation the prefix cache documents) — full shared-suffix bit-exactness is proven on CPU.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
@@ -160,6 +169,7 @@ fn build_tiny_llama() -> CausalLm {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn paged_is_bitexact_dropin_cpu() {
     let model = build_tiny_llama();
     // A prompt long enough to span several blocks (block_size 4) plus a partial tail.
@@ -182,9 +192,13 @@ fn paged_is_bitexact_dropin_cpu() {
         len,
         cache.reserved_tokens()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED paged_is_bitexact_dropin_cpu");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn ragged_lengths_decode_correctly_cpu() {
     let model = build_tiny_llama();
     // Three sequences of *different* prompt lengths — a ragged batch the contiguous cache can't hold
@@ -212,9 +226,13 @@ fn ragged_lengths_decode_correctly_cpu() {
             prompts[i].len()
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ragged_lengths_decode_correctly_cpu");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn shared_prefix_cow_is_bitexact_cpu() {
     let model = build_tiny_llama();
     let nl = model.config().num_layers;
@@ -278,6 +296,9 @@ fn shared_prefix_cow_is_bitexact_cpu() {
         0,
         "dropping seq 2 releases the shared references"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED shared_prefix_cow_is_bitexact_cpu");
 }
 
 // ---- Real-weights variants (#[ignore]) -----------------------------------------------------------
@@ -416,9 +437,14 @@ fn run_real(fx: Fixture) {
 fn paged_cache_real_weights_llama() {
     let Some(fx) = load_from("CANDLE_LLM_TEST_MODEL") else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/paged.rs:419 (paged_cache_real_weights_llama): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     run_real(fx);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED paged_cache_real_weights_llama");
 }
 
 #[test]
@@ -426,7 +452,12 @@ fn paged_cache_real_weights_llama() {
 fn paged_cache_real_weights_qwen3() {
     let Some(fx) = load_from("CANDLE_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set CANDLE_LLM_QWEN3_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/paged.rs:429 (paged_cache_real_weights_qwen3): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     run_real(fx);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED paged_cache_real_weights_qwen3");
 }

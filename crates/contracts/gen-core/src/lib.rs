@@ -10,6 +10,29 @@
 //! Numeric types here are restricted to `f32`/`f64`/`Vec<f32>`/`Vec<i32>`/`&[u8]` — never an
 //! `mlx_rs::Array` or candle tensor. See epic 3720 (the unified-contract roadmap, Phase 0).
 
+mod model_input_macros;
+
+#[cfg(feature = "model-inference-proof")]
+pub mod model_input_proof;
+
+// Observe only the original successful result; feature OFF is the original
+// expression, without a result temporary, new block or reader/control change.
+#[cfg(feature = "model-inference-proof")]
+macro_rules! __observe_input_success {
+    ($value:expr, $observe:expr) => {
+        ($value).inspect($observe)
+    };
+}
+#[cfg(not(feature = "model-inference-proof"))]
+macro_rules! __observe_input_success {
+    ($value:expr, $observe:expr) => {
+        ($value)
+    };
+}
+const _: fn() = || {
+    let _: std::result::Result<(), ()> = __observe_input_success!(Ok(()), |_| {});
+};
+
 pub mod approximation;
 pub mod attention_budget;
 pub mod audio_dsp;
@@ -321,3 +344,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod veda;
 pub use veda::{VedaBudget, VedaExecutionReport, VedaRequest};
 pub mod h3_terminal_telemetry;
+
+mod source_inventory;
+pub use source_inventory::SourceInventory;
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::IOS_ENGINEERING_FEATURES_SUPPORTED;

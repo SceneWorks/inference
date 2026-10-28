@@ -650,6 +650,7 @@ mod tests {
     /// Drop `.with_dense_fp8()` from `klein_import_residency` and pass an `sm_89`-shaped policy:
     /// the plan prices the row `Packed` and the construction below dies at the typed fp8 refusal.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy() {
         use candle_gen::gen_core::checkpoint_codec::ResidencyMode;
 
@@ -755,6 +756,9 @@ mod tests {
         for value in y.to_vec1::<f32>().unwrap() {
             assert_eq!(value, 2.0, "the dense decode must apply weight_scale");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED single_file::tests::a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy");
     }
 
     #[test]
@@ -1017,6 +1021,7 @@ mod tests {
     /// (`convert::build_target_state_dict` → VarBuilder), then run through one identical forward.
     /// Outputs must agree exactly — the declarative transform plan is the same semantic remap.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn planned_transformer_matches_the_loader_native_converter() {
         let cfg = tiny_cfg();
         let dir = tempfile::tempdir().unwrap();
@@ -1080,6 +1085,9 @@ mod tests {
             delta, 0.0,
             "the plan-driven load must equal the loader-native converter exactly"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED single_file::tests::planned_transformer_matches_the_loader_native_converter");
     }
 
     // ---- NVFP4: packed split agrees with the dense decode; refusals stay closed ----------------

@@ -46,6 +46,9 @@ fn qwen_image_conformance() {
         ..Profile::cheap()
     };
     conformance(|| candle_gen_qwen_image::load(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::qwen_image_conformance");
 }
 
 /// sc-8647 (parity with mlx-gen sc-8271): real-weight t2i smoke for the `Qwen/Qwen-Image-2512` base
@@ -108,4 +111,7 @@ fn qwen_image_2512_t2i_smoke() {
         "render looks degenerate (min={min} max={max} mean={mean:.1}) — 2512 base may not have \
          loaded coherently"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::qwen_image_2512_t2i_smoke");
 }

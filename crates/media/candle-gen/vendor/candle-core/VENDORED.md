@@ -77,6 +77,10 @@ evidence.
    backward routes each window's gradient to its maximum (split evenly over ties) and gives the
    rows / columns a floor-division pool drops zero gradient. See *Max-pool backward routes the
    window gradient* below.
+7. `Cargo.toml`, `src/npy.rs`, `src/pickle.rs` — security dependency bump, not upstream
+   (sc-16780): `zip` 7.2.0 is affected by RUSTSEC-2026-0367/0368/0369, fixed in 9.0.0. The
+   9.x entry-name accessors return `Result`; the three sites propagate that existing `ZipError`
+   through `?` instead of using an unchecked name. No archive extraction API is used.
 
 7. `Cargo.toml` — security-only dependency update (sc-26235): `zip` 7.2.0 → 9.0.0 to fix
    RUSTSEC-2026-0367 (privileged extraction permissions), RUSTSEC-2026-0368 (escaping symlink

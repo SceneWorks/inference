@@ -206,8 +206,14 @@ impl KreaTeConfig {
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let path = root.join("text_encoder").join("config.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Msg(format!("krea te: read {}: {e}", path.display())))?;
+        let text = mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(&path),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+                &path,
+                "mlx-gen-krea::text_encoder::KreaTeConfig::from_snapshot/architecture",
+            )
+        )
+        .map_err(|e| Error::Msg(format!("krea te: read {}: {e}", path.display())))?;
         let v: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("krea te: parse {}: {e}", path.display())))?;
         let tc = v.get("text_config").unwrap_or(&v);
@@ -288,7 +294,13 @@ impl KreaTeConfig {
         };
 
         // `text_encoder_select_layers` lives in the pipeline manifest.
-        if let Ok(t) = std::fs::read_to_string(root.join("model_index.json")) {
+        if let Ok(t) = mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(root.join("model_index.json")),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+                root.join("model_index.json"),
+                "mlx-gen-krea::text_encoder::KreaTeConfig::from_snapshot/select_layers_manifest",
+            )
+        ) {
             if let Ok(mv) = serde_json::from_str::<serde_json::Value>(&t) {
                 if let Some(arr) = mv
                     .get("text_encoder_select_layers")

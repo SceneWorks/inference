@@ -479,6 +479,9 @@ fn chroma_preview_frames_evolve_toward_the_final_image() {
     // FLUX.2 (+0.556 against a 0.874 ceiling). At 80.7% of this fit's 0.991 ceiling it is comfortably
     // ahead of that precedent; the load-bearing assertions are the monotonicities and the +0.30 rise.
     assert_chroma_previews_converge("chroma1-hd-euler", None, steps, size, 0.75, 1.5);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::chroma_preview_frames_evolve_toward_the_final_image");
 }
 
 /// Exactly one frame per **outer** solver step on a multi-eval solver, with the non-vacuity inequality
@@ -498,4 +501,7 @@ fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
         "heun must evaluate more than once per outer step or this row proves nothing about the \
          preview counter's dedup ({events} events for {steps} steps)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::a_multi_eval_solver_emits_one_frame_per_outer_step");
 }

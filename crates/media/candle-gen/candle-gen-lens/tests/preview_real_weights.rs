@@ -557,4 +557,7 @@ fn lens_preview_frames_evolve_toward_the_final_image() {
         live.height,
         &format!("{label}-final.png"),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::lens_preview_frames_evolve_toward_the_final_image");
 }

@@ -372,6 +372,9 @@ fn vram_receipt_prefix_forces_a_fresh_log_line() {
 #[ignore = "sc-17156 VRAM campaign; needs a staged MiniMax-H3 snapshot in MINIMAX_H3_VRAM_DIR + an idle CUDA GPU"]
 fn minimax_h3_vram_bf16() {
     measure("bf16", None);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vram_probe::minimax_h3_vram_bf16");
 }
 
 /// The **`q4`** tier at the same geometry (sc-20267).
@@ -386,6 +389,9 @@ fn minimax_h3_vram_bf16() {
 #[ignore = "sc-17156 VRAM campaign; needs a staged q4 MiniMax-H3 tier + an idle CUDA GPU; run alone"]
 fn minimax_h3_vram_q4() {
     measure("q4", Some(Quant::Q4));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vram_probe::minimax_h3_vram_q4");
 }
 
 /// The **`q8`** tier at the same geometry (sc-20267). Run alone — see [`minimax_h3_vram_q4`].
@@ -393,4 +399,7 @@ fn minimax_h3_vram_q4() {
 #[ignore = "sc-17156 VRAM campaign; needs a staged q8 MiniMax-H3 tier + an idle CUDA GPU; run alone"]
 fn minimax_h3_vram_q8() {
     measure("q8", Some(Quant::Q8));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vram_probe::minimax_h3_vram_q8");
 }

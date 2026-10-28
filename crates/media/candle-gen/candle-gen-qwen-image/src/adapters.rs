@@ -741,6 +741,7 @@ mod tests {
     /// fold** path agree to f32 tolerance. This is the acceptance parity the sampler's ~1-ULP
     /// sensitivity needs (`candle_gen::train::lora::reconstruct_lora_delta`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn resolve_lora_matches_fold_on_dense() {
         use crate::quant::QLinear;
         use candle_gen::candle_nn::Linear;
@@ -790,6 +791,11 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(d < 1e-4, "resolved additive != folded (max diff {d})");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::resolve_lora_matches_fold_on_dense"
+        );
     }
 
     /// A **LoHa** file is rejected by [`install_additive`]'s resolve preamble before any DiT walk (no

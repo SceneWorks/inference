@@ -230,7 +230,11 @@ impl MiniMaxH3Dit {
     pub fn load_dir_deferred(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
         let dir = dir.as_ref();
         let config_path = dir.join("config.json");
-        let text = std::fs::read_to_string(&config_path).map_err(|e| {
+        let text = mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(&config_path),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string(&config_path)
+        )
+        .map_err(|e| {
             Error::Msg(format!(
                 "minimax-h3 dit: reading {}: {e}",
                 config_path.display()
@@ -311,7 +315,11 @@ impl MiniMaxH3Dit {
     pub fn load_dir(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
         let dir = dir.as_ref();
         let config_path = dir.join("config.json");
-        let text = std::fs::read_to_string(&config_path).map_err(|e| {
+        let text = mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(&config_path),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string(&config_path)
+        )
+        .map_err(|e| {
             Error::Msg(format!(
                 "minimax-h3 dit: reading {}: {e}",
                 config_path.display()

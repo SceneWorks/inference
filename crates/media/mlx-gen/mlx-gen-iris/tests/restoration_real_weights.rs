@@ -175,6 +175,10 @@ fn real_restoration_matches_upstream() {
     let image = out.restored.to_rgb8();
     save_png(&image, "iris_restore_large_x4.png");
     assert_parity("large", &image.pixels, &golden);
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_real_weights::real_restoration_matches_upstream");
 }
 
 /// The small case (committed upstream reference): 64x48 at 4x = 256x192, enlarged to 1365x1024 (two
@@ -210,4 +214,8 @@ fn real_small_restoration_matches_upstream() {
     assert_eq!((image.width, image.height, steps), (256, 192, 2));
     save_png(&image, "iris_restore_small_x4.png");
     assert_parity("small", &image.pixels, &golden);
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_real_weights::real_small_restoration_matches_upstream");
 }

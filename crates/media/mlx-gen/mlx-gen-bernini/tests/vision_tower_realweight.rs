@@ -73,4 +73,8 @@ fn vision_tower_real_weight_smoke() {
         "vision tower real-weight ok: tokens {:?} max|·|={m:.4}",
         tokens.shape()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED vision_tower_realweight::vision_tower_real_weight_smoke"
+    );
 }

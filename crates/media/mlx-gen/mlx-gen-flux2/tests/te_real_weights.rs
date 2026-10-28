@@ -104,4 +104,8 @@ fn text_encoder_prompt_embeds_match_fork() {
         mean < bound,
         "TE prompt_embeds diverged: mean_rel={mean} (ref={ref_kind})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED te_real_weights::text_encoder_prompt_embeds_match_fork"
+    );
 }

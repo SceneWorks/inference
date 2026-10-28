@@ -44,6 +44,7 @@ fn tiny_cfg() -> PidConfig {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn sampler_loop_matches() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
@@ -76,11 +77,14 @@ fn sampler_loop_matches() {
         rel < 2e-2,
         "sampler output peak-rel={rel} (max|Δ|={d}) — divergence in velocity→x0 / SDE renoise / clamp"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sampler_parity::sampler_loop_matches");
 }
 
 /// F-006: a pre-tripped [`CancelFlag`] makes the 4-step decode loop return [`Error::Canceled`] at the
 /// first step boundary instead of running the full ~100 s decode. Uses the committed tiny fixture, so
 /// it runs by default (no real weights / Metal weight snapshot needed).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn sampler_run_honors_pretripped_cancel() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
@@ -120,4 +124,6 @@ fn sampler_run_honors_pretripped_cancel() {
         .run(&net, &noise, &eps, &caption, &lq_latent, &sigma, None)
         .expect("uncancelled run completes");
     assert_eq!(ok.shape()[0], noise.shape()[0]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sampler_parity::sampler_run_honors_pretripped_cancel");
 }

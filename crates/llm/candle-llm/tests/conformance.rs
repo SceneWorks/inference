@@ -17,6 +17,15 @@
 //!   cargo test --features cuda --test conformance -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Tensor};
@@ -114,6 +123,7 @@ fn write_snapshot_with_heads(identity: &str, qk_norm: bool, head_dim: usize) -> 
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn llama_provider_passes_core_llm_conformance() {
     let dir = write_snapshot();
     let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
@@ -127,6 +137,9 @@ fn llama_provider_passes_core_llm_conformance() {
 
     // Sanity: the provider id the suite checked is the registered one.
     assert_eq!(PROVIDER_ID, "candle-llama");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED llama_provider_passes_core_llm_conformance");
 }
 
 #[test]
@@ -138,6 +151,9 @@ fn real_model_passes_core_llm_conformance() {
         || Box::new(LlamaProvider::load(&spec).expect("load real provider")),
         &TextLlmProfile::cheap(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_model_passes_core_llm_conformance");
 }
 
 /// The full conformance suite on a **Qwen3** snapshot (per-head q/k RMSNorm, head_dim 128, tied
@@ -151,6 +167,9 @@ fn qwen3_passes_core_llm_conformance() {
         || Box::new(LlamaProvider::load(&spec).expect("load qwen3 provider")),
         &TextLlmProfile::cheap(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen3_passes_core_llm_conformance");
 }
 
 /// Run the full conformance suite against a quantize-on-load model. Quantized providers must satisfy
@@ -158,6 +177,8 @@ fn qwen3_passes_core_llm_conformance() {
 fn run_quantized_conformance(env_var: &str, quant: Quantize) {
     let Ok(dir) = std::env::var(env_var) else {
         eprintln!("skip: set {env_var}");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/conformance.rs:161 (run_quantized_conformance): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let spec = LoadSpec {
@@ -188,6 +209,9 @@ fn run_quantized_conformance(env_var: &str, quant: Quantize) {
 #[ignore = "needs a Llama snapshot via CANDLE_LLM_TEST_MODEL (Q8 quantize-on-load)"]
 fn quantized_q8_passes_core_llm_conformance() {
     run_quantized_conformance("CANDLE_LLM_TEST_MODEL", Quantize::Q8);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantized_q8_passes_core_llm_conformance");
 }
 
 /// Conformance on a **Q4_K quantize-on-load**. Q4_K's block size is 256, so the projection `in`-dims
@@ -197,6 +221,9 @@ fn quantized_q8_passes_core_llm_conformance() {
 #[ignore = "needs a Qwen3 snapshot via CANDLE_LLM_QWEN3_MODEL (Q4 quantize-on-load; dims must be 256-aligned)"]
 fn quantized_q4_passes_core_llm_conformance() {
     run_quantized_conformance("CANDLE_LLM_QWEN3_MODEL", Quantize::Q4);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantized_q4_passes_core_llm_conformance");
 }
 
 /// The full conformance suite on a **GGUF** checkpoint loaded directly (story 7254) — proves the GGUF
@@ -211,6 +238,9 @@ fn gguf_passes_core_llm_conformance() {
         || Box::new(LlamaProvider::load(&spec).expect("load gguf provider")),
         &TextLlmProfile::cheap(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gguf_passes_core_llm_conformance");
 }
 
 // --- story 7406: model-first resolution (core_llm::load_for_model) over the weightless probe ---
@@ -344,6 +374,7 @@ fn can_load_is_weightless_and_architecture_aware() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn load_for_model_resolves_synthetic_snapshot_without_naming_a_provider() {
     let dir = write_snapshot();
     let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
@@ -357,6 +388,9 @@ fn load_for_model_resolves_synthetic_snapshot_without_naming_a_provider() {
     let req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 4);
     let out = llm.complete(&req).expect("generate");
     assert!(!out.text.is_empty());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED load_for_model_resolves_synthetic_snapshot_without_naming_a_provider");
 }
 
 #[test]
@@ -582,6 +616,7 @@ fn candle_kv_plan_conforms_to_the_cross_backend_policy_table() {
 /// reason — `PolicyDisabled` un-opted, the table's refusal for a short context or an unnamed
 /// family — and opting in changes nothing about what Candle generates.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn candle_generations_report_the_dense_cache_and_generate_unchanged() {
     use core_llm::{KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy};
     let generate = |provider: &LlamaProvider, policy| {
@@ -615,12 +650,16 @@ fn candle_generations_report_the_dense_cache_and_generate_unchanged() {
         generate(&mistral, Policy::Qualified).kv_cache,
         Some(KvCacheReport::dense(Reason::UnqualifiedModel, None))
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED candle_generations_report_the_dense_cache_and_generate_unchanged");
 }
 
 /// AC1: a generation at Qwen3's qualified minimum context — one MLX runs on the fused compressed
 /// reader — runs dense on Candle as `ReaderUnavailable`, claims no compressed format or counter,
 /// and generates exactly what the un-opted request does.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_qualified_candle_generation_runs_dense_as_reader_unavailable() {
     use core_llm::{
         KvCacheCounters, KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy,
@@ -670,12 +709,16 @@ fn a_qualified_candle_generation_runs_dense_as_reader_unavailable() {
         (opted_in.text.as_str(), opted_in.usage),
         (off.text.as_str(), off.usage)
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED a_qualified_candle_generation_runs_dense_as_reader_unavailable");
 }
 
 /// AC1: Candle bounds the final context like MLX — a qualified-length prompt whose token budget
 /// reaches past the evidenced window reports the table's `AboveQualifiedContext`, not
 /// `ReaderUnavailable`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_candle_token_budget_past_the_qualified_window_reports_the_table_refusal() {
     use core_llm::{
         KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
@@ -714,4 +757,7 @@ fn a_candle_token_budget_past_the_qualified_window_reports_the_table_refusal() {
         output.kv_cache,
         Some(KvCacheReport::dense(Reason::AboveQualifiedContext, None))
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED a_candle_token_budget_past_the_qualified_window_reports_the_table_refusal");
 }

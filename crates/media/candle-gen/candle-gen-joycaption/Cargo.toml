@@ -17,6 +17,7 @@ candle-gen = { path = "../candle-gen" }
 candle-llm = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen/model-inference-proof", "candle-llm/model-inference-proof"]
 default = []
 # Forward the backend feature to candle-llm as well so the `candle-llava` provider's tower + decoder
 # run on the selected device (the CUDA worker build needs candle-llm built with `cuda`).

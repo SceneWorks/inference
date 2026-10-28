@@ -67,9 +67,9 @@ impl FluxImageProjModel {
     /// `[B, clip_embed_dim]` pooled CLIP image embeds → `[B, num_tokens, cross_attn_dim]` tokens.
     fn forward(&self, image_embeds: &Tensor) -> Result<Tensor> {
         let b = image_embeds.dim(0)?;
-        let x = self.proj.forward(image_embeds)?; // [B, num_tokens·cross_attn_dim]
+        let x = __model_proof_output!(self.proj.forward(image_embeds))?; // [B, num_tokens·cross_attn_dim]
         let x = x.reshape((b, self.num_tokens, self.cross_attn_dim))?;
-        self.norm.forward(&x)
+        __model_proof_output!(self.norm.forward(&x))
     }
 }
 
@@ -285,6 +285,7 @@ mod tests {
     /// `FluxImageProjModel::forward` projects `[B, embed]` → `[B, num_tokens, cross_attn_dim]` and
     /// LayerNorms each token (tiny dims; the real 768→4·4096 shape is the GPU validation).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn image_proj_model_shapes() {
         let dev = Device::Cpu;
         let (embed, num_tokens, cross) = (6usize, 2usize, 5usize);
@@ -308,12 +309,16 @@ mod tests {
             .unwrap()
             .iter()
             .all(|v| v.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_adapter::tests::image_proj_model_shapes");
     }
 
     /// `double_block_residual` produces `[B, img_seq, heads·head_dim]` from a per-head image query and
     /// the image tokens; `scale = 0` short-circuits to `None` (the no-IP ablation), as does an
     /// out-of-range block index. Tiny, shape-derived dims (no real 4096/3072 allocation).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn double_block_residual_shapes_and_gates() {
         let dev = Device::Cpu;
         let (b, num_tokens, cross) = (1usize, 4usize, 8usize);
@@ -360,6 +365,9 @@ mod tests {
         let off = FluxIpInjector::new(&adapter, tokens, 0.0);
         assert!(off.double_block_residual(0, &img_q).unwrap().is_none());
         assert_eq!(adapter.num_blocks(), 1);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_adapter::tests::double_block_residual_shapes_and_gates");
     }
 
     /// sc-9038 / F-054: the per-block K/V cache must be populated once and reused, producing a
@@ -368,6 +376,7 @@ mod tests {
     /// does), and every residual must match the value from a fresh injector that has never cached
     /// anything for that (block, img_q) — proving the reuse is lossless, not merely close.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cached_kv_is_bit_identical_across_steps() {
         let dev = Device::Cpu;
         let (b, num_tokens, cross) = (1usize, 4usize, 8usize);
@@ -425,5 +434,8 @@ mod tests {
             cache.iter().all(|slot| slot.is_some()),
             "every touched block must have a populated K/V cache slot"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_adapter::tests::cached_kv_is_bit_identical_across_steps");
     }
 }

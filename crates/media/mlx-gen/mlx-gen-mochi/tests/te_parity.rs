@@ -180,4 +180,6 @@ fn t5_encode_matches_golden() {
         neg_rel < 6e-2,
         "negative_prompt_embeds real-token peak_rel {neg_rel:.3e} too high"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::t5_encode_matches_golden");
 }

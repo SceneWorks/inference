@@ -165,8 +165,14 @@ impl PrismMlxPack {
 
         let hpath = dir.join("hadamard.json");
         let h: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&hpath)
-                .map_err(|e| Error::Config(format!("read {}: {e}", hpath.display())))?,
+            &crate::__model_input_reader!(
+                std::fs::read_to_string(&hpath),
+                "crates/llm/mlx-llm/src/prism.rs::from_dir::std::fs::read_to_string@5963",
+                ArtifactInput,
+                &hpath,
+                |__model_input_path| std::fs::read_to_string(__model_input_path)
+            )
+            .map_err(|e| Error::Config(format!("read {}: {e}", hpath.display())))?,
         )
         .map_err(|e| Error::Config(format!("parse {}: {e}", hpath.display())))?;
         for (key, expected) in [

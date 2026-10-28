@@ -854,6 +854,7 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_control_accepts_a_normalizable_sampler_dtype_and_binds_model_dtype() {
         let tmp = tempfile::tempdir().unwrap();
         let (dit, cfg, _) = crate::testfix::tiny_dit(&tmp);
@@ -900,6 +901,9 @@ mod tests {
             matches!(error, candle_gen::CandleError::Msg(ref message) if message.contains("prepared conditioning request identity")),
             "expected control model-identity rejection, got {error:?}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_dit::tests::prepared_control_accepts_a_normalizable_sampler_dtype_and_binds_model_dtype");
     }
 
     /// sc-18477: the strict-control DiT must expose the same canonical adapter surface as the base DiT,
@@ -975,6 +979,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn convrot_time_mod_projection_is_exposed_to_additive_adapter_walk() {
         let dev = Device::Cpu;
         let canonical = Tensor::from_vec(
@@ -1025,6 +1030,9 @@ mod tests {
             projection.is_convrot(),
             "adapter must preserve the int8 base"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_dit::tests::convrot_time_mod_projection_is_exposed_to_additive_adapter_walk");
     }
 
     #[test]

@@ -53,6 +53,8 @@ fn lens_vae_encode_matches_reference() -> Result<()> {
         Ok(d) => d,
         Err(_) => {
             eprintln!("SKIP: set LENS_VAE_DIR to the Lens vae snapshot dir");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/vae_encode_parity.rs:56 (lens_vae_encode_matches_reference): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return Ok(());
         }
     };
@@ -61,6 +63,8 @@ fn lens_vae_encode_matches_reference() -> Result<()> {
     });
     if !std::path::Path::new(&goldens_path).exists() {
         eprintln!("SKIP: goldens not found at {goldens_path} (run scripts/dump_lens_vae_encode_golden.py)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/vae_encode_parity.rs:62 (lens_vae_encode_matches_reference): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return Ok(());
     }
 
@@ -98,5 +102,9 @@ fn lens_vae_encode_matches_reference() -> Result<()> {
     assert!(cos > 0.999, "lens encode cosine {cos:.7} ≤ 0.999");
     assert!(pr < 2e-2, "lens encode peak_rel {pr:.3e} ≥ 2e-2");
     eprintln!("ALL PASS");
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED vae_encode_parity::lens_vae_encode_matches_reference"
+    );
     Ok(())
 }

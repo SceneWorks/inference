@@ -1,5 +1,15 @@
 //! Real-weight Stable Audio 3 DiT parity and exact key-consumption gates.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -255,6 +265,9 @@ fn small_music_intermediates_and_frozen_v_zero_padding_match() {
         valid_prefix_delta > 1e-4,
         "frozen CPU zero-V padding must change the valid-prefix softmax"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED small_music_intermediates_and_frozen_v_zero_padding_match");
 }
 
 /// Every assertion here is a self-comparison between two real-weight forwards — no frozen artifact
@@ -403,6 +416,9 @@ fn real_weights_detect_conditioning_mutations_and_exercise_cfg_apg() {
         "absent negative conditioning must zero the entire cross context, while an explicit \
          all-invalid negative prompt retains its conditioned duration row"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights_detect_conditioning_mutations_and_exercise_cfg_apg");
 }
 
 fn max_abs_diff(left: &Tensor, right: &Tensor) -> f32 {
@@ -425,6 +441,9 @@ fn all_six_cpu_f32_predictions_match_p0() {
     for case in CASES {
         run_case(case, &device);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED all_six_cpu_f32_predictions_match_p0");
 }
 
 #[test]
@@ -434,6 +453,9 @@ fn selected_real_device_prediction_matches_p0() {
         .expect("SA3_DIT_CASE_ENV must name one of the six snapshot environment variables");
     let case = CASES.iter().find(|case| case.env == selected).unwrap();
     run_case(case, &device());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED selected_real_device_prediction_matches_p0");
 }
 
 #[test]
@@ -488,6 +510,9 @@ fn selected_real_device_resource_probe() {
         candle_audio_stable_audio_3::candle_audio::harness::peak_rss_bytes(),
         checksum,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED selected_real_device_resource_probe");
 }
 
 struct TrackingBackend {

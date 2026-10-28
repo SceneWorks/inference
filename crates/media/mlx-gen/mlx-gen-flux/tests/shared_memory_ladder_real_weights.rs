@@ -677,4 +677,6 @@ fn exact_q4_shared_memory_ladder_arm() {
         get_cache_memory(),
         mlx_gen_flux::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::exact_q4_shared_memory_ladder_arm");
 }

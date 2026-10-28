@@ -37,6 +37,7 @@ sceneworks-gen-core-testkit = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-audio/model-inference-proof", "core-llm/model-inference-proof"]
 default = []
 # Keep candle-core (through candle-audio) and candle-nn on the same backend.
 metal = ["candle-audio/metal", "candle-nn/metal"]

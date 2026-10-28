@@ -123,4 +123,6 @@ fn dev_text_encoder_prompt_embeds_match_reference() {
         mean < bound,
         "dev TE prompt_embeds diverged (real tokens): mean_rel={mean} (ref={ref_kind})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_dev_real_weights::dev_text_encoder_prompt_embeds_match_reference");
 }

@@ -232,7 +232,14 @@ fn device_name(device: &Device) -> &'static str {
 }
 
 fn read_json(path: &std::path::Path) -> Result<(serde_json::Value, String), Error> {
-    let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
+    let bytes = candle_audio::gen_core::__model_input_reader!(
+        std::fs::read(path),
+        "crates/audio/candle-audio-sheetsage2/src/provider.rs::read_json::std::fs::read@8752",
+        ArtifactInput,
+        path,
+        |__model_input_path| std::fs::read(__model_input_path)
+    )
+    .map_err(|e| Error::io(path, e))?;
     let value = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
     let digest = Sha256::digest(&bytes)

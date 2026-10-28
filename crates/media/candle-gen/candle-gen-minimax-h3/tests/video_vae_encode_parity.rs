@@ -181,6 +181,7 @@ fn fixture_provenance_records_the_converted_path() {
 /// The bare encoder stack: `conv_in → down_blocks → norm_out → silu → conv_out`, at `T = 5` so
 /// the frame-isolated GroupNorm and the temporal strides are both live.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn encoder_stack_matches_the_reference() {
     let f = fixture();
     let cfg = encode_fixture_config(3);
@@ -195,6 +196,9 @@ fn encoder_stack_matches_the_reference() {
     assert_eq!(got.dims(), want.dims());
     assert_parity(&got, &want, TOL, "encoder stack");
     assert!(std_dev(&want) > 1e-4, "a ~constant golden is a false green");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::encoder_stack_matches_the_reference");
 }
 
 /// The spatial compression really is `patch_size`, with **no cropping**. A downsampler that
@@ -219,6 +223,7 @@ fn the_encoder_halves_rather_than_crops() {
 
 /// `_encode_clip` untiled — the encoder followed by `quant_conv`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn encode_clip_matches_the_reference_untiled() {
     let f = fixture();
     let v = vae(&f, 3);
@@ -239,6 +244,9 @@ fn encode_clip_matches_the_reference_untiled() {
         TOL,
         "encode_clip at the shipped tile size",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::encode_clip_matches_the_reference_untiled");
 }
 
 /// **The tiled encode**, at the fixture's shrunk tile geometry — the blend, the round-robin slack
@@ -248,6 +256,7 @@ fn encode_clip_matches_the_reference_untiled() {
 /// on in `__init__` rather than through `enable_tiling()`, so a port written from the class body
 /// alone would never see it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn tiled_encode_matches_the_reference() {
     let f = fixture();
     let v = vae(&f, 3);
@@ -282,6 +291,9 @@ fn tiled_encode_matches_the_reference() {
          tile blend"
     );
     const { assert!(ENCODER_TILING_IS_ON_BY_DEFAULT) };
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::tiled_encode_matches_the_reference");
 }
 
 /// **The keyframe path.** A single frame short-circuits the temporal chunking and produces
@@ -291,6 +303,7 @@ fn tiled_encode_matches_the_reference() {
 /// the temporal path over 17 copies of the image and return several latent frames, a plausible
 /// tensor of the wrong shape carrying conditioning the model was never trained on.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_keyframe_encodes_to_exactly_one_latent_frame() {
     let f = fixture();
     let v = vae(&f, 3);
@@ -315,12 +328,16 @@ fn a_keyframe_encodes_to_exactly_one_latent_frame() {
         std_dev(&want_std) > 1e-6,
         "a constant posterior std would make the sample seed inert"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::a_keyframe_encodes_to_exactly_one_latent_frame");
 }
 
 /// The chunked video path — 17 frames is exactly one clip, and `token_drop` trims the tail. Kept
 /// alongside the keyframe golden so the two paths gate each other rather than only one being
 /// exercised.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn chunked_encode_matches_the_reference() {
     let f = fixture();
     let v = vae(&f, 3);
@@ -339,6 +356,9 @@ fn chunked_encode_matches_the_reference() {
         .expect("encode");
     assert_eq!(single.mean().dims()[2], 1);
     assert!(posterior.mean().dims()[2] > 1);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::chunked_encode_matches_the_reference");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -351,6 +371,7 @@ fn chunked_encode_matches_the_reference() {
 /// This is why the parity goldens above are dumped at `T = 5` and `T = 17`. Written as a direct
 /// comparison rather than through the encoder, so it measures the convention itself.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn groupnorm_is_frame_isolated() {
     let dev = Device::Cpu;
     let cfg = encode_fixture_config(3);
@@ -418,6 +439,11 @@ fn groupnorm_is_frame_isolated() {
         delta > MUTATION_FLOOR,
         "a global GroupNorm gives the same answer ({delta:.3e}); this probe cannot gate isolation"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::groupnorm_is_frame_isolated"
+    );
 }
 
 /// **The downsampler's reflect pad is bottom/right only, and a symmetric one is the same SHAPE.**
@@ -426,6 +452,7 @@ fn groupnorm_is_frame_isolated() {
 /// even canvas, so only the values differ. Fed through the fixture's own stride-2 downsampler
 /// weight so the separation is measured on real convolution output rather than on the pad alone.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_downsampler_pad_is_asymmetric_and_that_is_not_free() {
     let f = fixture();
     let w = weights(model_map(&f));
@@ -472,6 +499,9 @@ fn the_downsampler_pad_is_asymmetric_and_that_is_not_free() {
         "a symmetric pad gives the same answer ({delta:.3e}); the parity goldens above cannot be \
          said to gate the half-pixel shift"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::the_downsampler_pad_is_asymmetric_and_that_is_not_free");
 }
 
 /// **What this suite cannot resolve**, pinned with numbers rather than left to be assumed.
@@ -492,6 +522,7 @@ fn the_downsampler_pad_is_asymmetric_and_that_is_not_free() {
 /// `a_config_missing_an_encoder_key_is_rejected` (a config without `norm_eps` is an error, not a
 /// silently-defaulted encoder).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_parity_bound_cannot_resolve_an_epsilon_substitution() {
     let f = fixture();
     let pixels = f.tensor("in.encode_clip.pixels");
@@ -531,6 +562,9 @@ fn the_parity_bound_cannot_resolve_an_epsilon_substitution() {
          an improvement, but this file's docs claim the goldens cannot resolve it — re-state them \
          before re-greening this."
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::the_parity_bound_cannot_resolve_an_epsilon_substitution");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -543,6 +577,7 @@ fn the_parity_bound_cannot_resolve_an_epsilon_substitution() {
 ///
 /// Mutating the whole set at once would prove only that the set is load-bearing, not each member.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn encoder_weights_are_all_load_bearing() {
     let f = fixture();
     let pixels = f.tensor("in.encode_clip.pixels");
@@ -625,11 +660,15 @@ fn encoder_weights_are_all_load_bearing() {
     // the sixteen is a divergence this file would actually catch.
     const { assert!(NORMALIZED_MUTATION_FLOOR >= TOL * 10.0) };
     const { assert!(MUTATION_FLOOR > NORMALIZED_MUTATION_FLOOR) };
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::encoder_weights_are_all_load_bearing");
 }
 
 /// The tiled golden depends on the tile geometry: encoding at a different tile size must give a
 /// different answer, or the "tiled" test is silently running the untiled path.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_tile_geometry_changes_the_result() {
     let f = fixture();
     let v = vae(&f, 3);
@@ -677,6 +716,9 @@ fn the_tile_geometry_changes_the_result() {
         "a min_overlap the slack has already absorbed must give the identical plan, got \
          {odelta:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::the_tile_geometry_changes_the_result");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -693,6 +735,7 @@ fn the_tile_geometry_changes_the_result() {
 /// is wrong, and never a silent wrong answer, so the untiled path does not need a check added; it
 /// needs covering, which is what the second half of this test does.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn encode_rejects_malformed_input() {
     use candle_gen_minimax_h3::spatial_tiling::SpatialTiling;
     let f = fixture();
@@ -732,6 +775,11 @@ fn encode_rejects_malformed_input() {
     );
     assert!(off.encode(&rgba).is_err());
     assert!(off.encode(&empty).is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::encode_rejects_malformed_input"
+    );
 }
 
 /// A VAE built from a weight map **without** the encode half decodes but cannot encode, and says
@@ -771,6 +819,7 @@ fn a_decode_only_weight_map_reports_the_missing_encode_half() {
 /// The posterior sample is `mean + std · noise`, and the noise is genuinely load-bearing — a
 /// sampler that quietly returned the mean would pass any test that only inspects shapes.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_posterior_sample_depends_on_its_noise() {
     let f = fixture();
     let v = vae(&f, 3);
@@ -805,6 +854,9 @@ fn the_posterior_sample_depends_on_its_noise() {
     assert!(posterior.sample_with(&wrong).is_err());
     let params = Tensor::zeros((1, 2, 1, 1, 1), DType::F32, &Device::Cpu).unwrap();
     DiagonalGaussian::from_parameters(&params).expect("a minimal posterior");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::the_posterior_sample_depends_on_its_noise");
 }
 
 /// `normalize` is the exact inverse of `denormalize`. `fl2va` encodes a keyframe and then
@@ -856,6 +908,7 @@ fn the_shipped_tile_geometry_is_pinned() {
 /// it `encode_clip` could keep reading the shipped constants directly while `decode_clip` follows
 /// the knobs, which compiles and leaves every other assertion in both suites passing.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_tiling_knobs_select_the_paths_they_name_on_the_encode_half() {
     use candle_gen_minimax_h3::spatial_tiling::SpatialTiling;
     let f = fixture();
@@ -899,6 +952,9 @@ fn the_tiling_knobs_select_the_paths_they_name_on_the_encode_half() {
     // default must agree with the untiled path, exactly as it does for decode.
     assert!(f.shape("in.encode_clip.pixels")[3] < TILE_SAMPLE_MIN_SIZE);
     assert_eq!(flat(&base.encode_clip(&pixels).expect("default")), untiled);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::the_tiling_knobs_select_the_paths_they_name_on_the_encode_half");
 }
 
 /// **The latent-alignment guard is reachable from the ENCODE half's public API**, not merely from
@@ -915,6 +971,7 @@ fn the_tiling_knobs_select_the_paths_they_name_on_the_encode_half() {
 /// The encode fixture's ratio is **4**, not the decode fixture's 2, so the geometries refused here
 /// are the ones 4 refuses.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_encode_tile_geometry_the_latent_grid_cannot_express_is_refused() {
     let f = fixture();
     let pixels = f.tensor("in.encode_clip.pixels");
@@ -991,4 +1048,7 @@ fn an_encode_tile_geometry_the_latent_grid_cannot_express_is_refused() {
     // The aligned geometry still encodes, so the guard refuses the misalignment and nothing else.
     let (tile, overlap) = encode_fixture_tiles(&f);
     assert!(vae(&f, 3).encode_clip_tiled(&pixels, tile, overlap).is_ok());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::an_encode_tile_geometry_the_latent_grid_cannot_express_is_refused");
 }

@@ -303,6 +303,7 @@ mod tests {
     /// This is weights-free: it runs on the checked-in 2-block fixture, so the mechanism is gated in
     /// CI rather than only on an operator's Mac.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_windowed_forward_is_bit_identical_to_the_resident_one() {
         let cfg = tiny_cfg();
         let weights = Weights::from_file(fixture()).expect("fixture");
@@ -370,6 +371,8 @@ mod tests {
                 "window {window} must be bit-identical to the resident forward"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED block_stream::tests::a_windowed_forward_is_bit_identical_to_the_resident_one");
     }
 
     /// A plan or a stream sized for a different stack is refused rather than silently walking a

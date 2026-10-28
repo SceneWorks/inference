@@ -546,6 +546,9 @@ fn sdxl_curated_preview_frames_evolve_toward_the_final_image() {
         1024,
         0.83,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::sdxl_curated_preview_frames_evolve_toward_the_final_image");
 }
 
 /// The registered route's OTHER lane: the bespoke Lightning Euler-trailing loop, which drives no
@@ -578,6 +581,9 @@ fn sdxl_lightning_preview_frames_evolve_toward_the_final_image() {
         movement.windows(2).all(|p| p[1] > p[0]),
         "the trailing schedule must accelerate into its terminal step: {movement:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::sdxl_lightning_preview_frames_evolve_toward_the_final_image");
 }
 
 /// Exactly one frame per **outer** solver step on a multi-eval solver.
@@ -607,6 +613,9 @@ fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
     );
     // `assert_lane_previews_converge` already required exactly `steps` frames numbered 1..=steps, so
     // the dedup collapsed the extra evaluations. Stated here because that is the point of the row.
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::a_multi_eval_solver_emits_one_frame_per_outer_step");
 }
 
 /// This story's own finding, measured rather than argued: the ε/DDPM running latent is **not** the

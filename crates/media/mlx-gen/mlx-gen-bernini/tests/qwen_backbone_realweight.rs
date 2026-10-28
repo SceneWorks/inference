@@ -84,4 +84,8 @@ fn qwen_backbone_real_weight_smoke() {
         "penultimate must be finite & non-trivial (max abs {m})"
     );
     println!("qwen2.5-vl backbone real-weight forward ok: penultimate max|·| = {m:.4}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED qwen_backbone_realweight::qwen_backbone_real_weight_smoke"
+    );
 }

@@ -355,7 +355,13 @@ impl LtxConfig {
         if !path.exists() {
             return Ok(Self::video_only_defaults());
         }
-        let text = std::fs::read_to_string(&path)?;
+        let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@17772",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
         let root_cfg: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
         let t = root_cfg
@@ -598,7 +604,13 @@ impl LtxVaeConfig {
         if !path.exists() {
             return Ok(Self::defaults());
         }
-        let text = std::fs::read_to_string(&path)?;
+        let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@29553",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
         let root_cfg: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
         match root_cfg.get("vae") {
@@ -718,7 +730,13 @@ impl AudioVaeConfig {
         if !path.exists() {
             return Ok(Self::defaults());
         }
-        let text = std::fs::read_to_string(&path)?;
+        let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@35239",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
         let root_cfg: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
         let dd = root_cfg
@@ -902,7 +920,13 @@ impl VocoderConfig {
         if !path.exists() {
             return Ok(Self::defaults());
         }
-        let text = std::fs::read_to_string(&path)?;
+        let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@42938",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
         let root_cfg: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
         Ok(match root_cfg.get("vocoder") {
@@ -960,7 +984,13 @@ impl SplitModel {
         if !path.exists() {
             return Ok(Self::dense());
         }
-        let text = std::fs::read_to_string(&path)?;
+        let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@45676",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx: parse split_model.json: {e}")))?;
         Ok(Self::from_value(&v))

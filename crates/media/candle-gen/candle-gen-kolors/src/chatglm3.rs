@@ -192,9 +192,18 @@ impl ChatGlmModel {
         cos: &Tensor,
         sin: &Tensor,
     ) -> CandleResult<Tensor> {
-        let r = self.attn(layer, &layer.input_ln.forward(x)?, mask, cos, sin)?;
+        let r = self.attn(
+            layer,
+            &__model_proof_output!(layer.input_ln.forward(x))?,
+            mask,
+            cos,
+            sin,
+        )?;
         let h = (x + r)?;
-        let r = self.mlp(layer, &layer.post_attn_ln.forward(&h)?)?;
+        let r = self.mlp(
+            layer,
+            &__model_proof_output!(layer.post_attn_ln.forward(&h))?,
+        )?;
         &h + r
     }
 
@@ -618,6 +627,7 @@ mod tests {
     /// shared `candle_gen::quant` packed-vs-dense tolerance (cosine > 0.99999) — proving the packed load
     /// path is numerically faithful for BOTH Kolors conditioning outputs (penultimate context + pooled).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_vs_dense_encode_parity() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tiny_cfg();
@@ -642,6 +652,9 @@ mod tests {
 
         std::fs::remove_file(&tmp_p).ok();
         std::fs::remove_file(&tmp_d).ok();
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED chatglm3::tests::packed_vs_dense_encode_parity");
     }
 
     #[test]

@@ -245,7 +245,9 @@ class WindowsOwnerTests(unittest.TestCase):
     def assert_exited(self, name):
         from scripts.tests.test_media_campaign_supervisor import WindowsSupervisorTests
 
-        WindowsSupervisorTests._assert_exited(self, int((self.dir / name).read_text(encoding="ascii")))
+        # CI_IMPACT: fixture adapter only; preserve the same native process-death assertion.
+        pid = int((self.dir / name).read_text(encoding="ascii"))
+        self.assertTrue(WindowsSupervisorTests._has_exited(self, pid), f"owned process {pid} is still alive")
 
     def test_success_and_nonzero_exit(self):
         self.assertEqual(self.supervise("print('hello')").strip(), "hello")
@@ -274,13 +276,13 @@ class WindowsOwnerTests(unittest.TestCase):
         self.assert_exited("r")
 
 
-class Gpu0ResourceTests(unittest.TestCase):
+class Gpu1ResourceTests(unittest.TestCase):
     UUID = "GPU-00112233-4455-6677-8899-aabbccddeeff"
     OTHER = "GPU-ffeeddcc-bbaa-9988-7766-554433221100"
 
     def check(self, gpus=None, failure=None):
-        query = mock.Mock(return_value=gpus or f"0, {self.UUID}, 8192, 16384\n1, {self.OTHER}, N/A, N/A\n", side_effect=failure)
-        result = unit.require_gpu0_budget(query)
+        query = mock.Mock(return_value=gpus or f"1, {self.UUID}, 8192, 16384\n0, {self.OTHER}, N/A, N/A\n", side_effect=failure)
+        result = unit.require_gpu1_budget(query)
         query.assert_called_once_with("--query-gpu=index,uuid,memory.free,memory.total")
         return result
 
@@ -293,28 +295,28 @@ class Gpu0ResourceTests(unittest.TestCase):
         self.assertEqual(result["uuid"], self.UUID)
         floor = result["budget"]["required_bytes"] // unit.MIB
         try:
-            self.check(f"0, {self.UUID}, {floor}, 16384\n")
+            self.check(f"1, {self.UUID}, {floor}, 16384\n")
         except unit.UnitFailure as error:
             self.fail(f"exact free-VRAM floor was refused: {error}")
         with self.assertRaisesRegex(unit.UnitFailure, "below unit requirement"):
-            self.check(f"0, {self.UUID}, {floor - 1}, 16384\n")
+            self.check(f"1, {self.UUID}, {floor - 1}, 16384\n")
 
     def test_unknown_malformed_ambiguous_and_insufficient_resource_fail_closed(self):
-        rows = [" ", f"1, {self.OTHER}, 5000, 6000", f"0, {self.UUID}, 5000, 6000\n0, {self.OTHER}, 5000, 6000",
-                f"0, {self.UUID}, 5000, 6000\n1, {self.UUID}, 5000, 6000", "0, GPU-bad, 5000, 6000",
-                f"0, {self.UUID}, N/A, 6000", f"0, {self.UUID}, nan, 6000", f"0, {self.UUID}, inf, 6000",
-                f"0, {self.UUID}, -1, 6000", f"0, {self.UUID}, 7000, 6000", f"0, {self.UUID}, 5000, inf", f"0, {self.UUID}, 5000, N/A", f"0, {self.UUID}, 5000"]
+        rows = [" ", f"0, {self.OTHER}, 5000, 6000", f"1, {self.UUID}, 5000, 6000\n0, {self.UUID}, 5000, 6000",
+                f"1, {self.UUID}, 5000, 6000\n1, {self.UUID}, 5000, 6000", "1, GPU-bad, 5000, 6000",
+                f"1, {self.UUID}, N/A, 6000", f"1, {self.UUID}, nan, 6000", f"1, {self.UUID}, inf, 6000",
+                f"1, {self.UUID}, -1, 6000", f"1, {self.UUID}, 7000, 6000", f"1, {self.UUID}, 5000, inf", f"1, {self.UUID}, 5000, N/A", f"1, {self.UUID}, 5000"]
         for row in rows:
             with self.subTest(row=row), self.assertRaises(unit.UnitFailure): self.check(row)
         for failure in (OSError("denied"), RuntimeError("trusted tool unavailable"), unit.subprocess.TimeoutExpired("nvml", 15)):
             with self.assertRaises(unit.UnitFailure): self.check(failure=failure)
 
     def test_nonzero_exit_refused_despite_valid_resource_stdout(self):
-        data = f"0, {self.UUID}, 8192, 16384\n"
+        data = f"1, {self.UUID}, 8192, 16384\n"
         with mock.patch.object(unit, "smi_path", return_value="trusted-nvml"), mock.patch.object(unit.subprocess, "run", return_value=unit.subprocess.CompletedProcess([], 0, stdout=data)) as run:
-            unit.require_gpu0_budget()
+            unit.require_gpu1_budget()
             run.return_value = unit.subprocess.CompletedProcess([], 9, stdout=data)
-            with self.assertRaisesRegex(unit.UnitFailure, "exited with 9"): unit.require_gpu0_budget()
+            with self.assertRaisesRegex(unit.UnitFailure, "exited with 9"): unit.require_gpu1_budget()
 
     def test_actual_shared_fixture_defines_monotonic_exact_ledger_and_growth(self):
         resource, fixture, dmd = unit.read_unit_resources()
@@ -349,14 +351,14 @@ class Gpu0ResourceTests(unittest.TestCase):
         self.assertGreater(unit.derive_unit_budget(higher_rank, fixture, dmd)["unrounded_bytes"], before["unrounded_bytes"])
 
     def test_budget_refusal_precedes_owner_and_spawn(self):
-        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(unit, "os", types.SimpleNamespace(name="nt")), mock.patch.object(unit, "provenance", return_value="x"), mock.patch.object(unit, "require_gpu0_budget", side_effect=unit.UnitFailure("insufficient")), mock.patch.object(unit, "WindowsOwner") as owner, mock.patch.object(unit, "supervise") as supervise:
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(unit, "os", types.SimpleNamespace(name="nt")), mock.patch.object(unit, "provenance", return_value="x"), mock.patch.object(unit, "require_gpu1_budget", side_effect=unit.UnitFailure("insufficient")), mock.patch.object(unit, "WindowsOwner") as owner, mock.patch.object(unit, "supervise") as supervise:
             record = Path(scratch) / "exe"; exe = Path(scratch) / "t"
             exe.write_text("x", encoding="utf-8"); record.write_text(str(exe), encoding="utf-8")
             with self.assertRaisesRegex(unit.UnitFailure, "insufficient"): unit.run_command(record)
             supervise.assert_not_called(); owner.assert_not_called()
 
     def test_fresh_uuid_binding_is_child_only_and_overrides_inherited_values(self):
-        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(unit, "os", types.SimpleNamespace(name="nt", environ=dict(os.environ, CUDA_VISIBLE_DEVICES="stale", CUDA_DEVICE_ORDER="FASTEST_FIRST", MOSS_CUDA_UNIT_EXPECTED_GPU_UUID=self.OTHER))), mock.patch.object(unit, "provenance", return_value="x"), mock.patch.object(unit, "require_gpu0_budget", return_value={"uuid": self.UUID, "free_bytes": 9999999999, "budget": {"required_bytes": 1610612736}}), mock.patch.object(unit, "WindowsOwner"), mock.patch.object(unit, "supervise", return_value=OK_OUTPUT.replace(" ... ok", f" ... MOSS_CUDA_CONTEXT_UUID={self.UUID}\nok")) as supervise:
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(unit, "os", types.SimpleNamespace(name="nt", environ=dict(os.environ, CUDA_VISIBLE_DEVICES="stale", CUDA_DEVICE_ORDER="FASTEST_FIRST", MOSS_CUDA_UNIT_EXPECTED_GPU_UUID=self.OTHER))), mock.patch.object(unit, "provenance", return_value="x"), mock.patch.object(unit, "require_gpu1_budget", return_value={"uuid": self.UUID, "free_bytes": 9999999999, "budget": {"required_bytes": 1610612736}}), mock.patch.object(unit, "WindowsOwner"), mock.patch.object(unit, "supervise", return_value=OK_OUTPUT.replace(" ... ok", f" ... MOSS_CUDA_CONTEXT_UUID={self.UUID}\nok")) as supervise:
             record = Path(scratch) / "exe"; exe = Path(scratch) / "t"
             exe.write_text("x", encoding="utf-8"); record.write_text(str(exe), encoding="utf-8")
             before = dict(unit.os.environ)
@@ -365,6 +367,7 @@ class Gpu0ResourceTests(unittest.TestCase):
             child = supervise.call_args.kwargs["env"]
             self.assertEqual(child["CUDA_VISIBLE_DEVICES"], self.UUID)
             self.assertEqual(child["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+            self.assertEqual(child["SCENEWORKS_GPU_ID"], "1")
             self.assertEqual(child[unit.EXPECTED_UUID_ENV], self.UUID)
             self.assertEqual(unit.os.environ, before)
 
@@ -414,11 +417,11 @@ class FixedCommandTests(unittest.TestCase):
         )
         self.assertEqual(
             unit.RUN_ARGS,
-            [unit.TEST_NAME, "--exact", "--nocapture", "--color", "never", "--test-threads=1"],
+            [unit.TEST_NAME, "--exact", "--ignored", "--nocapture", "--color", "never", "--test-threads=1"],
         )
         self.assertEqual((unit.DEADLINE_SECONDS, unit.RSS_CAP_BYTES), (300.0, 6 * 1024**3))
 
-    def test_the_fixed_test_exists_unignored_in_the_package_source(self):
+    def test_the_fixed_test_is_ignored_in_ordinary_ci_and_selected_manually(self):
         source = (unit.REPO_ROOT / "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs").read_text(
             encoding="utf-8"
         )
@@ -426,7 +429,7 @@ class FixedCommandTests(unittest.TestCase):
         attributes = source[source.rindex("\n}\n", 0, head):head]
         self.assertIn('#[cfg(feature = "cuda")]', attributes)
         self.assertIn("#[test]", attributes)
-        self.assertNotIn("ignore", attributes)
+        self.assertIn("#[ignore", attributes)
         body = source[head:source.index("\n}\n", head)]
         self.assertIn("Device::new_cuda(0).expect(", body)
         self.assertIn("is_cuda()", body)

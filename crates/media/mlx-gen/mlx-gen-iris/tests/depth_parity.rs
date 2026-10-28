@@ -71,10 +71,14 @@ fn map_array(map: &DepthMap) -> Array {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn depth_matches_upstream_stage_by_stage() {
     crate::common::cpu_process(
         "depth_parity::depth_matches_upstream_stage_by_stage",
-        depth_matches_upstream_stage_by_stage_body,
+        || {
+            depth_matches_upstream_stage_by_stage_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_parity::depth_matches_upstream_stage_by_stage");
+        },
     );
 }
 
@@ -168,11 +172,14 @@ fn depth_matches_upstream_stage_by_stage_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn bf16_release_policy_tracks_upstream() {
-    crate::common::cpu_process(
-        "depth_parity::bf16_release_policy_tracks_upstream",
-        bf16_release_policy_tracks_upstream_body,
-    );
+    crate::common::cpu_process("depth_parity::bf16_release_policy_tracks_upstream", || {
+        bf16_release_policy_tracks_upstream_body();
+        eprintln!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED depth_parity::bf16_release_policy_tracks_upstream"
+        );
+    });
 }
 
 fn bf16_release_policy_tracks_upstream_body() {

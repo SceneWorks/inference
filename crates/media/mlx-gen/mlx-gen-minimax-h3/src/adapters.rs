@@ -1036,7 +1036,13 @@ pub fn apply_minimax_h3_adapters(
     for spec in specs {
         let before = report.applied;
         let before_unmatched = report.unmatched_paths.len();
-        let w = Weights::from_file(&spec.path)?;
+        let w = mlx_gen::gen_core::__model_input_choose!(
+            Weights::from_file(&spec.path),
+            mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+                "minimax-h3/adapter-source",
+                || Weights::from_file(&spec.path),
+            )
+        )?;
         // sc-23402: the load boundary. Force and GPU-verify the whole file here, before anything
         // classifies, converts or folds it — see [`verify_adapter_file`] for why a stale adapter
         // read is the silent one.

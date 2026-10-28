@@ -133,6 +133,8 @@ fn qwen3_thinking_and_nothink() {
         !ncontent.trim().is_empty(),
         "no-think must produce a direct answer"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED thinking::qwen3_thinking_and_nothink");
 }
 
 #[test]
@@ -196,6 +198,8 @@ fn qwen3_multi_turn_carries_reasoning() {
         indices2.iter().enumerate().all(|(i, &x)| i == x),
         "turn 2 token indices must be contiguous: {indices2:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED thinking::qwen3_multi_turn_carries_reasoning");
 }
 
 #[test]
@@ -224,4 +228,6 @@ fn non_thinking_model_rejects_enable() {
         "non-thinking model emits no reasoning"
     );
     assert!(!out.text.is_empty());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED thinking::non_thinking_model_rejects_enable");
 }

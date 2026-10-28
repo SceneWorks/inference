@@ -260,11 +260,13 @@ impl Attention {
         let k = shape(self.k_proj.forward(x)?, self.kv_heads)?;
         let v = shape(self.v_proj.forward(x)?, self.kv_heads)?;
         // Per-head RMSNorm (Qwen3).
-        let q =
-            self.q_norm
-                .forward(&q.flatten(0, 2)?)?
-                .reshape((b, self.heads, len, self.head_dim))?;
-        let k = self.k_norm.forward(&k.flatten(0, 2)?)?.reshape((
+        let q = __model_proof_output!(self.q_norm.forward(&q.flatten(0, 2)?))?.reshape((
+            b,
+            self.heads,
+            len,
+            self.head_dim,
+        ))?;
+        let k = __model_proof_output!(self.k_norm.forward(&k.flatten(0, 2)?))?.reshape((
             b,
             self.kv_heads,
             len,
@@ -383,13 +385,15 @@ impl DecoderLayer {
         mask: &Tensor,
         rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
-        let h = self
-            .attn
-            .forward(&self.input_layernorm.forward(x)?, mask, rope)?;
+        let h = self.attn.forward(
+            &__model_proof_output!(self.input_layernorm.forward(x))?,
+            mask,
+            rope,
+        )?;
         let x = (x + h)?;
-        let h = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&x)?)?;
+        let h = self.mlp.forward(&__model_proof_output!(self
+            .post_attention_layernorm
+            .forward(&x))?)?;
         Ok((&x + h)?)
     }
 }
@@ -529,7 +533,8 @@ impl QwenImage21TextEncoder {
     ) -> Result<(Tensor, Vec<(String, Tensor)>)> {
         let (_, len) = input_ids.dims2()?;
         let mut stages = Vec::new();
-        let mut x = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+        let mut x =
+            __model_proof_output!(self.embed_tokens.forward(input_ids))?.to_dtype(self.dtype)?;
         if trace {
             stages.push(("embed".to_string(), x.clone()));
         }
@@ -671,10 +676,8 @@ impl QwenImage21TextEncoder {
 
         // 3. Embed, splice the vision rows in, build interleaved M-RoPE positions.
         let input_ids = input_ids(&ids, &self.device)?;
-        let embeds = self
-            .embed_tokens
-            .forward(&input_ids)?
-            .to_dtype(self.dtype)?;
+        let embeds =
+            __model_proof_output!(self.embed_tokens.forward(&input_ids))?.to_dtype(self.dtype)?;
         let embeds = splice_vision_features(&embeds, &ids, &vision_features, &[image_token])
             .map_err(from_llm)?;
         let (t_row, h_row, w_row, _) =

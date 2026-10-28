@@ -696,6 +696,7 @@ mod tests {
     /// mean-|x|, each level term, the total and the zero self-loss. Mutations: tap after the
     /// downsample; drop the mid attention; uniform level weights ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn matches_the_upstream_reference_on_formula_weights() {
         let fx = fixture();
         let case = &fx["vae_anchor"];
@@ -763,6 +764,9 @@ mod tests {
             2e-3,
         );
         assert!(scalar(&vae_anchor_feature_loss(&rf, &rf).unwrap().0).abs() < 1e-6);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::vae_anchor::tests::matches_the_upstream_reference_on_formula_weights");
     }
 
     struct Identity;
@@ -779,6 +783,7 @@ mod tests {
     /// (the Conv2D backward hazard). Mutations: drop the reference cache hit ⇒ counter 6; `detach`
     /// the live taps ⇒ no gradient; remove the downsample crop ⇒ backward shape error ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn references_are_cached_once_per_image_and_the_loss_flows_gradient() {
         let spill = tempfile::tempdir().unwrap();
         let mut path = PerceptualPath::new(
@@ -823,12 +828,16 @@ mod tests {
             .get(live.as_tensor())
             .expect("gradient reaches the live x0");
         assert!(scalar(&g.abs().unwrap().sum_all().unwrap()) > 0.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::vae_anchor::tests::references_are_cached_once_per_image_and_the_loss_flows_gradient");
     }
 
     /// One reference encode per `reference` call, none per `loss` call; each entry spills to its
     /// own file and loads back bit-identical (f16). Mutations: spill f32 ⇒ the dtype assertion
     /// reds; load another entry's file ⇒ the bit-exact check reds.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn references_spill_to_disk_and_load_back_bit_exact() {
         let spill = tempfile::tempdir().unwrap();
         let loss = VaeAnchorLoss::with_spill_root(encoder(32), spill.path());
@@ -871,11 +880,15 @@ mod tests {
             scalar(&loaded[0].to_dtype(DType::F32).unwrap().sum_all().unwrap()),
             "each entry has its own file"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::vae_anchor::tests::references_spill_to_disk_and_load_back_bit_exact");
     }
 
     /// The per-job cache directory is removed at job end (loss dropped) and on an error / panic
     /// unwinding through the job. Mutation: drop `SpillDir`'s `Drop` impl ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_reference_cache_is_removed_at_job_end_and_on_error() {
         let spill = tempfile::tempdir().unwrap();
         let x = uniform(7, (1, 8, 8, 3));
@@ -896,6 +909,9 @@ mod tests {
         assert!(r.is_err());
         let dir = crate::sync::lock_recover(&seen).clone().unwrap();
         assert!(!dir.exists(), "removed on error");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::vae_anchor::tests::the_reference_cache_is_removed_at_job_end_and_on_error");
     }
 
     #[test]

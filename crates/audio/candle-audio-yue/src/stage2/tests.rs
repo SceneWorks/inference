@@ -351,6 +351,7 @@ fn track(frames: u32) -> Vec<u32> {
 /// asserted Q8/Q4 that is not staged pre-quantized (quantized from `bf16/` on load). A root with
 /// nothing staged is a load error, not a stub.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn production_load_upsamples_through_candle_llm() {
     let root = tempfile::tempdir().unwrap();
     write_synthetic_snapshot(&root.path().join("bf16"));
@@ -370,11 +371,15 @@ fn production_load_upsamples_through_candle_llm() {
         ..assets
     };
     assert!(load(&empty, None).is_err(), "nothing staged");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage2::tests::production_load_upsamples_through_candle_llm");
 }
 
 /// **AC2 with a real LM** — batching is output-neutral: 2 full chunks + a ragged tail decoded as
 /// one 2-row group produce exactly the grid of decoding every chunk alone.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn batched_length_groups_equal_single_row_decoding() {
     let dir = tempfile::tempdir().unwrap();
     write_synthetic_snapshot(dir.path());
@@ -385,11 +390,15 @@ fn batched_length_groups_equal_single_row_decoding() {
     let (single, _) = upsample_with(&mut lm, &cb0, 1, &cancel).unwrap();
     batched.check_against(&cb0).unwrap();
     assert_eq!(batched, single);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage2::tests::batched_length_groups_equal_single_row_decoding");
 }
 
 /// The static-cache incremental decode computes the same logits as re-running the whole context
 /// from scratch each step (upstream `generate` re-prefills every frame).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn incremental_decode_matches_a_full_reprefill() {
     let dir = tempfile::tempdir().unwrap();
     write_synthetic_snapshot(dir.path());
@@ -404,6 +413,9 @@ fn incremental_decode_matches_a_full_reprefill() {
         d.max_abs_logit_delta,
         d.max_abs_logit
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage2::tests::incremental_decode_matches_a_full_reprefill");
 }
 
 /// Recomputes each step over the whole history with a fresh cache (upstream's per-frame prefill).
@@ -514,6 +526,7 @@ mod metal {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn metal_bf16_divergence_from_cpu_f32_is_characterised() {
         let device = Device::new_metal(0).expect("the metal feature requires a Metal device");
         let dir = tempfile::tempdir().unwrap();
@@ -526,5 +539,8 @@ mod metal {
         let cb0 = track(CHUNK_FRAMES as u32 + 5);
         let (grid, _) = upsample_with(&mut gpu, &cb0, 2, &CancelFlag::new()).unwrap();
         grid.check_against(&cb0).unwrap();
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED stage2::tests::metal::metal_bf16_divergence_from_cpu_f32_is_characterised");
     }
 }

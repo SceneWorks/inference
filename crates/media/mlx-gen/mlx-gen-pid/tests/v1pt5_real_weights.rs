@@ -72,6 +72,8 @@ fn v1pt5_flux_loads_and_forwards() {
     );
     assert!(peak > 1e-6, "v1.5 forward collapsed to ~0 (peak={peak})");
     eprintln!("v1.5 flux forward OK — output [1,3,64,64], peak|·|={peak:.4}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED v1pt5_real_weights::v1pt5_flux_loads_and_forwards");
 }
 
 /// NUMERIC GOLDEN (sc-12142): the mlx v1.5 flux `PidNet::forward` matches the reference torch
@@ -119,5 +121,9 @@ fn v1pt5_flux_forward_matches_reference() {
     assert!(
         peak_rel < 3e-2,
         "v1.5 forward diverges from reference: peak-rel={peak_rel} (max|Δ|={max_abs_diff})"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED v1pt5_real_weights::v1pt5_flux_forward_matches_reference"
     );
 }

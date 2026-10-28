@@ -25,6 +25,15 @@
 //! destabilizes InstantID's strong conditioning collapses the face toward 0 / undetectable. The mlx
 //! baseline lands euler/heun ~0.79, dpmpp_2m ~0.63.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 use std::path::Path;
 
 use candle_gen::gen_core::{Image, LoadSpec, WeightsSource};
@@ -145,4 +154,7 @@ fn curated_samplers_preserve_identity() {
              destabilize InstantID's conditioning"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED curated_samplers_preserve_identity");
 }

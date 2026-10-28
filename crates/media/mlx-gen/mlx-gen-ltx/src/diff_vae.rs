@@ -342,7 +342,13 @@ impl NaDiffusionDecoderConfig {
     pub fn from_model_dir(root: &Path) -> Result<Self> {
         const SECTIONS: [&str; 2] = ["diffusion_vae", "vae"];
         let path = root.join("embedded_config.json");
-        let text = std::fs::read_to_string(&path)?;
+        let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-ltx/src/diff_vae.rs::from_model_dir::std::fs::read_to_string@17071",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
         let root_cfg: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx diffvae: parse {}: {e}", path.display())))?;
         let vae = SECTIONS

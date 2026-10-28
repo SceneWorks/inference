@@ -211,6 +211,7 @@ mod tests {
     /// 256) and run the full encoder forward, asserting the FPN feature/pos shapes — validates the
     /// whole graph end-to-end with no weight download.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn encoder_forward_emits_fpn_shapes() {
         // Tiny config scaled to a 256² input (grid 64) so the test stays light + fast.
         let mut cfg = Sam2ImageEncoderConfig::tiny();
@@ -239,6 +240,10 @@ mod tests {
         assert_eq!(out.vision_features.shape(), &[1, 256, 16, 16]);
         assert_eq!(out.vision_pos_enc[0].shape(), &[1, 256, 64, 64]);
         let _ = std::fs::remove_file(&path);
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED image_encoder::tests::encoder_forward_emits_fpn_shapes"
+        );
     }
 
     /// Build a zero-filled checkpoint with every key the encoder requires, at the config's shapes.

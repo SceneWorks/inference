@@ -18,6 +18,15 @@
 //! [`Generator`](candle_gen::gen_core::Generator) — the registered `flux1_*` descriptors stay
 //! txt2img-only so the worker keeps the rest on the appropriate path.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod ca;
 pub mod eva_clip;
 pub mod idformer;

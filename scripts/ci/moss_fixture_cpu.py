@@ -139,11 +139,13 @@ class CpuOwner:
                             stable_session = os.getsid(pid)
                         except ProcessLookupError:
                             continue
-                        stable_identity = process_identity(pid)
-                        if stable_identity is None:  # Exited/zombie between the two identity reads.
+                        current_identity = process_identity(pid)
+                        if current_identity is None:
+                            # A fast child can exit/become a zombie between the birth samples.
+                            # It is no longer live; retain rejection of every non-None drift.
                             continue
                         if (session != self.session or stable_session != self.session
-                                or stable_identity != identity
+                                or current_identity != identity
                                 or identity[0] != self.uid or identity[1] < self.root_identity[1]):
                             raise UnitFailure("owned session UID/birth ownership differs")
                         self.known[pid] = identity

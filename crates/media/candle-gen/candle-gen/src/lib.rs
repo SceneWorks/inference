@@ -39,6 +39,15 @@
 // Re-export the backend-neutral contract so downstream provider crates resolve `gen_core::…`
 // through `candle_gen::gen_core` (single gen-core resolution — see the skew gate). Mirrors how
 // mlx-gen re-exports gen_core for mlx-gen-sdxl.
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 pub use gen_core;
 // Re-export the registration-constant macros so provider crates call `candle_gen::register_*!`
 // (the candle twin of `mlx_gen::register_generators!`). They include the `Into::into` error bridge.

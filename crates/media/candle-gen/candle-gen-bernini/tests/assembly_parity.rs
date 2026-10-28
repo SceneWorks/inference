@@ -28,6 +28,7 @@ fn assert_exact(name: &str, got: &[f32], want: &[f32]) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn assembly_matches_reference() {
     let dev = Device::Cpu;
     let g = Golden::load("assembly_golden");
@@ -85,6 +86,9 @@ fn assembly_matches_reference() {
         &flat_f32(&trunc),
         &g.f32("out.concat_trunc"),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED assembly_parity::assembly_matches_reference");
 }
 
 /// sc-11148 / F-079: on CUDA the planner-input tensors (token ids embedded by the backbone, plus the
@@ -95,6 +99,7 @@ fn assembly_matches_reference() {
 /// weights) so the CUDA gate catches any regression to a hardcoded-CPU planner tensor.
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn planner_tensors_land_on_cuda_backbone() {
     use std::collections::HashMap;
 
@@ -157,4 +162,9 @@ fn planner_tensors_land_on_cuda_backbone() {
         .unwrap();
     assert!(pos.device().same_device(&dev), "position ids moved to cuda");
     assert!(mask.device().same_device(&dev), "mask moved to cuda");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED assembly_parity::planner_tensors_land_on_cuda_backbone"
+    );
 }

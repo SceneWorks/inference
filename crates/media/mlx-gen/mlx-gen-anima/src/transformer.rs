@@ -10,18 +10,23 @@
 //! `CosmosTransformerBlock`, final layer. **Skipped** (config-off for Anima): learnable pos-embed
 //! (`extra_pos_embed_type=null`), cross-attn projection, ControlNet hooks, img-context.
 
-use mlx_rs::error::{Exception, Result as MlxResult};
+#[cfg(feature = "training")]
+use mlx_rs::error::Exception;
+use mlx_rs::error::Result as MlxResult;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, zeros_dtype};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter, LinearFacts};
+#[cfg(feature = "training")]
+use mlx_gen::adapters::Adapter;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, LinearFacts};
 use mlx_gen::nn::{gelu_exact, modulate, silu, timestep_sincos};
 use mlx_gen::qkv::{
     self, AttnPrepSpec, FusedQkvProjection, QkNormSpec, QkvPart, QkvSource, RopeSpec, RopeStyle,
     RopeTables,
 };
+#[cfg(feature = "training")]
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
@@ -35,6 +40,44 @@ const ATTN_QK_NORM_EPS: f32 = 1e-5;
 const NORM_EPS: f32 = 1e-6;
 /// Sinusoidal timestep-embedding `max_period` (`Timesteps` default).
 const TIME_MAX_PERIOD: f64 = 10000.0;
+
+/// iOS execution-quantum labels (see [`mlx_gen::ios_quantum`]). A capture reads these off a typed
+/// refusal, so they are stable identifiers rather than prose.
+pub(crate) const DIT_EMBED_QUANTUM: &str = "Anima DiT patch/time embed";
+pub(crate) const DIT_BLOCK_QUANTUM: &str = "Anima DiT block";
+pub(crate) const DIT_OUTPUT_QUANTUM: &str = "Anima DiT output projection";
+
+/// Counted live buffers of one DiT block quantum; see `Block::quantum_geometry` for each count.
+pub(crate) const BLOCK_ATTN_HIDDEN_LIVE: u64 = 21;
+pub(crate) const BLOCK_SELF_ATTN_LIVE: u64 = 18;
+pub(crate) const BLOCK_CONTEXT_LIVE: u64 = 3;
+pub(crate) const BLOCK_MLP_HIDDEN_LIVE: u64 = 6;
+pub(crate) const BLOCK_FF_LIVE: u64 = 2;
+
+// The backend, dtype width and SDPA score treatment every Anima attention (DiT, conditioner, Qwen3
+// tower) is priced with are shared kernel accounting (`mlx_gen::ios_quantum`, sc-26433), re-exported
+// so this crate's call sites keep their paths.
+pub(crate) use mlx_gen::ios_quantum::{dtype_bytes, sdpa_scores, Backend};
+
+/// The activation width a DiT block quantum runs at: the f32 RoPE tables promote the rotated q/k,
+/// and from there the attention output, the residual stream and the MLP, to f32 whatever the
+/// incoming hidden state's width (the first block takes the bf16 patch embedding and returns f32).
+pub(crate) fn block_element_bytes(hidden: &Array, rope_table: &Array) -> u64 {
+    hidden.item_size().max(rope_table.item_size()) as u64
+}
+
+/// Logical weight (and dense bias) elements of a DENSE projection; `0` for a packed one.
+pub(crate) fn dense_weight_elements(facts: &LinearFacts) -> u64 {
+    if facts.is_quantized {
+        return 0;
+    }
+    let product = |shape: &[i32]| {
+        shape
+            .iter()
+            .fold(1u64, |a, &d| a.saturating_mul(d.max(0) as u64))
+    };
+    product(&facts.base_shape).saturating_add(facts.bias_shape.as_deref().map_or(0, product))
+}
 
 /// Dense linear (no bias) — adapter-ready (`AdaptableLinear`); auto-detects a packed Q4/Q8 base.
 fn lin(w: &Weights, name: &str) -> Result<AdaptableLinear> {
@@ -432,6 +475,182 @@ impl Block {
         self.attn2.set_sdpa_checkpoint(on);
     }
 
+    /// The geometry of one forward of THIS block, read off its loaded tensors and the request:
+    /// `tokens` image tokens, `context_tokens` conditioner tokens (the encoder's sequence axis),
+    /// the query rows the attention plan actually scores at once (the larger of the self- and
+    /// cross-attention chunks; `tokens` when unbounded), the activation width, and `read_bytes`,
+    /// the stored bytes the quantum itself reads (`0` for a resident block, whose tensors are used
+    /// in place; the block's stored bytes for a rung-4 streamed block, read inside its quantum).
+    ///
+    /// Both attentions call `mlx_rs::fast::scaled_dot_product_attention` (directly, or per query
+    /// chunk through `sdpa_budgeted_bhsd`); their score treatment on `backend` is [`sdpa_scores`]
+    /// of the loaded head dim (128 in the shipped DiT, which the fused Metal kernel serves: no score
+    /// tensor materializes), the width and each attention's query chunking. q/k/v/out are counted
+    /// among the live hidden buffers. The width is f32 (see [`block_element_bytes`]).
+    ///
+    /// Weight copies ([`Self::promoted_weight_bytes`]): a dense bf16 projection fed the f32 stream
+    /// is promoted to an f32 copy for its matmul — the larger phase's copies are priced (a phase's
+    /// copies are released with its matmuls, before the next phase's are made). A packed (q4/q8)
+    /// projection is consumed in place by `quantized_matmul`: no copy.
+    ///
+    /// Counted live buffers (MLX holds an op's buffers until its stream catches up; elementwise
+    /// outputs it donates into a consumed input are not counted; a LayerNorm/RMSNorm is counted
+    /// with the temporaries of MLX's composed non-Metal fallback, so the CPU proof bounds the
+    /// device's fused kernels from above):
+    ///
+    /// * attention phase, `[B, tokens, dim]` ([`BLOCK_ATTN_HIDDEN_LIVE`] = 21): the self-attention —
+    ///   its LayerNorm with the fallback's temporaries and the modulation (3), q/k/v (3), the
+    ///   per-head q/k RMSNorms (2), the RoPE rotate-half and product for q and for k (4), the scaled
+    ///   q, the attention output, its head merge and `output_proj` (4), the gated residual and its
+    ///   sum (2) = 18 — and, live with its tail, the cross-attention's LayerNorm/modulation and
+    ///   q (3). Under a chunked self-attention plan every chunk is evaluated before the next is
+    ///   built, which synchronizes the stream and releases the self-attention's buffers before the
+    ///   cross-attention's exist: the phase then holds the self-attention's 18
+    ///   ([`BLOCK_SELF_ATTN_LIVE`]);
+    /// * cross-attention context, `[B, context_tokens, dim]` ([`BLOCK_CONTEXT_LIVE`] = 3): k, v and
+    ///   the k RMSNorm;
+    /// * MLP phase: the LayerNorm/modulation (3), `proj_out`, the gated residual and its sum = 6
+    ///   hidden ([`BLOCK_MLP_HIDDEN_LIVE`]); `proj_in` and the compiled (fused) exact GELU (2
+    ///   `[B, tokens, ff]`, [`BLOCK_FF_LIVE`]).
+    ///
+    /// Proven against MLX's measured peak, with f32 and with bf16 weights, in
+    /// `quantum_tests::dit_formulas_track_the_measured_peak`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn quantum_geometry(
+        &self,
+        batch: i32,
+        tokens: i32,
+        context_tokens: i32,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        element_bytes: u64,
+        read_bytes: u64,
+        backend: Backend,
+    ) -> mlx_gen::ios_quantum::AttentionBlockGeometry {
+        let heads = self.attn1.heads;
+        let self_rows = plan.budget.query_block(batch, heads, tokens, tokens);
+        let cross_rows = plan
+            .budget
+            .query_block(batch, heads, tokens, context_tokens);
+        let query_rows = self_rows.max(cross_rows).min(tokens);
+        let u = |v: i32| v.max(0) as u64;
+        let scores = sdpa_scores(
+            backend,
+            u(self.attn1.head_dim),
+            element_bytes,
+            &[
+                (u(tokens), u(self_rows), u(tokens)),
+                (u(tokens), u(cross_rows), u(context_tokens)),
+            ],
+        );
+        // A chunked self-attention evaluates every chunk before building the next, which
+        // synchronizes the stream: the self-attention's prefix is released before the
+        // cross-attention's buffers exist, so the phase holds the larger attention, not both.
+        let attn_hidden_live = if self_rows < tokens {
+            BLOCK_SELF_ATTN_LIVE
+        } else {
+            BLOCK_ATTN_HIDDEN_LIVE
+        };
+        mlx_gen::ios_quantum::AttentionBlockGeometry {
+            batch: batch.max(0) as u64,
+            tokens: tokens.max(0) as u64,
+            dim: self.attn1.to_out.base_shape()[0].max(0) as u64,
+            heads: heads.max(0) as u64,
+            context_tokens: context_tokens.max(0) as u64,
+            ff_hidden: self.ff.proj_in.base_shape()[0].max(0) as u64,
+            query_rows: query_rows.max(0) as u64,
+            element_bytes,
+            weight_bytes: read_bytes.saturating_add(self.promoted_weight_bytes(element_bytes)),
+            attn_hidden_live,
+            context_live: BLOCK_CONTEXT_LIVE,
+            scores,
+            mlp_hidden_live: BLOCK_MLP_HIDDEN_LIVE,
+            ff_live: BLOCK_FF_LIVE,
+        }
+    }
+
+    /// iOS quantum scratch for one forward of THIS block ([`Self::quantum_geometry`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn quantum_scratch(
+        &self,
+        batch: i32,
+        tokens: i32,
+        context_tokens: i32,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        element_bytes: u64,
+        read_bytes: u64,
+        backend: Backend,
+    ) -> u64 {
+        mlx_gen::ios_quantum::attention_block_bytes(self.quantum_geometry(
+            batch,
+            tokens,
+            context_tokens,
+            plan,
+            element_bytes,
+            read_bytes,
+            backend,
+        ))
+    }
+
+    /// The f32 copies a forward makes of this block's dense projection weights when the stream is
+    /// wider than their storage (bf16 weights, f32 stream: `matmul` promotes the weight): the
+    /// larger of the attention phase's projections (both attentions' q/k/v/out) and the MLP's.
+    /// The adaLN projections read the bf16 time embedding, so they are not promoted. `0` for a
+    /// packed (q4/q8) block, which `quantized_matmul` consumes in place.
+    pub(crate) fn promoted_weight_bytes(&self, element_bytes: u64) -> u64 {
+        let narrower = self
+            .attn1
+            .to_out
+            .weight_dtype()
+            .is_some_and(|dtype| dtype_bytes(dtype) < element_bytes);
+        if !narrower {
+            return 0;
+        }
+        let attention: u64 = [&self.attn1, &self.attn2]
+            .iter()
+            .map(|attn| {
+                [QkvPart::Q, QkvPart::K, QkvPart::V]
+                    .into_iter()
+                    .map(|part| dense_weight_elements(&attn.qkv.part_facts(part)))
+                    .sum::<u64>()
+                    + dense_weight_elements(&LinearFacts::of(&attn.to_out))
+            })
+            .sum();
+        let mlp = dense_weight_elements(&LinearFacts::of(&self.ff.proj_in))
+            + dense_weight_elements(&LinearFacts::of(&self.ff.proj_out));
+        attention.max(mlp).saturating_mul(element_bytes)
+    }
+
+    /// [`forward`](Self::forward) as one iOS execution quantum: the headroom check runs BEFORE the
+    /// block's graph is constructed and the result is materialized before return. A pass-through
+    /// (exactly `forward`) everywhere except a physical iOS device or the CPU diagnostic fixture.
+    /// `read_bytes` is what this quantum reads from disk (a streamed block's stored bytes; `0`
+    /// for a resident block).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_quantum(
+        &self,
+        hidden: &Array,
+        encoder: &Array,
+        embedded: &Array,
+        temb: &Array,
+        rope: (&Array, &Array),
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        tokens: i32,
+        read_bytes: u64,
+    ) -> Result<Array> {
+        let scratch = self.quantum_scratch(
+            hidden.shape()[0],
+            tokens,
+            encoder.shape()[1],
+            plan,
+            block_element_bytes(hidden, rope.0),
+            read_bytes,
+            Backend::current(),
+        );
+        mlx_gen::ios_quantum::run(DIT_BLOCK_QUANTUM, scratch, || {
+            self.forward(hidden, encoder, embedded, temb, rope, plan)
+        })
+    }
+
     pub(crate) fn forward(
         &self,
         hidden: &Array,
@@ -504,6 +723,12 @@ impl CosmosDiT {
 
     pub fn config(&self) -> &DitConfig {
         &self.cfg
+    }
+
+    /// The resident blocks (the CPU proofs run one block's quantum body directly; the iOS pricing
+    /// prices each block's quantum).
+    pub(crate) fn blocks(&self) -> &[Block] {
+        &self.blocks
     }
 
     /// Arm ladder rung 4 (SC-15524) by recording where `blocks` can be re-read from.
@@ -602,21 +827,14 @@ impl CosmosDiT {
         Ok(x.reshape(&[b, oc, pe_t * pt, pe_h * ph, pe_w * pw])?)
     }
 
-    /// Shared prep + transformer-block loop. Runs `num_blocks` blocks (`None` = all) over the patchified
-    /// hidden state and returns `(hidden [B, seq, hidden], (pe_t, pe_h, pe_w), embedded, temb)`. The
-    /// per-op math is identical to a full [`forward`]; only the number of blocks run is parameterized —
-    /// so [`forward`] and the stage-4 golden hook [`forward_hidden`] share ONE copy of the block math.
-    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn run_blocks(
+    /// The DiT entry quantum's body: concat the padding-mask channel, build this grid's RoPE,
+    /// patchify + patch-embed, and the time embedding. Returns `(hidden, rope, temb, embedded)`.
+    pub(crate) fn embed(
         &self,
         latents: &Array,
         sigma: &Array,
-        encoder: &Array,
         dtype: Dtype,
-        num_blocks: Option<usize>,
-        plan: mlx_gen::attention::AttentionPlan<'_>,
-        window: Option<crate::block_stream::BlockWindow<'_>>,
-    ) -> Result<(Array, (i32, i32, i32), Array, Array)> {
+    ) -> Result<(Array, crate::rope::CosmosRope, Array, Array)> {
         let latents = latents.as_dtype(dtype)?;
         let sh = latents.shape();
         let (b, _c, t, hl, wl) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
@@ -639,6 +857,40 @@ impl CosmosDiT {
 
         // 4. time embedding.
         let (temb, embedded) = self.time_embed.forward(sigma, dtype)?;
+        Ok((hidden, rope, temb, embedded))
+    }
+
+    /// Shared prep + transformer-block loop. Runs `num_blocks` blocks (`None` = all) over the patchified
+    /// hidden state and returns `(hidden [B, seq, hidden], (pe_t, pe_h, pe_w), embedded, temb)`. The
+    /// per-op math is identical to a full [`forward`]; only the number of blocks run is parameterized —
+    /// so [`forward`] and the stage-4 golden hook [`forward_hidden`] share ONE copy of the block math.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn run_blocks(
+        &self,
+        latents: &Array,
+        sigma: &Array,
+        encoder: &Array,
+        dtype: Dtype,
+        num_blocks: Option<usize>,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        window: Option<crate::block_stream::BlockWindow<'_>>,
+    ) -> Result<(Array, (i32, i32, i32), Array, Array)> {
+        let sh = latents.shape();
+        let (pt, ph, pw) = self.cfg.patch_size;
+        let (pe_t, pe_h, pe_w) = (sh[2] / pt as i32, sh[3] / ph as i32, sh[4] / pw as i32);
+        let tokens = pe_t * pe_h * pe_w;
+        // iOS: the entry quantum is checked before any graph below is constructed, priced at its own
+        // counted body plus what materializes inside it: the previous step's CFG combine + sampler
+        // update (lazy, latent-sized).
+        mlx_gen::ios_quantum::before(
+            DIT_EMBED_QUANTUM,
+            self.embed_quantum_scratch(latents, dtype),
+        )?;
+        let (hidden, rope, temb, embedded) = self.embed(latents, sigma, dtype)?;
+        mlx_gen::ios_quantum::finish(
+            DIT_EMBED_QUANTUM,
+            &[&hidden, &temb, &embedded, &rope.cos, &rope.sin],
+        )?;
 
         // 5. transformer blocks (all, or the first `num_blocks` for the stage-4 localization golden).
         let take = num_blocks.unwrap_or(self.blocks.len());
@@ -653,18 +905,22 @@ impl CosmosDiT {
                         "anima: the partial-stack golden hook cannot be windowed".to_owned(),
                     ));
                 }
-                self.run_windowed_blocks(hidden, encoder, &embedded, &temb, &rope, plan, window)?
+                self.run_windowed_blocks(
+                    hidden, encoder, &embedded, &temb, &rope, plan, window, tokens,
+                )?
             }
             None => {
                 let mut hidden = hidden;
                 for block in self.blocks.iter().take(take) {
-                    hidden = block.forward(
+                    hidden = block.forward_quantum(
                         &hidden,
                         encoder,
                         &embedded,
                         &temb,
                         (&rope.cos, &rope.sin),
                         plan,
+                        tokens,
+                        0,
                     )?;
                 }
                 hidden
@@ -690,6 +946,7 @@ impl CosmosDiT {
         rope: &crate::rope::CosmosRope,
         plan: mlx_gen::attention::AttentionPlan<'_>,
         window: crate::block_stream::BlockWindow<'_>,
+        tokens: i32,
     ) -> Result<Array> {
         let stream = self.block_stream.as_ref().ok_or_else(|| {
             mlx_gen::Error::Unsupported(
@@ -712,14 +969,19 @@ impl CosmosDiT {
             || stream.open(),
             |mut hidden, view, range| {
                 for index in range {
-                    let block = stream.materialize(view, index)?;
-                    hidden = block.forward(
+                    // Materializing builds lazy weight handles only: the block's stored bytes are
+                    // read INSIDE its quantum, which is priced with them and checked before its
+                    // forward is built.
+                    let (block, weight_bytes) = stream.materialize_counted(view, index)?;
+                    hidden = block.forward_quantum(
                         &hidden,
                         encoder,
                         embedded,
                         temb,
                         (&rope.cos, &rope.sin),
                         plan,
+                        tokens,
+                        weight_bytes,
                     )?;
                 }
                 Ok(hidden)
@@ -762,12 +1024,116 @@ impl CosmosDiT {
         plan: mlx_gen::attention::AttentionPlan<'_>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let (hidden, (pe_t, pe_h, pe_w), embedded, temb) =
             self.run_blocks(latents, sigma, encoder, dtype, None, plan, window)?;
-        // 6. output norm + projection + unpatchify.
-        let hidden = self.norm_out.forward(&hidden, &embedded, &temb)?;
+        // 6. output norm + projection + unpatchify, priced at its own counted body.
+        let scratch = self.output_quantum_scratch(
+            hidden.shape()[0],
+            hidden.shape()[1],
+            hidden.item_size() as u64,
+        );
+        mlx_gen::ios_quantum::run(DIT_OUTPUT_QUANTUM, scratch, || {
+            self.output(&hidden, &embedded, &temb, (pe_t, pe_h, pe_w))
+        })
+    }
+
+    /// The DiT output quantum's body: `norm_out` + `proj_out` + unpatchify.
+    pub(crate) fn output(
+        &self,
+        hidden: &Array,
+        embedded: &Array,
+        temb: &Array,
+        (pe_t, pe_h, pe_w): (i32, i32, i32),
+    ) -> Result<Array> {
+        let hidden = self.norm_out.forward(hidden, embedded, temb)?;
         let hidden = self.proj_out.forward(&hidden)?;
         self.unpatchify(&hidden, pe_t, pe_h, pe_w)
+    }
+
+    /// The time-embedding / adaLN-vector work every entry and output quantum carries: the f32
+    /// sinusoid, its cast, `linear_1`, SiLU, `linear_2` (3 wide) and the RMSNorm (entry), or the
+    /// SiLU, `linear_2` (2 wide), the `temb` column take and the sum (output) — at most eight
+    /// `[B, hidden]` f32 vectors. Negligible next to any token-sized buffer, but counted.
+    fn time_vector_bytes(&self, batch: u64) -> u64 {
+        mlx_gen::ios_quantum::tensor_bytes(4, &[batch, 8, self.cfg.hidden_size() as u64])
+    }
+
+    /// The DiT entry quantum's own counted body ([`Self::embed`]) for `latents` `[B, C, T, H, W]`
+    /// at `element_bytes`: the latent's cast copy (1 latent), the zero padding-mask channel, the
+    /// `C + 1`-channel concat and its patchified copy (2 x `[B, tokens, (C + 1)·pt·ph·pw]`), the
+    /// patch-embedded hidden state (1 `[B, tokens, hidden]`), this grid's RoPE tables (the shared
+    /// [`mlx_gen::ios_quantum::rope_table_bytes`] allowance), and the time vectors. Proven in
+    /// `quantum_tests::dit_formulas_track_the_measured_peak`.
+    pub(crate) fn embed_body_bytes(&self, latent_shape: &[i32], element_bytes: u64) -> u64 {
+        let d = |i: usize| latent_shape.get(i).copied().unwrap_or(0).max(0) as u64;
+        let (b, c, t, h, w) = (d(0), d(1), d(2), d(3), d(4));
+        let (pt, ph, pw) = self.cfg.patch_size;
+        let tokens = (t / pt as u64) * (h / ph as u64) * (w / pw as u64);
+        let channels = if self.cfg.concat_padding_mask {
+            c + 1
+        } else {
+            c
+        };
+        let eb = element_bytes;
+        let tb = mlx_gen::ios_quantum::tensor_bytes;
+        [
+            tb(eb, &[b, c, t, h, w]),
+            tb(eb, &[b, 1, t, h, w]),
+            2 * tb(eb, &[b, channels, t, h, w]),
+            tb(eb, &[b, tokens, self.cfg.hidden_size() as u64]),
+            mlx_gen::ios_quantum::rope_table_bytes(tokens, self.cfg.attention_head_dim as u64),
+            self.time_vector_bytes(b),
+        ]
+        .iter()
+        .fold(0u64, |a, x| a.saturating_add(*x))
+    }
+
+    /// The DiT entry quantum: its own counted body ([`Self::embed_body_bytes`]) plus the
+    /// sampler-step allowance for the previous step's lazy CFG combine + sampler update over the
+    /// incoming latent, which materializes here.
+    pub(crate) fn embed_quantum_scratch(&self, latents: &Array, dtype: Dtype) -> u64 {
+        self.embed_quantum_scratch_for(latents.shape(), dtype)
+    }
+
+    /// [`Self::embed_quantum_scratch`] over a `latent_shape` latent.
+    pub(crate) fn embed_quantum_scratch_for(&self, latent_shape: &[i32], dtype: Dtype) -> u64 {
+        let elements = latent_shape
+            .iter()
+            .fold(1u64, |a, &d| a.saturating_mul(d.max(0) as u64));
+        self.embed_body_bytes(latent_shape, dtype_bytes(dtype))
+            .saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(elements))
+    }
+
+    /// The DiT output quantum ([`Self::output`]) over `[B, tokens, hidden]` at `element_bytes`:
+    /// the LayerNorm with its fallback's temporaries and the modulation (4 hidden), `proj_out` and
+    /// its unpatchified copy (2 x `[B, tokens, pt·ph·pw·out_channels]`), the adaLN vectors, and
+    /// `proj_out`'s f32 weight copy when it is dense and narrower than the stream (the adaLN
+    /// projections read the bf16 time embedding: no copy). Proven in
+    /// `quantum_tests::dit_formulas_track_the_measured_peak`.
+    pub(crate) fn output_quantum_scratch(
+        &self,
+        batch: i32,
+        tokens: i32,
+        element_bytes: u64,
+    ) -> u64 {
+        let (b, t) = (batch.max(0) as u64, tokens.max(0) as u64);
+        let (pt, ph, pw) = self.cfg.patch_size;
+        let patch_out = (pt * ph * pw * self.cfg.out_channels) as u64;
+        let tb = mlx_gen::ios_quantum::tensor_bytes;
+        let promoted = if self
+            .proj_out
+            .weight_dtype()
+            .is_some_and(|dtype| dtype_bytes(dtype) < element_bytes)
+        {
+            dense_weight_elements(&LinearFacts::of(&self.proj_out)).saturating_mul(element_bytes)
+        } else {
+            0
+        };
+        (4 * tb(element_bytes, &[b, t, self.cfg.hidden_size() as u64]))
+            .saturating_add(2 * tb(element_bytes, &[b, t, patch_out]))
+            .saturating_add(self.time_vector_bytes(b))
+            .saturating_add(promoted)
     }
 
     /// Toggle SDPA-segment gradient checkpointing (sc-10576) on every DiT block's self- + cross-attn.
@@ -806,6 +1172,7 @@ impl CosmosDiT {
     /// LOCAL paths (e.g. `"self_attn.q_proj"`, `"adaln_modulation_mlp.2"`) trained on block `i`, in the
     /// order their `lora_a`/`lora_b` are threaded. Blocks with no trained targets still run checkpointed
     /// (hidden+encoder inputs only), so the whole stack is uniformly recompute-on-backward.
+    #[cfg(feature = "training")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_with_main_checkpointed(
         &self,
@@ -833,6 +1200,7 @@ impl CosmosDiT {
     /// `thread_encoder` gates the sc-10522 trap: `true` threads `encoder` as an explicit checkpoint
     /// input (the production path); `false` CAPTURES it as a constant (the deliberately-wrong path the
     /// grad-parity mutation test drives to prove the conditioner grads collapse to zero when captured).
+    #[cfg(feature = "training")]
     #[allow(clippy::too_many_arguments)]
     fn checkpointed_impl(
         &self,
@@ -962,7 +1330,7 @@ impl CosmosDiT {
     /// that deliberately CAPTURES `encoder` instead of threading it — the sc-10522 inert-conditioner
     /// bug. Used only by the grad-parity mutation test to prove the conditioner factors receive zero
     /// gradient on the wrong path (so the correct path's non-zero conditioner grads are meaningful).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "training"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_with_main_checkpointed_encoder_captured(
         &self,
@@ -998,6 +1366,7 @@ impl CosmosDiT {
         dtype: Dtype,
         num_blocks: Option<usize>,
     ) -> Result<Array> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         Ok(self
             .run_blocks(
                 latents,
@@ -1100,6 +1469,62 @@ impl AdaptableHost for AdaLayerNorm {
     }
 }
 
+/// Pure names used by BOTH the real block host and configured-overlay header normalization.
+pub(crate) fn adapter_block_paths() -> Vec<String> {
+    let mut out = Vec::new();
+    for attention in ["self_attn", "cross_attn"] {
+        for projection in ["q_proj", "k_proj", "v_proj", "output_proj"] {
+            out.push(format!("{attention}.{projection}"));
+        }
+    }
+    for projection in ["layer1", "layer2"] {
+        out.push(format!("mlp.{projection}"));
+    }
+    for norm in ["self_attn", "cross_attn", "mlp"] {
+        for projection in [1, 2] {
+            out.push(format!("adaln_modulation_{norm}.{projection}"));
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+enum GlobalAdapterTarget {
+    Patch,
+    Time1,
+    Time2,
+    Norm1,
+    Norm2,
+    Output,
+}
+const GLOBAL_ADAPTER_TARGETS: [(&str, GlobalAdapterTarget); 6] = [
+    ("x_embedder.proj.1", GlobalAdapterTarget::Patch),
+    ("t_embedder.1.linear_1", GlobalAdapterTarget::Time1),
+    ("t_embedder.1.linear_2", GlobalAdapterTarget::Time2),
+    ("final_layer.adaln_modulation.1", GlobalAdapterTarget::Norm1),
+    ("final_layer.adaln_modulation.2", GlobalAdapterTarget::Norm2),
+    ("final_layer.linear", GlobalAdapterTarget::Output),
+];
+
+pub(crate) fn adapter_target_paths(blocks: usize, include_globals: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for index in 0..blocks {
+        out.extend(
+            adapter_block_paths()
+                .into_iter()
+                .map(|path| format!("blocks.{index}.{path}")),
+        );
+    }
+    if include_globals {
+        out.extend(
+            GLOBAL_ADAPTER_TARGETS
+                .iter()
+                .map(|(path, _)| (*path).to_owned()),
+        );
+    }
+    out
+}
+
 impl AdaptableHost for Block {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
@@ -1114,14 +1539,7 @@ impl AdaptableHost for Block {
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        out.extend(prefixed_paths("self_attn", &self.attn1));
-        out.extend(prefixed_paths("cross_attn", &self.attn2));
-        out.extend(prefixed_paths("mlp", &self.ff));
-        out.extend(prefixed_paths("adaln_modulation_self_attn", &self.norm1));
-        out.extend(prefixed_paths("adaln_modulation_cross_attn", &self.norm2));
-        out.extend(prefixed_paths("adaln_modulation_mlp", &self.norm3));
-        out
+        adapter_block_paths()
     }
 }
 
@@ -1132,26 +1550,29 @@ impl AdaptableHost for Block {
 /// reachable via the dotted diffusers/peft form, which is all the real files use).
 impl AdaptableHost for CosmosDiT {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
-        match path {
-            ["blocks", n, rest @ ..] => self
+        if let ["blocks", n, rest @ ..] = path {
+            return self
                 .blocks
                 .get_mut(n.parse::<usize>().ok()?)?
-                .adaptable_mut(rest),
-            ["x_embedder", "proj", "1"] => Some(&mut self.patch_embed),
-            ["t_embedder", "1", "linear_1"] => Some(&mut self.time_embed.linear_1),
-            ["t_embedder", "1", "linear_2"] => Some(&mut self.time_embed.linear_2),
-            ["final_layer", "adaln_modulation", rest @ ..] => self.norm_out.adaptable_mut(rest),
-            ["final_layer", "linear"] => Some(&mut self.proj_out),
-            _ => None,
+                .adaptable_mut(rest);
         }
+        let name = path.join(".");
+        let target = GLOBAL_ADAPTER_TARGETS
+            .iter()
+            .find(|(path, _)| *path == name)?
+            .1;
+        Some(match target {
+            GlobalAdapterTarget::Patch => &mut self.patch_embed,
+            GlobalAdapterTarget::Time1 => &mut self.time_embed.linear_1,
+            GlobalAdapterTarget::Time2 => &mut self.time_embed.linear_2,
+            GlobalAdapterTarget::Norm1 => &mut self.norm_out.linear_1,
+            GlobalAdapterTarget::Norm2 => &mut self.norm_out.linear_2,
+            GlobalAdapterTarget::Output => &mut self.proj_out,
+        })
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for (i, b) in self.blocks.iter().enumerate() {
-            out.extend(prefixed_paths(&format!("blocks.{i}"), b));
-        }
-        out
+        adapter_target_paths(self.blocks.len(), false)
     }
 }
 
@@ -1163,7 +1584,7 @@ impl AdaptableHost for CosmosDiT {
 /// (sc-10522) can exercise the real [`AdaptableHost::adaptable_paths`] surface without the licensed
 /// checkpoint or any Metal compute — enumeration only walks the module tree; no placeholder tensor is
 /// ever evaluated.
-#[cfg(test)]
+#[cfg(all(test, feature = "training"))]
 mod structural {
     use super::*;
 
@@ -1463,6 +1884,7 @@ mod bounded_attention_tests {
 
     /// The plan reaches BOTH DiT attentions, and it really chunks at each of them.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_attention_plan_reaches_both_dit_attentions_and_chunks() {
         let cfg = cfg();
         let model = CosmosDiT::synthetic(cfg, 11);
@@ -1511,12 +1933,16 @@ mod bounded_attention_tests {
                 "{label}: a tripped cancel must not affect the unbounded (default) forward"
             );
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::bounded_attention_tests::the_attention_plan_reaches_both_dit_attentions_and_chunks");
     }
 
     /// Bounded attention is a memory-shape choice, not a numeric one: a plan that chunks BOTH
     /// attentions must reproduce the unbounded velocity, and the default `forward` must be
     /// **exactly** the explicitly-unbounded one.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_chunked_forward_matches_the_unbounded_forward() {
         let cfg = cfg();
         let model = CosmosDiT::synthetic(cfg, 11);
@@ -1554,5 +1980,8 @@ mod bounded_attention_tests {
             )
             .unwrap();
         assert_eq!(peak_relative_delta(&unbounded, &explicit), 0.0);
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::bounded_attention_tests::the_chunked_forward_matches_the_unbounded_forward");
     }
 }

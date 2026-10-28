@@ -158,6 +158,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # snapshot's config.json `"quantization"` marker; the per-crate converters already used serde_json,
 # now the shared core copy does.
 serde_json = { workspace = true }
+serde = { workspace = true }
 # SC-20686 Metal-lane campaign observer: runtime-derived model snapshot identity (src/sc20686.rs).
 sha2 = { workspace = true }
 # Match mlx-rs' safetensors ABI so the opt-in loader can inspect raw E4M3
@@ -183,3 +184,6 @@ tempfile = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+[features]
+model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "mlx-llm/model-inference-proof"]

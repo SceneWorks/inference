@@ -157,18 +157,18 @@ impl Attention {
         rope: Option<(&Tensor, &Tensor)>,
         mask: Option<&Tensor>,
     ) -> CandleResult<Tensor> {
-        let q = self.norm_q.forward(&to_heads(
-            &self.to_q.forward(x)?,
+        let q = __model_proof_output!(self.norm_q.forward(&to_heads(
+            &__model_proof_output!(self.to_q.forward(x))?,
             self.num_heads,
             self.head_dim,
-        )?)?;
-        let k = self.norm_k.forward(&to_heads(
-            &self.to_k.forward(kv_src)?,
+        )?))?;
+        let k = __model_proof_output!(self.norm_k.forward(&to_heads(
+            &__model_proof_output!(self.to_k.forward(kv_src))?,
             self.num_kv_heads,
             self.head_dim,
-        )?)?;
+        )?))?;
         let v = to_heads(
-            &self.to_v.forward(kv_src)?,
+            &__model_proof_output!(self.to_v.forward(kv_src))?,
             self.num_kv_heads,
             self.head_dim,
         )?;
@@ -191,7 +191,7 @@ impl Attention {
         let att = candle_nn::ops::softmax_last_dim(&att)?;
         let out = att.matmul(&v.contiguous()?)?;
         let _ = self.is_cross;
-        self.to_out.forward(&from_heads(&out)?)
+        __model_proof_output!(self.to_out.forward(&from_heads(&out)?))
     }
 }
 
@@ -242,7 +242,11 @@ impl Block {
         let (c_shift, c_scale, c_gate) = (chunk(3)?, chunk(4)?, chunk(5)?);
 
         // Self-attention (AdaLN-Zero modulated, gated residual).
-        let norm_x = modulate(&self.self_attn_norm.forward(x)?, &shift_msa, &scale_msa)?;
+        let norm_x = modulate(
+            &__model_proof_output!(self.self_attn_norm.forward(x))?,
+            &shift_msa,
+            &scale_msa,
+        )?;
         let mask = if self.sliding {
             sliding_mask
         } else {
@@ -254,15 +258,20 @@ impl Block {
         let x = (x + attn.broadcast_mul(&gate_msa)?)?;
 
         // Cross-attention to the condition context (ungated residual, no RoPE).
-        let norm_x = self.cross_attn_norm.forward(&x)?;
+        let norm_x = __model_proof_output!(self.cross_attn_norm.forward(&x))?;
         let cross = self.cross_attn.forward(&norm_x, ctx, None, None)?;
         let x = (&x + cross)?;
 
         // SwiGLU MLP (AdaLN-Zero modulated, gated residual).
-        let norm_x = modulate(&self.mlp_norm.forward(&x)?, &c_shift, &c_scale)?;
-        let ff = self.down_proj.forward(
-            &(self.gate_proj.forward(&norm_x)?.silu()? * self.up_proj.forward(&norm_x)?)?,
+        let norm_x = modulate(
+            &__model_proof_output!(self.mlp_norm.forward(&x))?,
+            &c_shift,
+            &c_scale,
         )?;
+        let ff = __model_proof_output!(self.down_proj.forward(
+            &(__model_proof_output!(self.gate_proj.forward(&norm_x))?.silu()?
+                * __model_proof_output!(self.up_proj.forward(&norm_x))?)?,
+        ))?;
         &x + ff.broadcast_mul(&c_gate)?
     }
 }
@@ -305,8 +314,10 @@ impl TimestepEmbedding {
     /// the raw `linear_2` output (no `act2`); the output-projection AdaLN consumes it unchanged.
     fn forward(&self, t: f64, device: &Device) -> CandleResult<(Tensor, Tensor)> {
         let s = sinusoidal(self.freq_dim, t * 1000.0, device)?;
-        let temb = self.linear_2.forward(&self.linear_1.forward(&s)?.silu()?)?; // [1, dim]
-        let tproj = self.time_proj.forward(&temb.silu()?)?; // [1, 6·dim] — act2 into time_proj only
+        let temb = __model_proof_output!(self
+            .linear_2
+            .forward(&__model_proof_output!(self.linear_1.forward(&s))?.silu()?))?; // [1, dim]
+        let tproj = __model_proof_output!(self.time_proj.forward(&temb.silu()?))?; // [1, 6·dim] — act2 into time_proj only
         Ok((temb, tproj))
     }
 
@@ -381,7 +392,7 @@ impl DiT {
 
     /// Embed the condition context once per run: `Linear(encoder_hidden_size → dim)`.
     pub fn embed_context(&self, encoder_hidden_states: &Tensor) -> CandleResult<Tensor> {
-        self.condition_embedder.forward(encoder_hidden_states)
+        __model_proof_output!(self.condition_embedder.forward(encoder_hidden_states))
     }
 
     /// Symmetric sliding-window band mask `[1, 1, T, T]` (additive `-inf` outside `|i−j| ≤ w`).
@@ -424,9 +435,8 @@ impl DiT {
             x = Tensor::cat(&[&x, &z], 1)?;
         }
         // Patchify: [B, T, C] → [B, C, T] → Conv1d → [B, dim, T/p] → [B, T/p, dim].
-        let x = self
-            .proj_in_conv
-            .forward(&x.transpose(1, 2)?.contiguous()?)?;
+        let x =
+            __model_proof_output!(self.proj_in_conv.forward(&x.transpose(1, 2)?.contiguous()?))?;
         let mut x = x.transpose(1, 2)?.contiguous()?;
         let patched_len = x.dim(1)?;
 
@@ -471,12 +481,16 @@ impl DiT {
             .broadcast_add(&temb.unsqueeze(1)?)?; // [1, 2, dim]
         let shift = m.narrow(1, 0, 1)?;
         let scale = m.narrow(1, 1, 1)?;
-        let x = modulate(&self.norm_out.forward(&x)?, &shift, &scale)?;
+        let x = modulate(
+            &__model_proof_output!(self.norm_out.forward(&x))?,
+            &shift,
+            &scale,
+        )?;
 
         // Depatchify: [B, T/p, dim] → [B, dim, T/p] → ConvTranspose1d → [B, acoustic, T] → [B, T, acoustic].
-        let v = self
+        let v = __model_proof_output!(self
             .proj_out_conv
-            .forward(&x.transpose(1, 2)?.contiguous()?)?;
+            .forward(&x.transpose(1, 2)?.contiguous()?))?;
         let v = v.transpose(1, 2)?.contiguous()?;
         let v = v.narrow(1, 0, orig_len)?; // crop the patch padding.
         Ok(Some(v))

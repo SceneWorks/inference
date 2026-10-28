@@ -178,6 +178,7 @@ fn tmp_dir(tmp: &tempfile::TempDir, tag: &str) -> PathBuf {
 /// across binaries for exactly this. `RUST_TEST_THREADS=1` (forced in `.cargo/config.toml`) does
 /// not help: the phases are sequential either way, and it is the accumulation, not concurrency,
 /// that strands the stream. Folding them into one function keeps that to a single arc.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_dit_exposes_its_whole_linear_surface_to_community_adapters() {
     let tmp = tempfile::tempdir().unwrap();
@@ -268,4 +269,6 @@ fn the_dit_exposes_its_whole_linear_surface_to_community_adapters() {
     assert_eq!(report.applied, paths.len());
     assert!(report.unmatched_paths.is_empty(), "{report:?}");
     let _ = std::fs::remove_dir_all(&dir);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapter_routing::the_dit_exposes_its_whole_linear_surface_to_community_adapters");
 }

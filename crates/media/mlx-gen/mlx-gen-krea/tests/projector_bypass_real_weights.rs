@@ -191,6 +191,7 @@ fn render_turbo(turbo: &std::path::Path, adapters: Vec<AdapterSpec>) -> Image {
 fn turbo_engine_renders_with_projector_bypass() {
     let (Some(turbo), Some(bypass)) = (turbo_dir(), bypass_file()) else {
         eprintln!("skipping: set KREA_TURBO_DIR and KREA_BYPASS_FILE");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in turbo_engine_renders_with_projector_bypass; see preceding skip diagnostic");
         return;
     };
 
@@ -211,4 +212,6 @@ fn turbo_engine_renders_with_projector_bypass() {
         d > 0.5,
         "the projector bypass must visibly change the same-seed render (mean|Δ|={d})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED projector_bypass_real_weights::turbo_engine_renders_with_projector_bypass");
 }

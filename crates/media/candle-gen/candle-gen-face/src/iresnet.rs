@@ -66,14 +66,14 @@ impl Affine {
         let c = self.scale.elem_count();
         let scale = self.scale.reshape((1, c, 1, 1))?;
         let shift = self.shift.reshape((1, c, 1, 1))?;
-        Ok(x.broadcast_mul(&scale)?.broadcast_add(&shift)?)
+        Ok(__model_proof_output!(x.broadcast_mul(&scale))?.broadcast_add(&shift)?)
     }
 
     fn forward_vec(&self, x: &Tensor) -> Result<Tensor> {
         let c = self.scale.elem_count();
         let scale = self.scale.reshape((1, c))?;
         let shift = self.shift.reshape((1, c))?;
-        Ok(x.broadcast_mul(&scale)?.broadcast_add(&shift)?)
+        Ok(__model_proof_output!(x.broadcast_mul(&scale))?.broadcast_add(&shift)?)
     }
 }
 
@@ -175,7 +175,9 @@ impl ArcFace {
         h = h.contiguous()?.reshape((n, flat))?;
         // fc Linear: [N,25088] @ [25088,512] + [512].
         let fc_b = self.fc_b.reshape((1, self.fc_b.elem_count()))?;
-        h = h.matmul(&self.fc_w.t()?)?.broadcast_add(&fc_b)?;
+        h = __model_proof_output!(
+            __model_proof_output!(h.matmul(&self.fc_w.t()?))?.broadcast_add(&fc_b)
+        )?;
         self.features.forward_vec(&h)
     }
 }

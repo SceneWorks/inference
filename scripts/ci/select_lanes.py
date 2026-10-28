@@ -15,6 +15,7 @@ LANES = (
     "contracts",
     "candle_cpu",
     "macos_metal",
+    "ios_build",
     "windows_cuda",
     "docs",
     "release",
@@ -40,6 +41,42 @@ def _is_sa3_reference_fixture(path: str) -> bool:
     return fixture_root == "sa3-reference" or (
         fixture_root.startswith("sa3-") and fixture_root.endswith("-reference")
     )
+
+
+# The workspace crates `runtime-ios` compiles for an iOS target (`cargo tree -p runtime-ios --target
+# aarch64-apple-ios`), plus the bundle itself. A change under any of them can change what the iOS
+# cross-build compiles or the metallib it emits, so it selects the `ios_build` lane. The mlx-rs pin
+# (Cargo.toml / Cargo.lock), `.cargo/`, scripts/ci and the workflows already select every lane.
+# test_select_lanes asserts the live `cargo tree -p runtime-ios` graph, and the device harness's
+# (`ios-host/smoke`, every feature), are subsets of this set, so a new iOS dependency cannot be left
+# out silently (over-selecting is harmless).
+IOS_BOUND_PATHS = (
+    "crates/bundles/runtime-ios",
+    "crates/bundles/runtime-catalog",
+    "crates/contracts/core-llm",
+    "crates/contracts/gen-core",
+    "crates/llm/mlx-llm",
+    "crates/media/mlx-gen/mlx-gen-anima",
+    "crates/media/mlx-gen/mlx-gen-ios-catalog",
+    "crates/media/mlx-gen/mlx-gen-iris",
+    "crates/media/mlx-gen/mlx-gen-pid",
+    "crates/media/mlx-gen/mlx-gen-qwen-image",
+    "crates/media/mlx-gen/mlx-gen-sana",
+    "crates/media/mlx-gen/mlx-gen-sdxl",
+    "crates/media/mlx-gen/mlx-gen-wan",
+    "crates/media/mlx-gen/mlx-gen-z-image",
+)
+
+
+def _is_ios_bound(path: str) -> bool:
+    if any(_under(path, prefix) for prefix in IOS_BOUND_PATHS):
+        return True
+    # `crates/media/mlx-gen` is the mlx-gen crate itself AND the parent of every provider crate;
+    # only its own files (not a sibling provider's) are on the iOS graph.
+    if _under(path, "crates/media/mlx-gen"):
+        rest = PurePosixPath(path).parts[3:]
+        return not (len(rest) > 1 and rest[0].startswith("mlx-gen-"))
+    return False
 
 
 def _all(lanes: dict[str, bool]) -> None:
@@ -81,6 +118,17 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
         return lanes
 
     for path in normalized:
+        if _is_ios_bound(path):
+            lanes["ios_build"] = True
+
+        # `ios-host/` is the explicit root-workspace device-harness package
+        # plus the Xcode host app. `ios_build` cross-builds and iOS-Clippies the harness; its
+        # weights-free unit tests and host Clippy ride `macos_metal`. No shipped crate depends on
+        # it, so no other lane can observe a change here.
+        if _under(path, "ios-host"):
+            lanes.update(ios_build=True, macos_metal=True)
+            continue
+
         # SA3's non-ignored parity/oracle targets read committed safetensors/JSON artifacts from
         # these migration subdirectories. A fixture-only edit is executable Rust test input, not a
         # prose-only change, and must exercise every platform that builds the Candle audio family.
@@ -156,7 +204,11 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             )
             continue
 
-        if _under(path, "crates/bundles/runtime-macos"):
+        # runtime-ios is MLX like runtime-macos: its host build/tests run on the macOS Metal lane,
+        # and its iOS cross-compile on `ios_build` (selected above).
+        if _under(path, "crates/bundles/runtime-macos") or _under(
+            path, "crates/bundles/runtime-ios"
+        ):
             lanes.update(macos_metal=True, real_weights=True, release=True)
             continue
 

@@ -103,7 +103,7 @@ impl SynchformerVisualEncoder {
         let x = self.forward_features(segments)?; // (S, 1569, D)
                                                   // Drop CLS, final norm.
         let x = x.narrow(1, 1, x.dim(1)? - 1)?; // (S, 1568, D)
-        let x = self.norm.forward(&x)?;
+        let x = __model_proof_output!(self.norm.forward(&x))?;
         // restore_spatio_temp_dims: (S, 1568, D) → (S, D, t, h, w).
         let d = config::EMBED_DIM;
         let (t, grid) = (config::TEMPORAL_RESOLUTION, config::GRID);
@@ -209,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_shape_finite_and_deterministic() {
         let enc = det_encoder();
         let dev = Device::Cpu;
@@ -229,9 +230,15 @@ mod tests {
         let out2 = enc.encode(&x).expect("encode again");
         let flat2 = out2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(flat, flat2, "encoder must be deterministic run-to-run");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED sync::tests::forward_shape_finite_and_deterministic"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn features_are_frame_varying() {
         let enc = det_encoder();
         let dev = Device::Cpu;
@@ -268,5 +275,8 @@ mod tests {
             var > 1e-8,
             "features must not be a constant vector (var={var})"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED sync::tests::features_are_frame_varying");
     }
 }

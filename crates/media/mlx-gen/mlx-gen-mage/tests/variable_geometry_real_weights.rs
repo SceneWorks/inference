@@ -121,6 +121,8 @@ fn both_four_to_one_orientations_render_exact_uncorrupted_shapes() {
         "same-seed, different-prompt renders differ at only {changed}/{} bytes",
         first.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED variable_geometry_real_weights::both_four_to_one_orientations_render_exact_uncorrupted_shapes");
 }
 
 #[test]
@@ -199,4 +201,6 @@ fn registered_generator_routes_multi_output_requests_through_budgeted_packs() {
     println!(
         "registered four-output 65,536-token request peak: {provider_peak_gb:.3} GB; exact seed/order replay passed"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED variable_geometry_real_weights::registered_generator_routes_multi_output_requests_through_budgeted_packs");
 }

@@ -71,6 +71,7 @@ fn prepend1(shape: &[i32]) -> Vec<i32> {
     s
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_i2v_channel_concat_matches_reference() {
     let low_w = load("i2v_low.safetensors");
@@ -172,4 +173,6 @@ fn wan_i2v_channel_concat_matches_reference() {
     // mean_rel ~O(1), not a few e-2.
     assert!(la_mr < 2e-2, "i2v latents diverged: mean_rel={la_mr:.3e}");
     assert!(vid_mr < 2e-2, "i2v video diverged: mean_rel={vid_mr:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED i2v_parity::wan_i2v_channel_concat_matches_reference");
 }

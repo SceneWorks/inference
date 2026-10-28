@@ -179,4 +179,6 @@ fn public_route_emits_exact_outer_step_cadence_without_changing_output() {
             &active,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED preview_real_weights::public_route_emits_exact_outer_step_cadence_without_changing_output");
 }

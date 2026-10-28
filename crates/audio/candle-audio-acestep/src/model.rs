@@ -641,6 +641,12 @@ fn shard_names_from_index(index_path: &Path) -> AudioResult<Vec<String>> {
             index_path.display()
         )));
     }
+    #[cfg(feature = "model-inference-proof")]
+    candle_audio::gen_core::model_input_proof::record_reader_paths(
+        "candle-audio-acestep::model::shard_names_from_index",
+        candle_audio::gen_core::model_input_proof::InputRole::Configuration,
+        &[index_path],
+    );
     Ok(shards)
 }
 

@@ -52,6 +52,7 @@ fn assert_exact(name: &str, got: &Array, want: &Array) {
     assert!(max_diff < 1e-6, "{name} max|Δ| {max_diff} not bit-exact");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn assembly_matches_reference() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
@@ -110,4 +111,6 @@ fn assembly_matches_reference() {
         &trunc,
         w.require("out.concat_trunc").unwrap(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED assembly_parity::assembly_matches_reference");
 }

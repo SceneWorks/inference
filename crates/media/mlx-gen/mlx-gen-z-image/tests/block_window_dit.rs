@@ -172,6 +172,7 @@ fn base_model(scratch: &Scratch) -> (ZImageTransformer, Array, Array) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn windowed_base_dit_matches_the_resident_forward_and_really_streams() {
     let tmp = tempfile::tempdir().unwrap();
     let scratch = Scratch::new(&tmp, "base", BASE_FIXTURE);
@@ -214,12 +215,16 @@ fn windowed_base_dit_matches_the_resident_forward_and_really_streams() {
         "the windowed forward did not re-materialize its blocks from the source (delta {delta:e}) — \
          it is silently running the resident stack, which would report a rung-4 saving of zero"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::windowed_base_dit_matches_the_resident_forward_and_really_streams");
 }
 
 /// Cancellation is checked at every window boundary by the shared primitive; the family must not
 /// swallow it. A tripped flag under a *bounded* plan aborts; the resident forward has no window
 /// boundary and is unaffected.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_tripped_cancel_aborts_a_windowed_forward_but_not_a_resident_one() {
     let tmp = tempfile::tempdir().unwrap();
     let scratch = Scratch::new(&tmp, "cancel", BASE_FIXTURE);
@@ -242,11 +247,15 @@ fn a_tripped_cancel_aborts_a_windowed_forward_but_not_a_resident_one() {
         model.forward(&x, 0.7, &cap).is_ok(),
         "the resident forward has no window boundary and must be unaffected"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::a_tripped_cancel_aborts_a_windowed_forward_but_not_a_resident_one");
 }
 
 /// Rung 4 must be unavailable — loudly — when the transformer has no re-openable source, rather than
 /// silently falling back to the resident stack.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_sourceless_transformer_refuses_a_window_instead_of_running_resident() {
     let w = Weights::from_file(BASE_FIXTURE).unwrap();
     let model = ZImageTransformer::from_weights(&w, "w", base_cfg()).unwrap();
@@ -267,12 +276,16 @@ fn a_sourceless_transformer_refuses_a_window_instead_of_running_resident() {
     assert!(err.contains("re-openable"), "{err}");
     // ...while the ordinary forward is entirely unaffected.
     assert!(model.forward(x, 0.7, cap).is_ok());
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::a_sourceless_transformer_refuses_a_window_instead_of_running_resident");
 }
 
 /// **The correctness risk SC-15750 explicitly did not cover.** A LoRA installed on the resident
 /// blocks must reach the streamed ones, byte-for-byte — and the capture that makes that happen must
 /// be load-bearing, so the second half asserts that WITHOUT it the outputs diverge.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_lora_on_the_trunk_survives_the_window_and_the_capture_is_load_bearing() {
     let tmp = tempfile::tempdir().unwrap();
     let scratch = Scratch::new(&tmp, "lora", BASE_FIXTURE);
@@ -345,11 +358,15 @@ fn a_lora_on_the_trunk_survives_the_window_and_the_capture_is_load_bearing() {
         "without `capture_block_adapters` the streamed blocks must be unadapted — if they match \
          anyway, the capture is not what is carrying the LoRA and the identity test is vacuous"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::a_lora_on_the_trunk_survives_the_window_and_the_capture_is_load_bearing");
 }
 
 /// Rung 3 and rung 4 compose: the ladder is cumulative, so a rung-4 selection also carries the
 /// attention budget, and both must be active in the same forward.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_window_composes_with_the_attention_budget() {
     let tmp = tempfile::tempdir().unwrap();
     let scratch = Scratch::new(&tmp, "compose", BASE_FIXTURE);
@@ -383,12 +400,16 @@ fn the_window_composes_with_the_attention_budget() {
             &tripped
         )
         .is_err());
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::the_window_composes_with_the_attention_budget");
 }
 
 /// The ControlNet route: BOTH stacks are windowed, and the dual-injection schedule — `before_proj`
 /// seed, per-block `after_proj` hints, `control_context_scale`, and the injection places — is
 /// unchanged. This is the second half of the correctness risk SC-15750 left open.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn windowed_control_dit_preserves_the_hint_injection() {
     let tmp = tempfile::tempdir().unwrap();
     let scratch = Scratch::new(&tmp, "control", CONTROL_FIXTURE);
@@ -465,6 +486,9 @@ fn windowed_control_dit_preserves_the_hint_injection() {
     // The resident control forward is untouched by the on-disk change.
     let resident_again = model.forward(&x, 0.7, &cap, Some(&cc), scale).unwrap();
     assert_eq!(peak_relative_delta(&resident_again, &resident), 0.0);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::windowed_control_dit_preserves_the_hint_injection");
 }
 
 /// A control transformer whose ControlNet checkpoint is not re-openable refuses a window rather than
@@ -504,6 +528,7 @@ fn a_half_streamable_control_transformer_refuses_the_window() {
 /// on-disk representation — so a windowed forward after either would silently run different weights
 /// or a different backward. Disarming makes that a typed refusal instead.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_training_mutation_disarms_the_window_rather_than_streaming_stale_weights() {
     let tmp = tempfile::tempdir().unwrap();
     for mutate in [
@@ -542,6 +567,9 @@ fn a_training_mutation_disarms_the_window_rather_than_streaming_stale_weights() 
         // The ordinary forward still works — disarming the rung is not disabling the model.
         assert!(model.forward(&x, 0.7, &cap).is_ok());
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::a_training_mutation_disarms_the_window_rather_than_streaming_stale_weights");
 }
 
 /// **The request-plumbing hole.** Everything above drives the DiT directly; the contract tests drive
@@ -553,6 +581,7 @@ fn a_training_mutation_disarms_the_window_rather_than_streaming_stale_weights() 
 /// disk — same discriminator as the DiT tests, one layer up. A `block_window: None` regression makes
 /// the second half fail, because the resident stack does not re-read the file.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_denoise_loop_threads_the_window_through_to_the_blocks() {
     let tmp = tempfile::tempdir().unwrap();
     use mlx_gen::attention::AttentionBudget;
@@ -603,6 +632,9 @@ fn the_denoise_loop_threads_the_window_through_to_the_blocks() {
         0.0,
         "the resident loop must not re-read the file"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::the_denoise_loop_threads_the_window_through_to_the_blocks");
 }
 
 /// The adapter-fidelity argument rests on Z-Image installing every adapter as a forward-time
@@ -655,6 +687,7 @@ fn the_z_image_adapter_path_never_folds_a_diff_patch_into_the_base() {
 /// arms use `guidance != 1.0` so the uncond forward actually runs — rung 4 has to cover BOTH forwards
 /// or the bound is half-applied for the whole of a base render.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn every_denoise_entry_point_threads_the_window_through_to_the_blocks() {
     let tmp = tempfile::tempdir().unwrap();
     use mlx_gen::attention::AttentionBudget;
@@ -802,12 +835,16 @@ fn every_denoise_entry_point_threads_the_window_through_to_the_blocks() {
             "{label}: the resident loop must not re-read the file"
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::every_denoise_entry_point_threads_the_window_through_to_the_blocks");
 }
 
 /// sc-16631: every public legacy denoise entry remains an exact inert-preview wrapper. This covers
 /// all four registered routes independently; a future signature/body drift in any one cannot hide
 /// behind the other three.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn every_legacy_denoise_entry_is_exactly_inert() {
     use mlx_gen::attention::AttentionBudget;
     use mlx_gen::{FlowMatchEuler, PreviewSink};
@@ -984,4 +1021,7 @@ fn every_legacy_denoise_entry_is_exactly_inert() {
         )
         .unwrap(),
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::every_legacy_denoise_entry_is_exactly_inert");
 }

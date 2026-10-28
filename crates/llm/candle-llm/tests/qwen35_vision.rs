@@ -12,6 +12,15 @@
 //! for its dominant color is a tight grounding check: if any stage is wrong (preprocess layout,
 //! encoder numerics, splice, M-RoPE positions), the model cannot reliably name the color.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_llm::LlamaProvider;
 use core_llm::{
     Channel, Content, ImageRef, LoadSpec, Message, Role, Sampling, StreamEvent, TextLlm,
@@ -98,4 +107,7 @@ fn qwen35_vision_grounds_on_image() {
             "{label}: greedy answer must ground on the image and name '{want}', got: {content:?}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen35_vision_grounds_on_image");
 }

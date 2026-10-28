@@ -36,4 +36,6 @@ fn flux1_schnell_generates_one_image_smoke() {
         }
         other => panic!("expected image output, got {other:?}"),
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_real_weights::flux1_schnell_generates_one_image_smoke");
 }

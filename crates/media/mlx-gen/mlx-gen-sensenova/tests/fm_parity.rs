@@ -36,20 +36,26 @@ fn check(name: &str, got: &Array, want: &Array) {
     assert!(r < 5e-3, "{name} peak-rel {r:.3e} exceeds 5e-3");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn fm_head_matches_reference() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let head = FmHead::from_weights(&w, "fm_modules.fm_head").unwrap();
     let got = head.forward(w.require("fm.in").unwrap()).unwrap();
     check("fm.out", &got, w.require("fm.out").unwrap());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fm_parity::fm_head_matches_reference");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn timestep_embedder_matches_reference() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let te = TimestepEmbedder::from_weights(&w, "fm_modules.timestep_embedder").unwrap();
     let got = te.forward(w.require("ts.in").unwrap()).unwrap();
     check("ts.out", &got, w.require("ts.out").unwrap());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fm_parity::timestep_embedder_matches_reference");
 }
 
 #[test]

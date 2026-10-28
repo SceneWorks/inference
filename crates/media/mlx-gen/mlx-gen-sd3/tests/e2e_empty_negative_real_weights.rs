@@ -80,6 +80,9 @@ fn try_golden() -> Option<Weights> {
                  Set SD3_EMPTY_NEG_GOLDEN to point at a non-default location.",
                 path.display()
             );
+            crate::model_inference_device::record_model_inference_prerequisite_missing(
+                "required work unavailable in try_golden; see preceding skip diagnostic",
+            );
             None
         }
     }
@@ -219,4 +222,6 @@ fn default_empty_negative_matches_diffusers() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_empty_negative_real_weights::default_empty_negative_matches_diffusers");
 }

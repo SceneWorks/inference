@@ -157,13 +157,13 @@ impl SiglipVisionTower {
         let np = self.cfg.num_patches();
         let h = self.cfg.hidden_size;
         // [b, 3, S, S] -> [b, hidden, grid, grid] -> [b, hidden, num_patches] -> [b, num_patches, hidden].
-        let patches = conv2d(
+        let patches = __model_proof_output!(conv2d(
             pixel_values,
             &self.patch_embedding,
             self.patch_bias.as_ref(),
             self.cfg.patch_size,
             0,
-        )?;
+        ))?;
         let patches = patches.reshape((b, h, np))?.transpose(1, 2)?.contiguous()?;
         let pos = self.position_embedding.reshape((1, np, h))?;
         Ok(patches.broadcast_add(&pos)?)
@@ -178,12 +178,12 @@ impl SiglipVisionTower {
             hidden = layer.forward(&hidden)?;
             hidden_states.push(hidden.clone());
         }
-        let last_hidden_state = layer_norm(
+        let last_hidden_state = __model_proof_output!(layer_norm(
             &hidden,
             &self.post_ln_w,
             &self.post_ln_b,
             self.cfg.layer_norm_eps,
-        )?;
+        ))?;
         Ok(SiglipVisionOutput {
             last_hidden_state,
             hidden_states,
@@ -236,9 +236,9 @@ impl SiglipEncoderLayer {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = layer_norm(x, &self.ln1_w, &self.ln1_b, self.eps)?;
+        let y = __model_proof_output!(layer_norm(x, &self.ln1_w, &self.ln1_b, self.eps))?;
         let x = (x + self.attn.forward(&y)?)?;
-        let y = layer_norm(&x, &self.ln2_w, &self.ln2_b, self.eps)?;
+        let y = __model_proof_output!(layer_norm(&x, &self.ln2_w, &self.ln2_b, self.eps))?;
         Ok((&x + self.mlp.forward(&y)?)?)
     }
 }
@@ -291,15 +291,27 @@ impl SiglipAttention {
                 .transpose(1, 2)?
                 .contiguous()?)
         };
-        let q = to_heads(linear(x, &self.q_w, self.q_b.as_ref())?)?;
-        let k = to_heads(linear(x, &self.k_w, self.k_b.as_ref())?)?;
-        let v = to_heads(linear(x, &self.v_w, self.v_b.as_ref())?)?;
+        let q = to_heads(__model_proof_output!(linear(
+            x,
+            &self.q_w,
+            self.q_b.as_ref()
+        ))?)?;
+        let k = to_heads(__model_proof_output!(linear(
+            x,
+            &self.k_w,
+            self.k_b.as_ref()
+        ))?)?;
+        let v = to_heads(__model_proof_output!(linear(
+            x,
+            &self.v_w,
+            self.v_b.as_ref()
+        ))?)?;
         // SigLIP attention is fully bidirectional — no mask, no softcap.
         let out = sdpa(&q, &k, &v, self.scale, None, AttnMask::None)?;
         let out = out
             .transpose(1, 2)?
             .reshape((b, n, self.num_heads * self.head_dim))?;
-        linear(&out, &self.out_w, self.out_b.as_ref())
+        __model_proof_output!(linear(&out, &self.out_w, self.out_b.as_ref()))
     }
 }
 
@@ -330,9 +342,9 @@ impl SiglipMlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = linear(x, &self.fc1_w, self.fc1_b.as_ref())?;
+        let x = __model_proof_output!(linear(x, &self.fc1_w, self.fc1_b.as_ref()))?;
         let x = gelu(&x)?; // gelu_pytorch_tanh
-        linear(&x, &self.fc2_w, self.fc2_b.as_ref())
+        __model_proof_output!(linear(&x, &self.fc2_w, self.fc2_b.as_ref()))
     }
 }
 

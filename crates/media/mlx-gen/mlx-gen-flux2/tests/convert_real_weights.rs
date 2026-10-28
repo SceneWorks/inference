@@ -120,4 +120,6 @@ fn convert_assembles_loadable_diffusers_dir() {
     if std::env::var_os("MLX_GEN_FLUX2_KEEP_CONVERTED").is_none() {
         let _ = std::fs::remove_dir_all(&out);
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED convert_real_weights::convert_assembles_loadable_diffusers_dir");
 }

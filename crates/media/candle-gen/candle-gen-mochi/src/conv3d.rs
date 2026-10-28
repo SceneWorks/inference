@@ -120,7 +120,7 @@ impl CausalConv3d {
                 .reshape((b * t, c, h, w))?
                 .contiguous()?; // [B·T, C, H, W]
             let padded = edge_pad2d(&merged, self.h_pad, self.w_pad)?;
-            let y = padded.conv2d(&wk, 0, 1, 1, 1)?; // padding 0 (already replicate-padded)
+            let y = __model_proof_output!(padded.conv2d(&wk, 0, 1, 1, 1))?; // padding 0 (already replicate-padded)
             acc = Some(match acc {
                 Some(a) => (a + y)?,
                 None => y,
@@ -132,7 +132,7 @@ impl CausalConv3d {
             .reshape((b, t, o, hp, wp))?
             .permute((0, 2, 1, 3, 4))?
             .contiguous()?; // [B, O, T, H, W]
-        y.broadcast_add(&self.bias)
+        __model_proof_output!(y.broadcast_add(&self.bias))
     }
 }
 
@@ -185,6 +185,7 @@ mod tests {
     /// A `1×1×1` conv (the decoder `conv_in`) is a plain 1×1 conv over each frame with no padding: the
     /// tap loop runs once and shapes pass through (T,H,W unchanged).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn conv_1x1x1_is_shape_preserving() {
         let dev = Device::Cpu;
         // weight [O=2, I=3, 1,1,1], bias [2].
@@ -201,5 +202,8 @@ mod tests {
         assert_eq!(y.dims(), &[1, 2, 4, 5, 6]);
         let v = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(v.iter().all(|&x| (x - 3.0).abs() < 1e-5));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conv3d::tests::conv_1x1x1_is_shape_preserving");
     }
 }

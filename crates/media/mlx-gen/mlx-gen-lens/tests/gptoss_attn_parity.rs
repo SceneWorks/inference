@@ -69,4 +69,8 @@ fn gptoss_attention_matches_reference() {
         pr < 5e-3,
         "attention-core peak_rel {pr:.3e} exceeds tol 5e-3"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED gptoss_attn_parity::gptoss_attention_matches_reference"
+    );
 }

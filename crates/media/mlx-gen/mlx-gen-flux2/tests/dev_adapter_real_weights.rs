@@ -340,4 +340,6 @@ fn dev_lora_and_lokr_visibly_affect_render() {
     let differ = base.iter().zip(&zero).filter(|(a, b)| a != b).count();
     println!("dev scale-0 LoRA no-op: {differ} px differ from the no-adapter render");
     assert_eq!(differ, 0, "scale-0 adapter must be a bit-exact no-op");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dev_adapter_real_weights::dev_lora_and_lokr_visibly_affect_render");
 }

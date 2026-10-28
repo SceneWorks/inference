@@ -159,10 +159,10 @@ impl EvaVisionTransformer {
             x = blk.forward(&x, &self.rope)?;
         }
 
-        x = self.norm.forward(&x)?;
+        x = __model_proof_output!(self.norm.forward(&x))?;
         // CLS token → head projection.
         let cls_tok = x.narrow(1, 0, 1)?.reshape((b, self.cfg.embed_dim))?;
-        let id_cond_vit = self.head.forward(&cls_tok)?;
+        let id_cond_vit = __model_proof_output!(self.head.forward(&cls_tok))?;
         Ok(EvaOutput {
             id_cond_vit,
             hidden,

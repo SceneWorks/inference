@@ -165,6 +165,9 @@ fn real_small_restoration_matches_upstream() {
         mean <= bound,
         "mean RGB8 distance {mean:.3} exceeds {bound:.3}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_real_weights::real_small_restoration_matches_upstream");
 }
 
 /// Release-scale timing render: the small reference input nearest-upsampled 8x to 512x384, then the
@@ -205,4 +208,7 @@ fn real_release_scale_restoration_renders() {
         .sqrt();
     eprintln!("[[IRIS_RESTORE_CANDLE]] release-scale mean {mean:.1} std {std:.1}");
     assert!(mean > 5.0 && mean < 250.0 && std > 5.0, "degenerate image");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_real_weights::real_release_scale_restoration_renders");
 }

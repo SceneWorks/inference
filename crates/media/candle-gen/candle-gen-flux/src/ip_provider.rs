@@ -134,7 +134,14 @@ fn detect_variant(flux_base: &Path) -> Result<Variant> {
         Ok(Variant::Schnell)
     } else if flux_base.join("transformer/config.json").is_file() {
         let path = flux_base.join("transformer/config.json");
-        let bytes = std::fs::read(&path).map_err(|error| {
+        let bytes = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/candle-gen/candle-gen-flux/src/ip_provider.rs::detect_variant::std::fs::read@6286",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+)
+        .map_err(|error| {
             CandleError::Msg(format!(
                 "flux ip-adapter: read packed transformer config {}: {error}",
                 path.display()

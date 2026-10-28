@@ -804,6 +804,9 @@ fn base_preview_frames_evolve_toward_the_final_image() {
         &BASE,
         &|_| {},
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::base_preview_frames_evolve_toward_the_final_image");
 }
 
 /// **One frame per outer step on a multi-eval solver**, proven non-vacuous first.
@@ -843,6 +846,9 @@ fn base_heun_preview_frames_evolve_toward_the_final_image() {
         "a multi-eval solver must still emit exactly one frame per outer step ({evaluations} \
          evaluations)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::base_heun_preview_frames_evolve_toward_the_final_image");
 }
 
 /// `sana_sprint_1600m` — the CFG-free SCM / TrigFlow lane, through `run_scm_sampler`.
@@ -864,6 +870,9 @@ fn sprint_preview_frames_evolve_toward_the_final_image() {
         &SPRINT,
         &|_| {},
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::sprint_preview_frames_evolve_toward_the_final_image");
 }
 
 // ── The σ conventions, measured on the committed constants alone ──────────────────────────────────

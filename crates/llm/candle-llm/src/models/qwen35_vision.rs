@@ -136,7 +136,7 @@ struct PatchEmbed {
 impl PatchEmbed {
     /// `pixel_values` `[num_patches, C·T·P·P]` → `[num_patches, hidden]`.
     fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        linear(pixel_values, &self.weight, self.bias.as_ref())
+        __model_proof_output!(linear(pixel_values, &self.weight, self.bias.as_ref()))
     }
 }
 
@@ -162,9 +162,9 @@ impl VisionBlock {
         head_dim: usize,
         mask: AttnMask<'_>,
     ) -> Result<Tensor> {
-        let y = layer_norm(x, &self.n1_w, &self.n1_b, LN_EPS)?;
+        let y = __model_proof_output!(layer_norm(x, &self.n1_w, &self.n1_b, LN_EPS))?;
         let x = x.broadcast_add(&self.attn(&y, cos, sin, num_heads, head_dim, mask)?)?;
-        let y = layer_norm(&x, &self.n2_w, &self.n2_b, LN_EPS)?;
+        let y = __model_proof_output!(layer_norm(&x, &self.n2_w, &self.n2_b, LN_EPS))?;
         Ok(x.broadcast_add(&self.mlp(&y)?)?)
     }
 
@@ -227,9 +227,10 @@ impl PatchMerger {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let m = if self.use_postshuffle_norm {
             let grouped = x.reshape(((), self.merge_dim))?;
-            layer_norm(&grouped, &self.norm_w, &self.norm_b, LN_EPS)?
+            __model_proof_output!(layer_norm(&grouped, &self.norm_w, &self.norm_b, LN_EPS))?
         } else {
-            layer_norm(x, &self.norm_w, &self.norm_b, LN_EPS)?.reshape(((), self.merge_dim))?
+            __model_proof_output!(layer_norm(x, &self.norm_w, &self.norm_b, LN_EPS))?
+                .reshape(((), self.merge_dim))?
         };
         // `nn.GELU()` default = exact erf — candle's `gelu_erf`.
         let m = gelu_erf(&self.fc1.forward(&m)?)?;
@@ -476,7 +477,7 @@ impl Qwen35VisionModel {
             .index_select(&idx_arr, 0)?
             .reshape((4, n as usize, hidden))?;
         let w_arr = Tensor::from_vec(wts, (4, n as usize, 1), device)?;
-        Ok(gathered.broadcast_mul(&w_arr)?.sum(0)?)
+        Ok(__model_proof_output!(gathered.broadcast_mul(&w_arr))?.sum(0)?)
     }
 }
 
@@ -763,6 +764,7 @@ mod tests {
     /// loader (incl. the Conv3d→linear patch-weight reshape). The same framework-independent fixture as
     /// the mlx-llm port (sc-7698); candle CPU runs the patches in exact f32, so the match is tight.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn encoder_matches_qwen3_5_vision_reference() {
         let j = oracle();
         let cfg = test_cfg();
@@ -911,6 +913,9 @@ mod tests {
             "vision encoder vs reference: rel err {rel} (max|Δ| {max_abs}, max|exp| {max_mag})"
         );
         assert_eq!(got, mlx_got, "MLX Conv3d layout conversion drifted");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35_vision::tests::encoder_matches_qwen3_5_vision_reference");
     }
 
     fn qwen3vl_oracle() -> serde_json::Value {

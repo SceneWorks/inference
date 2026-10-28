@@ -994,6 +994,7 @@ mod tests {
         masks
     }
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn masked_dense_oracle_is_dense_attention_when_every_key_is_kept() {
         // Guards the CUDA gate's oracle: gather, selection, masking and inverse scatter.
         let dev = Device::Cpu;
@@ -1032,6 +1033,9 @@ mod tests {
             let (sparse, _, _) = masked_dense_oracle(&r, 0, &q, &k, &v, 0.25);
             assert!(sparse.iter().zip(&dense).any(|(a, b)| (a - b).abs() > 1e-3));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED veda::tests::masked_dense_oracle_is_dense_attention_when_every_key_is_kept");
     }
     /// Batched against single-head scoring and selection of every layer and sample, against the
     /// independent host oracle per head: logits bit for bit (`to_bits`), rows exactly, gathers
@@ -1108,6 +1112,7 @@ mod tests {
         failures
     }
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn head_batches_select_and_reassemble_exactly_as_single_heads() {
         let dev = Device::Cpu;
         for (bundle, heads, dim) in [
@@ -1139,6 +1144,9 @@ mod tests {
                 assert_eq!(order, vec![1, 0]);
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED veda::tests::head_batches_select_and_reassemble_exactly_as_single_heads");
     }
     #[test]
     fn batches_follow_the_bound_and_refuse_before_gather() {
@@ -1345,6 +1353,7 @@ mod tests {
         assert_eq!(report.borrow().sparse_calls, 0);
     }
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn host_scores_are_the_frozen_host_contract() {
         // Off CUDA the scorer is gen-core's host contract itself (the CUDA gate holds the device
         // scorer to it bit for bit).
@@ -1387,6 +1396,9 @@ mod tests {
         );
         assert!(scores(p, 2, &[0], l, &qt, &kt).is_err());
         assert!(scores(p, 0, &[2], l, &qt, &kt).is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED veda::tests::host_scores_are_the_frozen_host_contract");
     }
     /// The tiled production attention kernel against the frozen per-row `pointer-v1` kernel it
     /// replaced (`veda_pointer_v1.cu`, verbatim from main), on one problem with three heads whose
@@ -1547,6 +1559,7 @@ mod tests {
     /// Missing/unsupported CUDA is failure, never an ignored or early-return success.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn actual_cuda_kernel_gate() {
         let dev = Device::new_cuda(0).expect("S3 requires an exclusively admitted CUDA device");
         for dtype in [DType::BF16, DType::F16] {
@@ -1794,6 +1807,9 @@ mod tests {
                 })
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED veda::tests::actual_cuda_kernel_gate");
     }
     #[test]
     fn independent_masks_include_dense_globals_and_valid_reference_rows() {

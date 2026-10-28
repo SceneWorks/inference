@@ -115,7 +115,7 @@ fn control_image(g: &Weights) -> Image {
 /// changes it (the control branch is active). Isolates the control transformer with the fork's
 /// `cap_feats` + `control_context`.
 #[test]
-#[ignore = "needs real Z-Image + control weights and the local control golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image + control weights and the local control golden"]
 fn control_scale0_is_inert() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
@@ -148,6 +148,9 @@ fn control_scale0_is_inert() {
         active > 1e-2,
         "control branch appears inert at scale={scale}: peak_rel {active:.2e}"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED control_real_weights::control_scale0_is_inert");
 }
 
 /// Gate B: the single control forward (first step) reproduces the fork's `v0`, using the fork's exact
@@ -155,7 +158,7 @@ fn control_scale0_is_inert() {
 /// fork feeds the control context as f32, so the whole control branch promotes to f32; sc-2720).
 /// Matching that dtype flow drops the single-forward error to the embedding bf16 floor.
 #[test]
-#[ignore = "needs real Z-Image + control weights and the local control golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image + control weights and the local control golden"]
 fn control_single_forward_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
@@ -184,6 +187,9 @@ fn control_single_forward_matches_golden() {
         pr < 5e-3,
         "control single forward diverged: peak_rel {pr:.2e}"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED control_real_weights::control_single_forward_matches_golden");
 }
 
 /// Gate C: the full control denoise loop reproduces the fork's final latents, using the fork's exact
@@ -192,7 +198,7 @@ fn control_single_forward_matches_golden() {
 /// like the fork's loop. The latent peak-rel is a single-outlier metric (the real gate is px>8 in
 /// `control_full_pipeline_matches_fork`).
 #[test]
-#[ignore = "needs real Z-Image + control weights and the local control golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image + control weights and the local control golden"]
 fn control_denoise_loop_matches_golden() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
@@ -235,6 +241,9 @@ fn control_denoise_loop_matches_golden() {
         pr < 2e-1,
         "control final latents diverged: peak_rel {pr:.2e}"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED control_real_weights::control_denoise_loop_matches_golden");
 }
 
 /// DIAGNOSTIC (sc-2720): control denoise under three input-dtype regimes on the same build, vs the
@@ -246,7 +255,7 @@ fn control_denoise_loop_matches_golden() {
 /// which the fork never does) diverges badly — that was the wrong reading of "the fork runs bf16".
 /// No assertion (it documents the dtype-flow finding).
 #[test]
-#[ignore = "diagnostic; needs real Z-Image + control weights and the control golden"]
+#[ignore = "model inference; explicit model-proof workflow; diagnostic; needs real Z-Image + control weights and the control golden"]
 fn control_dtype_compare() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
@@ -312,6 +321,9 @@ fn control_dtype_compare() {
     println!("  mixed (fork: bf16 latents+cap, f32 control): latent peak_rel={m_pr:.3e}  px>8={m_px:.3}%");
     println!("  pure f32  (old whole-path forcing)         : latent peak_rel={f_pr:.3e}  px>8={f_px:.3}%");
     println!("  pure bf16 (control branch forced to bf16)  : latent peak_rel={b_pr:.3e}  px>8={b_px:.3}%");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED control_real_weights::control_dtype_compare");
 }
 
 /// Q8 control gate (sc-2257 Q8 control branch): proves the control port adds **zero** error to the
@@ -331,7 +343,7 @@ fn control_dtype_compare() {
 /// still hold (control base path byte-identical to standalone base Q8). The dense control path is
 /// pixel-faithful (`control_full_pipeline_matches_fork`, 0.166%).
 #[test]
-#[ignore = "needs real Z-Image + control weights and the local Q8 control golden \
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image + control weights and the local Q8 control golden \
             (QUANTIZE=8 dump_z_image_control_golden.py)"]
 fn control_q8_transformer_matches_golden() {
     let g = Weights::from_file(Q8_GOLDEN).unwrap();
@@ -444,6 +456,9 @@ fn control_q8_transformer_matches_golden() {
         "control Q8 transformer-isolated render diverged: {:.3}% px>8 (sc-2604 f32-quantize regression?)",
         frac * 100.0
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED control_real_weights::control_q8_transformer_matches_golden");
 }
 
 /// DIAGNOSTIC (sc-2349 Q8 root-cause): stage-by-stage bisection of the Q8 control single forward vs
@@ -451,7 +466,7 @@ fn control_q8_transformer_matches_golden() {
 /// mean-rel localizes the bug. fork-f32 ≈ fork-bf16 (~0.24%), so this isolates a real bug from the
 /// activation dtype. Uses `forward_capture` to read Rust's intermediates.
 #[test]
-#[ignore = "diagnostic; needs the Q8 bisect golden"]
+#[ignore = "model inference; explicit model-proof workflow; diagnostic; needs the Q8 bisect golden"]
 fn control_q8_bisect() {
     let g = Weights::from_file(Q8_GOLDEN).unwrap();
     let bisect = Weights::from_file(concat!(
@@ -562,6 +577,9 @@ fn control_q8_bisect() {
         mean_rel(&v_none, &v_base),
         peak_rel(&v_none, &v_base),
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED control_real_weights::control_q8_bisect");
 }
 
 /// DETERMINISM (sc-2349 Q8 root-cause; Michael's falsification test): does the SAME toolchain
@@ -571,7 +589,7 @@ fn control_q8_bisect() {
 /// kernel uses non-fixed-order (atomic) reductions and the "8% residual" is partly nondeterminism,
 /// not a stable computational difference. Reports max|Δ| for Q8 vs dense, single-forward + full-loop.
 #[test]
-#[ignore = "diagnostic; needs real Z-Image + control weights and the Q8 control golden"]
+#[ignore = "model inference; explicit model-proof workflow; diagnostic; needs real Z-Image + control weights and the Q8 control golden"]
 fn control_q8_determinism() {
     let g = Weights::from_file(Q8_GOLDEN).unwrap();
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
@@ -681,6 +699,9 @@ fn control_q8_determinism() {
     cmp_prev("Q8 full-loop", &final_path, &la);
     write_f32(&v0_path, &a);
     write_f32(&final_path, &la);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED control_real_weights::control_q8_determinism");
 }
 
 /// Drive the full control pipeline through the public API and compare to the fork's golden render.
@@ -772,13 +793,18 @@ fn full_pipeline(golden_path: &str, quant: Option<Quant>, bits_label: &str, max_
 /// The integration proof: dense control render vs the fork's control golden. Runs the fork's exact
 /// **mixed precision** — bf16 latents + bf16 cap_feats, f32 control_context (sc-2720).
 #[test]
-#[ignore = "needs real Z-Image + control weights and the local control golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image + control weights and the local control golden"]
 fn control_full_pipeline_matches_fork() {
     // Measured (1024², 8-step, scale 1.0): 0.363% px>8 — the production re-encoding floor (VAE-encode
     // the control image + text-encode the prompt, vs the golden's stored intermediates). The denoise
     // itself, fed the golden's intermediates, is 0.039% (`control_dtype_compare`). 0.7% guards a
     // regression toward the wrong pure-bf16 control path (1.6%) without false-failing.
     full_pipeline(GOLDEN, None, "", 0.007);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED control_real_weights::control_full_pipeline_matches_fork"
+    );
 }
 
 /// sc-2257 Q8 control branch: the **full public Q8 path** (`with_quant(Q8)`) vs the fork's Q8
@@ -792,8 +818,11 @@ fn control_full_pipeline_matches_fork() {
 /// composition proof still holds (`control_q8_transformer_matches_golden`: the control base path is
 /// byte-identical to a standalone base Q8). Bound tightened to 1% (catches a regression to ~8%).
 #[test]
-#[ignore = "needs real Z-Image + control weights and the local Q8 control golden \
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image + control weights and the local Q8 control golden \
             (QUANTIZE=8 dump_z_image_control_golden.py)"]
 fn control_q8_full_pipeline_matches_fork() {
     full_pipeline(Q8_GOLDEN, Some(Quant::Q8), "_q8", 0.01);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED control_real_weights::control_q8_full_pipeline_matches_fork");
 }

@@ -332,6 +332,8 @@ fn real_wan_style_lora_loads_and_changes_the_render() {
         "the LoRA's effect ({applied:.3}) is not clearly above the scale-0 floor ({noop:.3}) — the \
          'it changed the output' claim would not be attributable to the adapter"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED style_lora_real_weights::real_wan_style_lora_loads_and_changes_the_render");
 }
 
 /// The **step-distill** class: a real Wan-T2V LoRA that also targets the seven whole-model globals must
@@ -344,6 +346,7 @@ fn real_wan_style_lora_loads_and_changes_the_render() {
 fn real_wan_step_distill_lora_installs_over_the_widened_globals() {
     let Ok(path) = std::env::var("KREA_DISTILL_LORA") else {
         eprintln!("skip: set KREA_DISTILL_LORA to a real Wan T2V step-distill LoRA .safetensors");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in real_wan_step_distill_lora_installs_over_the_widened_globals; see preceding skip diagnostic");
         return;
     };
     let path = PathBuf::from(path);
@@ -383,4 +386,6 @@ fn real_wan_step_distill_lora_installs_over_the_widened_globals() {
         1,
         "exactly one exposed global (patch_embedding, `.diff_b`-only) goes unmatched by this file"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED style_lora_real_weights::real_wan_step_distill_lora_installs_over_the_widened_globals");
 }

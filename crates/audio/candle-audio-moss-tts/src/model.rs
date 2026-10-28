@@ -214,7 +214,14 @@ impl Loaded {
     fn from_snapshot(root: &std::path::Path) -> gen_core::Result<Self> {
         let cfg = MossTtsdConfig::from_dir(root).map_err(gen_core::Error::from)?;
         let tok_path = root.join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| {
+        let tokenizer = candle_audio::gen_core::__model_input_reader!(
+            Tokenizer::from_file(&tok_path),
+            "candle-audio-moss-tts::model::Loaded::from_snapshot/tokenizer",
+            Tokenizer,
+            &tok_path,
+            |path| Tokenizer::from_file(path)
+        )
+        .map_err(|e| {
             gen_core::Error::Msg(format!("{MODEL_ID}: load {}: {e}", tok_path.display()))
         })?;
         let weights = root.join(crate::prepare::MODEL_WEIGHTS);

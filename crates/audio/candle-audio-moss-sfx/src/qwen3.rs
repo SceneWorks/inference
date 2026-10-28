@@ -72,25 +72,19 @@ impl Attention {
         mask: Option<&Tensor>,
     ) -> CandleResult<Tensor> {
         let (b, l, _) = x.dims3()?;
-        let q = self
-            .q_proj
-            .forward(x)?
+        let q = __model_proof_output!(self.q_proj.forward(x))?
             .reshape((b, l, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let k = self
-            .k_proj
-            .forward(x)?
+        let k = __model_proof_output!(self.k_proj.forward(x))?
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let v = self
-            .v_proj
-            .forward(x)?
+        let v = __model_proof_output!(self.v_proj.forward(x))?
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
         // Per-head q/k RMSNorm (over head_dim), then half-split RoPE — the HF Qwen3 order.
-        let q = self.q_norm.forward(&q.contiguous()?)?;
-        let k = self.k_norm.forward(&k.contiguous()?)?;
+        let q = __model_proof_output!(self.q_norm.forward(&q.contiguous()?))?;
+        let k = __model_proof_output!(self.k_norm.forward(&k.contiguous()?))?;
         let q = candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?;
         let k = candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?;
 
@@ -110,7 +104,7 @@ impl Attention {
             l,
             self.num_heads * self.head_dim,
         ))?;
-        self.o_proj.forward(&out)
+        __model_proof_output!(self.o_proj.forward(&out))
     }
 }
 
@@ -156,9 +150,9 @@ impl Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let gate = self.gate_proj.forward(x)?.silu()?;
-        let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
+        let gate = __model_proof_output!(self.gate_proj.forward(x))?.silu()?;
+        let up = __model_proof_output!(self.up_proj.forward(x))?;
+        __model_proof_output!(self.down_proj.forward(&(gate * up)?))
     }
 }
 
@@ -190,13 +184,16 @@ impl Layer {
         sin: &Tensor,
         mask: Option<&Tensor>,
     ) -> CandleResult<Tensor> {
-        let h = self
-            .attn
-            .forward(&self.input_layernorm.forward(x)?, cos, sin, mask)?;
+        let h = self.attn.forward(
+            &__model_proof_output!(self.input_layernorm.forward(x))?,
+            cos,
+            sin,
+            mask,
+        )?;
         let x = (x + h)?;
-        let h = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&x)?)?;
+        let h = self.mlp.forward(&__model_proof_output!(self
+            .post_attention_layernorm
+            .forward(&x))?)?;
         x + h
     }
 }
@@ -263,7 +260,7 @@ impl Qwen3Encoder {
     pub fn encode(&self, ids: &[u32]) -> CandleResult<Tensor> {
         let len = ids.len();
         let input = Tensor::from_vec(ids.to_vec(), (1, len), &self.device)?;
-        let mut h = self.embed_tokens.forward(&input)?;
+        let mut h = __model_proof_output!(self.embed_tokens.forward(&input))?;
         let (cos, sin) = self.rope_tables(len)?;
         let mask = if len > 1 {
             Some(self.causal_mask(len, h.dtype())?)
@@ -273,7 +270,7 @@ impl Qwen3Encoder {
         for layer in &self.layers {
             h = layer.forward(&h, &cos, &sin, mask.as_ref())?;
         }
-        self.norm.forward(&h)
+        __model_proof_output!(self.norm.forward(&h))
     }
 }
 
@@ -312,6 +309,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn encode_is_causal_and_stateless() {
         let enc = tiny_encoder(1.0);
         let full = enc.encode(&[1, 2, 3, 4]).unwrap();
@@ -334,5 +332,8 @@ mod tests {
         let a2 = again.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let a1 = full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(a1, a2);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen3::tests::encode_is_causal_and_stateless");
     }
 }

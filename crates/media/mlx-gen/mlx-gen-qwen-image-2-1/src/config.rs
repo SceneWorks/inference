@@ -83,8 +83,14 @@ pub const PRESETS: [SizePreset; 7] = [
 ];
 
 fn read_json(path: &Path) -> Result<Value> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::Msg(format!("qwen_image_2_1: read {}: {e}", path.display())))?;
+    let bytes = mlx_gen::gen_core::__model_input_reader!(
+        std::fs::read(path),
+        "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/config.rs::read_json::std::fs::read@3295",
+        ArtifactInput,
+        path,
+        |__model_input_path| std::fs::read(__model_input_path)
+    )
+    .map_err(|e| Error::Msg(format!("qwen_image_2_1: read {}: {e}", path.display())))?;
     serde_json::from_slice(&bytes)
         .map_err(|e| Error::Msg(format!("qwen_image_2_1: parse {}: {e}", path.display())))
 }

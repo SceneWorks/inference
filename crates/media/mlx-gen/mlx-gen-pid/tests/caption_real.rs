@@ -96,4 +96,6 @@ fn caption_encoding_matches() {
         cos > 0.998,
         "caption_embs cosine={cos} — forward divergence (ids matched exactly)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED caption_real::caption_encoding_matches");
 }

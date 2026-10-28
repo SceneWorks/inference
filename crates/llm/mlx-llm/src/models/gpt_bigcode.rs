@@ -428,6 +428,7 @@ mod tests {
     /// the activation dtype; on a random BF16 fixture its logits stay within the gate's budget of
     /// the `f32` path and its greedy tokens agree ([`crate::primitives::activation::parity`]).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn geglu_activation_dtype_parity() {
         use crate::primitives::activation::parity::{assert_geglu_parity, random_bf16};
         let (v, h, layers, heads, positions) = (64, 64, 2, 4, 64);
@@ -472,9 +473,12 @@ mod tests {
         .unwrap();
         let report = assert_geglu_parity("gpt_bigcode", &model, &[3, 17, 5, 40, 9], 16);
         eprintln!("gpt_bigcode GeGLU parity: {report:?}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::gpt_bigcode::tests::geglu_activation_dtype_parity");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn tiny_decoder_loads_and_projects_with_tied_token_embeddings() {
         let model = tiny_decoder();
         assert_eq!(
@@ -490,9 +494,12 @@ mod tests {
         let logits = logits.as_slice::<f32>();
         assert!(logits[1] > logits[0]);
         assert!(logits[1] > logits[2]);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::gpt_bigcode::tests::tiny_decoder_loads_and_projects_with_tied_token_embeddings");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn tiny_mqa_greedy_decode_is_deterministic_and_bounded() {
         let model = tiny_decoder();
         let config = GenerationConfig {
@@ -529,5 +536,7 @@ mod tests {
                 .shape(),
             &[1, 3]
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::gpt_bigcode::tests::tiny_mqa_greedy_decode_is_deterministic_and_bounded");
     }
 }

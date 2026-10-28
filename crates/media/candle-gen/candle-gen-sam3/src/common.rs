@@ -143,7 +143,7 @@ impl Linear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(self.0.forward(x)?)
+        Ok(__model_proof_output!(self.0.forward(x))?)
     }
 
     /// Fold a dense projection to `Q4_0`/`Q8_0` in place **iff** `in_features % 32 == 0` (else it stays
@@ -168,7 +168,7 @@ impl Linear {
 /// LayerNorm over the last dim with explicit weight/bias (eps as the reference's f64).
 pub(crate) fn layer_norm(x: &Tensor, w: &Tensor, b: &Tensor, eps: f64) -> Result<Tensor> {
     let ln = LayerNorm::new(w.clone(), b.clone(), eps);
-    Ok(ln.forward(x)?)
+    Ok(__model_proof_output!(ln.forward(x))?)
 }
 
 /// Scaled-dot-product attention, no mask. `q`/`k`/`v`: `[b, nh, seq, hd]` → `[b, nh, seq, hd]`.
@@ -267,7 +267,9 @@ pub(crate) fn group_norm_nhwc(
     let xc = x.permute([0, 3, 1, 2])?.contiguous()?; // NHWC → NCHW
     let c = xc.dim(1)?;
     let gn = GroupNorm::new(weight.clone(), bias.clone(), c, num_groups, eps)?;
-    Ok(gn.forward(&xc)?.permute([0, 2, 3, 1])?.contiguous()?) // NCHW → NHWC
+    Ok(__model_proof_output!(gn.forward(&xc))?
+        .permute([0, 2, 3, 1])?
+        .contiguous()?) // NCHW → NHWC
 }
 
 /// Nearest-neighbour `factor`× upsample of an NHWC activation (the FPN pixel decoder's 2× upsample).
@@ -325,13 +327,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q8_linear_is_near_lossless() {
         quant_roundtrip(Quant::Q8, 0.999);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED common::tests::q8_linear_is_near_lossless");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q4_linear_stays_coherent() {
         quant_roundtrip(Quant::Q4, 0.95);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED common::tests::q4_linear_stays_coherent");
     }
 
     /// Write a single-tensor `.safetensors` file (`name -> [value]`, f32) at `path`.

@@ -125,9 +125,13 @@ impl Conv1d {
 
     /// `[B, C_in, T]` → `[B, C_out, T']`.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = x
-            .contiguous()?
-            .conv1d(&self.weight, self.padding, 1, self.dilation, 1)?;
+        let y = __model_proof_output!(x.contiguous()?.conv1d(
+            &self.weight,
+            self.padding,
+            1,
+            self.dilation,
+            1
+        ))?;
         match &self.bias {
             Some(b) => add_bias(&y, b),
             None => Ok(y),
@@ -183,7 +187,12 @@ impl ConvTranspose1d {
 
     /// `[B, C_in, T]` → `[B, C_out, T·stride]`.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = transposed_conv1d(x, &self.weight, self.stride, self.padding)?;
+        let y = __model_proof_output!(transposed_conv1d(
+            x,
+            &self.weight,
+            self.stride,
+            self.padding
+        ))?;
         add_bias(&y, &self.bias)
     }
 }
@@ -583,10 +592,13 @@ impl MiniMaxH3AudioVae {
                 self.cfg.latent_channels
             )));
         }
-        let x =
-            z.to_dtype(self.dec_in_w.dtype())?
-                .contiguous()?
-                .conv1d(&self.dec_in_w, 0, 1, 1, 1)?;
+        let x = __model_proof_output!(z.to_dtype(self.dec_in_w.dtype())?.contiguous()?.conv1d(
+            &self.dec_in_w,
+            0,
+            1,
+            1,
+            1
+        ))?;
         let x = add_bias(&x, &self.dec_in_b)?;
         self.decoder.forward(&x)
     }

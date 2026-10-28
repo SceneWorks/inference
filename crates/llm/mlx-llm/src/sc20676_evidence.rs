@@ -5554,6 +5554,7 @@ mod tests {
     /// prompt offset predicts the rest (an off-by-one alignment would disagree everywhere).
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn one_pass_teacher_forcing_matches_the_step_by_step_decode_loop() {
         let model = tiny_packed_capable_model();
         let vocab = model.config().vocab_size;
@@ -5575,6 +5576,8 @@ mod tests {
         assert_eq!(one_pass, stepwise);
         let (matches, flips) = reference_agreement(&one_pass, &reference).unwrap();
         assert_eq!(matches as usize + flips.len(), reference.len());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED sc20676_evidence::tests::one_pass_teacher_forcing_matches_the_step_by_step_decode_loop");
     }
 
     #[test]

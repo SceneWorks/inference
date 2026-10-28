@@ -188,4 +188,6 @@ fn turbo_generator_emits_numbered_developing_frame_strip() {
         load_seconds,
         render_seconds,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED preview_real_weights::turbo_generator_emits_numbered_developing_frame_strip");
 }

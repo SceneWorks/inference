@@ -217,6 +217,7 @@ fn control_in_dim_is_260_for_dev() {
     assert_eq!(CONTROL_IN_DIM, 260);
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn scale_zero_equals_base_forward() {
     let f = Fixture::load();
@@ -229,8 +230,11 @@ fn scale_zero_equals_base_forward() {
          max|Δ| = {}",
         max_abs_diff(&base, &control0)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_parity::scale_zero_equals_base_forward");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn scale_nonzero_injects_and_stays_finite() {
     let f = Fixture::load();
@@ -248,5 +252,9 @@ fn scale_nonzero_injects_and_stays_finite() {
     assert!(
         peak.is_finite(),
         "controlled output must be finite, got peak {peak}"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED control_parity::scale_nonzero_injects_and_stays_finite"
     );
 }

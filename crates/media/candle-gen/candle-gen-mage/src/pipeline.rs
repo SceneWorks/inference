@@ -42,7 +42,13 @@ impl MagePipeline {
         device: &Device,
         adapters: &[AdapterSpec],
     ) -> Result<Self> {
-        let cfg_text = std::fs::read_to_string(dirs.transformer.join("config.json"))?;
+        let cfg_text = candle_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(dirs.transformer.join("config.json")),
+            candle_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+                dirs.transformer.join("config.json"),
+                "candle-gen-mage::pipeline::MagePipeline::load_components",
+            )
+        )?;
         let cfg = MageConfig::from_json(&cfg_text)?;
         let mut transformer =
             MageTransformer::load_with_quant(&dirs.transformer, &cfg, quant, device)?;
@@ -78,7 +84,13 @@ impl MagePipeline {
         cancel: &candle_gen::gen_core::CancelFlag,
         adapters: &[AdapterSpec],
     ) -> Result<MageHeavy> {
-        let cfg_text = std::fs::read_to_string(dirs.transformer.join("config.json"))?;
+        let cfg_text = candle_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(dirs.transformer.join("config.json")),
+            candle_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+                dirs.transformer.join("config.json"),
+                "candle-gen-mage::pipeline::MagePipeline::load_heavy",
+            )
+        )?;
         let cfg = MageConfig::from_json(&cfg_text)?;
         if stream_transformer_blocks && !adapters.is_empty() {
             candle_core::bail!(

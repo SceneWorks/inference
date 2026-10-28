@@ -77,6 +77,7 @@ fn stats(t: &Tensor) -> (f32, f32) {
 /// (CFG-free), keeps the trunk in/out channel + spatial shape, and yields a finite, non-degenerate
 /// latent.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn sprint_scm_2step_finite_nondegenerate() {
     let dev = Device::Cpu;
     let cfg = tiny_sprint_config();
@@ -126,10 +127,14 @@ fn sprint_scm_2step_finite_nondegenerate() {
     let (lo, hi) = stats(&denoised);
     assert!(lo.is_finite() && hi.is_finite(), "non-finite: [{lo}, {hi}]");
     assert!(hi - lo > 1e-6, "SCM latent is constant — graph degenerate");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED sprint_scm::sprint_scm_2step_finite_nondegenerate");
 }
 
 /// Single-step Sprint (num_steps = 1) skips the renoise and produces a finite latent.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn sprint_scm_single_step_finite() {
     let dev = Device::Cpu;
     let cfg = tiny_sprint_config();
@@ -164,11 +169,15 @@ fn sprint_scm_single_step_finite() {
     assert_eq!(steps, 1, "single-step SCM runs exactly one step");
     let (lo, hi) = stats(&out);
     assert!(lo.is_finite() && hi.is_finite());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED sprint_scm::sprint_scm_single_step_finite");
 }
 
 /// Determinism: same seed reproduces the denoised latent; a 4-step run's renoise actually mixes the
 /// per-step seed in, so a different seed diverges.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn sprint_scm_seed_determinism() {
     let dev = Device::Cpu;
     let cfg = tiny_sprint_config();
@@ -198,4 +207,7 @@ fn sprint_scm_seed_determinism() {
     };
     assert_eq!(run(7), run(7), "same seed reproduces");
     assert_ne!(run(7), run(8), "different seed diverges (renoise mixes in)");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED sprint_scm::sprint_scm_seed_determinism");
 }

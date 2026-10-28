@@ -72,6 +72,7 @@ fn ids_of(array: &mlx_rs::Array) -> Vec<i32> {
     array.as_slice::<i32>().to_vec()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn packed_te_tokenizer_needs_no_other_file() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -113,6 +114,10 @@ fn packed_te_tokenizer_needs_no_other_file() {
     assert_eq!(tokenizer.decode(&[4, 5, 6]).expect("decode"), "a red fox");
     // The dir still holds exactly the one file the tokenizer came from.
     assert_eq!(std::fs::read_dir(dir.path()).expect("read dir").count(), 1);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED gemma_tokenizer::packed_te_tokenizer_needs_no_other_file"
+    );
 }
 
 #[test]
@@ -137,6 +142,7 @@ fn packed_te_load_fails_loudly_when_an_asset_is_absent() {
     assert!(text.contains("gemma_config"), "{text}");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn gemma3_path_keeps_exactly_one_bos() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -161,8 +167,11 @@ fn gemma3_path_keeps_exactly_one_bos() {
 
     // The 2.3 contract still refuses an empty prompt (unchanged).
     assert!(tokenizer.encode("", 8).is_err());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma_tokenizer::gemma3_path_keeps_exactly_one_bos");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn gemma3_path_repairs_a_tokenizer_that_emits_no_bos() {
     // The regression direction the guard exists for: if a Gemma snapshot ever ships without the
@@ -178,6 +187,8 @@ fn gemma3_path_repairs_a_tokenizer_that_emits_no_bos() {
         .encode("a red fox in the snow", 8)
         .expect("encode");
     assert_eq!(ids_of(&ids), vec![0, 2, 4, 5, 6, 7, 8, 9]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma_tokenizer::gemma3_path_repairs_a_tokenizer_that_emits_no_bos");
 }
 
 /// Opt-in end-to-end proof against the shipped 26.3 GB text encoder: only the header and the packed

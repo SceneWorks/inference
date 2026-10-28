@@ -130,18 +130,22 @@ impl EncoderLayer {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let device = x.device();
         let len = x.dim(1)?;
-        let h = self.input_layernorm.forward(x)?;
-        let q = self.norm_q.forward(&to_heads(
-            &self.to_q.forward(&h)?,
+        let h = __model_proof_output!(self.input_layernorm.forward(x))?;
+        let q = __model_proof_output!(self.norm_q.forward(&to_heads(
+            &__model_proof_output!(self.to_q.forward(&h))?,
             self.num_heads,
             self.head_dim,
-        )?)?;
-        let k = self.norm_k.forward(&to_heads(
-            &self.to_k.forward(&h)?,
+        )?))?;
+        let k = __model_proof_output!(self.norm_k.forward(&to_heads(
+            &__model_proof_output!(self.to_k.forward(&h))?,
             self.num_kv_heads,
             self.head_dim,
-        )?)?;
-        let v = to_heads(&self.to_v.forward(&h)?, self.num_kv_heads, self.head_dim)?;
+        )?))?;
+        let v = to_heads(
+            &__model_proof_output!(self.to_v.forward(&h))?,
+            self.num_kv_heads,
+            self.head_dim,
+        )?;
         let (cos, sin) = rope_tables(self.head_dim, len, self.theta, device)?;
         let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
@@ -151,14 +155,15 @@ impl EncoderLayer {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         // Bidirectional (encoder) attention — no causal mask.
         let att = candle_nn::ops::softmax_last_dim(&(q.matmul(&k.transpose(2, 3)?)? * scale)?)?;
-        let attn = self
+        let attn = __model_proof_output!(self
             .to_out
-            .forward(&from_heads(&att.matmul(&v.contiguous()?)?)?)?;
+            .forward(&from_heads(&att.matmul(&v.contiguous()?)?)?))?;
         let x = (x + attn)?;
-        let h = self.post_attention_layernorm.forward(&x)?;
-        let ff = self
-            .down_proj
-            .forward(&(self.gate_proj.forward(&h)?.silu()? * self.up_proj.forward(&h)?)?)?;
+        let h = __model_proof_output!(self.post_attention_layernorm.forward(&x))?;
+        let ff = __model_proof_output!(self.down_proj.forward(
+            &(__model_proof_output!(self.gate_proj.forward(&h))?.silu()?
+                * __model_proof_output!(self.up_proj.forward(&h))?)?
+        ))?;
         x + ff
     }
 }
@@ -195,11 +200,11 @@ impl Encoder {
 
     /// Project raw inputs through `embed_tokens`, then run the contextual encoder stack.
     fn forward(&self, input: &Tensor) -> CandleResult<Tensor> {
-        let mut x = self.embed_tokens.forward(input)?;
+        let mut x = __model_proof_output!(self.embed_tokens.forward(input))?;
         for l in &self.layers {
             x = l.forward(&x)?;
         }
-        self.norm.forward(&x)
+        __model_proof_output!(self.norm.forward(&x))
     }
 }
 
@@ -348,7 +353,9 @@ impl ConditionEncoder {
         // drone-like audio (observed on all text2music outputs)", which is exactly the broadband
         // drone this port emitted over every generated track.
         parts.push(timbre.clone());
-        parts.push(self.text_projector.forward(text_hidden)?);
+        parts.push(__model_proof_output!(self
+            .text_projector
+            .forward(text_hidden))?);
         let refs: Vec<&Tensor> = parts.iter().collect();
         Tensor::cat(&refs, 1)
     }
@@ -379,6 +386,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn repeated_encodes_compute_fixed_timbre_context_once() {
         let device = Device::Cpu;
         let cfg = ConditionEncoderConfig {
@@ -470,5 +478,8 @@ mod tests {
             "only pooled timbre is cached"
         );
         assert_ne!(rows(&first, 2), rows(&second, 2), "text must stay dynamic");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED condition::tests::repeated_encodes_compute_fixed_timbre_context_once");
     }
 }

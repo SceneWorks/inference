@@ -129,6 +129,8 @@ fn open_tier() -> Option<(Tier, Device, Pool)> {
 #[ignore = "real weights + CUDA; set SC15792_Q4"]
 fn window_peak_sweep_is_linear_and_output_is_identical() -> Result<()> {
     let Some((tier, dev, pool)) = open_tier() else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/rung4_block_window_real_weights.rs:132 (window_peak_sweep_is_linear_and_output_is_identical): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
         return Ok(());
     };
     let cancel = CancelFlag::default();
@@ -198,6 +200,8 @@ fn window_peak_sweep_is_linear_and_output_is_identical() -> Result<()> {
         "window 1 must cut the RESERVED peak by more than 5x against fully resident, got {:.1}x",
         resident.3 / w1.3
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rung4_block_window_real_weights::window_peak_sweep_is_linear_and_output_is_identical");
     Ok(())
 }
 
@@ -219,6 +223,8 @@ fn window_peak_sweep_is_linear_and_output_is_identical() -> Result<()> {
 #[ignore = "real weights + CUDA; set SC15792_Q4"]
 fn defeating_the_release_restores_the_resident_peak() -> Result<()> {
     let Some((tier, dev, pool)) = open_tier() else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/rung4_block_window_real_weights.rs:222 (defeating_the_release_restores_the_resident_peak): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
         return Ok(());
     };
     let cancel = CancelFlag::default();
@@ -270,6 +276,8 @@ fn defeating_the_release_restores_the_resident_peak() -> Result<()> {
          {honest_live:.1} MiB). The window bound is then incidental, not load-bearing, and \
          `window_peak_sweep_is_linear_and_output_is_identical` is measuring something else."
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rung4_block_window_real_weights::defeating_the_release_restores_the_resident_peak");
     Ok(())
 }
 
@@ -285,6 +293,8 @@ fn defeating_the_release_restores_the_resident_peak() -> Result<()> {
 #[ignore = "real weights + CUDA; set SC15792_Q4"]
 fn cancel_and_injected_error_leave_no_residual_growth() -> Result<()> {
     let Some((tier, dev, pool)) = open_tier() else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/rung4_block_window_real_weights.rs:288 (cancel_and_injected_error_leave_no_residual_growth): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
         return Ok(());
     };
     let plan = BlockPlan::new(tier.n_blocks(), 1)?;
@@ -394,6 +404,8 @@ fn cancel_and_injected_error_leave_no_residual_growth() -> Result<()> {
          return the last window's pages",
         pool.reserved() as f64 / MIB
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rung4_block_window_real_weights::cancel_and_injected_error_leave_no_residual_growth");
     Ok(())
 }
 
@@ -418,6 +430,8 @@ fn windowed_fits_an_enforced_cap_the_resident_path_cannot() -> Result<()> {
     // `rung4_windowed_survives_a_cap_the_resident_path_cannot`, and anyone re-running that story's
     // documented invocation should exercise something rather than silently skip.
     let Some(path) = env_path_opt(TAG, TIER_ENV).or_else(|| env_path_opt(TAG, "SC16091_Q4")) else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/rung4_block_window_real_weights.rs:421 (windowed_fits_an_enforced_cap_the_resident_path_cannot): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
         return Ok(());
     };
     let cap_mib = env_usize("SC15792_CAP_MIB", 1024);
@@ -476,6 +490,8 @@ fn windowed_fits_an_enforced_cap_the_resident_path_cannot() -> Result<()> {
         "the windowed reserved high-water ({win_reserved:.1} MiB) exceeded the cap ({cap_mib} MiB) \
          — the counters are not following the capped pool"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rung4_block_window_real_weights::windowed_fits_an_enforced_cap_the_resident_path_cannot");
     Ok(())
 }
 
@@ -500,6 +516,8 @@ fn windowed_fits_an_enforced_cap_the_resident_path_cannot() -> Result<()> {
 #[ignore = "real weights + CUDA; set SC15792_Q4"]
 fn worker_thread_materialization_is_bit_identical() -> Result<()> {
     let Some((tier, dev, pool)) = open_tier() else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/rung4_block_window_real_weights.rs:503 (worker_thread_materialization_is_bit_identical): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
         return Ok(());
     };
     let cancel = CancelFlag::default();
@@ -534,5 +552,7 @@ fn worker_thread_materialization_is_bit_identical() -> Result<()> {
         "the window bound did not hold off the main thread: {worker_live:.1} MiB against \
          {main_live:.1} MiB on it"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rung4_block_window_real_weights::worker_thread_materialization_is_bit_identical");
     Ok(())
 }

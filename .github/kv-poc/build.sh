@@ -11,6 +11,39 @@ set -euo pipefail
 # shellcheck source=.github/kv-poc/common.sh
 source "$(dirname "$0")/common.sh"
 
+# fetch-prebuilt-mlx.sh:79-88 emits exactly these two raw path assignments. Its stdout is
+# data, NOT a shell program: never eval it (paths may contain spaces or hostile shell bytes).
+parse_prebuilt_env() {
+  local key value prebuilt_dir='' metallib_path='' have_dir=0 have_metallib=0
+  while IFS='=' read -r key value; do
+    case "$value" in
+      ''|*'$'*|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*|*'\'*|*'"'*|*"'"*|*'*'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*|*$'\r'*|*$'\t'*)
+        echo "::error title=invalid prebuilt output::unsafe or empty raw path for '$key'" >&2
+        return 1
+        ;;
+    esac
+    case "$key" in
+      PMETAL_MLX_PREBUILT_DIR)
+        [ "$have_dir" = 0 ] || { echo "::error title=invalid prebuilt output::duplicate $key" >&2; return 1; }
+        prebuilt_dir="$value"; have_dir=1
+        ;;
+      PMETAL_METALLIB_PATH)
+        [ "$have_metallib" = 0 ] || { echo "::error title=invalid prebuilt output::duplicate $key" >&2; return 1; }
+        metallib_path="$value"; have_metallib=1
+        ;;
+      *)
+        echo "::error title=invalid prebuilt output::unknown key '$key'" >&2
+        return 1
+        ;;
+    esac
+  done <<< "$1"
+  [ "$have_dir" = 1 ] && [ "$have_metallib" = 1 ] || {
+    echo "::error title=invalid prebuilt output::missing required path assignment" >&2
+    return 1
+  }
+  export PMETAL_MLX_PREBUILT_DIR="$prebuilt_dir" PMETAL_METALLIB_PATH="$metallib_path"
+}
+
 # The dev-Mac frozen W1 build's metallib (prebuilt 105a72fd7840 Release). A mismatch is a notice
 # for the reader, not a failure: fetch-prebuilt-mlx.sh already verifies the asset's own sha256.
 REFERENCE_METALLIB_SHA256=09336da65b3e8fc60e9d07e9ecec1115df638e42b8b20ce8706d83946539879d
@@ -136,7 +169,7 @@ stage_binaries() {
   local prebuilt rc=0
   prebuilt="$(cd "$INF" && scripts/fetch-prebuilt-mlx.sh --build-type Release)" || rc=$?
   [ "$rc" = 0 ] || { echo "::error title=prebuilt MLX unavailable::fetch-prebuilt-mlx.sh exited $rc; the frozen campaign build requires the published Release prebuilt"; return 1; }
-  eval "$prebuilt"
+  parse_prebuilt_env "$prebuilt" || return 1
   export PMETAL_MLX_PREBUILT_DIR PMETAL_METALLIB_PATH
   export CARGO_TARGET_DIR="$KV_TARGET"
   local bin_args=""
@@ -199,7 +232,7 @@ stage_w2_binaries() {
   local prebuilt rc=0
   prebuilt="$(cd "$INF" && scripts/fetch-prebuilt-mlx.sh --build-type Release)" || rc=$?
   [ "$rc" = 0 ] || { echo "::error title=prebuilt MLX unavailable::fetch-prebuilt-mlx.sh exited $rc; the frozen campaign build requires the published Release prebuilt"; return 1; }
-  eval "$prebuilt"
+  parse_prebuilt_env "$prebuilt" || return 1
   export PMETAL_MLX_PREBUILT_DIR PMETAL_METALLIB_PATH
   export CARGO_TARGET_DIR="$KV_TARGET"
   (cd "$INF" && rustc --version && cargo --version \

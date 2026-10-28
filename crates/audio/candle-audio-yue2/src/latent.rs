@@ -425,7 +425,14 @@ impl AcousticLatents {
     pub fn load(dir: &Path) -> Result<Self, LatentError> {
         let read = |name: &str| {
             let path = dir.join(name);
-            fs::read(&path).map_err(|source| LatentError::Io {
+            candle_audio::gen_core::__model_input_reader!(
+                fs::read(&path),
+                "crates/audio/candle-audio-yue2/src/latent.rs::load::fs::read@17261",
+                ArtifactInput,
+                &path,
+                |__model_input_path| fs::read(__model_input_path)
+            )
+            .map_err(|source| LatentError::Io {
                 path: path.display().to_string(),
                 source,
             })

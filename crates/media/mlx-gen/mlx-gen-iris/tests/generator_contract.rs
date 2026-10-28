@@ -68,11 +68,14 @@ fn missing_or_unknown_component_fails_at_load() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn gen_core_conformance_resident() {
-    cpu_process(
-        "generator_contract::gen_core_conformance_resident",
-        gen_core_conformance_resident_body,
-    );
+    cpu_process("generator_contract::gen_core_conformance_resident", || {
+        gen_core_conformance_resident_body();
+        eprintln!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::gen_core_conformance_resident"
+        );
+    });
 }
 
 fn gen_core_conformance_resident_body() {
@@ -80,10 +83,14 @@ fn gen_core_conformance_resident_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn gen_core_conformance_sequential() {
     cpu_process(
         "generator_contract::gen_core_conformance_sequential",
-        gen_core_conformance_sequential_body,
+        || {
+            gen_core_conformance_sequential_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::gen_core_conformance_sequential");
+        },
     );
 }
 
@@ -92,10 +99,14 @@ fn gen_core_conformance_sequential_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
     cpu_process(
         "generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8",
-        progress_is_steps_then_one_decoding_and_output_is_rgb8_body,
+        || {
+            progress_is_steps_then_one_decoding_and_output_is_rgb8_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8");
+        },
     );
 }
 
@@ -125,10 +136,14 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn count_folds_into_one_bar_with_distinct_seeds() {
     cpu_process(
         "generator_contract::count_folds_into_one_bar_with_distinct_seeds",
-        count_folds_into_one_bar_with_distinct_seeds_body,
+        || {
+            count_folds_into_one_bar_with_distinct_seeds_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::count_folds_into_one_bar_with_distinct_seeds");
+        },
     );
 }
 
@@ -153,10 +168,14 @@ fn count_folds_into_one_bar_with_distinct_seeds_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn mid_run_cancel_is_typed_and_returns_no_image() {
     cpu_process(
         "generator_contract::mid_run_cancel_is_typed_and_returns_no_image",
-        mid_run_cancel_is_typed_and_returns_no_image_body,
+        || {
+            mid_run_cancel_is_typed_and_returns_no_image_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::mid_run_cancel_is_typed_and_returns_no_image");
+        },
     );
 }
 

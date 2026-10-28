@@ -334,7 +334,13 @@ impl Trainer for MageTrainer {
 
 fn packed_component(dir: &Path) -> Result<bool> {
     let config = dir.join(TRANSFORMER_CONFIG);
-    let text = match std::fs::read_to_string(&config) {
+    let text = match candle_gen::gen_core::__model_input_choose!(
+        std::fs::read_to_string(&config),
+        candle_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+            &config,
+            "candle-gen-mage::training::packed_component",
+        )
+    ) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
@@ -728,8 +734,14 @@ impl MageTrainer {
             &aux_loss_context(&self.device, decoder),
         )?;
         let cache = cache_samples(&self.dirs, req, &self.device, on_progress)?;
-        let cfg_text = std::fs::read_to_string(self.dirs.transformer.join(TRANSFORMER_CONFIG))
-            .map_err(|error| CandleError::Msg(format!("{LABEL}: read config: {error}")))?;
+        let cfg_text = candle_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(self.dirs.transformer.join(TRANSFORMER_CONFIG)),
+            candle_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+                self.dirs.transformer.join(TRANSFORMER_CONFIG),
+                "candle-gen-mage::training::MageTrainer::train_impl",
+            )
+        )
+        .map_err(|error| CandleError::Msg(format!("{LABEL}: read config: {error}")))?;
         let dit_cfg = MageConfig::from_json(&cfg_text)?;
         let compute_dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
         let (transformer, surface) = if req.config.full_finetune {
@@ -1180,6 +1192,7 @@ mod tests {
     /// full fine-tune). An all-ones map is the unweighted loss; an all-zero map zeroes the loss AND
     /// every trainable gradient; a half map lands between.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_adapter_and_full_step_loss() {
         let fixture = tiny_transformer_dir();
         let cfg = tiny_config();
@@ -1232,6 +1245,9 @@ mod tests {
             let mid = loss(Some(&half)).to_scalar::<f32>().unwrap();
             assert!(mid > 0.0 && mid < plain, "{mid} vs {plain}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_adapter_and_full_step_loss");
     }
 
     /// sc-24828: the packed weight lines up with the packed latent — a weight whose value encodes its
@@ -1305,6 +1321,7 @@ mod tests {
     /// sc-2127: the trainer declares buckets, each bucket edge packs its own grid, and the real
     /// transformer accepts a cached sample of each bucket's size with that bucket's layout.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn each_bucket_packs_its_own_grid_and_forwards() {
         assert!(trainer_descriptor().techniques.resolution_buckets);
         for (edge, grid) in [(512u32, 32usize), (1024, 64)] {
@@ -1329,9 +1346,13 @@ mod tests {
             let output = model.forward(&latent, &text, &sigma, &layout).unwrap();
             assert_eq!(output.dims(), latent.dims(), "edge {edge}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::each_bucket_packs_its_own_grid_and_forwards");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn lora_and_lokr_train_save_and_apply_on_actual_mage_projection() {
         for (network, runtime_kind) in [
             (NetworkType::Lora, RuntimeAdapterKind::Lora),
@@ -1386,9 +1407,13 @@ mod tests {
             let (_, after) = step_surface(&applied, &[]);
             assert_ne!(before, after, "saved {network:?} did not affect inference");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::lora_and_lokr_train_save_and_apply_on_actual_mage_projection");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn full_surface_updates_separated_weights_and_round_trips_production_loader() {
         let fixture = tiny_transformer_dir();
         let cfg = tiny_config();
@@ -1449,6 +1474,9 @@ mod tests {
         }
         let _reloaded = MageTransformer::load(output.path(), &cfg, &Device::Cpu)
             .expect("full checkpoint reloads through the production Mage transformer loader");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::full_surface_updates_separated_weights_and_round_trips_production_loader");
     }
 
     /// sc-24830 (epic 2123 depth anchoring) — the Candle Mage step seam on the tiny synthetic
@@ -1567,6 +1595,7 @@ mod tests {
         /// AC1: a depth step has no diffusion term, total == aux, and the LoRA factors get a nonzero
         /// gradient. Mutation: ignore `plan.diffusion` (always compute the velocity term) ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn depth_step_trains_the_lora_through_depth_only() {
             let f = fixture();
             let cache = vec![sample(1)];
@@ -1599,6 +1628,9 @@ mod tests {
                 })
                 .sum();
             assert!(mag > 0.0 && mag.is_finite(), "LoRA grad |Σ| {mag}");
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::depth_step_trains_the_lora_through_depth_only");
         }
 
         /// The alternation interleaves (never two depth steps in a row) and gives each of 2
@@ -1606,6 +1638,7 @@ mod tests {
         /// driver's alternation over the item count with a bare global-step key (no period) ⇒
         /// item 0 locks to diffusion ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn every_item_gets_both_kinds_and_references_are_built_once() {
             let f = fixture();
             let cache = vec![sample(1), sample(2)];
@@ -1627,11 +1660,15 @@ mod tests {
                 assert!(k.contains(&true) && k.contains(&false), "{kinds:?}");
             }
             assert_eq!(aux.path().reference_computations(), cache.len());
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::every_item_gets_both_kinds_and_references_are_built_once");
         }
 
         /// E1: no driver ⇒ the step equals the pre-epic-2123 step bit for bit (loss value and every
         /// LoRA gradient). Mutation: perturb the off-path loss (scale the prediction by 1.0001) ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn everything_off_is_bit_identical_to_the_legacy_step() {
             let f = fixture();
             let cache = vec![sample(1)];
@@ -1701,6 +1738,9 @@ mod tests {
                 let (a, b) = (g_off.get(v.as_tensor()), g_legacy.get(v.as_tensor()));
                 assert_eq!(a.map(bits), b.map(bits));
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::everything_off_is_bit_identical_to_the_legacy_step");
         }
 
         /// E7: depth grows the estimate by decoder + DA2 (more for Large); the shared check refuses at

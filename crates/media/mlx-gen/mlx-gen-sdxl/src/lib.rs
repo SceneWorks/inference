@@ -22,6 +22,7 @@ pub(crate) mod block_stream;
 pub mod config;
 pub mod convert;
 pub mod inpaint;
+pub mod ios_pricing;
 pub mod ip_adapter;
 pub mod ldm;
 pub mod loader;
@@ -37,13 +38,54 @@ pub mod pipeline;
 pub mod plan;
 pub mod preview;
 pub mod quant;
+// iOS bounded execution quanta (sc-26270): labels and loaded-tensor scratch geometry.
+pub(crate) mod quantum;
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_tests;
+// sc-26270 (E2): the Mac default txt2img/img2img path pinned to a pre-epic golden.
+#[cfg(all(test, target_os = "macos"))]
+mod default_path_golden;
 pub mod sampler;
+/// Shared host-only SDXL sampling resolution, replay and logical lifetime facts.
+pub mod sampling;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+pub(crate) mod test_metal_guard;
+#[doc(hidden)]
+pub mod test_support;
 pub mod text_encoder;
 pub mod tokenizer;
+#[cfg(feature = "training")]
 pub mod training;
 pub mod unet;
 pub mod vae;
 pub mod vision_encoder;
+
+/// Weights-free numerics on MLX's **CPU** device (sc-26268): the low-memory parity tests run the
+/// same op graphs as production on tiny synthetic weights, need no accelerator, and must not depend
+/// on whose GPU the test host has. The guard restores the previous default device on drop, so a
+/// following test in the same (single-threaded) binary is unaffected.
+#[cfg(test)]
+pub(crate) mod test_device {
+    pub(crate) fn record_model_inference_device() {
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+    }
+
+    pub(crate) struct DeviceGuard(mlx_rs::Device);
+
+    impl Drop for DeviceGuard {
+        fn drop(&mut self) {
+            mlx_rs::Device::set_default(&self.0);
+        }
+    }
+
+    pub(crate) fn cpu_only() -> DeviceGuard {
+        let guard = DeviceGuard(mlx_rs::Device::try_default().expect("default device"));
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        guard
+    }
+}
 
 pub use adapters::{
     apply_sdxl_adapters, apply_sdxl_adapters_with, lora_delta, LoraCoverage, SdxlLoraReport,
@@ -60,12 +102,13 @@ pub use loader::{
     load_controlnet, load_ip_adapter, load_text_encoder_1, load_text_encoder_1_dtype,
     load_text_encoder_2, load_text_encoder_2_dtype, load_tokenizer, load_unet, load_unet_dtype,
     load_unet_kolors_dtype, load_unet_with_config, load_unet_with_config_streamed, load_vae,
-    resolve_unet_weight_file, resolve_vae_weight_file,
+    require_dense_training_base, resolve_unet_weight_file, resolve_vae_weight_file,
 };
 pub use long_prompt::ChunkedTokens;
 pub use model::{
-    descriptor, load, load_concrete, load_from_ldm_file, snapshot_component_footprint,
-    DecodeQualitySample, Sdxl, LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
+    conditioning_window_count, conditioning_window_count_with_source_capacity, descriptor, load,
+    load_concrete, load_from_ldm_file, snapshot_component_footprint, DecodeQualitySample, Sdxl,
+    LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
 };
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,
@@ -74,14 +117,17 @@ pub use pipeline::{
     denoise_ip_control, denoise_ip_control_with_preview, denoise_ip_multi_control,
     denoise_ip_multi_control_with_preview, denoise_ip_with_preview, denoise_multi_control,
     denoise_multi_control_with_preview, denoise_with_preview, encode_conditioning,
-    encode_conditioning_windows, encode_init_latents, preprocess_control_image,
-    preprocess_init_image, seeded_prior, text_time_ids, ControlContext, Denoiser,
+    encode_conditioning_windows, encode_init_latents, encode_init_latents_tiled,
+    preprocess_control_image, preprocess_init_image, seeded_prior, text_time_ids, ControlContext,
+    Denoiser,
 };
 pub use plan::{SdxlBlockWindow, SdxlForwardPlan};
 pub use sampler::EulerSampler;
 pub use text_encoder::{ClipOutput, ClipTextEncoder};
 pub use tokenizer::{ClipBpeTokenizer, PAD_ID};
+#[cfg(feature = "training")]
 pub use training::family::{train_family, SdxlFamilyHooks, TrainTimestep};
+#[cfg(feature = "training")]
 pub use training::{load_trainer, SdxlTrainer};
 pub use unet::{ControlNet, ControlResiduals, Transformer2D, UNet2DConditionModel};
 pub use vae::{Autoencoder, SdxlLatentDecoder};
@@ -152,6 +198,17 @@ pub fn exercise_retained_compile_inventory(input: &mlx_rs::Array) -> mlx_gen::Re
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    let registry = register_generator(registry);
+    #[cfg(feature = "training")]
+    let registry = registry.register_trainer(training::TRAINER_REGISTRATION);
+    registry
+}
+
+/// Register the complete SDXL generator, imported-checkpoint and memory surfaces, never a trainer.
+/// iOS uses this seam even when another workspace consumer unifies `training` on this crate.
+pub fn register_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
         .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
@@ -191,7 +248,6 @@ pub fn register_providers(
             },
         )
         .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
-        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit MLX SDXL provider catalog.
@@ -229,25 +285,25 @@ mod explicit_registry_tests {
     }
 
     /// sc-21510: rung 4 is tier-agnostic. The selector names an already-resolved artifact tier, so a
-    /// packed Q4/Q8 snapshot re-quantizes nothing and its blocks stay as lazy as BF16's. Every other
-    /// (surface, rung) disposition is unchanged.
+    /// packed Q4/Q8 snapshot re-quantizes nothing and its blocks stay as lazy as BF16's. sc-26268:
+    /// rung 2 (bounded decode) is published route-blind on every surface. Rung 3 stays `Missing`.
     #[test]
     fn published_ladder_surface_is_pinned_per_selector() {
         assert_eq!(
             ladder_lines(super::MODEL_ID),
             [
-                "bf16:resident:eager II---",
-                "bf16:resident:deferred II--I",
-                "bf16:sequential:eager II---",
-                "bf16:sequential:deferred II--I",
-                "q4:resident:eager II---",
-                "q4:resident:deferred II--I",
-                "q4:sequential:eager II---",
-                "q4:sequential:deferred II--I",
-                "q8:resident:eager II---",
-                "q8:resident:deferred II--I",
-                "q8:sequential:eager II---",
-                "q8:sequential:deferred II--I",
+                "bf16:resident:eager III--",
+                "bf16:resident:deferred III-I",
+                "bf16:sequential:eager III--",
+                "bf16:sequential:deferred III-I",
+                "q4:resident:eager III--",
+                "q4:resident:deferred III-I",
+                "q4:sequential:eager III--",
+                "q4:sequential:deferred III-I",
+                "q8:resident:eager III--",
+                "q8:resident:deferred III-I",
+                "q8:sequential:eager III--",
+                "q8:sequential:deferred III-I",
             ]
         );
     }
@@ -265,7 +321,12 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit_generators, ["sdxl"]);
-        assert_eq!(explicit_trainers, ["sdxl"]);
+        let expected_trainers: &[&str] = if cfg!(feature = "training") {
+            &["sdxl"]
+        } else {
+            &[]
+        };
+        assert_eq!(explicit_trainers, expected_trainers);
     }
 
     /// Weights-free behavioral oracle for the shared memory ladder (SC-15525).
@@ -445,3 +506,7 @@ mod sc2963 {
         super::RETAINED_SILU_GLUE.with(|slot| *slot.borrow_mut() = None);
     }
 }
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

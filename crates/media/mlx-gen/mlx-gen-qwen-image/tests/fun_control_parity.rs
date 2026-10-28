@@ -70,6 +70,7 @@ fn max_abs(a: &Array) -> f32 {
 /// GAP 1: the VACE branch `forward_control` reproduces the upstream reference hints. The fixture
 /// weights carry the checkpoint (diffusers) key names, so this drives them through the same
 /// `remap_transformer_keys` the production `load_controlnet` uses.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn forward_control_hints_match_videox_reference() {
     let mut w = Weights::from_file(FIXTURE).unwrap();
@@ -117,6 +118,8 @@ fn forward_control_hints_match_videox_reference() {
         "✓ VACE control hints match VideoX-Fun: 3 × {:?}  worst max|Δ| {worst:.3e}",
         hints[0].shape()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fun_control_parity::forward_control_hints_match_videox_reference");
 }
 
 /// GAP 2: the production 132-ch control-context fill + 2×2 pack byte-matches the fork's

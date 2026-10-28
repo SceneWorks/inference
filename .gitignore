@@ -4,6 +4,11 @@ __pycache__/
 *.py[cod]
 .DS_Store
 
+# Generated iOS host project (XcodeGen; regenerate with `xcodegen generate` in ios-host/).
+ios-host/*.xcodeproj/
+ios-host/App/Info.plist
+ios-host/smoke/target/
+
 # Local scratch harnesses parked inside a crate's `tests/`. Anything under `tests/` is a cargo
 # integration-test target: it compiles on every `cargo test -p <crate>` and `git add -A` would
 # commit it. Name scratch files `*_scratch.rs` so neither can happen by accident. A sweep or probe

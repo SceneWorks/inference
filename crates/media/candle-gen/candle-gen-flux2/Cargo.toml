@@ -37,6 +37,7 @@ serde = { version = "1", features = ["derive"] }
 sha2 = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "candle-llm/model-inference-proof"]
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider selects the matching candle backend everywhere.
 default = []

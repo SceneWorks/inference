@@ -1677,10 +1677,19 @@ impl MiniMaxH3 {
                 ))
             })
         };
-        crate::audio_config::MiniMaxH3AudioVaeConfig::from_source_files(
-            &read("config.json")?,
-            &read("config.yaml")?,
-            &read("metadata.json")?,
+        candle_gen::gen_core::__model_input_result!(
+            crate::audio_config::MiniMaxH3AudioVaeConfig::from_source_files(
+                &read("config.json")?,
+                &read("config.yaml")?,
+                &read("metadata.json")?,
+            ),
+            "candle-gen-minimax-h3::model::MiniMaxH3::audio_vae_config/configuration",
+            Configuration,
+            &[
+                src.join("config.json"),
+                src.join("config.yaml"),
+                src.join("metadata.json")
+            ]
         )
     }
 }

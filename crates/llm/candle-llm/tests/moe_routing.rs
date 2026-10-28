@@ -34,6 +34,15 @@
 //! SC24440_WRITE_MOE_GREEDY=1 cargo test -p candle-llm --test moe_routing
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Tensor};
@@ -471,6 +480,7 @@ fn greedy_cases() -> Vec<(&'static str, Vec<i32>)> {
 /// **AC1.** Every MoE family's greedy tokens are identical to the pre-change router's — through
 /// the CPU's grouped dispatch and through the stacked device dispatch a GPU step takes.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn moe_greedy_tokens_match_the_pre_change_router() {
     let cases = greedy_cases();
     if std::env::var("SC24440_WRITE_MOE_GREEDY").is_ok() {
@@ -512,6 +522,9 @@ fn moe_greedy_tokens_match_the_pre_change_router() {
             "{name}: greedy tokens diverged from the pre-change router"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moe_greedy_tokens_match_the_pre_change_router");
 }
 
 /// Prefill [`PROMPT`] through `step` (`tokens`, `offset`), then count the host syncs and MoE
@@ -531,6 +544,7 @@ fn decode_step_counts(mut step: impl FnMut(&[i32], i32)) -> (u64, u64) {
 /// **AC2.** A decode step on an MoE fixture routes every MoE layer on the device and reads nothing
 /// back to the host (see the module docs for what each counter can and cannot see).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_moe_decode_step_reads_nothing_back_to_the_host() {
     let dev = Device::Cpu;
     let (q2, q2w) = qwen2_moe(TINY, false, 0x2444_0001);
@@ -566,6 +580,9 @@ fn an_moe_decode_step_reads_nothing_back_to_the_host() {
         (0, 4),
         "qwen35_moe: (host syncs, MoE layers dispatched on the device) of a decode step"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED an_moe_decode_step_reads_nothing_back_to_the_host");
 }
 
 /// **AC3.** `graph_support()` no longer refuses an MoE model for its router.
@@ -642,6 +659,7 @@ fn mlx_q8_experts(weights: &HashMap<String, Tensor>) -> HashMap<String, Tensor> 
 /// the dequantize-per-forward Q8 tier — refused for graph capture off CUDA by that bank's cause —
 /// and decodes greedily through the grouped dispatch.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_mlx_q8_expert_fixture_loads_its_triples_and_decodes() {
     let (q2n, q2nw) = qwen2_moe(WIDE, true, 0x2444_0002);
     let model = causal(
@@ -654,6 +672,11 @@ fn the_mlx_q8_expert_fixture_loads_its_triples_and_decodes() {
         Err("moe_expert_host_dispatch:not_cuda")
     );
     assert_eq!(greedy_causal(&model).len(), GREEDY_STEPS + 1);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED the_mlx_q8_expert_fixture_loads_its_triples_and_decodes"
+    );
 }
 
 /// sc-24440 part 2: the indexed MoE dispatch on CUDA, end to end. Each fixture runs twice on the
@@ -777,12 +800,15 @@ mod cuda {
     };
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn moe_fixtures_decode_indexed_on_cuda_token_identical_to_the_grouped_dispatch() {
         let _graphs = cuda_graphs_policy_guard(Some(true));
         let device = match select_device() {
             Ok(d @ Device::Cuda(_)) => d,
             _ => {
                 eprintln!("skipping: no CUDA device");
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/moe_routing.rs:786 (moe_fixtures_decode_indexed_on_cuda_token_identical_to_the_grouped_dispatch): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
                 return;
             }
         };
@@ -847,5 +873,8 @@ mod cuda {
                 candle_quant_kernels::skip_without_sm120(&format!("NVFP4 MoE fixture ({why})"))
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda::moe_fixtures_decode_indexed_on_cuda_token_identical_to_the_grouped_dispatch");
     }
 }

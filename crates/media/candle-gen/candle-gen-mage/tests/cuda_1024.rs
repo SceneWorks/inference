@@ -68,4 +68,7 @@ fn correct_1024_rl_generation_matches_the_torch_oracle() {
         mean_rel <= 0.10,
         "1024² Torch image mean_rel {mean_rel:.6} exceeds calibrated 0.10 gate"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda_1024::correct_1024_rl_generation_matches_the_torch_oracle");
 }

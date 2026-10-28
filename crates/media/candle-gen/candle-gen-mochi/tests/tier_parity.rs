@@ -81,6 +81,8 @@ fn tier_forward_parity(tier: &str, expect_bits: Option<i32>, peak_bar: f32, mean
             "skip: no {tier} tier at {} (set MOCHI_MLX_TIER_DIR)",
             tier_dir.display()
         );
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-mochi/tests/tier_parity.rs:84 (tier_forward_parity): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     }
 
@@ -137,6 +139,9 @@ fn tier_forward_parity(tier: &str, expect_bits: Option<i32>, peak_bar: f32, mean
 #[ignore = "needs the mochi-1-mlx bf16 tier (MOCHI_MLX_TIER_DIR) + the CUDA golden"]
 fn bf16_tier_forward_matches_golden() {
     tier_forward_parity("bf16", None, 1.0e-1, 3.0e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tier_parity::bf16_tier_forward_matches_golden");
 }
 
 /// **q8 tier ≈ dense**: the Q8 packed attn/ff Linears add only the accepted `Q8_0` double-quant (Phase-2
@@ -145,6 +150,9 @@ fn bf16_tier_forward_matches_golden() {
 #[ignore = "needs the mochi-1-mlx q8 tier (MOCHI_MLX_TIER_DIR) + the CUDA golden"]
 fn q8_tier_forward_matches_golden() {
     tier_forward_parity("q8", Some(8), 1.2e-1, 6.0e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tier_parity::q8_tier_forward_matches_golden");
 }
 
 /// **q4 tier is lossy-bounded**: Q4 on a 10B DiT is genuinely lossy — a bounded perturbation of the bf16
@@ -154,6 +162,9 @@ fn q8_tier_forward_matches_golden() {
 #[ignore = "needs the mochi-1-mlx q4 tier (MOCHI_MLX_TIER_DIR) + the CUDA golden"]
 fn q4_tier_forward_matches_golden() {
     tier_forward_parity("q4", Some(4), 2.0e-1, 1.2e-1);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tier_parity::q4_tier_forward_matches_golden");
 }
 
 /// End-to-end **load** of the q4 tier through `Pipeline::load_components`: exercises the tier resolver

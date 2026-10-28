@@ -36,20 +36,24 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + U-Net golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + U-Net golden"]
 fn unet_single_forward_matches_vendored() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let timestep: f32 = g.metadata("timestep").unwrap().parse().unwrap();
     let unet = load_unet(&snapshot()).unwrap();
 
-    let eps = unet
-        .forward(
+    let eps = (
+        crate::common::record_model_inference_device(),
+        unet.forward(
             g.require("latents").unwrap(),
             timestep,
             g.require("conditioning").unwrap(),
             g.require("pooled").unwrap(),
             g.require("time_ids").unwrap(),
-        )
+        ),
+    )
+        .1
         .unwrap();
 
     let golden = g.require("eps").unwrap();
@@ -68,4 +72,8 @@ fn unet_single_forward_matches_vendored() {
     );
     assert!(pr < 5e-3, "U-Net forward diverged: peak_rel {pr:.3e}");
     println!("✓ SDXL U-Net single forward matches the vendored reference (f32)");
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED unet_real_weights::unet_single_forward_matches_vendored"
+    );
 }

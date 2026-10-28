@@ -160,4 +160,6 @@ fn lens_adapters_match_reference() {
     );
 
     eprintln!("ALL PASS");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adapter_parity::lens_adapters_match_reference");
 }

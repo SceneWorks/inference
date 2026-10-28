@@ -549,6 +549,11 @@ fn the_install_folds_at_the_published_strength() {
         0.0,
         "a zero-strength adapter must be byte-identical to the bare base"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::the_install_folds_at_the_published_strength"
+    );
 }
 
 /// **The installed fold keeps the factor's dtype.**
@@ -755,6 +760,9 @@ fn lokr_matches_an_independent_dense_kron_and_rejects_mutant_results() {
             "the oracle must fail the plausible {name} mutation, separation was only {separation:.3e}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::lokr_matches_an_independent_dense_kron_and_rejects_mutant_results");
 }
 
 /// The raw MiniMax-H3 module surface is four leaves: fused QKV, attention output, and both MLP
@@ -847,6 +855,9 @@ fn fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically() {
         let drift = rel_max_abs(&actual, &expected);
         assert!(drift < 2e-5, "{target}: rel-max-abs {drift:.3e}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically");
 }
 
 #[test]
@@ -1039,6 +1050,11 @@ fn manual_cuda_fabricated_lokr_install_receipt() {
         "[sc-20757-lokr] {}",
         String::from_utf8_lossy(&receipt_bytes)
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::manual_cuda_fabricated_lokr_install_receipt"
+    );
 }
 
 /// **The PEFT `lora_adapter_metadata` blob is the middle link of the alpha chain — and its `r` is a
@@ -1141,6 +1157,9 @@ fn a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check() {
         "an in-band .alpha of 128 must outrank BOTH a blob lora_alpha of 8 and a top-level alpha \
          of 8; got rel-max-abs {drift:.3e} against the fold-1.0 reference"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check");
 }
 
 // ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
@@ -1626,9 +1645,18 @@ macro_rules! per_alpha_spelling {
         const GENERATED_SPELLINGS: &[AlphaSpelling] = &[$($spelling),+];
         $(
             #[test]
+            #[ignore = "model inference; explicit model workflow only"]
             fn $name() {
                 assert_twin_equivalence($spelling);
-            }
+                            #[cfg(feature = "model-inference-proof")]
+                match stringify!($name) {
+                    "a_converted_comfyui_file_folds_like_its_diffusers_twin_in_band" => println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::a_converted_comfyui_file_folds_like_its_diffusers_twin_in_band"),
+                    "a_converted_comfyui_file_folds_like_its_diffusers_twin_peft_blob" => println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::a_converted_comfyui_file_folds_like_its_diffusers_twin_peft_blob"),
+                    "a_converted_comfyui_file_folds_like_its_diffusers_twin_metadata" => println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::a_converted_comfyui_file_folds_like_its_diffusers_twin_metadata"),
+                    "a_converted_comfyui_file_folds_like_its_diffusers_twin_absent" => println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::a_converted_comfyui_file_folds_like_its_diffusers_twin_absent"),
+                    _ => panic!("undeclared generated model-proof case"),
+                };
+}
 
             #[test]
             fn $chain() {
@@ -1972,6 +2000,7 @@ fn block_diagonality_is_measured_on_the_bytes_not_inferred_from_the_shape() {
 /// The control is the same snapshot loaded with no adapters: it must come back un-adapted, so the
 /// residual below is attributable to the spec and not to the fixture.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_render_seam_folds_the_staged_adapter_onto_the_dit() {
     let cfg = dit_fixture_config();
     let tmp = tempfile::tempdir().unwrap();
@@ -2063,6 +2092,9 @@ fn the_render_seam_folds_the_staged_adapter_onto_the_dit() {
         "the staged adapter must CHANGE the render's DiT; got a residual of {residual:.3e}, which \
          is what a provider that accepted the spec and never installed it produces"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::the_render_seam_folds_the_staged_adapter_onto_the_dit");
 }
 
 /// The fixture geometry as the diffusers `config.json` the DiT loader parses.
@@ -2465,7 +2497,15 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
 
     let dit_dir = trainer_dit_path();
     let config_path = dit_dir.join("config.json");
-    let config_text = std::fs::read_to_string(&config_path)
+    let config_text = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&config_path),
+"crates/media/candle-gen/candle-gen-minimax-h3/tests/turbo_lora.rs::manual_cuda_exact_h3_trainer_runtime_receipt::std::fs::read_to_string@103822",
+Configuration,
+&config_path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .unwrap_or_else(|error| panic!("read {}: {error}", config_path.display()));
     let config_sha256 = sha256_of(&config_path);
     let config_json: serde_json::Value =
@@ -2602,6 +2642,11 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
         "SC21028_TRAINER_RUNTIME_CORRECTNESS backend=candle probe={} \
          observed_vs_independent_expected_relative_max_abs={:.6e} limit={:.6e}",
         probe, residual_correctness_rel_max, SC21028_RUNTIME_RESIDUAL_REL_MAX
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED turbo_lora::manual_cuda_exact_h3_trainer_runtime_receipt"
     );
 }
 

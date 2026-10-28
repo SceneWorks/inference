@@ -18,6 +18,7 @@ use candle_gen_iris::{denoise, encode, load_backbone, IrisTextEncoder};
 use crate::common::{assert_close, cpu, fixture, tiny_backbone, tiny_config, tiny_text_encoder};
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn generate_matches_upstream_from_injected_noise() {
     let config = tiny_config();
     let te = IrisTextEncoder::load(&tiny_text_encoder(), &config.text_encoder, &cpu()).unwrap();
@@ -52,4 +53,7 @@ fn generate_matches_upstream_from_injected_noise() {
     .unwrap();
     assert_eq!(steps, (1..=params.steps).collect::<Vec<_>>());
     assert_close("image", &image, golden.require("image"), 6e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_parity::generate_matches_upstream_from_injected_noise");
 }

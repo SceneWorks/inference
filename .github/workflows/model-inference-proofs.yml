@@ -1,0 +1,187 @@
+name: Explicit model inference proofs
+
+# Model execution is NEVER a PR/push CI step. Dispatch only an approved source/case/resource plan.
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: Fixed compatible execution route; actual test devices are recorded separately
+        type: choice
+        required: true
+        default: mlx
+        options: [mlx, candle-cpu, candle-metal, candle-cuda]
+      request:
+        description: 'JSON with registered selection and explicit supervisor policy; optional runner="nax" for provisioned assets'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# No workflow-level concurrency group: GitHub replaces older PENDING members even cancel:false.
+# Compatible registered runner queues / existing physical execution coordination do the queuing.
+jobs:
+  plan:
+    name: Validate exact model-proof request (no model execution)
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned uv on Linux
+        if: runner.os == 'Linux'
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.12.3'
+          enable-cache: false
+      - name: Install managed CPython 3.12 on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          uv python install 3.12.10 --managed-python --no-bin --no-config
+          PYTHON="$(uv python find 3.12.10 --managed-python --no-project --no-config)"
+          "$PYTHON" -c 'import sys; assert sys.version_info[:3] == (3,12,10), sys.version'
+          printf 'REVIEWED_PYTHON=%s\n' "$PYTHON" >> "$GITHUB_ENV"
+      - name: Validate registered cases and explicit resource policy
+        id: plan
+        env:
+          MODEL_PROOF_BACKEND: ${{ inputs.backend }}
+          MODEL_PROOF_REQUEST: ${{ inputs.request }}
+        run: |
+          "$REVIEWED_PYTHON" -I scripts/ci/model_inference_proofs.py --plan \
+            --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
+            --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
+          "$REVIEWED_PYTHON" -I -c 'import json,os; p=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"model-proof-plan.json"),encoding="utf-8")); matrix={"include":[{"runner":p["runner"],"asset_setup":p["asset_setup"]}]}; open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8").write("matrix="+json.dumps(matrix,separators=(",",":"))+"\n")'
+
+  prove:
+    name: Explicit ${{ inputs.backend }} model tests
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      MODEL_PROOF_BACKEND: ${{ inputs.backend }}
+      MODEL_PROOF_REQUEST: ${{ inputs.request }}
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      CARGO_BUILD_JOBS: '4'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_STRIP: 'false'
+      CARGO_PROFILE_TEST_STRIP: 'false'
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
+      CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select Git Bash on Windows
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Install pinned uv on Windows
+        if: runner.os == 'Windows'
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.12.3'
+          enable-cache: false
+      - name: Install reviewed CPython 3.12 on Windows
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd
+      - name: Install pinned uv on Linux
+        if: runner.os == 'Linux'
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.12.3'
+          enable-cache: false
+      - name: Install managed CPython 3.12 on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          uv python install 3.12.10 --managed-python --no-bin --no-config
+          PYTHON="$(uv python find 3.12.10 --managed-python --no-project --no-config)"
+          "$PYTHON" -c 'import sys; assert sys.version_info[:3] == (3,12,10), sys.version'
+          printf 'REVIEWED_PYTHON=%s\n' "$PYTHON" >> "$GITHUB_ENV"
+      - name: Set owned proof paths and actual runner environment
+        shell: bash
+        env:
+          OWNED_PROOF_EVIDENCE: ${{ runner.temp }}/model-proof-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          ACTUAL_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          printf 'MODEL_PROOF_EVIDENCE=%s\n' "$OWNED_PROOF_EVIDENCE" >> "$GITHUB_ENV"
+          printf 'MODEL_PROOF_RUNNER_ENVIRONMENT=%s\n' "$ACTUAL_RUNNER_ENVIRONMENT" >> "$GITHUB_ENV"
+      - name: Select Rustup proxies on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          RUSTUP_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+          for tool in cargo rustc rustup; do test -x "$RUSTUP_BIN/$tool"; done
+          printf '%s\n' "$RUSTUP_BIN" >> "$GITHUB_PATH"
+      - name: Select real pinned Rust toolchain on Windows
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: . ./scripts/ci/real-weights/model-proof-execute/windows-rust.ps1
+      - name: Report actual host and pinned toolchain (no model execution)
+        shell: bash
+        run: source scripts/ci/real-weights/model-proof-execute/host.sh
+      - name: Require Python 3.12 on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: command -v python3.12
+      - name: Verify pinned Iris quant snapshots on the secondary Mac
+        if: matrix.asset_setup == 'iris-quant' && runner.os == 'macOS'
+        shell: bash
+        run: python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
+      - name: Verify pinned Iris quant snapshots on Windows
+        if: matrix.asset_setup == 'iris-quant' && runner.os == 'Windows'
+        shell: cmd
+        env:
+          CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
+      - name: Run exact registered model tests under external guards (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; else PYTHON="$REVIEWED_PYTHON"; fi
+          "$PYTHON" -I scripts/ci/model_inference_proofs.py \
+            --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
+            --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
+      - name: Run exact registered model tests under external guards (Windows CUDA)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          if not defined REVIEWED_PYTHON (
+            echo A reviewed absolute Python 3.12 interpreter must be provisioned.
+            exit /b 1
+          )
+          set "RUSTC_WRAPPER="
+          "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%MODEL_PROOF_EVIDENCE%"
+      - name: Validate owned evidence tree before any upload
+        id: evidence
+        if: always()
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; elif [[ "$RUNNER_OS" == Windows ]]; then PYTHON="$REVIEWED_PYTHON"; else PYTHON="$REVIEWED_PYTHON"; fi
+          "$PYTHON" -I scripts/ci/model_inference_proofs.py --verify-artifacts \
+            --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
+            --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
+      - name: Upload exact case evidence, safe generated outputs, logs and summary
+        if: always() && steps.evidence.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: model-proof-${{ github.sha }}-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.MODEL_PROOF_EVIDENCE }}
+          if-no-files-found: error

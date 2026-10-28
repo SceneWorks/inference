@@ -186,6 +186,8 @@ fn run_turbo_smoke(label: &str, w: u32, h: u32, steps: u32, quant: Quant) {
 #[ignore = "needs the SD3.5-Large-Turbo snapshot (set SD3_LARGE_TURBO_SNAPSHOT) + Metal"]
 fn e2e_turbo_1024_q8() {
     run_turbo_smoke("1024_q8", 1024, 1024, 4, Quant::Q8);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_turbo_real_weights::e2e_turbo_1024_q8");
 }
 
 /// Faster correctness pre-check at a smaller resolution (Q4) — proves the path before the full
@@ -194,4 +196,6 @@ fn e2e_turbo_1024_q8() {
 #[ignore = "needs the SD3.5-Large-Turbo snapshot (set SD3_LARGE_TURBO_SNAPSHOT) + Metal"]
 fn e2e_turbo_512_q4_quick() {
     run_turbo_smoke("512_q4", 512, 512, 4, Quant::Q4);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_turbo_real_weights::e2e_turbo_512_q4_quick");
 }

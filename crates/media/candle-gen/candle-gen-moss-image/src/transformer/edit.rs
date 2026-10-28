@@ -400,7 +400,7 @@ impl Transformer {
             .reshape((1, c, h, w))?;
         self.device().synchronize()?;
         check_cancel(cancel)?;
-        Ok(output)
+        __model_proof_output!(Ok(output))
     }
 }
 

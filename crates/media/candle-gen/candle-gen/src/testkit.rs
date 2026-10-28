@@ -321,6 +321,12 @@ pub fn read_ppm(path: &Path) -> Image {
     let _max: usize = tok().parse().expect("ppm maxval");
     i += 1; // single whitespace after maxval, before the pixel block
     let pixels = bytes[i..i + w * h * 3].to_vec();
+    #[cfg(feature = "model-inference-proof")]
+    gen_core::model_input_proof::record_reader_paths(
+        "candle-gen::testkit::read_ppm",
+        gen_core::model_input_proof::InputRole::Reference,
+        &[path],
+    );
     Image {
         width: w as u32,
         height: h as u32,

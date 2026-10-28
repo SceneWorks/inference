@@ -235,6 +235,7 @@ fn params(seed: u64, frames: usize, steps: Option<usize>) -> ArGenParams {
 }
 
 /// Correct latent-sequence shape + seed determinism through the real causal forward.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn generate_latents_shape_and_determinism() {
     let (causal, cfg, ctx) = setup();
@@ -282,10 +283,13 @@ fn generate_latents_shape_and_determinism() {
         max_abs_diff(&a, &c) > 0.0,
         "a different seed must change the latents"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ar_generate::generate_latents_shape_and_determinism");
 }
 
 /// KV threading: the persistent cache grows by exactly one chunk per chunk, ending at
 /// `num_frames · frame_seq_length` — both for a whole-block clip and a partial trailing block.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn generate_latents_threads_persistent_kv_cache() {
     let (causal, cfg, ctx) = setup();
@@ -338,9 +342,14 @@ fn generate_latents_threads_persistent_kv_cache() {
     )
     .expect_err("a populated cache must be rejected");
     assert!(err.to_string().contains("empty"), "err: {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED ar_generate::generate_latents_threads_persistent_kv_cache"
+    );
 }
 
 /// A caller `steps` override changes the number of forwards and still produces the correct shape.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn generate_latents_honors_steps_override() {
     let (causal, cfg, ctx) = setup();
@@ -380,10 +389,13 @@ fn generate_latents_honors_steps_override() {
         &mut sink()
     )
     .is_err());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ar_generate::generate_latents_honors_steps_override");
 }
 
 /// A latent geometry whose per-frame token count disagrees with `frame_seq_length` is rejected up
 /// front (the S3 causal forward bakes `frame_seq_length` into its cache windowing / RoPE offset).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn generate_latents_rejects_geometry_mismatch() {
     let (causal, cfg, ctx) = setup();
@@ -400,6 +412,10 @@ fn generate_latents_rejects_geometry_mismatch() {
     let err = generate_latents(&causal, &cfg, &ctx, &bad, &no_cancel(), &mut sink())
         .expect_err("mismatched per-frame token count must be rejected");
     assert!(err.to_string().contains("frame_seq_length"), "err: {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED ar_generate::generate_latents_rejects_geometry_mismatch"
+    );
 }
 
 /// S5 clean-context KV recompute (sc-8438), through the real tiny causal transformer. With recompute
@@ -408,6 +424,7 @@ fn generate_latents_rejects_geometry_mismatch() {
 /// final-denoise-step's. Both commit exactly once per chunk (identical committed token count), but the
 /// committed K/V **differ** — proving the recompute genuinely commits the clean-context forward, not the
 /// noisy final step. Same seed/model/context isolate the recompute as the only variable.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn recompute_commits_clean_context_kv_distinct_from_s4_baseline() {
     let (causal, cfg_on, ctx) = setup();
@@ -461,12 +478,15 @@ fn recompute_commits_clean_context_kv_distinct_from_s4_baseline() {
         max_abs_diff(&k_on, &k_off) > 0.0,
         "recompute must commit clean-context K/V distinct from the S4 near-clean-final-step K/V"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ar_generate::recompute_commits_clean_context_kv_distinct_from_s4_baseline");
 }
 
 /// Bounded (streaming) window (sc-8438): a clip several windows long must (a) generate the correct
 /// latents, (b) keep physical KV storage bounded to the window (eviction — not the full clip), and
 /// (c) read only the last `max_attention_size` tokens each chunk without OOB. The window unit is the
 /// reference's `local_attn_size × frame_seq_length` (frames), and the AR loop drives the windowed read.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn bounded_window_long_clip_stays_bounded_no_oob() {
     let mut cfg = tiny_cfg();
@@ -523,6 +543,10 @@ fn bounded_window_long_clip_stays_bounded_no_oob() {
         cache.retained_tokens(),
         8 * fsl
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED ar_generate::bounded_window_long_clip_stays_bounded_no_oob"
+    );
 }
 
 // ── S7 i2v / v2v conditioning (sc-8440) ──────────────────────────────────────────────────────────
@@ -547,6 +571,7 @@ fn frame_slice(latents: &Array, start: i32, count: i32) -> Array {
 /// from a same-seed t2v run — the still actually influences generation (the first generated chunk
 /// attends the warmed reference). Correct output shape; deterministic; a different still ⇒ a different
 /// continuation.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn i2v_reference_warms_cache_and_conditions_generation() {
     let (causal, cfg, ctx) = setup();
@@ -620,12 +645,15 @@ fn i2v_reference_warms_cache_and_conditions_generation() {
         max_abs_diff(&gen, &frame_slice(&i2v_b, 1, 2)) > 1e-4,
         "a different reference still must change the generated continuation"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ar_generate::i2v_reference_warms_cache_and_conditions_generation");
 }
 
 /// **Cache-warm correctness**: the reference frames' clean-context K/V populate the cache *before*
 /// generation — after `generate_latents_conditioned_into` the committed count is `(F_ref +
 /// num_latent_frames) · frame_seq_length`, i.e. one commit per reference block (the warm) plus one per
 /// generated block. Mirrors the S5 clean-context commit applied to the reference.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn i2v_cache_warm_commits_reference_before_generation() {
     let (causal, cfg, ctx) = setup();
@@ -655,12 +683,15 @@ fn i2v_cache_warm_commits_reference_before_generation() {
         "cache holds the warmed reference frame + the generated frames"
     );
     assert_eq!(out.shape(), &[16, 3, 4, 4]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ar_generate::i2v_cache_warm_commits_reference_before_generation");
 }
 
 /// **v2v**: a VAE-encoded source clip drives a strength-controlled init. The source and the strength
 /// both influence the output (different source ⇒ different output at a partial strength; strength=0 vs
 /// strength=1 differ), the shape is correct, generation is deterministic, and at `strength = 1` the
 /// source is fully washed out (source-independent — a full regeneration).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn v2v_source_and_strength_condition_generation() {
     let (causal, cfg, ctx) = setup();
@@ -782,5 +813,9 @@ fn v2v_source_and_strength_condition_generation() {
         )
         .is_err(),
         "a source with the wrong frame count is rejected"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED ar_generate::v2v_source_and_strength_condition_generation"
     );
 }

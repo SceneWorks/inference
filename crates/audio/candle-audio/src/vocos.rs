@@ -96,12 +96,12 @@ impl ConvNeXtBlock {
     /// `[1, dim, T]` → `[1, dim, T]`.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let residual = x;
-        let h = self.dwconv.forward(x)?;
+        let h = __model_proof_output!(self.dwconv.forward(x))?;
         let h = h.transpose(1, 2)?.contiguous()?; // [1, T, dim]
-        let h = self.norm.forward(&h)?;
-        let h = self.pwconv1.forward(&h)?.gelu_erf()?;
-        let h = self.pwconv2.forward(&h)?;
-        let h = h.broadcast_mul(&self.gamma)?;
+        let h = __model_proof_output!(self.norm.forward(&h))?;
+        let h = __model_proof_output!(self.pwconv1.forward(&h))?.gelu_erf()?;
+        let h = __model_proof_output!(self.pwconv2.forward(&h))?;
+        let h = __model_proof_output!(h.broadcast_mul(&self.gamma))?;
         let h = h.transpose(1, 2)?.contiguous()?; // [1, dim, T]
         residual + h
     }
@@ -186,8 +186,8 @@ impl Vocos {
         features: &Tensor,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Option<Vec<f32>>> {
-        let mut x = self.embed.forward(features)?; // [1, dim, T]
-        x = self.norm.forward(&x.transpose(1, 2)?.contiguous()?)?;
+        let mut x = __model_proof_output!(self.embed.forward(features))?; // [1, dim, T]
+        x = __model_proof_output!(self.norm.forward(&x.transpose(1, 2)?.contiguous()?))?;
         x = x.transpose(1, 2)?.contiguous()?;
         for block in &self.blocks {
             if cancel() {
@@ -198,10 +198,10 @@ impl Vocos {
         if cancel() {
             return Ok(None);
         }
-        let x = self
+        let x = __model_proof_output!(self
             .final_layer_norm
-            .forward(&x.transpose(1, 2)?.contiguous()?)?; // [1, T, dim]
-        let coeffs = self.head_out.forward(&x)?.i(0)?; // [T, n_fft + 2]
+            .forward(&x.transpose(1, 2)?.contiguous()?))?; // [1, T, dim]
+        let coeffs = __model_proof_output!(self.head_out.forward(&x))?.i(0)?; // [T, n_fft + 2]
         let n_bins = self.cfg.n_fft / 2 + 1;
         let mag = coeffs.narrow(1, 0, n_bins)?;
         let phase = coeffs.narrow(1, n_bins, n_bins)?;
@@ -359,6 +359,7 @@ mod tests {
     };
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn overlap_add_and_forward_emit_hop_samples_per_frame() {
         let vocos = zero_vocos(TINY);
         let frames = vec![vec![0f32; TINY.n_fft]; 5];
@@ -367,12 +368,16 @@ mod tests {
         let wav = vocos.forward(&feats).unwrap();
         assert_eq!(wav.len(), 7 * TINY.hop);
         assert!(wav.iter().all(|v| v.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vocos::tests::overlap_add_and_forward_emit_hop_samples_per_frame");
     }
 
     /// Zero head weights give `mag = e⁰ = 1`, `φ = 0` on every bin — an impulse at each frame's
     /// start, which the window zeroes; the result must stay finite and exactly `T · hop` long for a
     /// non-power-of-two `n_fft` (YuE's 3528 / 882 geometry).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn non_power_of_two_transforms_keep_the_same_padding_length() {
         let cfg = VocosConfig {
             n_fft: 3528,
@@ -384,6 +389,9 @@ mod tests {
         let wav = vocos.forward(&feats).unwrap();
         assert_eq!(wav.len(), 3 * 882);
         assert!(wav.iter().all(|v| v.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vocos::tests::non_power_of_two_transforms_keep_the_same_padding_length");
     }
 
     /// `max|got − want| / max|want|`; a length mismatch is an infinite error.
@@ -407,6 +415,7 @@ mod tests {
     /// the head's clamp and the inverse DFT's sign are all observable. Measured max relative
     /// difference: 1.3e-6 (CPU/f32), bound 1e-5.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vocos_matches_the_upstream_reference_at_moss_geometry() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/vocos_tiny_moss_reference.safetensors");
@@ -430,9 +439,13 @@ mod tests {
         let rel = max_rel(&got, &want);
         println!("tiny MOSS-geometry vocos: max|Δ|/max|ref| = {rel:.3e}");
         assert!(rel <= 1e-5, "vocos diverges from the reference: {rel:.3e}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vocos::tests::vocos_matches_the_upstream_reference_at_moss_geometry");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cancel_trips_between_blocks_and_bad_geometry_is_refused() {
         let vocos = zero_vocos(TINY);
         let feats = Tensor::zeros((1, TINY.input_channels, 2), DType::F32, &Device::Cpu).unwrap();
@@ -442,5 +455,8 @@ mod tests {
             .is_none());
         let vb = VarBuilder::from_tensors(HashMap::new(), DType::F32, &Device::Cpu);
         assert!(Vocos::load(&vb, TINY, hann_window(8), &Device::Cpu).is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vocos::tests::cancel_trips_between_blocks_and_bad_geometry_is_refused");
     }
 }

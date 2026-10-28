@@ -19,6 +19,10 @@
 
 use mlx_gen_sana::SanaTransformerConfig;
 
+#[cfg(target_os = "macos")]
+#[path = "../../../mlx-gen-iris/tests/common/metal_guard.rs"]
+pub mod quantum_metal_guard;
+
 /// Latent channels the tiny golden was dumped at.
 pub const SHARED_FIXTURE_TINY_IN_CHANNELS: i32 = 4;
 /// Predicted-noise channels.

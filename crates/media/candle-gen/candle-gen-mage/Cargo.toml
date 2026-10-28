@@ -6,6 +6,7 @@ license = "Apache-2.0"
 autotests = false
 
 [features]
+model-inference-proof = ["candle-gen-boogu/model-inference-proof", "candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof", "sceneworks-gen-core/model-inference-proof"]
 default = []
 cuda = ["candle-gen/cuda", "candle-gen-boogu/cuda", "candle-transformers/cuda", "candle-gen-perceptual/cuda"]
 testkit = ["candle-gen/testkit"]

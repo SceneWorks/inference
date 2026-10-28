@@ -48,6 +48,7 @@ fn t2i_realweight_matches_reference() {
             snap.display(),
             fix.display()
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in t2i_realweight_matches_reference; see preceding skip diagnostic");
         return;
     }
 
@@ -135,4 +136,6 @@ fn t2i_realweight_matches_reference() {
         "directional similarity {cosine:.5} below 0.99"
     );
     assert!(peak_rel < 0.1, "peak-rel {peak_rel:.3e} exceeds 0.10");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED t2i_realweight::t2i_realweight_matches_reference");
 }

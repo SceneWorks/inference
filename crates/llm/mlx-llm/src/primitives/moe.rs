@@ -641,6 +641,7 @@ mod tests {
     /// Both dispatch shapes (unsorted decode, sorted prefill) and both routing branches match the
     /// textbook block.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn sparse_moe_matches_the_reference_block() {
         for routing in [
             MoeRouting {
@@ -665,11 +666,14 @@ mod tests {
                 assert!(d < 1e-4, "t={t} {routing:?}: max abs diff {d}");
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::moe::tests::sparse_moe_matches_the_reference_block");
     }
 
     /// A quantized bank (gather_qmm) matches the same block with each expert quantized on its own
     /// (quantized_matmul) — the representation the per-expert router ran.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn quantized_bank_matches_per_expert_quantized_experts() {
         let routing = MoeRouting {
             experts_per_tok: 2,
@@ -722,6 +726,8 @@ mod tests {
             let d = max_diff(&got, &want);
             assert!(d < 1e-4, "t={t}: max abs diff {d}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::moe::tests::quantized_bank_matches_per_expert_quantized_experts");
     }
 
     /// sc-24446: a fused gate‖up bank (Qwen3.6's `experts.gate_up_proj`) dispatched as ONE
@@ -731,6 +737,7 @@ mod tests {
     ///
     /// MUTATION: swap the halves in `GateUp::forward` (gate ↔ up), and every case goes RED.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_fused_gate_up_bank_matches_the_split_banks_exactly() {
         let (e, h, inter) = (8, 64, 64);
         let routing = MoeRouting {
@@ -789,6 +796,8 @@ mod tests {
                 }
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::moe::tests::a_fused_gate_up_bank_matches_the_split_banks_exactly");
     }
 
     /// A fused bank with no even gate/up split is refused at load.

@@ -4,6 +4,15 @@
 //! hybrid, hybrid-MoE and Qwen2-MoE targets beside a hybrid and a Causal draft. The checks are the
 //! backend-neutral ones MLX runs too.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_llm::LlamaProvider;
 use core_llm::{LoadSpec, TextLlm};
 use core_llm_testkit::{
@@ -19,17 +28,22 @@ use common::Fixture;
 /// report naming `draft_model`, drafts are accepted and rejected, and a seeded stochastic run
 /// reproduces.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_resident_draft_proposes_and_greedy_output_is_off() {
     let root = Fixture::new("candle-llm-draft-model-", None);
     let fixture = write_draft_model_fixture(&root).unwrap();
     let provider = LlamaProvider::load(&fixture.spec_with_draft()).unwrap();
     check_draft_model_resident(&provider, &fixture.draft.to_string_lossy())
         .unwrap_or_else(|e| panic!("{e}"));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED a_resident_draft_proposes_and_greedy_output_is_off");
 }
 
 /// AC2: a draft whose tokenizer is not the target's is refused at load by name; the target
 /// still loads, does not advertise `draft_model`, and decodes exactly as it does alone.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_mismatched_tokenizer_draft_is_refused_and_the_target_still_loads() {
     let root = Fixture::new("candle-llm-draft-model-", None);
     let fixture = write_draft_model_fixture(&root).unwrap();
@@ -38,6 +52,9 @@ fn a_mismatched_tokenizer_draft_is_refused_and_the_target_still_loads() {
     check_draft_model_refused(&provider, &alone, &fixture.foreign_draft.to_string_lossy())
         .unwrap_or_else(|e| panic!("{e}"));
     assert!(alone.load_report().unwrap().draft.is_none());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED a_mismatched_tokenizer_draft_is_refused_and_the_target_still_loads");
 }
 
 fn load(spec: &LoadSpec) -> Result<Box<dyn TextLlm>, String> {
@@ -49,37 +66,59 @@ fn load(spec: &LoadSpec) -> Result<Box<dyn TextLlm>, String> {
 /// A real stop token the drafts propose and the target accepts ends every `draft_model` run —
 /// the host-sampled paths (a penalty, a near-zero temperature) included — where `off` stops.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_draft_proposed_stop_token_ends_the_run_where_off_does() {
     let root = Fixture::new("candle-llm-draft-model-", None);
     let fixture = write_draft_model_fixture(&root).unwrap();
     check_draft_model_stop_token(&fixture, &load).unwrap_or_else(|e| panic!("{e}"));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED a_draft_proposed_stop_token_ends_the_run_where_off_does"
+    );
 }
 
 /// E2: a request past the draft's own context window runs `auto` by name instead of driving the
 /// draft past it; within the window the draft runs.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_request_past_the_draft_context_falls_back_by_name() {
     let root = Fixture::new("candle-llm-draft-model-", None);
     let fixture = write_draft_model_fixture(&root).unwrap();
     check_draft_model_short_context(&fixture, &load).unwrap_or_else(|e| panic!("{e}"));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED a_request_past_the_draft_context_falls_back_by_name"
+    );
 }
 
 /// Epic AT1 (E1): the hybrid, hybrid-MoE and Causal-MoE targets, each beside the hybrid draft
 /// and the Causal draft, run `draft_model` and every other proposer they advertise (MTP, prompt
 /// lookup) at depths 1, 3 and the advertised max, each emitting exactly `off`'s greedy stream.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_target_and_draft_pairing_is_greedy_exact_at_every_depth() {
     let root = Fixture::new("candle-llm-draft-model-", None);
     let fixture = write_draft_model_fixture(&root).unwrap();
     check_draft_model_targets(&fixture, &load).unwrap_or_else(|e| panic!("{e}"));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED every_target_and_draft_pairing_is_greedy_exact_at_every_depth");
 }
 
 /// sc-24446 (E1, E8): a Qwen3-VL image request with a resident draft runs `draft_model` over the
 /// image-expanded history at every advertised depth and emits exactly `off`'s greedy stream —
 /// the same backend-neutral check the other backend runs.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_qwen3vl_image_request_runs_the_draft_greedy_exact() {
     let root = Fixture::new("candle-llm-draft-model-vl-", None);
     let fixture = write_qwen3vl_draft_fixture(&root).unwrap();
     check_draft_model_qwen3vl_multimodal(&fixture, &load).unwrap_or_else(|e| panic!("{e}"));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED a_qwen3vl_image_request_runs_the_draft_greedy_exact"
+    );
 }

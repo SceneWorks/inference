@@ -56,6 +56,16 @@
 //!
 //! Driven by `.github/workflows/real-weights-yue.yml` with `mode: memory`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::{Path, PathBuf};
 
 use candle_audio_yue::gen_core::{
@@ -633,6 +643,9 @@ fn measure_one_case() {
             .unwrap_or_else(|| "no CUDA probe (built without --features cuda)".into())
     );
     println!("wrote {}", path.display());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED measure_one_case");
 }
 
 #[cfg(feature = "cuda")]

@@ -150,6 +150,10 @@ fn small_vision_transformer_matches_fork() {
     );
     assert!(mean < 2e-3, "vt mean-rel {mean:.3e}");
     assert!(peak < 1e-2, "vt peak-rel {peak:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED vision_real_weights::small_vision_transformer_matches_fork"
+    );
 }
 
 /// Locate the Qwen-Image-Edit-2511 snapshot dir (env override, else the HF cache).
@@ -178,6 +182,8 @@ fn vision_transformer_real_weights_matches_fork() {
     );
     assert!(mean < 2e-3, "real vt mean-rel {mean:.3e}");
     assert!(peak < 1e-2, "real vt peak-rel {peak:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vision_real_weights::vision_transformer_real_weights_matches_fork");
 }
 
 /// Gate C (slice 6b-3): the full **VL conditioning encoder** — vision embeds spliced into the text
@@ -209,6 +215,10 @@ fn vl_encoder_real_weights_matches_fork() {
     // error (peak ≈ mean) — the bf16 mantissa signature, not a logic error.
     assert!(mean < 5e-3, "VL encoder mean-rel {mean:.3e}");
     assert!(peak < 1e-2, "VL encoder peak-rel {peak:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED vision_real_weights::vl_encoder_real_weights_matches_fork"
+    );
 }
 
 /// Slice 6b-2: the edit chat template + `<|image_pad|>` expansion + special-token tokenization,

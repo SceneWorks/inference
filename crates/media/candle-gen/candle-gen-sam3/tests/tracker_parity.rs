@@ -93,4 +93,9 @@ fn tracker_single_frame_matches_oracle() {
         "object score ours {} vs {want_obj}",
         out.object_score
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED tracker_parity::tracker_single_frame_matches_oracle"
+    );
 }

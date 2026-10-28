@@ -3,6 +3,16 @@
 //! `YUE2_VAE_REFERENCE_DIR` fixture, and an output path in `YUE2_PRECISION_RECEIPT`. It never
 //! downloads weights. Run it alone, once per backend, with an external device/host-memory sampler.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -537,4 +547,7 @@ fn explicit_stage_precision_real_weights() {
     let receipt = json!({"schemaVersion": 1, "backend": backend, "referenceSha256": reference_sha256, "listeningDir": work, "cases": cases, "legacyToBf16CachedDecode": {"sourceIdentity": legacy_source["runIdentity"], "targetIdentity": cross_result["identity"], "targetConfig": cross_config, "sourceGeneration": source_generation}});
     std::fs::write(&out, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     println!("YUE2_PRECISION_RECEIPT {}", out.display());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED explicit_stage_precision_real_weights");
 }

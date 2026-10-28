@@ -1698,6 +1698,7 @@ mod tests {
     /// dequantized to dense at load — reports `is_packed()`, and produces a finite velocity on a CPU
     /// forward (the dequant-on-matmul path executes end-to-end).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn from_gguf_builds_fully_resident_dit_and_forwards() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = gguf_cfg();
@@ -1758,5 +1759,8 @@ mod tests {
             "GGUF-resident DiT forward must be finite (got {max})"
         );
         std::fs::remove_file(&path).ok();
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED gguf::tests::from_gguf_builds_fully_resident_dit_and_forwards");
     }
 }

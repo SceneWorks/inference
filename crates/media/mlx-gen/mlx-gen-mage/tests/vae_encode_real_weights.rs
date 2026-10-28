@@ -79,6 +79,8 @@ fn encoder_matches_five_geometry_f32_and_bf16_goldens() {
         0.21,
         0.03,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_encode_real_weights::encoder_matches_five_geometry_f32_and_bf16_goldens");
 }
 
 #[test]
@@ -101,4 +103,6 @@ fn mean_latent_round_trip_is_finite_and_shape_exact() {
             .all(|value| value.is_finite()),
         "mean-latent round trip produced non-finite pixels"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_encode_real_weights::mean_latent_round_trip_is_finite_and_shape_exact");
 }

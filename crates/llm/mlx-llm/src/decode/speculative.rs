@@ -276,6 +276,7 @@ mod tests {
     /// plain loop's, first token and all. (Top-p is what separates the rules: the heap-order
     /// reference walks the nucleus heaviest-first, the shared sampler in vocabulary order.)
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn draft_speculation_draws_by_the_shared_sampler() {
         let (target, draft) = (causal(), causal());
         let prompt = [3, 9, 4, 11, 3, 9, 4, 11];
@@ -311,6 +312,8 @@ mod tests {
             );
             assert_eq!(out.tokens, expected.tokens, "seed {seed}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::speculative::tests::draft_speculation_draws_by_the_shared_sampler");
     }
 }
 
@@ -379,6 +382,7 @@ mod compressed_tests {
     /// past its quantized extent. (A verify forward rounds differently from single-token decode —
     /// the module's kernel caveat — so drafted tokens track rather than equal the plain decode.)
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prompt_lookup_speculation_runs_on_compressed_pages() {
         let model = crate::provider::tests::tiny_causal_model(4, 2, 64);
         let reader = crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).unwrap();
@@ -425,6 +429,8 @@ mod compressed_tests {
             "some drafts were rolled back: {stats:?}"
         );
         assert_eq!(drafted.tokens.len(), reference.tokens.len());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::speculative::compressed_tests::prompt_lookup_speculation_runs_on_compressed_pages");
     }
 
     /// Prompt-lookup speculation on the contiguous compressed cache (sc-20681): it stays compressed
@@ -433,6 +439,7 @@ mod compressed_tests {
     /// drafts it is the plain compressed decode token for token, with drafts it accepts and
     /// rejects, and it ends holding exactly the prompt and every committed token but the last.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prompt_lookup_speculation_runs_on_the_contiguous_compressed_cache() {
         let model = crate::provider::tests::tiny_causal_model(4, 2, 64);
         let reader = crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).unwrap();
@@ -495,6 +502,8 @@ mod compressed_tests {
             "some drafts were rolled back: {stats:?}"
         );
         assert_eq!(drafted.tokens.len(), reference.tokens.len());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::speculative::compressed_tests::prompt_lookup_speculation_runs_on_the_contiguous_compressed_cache");
     }
 
     /// Records whether every rollback truncation lands inside an armed speculation window.
@@ -557,6 +566,7 @@ mod compressed_tests {
     /// Both speculative loops arm exact rollback before every speculative step: each truncation
     /// that drops positions lands inside a window armed at or below its length.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn speculative_loops_arm_exact_rollback_before_every_truncation() {
         let target = crate::provider::tests::tiny_causal_model(4, 2, 64);
         let draft = crate::provider::tests::tiny_causal_model(2, 1, 64);
@@ -592,6 +602,8 @@ mod compressed_tests {
             assert!(spy.rollbacks > 0);
             assert_eq!(spy.unarmed_rollbacks, 0);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::speculative::compressed_tests::speculative_loops_arm_exact_rollback_before_every_truncation");
     }
 
     /// Draft-model speculation with the target and the draft each on its own paged compressed
@@ -599,6 +611,7 @@ mod compressed_tests {
     /// back every step, the target ends position-exact (prompt + every fed token) and the draft
     /// on a prefix of it, and neither pool keeps a page past its cache's quantized extent.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn draft_speculation_runs_target_and_draft_on_separate_compressed_caches() {
         let target = crate::provider::tests::tiny_causal_model(4, 2, 64);
         let draft = crate::provider::tests::tiny_causal_model(2, 1, 64);
@@ -646,5 +659,7 @@ mod compressed_tests {
         );
         assert_no_stray_pages(&target_cache, &target_pool);
         assert_no_stray_pages(&draft_cache, &draft_pool);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::speculative::compressed_tests::draft_speculation_runs_target_and_draft_on_separate_compressed_caches");
     }
 }

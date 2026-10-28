@@ -204,7 +204,12 @@ impl MiniMaxH3TeConfig {
         let text = std::fs::read_to_string(&path).map_err(|e| {
             CandleError::Msg(format!("minimax-h3 te: read {}: {e}", path.display()))
         })?;
-        Self::from_config_json(&text)
+        candle_gen::gen_core::__model_input_result!(
+            Self::from_config_json(&text),
+            "candle-gen-minimax-h3::text_encoder::MiniMaxH3TeConfig::from_component_dir/configuration",
+            Configuration,
+            &[&path]
+        )
     }
 
     /// Parse a `text_encoder/config.json` document. Split out from [`Self::from_snapshot`] so the

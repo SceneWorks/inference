@@ -292,6 +292,8 @@ fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
 /// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights(spec: &LoadSpec) -> Result<KolorsTrainer> {
     let root = snapshot_root(spec)?;
+    // Training reads the dense base; a packed U-Net tier is refused (the SDXL trainer's contract).
+    mlx_gen_sdxl::require_dense_training_base(root, MODEL_ID, &["unet"])?;
     let dtype = Dtype::Float32;
     let te_w = Weights::from_dir(root.join("text_encoder"))?;
     // bf16 frozen encoder (see the struct field) — half the f32 footprint, matches fp16 inference.
@@ -412,6 +414,37 @@ fn projected_dense_peak_gb(p: f64, bf16: bool) -> f64 {
         5.68 + 4.70e-4 * p + 2.166e-8 * p * p
     } else {
         11.02 + 9.50e-4 * p + 4.295e-8 * p * p
+    }
+}
+
+#[cfg(test)]
+mod dense_base_tests {
+    /// A packed U-Net tier is refused before the 6B encoder or any other weight is read.
+    #[test]
+    fn the_trainer_refuses_a_packed_unet_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("unet")).unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.to_path_buf()));
+        let dense_err = match super::load_weights(&spec) {
+            Ok(_) => panic!("an empty tree cannot load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(!dense_err.contains("pre-quantized"), "{dense_err}");
+
+        std::fs::write(
+            root.join("unet/config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .unwrap();
+        let err = match super::load_weights(&spec) {
+            Ok(_) => panic!("a packed tier must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("pre-quantized Q8") && err.contains("unet"),
+            "{err}"
+        );
     }
 }
 
@@ -680,6 +713,10 @@ mod first_step_repro {
             )
             .map_err(|e| eprintln!("  edge {edge} error: {e}"));
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_memory_sweep"
+        );
     }
 
     /// sc-4941 — block (gradient) checkpointing must not change the math vs the dense path. Same gate
@@ -735,6 +772,8 @@ mod first_step_repro {
         // Recompute fp noise (a few e-3; the 256-token ChatGLM cross-attention accumulates more than
         // SDXL's short prompt). A real bug is orders of magnitude larger.
         assert!(max_rel < 5e-3, "block ckpt must match dense: {max_rel:.2e}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::block_ckpt_grads_match_dense");
     }
 
     /// The carve-out audit: does the ChatGLM3 context need to stay f32 under bf16, or does the whole
@@ -867,6 +906,8 @@ mod first_step_repro {
             "bf16 must shrink the working set (the resident ChatGLM dilutes the ratio vs SDXL's 57%): \
              f32 {f32_peak:.2} GB vs bf16 {bf16_peak:.2} GB"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::bf16_grads_direction_and_memory_vs_f32");
     }
 }
 
@@ -981,6 +1022,7 @@ mod depth_anchoring_tests {
     /// recovery) ⇒ the depth term changes ⇒ the cross-check against an explicitly recovered x0
     /// reds.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_depth_only() {
         let h = hooks();
         for ckpt in [false, true] {
@@ -1121,6 +1163,8 @@ mod depth_anchoring_tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only");
     }
 
     /// E7 for Kolors' own peak curve: the TAESDXL + DA2 footprint is counted on the dense and the

@@ -142,4 +142,8 @@ fn krea_720x1280_pid_bottom_green_cast() {
         fixed_excess.abs() < abs_excess.abs() * 0.5,
         "fix should at least halve the bottom green-cast excess (absolute={abs_excess:.2}, fixed={fixed_excess:.2})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED pid_tall_green_cast::krea_720x1280_pid_bottom_green_cast"
+    );
 }

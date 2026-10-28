@@ -350,6 +350,12 @@ impl Golden {
                 },
             );
         }
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::record_reader_paths(
+            "candle-gen-minimax-h3::tests::common::Golden::load/reference",
+            candle_gen::gen_core::model_input_proof::InputRole::Reference,
+            &[std::path::Path::new(path)],
+        );
         Golden {
             data_start: 8 + hlen,
             data: bytes,

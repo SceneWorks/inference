@@ -608,8 +608,8 @@ impl MochiTransformer3DModel {
             .contiguous()?;
         let pw_f32 = self.patch_w.to_dtype(DType::F32)?;
         let pb_f32 = self.patch_b.to_dtype(DType::F32)?;
-        let x = x.conv2d(&pw_f32, 0, p, 1, 1)?; // [B·F, inner, ph, pw]
-        let x = x.broadcast_add(&pb_f32.reshape((1, inner, 1, 1))?)?;
+        let x = __model_proof_output!(x.conv2d(&pw_f32, 0, p, 1, 1))?; // [B·F, inner, ph, pw]
+        let x = __model_proof_output!(x.broadcast_add(&pb_f32.reshape((1, inner, 1, 1))?))?;
         let mut hs = x
             .reshape((b * f, inner, ph * pw))?
             .transpose(1, 2)?
@@ -985,6 +985,7 @@ mod tests {
     /// A single joint-attention block forwards to the right shapes and is deterministic — the CPU
     /// CI-green DiT-block gate (no model weights).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn block_forward_shapes_and_determinism() {
         let dev = Device::Cpu;
         let cfg = MochiDitConfig {
@@ -1034,11 +1035,15 @@ mod tests {
             .unwrap()
             .iter()
             .all(|x| x.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::block_forward_shapes_and_determinism");
     }
 
     /// The full model forwards a `[neg, pos]` batch to a velocity of the latent shape, is
     /// deterministic, and finite — the CPU CI-green full-DiT gate (no model weights).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn full_model_forward_shapes_and_determinism() {
         let dev = Device::Cpu;
         let cfg = tiny_full_cfg();
@@ -1076,10 +1081,14 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert_eq!(d, 0.0, "forward is deterministic");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::full_model_forward_shapes_and_determinism");
     }
 
     /// The final `context_pre_only` block returns `enc` unchanged (the text output path is dropped).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn context_pre_only_block_returns_enc_unchanged() {
         let dev = Device::Cpu;
         let cfg = MochiDitConfig {
@@ -1122,5 +1131,8 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert_eq!(same, 0.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::context_pre_only_block_returns_enc_unchanged");
     }
 }

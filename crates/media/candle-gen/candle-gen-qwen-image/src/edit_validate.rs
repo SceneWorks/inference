@@ -162,6 +162,9 @@ fn real_weight_edit() {
     println!(
         "Qwen-Image-Edit validation PASS ✅ (eyeball the PPMs for reference-respecting edits)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED edit_validate::real_weight_edit");
 }
 
 /// sc-6217: a >1024² edit makes the joint `[txt, noise, ref]` sequence (24 heads) blow past candle's
@@ -216,6 +219,9 @@ fn high_res_edit_avoids_i32_overflow() {
     println!(
         "sc-6217 high-res edit PASS ✅ (eyeball qwen_edit_highres_1536.ppm — no noisy bottom band)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED edit_validate::high_res_edit_avoids_i32_overflow");
 }
 
 /// sc-6220: the **Qwen-Image-Edit-2511-Lightning** few-step distill — load the `-2511` base with the
@@ -297,4 +303,7 @@ fn lightning_edit_4steps() {
         "lightning prompt A-vs-B diff {diff:.2} too small — distill/sampler not steering"
     );
     println!("sc-6220 lightning 4-step edit PASS ✅ (eyeball the PPMs)");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED edit_validate::lightning_edit_4steps");
 }

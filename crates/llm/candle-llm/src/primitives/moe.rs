@@ -595,7 +595,7 @@ impl SparseMoe {
     /// which is at least `1 / experts` — so no clamp is taken here.
     pub fn route(&self, xf: &Tensor) -> Result<(Tensor, Tensor)> {
         let k = self.top_k();
-        let logits = xf.matmul(&self.router.t()?)?; // [t, E]
+        let logits = __model_proof_output!(xf.matmul(&self.router.t()?))?; // [t, E]
         let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
         let ids = probs
             .arg_sort_last_dim(false)?
@@ -913,6 +913,7 @@ mod tests {
 
     /// The device router picks the top-k and weights them exactly as the host router did.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn device_routes_match_a_host_top_k() {
         for routing in [NORM, SCALED] {
             let moe = block(8, 32, 16, routing, None);
@@ -946,6 +947,9 @@ mod tests {
                 }
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::moe::tests::device_routes_match_a_host_top_k");
     }
 
     /// A single-token step through the stacked device dispatch is bit-identical to the grouped
@@ -956,6 +960,7 @@ mod tests {
     /// plain GEMM whose rounding the backend may vary with `t`; the dispatch is compared on one
     /// set of routes.)
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn stacked_device_dispatch_matches_the_grouped_dispatch() {
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         for routing in [NORM, SCALED, WIDE_K] {
@@ -998,6 +1003,9 @@ mod tests {
                 }
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::moe::tests::stacked_device_dispatch_matches_the_grouped_dispatch");
     }
 
     /// Syncs and device dispatches a `forward` of `x` issues on this thread.
@@ -1014,6 +1022,7 @@ mod tests {
     /// bank's grouped dispatch reads its routes once — and says so as its graph refusal. On the
     /// CPU the dense bank goes grouped too (a host read is free there).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn host_reads_follow_the_bank() {
         let x = randn(&[1, 1, 64], &mut SplitMix64::new(3));
         let dense = block(8, 64, 64, NORM, None);
@@ -1040,6 +1049,11 @@ mod tests {
         assert_eq!(q8.indexed_refusal(), Some("not_cuda"));
         // A dense bank the indexed kernels refuse still dispatches on the device (gathered).
         assert_eq!(dense.indexed_refusal(), Some("not_cuda"));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED primitives::moe::tests::host_reads_follow_the_bank"
+        );
     }
 
     /// Every cause the indexed kernels can refuse a bank for composes into a named graph refusal
@@ -1099,6 +1113,7 @@ mod tests {
     /// Off CUDA a dense bank's device dispatch is the gathered one (it copies its experts — the
     /// copy counter says so), and [`with_grouped_dispatch`] overrides every device choice.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_gathered_dispatch_is_counted_and_grouped_can_be_forced() {
         let x = randn(&[1, 1, 64], &mut SplitMix64::new(6));
         let dense = block(8, 64, 64, NORM, None);
@@ -1114,6 +1129,9 @@ mod tests {
             FORCE_GROUPED_DISPATCH.with(|c| !c.get()),
             "the flag is restored"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::moe::tests::the_gathered_dispatch_is_counted_and_grouped_can_be_forced");
     }
 
     /// Admission's per-token bytes cover the dispatch a step takes: on the CPU the grouped one
@@ -1133,6 +1151,7 @@ mod tests {
     /// ([`DEVICE_DISPATCH_MAX_ROWS`] tokens) through 8 experts at k = 2 — more (token, slot) pairs
     /// than experts — is dispatched on the device and not refused; a prefill-sized step is not.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_graph_refusal_matches_the_dispatch_forward_takes() {
         let dense = block(8, 64, 64, NORM, None);
         let decode = randn(&[1, DEVICE_DISPATCH_MAX_ROWS, 64], &mut SplitMix64::new(4));
@@ -1149,6 +1168,9 @@ mod tests {
             with_device_dispatch(|| step_counts(&dense, &prefill)),
             (1, 0)
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::moe::tests::the_graph_refusal_matches_the_dispatch_forward_takes");
     }
 
     /// Timing, not a gate: the stacked device dispatch against the grouped dispatch on the CPU at
@@ -1198,6 +1220,9 @@ mod tests {
                 stacked / grouped
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::moe::tests::stacked_vs_grouped_cpu_timing");
     }
 
     /// Every device→host read in this module goes through [`read_routes`], so the host-sync
@@ -1440,6 +1465,7 @@ mod cuda_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn every_expert_format_is_dispatched_indexed_and_matches_the_grouped_dispatch() {
         let dev = crate::device::new_cuda_for_test().expect("a CUDA device");
         let sm120 = ProjectionFormat::nvfp4(&dev).is_ok();
@@ -1457,6 +1483,8 @@ mod cuda_tests {
         for (fmt, dtype, h, inter) in cases {
             if matches!(fmt, Fmt::Nvfp4) && !sm120 {
                 candle_quant_kernels::skip_without_sm120("NVFP4 MoE experts");
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/primitives/moe.rs:1460 (every_expert_format_is_dispatched_indexed_and_matches_the_grouped_dispatch): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
                 continue;
             }
             let moe = block(&dev, dtype, h, inter, fmt);
@@ -1511,6 +1539,9 @@ mod cuda_tests {
                 }
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::moe::cuda_tests::every_expert_format_is_dispatched_indexed_and_matches_the_grouped_dispatch");
     }
 
     /// NVFP4's indexed kernel is the decode GEMV's core: with the GEMV switched off every NVFP4

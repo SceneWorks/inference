@@ -109,7 +109,12 @@ impl PrismVisionGguf {
         let weights = Weights::from_map(dense, device.clone());
         let model =
             Qwen35VisionModel::from_gguf_weights(&weights, PREFIX, cfg.clone(), &mut packed)?;
-        Ok(Self { model, config: cfg })
+        crate::__model_input_result!(
+            Ok(Self { model, config: cfg }),
+            "candle-llm::prism_vision_gguf::PrismVisionGguf::open",
+            ModelWeights,
+            &[path]
+        )
     }
 }
 
@@ -553,6 +558,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn bf16_and_compact_q8_projectors_execute_close_to_dense_reference() {
         let dir = tempfile::tempdir().unwrap();
         let bf16_path = dir.path().join("mmproj-bf16.gguf");
@@ -583,6 +589,9 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(max_abs < 0.02, "Q8 projector drift {max_abs}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED prism_vision_gguf::tests::bf16_and_compact_q8_projectors_execute_close_to_dense_reference");
     }
 
     #[test]

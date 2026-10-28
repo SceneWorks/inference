@@ -189,7 +189,15 @@ impl Yue2TextTokenizer {
                 actual,
             });
         }
-        Self::from_tiktoken_bytes(&bytes)
+        candle_audio::gen_core::__model_input_choose!(Self::from_tiktoken_bytes(&bytes), Self::from_tiktoken_bytes(&bytes).inspect(|_| {
+            if let Some(digest) = candle_audio::gen_core::model_input_proof::sha256_from_hex(&actual) {
+                candle_audio::gen_core::model_input_proof::record_inputs(
+                    "candle-audio-yue2::tokenizer::Yue2TextTokenizer::from_verified",
+                    candle_audio::gen_core::model_input_proof::InputRole::Tokenizer,
+                    &[candle_audio::gen_core::model_input_proof::InputIdentity::same_read_buffer(Some(path), digest)],
+                );
+            }
+        }))
     }
 
     /// Parse checkpoint-native `qwen.tiktoken` bytes (exactly [`ORDINARY_TOKENS`] ranks).

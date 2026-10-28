@@ -844,6 +844,9 @@ fn the_evicted_adaln_weights_leave_memory() {
         fresh.iter().all(DitBlock::holds_adaln),
         "a refused precompute must not have evicted anything"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adaln_evict_memory::the_evicted_adaln_weights_leave_memory");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1042,4 +1045,7 @@ fn the_evicted_adaln_weights_leave_the_cuda_pool() {
     drop((held, pinned_cache, pinned_blocks));
     device.synchronize().unwrap();
     one_forward(&c, &blocks, &cache, &device);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adaln_evict_memory::the_evicted_adaln_weights_leave_the_cuda_pool");
 }

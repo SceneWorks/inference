@@ -176,6 +176,7 @@ fn noise_px(key: &str, h: usize, w: usize) -> Tensor {
 /// ⇒ shape/values red; drop the `2·px − 1` normalization ⇒ embedding red; skip the bias centring
 /// ⇒ cos red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn identity_path_matches_the_torch_reference() {
     let f = fixture();
     let (live, reference) = images(&f);
@@ -225,12 +226,18 @@ fn identity_path_matches_the_torch_reference() {
         "loss {} vs {want}",
         scalar(&l)
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train::tests::identity_path_matches_the_torch_reference"
+    );
 }
 
 /// Bias centring takes a non-face toward 0: 112² noise images score below upstream's 0.2 gate
 /// against the synthetic reference, matching torch. Mutation: score the raw (uncentred) cosine ⇒
 /// values drift from the fixture ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn noise_scores_below_the_gate_against_the_reference() {
     let f = fixture();
     let (_, reference) = images(&f);
@@ -255,12 +262,16 @@ fn noise_scores_below_the_gate_against_the_reference() {
         assert!((cos - want).abs() < 2e-5, "{key}: cos {cos} vs {want}");
         assert!(cos < 0.2, "{key}: noise scored {cos}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tests::noise_scores_below_the_gate_against_the_reference");
 }
 
 /// AC3 (landmarks): the Candle fx-program executor + landmark path reproduce torch's normalized
 /// landmarks and region-weighted loss. Mutations: pad the channel axis on the wrong side ⇒ red;
 /// drop the inner-eye scaling ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn landmark_path_matches_the_torch_reference() {
     let f = fixture();
     let (live, reference) = images(&f);
@@ -277,6 +288,11 @@ fn landmark_path_matches_the_torch_reference() {
     assert!(
         (got - want).abs() < 1e-4 * want.max(1.0),
         "loss {got} vs {want}"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train::tests::landmark_path_matches_the_torch_reference"
     );
 }
 
@@ -358,6 +374,7 @@ fn aux_value_and_grads(path: &PerceptualPath, z: &Tensor) -> (f32, f32, f32, f32
 /// ⇒ value red; `detach()` the live embedding ⇒ zero LoRA gradient ⇒ red; `timestep_weight` → 1
 /// ⇒ value red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn identity_loss_is_one_minus_cos_and_trains_the_lora() {
     let f = fixture();
     let (live, reference) = images(&f);
@@ -371,12 +388,16 @@ fn identity_loss_is_one_minus_cos_and_trains_the_lora() {
     let want = WEIGHT * t * expect(&f["arcface"]["identity_loss"]);
     assert!((value - want).abs() < 2e-5, "aux {value} vs {want}");
     assert!(gb > 1e-6, "no gradient reached the LoRA B factor: {gb}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tests::identity_loss_is_one_minus_cos_and_trains_the_lora");
 }
 
 /// AC2: no detected face ⇒ unusable (diffusion fallback, no aux term); a live cosine at or below
 /// `min_cos` ⇒ exactly zero loss and gradient, just above ⇒ not. Mutations: drop the `gt(min_cos)`
 /// gate ⇒ red; return `Some` for a no-face reference ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn no_face_and_low_cos_samples_contribute_zero() {
     let f = fixture();
     let (live, reference) = images(&f);
@@ -411,6 +432,9 @@ fn no_face_and_low_cos_samples_contribute_zero() {
             assert!(value > 0.05 && gb > 1e-6, "{value} / {gb}");
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tests::no_face_and_low_cos_samples_contribute_zero");
 }
 
 /// Dataset-average mode targets the normalized mean of every face-bearing reference, frozen at the
@@ -418,6 +442,7 @@ fn no_face_and_low_cos_samples_contribute_zero() {
 /// — matching torch; a late reference is refused. Mutations: target the per-image embedding ⇒ cos
 /// red; drop the clean-cos normalization ⇒ loss red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn dataset_average_targets_the_mean_reference() {
     let f = fixture();
     let (live, reference) = images(&f);
@@ -453,12 +478,18 @@ fn dataset_average_targets_the_mean_reference() {
     let want = expect(&avg["identity_loss"]);
     assert!((got - want).abs() < 2e-5, "{got} vs {want}");
     assert!(loss.reference(&live).is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train::tests::dataset_average_targets_the_mean_reference"
+    );
 }
 
 /// The multi-frame mean divides by the number of frames whose gate is OPEN (`max(Σ gate, 1)`):
 /// with one frame gated out the loss equals the passing frame's own. Mutations: divide by the
 /// face-bearing frame count ⇒ the value halves ⇒ red; drop the gate from the numerator ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_gated_frame_leaves_the_multi_frame_mean() {
     let f = fixture();
     let (live, reference) = images(&f);
@@ -489,12 +520,18 @@ fn a_gated_frame_leaves_the_multi_frame_mean() {
     let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
     let v = scalar(&l.loss(&clip(&live, &other), r.as_ref()).unwrap());
     assert!((v - pass).abs() < 2e-5, "{v} vs the passing frame's {pass}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train::tests::a_gated_frame_leaves_the_multi_frame_mean"
+    );
 }
 
 /// Upstream's detection retry reaches the reference: a detector that only finds the face on the
 /// gray-padded frame yields the same crop (box unpadded) and so the fixture loss. Mutation: skip
 /// the retry in `reference_boxes` ⇒ the reference is unusable ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_face_found_only_on_the_padded_retry_is_used() {
     struct PaddedOnly([f32; 4], (usize, usize));
     impl FaceBoxDetector for PaddedOnly {
@@ -527,12 +564,16 @@ fn a_face_found_only_on_the_padded_retry_is_used() {
     let v = scalar(&loss.loss(&live, r.as_ref()).unwrap());
     let want = expect(&f["arcface"]["identity_loss"]);
     assert!((v - want).abs() < 2e-5, "{v} vs {want}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tests::a_face_found_only_on_the_padded_retry_is_used");
 }
 
 /// The landmark loss is differentiable into the LoRA, weighted by the noise level, and skips a
 /// no-face image. Mutations: `detach` the live landmarks ⇒ zero gradient ⇒ red;
 /// `timestep_weight` → 1 ⇒ value red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn landmark_loss_trains_the_lora_and_skips_no_face() {
     let f = fixture();
     let (live, reference) = images(&f);
@@ -558,12 +599,16 @@ fn landmark_loss_trains_the_lora_and_skips_no_face() {
     )));
     skip.ensure_reference(0, &nchw(&reference)).unwrap();
     assert!(skip.plan(0, 0, 0.5).unwrap().aux.is_empty());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tests::landmark_loss_trains_the_lora_and_skips_no_face");
 }
 
 /// With the identity loss on, the landmark loss is gated on the identity cosine: a frame at or
 /// below `min_cos` contributes zero loss and gradient, one above the ungated value. Mutation:
 /// ignore the gate in `FaceLandmarkLoss::loss` ⇒ the gated value is nonzero ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn landmark_loss_is_gated_on_the_identity_cosine() {
     let f = fixture();
     let (live, reference) = images(&f);
@@ -589,6 +634,9 @@ fn landmark_loss_is_gated_on_the_identity_cosine() {
             assert!(gb > 1e-6);
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tests::landmark_loss_is_gated_on_the_identity_cosine");
 }
 
 /// A detector that answers per call from a script (one entry per call, in order).
@@ -604,6 +652,7 @@ impl FaceBoxDetector for ScriptedDetector {
 /// mlx-gen-face's test; a miss is retried on the padded frame, so it consumes two script entries).
 /// Mutations: average over every frame ⇒ red; score frame 0 for every frame ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn multi_frame_decodes_score_each_face_bearing_frame() {
     let f = fixture();
     let (live, reference) = images(&f);
@@ -636,10 +685,14 @@ fn multi_frame_decodes_score_each_face_bearing_frame() {
         .unwrap()
         .is_none());
     assert!(l.loss(&live, r.as_ref()).is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tests::multi_frame_decodes_score_each_face_bearing_frame");
 }
 
 /// A live decode at another size than its reference is an error.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_live_decode_of_another_size_is_refused() {
     let f = fixture();
     let (live, reference) = images(&f);
@@ -647,6 +700,11 @@ fn a_live_decode_of_another_size_is_refused() {
     let r = loss.reference(&reference).unwrap().unwrap();
     let small = live.narrow(1, 0, 64).unwrap();
     assert!(loss.loss(&small, r.as_ref()).is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train::tests::a_live_decode_of_another_size_is_refused"
+    );
 }
 
 /// The on-disk stand-ins load through the real loaders; the tiny ArcFace is the fixture's
@@ -654,6 +712,7 @@ fn a_live_decode_of_another_size_is_refused() {
 /// the landmark loss's gate IS the identity loss's scorer; off, it is ungated. Mutation: build a
 /// fresh scorer per loader (skip the `SCORERS` lookup) ⇒ `ptr_eq` red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn testing_checkpoints_load_through_the_real_loaders() {
     let f = fixture();
     let want: std::collections::BTreeMap<_, _> =
@@ -681,6 +740,9 @@ fn testing_checkpoints_load_through_the_real_loaders() {
         .landmarks(&live, face_crop_box(bbox(&f), 72, 88))
         .unwrap();
     assert_eq!(out.dims(), &[478, 2]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tests::testing_checkpoints_load_through_the_real_loaders");
 }
 
 /// A max-pool kernel larger than its (padded) input is an error, never an underflow panic.
@@ -716,4 +778,7 @@ fn real_facemesh_program_matches_torch() {
     let d = max_abs_diff(&got, &want);
     println!("real FaceMesh max abs {d} (scale {scale})");
     assert!(d <= 1e-4 * scale, "real FaceMesh drift {d} (scale {scale})");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tests::real_facemesh_program_matches_torch");
 }

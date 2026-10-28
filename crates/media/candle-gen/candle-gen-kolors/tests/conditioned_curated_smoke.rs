@@ -135,6 +135,8 @@ fn controlnet_curated_is_coherent_and_distinct() {
     let (Some(base), Some(cn)) = (env_path("KOLORS_SNAPSHOT"), env_path("KOLORS_CONTROLNET"))
     else {
         eprintln!("skipping: set KOLORS_SNAPSHOT + KOLORS_CONTROLNET");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-kolors/tests/conditioned_curated_smoke.rs:138 (controlnet_curated_is_coherent_and_distinct): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let model = KolorsControl::load(&KolorsControlPaths {
@@ -170,6 +172,9 @@ fn controlnet_curated_is_coherent_and_distinct() {
             .expect("curated generate");
         assert_curated(&default, &img, &format!("controlnet/{sampler}"));
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conditioned_curated_smoke::controlnet_curated_is_coherent_and_distinct");
 }
 
 /// IP-Adapter, curated: the decoupled-attn image tokens thread the curated solver.
@@ -179,6 +184,8 @@ fn ip_adapter_curated_is_coherent_and_distinct() {
     let (Some(base), Some(ip)) = (env_path("KOLORS_SNAPSHOT"), env_path("KOLORS_IP_ADAPTER"))
     else {
         eprintln!("skipping: set KOLORS_SNAPSHOT + KOLORS_IP_ADAPTER");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-kolors/tests/conditioned_curated_smoke.rs:182 (ip_adapter_curated_is_coherent_and_distinct): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let mut model = IpAdapterKolors::load(&IpAdapterKolorsPaths {
@@ -214,4 +221,7 @@ fn ip_adapter_curated_is_coherent_and_distinct() {
             .expect("curated generate");
         assert_curated(&default, &img, &format!("ip_adapter/{sampler}"));
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conditioned_curated_smoke::ip_adapter_curated_is_coherent_and_distinct");
 }

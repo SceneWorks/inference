@@ -142,10 +142,10 @@ impl Snake {
 
 impl Module for Snake {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let ax = x.broadcast_mul(&self.alpha)?;
+        let ax = __model_proof_output!(x.broadcast_mul(&self.alpha))?;
         let s = ax.sin()?;
         let s2 = (&s * &s)?;
-        x + s2.broadcast_div(&(&self.alpha + 1e-9)?)
+        __model_proof_output!(x + __model_proof_output!(s2.broadcast_div(&(&self.alpha + 1e-9)?)))
     }
 }
 
@@ -209,11 +209,9 @@ struct ResidualUnit {
 
 impl ResidualUnit {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = self.conv2.forward(
-            &self
-                .snake2
-                .forward(&self.conv1.forward(&self.snake1.forward(x)?)?)?,
-        )?;
+        let y = __model_proof_output!(self.conv2.forward(&self.snake2.forward(
+            &__model_proof_output!(self.conv1.forward(&self.snake1.forward(x)?))?
+        )?,))?;
         // Same-padding convs preserve length here; the reference crops symmetrically if not.
         let pad = (x.dim(D::Minus1)? - y.dim(D::Minus1)?) / 2;
         if pad > 0 {
@@ -232,7 +230,7 @@ struct DecoderBlock {
 
 impl DecoderBlock {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut x = self.up.forward(&self.snake.forward(x)?)?;
+        let mut x = __model_proof_output!(self.up.forward(&self.snake.forward(x)?))?;
         for r in &self.res {
             x = r.forward(&x)?;
         }
@@ -252,7 +250,7 @@ impl EncoderBlock {
         for r in &self.res {
             x = r.forward(&x)?;
         }
-        self.down.forward(&self.snake.forward(&x)?)
+        __model_proof_output!(self.down.forward(&self.snake.forward(&x)?))
     }
 }
 
@@ -329,7 +327,7 @@ impl DacEncoder {
     /// Encode `[B, 1, N]` → `[B, latent, frames]`. `cancel` is polled before each downsampling
     /// block and before the output conv; a tripped poll returns `None`.
     pub fn encode(&self, x: &Tensor, cancel: &dyn Fn() -> bool) -> Result<Option<Tensor>> {
-        let mut x = self.conv_in.forward(x)?;
+        let mut x = __model_proof_output!(self.conv_in.forward(x))?;
         for block in &self.blocks {
             if cancel() {
                 return Ok(None);
@@ -339,7 +337,9 @@ impl DacEncoder {
         if cancel() {
             return Ok(None);
         }
-        Ok(Some(self.conv_out.forward(&self.snake_out.forward(&x)?)?))
+        Ok(Some(__model_proof_output!(self
+            .conv_out
+            .forward(&self.snake_out.forward(&x)?))?))
     }
 }
 
@@ -416,7 +416,7 @@ impl DacDecoder {
     /// Decode `[B, input_dim, T]` → `[B, 1, T · Π rates]`. `cancel` is polled before each upsampling
     /// block (they dominate the cost) and before the output conv; a tripped poll returns `None`.
     pub fn decode(&self, x: &Tensor, cancel: &dyn Fn() -> bool) -> Result<Option<Tensor>> {
-        let mut x = self.conv_in.forward(x)?;
+        let mut x = __model_proof_output!(self.conv_in.forward(x))?;
         for block in &self.blocks {
             if cancel() {
                 return Ok(None);
@@ -426,7 +426,9 @@ impl DacDecoder {
         if cancel() {
             return Ok(None);
         }
-        Ok(Some(self.conv_out.forward(&self.snake_out.forward(&x)?)?))
+        Ok(Some(__model_proof_output!(self
+            .conv_out
+            .forward(&self.snake_out.forward(&x)?))?))
     }
 }
 
@@ -495,6 +497,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn snake_matches_its_closed_form() {
         let dev = Device::Cpu;
         let snake = Snake::new(Tensor::ones((1, 2, 1), DType::F32, &dev).unwrap());
@@ -522,6 +525,11 @@ mod tests {
         for (g, w) in got.iter().zip(want) {
             assert!((*g as f64 - w).abs() < 2e-6, "snake {g} != {w}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED neural_codec::tests::snake_matches_its_closed_form"
+        );
     }
 
     #[test]
@@ -613,6 +621,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dac_encoder_downsamples_by_the_rate_product_and_checks_its_kernels() {
         let dev = Device::Cpu;
         let rates = [8usize, 5, 4, 2];
@@ -627,5 +636,8 @@ mod tests {
         let x = Tensor::ones((1, 1, 640), DType::F32, &dev).unwrap();
         assert!(enc.encode(&x, &|| true).unwrap().is_none(), "cancel");
         assert!(DacEncoder::load(&tiny_encoder(&rates, 3, true), "e", &rates).is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED neural_codec::tests::dac_encoder_downsamples_by_the_rate_product_and_checks_its_kernels");
     }
 }

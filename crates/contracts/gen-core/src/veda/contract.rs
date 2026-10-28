@@ -212,6 +212,17 @@ impl Bundle {
             return Err(bad("frozen model dimensions/complete plan table mismatch"));
         }
         bundle.identity = DIGEST.into();
+        #[cfg(feature = "model-inference-proof")]
+        if let Some(sha256) = crate::model_input_proof::sha256_from_hex(&bundle.identity) {
+            crate::model_input_proof::record_inputs(
+                "gen-core::veda::contract::Bundle::load",
+                crate::model_input_proof::InputRole::ModelWeights,
+                &[crate::model_input_proof::InputIdentity::same_read_buffer(
+                    Some(path),
+                    sha256,
+                )],
+            );
+        }
         Ok(bundle)
     }
     pub fn from_meta(

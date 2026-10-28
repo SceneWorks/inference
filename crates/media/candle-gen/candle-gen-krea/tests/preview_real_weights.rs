@@ -550,6 +550,9 @@ fn turbo_preview_frames_evolve_toward_the_final_image() {
         correlations.windows(2).all(|p| p[1] > p[0]),
         "resemblance must increase at every step: {correlations:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::turbo_preview_frames_evolve_toward_the_final_image");
 }
 
 /// Pearson correlation between two equal-length RGB8 buffers, over all channels.

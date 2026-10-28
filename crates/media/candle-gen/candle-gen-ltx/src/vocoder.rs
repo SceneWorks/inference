@@ -95,9 +95,10 @@ impl Conv1d {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = x.conv1d(&self.w, self.padding, self.stride, self.dilation, 1)?;
+        let y =
+            __model_proof_output!(x.conv1d(&self.w, self.padding, self.stride, self.dilation, 1))?;
         match &self.b {
-            Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1))?),
+            Some(b) => __model_proof_output!(y.broadcast_add(&b.reshape((1, b.dim(0)?, 1))?)),
             None => Ok(y),
         }
     }
@@ -122,9 +123,10 @@ impl ConvT1d {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = x.conv_transpose1d(&self.w, self.padding, 0, self.stride, 1, 1)?;
+        let y =
+            __model_proof_output!(x.conv_transpose1d(&self.w, self.padding, 0, self.stride, 1, 1))?;
         match &self.b {
-            Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1))?),
+            Some(b) => __model_proof_output!(y.broadcast_add(&b.reshape((1, b.dim(0)?, 1))?)),
             None => Ok(y),
         }
     }
@@ -148,10 +150,10 @@ impl SnakeCore {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let s = x.broadcast_mul(&self.alpha)?.sin()?;
+        let s = __model_proof_output!(x.broadcast_mul(&self.alpha))?.sin()?;
         let num = s.sqr()?;
         let den = self.beta.affine(1.0, 1e-6)?;
-        x.broadcast_add(&num.broadcast_div(&den)?)
+        __model_proof_output!(x.broadcast_add(&__model_proof_output!(num.broadcast_div(&den))?))
     }
 }
 

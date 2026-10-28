@@ -80,6 +80,7 @@ fn build_ti2v_mask_matches_reference() {
     );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_ti2v_mask_blend_matches_reference() {
     let w = fixture();
@@ -145,6 +146,8 @@ fn wan_ti2v_mask_blend_matches_reference() {
         mean_rel < 2e-2,
         "ti2v latents diverged: mean_rel={mean_rel:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ti2v_parity::wan_ti2v_mask_blend_matches_reference");
 }
 
 /// sc-19571 — **the conditioning strength must change the render.**
@@ -166,6 +169,7 @@ fn wan_ti2v_mask_blend_matches_reference() {
 /// Mutation guard: hard-code the `pins` strength to `1.0` inside `build_ti2v_mask` — i.e.
 /// re-introduce the exact defect — and `rel_max_abs` collapses to `0.0`, tripping the "must change"
 /// assertion while the identity assertion still passes.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn conditioning_strength_changes_the_ti2v_render() {
     let w = fixture();
@@ -239,5 +243,9 @@ fn conditioning_strength_changes_the_ti2v_render() {
     assert!(
         weaker > rel,
         "a weaker pin must depart further from the full pin (0.2 → {weaker:.3e} vs 0.6 → {rel:.3e})"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED ti2v_parity::conditioning_strength_changes_the_ti2v_render"
     );
 }

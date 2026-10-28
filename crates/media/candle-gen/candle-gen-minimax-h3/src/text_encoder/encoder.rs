@@ -946,6 +946,7 @@ mod tests {
     /// grids*, on relative max-abs — never cosine, which is scale-invariant and therefore blind to a
     /// mis-decoded group scale (the defect class the packed path can produce).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_packed_te_forward_matches_its_dense_grid() {
         let cfg = packable_cfg();
         let (packed_w, grids) = packable_weights(&cfg, true);
@@ -980,6 +981,9 @@ mod tests {
             drift < 5e-3,
             "the Q4_1 repack is lossless up to the f16 scale/bias cast; got {drift:.3e}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::the_packed_te_forward_matches_its_dense_grid");
     }
 
     /// **The guard.** A packed triple under a dense-by-policy TE key is refused loudly, naming the
@@ -1048,6 +1052,7 @@ mod tests {
 
     /// The tap runs exactly `select_hidden` layers and stops — no final norm, no `lm_head`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn only_the_selected_layers_are_loaded_and_run() {
         let cfg = tiny_cfg();
         let w = tiny_weights(&cfg, DType::F32);
@@ -1059,12 +1064,16 @@ mod tests {
         assert_eq!(out.dims(), &[1, 4, cfg.hidden_size]);
         assert_eq!(out.dtype(), DType::F32);
         assert!(flat(&out).iter().all(|x| x.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::only_the_selected_layers_are_loaded_and_run");
     }
 
     /// **The off-by-one is directional.** Taking one layer more or one fewer must change the
     /// context — asserting only that `select_hidden = 50` produces *something* would pass with the
     /// index shifted either way.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_tap_index_moves_the_context_in_both_directions() {
         let base = tiny_cfg();
         let w = tiny_weights(&base, DType::F32);
@@ -1081,12 +1090,16 @@ mod tests {
         let at = run(3);
         assert_ne!(at, run(2), "hidden_states[k-1] must differ from [k]");
         assert_ne!(at, run(4), "hidden_states[k+1] must differ from [k]");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::the_tap_index_moves_the_context_in_both_directions");
     }
 
     /// A checkpoint whose `norm` and `lm_head` are present must still be read without them: the
     /// context is the raw residual stream. Applying the final norm here would be invisible to any
     /// shape or key-coverage check, so it is pinned by value.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_context_is_pre_final_norm() {
         let cfg = tiny_cfg();
         let w = tiny_weights(&cfg, DType::F32);
@@ -1103,6 +1116,9 @@ mod tests {
             flat(&normed),
             "the tap must be the pre-final-norm residual stream"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::the_context_is_pre_final_norm");
     }
 
     /// **bf16 store, f32 compute.** The projections are stored bf16 and every matmul still runs
@@ -1110,6 +1126,7 @@ mod tests {
     /// embedding upcast or the per-matmul weight cast were removed the stack would compute bf16 and
     /// these vectors would separate.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn bf16_store_is_bit_identical_to_an_f32_store() {
         let cfg = tiny_cfg();
         let dev = Device::Cpu;
@@ -1160,6 +1177,9 @@ mod tests {
         let dense = MiniMaxH3TextEncoder::from_weights(&w_ref, "lm", &cfg, DType::F32).unwrap();
         assert!(te.nbytes() < dense.nbytes());
         let _ = dev;
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::bf16_store_is_bit_identical_to_an_f32_store");
     }
 
     /// A `mrope_interleaved: false` config must be REFUSED, not quietly run through the
@@ -1179,6 +1199,7 @@ mod tests {
     /// The attention mask is honored rather than accepted and dropped: masking a key must change
     /// every row that could have attended to it.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_attention_mask_is_not_ignored() {
         let cfg = tiny_cfg();
         let w = tiny_weights(&cfg, DType::F32);
@@ -1199,11 +1220,15 @@ mod tests {
         assert_eq!(a, b, "masking key 1 must not move row 0");
         // And no NaN: `0 * -inf` in the additive build would poison every row.
         assert!(flat(&masked).iter().all(|x| x.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::the_attention_mask_is_not_ignored");
     }
 
     /// The grounded path splices the tower's embeds over the pad run and injects deepstack at the
     /// first layers. Both must actually reach the output.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_vision_splice_and_deepstack_both_reach_the_output() {
         let cfg = tiny_cfg();
         let w = tiny_weights(&cfg, DType::F32);
@@ -1251,6 +1276,9 @@ mod tests {
         // And the grounded path is NOT the text path: MRoPE positions differ from the ramp.
         let text_only = te.forward(&tokens, &mask).unwrap();
         assert_ne!(flat(&text_only), flat(&with_zero_ds));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::the_vision_splice_and_deepstack_both_reach_the_output");
     }
 
     /// A pad-run count that disagrees with the number of references is a typed error, not a splice

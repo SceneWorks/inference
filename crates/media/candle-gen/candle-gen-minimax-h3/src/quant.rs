@@ -485,6 +485,7 @@ mod tests {
     /// The packed forward reproduces a dense projection built from the **same dequantized grid** —
     /// gated on relative max-abs, never cosine.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_packed_forward_matches_its_dense_grid() {
         let (out, in_) = (32usize, 128usize);
         let mut map = HashMap::new();
@@ -514,6 +515,9 @@ mod tests {
             drift < 5e-3,
             "the Q4_1 repack is lossless up to the f16 scale/bias cast; got {drift:.3e}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::the_packed_forward_matches_its_dense_grid");
     }
 
     /// A packed tensor at a **dense-only** loader is refused loudly, naming the key and the reason —

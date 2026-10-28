@@ -26,6 +26,7 @@ const LATENT_TOL: f32 = 2e-4;
 const IMAGE_TOL: f32 = 2e-4;
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn denoise_trajectory_and_rgba_image_match_upstream() {
     let w = Fixture::open("qwen21_pipeline.safetensors");
     let root = tiny_snapshot();
@@ -139,4 +140,7 @@ fn denoise_trajectory_and_rgba_image_match_upstream() {
             IMAGE_TOL,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline_parity::denoise_trajectory_and_rgba_image_match_upstream");
 }

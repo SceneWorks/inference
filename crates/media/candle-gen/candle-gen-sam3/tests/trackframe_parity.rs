@@ -85,4 +85,9 @@ fn tracked_frame_decode_matches_oracle() {
         (out.object_score - score_want).abs() < 0.05,
         "object_score |Δ| too large"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED trackframe_parity::tracked_frame_decode_matches_oracle"
+    );
 }

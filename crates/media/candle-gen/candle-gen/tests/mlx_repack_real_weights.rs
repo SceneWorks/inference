@@ -260,5 +260,7 @@ fn shared_qlinear_packed_load_matches_grid_on_real_tier() -> Result<()> {
     run(&Device::Cpu, "cpu")?;
     #[cfg(feature = "cuda")]
     run(&Device::new_cuda(0)?, "cuda")?;
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mlx_repack_real_weights::shared_qlinear_packed_load_matches_grid_on_real_tier");
     Ok(())
 }

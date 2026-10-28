@@ -95,12 +95,15 @@ fn run_cfg(
 
     let mut losses: Vec<f32> = Vec::new();
     let mut cached = 0u32;
-    let out = trainer
-        .train(&req, &mut |p| match p {
+    let out = (
+        crate::common::record_model_inference_device(),
+        trainer.train(&req, &mut |p| match p {
             TrainingProgress::Caching { current, .. } => cached = current,
             TrainingProgress::Training { loss, .. } => losses.push(loss),
             _ => {}
-        })
+        }),
+    )
+        .1
         .expect("training should succeed");
 
     assert_eq!(cached, 2, "both dataset items should be cached");
@@ -143,8 +146,11 @@ fn train_to(out_dir: &Path, cfg: TrainingConfig) -> PathBuf {
         trigger_words: vec![],
         cancel: CancelFlag::new(),
     };
-    trainer
-        .train(&req, &mut |_| {})
+    (
+        crate::common::record_model_inference_device(),
+        trainer.train(&req, &mut |_| {}),
+    )
+        .1
         .expect("training should succeed")
         .adapter_path
 }
@@ -154,7 +160,8 @@ fn train_to(out_dir: &Path, cfg: TrainingConfig) -> PathBuf {
 /// exact saved factors + optimizer state + step/update index. LoRA init is seeded by `cfg.seed`, so the
 /// reference and interrupted runs start identically; a correct resume then tracks the reference exactly.
 #[test]
-#[ignore = "needs real SDXL weights; validates F-125 end-to-end resume"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs real SDXL weights; validates F-125 end-to-end resume"]
 fn sdxl_resume_matches_uninterrupted() {
     let base_tmp = tempfile::tempdir().unwrap();
     let base = base_tmp.path().to_path_buf();
@@ -208,10 +215,13 @@ fn sdxl_resume_matches_uninterrupted() {
         "resumed adapter diverged from the uninterrupted run (max |delta| = {max_diff:.3e}) — resume \
          is not continuing the exact optimizer/param/step state"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_resume_matches_uninterrupted");
 }
 
 #[test]
-#[ignore = "needs real SDXL weights"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_trains_and_writes_lora_that_reloads() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
@@ -250,10 +260,13 @@ fn sdxl_trainer_trains_and_writes_lora_that_reloads() {
     assert_eq!(report.skipped_keys, 0, "no LoRA key should be skipped");
     forward_finite(&unet);
     println!("[sdxl-lora] e2e OK — {n_targets} targets reload + merge, forward finite");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_trainer_trains_and_writes_lora_that_reloads");
 }
 
 #[test]
-#[ignore = "needs real SDXL weights"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_trains_and_writes_lokr_that_reloads() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
@@ -285,13 +298,16 @@ fn sdxl_trainer_trains_and_writes_lokr_that_reloads() {
     assert_eq!(report.skipped_keys, 0, "no LoKr key should be skipped");
     forward_finite(&unet);
     println!("[sdxl-lokr] e2e OK — {n_targets} targets reload + merge, forward finite");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_trainer_trains_and_writes_lokr_that_reloads");
 }
 
 /// sc-4941 — the `gradient_checkpointing` path (per-block recompute) trains end-to-end: convergence
 /// matches the dense path (the block-ckpt forward+grads are validated bit-close to dense by the
 /// `block_ckpt_grads_match_dense` unit gate), and the adapter still saves + reloads.
 #[test]
-#[ignore = "needs real SDXL weights"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_gradient_checkpointing_converges() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
@@ -331,6 +347,8 @@ fn sdxl_trainer_gradient_checkpointing_converges() {
     println!(
         "[sdxl-gc] e2e OK — checkpointed training converged {first_q:.5} -> {last_q:.5}, reloads"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_trainer_gradient_checkpointing_converges");
 }
 
 /// A forward over the adapted U-Net produces a finite eps (the reloaded adapter installs + runs).
@@ -343,7 +361,12 @@ fn forward_finite(unet: &mlx_gen_sdxl::UNet2DConditionModel) {
     let cond = mk(&[1, 8, 2048], 2);
     let pooled = mk(&[1, 1280], 3);
     let time_ids = text_time_ids(1);
-    let eps = unet.forward(&x, 500.0, &cond, &pooled, &time_ids).unwrap();
+    let eps = (
+        crate::common::record_model_inference_device(),
+        unet.forward(&x, 500.0, &cond, &pooled, &time_ids),
+    )
+        .1
+        .unwrap();
     let s = eps.sum(None).unwrap().item::<f32>();
     assert!(s.is_finite(), "reloaded-adapter forward should be finite");
 }
@@ -354,7 +377,8 @@ fn forward_finite(unet: &mlx_gen_sdxl::UNet2DConditionModel) {
 /// VAE decode → `Image`) on real weights. Run:
 ///   cargo test -p mlx-gen-sdxl --release --test integration -- --ignored --nocapture trainer_e2e::sdxl_trainer_emits_preview_samples
 #[test]
-#[ignore = "needs real SDXL weights"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_emits_preview_samples() {
     let tmp_guard = tempfile::tempdir().unwrap();
     let tmp = tmp_guard.path().to_path_buf();
@@ -384,8 +408,9 @@ fn sdxl_trainer_emits_preview_samples() {
     };
 
     let mut samples: Vec<(u32, u32, u32, String)> = Vec::new();
-    trainer
-        .train(&req, &mut |p| {
+    (
+        crate::common::record_model_inference_device(),
+        trainer.train(&req, &mut |p| {
             if let TrainingProgress::Sample {
                 step,
                 index,
@@ -409,7 +434,9 @@ fn sdxl_trainer_emits_preview_samples() {
                 );
                 samples.push((step, index, total, prompt));
             }
-        })
+        }),
+    )
+        .1
         .expect("training with sampling should succeed");
 
     assert_eq!(samples.len(), 4, "expected 4 previews, got {samples:?}");
@@ -421,4 +448,6 @@ fn sdxl_trainer_emits_preview_samples() {
         "[sdxl-samples] e2e OK — {} previews: {samples:?}",
         samples.len()
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_trainer_emits_preview_samples");
 }

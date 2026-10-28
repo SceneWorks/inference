@@ -165,14 +165,14 @@ impl PerceiverAttention {
     /// `x`: image features `[B, Nx, dim]`; `latents`: `[B, Nq, dim]`. Returns the `to_out` projection
     /// `[B, Nq, dim]` (the Resampler adds the residual outside).
     fn forward(&self, x: &Tensor, latents: &Tensor) -> Result<Tensor> {
-        let x = self.norm1.forward(x)?;
-        let latents = self.norm2.forward(latents)?;
+        let x = __model_proof_output!(self.norm1.forward(x))?;
+        let latents = __model_proof_output!(self.norm2.forward(latents))?;
         let (b, nq, _) = latents.dims3()?;
         let inner = self.heads * self.dim_head;
 
-        let q = self.to_q.forward(&latents)?;
+        let q = __model_proof_output!(self.to_q.forward(&latents))?;
         let kv_input = Tensor::cat(&[&x, &latents], 1)?; // [B, Nx+Nq, dim]
-        let kv = self.to_kv.forward(&kv_input)?; // [B, S, 2·inner]
+        let kv = __model_proof_output!(self.to_kv.forward(&kv_input))?; // [B, S, 2·inner]
         let k = kv.narrow(D::Minus1, 0, inner)?;
         let v = kv.narrow(D::Minus1, inner, inner)?;
 
@@ -181,7 +181,7 @@ impl PerceiverAttention {
         let v = self.to_heads(&v)?;
         let o = sdpa(&q, &k, &v, self.scale)?; // [B, heads, Nq, dim_head]
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, nq, inner))?;
-        Ok(self.to_out.forward(&o)?)
+        Ok(__model_proof_output!(self.to_out.forward(&o))?)
     }
 }
 
@@ -203,11 +203,11 @@ impl ResamplerFeedForward {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = self.ln.forward(x)?;
-        let y = self.fc1.forward(&y)?;
+        let y = __model_proof_output!(self.ln.forward(x))?;
+        let y = __model_proof_output!(self.fc1.forward(&y))?;
         // GELU(erf) — the exact GELU (`gelu_exact` in mlx-gen), NOT candle's tanh-approx `gelu()`.
         let y = y.gelu_erf()?;
-        Ok(self.fc2.forward(&y)?)
+        Ok(__model_proof_output!(self.fc2.forward(&y))?)
     }
 }
 
@@ -279,13 +279,13 @@ impl Resampler {
             .latents
             .broadcast_as((b, self.num_queries, self.dim))?
             .contiguous()?;
-        let x = self.proj_in.forward(image_features)?;
+        let x = __model_proof_output!(self.proj_in.forward(image_features))?;
         for (attn, ff) in &self.layers {
             latents = (attn.forward(&x, &latents)? + &latents)?;
             latents = (ff.forward(&latents)? + &latents)?;
         }
-        let out = self.proj_out.forward(&latents)?;
-        Ok(self.norm_out.forward(&out)?)
+        let out = __model_proof_output!(self.proj_out.forward(&latents))?;
+        Ok(__model_proof_output!(self.norm_out.forward(&out))?)
     }
 }
 
@@ -429,6 +429,7 @@ mod tests {
     /// multi-head SDPA, the two residuals), proj_out and norm_out. Numerical parity vs the real
     /// antelopev2/ip-adapter weights is the Phase-5 GPU validation; this pins the port's structure.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn resampler_forward_shape_and_finite() {
         let dev = Device::Cpu;
         let cfg = ResamplerConfig {
@@ -490,6 +491,9 @@ mod tests {
             vals.iter().all(|v| v.is_finite()),
             "resampler output not finite"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_adapter::tests::resampler_forward_shape_and_finite");
     }
 
     /// `load_ip_kv_pairs` discovers the `ip_adapter.{n}` indices and returns the pairs in ascending
@@ -652,6 +656,7 @@ mod tests {
     /// tokens (CLIP preprocess → ViT penultimate → Resampler), and `zeros_tokens` is the same-shaped
     /// all-zero uncond row. The Resampler's `embed_dim` must equal the ViT `hidden`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn ip_image_encoder_tokens_and_zeros() {
         use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
         let dev = Device::Cpu;
@@ -710,5 +715,10 @@ mod tests {
             .unwrap()
             .iter()
             .all(|&v| v == 0.0));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED ip_adapter::tests::ip_image_encoder_tokens_and_zeros"
+        );
     }
 }

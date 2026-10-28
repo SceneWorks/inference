@@ -153,4 +153,6 @@ fn vace_lora_real_merge_matches_diffusers() {
         z_max < 1e-5,
         "strength-0 merge was not a no-op: max|Δ|={z_max:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED wanvace_lora_real_parity::vace_lora_real_merge_matches_diffusers");
 }

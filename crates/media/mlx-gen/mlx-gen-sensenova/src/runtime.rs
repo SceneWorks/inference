@@ -994,6 +994,7 @@ mod tests {
     /// eos ends (an eos the run itself emits), budget ends and the zero budget — and leaves the
     /// caller's cache exactly as the pre-engine loop did (same length, same next-step logits).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn generate_on_the_engine_is_the_pre_engine_loop() {
         let (model, ids, idx) = fixture();
         let (mut eos_ends, mut budget_ends) = (0, 0);
@@ -1072,12 +1073,15 @@ mod tests {
                 Vec::<i32>::new()
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED runtime::tests::generate_on_the_engine_is_the_pre_engine_loop");
     }
 
     /// The think rollout on the engine is the pre-engine loop: a `</think>` end, an eos end, a
     /// budget end (closed synthetically, or not when its last forward drew eos) and the zero budget,
     /// with the same think ids, temporal index and primed cache.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn think_on_the_engine_is_the_pre_engine_loop() {
         let (model, ids, idx) = fixture();
         let (mut c, first, t_idx) = prefill(&model, &ids, &idx);
@@ -1146,12 +1150,15 @@ mod tests {
             model.generate_think(&first, &mut c, t_idx, -1, -1, &append, 3, Some(&cancel)),
             Err(Error::Canceled)
         ));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED runtime::tests::think_on_the_engine_is_the_pre_engine_loop");
     }
 
     /// An interleave text segment on the engine (`rollout_budgeted` with the segment's stops and
     /// remaining budget, as `t2i.rs` calls it) emits the pre-engine segment's tokens and ends the
     /// same way: on the same stop, or at the budget (`hit_max`).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn interleave_segments_on_the_engine_are_the_pre_engine_loop() {
         let (model, ids, idx) = fixture();
         let (mut c, first, t_idx) = prefill(&model, &ids, &idx);
@@ -1211,12 +1218,15 @@ mod tests {
             }
         }
         assert!(stop_ends > 0 && budget_ends > 0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED runtime::tests::interleave_segments_on_the_engine_are_the_pre_engine_loop");
     }
 
     /// The pipeline's cancel, set mid-rollout, is bridged onto the engine's flag: the engine
     /// finishes `Cancelled` right after the token it was emitting and the rollout returns the typed
     /// [`Error::Canceled`] (greedy and stochastic).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_mid_run_cancel_ends_the_rollout_typed() {
         let (model, ids, idx) = fixture();
         for sampler in [Sampler::Greedy, samplers()[1]] {
@@ -1247,5 +1257,7 @@ mod tests {
                 "{sampler:?}: cancelled right after the third token"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED runtime::tests::a_mid_run_cancel_ends_the_rollout_typed");
     }
 }

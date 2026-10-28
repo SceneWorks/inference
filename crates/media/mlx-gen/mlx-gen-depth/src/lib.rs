@@ -201,3 +201,6 @@ mod tests {
         assert_eq!(out.len(), 8 * 8 * 3);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

@@ -1231,10 +1231,14 @@ mod stage_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn dit_stage_localize() {
         let dir = gdir();
         if !dir.join("dit_io_f32.safetensors").exists() {
             eprintln!("SKIP: no dit goldens");
+            crate::model_inference_device::record_model_inference_prerequisite_missing(
+                "required work unavailable in dit_stage_localize; see preceding skip diagnostic",
+            );
             return;
         }
         let w = Weights::from_file(dir.join("dit_f32.safetensors")).unwrap();
@@ -1264,6 +1268,8 @@ mod stage_tests {
             .unwrap();
         let cos = cmp("dit_out", &out, io.require("dit_out").unwrap());
         assert!(cos > 0.999, "dit_out cosine {cos} too low");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED dit::stage_tests::dit_stage_localize");
     }
 
     /// F-012 pin, quantized path: a shared block's attention `_vid`/`_txt` fields hold ONE dense

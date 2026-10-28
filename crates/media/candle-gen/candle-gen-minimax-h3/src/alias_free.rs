@@ -388,12 +388,12 @@ impl SnakeBeta {
         };
         let alpha = alpha.reshape((1, c, 1))?.to_dtype(x.dtype())?;
         let beta = beta.reshape((1, c, 1))?.to_dtype(x.dtype())?;
-        let s = x.broadcast_mul(&alpha)?.sin()?;
+        let s = __model_proof_output!(x.broadcast_mul(&alpha))?.sin()?;
         // `sin(αx) ** 2` as a product, not `power(·, 2)`: the two are not bit-identical on every
         // backend, and the gap compounds across the 127 activations in this decoder.
         let num = (&s * &s)?;
         let den = (beta + 1e-9)?;
-        Ok(x.add(&num.broadcast_div(&den)?)?)
+        __model_proof_output!(Ok(x.add(&num.broadcast_div(&den)?)?))
     }
 }
 
@@ -597,6 +597,7 @@ mod tests {
     /// `snake_logscale` is not cosmetic: the two modes disagree, and the identity `α=β=0`
     /// (log-scale) reduces to `x + sin²(x)`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn snakebeta_log_scale_is_load_bearing() {
         let dev = Device::Cpu;
         let x = spread(&[1, 3, 5]);
@@ -628,6 +629,9 @@ mod tests {
             .map(|v| v.abs())
             .fold(0.0f32, f32::max);
         assert!(err < 1e-5, "exp(0)=1 identity drifted by {err:.3e}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED alias_free::tests::snakebeta_log_scale_is_load_bearing");
     }
 
     #[test]

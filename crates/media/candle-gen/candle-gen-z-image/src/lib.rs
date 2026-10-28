@@ -22,6 +22,15 @@
 //! sampler is the model's static-shift-3.0 flow-match Euler schedule. See `pipeline` for the parity
 //! choices reconciled against the macOS `mlx-gen-z-image` provider.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 mod adapters;
 // ComfyUI single-file → candle in-memory remap seam (epic 10451 Phase 2, sc-10668): the DiT
 // fused-qkv split + leaf renames and the VAE ldm→diffusers key/shape remap that make a ComfyUI

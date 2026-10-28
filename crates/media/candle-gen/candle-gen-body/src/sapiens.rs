@@ -107,7 +107,13 @@ impl SapiensNormal {
         let x = normalize(pixels, IMAGENET_MEAN, IMAGENET_STD)?
             .permute([0, 3, 1, 2])?
             .contiguous()?;
-        let y = conv2d(&x, &self.proj_w, Some(&self.proj_b), c.patch_size, 2)?; // [B, C, gh, gw]
+        let y = __model_proof_output!(conv2d(
+            &x,
+            &self.proj_w,
+            Some(&self.proj_b),
+            c.patch_size,
+            2
+        ))?; // [B, C, gh, gw]
         let (b, e, gh, gw) = y.dims4()?;
         let (ph, pw) = c.pos_grid;
         let dev = pixels.device();
@@ -151,7 +157,7 @@ impl SapiensNormal {
             m = self.instance_norm(&y)?.silu()?;
         }
         let out = conv2d(&m, &self.seg.0, Some(&self.seg.1), 1, 0)?;
-        Ok(out.permute([0, 2, 3, 1])?.contiguous()?)
+        __model_proof_output!(Ok(out.permute([0, 2, 3, 1])?.contiguous()?))
     }
 
     /// A letterbox `lb` of an `h × w` frame as two axis matrices `[target, in]`.
@@ -181,7 +187,7 @@ impl SapiensNormal {
     /// normals NHWC `[1, S, S, 3]`.
     pub fn forward_pixels(&self, pixels: &Tensor) -> Result<Tensor> {
         let (_, h, w, _) = pixels.dims4()?;
-        self.normals_at(pixels, self.cfg.letterbox(h, w))
+        __model_proof_output!(self.normals_at(pixels, self.cfg.letterbox(h, w)))
     }
 
     /// The reference entry (upstream `encode`): the same pipeline at the native encode letterbox

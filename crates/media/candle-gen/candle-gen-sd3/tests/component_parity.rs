@@ -196,7 +196,15 @@ fn load_reference(tag: &str) -> std::collections::HashMap<String, Tensor> {
 /// Parse a variant's reference manifest JSON.
 fn manifest(tag: &str) -> serde_json::Value {
     let path = reference_dir().join(format!("{tag}_manifest.json"));
-    let txt = std::fs::read_to_string(&path)
+    let txt = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/candle-gen/candle-gen-sd3/tests/component_parity.rs::manifest::std::fs::read_to_string@10785",
+Configuration,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .unwrap_or_else(|e| panic!("read manifest {}: {e}", path.display()));
     serde_json::from_str(&txt).expect("parse manifest json")
 }
@@ -594,6 +602,9 @@ fn sd35_bigg_pad_token_ab() {
         );
     }
     eprintln!("=== sc-9581 A/B PASS: bigG pad fix changes conditioning AND improves diffusers parity ===\n");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED component_parity::sd35_bigg_pad_token_ab");
 }
 
 /// The fixed prompt for `tag` — read from its reference manifest so it stays in lockstep with Python.
@@ -620,6 +631,9 @@ fn read_timestep(tag: &str) -> f32 {
 #[ignore = "real-weight parity: needs the SD3.5-large snapshot + the diffusers reference (see module header)"]
 fn sd35_large_component_parity_vs_diffusers() {
     run_parity(&VARIANTS[0]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED component_parity::sd35_large_component_parity_vs_diffusers");
 }
 
 /// SD3.5-medium parity — the **MMDiT-X** (dual-attention) variant (sc-9580, highest-value add).
@@ -627,6 +641,9 @@ fn sd35_large_component_parity_vs_diffusers() {
 #[ignore = "real-weight parity: needs the SD3.5-medium snapshot + the diffusers reference (see module header)"]
 fn sd35_medium_component_parity_vs_diffusers() {
     run_parity(&VARIANTS[1]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED component_parity::sd35_medium_component_parity_vs_diffusers");
 }
 
 /// SD3.5-large-turbo parity — the guidance-distilled Large sibling (sc-9580).
@@ -634,6 +651,9 @@ fn sd35_medium_component_parity_vs_diffusers() {
 #[ignore = "real-weight parity: needs the SD3.5-large-turbo snapshot + the diffusers reference (see module header)"]
 fn sd35_large_turbo_component_parity_vs_diffusers() {
     run_parity(&VARIANTS[2]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED component_parity::sd35_large_turbo_component_parity_vs_diffusers");
 }
 
 /// A tensor-shape sanity guard that runs WITHOUT weights (not `#[ignore]`d): for every [`VARIANTS`]

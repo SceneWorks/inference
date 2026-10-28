@@ -121,20 +121,24 @@ impl DurationHead {
         }
         let mut groups: Vec<Tensor> = Vec::with_capacity(2);
         if let Some(v) = video_tokens {
-            let proj = linear(
+            let proj = __model_proof_output!(linear(
                 &v.to_dtype(DType::F32)?,
                 &self.video_proj_w,
                 &self.video_proj_b,
-            )?;
-            groups.push(proj.broadcast_add(&self.video_mod_emb)?);
+            ))?;
+            groups.push(__model_proof_output!(
+                proj.broadcast_add(&self.video_mod_emb)
+            )?);
         }
         if let Some(a) = audio_tokens {
-            let proj = linear(
+            let proj = __model_proof_output!(linear(
                 &a.to_dtype(DType::F32)?,
                 &self.audio_proj_w,
                 &self.audio_proj_b,
-            )?;
-            groups.push(proj.broadcast_add(&self.audio_mod_emb)?);
+            ))?;
+            groups.push(__model_proof_output!(
+                proj.broadcast_add(&self.audio_mod_emb)
+            )?);
         }
         let tokens = if groups.len() == 1 {
             groups.into_iter().next().expect("len checked above")
@@ -171,13 +175,16 @@ impl DurationHead {
         let scale = 1.0 / (head_dim as f64).sqrt();
         let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
         let weights = candle_gen::candle_nn::ops::softmax_last_dim(&scores)?;
-        let attn = weights.matmul(&v)?; // (b,nh,nq,head_dim)
+        let attn = __model_proof_output!(weights.matmul(&v))?; // (b,nh,nq,head_dim)
         let attn = attn.transpose(1, 2)?.reshape((b, nq, hd))?.contiguous()?;
-        let pooled = linear(&attn, &self.out_proj_w, &self.out_proj_b)?;
+        let pooled = __model_proof_output!(linear(&attn, &self.out_proj_w, &self.out_proj_b))?;
 
         let pooled_flat = pooled.reshape((b, nq * hd))?;
-        let hidden = linear(&pooled_flat, &self.mlp_hidden_w, &self.mlp_hidden_b)?.gelu()?; // tanh-approx GELU
-        let log_duration = linear(&hidden, &self.mlp_out_w, &self.mlp_out_b)?.reshape(b)?; // squeeze(-1)
+        let hidden =
+            __model_proof_output!(linear(&pooled_flat, &self.mlp_hidden_w, &self.mlp_hidden_b))?
+                .gelu()?; // tanh-approx GELU
+        let log_duration =
+            __model_proof_output!(linear(&hidden, &self.mlp_out_w, &self.mlp_out_b))?.reshape(b)?; // squeeze(-1)
         log_duration.exp()
     }
 
@@ -290,24 +297,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_is_modality_agnostic_video_only() {
         let device = Device::Cpu;
         let head = DurationHead::from_weights(&synthetic_weights(&device), &device).unwrap();
         let video = probe(&[1, 5, hparams::VIDEO_CROSS_ATTENTION_DIM], &device);
         let seconds = head.predict_seconds(Some(&video), None).unwrap();
         assert!(seconds.is_finite() && seconds > 0.0, "seconds={seconds}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED duration_head::tests::forward_is_modality_agnostic_video_only");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_is_modality_agnostic_audio_only() {
         let device = Device::Cpu;
         let head = DurationHead::from_weights(&synthetic_weights(&device), &device).unwrap();
         let audio = probe(&[1, 4, hparams::AUDIO_CROSS_ATTENTION_DIM], &device);
         let seconds = head.predict_seconds(None, Some(&audio)).unwrap();
         assert!(seconds.is_finite() && seconds > 0.0, "seconds={seconds}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED duration_head::tests::forward_is_modality_agnostic_audio_only");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_accepts_both_modalities_at_once() {
         let device = Device::Cpu;
         let head = DurationHead::from_weights(&synthetic_weights(&device), &device).unwrap();
@@ -315,14 +331,21 @@ mod tests {
         let audio = probe(&[1, 4, hparams::AUDIO_CROSS_ATTENTION_DIM], &device);
         let seconds = head.predict_seconds(Some(&video), Some(&audio)).unwrap();
         assert!(seconds.is_finite() && seconds > 0.0, "seconds={seconds}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED duration_head::tests::forward_accepts_both_modalities_at_once");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn predict_seconds_rejects_a_multi_item_batch() {
         let device = Device::Cpu;
         let head = DurationHead::from_weights(&synthetic_weights(&device), &device).unwrap();
         let video = probe(&[2, 5, hparams::VIDEO_CROSS_ATTENTION_DIM], &device);
         assert!(head.predict_seconds(Some(&video), None).is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED duration_head::tests::predict_seconds_rejects_a_multi_item_batch");
     }
 
     /// Reachability at the real-component level (sc-18774 acceptance): wiring
@@ -330,6 +353,7 @@ mod tests {
     /// synthetic-weighted) `DurationHead::forward` proves the opt-in seam reaches all the way into
     /// the network's forward pass, not just a mock closure.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn opt_in_seam_reaches_the_real_forward_pass() {
         use candle_gen::gen_core::duration_head::{resolve_request_num_frames, AutoDurationRange};
 
@@ -374,5 +398,8 @@ mod tests {
         .unwrap();
         assert_eq!(explicit, Some(65));
         assert_eq!(calls, 0, "explicit duration must never reach the head");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED duration_head::tests::opt_in_seam_reaches_the_real_forward_pass");
     }
 }

@@ -62,3 +62,6 @@ mod explicit_registry_tests {
         assert_eq!(explicit, ["seedvr2", "seedvr2_3b", "seedvr2_7b"]);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

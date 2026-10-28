@@ -51,7 +51,7 @@ impl TemporalConv3d {
                 .permute((0, 2, 1, 3, 4))?
                 .reshape((b * t, c, h, w))?
                 .contiguous()?;
-            let y = merged.conv2d(&wk, 0, 1, 1, 1)?; // [B·T, O, H, W]
+            let y = __model_proof_output!(merged.conv2d(&wk, 0, 1, 1, 1))?; // [B·T, O, H, W]
             acc = Some(match acc {
                 Some(a) => (a + y)?,
                 None => y,
@@ -63,7 +63,7 @@ impl TemporalConv3d {
             .reshape((b, t, o, hp, wp))?
             .permute((0, 2, 1, 3, 4))?
             .contiguous()?;
-        y.broadcast_add(&self.bias)
+        __model_proof_output!(y.broadcast_add(&self.bias))
     }
 }
 
@@ -74,6 +74,7 @@ mod tests {
 
     /// A `(1,1,1)` temporal kernel is a pointwise channel conv — equivalent to a per-frame matmul.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn kd1_is_pointwise() -> Result<()> {
         let dev = Device::Cpu;
         let (o, i) = (4usize, 3usize);
@@ -85,11 +86,14 @@ mod tests {
         let x = Tensor::randn(0f32, 1.0, (1, i, 5, 2, 2), &dev)?;
         let y = conv.forward(&x)?;
         assert_eq!(y.dims(), &[1, o, 5, 2, 2]);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conv3d::tests::kd1_is_pointwise");
         Ok(())
     }
 
     /// A symmetric `(3,1,1)` kernel preserves the temporal length (pad 1 each side).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn kd3_preserves_temporal_len() -> Result<()> {
         let dev = Device::Cpu;
         let (o, i) = (2usize, 2usize);
@@ -101,6 +105,8 @@ mod tests {
         let x = Tensor::randn(0f32, 1.0, (1, i, 7, 3, 3), &dev)?;
         let y = conv.forward(&x)?;
         assert_eq!(y.dims(), &[1, o, 7, 3, 3]);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conv3d::tests::kd3_preserves_temporal_len");
         Ok(())
     }
 }

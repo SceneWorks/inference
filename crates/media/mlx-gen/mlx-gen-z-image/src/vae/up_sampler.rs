@@ -20,6 +20,31 @@ impl UpSampler {
         })
     }
 
+    /// The upsample as one iOS quantum: the nearest-2x copy (input width at the doubled extent),
+    /// the convolution's output and kernel transient ([`mlx_gen::ios_quantum::single_conv_bytes`]).
+    pub(crate) fn forward_quantum(&self, x_nchw: &Array) -> Result<Array> {
+        crate::quantum::conv_quantum(
+            crate::quantum::VAE_UPSAMPLE,
+            |backend| {
+                let [b, h, w, c] = crate::quantum::nhwc(x_nchw);
+                let call = mlx_gen::ios_quantum::ConvCall::new(
+                    &[b, 2 * h, 2 * w, c],
+                    x_nchw.item_size() as u64,
+                    &self.conv_w,
+                    1,
+                    1,
+                );
+                mlx_gen::ios_quantum::single_conv_bytes(&call, 1, 0, backend)
+            },
+            || self.forward(x_nchw),
+        )
+    }
+
+    /// The `[out, 3, 3, in]` NHWC conv weight (for the iOS convolution accounting).
+    pub(crate) fn weight(&self) -> &Array {
+        &self.conv_w
+    }
+
     pub fn forward(&self, x_nchw: &Array) -> Result<Array> {
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?; // NHWC
         let up = upsample_nearest(&x, 2)?;
@@ -34,6 +59,16 @@ impl UpSampler {
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
+        // iOS: one tiled stage at the doubled extent (it also holds the nearest-2x copy); each conv
+        // tile is checked on its own.
+        let s = x.shape();
+        crate::quantum::before_tiled_stage(
+            crate::quantum::VAE_DECODE_TILED_STAGE,
+            &[s[0], 2 * s[1], 2 * s[2], s[3]],
+            x.item_size() as u64,
+            &self.conv_w,
+            false,
+        )?;
         let up = upsample_nearest(&x, 2)?;
         let h = tiled_conv2d_3x3_nhwc(
             &up,
@@ -41,8 +76,22 @@ impl UpSampler {
             Some(&self.conv_b),
             tile_edge,
             cancel,
-            |tile| Ok(tile.clone()),
+            |tile| {
+                crate::quantum::before_tile(
+                    crate::quantum::VAE_DECODE_TILE,
+                    tile,
+                    mlx_gen::ios_quantum::TileSource {
+                        full_width: up.shape()[2],
+                        normalized: false,
+                    },
+                    &self.conv_w,
+                )?;
+                Ok(tile.clone())
+            },
         )?;
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_gen::ios_quantum::finish(crate::quantum::VAE_DECODE_TILED_STAGE, &[&h])?;
+        }
         Ok(h.transpose_axes(&[0, 3, 1, 2])?)
     }
 }

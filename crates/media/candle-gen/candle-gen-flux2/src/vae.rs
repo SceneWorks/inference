@@ -142,9 +142,9 @@ impl Resnet {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = self.norm1.forward(x)?.silu()?;
+        let h = __model_proof_output!(self.norm1.forward(x))?.silu()?;
         let h = self.conv1.forward(&h)?;
-        let h = self.norm2.forward(&h)?.silu()?;
+        let h = __model_proof_output!(self.norm2.forward(&h))?.silu()?;
         let h = self.conv2.forward(&h)?;
         let res = match &self.shortcut {
             Some(c) => c.forward(x)?,
@@ -178,15 +178,15 @@ impl MidAttention {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (b, c, h, w) = x.dims4()?;
-        let normed = self.norm.forward(x)?;
+        let normed = __model_proof_output!(self.norm.forward(x))?;
         // (B, C, H, W) -> (B, H*W, C)
         let seq = normed
             .reshape((b, c, h * w))?
             .transpose(1, 2)?
             .contiguous()?;
-        let q = self.q.forward(&seq)?;
-        let k = self.k.forward(&seq)?;
-        let v = self.v.forward(&seq)?;
+        let q = __model_proof_output!(self.q.forward(&seq))?;
+        let k = __model_proof_output!(self.k.forward(&seq))?;
+        let v = __model_proof_output!(self.v.forward(&seq))?;
         let scale = (self.channels as f64).powf(-0.5);
         // i32-overflow guard (sc-9116): the single-head spatial scores `[B, HW, HW]` reach `65536² ≈
         // 4.3e9 > i32::MAX` at a 2048² decode, so chunk over the query rows (byte-identical for the
@@ -199,7 +199,7 @@ impl MidAttention {
             candle_gen::candle_nn::ops::softmax_last_dim,
             candle_gen::ATTN_SCORES_BUDGET,
         )?; // (B, HW, C)
-        let o = self.out.forward(&o)?;
+        let o = __model_proof_output!(self.out.forward(&o))?;
         // back to (B, C, H, W) and residual
         let o = o.transpose(1, 2)?.reshape((b, c, h, w))?;
         x + o
@@ -354,7 +354,7 @@ impl Encoder {
         h = self.mid_resnet0.forward(&h)?;
         h = self.mid_attn.forward(&h)?;
         h = self.mid_resnet1.forward(&h)?;
-        let h = self.conv_norm_out.forward(&h)?.silu()?;
+        let h = __model_proof_output!(self.conv_norm_out.forward(&h))?.silu()?;
         self.conv_out.forward(&h)
     }
 }
@@ -614,7 +614,7 @@ impl Flux2Vae {
                 for block in &self.up_blocks {
                     h = block.forward(&h)?;
                 }
-                let h = self.conv_norm_out.forward(&h)?.silu()?;
+                let h = __model_proof_output!(self.conv_norm_out.forward(&h))?.silu()?;
                 self.conv_out.forward(&h)?.unsqueeze(2)
             },
         )?;
@@ -629,7 +629,7 @@ impl Flux2Vae {
         for ub in &self.up_blocks {
             h = ub.forward(&h)?;
         }
-        let h = self.conv_norm_out.forward(&h)?.silu()?;
+        let h = __model_proof_output!(self.conv_norm_out.forward(&h))?.silu()?;
         self.conv_out.forward(&h)
     }
 
@@ -721,7 +721,7 @@ impl Flux2Vae {
                 for block in &self.up_blocks {
                     h = block.forward(&h)?;
                 }
-                let h = self.conv_norm_out.forward(&h)?.silu()?;
+                let h = __model_proof_output!(self.conv_norm_out.forward(&h))?.silu()?;
                 self.conv_out.forward(&h)?.unsqueeze(2)
             },
         )?

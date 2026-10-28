@@ -43,7 +43,12 @@ struct Conv2d {
 impl Conv2d {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let y = chunked_conv2d(x, &self.weight, 1)?;
-        y.broadcast_add(&self.bias.reshape((1, self.bias.elem_count(), 1, 1))?)
+        __model_proof_output!(y.broadcast_add(&self.bias.reshape((
+            1,
+            self.bias.elem_count(),
+            1,
+            1
+        ))?))
     }
 }
 
@@ -81,7 +86,9 @@ impl GroupNorm32 {
             .reshape((b, c, t, h, w))?;
         let weight = self.weight.to_dtype(DType::F32)?.reshape((1, c, 1, 1, 1))?;
         let bias = self.bias.to_dtype(DType::F32)?.reshape((1, c, 1, 1, 1))?;
-        ((normalized.broadcast_mul(&weight)?).broadcast_add(&bias)?).to_dtype(dtype)
+        __model_proof_output!(
+            ((normalized.broadcast_mul(&weight)?).broadcast_add(&bias)?).to_dtype(dtype)
+        )
     }
 }
 
@@ -401,6 +408,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn group_norm_broadcasts_production_upsampler_variance_shape() -> Result<()> {
         let device = Device::Cpu;
         let norm = GroupNorm32 {
@@ -411,6 +419,8 @@ mod tests {
         let y = norm.forward(&x)?;
         assert_eq!(y.dims(), &[1, 1024, 5, 8, 12]);
         assert_eq!(y.sum_all()?.to_scalar::<f32>()?, 0.0);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED upsampler::tests::group_norm_broadcasts_production_upsampler_variance_shape");
         Ok(())
     }
 }

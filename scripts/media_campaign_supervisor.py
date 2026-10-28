@@ -108,7 +108,7 @@ def load_policy(path: Path) -> SafetyPolicy:
         raise SupervisionError("invalid-policy", "schemaVersion must be 1")
     backend = data.get("backend")
     expected = base | (cuda if backend in {"linux-cuda", "windows-cuda"} else set())
-    if backend not in {"darwin-mlx", "linux-cuda", "windows-cuda"} or set(data) != expected:
+    if backend not in {"darwin-mlx", "linux-cpu", "linux-cuda", "windows-cpu", "windows-cuda"} or set(data) != expected:
         raise SupervisionError("invalid-policy", "backend or exact policy fields are invalid")
     deadline = data["deadlineSeconds"]
     if type(deadline) not in (int, float) or deadline <= 0 or deadline >= 2**53 or not math.isfinite(deadline):
@@ -520,8 +520,8 @@ class SystemProbe:
         self.policy = policy
         # {pid: bytes} behind the most recent tree_footprint total (POSIX backends only).
         self.last_tree_breakdown: dict[int, int] = {}
-        actual = {"Darwin": "darwin-mlx", "Linux": "linux-cuda",
-                  "Windows": "windows-cuda"}.get(platform.system(), "unsupported")
+        actual = {"Darwin": "darwin-mlx", "Linux": "linux-cpu" if policy.backend == "linux-cpu" else "linux-cuda",
+                  "Windows": "windows-cpu" if policy.backend == "windows-cpu" else "windows-cuda"}.get(platform.system(), "unsupported")
         if actual != policy.backend:
             raise SupervisionError("unsupported-host", f"{policy.backend} cannot run on {actual}")
         try:
@@ -538,7 +538,7 @@ class SystemProbe:
 
     def host_free(self) -> int:
         """Linux/Windows host free memory; macOS measures through host_admission."""
-        if self.policy.backend == "windows-cuda":
+        if self.policy.backend in {"windows-cpu", "windows-cuda"}:
             try:
                 return windows.host_free_bytes()
             except windows.WindowsJobError as error:
@@ -559,7 +559,7 @@ class SystemProbe:
 
     def tree_footprint(self, owner: PosixTree | windows.WindowsJob) -> int | None:
         """The owned tree's footprint, or None when every owned process vanished mid-sample."""
-        if self.policy.backend == "windows-cuda":
+        if self.policy.backend in {"windows-cpu", "windows-cuda"}:
             try:
                 return owner.footprint_bytes()
             except windows.WindowsJobError as error:
@@ -599,15 +599,70 @@ class SystemProbe:
         usage = _bounded_output([self._smi, "--query-compute-apps=pid,used_gpu_memory,gpu_uuid",
                                  "--format=csv,noheader,nounits"])
         used = 0
-        for line in usage.splitlines():
+        unknown_owned = False
+        seen: set[tuple[int, str]] = set()
+        for number, line in enumerate(usage.splitlines(), 1):
             parts = [item.strip() for item in line.split(",")]
-            if len(parts) != 3 or not parts[0].isdecimal() or not parts[1].isdecimal():
-                raise SupervisionError("probe-failure", "CUDA process-memory row is malformed")
-            if int(parts[0]) in pids:
-                if parts[2] != uuid:
+            if (len(parts) != 3 or not parts[0].isdecimal() or len(parts[0]) > 10 or int(parts[0]) <= 0
+                    or not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", parts[2])):
+                raise SupervisionError("probe-failure", f"CUDA process-memory row {number} has malformed PID/UUID: {line[:160]!r}")
+            pid = int(parts[0])
+            key = (pid, parts[2].casefold())
+            if key in seen:
+                raise SupervisionError("probe-failure", f"CUDA process-memory row {number} duplicates PID/UUID {pid}/{parts[2]}")
+            seen.add(key)
+            if pid in pids:
+                # A multi-device run declares its exact UUID set on the SAME owned tree.
+                # Attribute only this probe's UUID; still reject any undeclared device.
+                allowed = getattr(owner, "cuda_device_uuids", (uuid,))
+                if parts[2] not in allowed:
                     raise SupervisionError("probe-failure", "child used an unexpected GPU")
-                used += int(parts[1]) * 1024**2
+            if parts[1].isdecimal() and len(parts[1]) <= 20:
+                if pid in pids and parts[2] == uuid:
+                    used += int(parts[1]) * 1024**2
+            elif parts[1] in {"N/A", "[N/A]"}:
+                if self.policy.backend != "windows-cuda":
+                    raise SupervisionError("probe-failure", f"CUDA process-memory row {number} is unavailable: {line[:160]!r}")
+                if pid in pids:
+                    if parts[2] == uuid:
+                        unknown_owned = True
+                # An exact, unique PID outside the owned Job is not child usage.
+                # WDDM commonly reports its graphics processes with N/A memory.
+            else:
+                raise SupervisionError("probe-failure", f"CUDA process-memory row {number} has unknown usage: {line[:160]!r}")
+        if unknown_owned:
+            free, used = self._windows_global_used_upper_bound()
+            self.gpu_usage_basis = "global-used-upper-bound"
+        else:
+            self.gpu_usage_basis = "owned-process-attributed"
         return free, used
+
+    def _windows_global_used_upper_bound(self) -> tuple[int, int]:
+        """One exact WDDM card sample bounds child use when its per-PID value is N/A.
+
+        Total minus free includes all allocations, including the owned child and
+        reserved/unattributed memory. The extra MiB covers rounded SMI counters.
+        This is a conservative cap input, never an attributed child peak.
+        """
+        if self.policy.backend != "windows-cuda":
+            raise SupervisionError("probe-failure", "global-used bound requires Windows CUDA")
+        assert self.policy.cuda_device_uuid
+        uuid = self.policy.cuda_device_uuid
+        raw = _bounded_output([self._smi, f"--id={uuid}",
+                               "--query-gpu=uuid,driver_model.current,memory.total,memory.used,memory.free",
+                               "--format=csv,noheader,nounits"])
+        rows = [line.split(",") for line in raw.splitlines()]
+        if len(rows) != 1:
+            raise SupervisionError("probe-failure", "WDDM global-used card sample is missing or duplicate")
+        fields = [value.strip() for value in rows[0]]
+        if (len(fields) != 5 or fields[0] != uuid or fields[1] != "WDDM"
+                or any(not value.isdecimal() or len(value) > 20 for value in fields[2:])):
+            raise SupervisionError("probe-failure", f"WDDM global-used card sample has invalid identity/counters: {raw[:160]!r}")
+        total, used, free = map(int, fields[2:])
+        if (total <= 0 or used > total or free > total or used + free > total + 2):
+            raise SupervisionError("probe-failure", f"WDDM global-used card counters are inconsistent: {raw[:160]!r}")
+        mib = 1024**2
+        return free * mib, (max(used, total - free) + 1) * mib
 
     def gpu_free(self) -> int:
         assert self.policy.cuda_device_uuid
@@ -714,7 +769,7 @@ def runtime_guarded_admission(
               policy.stdout_cap_bytes, policy.stderr_cap_bytes, policy.event_cap_bytes]
     if cuda:
         guards += [policy.gpu_free_reserve_bytes, policy.child_gpu_cap_bytes]
-    if (policy.backend not in {"darwin-mlx", "linux-cuda", "windows-cuda"}
+    if (policy.backend not in {"darwin-mlx", "linux-cpu", "linux-cuda", "windows-cpu", "windows-cuda"}
             or not all(_positive(value) for value in guards)
             or policy.poll_millis >= policy.deadline_seconds * 1000
             or policy.term_grace_millis >= policy.deadline_seconds * 1000
@@ -785,7 +840,7 @@ def validate_admission(value: object, *, policy_sha256: str, admitted: bool = Tr
     if (not isinstance(value, dict) or value.get("mode") != RUNTIME_GUARDED_ADMISSION
             or value.get("rule") != ESTIMATE_PLUS_RESERVE_RULE
             or value.get("policySha256") != policy_sha256
-            or value.get("backend") not in {"darwin-mlx", "linux-cuda", "windows-cuda"}
+            or value.get("backend") not in {"darwin-mlx", "linux-cpu", "linux-cuda", "windows-cpu", "windows-cuda"}
             or not _positive(value.get("childFootprintCapBytes"))
             or not _positive(value.get("hostFreeReserveBytes"))
             or not _positive(value.get("deadlineSeconds"))
@@ -812,10 +867,10 @@ def validate_admission(value: object, *, policy_sha256: str, admitted: bool = Tr
             raise SupervisionError("invalid-admission", f"recorded {key} exceeds its cap")
     _validate_estimate(value, "host", "hostEstimateSource", "hostEstimateBytes", "staticFloorHostBytes",
                        "childFootprintCapBytes", "hostFreeReserveBytes", "hostAvailableBytes", admitted)
-    if value["backend"] == "darwin-mlx":
+    if value["backend"] in {"darwin-mlx", "linux-cpu", "windows-cpu"}:
         if any(value.get(key) is not None for key in
                ("staticFloorGpuBytes", "gpuEstimateSource", "gpuEstimateBytes", "gpuAvailableBytes")):
-            raise SupervisionError("invalid-admission", "a macOS admission records no CUDA estimate")
+            raise SupervisionError("invalid-admission", "a CPU/shared-memory admission records no CUDA estimate")
     else:
         _validate_estimate(value, "CUDA", "gpuEstimateSource", "gpuEstimateBytes", "staticFloorGpuBytes",
                            "childGpuCapBytes", "gpuFreeReserveBytes", "gpuAvailableBytes", admitted)
@@ -861,6 +916,7 @@ def write_unaccepted_record(path: Path, *, kind: str, coordinate: str, error: Su
         "schemaVersion": 1, "kind": kind, "coordinate": coordinate, "accepted": False,
         "outcome": outcome, "reason": error.reason, "detail": error.detail, "pid": error.pid,
         "admission": error.admission,
+        **({"cudaDevices": error.cuda_devices} if hasattr(error, "cuda_devices") else {}),
         **({"watchdogHostMemory": error.watchdog_host_memory}
            if error.watchdog_host_memory is not None else {}),
         **({"watchdogChildFootprint": error.watchdog_child_footprint}
@@ -949,6 +1005,56 @@ def check_operator_stop(stop_files: tuple[Path, ...] | None, logs: Path, *, kind
     raise OperatorStop(before=before, index=index, total=total, record=record)
 
 
+class _CudaWatch:
+    def __init__(self, policy: SafetyPolicy, probe: object, admission: dict[str, object], role: int):
+        self.policy, self.probe, self.admission, self.role = policy, probe, admission, role
+        self.peak = 0
+        self.global_upper_bound_peak = 0
+        self.global_upper_bound_samples = 0
+        self.samples: list[dict[str, object]] = []
+        self.failed = FailedTicks(f"CUDA probe {policy.cuda_device_uuid}")
+
+    def evidence(self) -> dict[str, object]:
+        result = {"role": self.role, "cudaDeviceUuid": self.policy.cuda_device_uuid,
+                "admission": self.admission, "samples": tuple(self.samples),
+                "peakGpuBytes": self.peak if self.peak > 0 else None,
+                "peakGpuUnknownReason": None if self.peak > 0 else "no attributable positive GPU-memory sample",
+                "policySha256": self.policy.sha256}
+        if self.global_upper_bound_samples:
+            result["peakGlobalUsedUpperBoundBytes"] = self.global_upper_bound_peak
+            result["globalUsedUpperBoundSampleCount"] = self.global_upper_bound_samples
+            if self.peak == 0:
+                result["peakGpuUnknownReason"] = "global GPU used upper bound sampled; no attributable child GPU-memory sample"
+        return result
+
+
+def _cuda_pairs(policy: SafetyPolicy, probe: object | None,
+                policies: tuple[SafetyPolicy, ...], probes: tuple[object, ...]):
+    if not isinstance(policies, tuple) or not isinstance(probes, tuple) or len(policies) != len(probes):
+        raise SupervisionError("invalid-policy", "secondary CUDA policies/probes must be equal explicit tuples")
+    if not policies:
+        return ()
+    shared = ("backend", "deadline_seconds", "poll_millis", "term_grace_millis",
+              "host_free_reserve_bytes", "child_footprint_cap_bytes", "stdout_cap_bytes",
+              "stderr_cap_bytes", "event_cap_bytes")
+    pairs = ((policy, probe), *zip(policies, probes))
+    seen: set[str] = set()
+    for device, sampler in pairs:
+        if (not isinstance(device, SafetyPolicy) or device.backend not in {"linux-cuda", "windows-cuda"}
+                or any(getattr(device, field) != getattr(policy, field) for field in shared)
+                or not isinstance(device.cuda_device_uuid, str)
+                or not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", device.cuda_device_uuid)):
+            raise SupervisionError("invalid-policy", "multi-CUDA policies must share host/tree/log/deadline guards and explicit UUIDs")
+        if device.cuda_device_uuid.casefold() in seen:
+            raise SupervisionError("invalid-policy", "multi-CUDA UUIDs must be unique")
+        seen.add(device.cuda_device_uuid.casefold())
+        if (sampler is None or getattr(sampler, "policy", None) != device
+                or not callable(getattr(sampler, "gpu_free", None))
+                or not callable(getattr(sampler, "gpu_free_and_tree_bytes", None))):
+            raise SupervisionError("invalid-policy", "each CUDA probe must explicitly match its policy/UUID")
+    return pairs
+
+
 @dataclass(frozen=True)
 class RunResult:
     pid: int
@@ -962,6 +1068,12 @@ class RunResult:
     admission: dict[str, object]
 
 
+@dataclass(frozen=True)
+class MultiCudaRunResult(RunResult):
+    # The legacy result constructor/fields/asdict stay exactly unchanged for a single device.
+    cuda_devices: tuple[dict[str, object], ...]
+
+
 def run_guarded(
     argv: list[str], *, cwd: Path, env: dict[str, str], policy: SafetyPolicy,
     stdout_path: Path, stderr_path: Path, static_floor_host_bytes: int | None = None,
@@ -970,6 +1082,9 @@ def run_guarded(
     measured_peak_gpu_bytes: int | None = None, event_path: Path | None = None,
     probe: object | None = None, clock: Callable[[], float] = time.monotonic,
     on_spawn: Callable[[int, int | None], None] | None = None,
+    require_gpu_sample: bool = True, pass_fds: tuple[int, ...] = (),
+    additional_cuda_policies: tuple[SafetyPolicy, ...] = (),
+    additional_cuda_probes: tuple[object, ...] = (),
 ) -> RunResult:
     """Run one row under runtime-guarded, estimate-plus-reserve admission.
 
@@ -977,7 +1092,10 @@ def run_guarded(
     malformed estimate) and the owned child PID (None when refused before spawn) so callers can
     seal it as unaccepted.
     """
+    if type(require_gpu_sample) is not bool:
+        raise SupervisionError("invalid-policy", "GPU sample requirement must be boolean")
     admission = None
+    cuda_states: tuple[_CudaWatch, ...] = ()
     spawned: list[int] = []
 
     def record_spawn(pid: int, pgid: int | None) -> None:
@@ -986,6 +1104,7 @@ def run_guarded(
             on_spawn(pid, pgid)
 
     try:
+        pairs = _cuda_pairs(policy, probe, additional_cuda_policies, additional_cuda_probes)
         admission = runtime_guarded_admission(
             policy, static_floor_host_bytes=static_floor_host_bytes,
             static_floor_gpu_bytes=static_floor_gpu_bytes,
@@ -993,14 +1112,25 @@ def run_guarded(
             measured_peak_host_bytes=measured_peak_host_bytes,
             measured_peak_gpu_bytes=measured_peak_gpu_bytes,
         )
+        if pairs:
+            secondary = [runtime_guarded_admission(
+                device, static_floor_host_bytes=static_floor_host_bytes,
+                host_estimate_source=host_estimate_source, measured_peak_host_bytes=measured_peak_host_bytes,
+            ) for device, _sampler in pairs[1:]]
+            cuda_states = tuple(_CudaWatch(device, sampler, device_admission, role)
+                                for role, ((device, sampler), device_admission)
+                                in enumerate(zip(pairs, [admission, *secondary])))
         return _run_admitted(
             argv, cwd=cwd, env=env, policy=policy, admission=admission,
             stdout_path=stdout_path, stderr_path=stderr_path, event_path=event_path,
-            probe=probe, clock=clock, on_spawn=record_spawn,
+            probe=probe, clock=clock, on_spawn=record_spawn, require_gpu_sample=require_gpu_sample, pass_fds=pass_fds,
+            cuda_states=cuda_states,
         )
     except SupervisionError as error:
         error.admission = admission
         error.pid = spawned[0] if spawned else None
+        if cuda_states:
+            error.cuda_devices = tuple(state.evidence() for state in cuda_states)
         raise
 
 
@@ -1008,15 +1138,22 @@ def _run_admitted(
     argv: list[str], *, cwd: Path, env: dict[str, str], policy: SafetyPolicy,
     admission: dict[str, object], stdout_path: Path, stderr_path: Path,
     event_path: Path | None, probe: object | None, clock: Callable[[], float],
-    on_spawn: Callable[[int, int | None], None],
+    on_spawn: Callable[[int, int | None], None], require_gpu_sample: bool = True,
+    pass_fds: tuple[int, ...] = (), cuda_states: tuple[_CudaWatch, ...] = (),
 ) -> RunResult:
+    if (not isinstance(pass_fds, tuple) or any(type(fd) is not int or fd < 3 for fd in pass_fds)
+            or (os.name == 'nt' and pass_fds)):
+        raise SupervisionError('invalid-command', 'inherited cooperative lease descriptors must be explicit POSIX fds')
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise SupervisionError("invalid-command", "argv is empty or malformed")
-    if (policy.backend == "windows-cuda") != (os.name == "nt"):
+    if (policy.backend in {"windows-cpu", "windows-cuda"}) != (os.name == "nt"):
         raise SupervisionError("unsupported-host", "safety backend differs from process host")
     if stdout_path == stderr_path or any(path.exists() for path in (stdout_path, stderr_path)):
         raise SupervisionError("invalid-log", "bounded log paths must be distinct and fresh")
     probe = probe if probe is not None else SystemProbe(policy)
+    multi_cuda = bool(cuda_states)
+    devices = cuda_states or ((_CudaWatch(policy, probe, admission, 0),)
+                             if policy.backend in {"linux-cuda", "windows-cuda"} else ())
     started = clock()
     # On macOS the admission measure counts reclaimable clean file cache (darwin_host_memory),
     # and the live reserve watchdog below uses the same measure, so page cache alone never
@@ -1036,23 +1173,33 @@ def _run_admitted(
             f"estimate {admission['hostEstimateBytes']} bytes ({admission['hostEstimateSource']}; "
             f"{ESTIMATE_PLUS_RESERVE_RULE})")
     gpu_free = None
-    if policy.backend in {"linux-cuda", "windows-cuda"}:
+    for state in devices:
+        if multi_cuda and clock() - started >= policy.deadline_seconds:
+            raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
+        device, sampler, device_admission = state.policy, state.probe, state.admission
+        device_admission["hostAvailableBytes"] = host_free
         try:
-            gpu_free = read_gpu(probe.gpu_free)
+            available_gpu = read_gpu(sampler.gpu_free)
         except SupervisionError as error:
-            raise SupervisionError(error.reason, f"preflight {error.detail}") from error
-        admission["gpuAvailableBytes"] = gpu_free
-        if gpu_free < policy.gpu_free_reserve_bytes + admission["gpuEstimateBytes"]:
+            label = f"CUDA {device.cuda_device_uuid} " if multi_cuda else ""
+            raise SupervisionError(error.reason, f"{label}preflight {error.detail}") from error
+        device_admission["gpuAvailableBytes"] = available_gpu
+        if state.role == 0:
+            gpu_free = available_gpu
+        if available_gpu < device.gpu_free_reserve_bytes + device_admission["gpuEstimateBytes"]:
+            label = f"CUDA {device.cuda_device_uuid} " if multi_cuda else "CUDA "
             raise SupervisionError(
                 "preflight-memory",
-                f"CUDA free {gpu_free} bytes is below reserve {policy.gpu_free_reserve_bytes} plus "
-                f"estimate {admission['gpuEstimateBytes']} bytes ({admission['gpuEstimateSource']}; "
+                f"{label}free {available_gpu} bytes is below reserve {device.gpu_free_reserve_bytes} plus "
+                f"estimate {device_admission['gpuEstimateBytes']} bytes ({device_admission['gpuEstimateSource']}; "
                 f"{ESTIMATE_PLUS_RESERVE_RULE})")
+    if multi_cuda and clock() - started >= policy.deadline_seconds:
+        raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
     with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
         job = None
-        if policy.backend == "windows-cuda":
+        if policy.backend in {"windows-cpu", "windows-cuda"}:
             try:
                 job = windows.WindowsJob()
                 # CREATE_SUSPENDED: no descendant can start before Job ownership is installed.
@@ -1071,19 +1218,22 @@ def _run_admitted(
         else:
             try:
                 child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
-                                         start_new_session=True)
+                                         start_new_session=True, pass_fds=pass_fds)
             except OSError as error:
                 raise SupervisionError("spawn-failure", str(error)) from error
         known = {child.pid}
         owner = job if job is not None else PosixTree(child.pid, known)
+        if multi_cuda:
+            owner.cuda_device_uuids = tuple(state.policy.cuda_device_uuid for state in devices)
         peak_host = 0
         peak_gpu = 0
+        gpu_sample_bytes = 0
         samples: list[dict[str, object]] = []
         trajectory: list[tuple[int, int]] = []  # (elapsed ms, owned-tree footprint) per sample
         failed_tree_ticks = FailedTicks("process-tree probe")
         failed_footprint_ticks = FailedTicks("child footprint probe")
         failed_host_ticks = FailedTicks("live host probe")
-        failed_gpu_ticks = FailedTicks("CUDA probe")
+        failed_gpu_ticks = FailedTicks("CUDA probe")  # preserve single-device error detail
         def check_artifact_caps() -> None:
             if stdout_path.stat().st_size > policy.stdout_cap_bytes or stderr_path.stat().st_size > policy.stderr_cap_bytes:
                 raise SupervisionError("log-cap", "child exceeded a bounded transcript file")
@@ -1113,11 +1263,23 @@ def _run_admitted(
             check_artifact_caps()
             if status != 0:
                 raise SupervisionError("child-exit", f"child exited with status {status}")
-            if policy.backend == "windows-cuda" and peak_gpu <= 0:
-                raise SupervisionError("probe-failure", "CUDA child had no attributable GPU-memory sample")
+            if policy.backend == "windows-cuda" and require_gpu_sample:
+                missing = [state for state in devices if state.peak <= 0]
+                if missing:
+                    label = f" on {missing[0].policy.cuda_device_uuid}" if multi_cuda else ""
+                    raise SupervisionError("probe-failure", f"CUDA child had no attributable GPU-memory sample{label}")
             child.wait()
-            return RunResult(child.pid, status, peak_host, peak_gpu if gpu_free is not None else None,
-                             host_free, gpu_free, clock() - started, tuple(samples), admission)
+            # Explicit model-test proofs attest the actual in-scope device separately. A fast
+            # successful test may end between GPU polling ticks: report UNKNOWN, never a fake
+            # zero measurement. Existing campaign callers retain their strict/default behavior.
+            observed_gpu_peak = peak_gpu if gpu_free is not None else None
+            if not require_gpu_sample and observed_gpu_peak == 0:
+                observed_gpu_peak = None
+            fields = (child.pid, status, peak_host, observed_gpu_peak,
+                      host_free, gpu_free, clock() - started, tuple(samples), admission)
+            if multi_cuda:
+                return MultiCudaRunResult(*fields, tuple(state.evidence() for state in devices))
+            return RunResult(*fields)
 
         try:
             # Windows ownership is a Job, not a POSIX process group.
@@ -1155,7 +1317,7 @@ def _run_admitted(
                         f"{policy.host_free_reserve_bytes} bytes")
                     error.watchdog_host_memory = live_host
                     raise error
-                if pids:
+                if pids or (multi_cuda and pids is not None and owned):
                     try:
                         footprint = probe.tree_footprint(owner)
                     except SupervisionError as error:
@@ -1191,17 +1353,52 @@ def _run_admitted(
                                 footprint, policy.child_footprint_cap_bytes, trajectory,
                                 getattr(probe, "last_tree_breakdown", None))
                             raise error
-                    if policy.backend in {"linux-cuda", "windows-cuda"}:
+                    for state in devices:
+                        if multi_cuda and clock() - started >= policy.deadline_seconds:
+                            raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
+                        device, sampler = state.policy, state.probe
+                        failures = state.failed if multi_cuda else failed_gpu_ticks
                         try:
-                            device_free, device_used = read_gpu(lambda: probe.gpu_free_and_tree_bytes(owner))
+                            device_free, device_used = read_gpu(lambda: sampler.gpu_free_and_tree_bytes(owner))
                         except SupervisionError as error:
-                            failed_gpu_ticks.failed(error)
-                            time.sleep(policy.poll_millis / 1000)
-                            continue
-                        failed_gpu_ticks.succeeded()
-                        peak_gpu = max(peak_gpu, device_used)
-                        if device_free < policy.gpu_free_reserve_bytes or device_used > policy.child_gpu_cap_bytes:
-                            raise SupervisionError("device-memory", "owned CUDA use or free reserve exceeded cap")
+                            failures.failed(error)
+                            continue  # other explicit UUIDs still get this tick's checks
+                        failures.succeeded()
+                        basis = getattr(sampler, "gpu_usage_basis", "owned-process-attributed")
+                        if basis == "global-used-upper-bound":
+                            if device.backend != "windows-cuda":
+                                raise SupervisionError("probe-failure", "global-used bound is only valid for Windows WDDM")
+                            state.global_upper_bound_peak = max(state.global_upper_bound_peak, device_used)
+                            state.global_upper_bound_samples += 1
+                            if not multi_cuda:
+                                samples.append({"phase": "cuda-global-used-upper-bound-sample",
+                                                "cudaDeviceUuid": device.cuda_device_uuid,
+                                                "globalUsedUpperBoundBytes": device_used,
+                                                "gpuFreeBytes": device_free, "at_ns": time.time_ns()})
+                                gpu_sample_bytes += len(canonical(samples[-1]))
+                                if len(samples) * 160 + gpu_sample_bytes > policy.event_cap_bytes:
+                                    raise SupervisionError("event-cap", "process/device sample spool exceeded cap")
+                        elif basis == "owned-process-attributed":
+                            state.peak = max(state.peak, device_used)
+                        else:
+                            raise SupervisionError("probe-failure", "CUDA sample has unknown usage basis")
+                        if state.role == 0:
+                            peak_gpu = state.peak
+                        if multi_cuda:
+                            sample = {"phase": "device-sample", "cudaDeviceUuid": device.cuda_device_uuid,
+                                      "gpuFreeBytes": device_free, "rootExited": status is not None, "at_ns": time.time_ns()}
+                            if basis == "global-used-upper-bound":
+                                sample["globalUsedUpperBoundBytes"] = device_used
+                                sample["gpuUsageBasis"] = basis
+                            else:
+                                sample["ownedGpuBytes"] = device_used
+                            state.samples.append(sample)
+                            gpu_sample_bytes += len(canonical(state.samples[-1]))
+                            if len(samples) * 160 + gpu_sample_bytes > policy.event_cap_bytes:
+                                raise SupervisionError("event-cap", "process/device sample spool exceeded cap")
+                        if device_free < device.gpu_free_reserve_bytes or device_used > device.child_gpu_cap_bytes:
+                            label = f" on {device.cuda_device_uuid}" if multi_cuda else ""
+                            raise SupervisionError("device-memory", f"owned CUDA use or free reserve exceeded cap{label}")
                 time.sleep(policy.poll_millis / 1000)
         except BaseException:
             try:

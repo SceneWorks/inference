@@ -993,7 +993,13 @@ pub(crate) fn detect_packed_group(cfg_path: &Path) -> Result<Option<usize>> {
     if !cfg_path.is_file() {
         return Ok(None);
     }
-    let bytes = std::fs::read(cfg_path)
+    let bytes = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(cfg_path),
+"crates/media/candle-gen/candle-gen-kolors/src/pipeline.rs::detect_packed_group::std::fs::read@45743",
+ArtifactInput,
+cfg_path,
+|__model_input_path| std::fs::read(__model_input_path)
+)
         .map_err(|e| CandleError::Msg(format!("kolors: read {}: {e}", cfg_path.display())))?;
     let cfg: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| CandleError::Msg(format!("kolors: parse {}: {e}", cfg_path.display())))?;

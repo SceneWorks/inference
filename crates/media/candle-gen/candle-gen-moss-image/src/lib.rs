@@ -1,5 +1,13 @@
 //! Native MOSS-Image Base/SFT, including both explicit published DMD precision policies.
 //! Caller-provisioned exact assets only. No acquisition or Python production execution.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 mod adapters;
 mod edit;
 mod loader;

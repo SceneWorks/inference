@@ -26,6 +26,7 @@ fn registry_load_and_generate() {
     let snap = snapshot_dir();
     if !snap.exists() {
         eprintln!("skipping: snapshot missing at {}", snap.display());
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in registry_load_and_generate; see preceding skip diagnostic");
         return;
     }
 
@@ -93,4 +94,6 @@ fn registry_load_and_generate() {
         }
         _ => panic!("expected Images"),
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED model_realweight::registry_load_and_generate");
 }

@@ -72,6 +72,8 @@ fn svd_transformer_matches_diffusers() {
     let (max_abs, l2) = rel_l2(&out, &want);
     println!("transformer parity: max|Δ| {max_abs}, rel-L2 {l2}");
     assert!(l2 < 3e-3, "transformer rel-L2 {l2} (max|Δ| {max_abs})");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED unet_parity::svd_transformer_matches_diffusers");
 }
 
 /// Isolated `SpatioTemporalResBlock` (down_blocks.0.resnets.0, eps 1e-6) parity.
@@ -106,6 +108,8 @@ fn svd_resblock_matches_diffusers() {
     let (max_abs, l2) = rel_l2(&out, &want);
     println!("resblock parity: max|Δ| {max_abs}, rel-L2 {l2}");
     assert!(l2 < 3e-3, "resblock rel-L2 {l2} (max|Δ| {max_abs})");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED unet_parity::svd_resblock_matches_diffusers");
 }
 
 #[test]
@@ -175,4 +179,6 @@ fn svd_unet_matches_diffusers() {
         peak_rel < 4e-2,
         "unet peak-rel {peak_rel} (max|Δ| {max_abs})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED unet_parity::svd_unet_matches_diffusers");
 }

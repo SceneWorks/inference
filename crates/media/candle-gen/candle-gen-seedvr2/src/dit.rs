@@ -50,7 +50,7 @@ impl Linear {
         })))
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.0.forward(x)
+        __model_proof_output!(self.0.forward(x))
     }
 
     /// Fold a dense `[out,in]` weight to `Q4_0`/`Q8_0` in place (sc-5927). No-op when already
@@ -1072,13 +1072,21 @@ mod quant_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q8_is_near_lossless() {
         quant_roundtrip(Quant::Q8, 0.999);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::quant_tests::q8_is_near_lossless");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q4_stays_coherent() {
         quant_roundtrip(Quant::Q4, 0.95);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::quant_tests::q4_stays_coherent");
     }
 
     /// A Linear whose `in_features` is not a multiple of the block (the `vid_in.proj` in=132 case)

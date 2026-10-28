@@ -36,6 +36,7 @@ fn meta_i(w: &Weights, k: &str) -> i32 {
     w.metadata(k).unwrap().parse().unwrap()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vision_tower_matches_reference_f32() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
@@ -82,4 +83,8 @@ fn vision_tower_matches_reference_f32() {
     // ~1e-3 f32 cross-backend floor (patch matmul + 4 RoPE/softmax blocks + merger); a wrong window
     // permutation / mask / merge is O(0.1+).
     assert!(rel < 5e-3, "vision tower peak-rel {rel:.3e} exceeds 5e-3");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED vision_tower_parity::vision_tower_matches_reference_f32"
+    );
 }

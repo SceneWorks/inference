@@ -496,8 +496,10 @@ struct SnakeBeta {
 
 impl SnakeBeta {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let s = x.broadcast_mul(&self.alpha)?.sin()?.sqr()?;
-        x + s.broadcast_mul(&self.inv_beta)?
+        let s = __model_proof_output!(x.broadcast_mul(&self.alpha))?
+            .sin()?
+            .sqr()?;
+        __model_proof_output!(x + __model_proof_output!(s.broadcast_mul(&self.inv_beta))?)
     }
 }
 
@@ -529,12 +531,24 @@ impl Conv {
                 self.dilation,
             )?
         } else {
-            x.conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?
+            __model_proof_output!(x.conv1d(
+                &self.weight,
+                self.padding,
+                self.stride,
+                self.dilation,
+                1
+            ))?
         };
         #[cfg(not(feature = "cuda"))]
-        let y = x.conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?;
+        let y = __model_proof_output!(x.conv1d(
+            &self.weight,
+            self.padding,
+            self.stride,
+            self.dilation,
+            1
+        ))?;
         match &self.bias {
-            Some(b) => y.broadcast_add(&b.reshape((1, (), 1))?),
+            Some(b) => __model_proof_output!(y.broadcast_add(&b.reshape((1, (), 1))?)),
             None => Ok(y),
         }
     }
@@ -569,13 +583,14 @@ impl ConvT {
         let y = if stable_bf16_convolution(x.dtype(), x.device().location()) {
             candle_quant_kernels::yue2_stable_conv::conv_transpose1d(x, &self.weight, self.stride)?
         } else {
-            x.conv_transpose1d(&self.weight, 0, 0, self.stride, 1, 1)?
+            __model_proof_output!(x.conv_transpose1d(&self.weight, 0, 0, self.stride, 1, 1))?
         };
         #[cfg(not(feature = "cuda"))]
-        let y = x.conv_transpose1d(&self.weight, 0, 0, self.stride, 1, 1)?;
+        let y = __model_proof_output!(x.conv_transpose1d(&self.weight, 0, 0, self.stride, 1, 1))?;
         let len = y.dim(D::Minus1)? - 2 * self.padding;
-        y.narrow(D::Minus1, self.padding, len)?
-            .broadcast_add(&self.bias.reshape((1, (), 1))?)
+        __model_proof_output!(y
+            .narrow(D::Minus1, self.padding, len)?
+            .broadcast_add(&self.bias.reshape((1, (), 1))?))
     }
 
     fn output_length(&self, n: i64) -> i64 {
@@ -1050,8 +1065,14 @@ impl Yue2Vae {
             )));
         }
         let (device, cuda_bf16_math) = vae_device(device, dtype)?;
-        let text = fs::read_to_string(config_path)
-            .map_err(|e| VaeError::Config(format!("reading {}: {e}", config_path.display())))?;
+        let text = candle_audio::gen_core::__model_input_reader!(
+fs::read_to_string(config_path),
+"crates/audio/candle-audio-yue2/src/vae.rs::load_files_with_dtype::fs::read_to_string@39074",
+ArtifactInput,
+config_path,
+|__model_input_path| fs::read_to_string(__model_input_path)
+)
+        .map_err(|e| VaeError::Config(format!("reading {}: {e}", config_path.display())))?;
         let config = VaeConfig::parse(&text)?;
         if config.release_variant != identity.release_variant {
             return Err(VaeError::Config(format!(
@@ -1426,6 +1447,9 @@ pub(crate) mod tests {
                 .iter()
                 .all(|x| x.is_finite()));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::bf16_cuda_both_vae_variants_decode_full_tiled_and_encode");
     }
 
     struct MockMath {
@@ -1681,6 +1705,7 @@ pub(crate) mod tests {
     /// The native full decode reproduces upstream `YuE2VAE.decode` for both decoders
     /// (mutation: drop the `exp` of Snake α → red; swap output channels → red).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn full_decode_matches_upstream_for_both_decoders() {
         let r = reference();
         for v in [VaeVariant::Standard, VaeVariant::Legacy] {
@@ -1691,6 +1716,9 @@ pub(crate) mod tests {
             println!("{v:?}: native vs upstream full decode max|Δ| = {err:e}");
             assert!(err < TINY_TOL, "{v:?}: {err}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::full_decode_matches_upstream_for_both_decoders");
     }
 
     /// Tiled decode equals the full decode for many (frames, core) shapes, including a final short
@@ -1698,6 +1726,7 @@ pub(crate) mod tests {
     /// decode is refused, and a deliberately under-haloed tiling (bypassing the guard) visibly
     /// differs — so the equality is not vacuous.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiled_decode_matches_full_decode_across_seams() {
         let vae = tiny(VaeVariant::Standard, VaeParts::DecoderOnly);
         let base = latent_bct();
@@ -1754,10 +1783,14 @@ pub(crate) mod tests {
             naive_err > 100.0 * TINY_TOL,
             "zero-halo tiling unexpectedly exact: {naive_err}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::tiled_decode_matches_full_decode_across_seams");
     }
 
     /// Cancellation stops before the next tile and reports progress honestly.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiled_decode_honours_cancellation() {
         let vae = tiny(VaeVariant::Legacy, VaeParts::DecoderOnly);
         let z = latent_bct();
@@ -1784,6 +1817,9 @@ pub(crate) mod tests {
             ),
             "{err}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::tiled_decode_honours_cancellation");
     }
 
     /// Invalid latents are refused like upstream `_latent` (wrong width, empty, non-finite, BF16).
@@ -1808,6 +1844,7 @@ pub(crate) mod tests {
     /// sample for both VAEs (mutation: drop the +1e-4 floor or use plain `log(1+exp)` without the
     /// threshold → red at this tolerance for large |scale|; swap mean/scale halves → red).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn encoder_matches_upstream_posterior_and_sample() {
         let r = reference();
         for v in [VaeVariant::Standard, VaeVariant::Legacy] {
@@ -1833,6 +1870,9 @@ pub(crate) mod tests {
         assert!(dec_only
             .encode(&Tensor::zeros((1, 2, 1919), DType::F32, &Device::Cpu).unwrap())
             .is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::encoder_matches_upstream_posterior_and_sample");
     }
 
     fn meta_frames(name: &str) -> usize {

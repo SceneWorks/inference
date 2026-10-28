@@ -190,6 +190,7 @@ fn run(case: &str, activation: FfnActivation, rope: Rope) -> (f32, f32, f32) {
 }
 
 /// The whole 2-block model, both packings, against the reference's own f32 output.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn small_model_matches_the_reference() {
     for case in ["gen", "edit"] {
@@ -200,9 +201,12 @@ fn small_model_matches_the_reference() {
             "{case} diverged: max_rel {rel}, mean_rel {mean}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED mage_flow_small::small_model_matches_the_reference");
 }
 
 /// One dual-stream block, fed the reference's own post-embedding streams, `temb` and msrope table.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn small_block_matches_the_reference() {
     let w = fixture();
@@ -236,6 +240,8 @@ fn small_block_matches_the_reference() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED mage_flow_small::small_block_matches_the_reference");
 }
 
 /// The msrope table the port builds must equal the one the reference handed to its first block —
@@ -311,6 +317,7 @@ fn the_msrope_table_gate_rejects_both_wrong_conventions() {
 /// **The output-level discrimination battery.** Each row is a real porting mistake, with the
 /// measured effect asserted *in both directions* — a mistake this gate cannot see is written down
 /// as such rather than quietly omitted, so the suite never claims coverage it does not have.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_parity_gate_rejects_real_porting_mistakes() {
     struct Mutation {
@@ -422,4 +429,6 @@ fn the_parity_gate_rejects_real_porting_mistakes() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED mage_flow_small::the_parity_gate_rejects_real_porting_mistakes");
 }

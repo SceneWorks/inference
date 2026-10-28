@@ -71,7 +71,12 @@ fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, 
         .load("sdxl", &spec)
         .expect("load sdxl");
     reset_peak_memory();
-    let out = model.generate(req, &mut |_| {}).expect("generate");
+    let out = (
+        crate::common::record_model_inference_device(),
+        model.generate(req, &mut |_| {}),
+    )
+        .1
+        .expect("generate");
     let peak = get_peak_memory();
     let img = match out {
         GenerationOutput::Images(mut v) => {
@@ -87,7 +92,8 @@ fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, 
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot (SDXL_SNAPSHOT or the HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot (SDXL_SNAPSHOT or the HF cache)"]
 fn sequential_bounds_peak_and_is_byte_identical() {
     let req = probe_request();
 
@@ -130,10 +136,13 @@ fn sequential_bounds_peak_and_is_byte_identical() {
         peak_sequential as f64 / GIB,
         peak_resident as f64 / GIB,
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::sequential_bounds_peak_and_is_byte_identical");
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot (SDXL_SNAPSHOT or the HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot (SDXL_SNAPSHOT or the HF cache)"]
 fn sequential_repeat_job_stays_bounded() {
     // The property that actually lets a small Mac RUN (not just survive once): a second Sequential
     // job must peak the same as the first, i.e. nothing large stayed resident across jobs. If the
@@ -156,4 +165,6 @@ fn sequential_repeat_job_stays_bounded() {
         peak2 as f64 / GIB,
         peak1 as f64 / GIB,
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::sequential_repeat_job_stays_bounded");
 }

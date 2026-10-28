@@ -50,7 +50,7 @@ pub const MODEL_ID: &str = "z_image_control";
 /// `Reference` (an optional img2img init — the fork's `generate_image` accepts both).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        encoder_contract: Some(crate::active_encoder_contract()),
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: Some(accepted_kinds()),
         required_components: &[],

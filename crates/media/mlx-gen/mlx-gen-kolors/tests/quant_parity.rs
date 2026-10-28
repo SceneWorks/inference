@@ -122,6 +122,8 @@ fn kolors_quant_encoder_floor() {
     println!(
         "✓ Q8/Q4 ChatGLM3 conditioning within the documented floor; encoder footprint recorded"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::kolors_quant_encoder_floor");
 }
 
 #[test]
@@ -163,4 +165,6 @@ fn kolors_quant_generate_runs() {
     println!(
         "✓ Q8 + Q4 full Kolors generate completes and renders coherently; peak memory recorded"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::kolors_quant_generate_runs");
 }

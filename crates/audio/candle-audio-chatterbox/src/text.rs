@@ -93,6 +93,12 @@ impl EnTokenizer {
                 "chatterbox: tokenizer.json missing [START]/[STOP] special tokens".into(),
             ));
         }
+        #[cfg(feature = "model-inference-proof")]
+        candle_audio::gen_core::model_input_proof::record_reader_paths(
+            "candle-audio-chatterbox::text::EnTokenizer::from_file/tokenizer",
+            candle_audio::gen_core::model_input_proof::InputRole::Tokenizer,
+            &[path],
+        );
         Ok(Self {
             tokenizer,
             start_text_token,

@@ -121,4 +121,6 @@ fn profile_footprint() {
         .save(&out_path)
         .unwrap();
     println!("[{label}] wrote {}", out_path.display());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memprofile::profile_footprint");
 }

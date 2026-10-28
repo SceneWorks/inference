@@ -10,6 +10,8 @@ use regex::Regex;
 
 use mlx_gen::{Error, Result};
 
+mod host_preflight;
+
 /// The vendored CLIP word-splitting pattern (`Tokenizer.pat`), case-insensitive. Order matters:
 /// the two special tokens, then apostrophe contractions, then letter runs, a single digit, and a
 /// run of "other" (non-space, non-letter, non-digit) characters.
@@ -72,13 +74,43 @@ impl ClipBpeTokenizer {
 
     /// Load from explicit `vocab.json` + `merges.txt` paths.
     pub fn from_files(vocab_path: impl AsRef<Path>, merges_path: impl AsRef<Path>) -> Result<Self> {
-        let vocab_raw = std::fs::read_to_string(vocab_path.as_ref())
-            .map_err(|e| Error::Msg(format!("sdxl tokenizer: read vocab.json: {e}")))?;
+        Self::from_readers(
+            || {
+                mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(vocab_path.as_ref()),
+"crates/media/mlx-gen/mlx-gen-sdxl/src/tokenizer.rs::from_files::std::fs::read_to_string@3322",
+ArtifactInput,
+vocab_path.as_ref(),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+                .map_err(|e| Error::Msg(format!("sdxl tokenizer: read vocab.json: {e}")))
+            },
+            || {
+                mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(merges_path.as_ref()),
+"crates/media/mlx-gen/mlx-gen-sdxl/src/tokenizer.rs::from_files::std::fs::read_to_string@3509",
+ArtifactInput,
+merges_path.as_ref(),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+                .map_err(|e| Error::Msg(format!("sdxl tokenizer: read merges.txt: {e}")))
+            },
+            || Ok(()),
+        )
+    }
+
+    // Readers are FnOnce and invoked lazily in the original constructor order. In particular,
+    // malformed vocab cannot trigger the future merges read. BOS/EOS still precede Regex::new.
+    fn from_readers(
+        read_vocab: impl FnOnce() -> Result<String>,
+        read_merges: impl FnOnce() -> Result<String>,
+        before_regex: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
+        let vocab_raw = read_vocab()?;
         let vocab: HashMap<String, i32> = serde_json::from_str(&vocab_raw)
             .map_err(|e| Error::Msg(format!("sdxl tokenizer: parse vocab.json: {e}")))?;
 
-        let merges_raw = std::fs::read_to_string(merges_path.as_ref())
-            .map_err(|e| Error::Msg(format!("sdxl tokenizer: read merges.txt: {e}")))?;
+        let merges_raw = read_merges()?;
         // `f.read().strip().split("\n")[1 : MERGES_END]` — drop the header line, cap the count.
         let lines: Vec<&str> = merges_raw.trim().split('\n').collect();
         let end = MERGES_END.min(lines.len());
@@ -97,6 +129,7 @@ impl ClipBpeTokenizer {
             .get("<|endoftext|>")
             .ok_or_else(|| Error::Msg("sdxl tokenizer: vocab lacks <|endoftext|>".into()))?;
 
+        before_regex()?;
         let pat = Regex::new(CLIP_PATTERN)
             .map_err(|e| Error::Msg(format!("sdxl tokenizer: bad pattern: {e}")))?;
 
@@ -441,5 +474,351 @@ mod tests {
         let neg_w1 = &w1[MAX_LENGTH..];
         assert_eq!(neg_w1[..2], [49406, 49407], "empty filler window");
         assert!(neg_w1[2..].iter().all(|&t| t == PAD_ID));
+    }
+}
+
+/// Pure-host pre-key count with existing retained asset tokens. The source certificate is checked
+/// before numerical guards or reads: an unclosed term is an explicit error, never zero/NoEvidence.
+/// Both facts must pass the source-bound checked generator before any guarded read.
+pub(crate) fn count_pinned_with_source_capacity(
+    vocab: Option<&mlx_gen::gen_core::PinnedWeightsFile>,
+    merges: Option<&mlx_gen::gen_core::PinnedWeightsFile>,
+    prompt: &str,
+    negative: Option<&str>,
+    next: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<u32> {
+    let regex = host_preflight::reviewed_regex_source_facts()?;
+    count_pinned_using_facts(vocab, merges, prompt, negative, next, &regex)
+}
+
+fn count_pinned_using_facts(
+    vocab: Option<&mlx_gen::gen_core::PinnedWeightsFile>,
+    merges: Option<&mlx_gen::gen_core::PinnedWeightsFile>,
+    prompt: &str,
+    negative: Option<&str>,
+    next: &mut dyn FnMut(u64) -> Result<()>,
+    regex: &host_preflight::RegexSourceFacts,
+) -> Result<u32> {
+    count_pinned_using_reader(
+        vocab,
+        merges,
+        prompt,
+        negative,
+        next,
+        regex,
+        host_preflight::read_pinned_utf8,
+    )
+}
+
+type PinnedReader = fn(
+    &mlx_gen::gen_core::PinnedWeightsFile,
+    &str,
+    &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<String>;
+
+fn count_pinned_using_reader(
+    vocab: Option<&mlx_gen::gen_core::PinnedWeightsFile>,
+    merges: Option<&mlx_gen::gen_core::PinnedWeightsFile>,
+    prompt: &str,
+    negative: Option<&str>,
+    next: &mut dyn FnMut(u64) -> Result<()>,
+    regex: &host_preflight::RegexSourceFacts,
+    read_pin: PinnedReader,
+) -> Result<u32> {
+    // Stack-only shared access to one sequential callback; no cache/global/framework is created.
+    let next = std::cell::RefCell::new(next);
+    let tokenizer = ClipBpeTokenizer::from_readers(
+        || {
+            let pin = vocab.ok_or_else(|| host_preflight::missing_member("vocab.json"))?;
+            (**next.borrow_mut())(host_preflight::vocab_new_upper(
+                pin.target_fingerprint().size,
+            )?)?;
+            read_pin(pin, "vocab.json", &mut **next.borrow_mut())
+        },
+        || {
+            let pin = merges.ok_or_else(|| host_preflight::missing_member("merges.txt"))?;
+            (**next.borrow_mut())(host_preflight::merges_new_upper(
+                pin.target_fingerprint().size,
+            )?)?;
+            read_pin(pin, "merges.txt", &mut **next.borrow_mut())
+        },
+        || (**next.borrow_mut())(regex.constructor()?),
+    )?;
+    // Current snapshot contains retained tokenizer/vocab/regex. Only NEW row/BPE/cache requests
+    // are checked here, not those retained objects again. Empty ChunkPlan probe is included.
+    (**next.borrow_mut())(host_preflight::prompt_new_upper(prompt, negative, regex)?)?;
+    let mut rows = vec![tokenizer.tokenize(prompt)?];
+    if let Some(negative) = negative {
+        rows.push(tokenizer.tokenize(negative)?);
+    }
+    let plan = crate::long_prompt::ChunkPlan::from_tokenizer(&tokenizer)?;
+    u32::try_from(crate::long_prompt::common_chunks(&plan, &rows))
+        .map_err(|_| Error::Msg("sdxl: CLIP window count overflows u32".into()))
+}
+
+#[cfg(test)]
+mod pre_key_reader_order_tests {
+    use super::*;
+    use std::cell::Cell;
+    #[test]
+    fn lazy_readers_preserve_vocab_parse_merges_bos_regex_error_order_host() {
+        let merges = Cell::new(false);
+        let regex = Cell::new(false);
+        let failed = ClipBpeTokenizer::from_readers(
+            || Ok("{".into()),
+            || {
+                merges.set(true);
+                Err(Error::Msg("future merges read".into()))
+            },
+            || {
+                regex.set(true);
+                Ok(())
+            },
+        );
+        assert!(failed
+            .err()
+            .expect("malformed vocab")
+            .to_string()
+            .contains("parse vocab.json"));
+        assert!(!merges.get());
+        assert!(!regex.get());
+        let failed = ClipBpeTokenizer::from_readers(
+            || Ok("{}".into()),
+            || {
+                merges.set(true);
+                Ok("#version\n".into())
+            },
+            || {
+                regex.set(true);
+                Ok(())
+            },
+        );
+        assert!(failed
+            .err()
+            .expect("missing BOS")
+            .to_string()
+            .contains("vocab lacks <|startoftext|>"));
+        assert!(merges.get());
+        assert!(!regex.get());
+    }
+}
+
+#[cfg(test)]
+mod pre_key_guarded_count_tests {
+    use super::*;
+    use mlx_gen::gen_core::{LoadSpec, SourceInventory, WeightsSource};
+
+    fn source_fixture(vocab: &str) -> (tempfile::TempDir, SourceInventory) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("vocab.json"), vocab).unwrap();
+        std::fs::write(root.path().join("merges.txt"), "#version\n").unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        let source = SourceInventory::capture(&spec).unwrap();
+        (root, source)
+    }
+
+    const VOCAB: &str = r#"{"<|startoftext|>":49406,"<|endoftext|>":49407,"a</w>":1}"#;
+
+    #[test]
+    fn ordinary_readers_keep_all_constructor_error_boundaries() {
+        use std::cell::Cell;
+        let merges = Cell::new(false);
+        let regex = Cell::new(false);
+        let failed = ClipBpeTokenizer::from_readers(
+            || Err(Error::Msg("vocab read refusal".into())),
+            || {
+                merges.set(true);
+                Ok("#version\n".into())
+            },
+            || {
+                regex.set(true);
+                Ok(())
+            },
+        );
+        assert!(failed
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("vocab read refusal"));
+        assert!(!merges.get() && !regex.get());
+        let failed = ClipBpeTokenizer::from_readers(
+            || Ok(VOCAB.into()),
+            || {
+                merges.set(true);
+                Err(Error::Msg("merges read refusal".into()))
+            },
+            || {
+                regex.set(true);
+                Ok(())
+            },
+        );
+        assert!(failed
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("merges read refusal"));
+        assert!(merges.get() && !regex.get());
+        let failed = ClipBpeTokenizer::from_readers(
+            || Ok(r#"{"<|startoftext|>":49406}"#.into()),
+            || Ok("#version\n".into()),
+            || {
+                regex.set(true);
+                Ok(())
+            },
+        );
+        assert!(failed
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("vocab lacks <|endoftext|>"));
+        assert!(!regex.get());
+        let failed = ClipBpeTokenizer::from_readers(
+            || Ok(VOCAB.into()),
+            || Ok("#version\n".into()),
+            || Err(Error::Msg("constructor capacity refusal".into())),
+        );
+        assert!(failed
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("constructor capacity refusal"));
+    }
+
+    // The hashbrown allocation law is explicitly target-bound. These tests use
+    // finite arithmetic/native-reader fixtures, NOT guarded filesystem/regex activation.
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    #[test]
+    fn every_requested_phase_can_refuse_before_the_next_phase() {
+        let (root, source) = source_fixture(VOCAB);
+        let vocab = source.member_pin(&root.path().join("vocab.json")).unwrap();
+        let merges = source.member_pin(&root.path().join("merges.txt")).unwrap();
+        for stop_at in 0..4 {
+            let mut requests = Vec::new();
+            let mut next = |bytes| {
+                requests.push(bytes);
+                if requests.len() == stop_at + 1 {
+                    Err(Error::Msg(format!("phase {stop_at} refused")))
+                } else {
+                    Ok(())
+                }
+            };
+            let result = count_pinned_using_reader(
+                vocab,
+                merges,
+                "a",
+                Some("a"),
+                &mut next,
+                &host_preflight::finite_test_fixture(),
+                host_preflight::native_pin_reader_test_fixture,
+            );
+            assert!(result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(&format!("phase {stop_at} refused")));
+            assert_eq!(requests.len(), stop_at + 1);
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    #[test]
+    fn malformed_vocab_does_not_request_merges_and_bos_eos_precede_regex() {
+        for (vocab_json, expected, expected_phases) in [
+            ("{", "parse vocab.json", 1),
+            ("{}", "vocab lacks <|startoftext|>", 2),
+            (
+                r#"{"<|startoftext|>":49406}"#,
+                "vocab lacks <|endoftext|>",
+                2,
+            ),
+        ] {
+            let (root, source) = source_fixture(vocab_json);
+            let vocab = source.member_pin(&root.path().join("vocab.json")).unwrap();
+            let merges = source.member_pin(&root.path().join("merges.txt")).unwrap();
+            let mut requests = Vec::new();
+            let mut next = |bytes| {
+                requests.push(bytes);
+                Ok(())
+            };
+            let result = count_pinned_using_reader(
+                vocab,
+                merges,
+                "a",
+                None,
+                &mut next,
+                &host_preflight::finite_test_fixture(),
+                host_preflight::native_pin_reader_test_fixture,
+            );
+            assert!(result.err().unwrap().to_string().contains(expected));
+            assert_eq!(requests.len(), expected_phases);
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    #[test]
+    fn guarded_windows_match_both_shared_clip_rows_and_real_empty_probe() {
+        let (root, source) = source_fixture(VOCAB);
+        let vocab = source.member_pin(&root.path().join("vocab.json")).unwrap();
+        let merges = source.member_pin(&root.path().join("merges.txt")).unwrap();
+        let long = std::iter::repeat_n("a", 151).collect::<Vec<_>>().join(" ");
+        for (positive, negative) in [
+            ("", None),
+            ("a", Some("")),
+            ("a", Some(long.as_str())),
+            (long.as_str(), None),
+            (long.as_str(), Some("a")),
+        ] {
+            let tokenizer = ClipBpeTokenizer::from_dir(root.path()).unwrap();
+            let mut rows = vec![tokenizer.tokenize(positive).unwrap()];
+            if let Some(negative) = negative {
+                rows.push(tokenizer.tokenize(negative).unwrap());
+            }
+            let plan = crate::long_prompt::ChunkPlan::from_tokenizer(&tokenizer).unwrap();
+            let expected = crate::long_prompt::common_chunks(&plan, &rows) as u32;
+            let mut requests = Vec::new();
+            let mut next = |bytes| {
+                requests.push(bytes);
+                Ok(())
+            };
+            let actual = count_pinned_using_reader(
+                vocab,
+                merges,
+                positive,
+                negative,
+                &mut next,
+                &host_preflight::finite_test_fixture(),
+                host_preflight::native_pin_reader_test_fixture,
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                requests.len(),
+                4,
+                "vocab, merges, constructor, all serial rows/probe"
+            );
+            assert_eq!(requests[2], 64, "labeled constructor fixture");
+            assert!(
+                requests[3] >= 128,
+                "includes labeled search high-water fixture"
+            );
+            if positive == long.as_str() || negative == Some(long.as_str()) {
+                assert_eq!(
+                    actual, 3,
+                    "no prompt truncation; max over both actual CFG rows"
+                );
+            }
+        }
     }
 }

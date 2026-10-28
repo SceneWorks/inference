@@ -1,7 +1,7 @@
 //! The memory-strategy contract of the three Iris inference tasks on their **loaded** models
 //! (sc-25690), on the committed miniature resources: each loaded model publishes exactly the
-//! contract its registration builds for the same spec, and the one optimized rung the family
-//! implements — generation's staged residency — is executed end to end through the shared
+//! contract its registration builds for the same spec, and generation's staged residency plus
+//! bounded-attention selection execute end to end through the shared
 //! request-scope seam, not merely declared.
 
 use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
@@ -71,10 +71,14 @@ fn render(generator: &dyn mlx_gen::Generator, req: &GenerationRequest) -> (Vec<S
 /// default) instead of `run_request_scoped(stage_residency_for(..))` — the staged request then
 /// loads nothing and reports only its steps.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image() {
     cpu_process(
         "memory_contract::a_staged_selection_stages_a_warm_generator_and_renders_the_same_image",
-        a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body,
+        || {
+            a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_contract::a_staged_selection_stages_a_warm_generator_and_renders_the_same_image");
+        },
     );
 }
 
@@ -136,6 +140,32 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
     );
     assert_eq!(staged_pixels, warm, "staging must not change the render");
 
+    // The same admitted request can compose staging with bounded attention. At miniature size
+    // the published budget is in-budget, so this also pins the unchanged single-call fast path.
+    context.selection = contract
+        .representative_selection(
+            MemoryStrategy::BoundedAttention,
+            context.selection.tier,
+            false,
+        )
+        .unwrap();
+    context.selection.parameters.stage_residency = Some(true);
+    let mut bounded = request();
+    let mut scope = generator
+        .begin_memory_strategy_request(&context)
+        .unwrap()
+        .unwrap();
+    scope.configure_request(&mut bounded).unwrap();
+    assert!(bounded
+        .memory
+        .is_some_and(|m| m.stage_residency && m.chunk_attention));
+    generator.validate(&bounded).unwrap();
+    let (bounded_events, bounded_pixels) = render(generator.as_ref(), &bounded);
+    scope.finish(MemoryRunOutcome::Complete).unwrap();
+    drop(scope);
+    assert_eq!(bounded_events, staged_events);
+    assert_eq!(bounded_pixels, warm);
+
     // The staged request evicted the warm pair; the next unstaged request rebuilds it.
     let (rebuild_events, rebuilt) = render(generator.as_ref(), &request());
     assert_eq!(&rebuild_events[..2], &STAGED_LOADS);
@@ -154,6 +184,7 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
         },
         GenerationMemory {
             chunk_attention: true,
+            attention_chunk_size: Some(17),
             ..Default::default()
         },
         GenerationMemory {
@@ -165,7 +196,11 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
         unhonoured.memory = Some(memory);
         match generator.validate(&unhonoured) {
             Err(gen_core::Error::Unsupported(message)) => {
-                assert!(message.contains("GenerationMemory::"), "{message}")
+                assert!(
+                    message.contains("GenerationMemory::")
+                        || message.contains("attention_chunk_size"),
+                    "{message}"
+                )
             }
             other => panic!("expected a typed refusal, got {other:?}"),
         }
@@ -183,12 +218,13 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
 
 /// The encoder-free tasks publish their loaded contract too: the resident baseline, priced from
 /// the export on disk, identical to what the registration builds for the same spec, with the
-/// registered safety check bound to the precision the model computes in. A deferred load shape —
-/// which no Iris loader has — is refused at load on all three routes.
+/// registered safety check bound to the precision the model computes in. A deferred load shape
+/// (rung 4, epic 16774) loads on all three routes and publishes the registration's deferred
+/// contract, bounded transformer residency implemented.
 ///
 /// *Mutations that red this:* a loader pricing at a precision other than its spec's (the restorer
 /// pricing bf16 for an FP32 load); a loaded safety check that ignores the model's precision; a
-/// loader that accepts a deferred spec.
+/// deferred loader publishing the eager contract.
 #[test]
 fn the_encoder_free_tasks_publish_their_registered_contract_when_loaded() {
     cpu_process(
@@ -324,31 +360,38 @@ fn the_encoder_free_tasks_publish_their_registered_contract_when_loaded_body() {
         }
     }
 
-    // No loader has a deferred-materialization load shape: each refuses one by name.
+    // Every loader takes a deferred-materialization load shape (rung 4) and publishes the
+    // registration's deferred contract, with bounded transformer residency implemented.
     let deferred = gen_core::LoadShape::DeferredMaterialization;
-    let refusal = |error: String| assert!(error.contains("load_shape"), "{error}");
+    let rung4 = |contract: &gen_core::MemoryProviderContract| {
+        gen_core_testkit::memory_strategy_conformance(contract);
+        assert_eq!(contract.load_shape, deferred);
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Implemented
+        );
+    };
     let spec = LoadSpec::new(WeightsSource::Dir(depth_dir)).with_load_shape(deferred);
-    match mlx_gen_iris::depth::load_depth(&spec) {
-        Err(mlx_gen::Error::Unsupported(message)) => refusal(message),
-        other => panic!("depth: expected a typed refusal, got {:?}", other.err()),
-    }
+    let depth = mlx_gen_iris::depth::load_depth(&spec).unwrap();
+    assert_eq!(
+        *depth.memory_strategy_contract(),
+        (DEPTH_MEMORY_REGISTRATION.contract)(&spec).unwrap()
+    );
+    rung4(depth.memory_strategy_contract());
     let spec = LoadSpec::new(WeightsSource::Dir(restore_dir)).with_load_shape(deferred);
-    match mlx_gen_iris::IrisRestorer::load(&spec) {
-        Err(mlx_gen::Error::Unsupported(message)) => refusal(message),
-        other => panic!(
-            "restoration: expected a typed refusal, got {:?}",
-            other.err()
-        ),
-    }
+    let restorer = mlx_gen_iris::IrisRestorer::load(&spec).unwrap();
+    assert_eq!(
+        *restorer.memory_strategy_contract(),
+        (RESTORE_MEMORY_REGISTRATION.contract)(&spec).unwrap()
+    );
+    rung4(restorer.memory_strategy_contract());
     let spec = generation_spec(OffloadPolicy::Resident).with_load_shape(deferred);
-    match mlx_gen_iris::provider_registry()
+    let generator = mlx_gen_iris::provider_registry()
         .unwrap()
         .load("iris_3b", &spec)
-    {
-        Err(gen_core::Error::Unsupported(message)) => refusal(message),
-        other => panic!(
-            "generation: expected a typed refusal, got {:?}",
-            other.err()
-        ),
-    }
+        .unwrap();
+    rung4(generator.memory_strategy_contract().unwrap());
 }

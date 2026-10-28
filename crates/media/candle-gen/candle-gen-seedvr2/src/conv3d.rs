@@ -218,7 +218,7 @@ impl CausalConv3d {
             .reshape((b, t_out, o, hp, wp))?
             .permute((0, 2, 1, 3, 4))?
             .contiguous()?;
-        y.broadcast_add(&self.bias)
+        __model_proof_output!(y.broadcast_add(&self.bias))
     }
 }
 
@@ -253,6 +253,7 @@ mod tests {
 
     /// A 3×3×3 causal conv (stride 1, spatial pad 1) preserves T,H,W (causal repeat = 2 frames).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn k333_preserves_dims() -> Result<()> {
         let dev = Device::Cpu;
         let (o, i) = (4usize, 3usize);
@@ -267,12 +268,15 @@ mod tests {
         let x = Tensor::randn(0f32, 1.0, (1, i, 5, 8, 8), &dev)?;
         let y = c.forward(&x)?;
         assert_eq!(y.dims(), &[1, o, 5, 8, 8]);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conv3d::tests::k333_preserves_dims");
         Ok(())
     }
 
     /// A temporal-stride-2 downsample conv (3×3×3, causal pad 2) halves T (ceil) — the encoder
     /// temporal down block.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn temporal_stride2_halves_t() -> Result<()> {
         let dev = Device::Cpu;
         let (o, i) = (2usize, 2usize);
@@ -288,6 +292,8 @@ mod tests {
         let x = Tensor::randn(0f32, 1.0, (1, i, 9, 4, 4), &dev)?;
         let y = c.forward(&x)?; // T_out = (9+2-3)/2 + 1 = 5
         assert_eq!(y.dims(), &[1, o, 5, 4, 4]);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conv3d::tests::temporal_stride2_halves_t");
         Ok(())
     }
 
@@ -296,10 +302,15 @@ mod tests {
     /// **T>1, distinct-frame** input — the case the image (T=1) path never exercised. Covers temporal
     /// stride 1 (resnet/conv_in convs) AND stride 2 (the encoder temporal downsamplers).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn matches_bruteforce_conv3d_t_gt_1() -> Result<()> {
         for st in [1usize, 2usize] {
             bruteforce_conv3d_case(st)?;
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED conv3d::tests::matches_bruteforce_conv3d_t_gt_1"
+        );
         Ok(())
     }
 
@@ -407,6 +418,7 @@ mod tests {
 
     /// A 1×1×1 conv is pointwise and preserves all dims (the resnet shortcut / upscale conv).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn k111_pointwise() -> Result<()> {
         let dev = Device::Cpu;
         let (o, i) = (5usize, 3usize);
@@ -421,6 +433,8 @@ mod tests {
         let x = Tensor::randn(0f32, 1.0, (1, i, 6, 3, 3), &dev)?;
         let y = c.forward(&x)?;
         assert_eq!(y.dims(), &[1, o, 6, 3, 3]);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conv3d::tests::k111_pointwise");
         Ok(())
     }
 }

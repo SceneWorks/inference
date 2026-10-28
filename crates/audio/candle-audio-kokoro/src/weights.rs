@@ -167,6 +167,12 @@ impl VoicePack {
                 path.display()
             )));
         }
+        #[cfg(feature = "model-inference-proof")]
+        candle_audio::gen_core::model_input_proof::record_reader_paths(
+            "candle-audio-kokoro::weights::VoicePack::from_file",
+            candle_audio::gen_core::model_input_proof::InputRole::TensorInput,
+            &[path],
+        );
         Ok(Self {
             rows: data.len() / Self::STYLE_WIDTH,
             dim: Self::STYLE_WIDTH,

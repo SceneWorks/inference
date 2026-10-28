@@ -202,7 +202,13 @@ impl NeoChatConfig {
     /// Read and parse `<root>/config.json`.
     pub fn from_dir(root: impl AsRef<Path>) -> Result<Self> {
         let path = root.as_ref().join("config.json");
-        let text = std::fs::read_to_string(&path)
+        let text = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/candle-gen/candle-gen-sensenova/src/config.rs::from_dir::std::fs::read_to_string@9987",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
             .map_err(|e| CandleError::Msg(format!("sensenova: reading {}: {e}", path.display())))?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| CandleError::Msg(format!("sensenova: parsing {}: {e}", path.display())))?;

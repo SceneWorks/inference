@@ -30,6 +30,15 @@
 //! registration. Inference adapters — LoRA / LoKr / LoHa, the lightx2v lightning diff-patch, and the
 //! Bias-Aware DPO refinement LoRA — fold into the dense DiT via [`adapters::merge_adapters`] (sc-6838).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 mod common;
 
 pub mod adapters;

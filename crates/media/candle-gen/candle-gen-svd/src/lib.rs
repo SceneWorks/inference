@@ -20,6 +20,15 @@
 //! The experimental fp16/bf16 paths are reachable only via the `SVD_FORCE_F16` / `SVD_FORCE_BF16` env
 //! vars (the sc-5493 GPU follow-up). `backend = "candle"`, `mac_only = false`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod config;
 pub mod conv3d;
 pub mod embeddings;

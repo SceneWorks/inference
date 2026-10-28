@@ -28,10 +28,12 @@ impl DynamicTanh {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.broadcast_mul(&self.alpha)?
-            .tanh()?
-            .broadcast_mul(&self.gamma)?
-            .broadcast_add(&self.beta)
+        __model_proof_output!(__model_proof_output!(__model_proof_output!(
+            x.broadcast_mul(&self.alpha)
+        )?
+        .tanh()?
+        .broadcast_mul(&self.gamma))?
+        .broadcast_add(&self.beta))
     }
 }
 
@@ -276,7 +278,7 @@ impl FeedForward {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let projected = self.input.forward(x)?;
+        let projected = __model_proof_output!(self.input.forward(x))?;
         let hidden = if self.glu {
             let values = projected.narrow(D::Minus1, 0, self.inner_dim)?;
             let gate = projected.narrow(D::Minus1, self.inner_dim, self.inner_dim)?;
@@ -284,7 +286,7 @@ impl FeedForward {
         } else {
             self.activate(&projected)?
         };
-        self.output.forward(&hidden)
+        __model_proof_output!(self.output.forward(&hidden))
     }
 }
 
@@ -300,7 +302,7 @@ impl LayerScale {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.broadcast_mul(&self.scale)
+        __model_proof_output!(x.broadcast_mul(&self.scale))
     }
 }
 
@@ -632,7 +634,7 @@ impl Attention {
             out =
                 combine_differential(&out, &self.attend(qd, kd, &v, padding_mask, additive_mask)?)?;
         }
-        self.to_out.forward(&from_heads(&out)?)
+        __model_proof_output!(self.to_out.forward(&from_heads(&out)?))
     }
 
     /// Execute one bounded query tile of self-attention against its key/value halo.
@@ -723,7 +725,7 @@ impl Attention {
         if let (Some(qd), Some(kd)) = (&q_diff, &k_diff) {
             out = combine_differential(&out, &self.attend(qd, kd, &v, None, Some(&mask))?)?;
         }
-        self.to_out.forward(&from_heads(&out)?)
+        __model_proof_output!(self.to_out.forward(&from_heads(&out)?))
     }
 }
 
@@ -785,9 +787,9 @@ impl LocalConditioning {
     }
 
     pub fn forward(&self, input: &Tensor, target_len: usize) -> Result<Tensor> {
-        let mut x = self
-            .second
-            .forward(&candle_nn::ops::silu(&self.first.forward(input)?)?)?;
+        let mut x = __model_proof_output!(self.second.forward(&candle_nn::ops::silu(
+            &__model_proof_output!(self.first.forward(input))?
+        )?))?;
         let len = x.dim(1)?;
         if len < target_len {
             let (batch, _, dim) = x.dims3()?;
@@ -1198,6 +1200,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiled_band_matches_dense_mask_for_ordinary_and_differential_attention() {
         let device = Device::Cpu;
         let batch = 2;
@@ -1268,6 +1271,9 @@ mod tests {
                 "differential={differential}: dense/band max abs {error}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::tiled_band_matches_dense_mask_for_ordinary_and_differential_attention");
     }
 
     #[test]
@@ -1340,6 +1346,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn corrected_dyt_differential_and_gate_equations_are_exact() {
         let dev = Device::Cpu;
         let dyt = DynamicTanh::from_tensors(
@@ -1374,9 +1381,13 @@ mod tests {
             .unwrap()[0];
         assert!((gate - 0.731_058_6).abs() < 1e-6);
         assert!((gate - 0.5).abs() > 0.2);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::corrected_dyt_differential_and_gate_equations_are_exact");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn varmap_initialization_honors_zero_branches_and_layer_scale_override() {
         let dev = Device::Cpu;
         let input = Tensor::ones((1, 3, 4), DType::F32, &dev).unwrap();
@@ -1575,5 +1586,8 @@ mod tests {
                 "{key} must use upstream's random initialization"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::varmap_initialization_honors_zero_branches_and_layer_scale_override");
     }
 }

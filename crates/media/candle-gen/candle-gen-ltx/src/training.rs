@@ -3373,8 +3373,14 @@ impl FlowMatchTrainer for LtxTrainer {
                     &GemmaConfig::gemma_3_12b(),
                     &ConnectorConfig::ltx_2_3(),
                 )?;
-                let tokenizer = tokenizers::Tokenizer::from_file(paths.tokenizer_path())
-                    .map_err(|e| CandleError::Msg(format!("{LABEL}: load tokenizer: {e}")))?;
+                let tokenizer = candle_gen::gen_core::__model_input_reader!(
+                    tokenizers::Tokenizer::from_file(paths.tokenizer_path()),
+                    "candle-gen-ltx::training::LtxTrainer::cache/ltx23-tokenizer",
+                    Tokenizer,
+                    paths.tokenizer_path(),
+                    |actual_path| tokenizers::Tokenizer::from_file(actual_path)
+                )
+                .map_err(|e| CandleError::Msg(format!("{LABEL}: load tokenizer: {e}")))?;
                 let vae = LtxVideoVae::new_with_encoder(
                     paths.vae_vb(DType::F32, device)?.pp("vae"),
                     paths.vae_encoder_vb(DType::F32, device)?.pp("vae"),
@@ -4177,6 +4183,7 @@ mod tests {
     /// checkpointed); a half map is strictly between and matches across paths. The weight is the
     /// production `[1, 1, F, h, w]` grid flattened by `flatten_latent`, as the cache builds it.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_both_ltx23_backward_paths() {
         use candle_gen::candle_nn::VarBuilder;
         use candle_gen::train::lora::build_lora_targets;
@@ -4236,6 +4243,9 @@ mod tests {
             "dense {dense} vs checkpoint {ckpt}"
         );
         assert!(trainer_descriptor().techniques.subject_mask_loss);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_ltx23_backward_paths");
     }
 
     /// sc-24828: the flattened weight lines up with `flatten_latent`'s token order: token
@@ -5144,6 +5154,7 @@ mod depth_anchoring_tests {
     /// total == the weighted depth term, a nonzero finite gradient on the zero-init LoRA-B factors —
     /// and step 1 carries no depth term. Mutation: compute the diffusion term unconditionally ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let f = fixture();
         for ckpt in [false, true] {
@@ -5180,12 +5191,16 @@ mod depth_anchoring_tests {
                 .sum();
             assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B grad {gb}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths");
     }
 
     /// AC (c): depth off ⇒ bit-identical to the legacy LTX-2.3 step (its body reproduced here), and
     /// a diffusion-only planned step equals it too. Mutation: scale the diffusion loss (×1.0001) ⇒
     /// red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_off_is_bit_identical_to_the_legacy_step() {
         assert!(
             load_perceptual_path(&TrainingConfig::default(), &Device::Cpu)
@@ -5225,6 +5240,9 @@ mod depth_anchoring_tests {
             grad_bits(&g_on, &f.set.vars),
             grad_bits(&g_off, &f.set.vars)
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// The flattened `(1, S, C)` cache latent unflattens to the decoder's NCHW and round-trips
@@ -5545,6 +5563,7 @@ mod ltx25_depth_anchoring_tests {
     /// unconditionally ⇒ red; build the video velocity objective without the `diffusion_on` gate
     /// (built, not added) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_step_trains_the_lora_through_the_video_stream_only() {
         for with_audio in [true, false] {
             let f = fixture(with_audio);
@@ -5595,12 +5614,16 @@ mod ltx25_depth_anchoring_tests {
                 "audio={with_audio}: LoRA-B grad {gb}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::ltx25_depth_anchoring_tests::depth_step_trains_the_lora_through_the_video_stream_only");
     }
 
     /// AC (c): depth off ⇒ bit-identical to the pre-epic-2123 AV step (its all-generated body
     /// reproduced here: flow-match inputs, σ on every token, the two masked MSEs averaged), and a
     /// diffusion-only planned step equals it too. Mutation: scale the averaged loss (×1.0001) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_off_is_bit_identical_to_the_legacy_av_step() {
         let f = fixture(true);
         for (i, v) in f.set.vars.iter().enumerate() {
@@ -5657,6 +5680,9 @@ mod ltx25_depth_anchoring_tests {
             grad_bits(&g_on, &f.set.vars),
             grad_bits(&g_off, &f.set.vars)
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::ltx25_depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_av_step");
     }
 
     /// The depth frames skip conditioning frames and pick evenly spaced generated frames;
@@ -5716,6 +5742,7 @@ mod ltx25_depth_anchoring_tests {
     /// Mutations: decode every row as an independent `T = 1` frame ⇒ red; drop the lone-frame-0
     /// branch (treat the batch as pairs only) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_decoder_decodes_each_frame_with_its_predecessor() {
         let dec = Ltx25DepthDecoder(tiny_decoder());
         let dev = Device::Cpu;
@@ -5772,6 +5799,9 @@ mod ltx25_depth_anchoring_tests {
                 .unwrap();
             assert!(m > 0.0 && m.is_finite(), "row {row}: {m}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::ltx25_depth_anchoring_tests::depth_decoder_decodes_each_frame_with_its_predecessor");
     }
 
     /// AC (d), E7: the LTX-2.5 depth footprint grows with the decoded frames and the Large DA2,

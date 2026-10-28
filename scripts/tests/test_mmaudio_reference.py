@@ -40,23 +40,25 @@ def _minimum_midpoint_margin(nudge: float) -> float:
         (int(ref.DURATION * ref.CLIP_FPS), ref.CLIP_FPS, ref.CLIP_SIZE),
         (int(ref.DURATION * ref.SYNC_FPS), ref.SYNC_FPS, ref.SYNC_SIZE),
     ):
-        t = (np.arange(count, dtype=np.float64) / fps)[:, None, None]
         axis = (np.arange(size, dtype=np.float64) + 0.5) / size
         u, v = axis[None, None, :], axis[None, :, None]
         tau = 2.0 * np.pi
-        channels = (
-            0.5 + 0.5 * np.sin(tau * (u + 0.25 * t)),
-            0.5 + 0.5 * np.sin(tau * (v - 0.15 * t) + tau / 3.0),
-            0.5 + 0.5 * np.sin(tau * (0.5 * (u + v) + 0.35 * t) + 2.0 * tau / 3.0),
-        )
-        stacked = np.stack(
-            [np.broadcast_to(c, (count, size, size)) for c in channels], axis=-1
-        )
-        bar = np.mod(0.12 * t, 1.0)
-        on = (np.abs(u - bar) < 0.02)[..., None]
-        stacked = np.where(on, np.minimum(stacked + 0.6, 1.0), stacked)
-        scaled = stacked * 255.0 + nudge
-        worst = min(worst, float(np.abs(scaled - np.floor(scaled) - 0.5).min()))
+        # Frames are independent: reduce every coordinate without full-video float64 arrays.
+        for frame in range(count):
+            t = (np.arange(frame, frame + 1, dtype=np.float64) / fps)[:, None, None]
+            channels = (
+                0.5 + 0.5 * np.sin(tau * (u + 0.25 * t)),
+                0.5 + 0.5 * np.sin(tau * (v - 0.15 * t) + tau / 3.0),
+                0.5 + 0.5 * np.sin(tau * (0.5 * (u + v) + 0.35 * t) + 2.0 * tau / 3.0),
+            )
+            stacked = np.stack(
+                [np.broadcast_to(c, (1, size, size)) for c in channels], axis=-1
+            )
+            bar = np.mod(0.12 * t, 1.0)
+            on = (np.abs(u - bar) < 0.02)[..., None]
+            stacked = np.where(on, np.minimum(stacked + 0.6, 1.0), stacked)
+            scaled = stacked * 255.0 + nudge
+            worst = min(worst, float(np.abs(scaled - np.floor(scaled) - 0.5).min()))
     return worst
 
 

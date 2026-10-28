@@ -437,6 +437,12 @@ impl SdxlTokenizers {
                 tok_g_file.display()
             ))
         })?;
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::record_reader_paths(
+            "candle-gen-sdxl::pipeline::SdxlTokenizers::load/tokenizers",
+            candle_gen::gen_core::model_input_proof::InputRole::Tokenizer,
+            &[&tok_l_file, &tok_g_file],
+        );
         Ok(Self { tok_l, tok_g })
     }
 }
@@ -1473,8 +1479,14 @@ pub(crate) fn detect_packed_clip(root: &Path, which: &Clip) -> Result<Option<(Pa
     if !cfg_path.is_file() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&cfg_path)
-        .map_err(|e| CandleError::Msg(format!("sdxl: read {dir}/config.json: {e}")))?;
+    let bytes = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&cfg_path),
+"crates/media/candle-gen/candle-gen-sdxl/src/pipeline.rs::detect_packed_clip::std::fs::read@75223",
+ArtifactInput,
+&cfg_path,
+|__model_input_path| std::fs::read(__model_input_path)
+)
+    .map_err(|e| CandleError::Msg(format!("sdxl: read {dir}/config.json: {e}")))?;
     let cfg: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| CandleError::Msg(format!("sdxl: parse {dir}/config.json: {e}")))?;
     let Some(packed) = PackedConfig::from_config(&cfg) else {
@@ -1499,8 +1511,14 @@ pub(crate) fn detect_packed_unet(root: &Path) -> Result<Option<(PathBuf, usize)>
     if !cfg_path.is_file() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&cfg_path)
-        .map_err(|e| CandleError::Msg(format!("sdxl: read unet/config.json: {e}")))?;
+    let bytes = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&cfg_path),
+"crates/media/candle-gen/candle-gen-sdxl/src/pipeline.rs::detect_packed_unet::std::fs::read@76839",
+ArtifactInput,
+&cfg_path,
+|__model_input_path| std::fs::read(__model_input_path)
+)
+    .map_err(|e| CandleError::Msg(format!("sdxl: read unet/config.json: {e}")))?;
     let cfg: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| CandleError::Msg(format!("sdxl: parse unet/config.json: {e}")))?;
     let Some(packed) = PackedConfig::from_config(&cfg) else {
@@ -1672,6 +1690,7 @@ mod tests {
     /// [`Pipeline::decode`] route for byte-exact RGB parity and PiD selection. Explicit gate arms
     /// exercise the same production helper's monolithic/tiled dispatch and postprocess.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decoder_seam_preserves_sdxl_default_and_pid_bytes() {
         let device = Device::Cpu;
         let vae = tiny_sdxl_vae(&device);
@@ -1730,6 +1749,9 @@ mod tests {
         assert!(tiled.pixels.iter().all(|pixel| *pixel == 255));
         assert_eq!(native.decode_calls.get(), 1);
         assert_eq!(native.tiled_calls.get(), 1);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::decoder_seam_preserves_sdxl_default_and_pid_bytes");
     }
 
     /// sc-9416: `detect_packed_unet` returns `Some((file, group_size))` for a snapshot whose
@@ -2102,6 +2124,7 @@ mod tests {
     /// Mutation-checked, all three killed: dropping the narrow fails (1), `narrow(0, 0, 1)` fails
     /// (2), and narrowing unconditionally fails (3).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn render_at_guidance_one_runs_cfg_off_without_batch_mismatch() {
         use candle_gen::candle_nn::VarMap;
         use candle_transformers::models::stable_diffusion::vae::AutoEncoderKLConfig;
@@ -2214,5 +2237,8 @@ mod tests {
             multi[0].pixels, multi[1].pixels,
             "image 1 uses base_seed+1 ⇒ a different image"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::render_at_guidance_one_runs_cfg_off_without_batch_mismatch");
     }
 }

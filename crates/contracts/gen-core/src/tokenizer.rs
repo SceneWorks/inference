@@ -138,7 +138,14 @@ pub struct TextTokenizer {
 impl TextTokenizer {
     /// Load from a `tokenizer.json` (the fast-tokenizer file shipped in every HF repo).
     pub fn from_file(path: impl AsRef<Path>, config: TokenizerConfig) -> Result<Self> {
-        let inner = Tokenizer::from_file(path.as_ref()).map_err(tok_err)?;
+        let inner = crate::__model_input_reader!(
+            Tokenizer::from_file(path.as_ref()),
+            "gen-core::tokenizer::TextTokenizer::from_file",
+            Tokenizer,
+            path.as_ref(),
+            |__input_path| Tokenizer::from_file(__input_path)
+        )
+        .map_err(tok_err)?;
         Ok(Self { inner, config })
     }
 
@@ -190,6 +197,12 @@ impl TextTokenizer {
                 .build()
                 .map_err(|e| Error::Msg(format!("tokenizer: {e}")))?,
         ));
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_input_proof::record_reader_paths(
+            "gen-core::tokenizer::TextTokenizer::from_clip_bpe",
+            crate::model_input_proof::InputRole::Tokenizer,
+            &[vocab, merges],
+        );
         Ok(Self { inner, config })
     }
 

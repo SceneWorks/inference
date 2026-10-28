@@ -260,7 +260,7 @@ impl ViTLayer {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = layer_norm(x, &self.norm1_w, &self.norm1_b, self.eps)?;
+        let normed = __model_proof_output!(layer_norm(x, &self.norm1_w, &self.norm1_b, self.eps))?;
         let attended = if self.window > 0 {
             let (h, w) = (normed.dim(1)?, normed.dim(2)?);
             let (windows, pad_hw) = window_partition(&normed, self.window)?;
@@ -270,7 +270,7 @@ impl ViTLayer {
             self.attn.forward(&normed, &self.rope)?
         };
         let x = x.broadcast_add(&attended)?;
-        let mlp_in = layer_norm(&x, &self.norm2_w, &self.norm2_b, self.eps)?;
+        let mlp_in = __model_proof_output!(layer_norm(&x, &self.norm2_w, &self.norm2_b, self.eps))?;
         Ok(x.broadcast_add(&self.mlp.forward(&mlp_in)?)?)
     }
 
@@ -350,10 +350,16 @@ impl Backbone {
     /// `[1, grid, grid, C]`. The patch-embed conv runs directly on NCHW (torch-native OIHW kernel);
     /// the rest of the backbone is channels-last.
     pub(crate) fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        let x = pixel_values.conv2d(&self.patch_w, 0, self.patch_size, 1, 1)?; // [1, C, grid, grid]
+        let x =
+            __model_proof_output!(pixel_values.conv2d(&self.patch_w, 0, self.patch_size, 1, 1))?; // [1, C, grid, grid]
         let x = x.permute([0, 2, 3, 1])?.contiguous()?; // NHWC
         let mut x = x.broadcast_add(&self.tiled_pos()?)?;
-        x = layer_norm(&x, &self.front_norm_w, &self.front_norm_b, self.eps)?;
+        x = __model_proof_output!(layer_norm(
+            &x,
+            &self.front_norm_w,
+            &self.front_norm_b,
+            self.eps
+        ))?;
         for layer in &self.layers {
             x = layer.forward(&x)?;
         }

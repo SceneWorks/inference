@@ -157,11 +157,13 @@ fn tmp_out(label: &str) -> Fixture {
 fn gguf_dense_conversion_tracks_hf() {
     let Some(r) = load_ref() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in gguf_dense_conversion_tracks_hf; see preceding skip diagnostic");
         return;
     };
     let files = gguf_files();
     if files.is_empty() {
         eprintln!("skip: set MLX_LLM_GGUF_DIR to a directory of *.gguf");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in gguf_dense_conversion_tracks_hf; see preceding skip diagnostic");
         return;
     }
 
@@ -268,6 +270,8 @@ fn gguf_dense_conversion_tracks_hf() {
         "parity failures:\n  {}",
         failures.join("\n  ")
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gguf::gguf_dense_conversion_tracks_hf");
 }
 
 /// The optional MLX requant path: convert with `--quant q8`/`q4`, and the resulting snapshot loads
@@ -278,6 +282,7 @@ fn gguf_dense_conversion_tracks_hf() {
 fn gguf_requant_snapshot_loads_quantized() {
     let Some(r) = load_ref() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in gguf_requant_snapshot_loads_quantized; see preceding skip diagnostic");
         return;
     };
     // Prefer a high-precision source so the only meaningful loss is the MLX requant itself.
@@ -288,6 +293,7 @@ fn gguf_requant_snapshot_loads_quantized() {
         .or_else(|| files.first())
     else {
         eprintln!("skip: set MLX_LLM_GGUF_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in gguf_requant_snapshot_loads_quantized; see preceding skip diagnostic");
         return;
     };
 
@@ -340,6 +346,8 @@ fn gguf_requant_snapshot_loads_quantized() {
         );
         assert!(!text.trim().is_empty(), "{tag}: produced no text");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gguf::gguf_requant_snapshot_loads_quantized");
 }
 
 /// Per-tensor weight parity vs HF — the direct proof every block layout is decoded correctly,
@@ -629,10 +637,12 @@ fn gguf_iq_dequant_matches_hf_by_type() {
 fn gguf_iq_snapshot_generates() {
     let Some(r) = load_ref() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in gguf_iq_snapshot_generates; see preceding skip diagnostic");
         return;
     };
     let Ok(gguf_dir) = std::env::var("MLX_LLM_IQ_GGUF_DIR") else {
         eprintln!("skip: set MLX_LLM_IQ_GGUF_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in gguf_iq_snapshot_generates; see preceding skip diagnostic");
         return;
     };
     let mut files: Vec<_> = std::fs::read_dir(&gguf_dir)
@@ -647,6 +657,7 @@ fn gguf_iq_snapshot_generates() {
     files.sort();
     if files.is_empty() {
         eprintln!("skip: no IQ *.gguf in MLX_LLM_IQ_GGUF_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in gguf_iq_snapshot_generates; see preceding skip diagnostic");
         return;
     }
 
@@ -688,6 +699,8 @@ fn gguf_iq_snapshot_generates() {
         "IQ snapshot run failures:\n  {}",
         failures.join("\n  ")
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gguf::gguf_iq_snapshot_generates");
 }
 
 /// Drop-regression for this suite's fixture helper: the guarded root — the converter's output dir

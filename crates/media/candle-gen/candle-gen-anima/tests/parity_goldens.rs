@@ -436,8 +436,12 @@ fn assert_synth(got: &Tensor, g: &Value, label: &str, stat_rtol: f64, max_rel_l2
 /// `max_rel_l2 = 5e-3` clears the accumulated cross-device/-framework fp32 spread yet trips on every
 /// structural mutation with >10× margin (drop-concat/adaLN-swap/RoPE-h/w-swap, per the MLX measurements).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn synthetic_dit_forward_golden() {
     let g = load_golden("dit_synthetic_golden.json");
     let full = synth_full_velocity();
     assert_synth(&full, &g["full"], "synth_full", 3e-3, 5e-3);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED parity_goldens::synthetic_dit_forward_golden");
 }

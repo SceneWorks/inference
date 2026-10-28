@@ -161,18 +161,24 @@ fn assert_runs_in_compute_dtype(dir: &Fixture, label: &str) {
     );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn f16_scale_snapshot_runs_and_caches_in_compute_dtype() {
     for tied in [true, false] {
         let dir = write_snapshot(Dtype::Float16, tied);
         assert_runs_in_compute_dtype(&dir, &format!("F16 scales, tied={tied}"));
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quantized_compute_dtype::f16_scale_snapshot_runs_and_caches_in_compute_dtype");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn bf16_scale_snapshot_runs_and_caches_in_compute_dtype() {
     for tied in [true, false] {
         let dir = write_snapshot(Dtype::Bfloat16, tied);
         assert_runs_in_compute_dtype(&dir, &format!("BF16 scales, tied={tied}"));
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quantized_compute_dtype::bf16_scale_snapshot_runs_and_caches_in_compute_dtype");
 }

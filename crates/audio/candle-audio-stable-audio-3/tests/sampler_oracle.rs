@@ -1,5 +1,15 @@
 //! Corrected Stable Audio 3 sampler math and mutation gates.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -956,6 +966,11 @@ fn all_six_real_p0_pingpong_trajectories_match_stepwise() {
             case.env,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED all_six_real_p0_pingpong_trajectories_match_stepwise"
+    );
 }
 
 fn max_abs_diff(left: &Tensor, right: &Tensor) -> f32 {
@@ -1051,6 +1066,11 @@ fn real_sampler_cfg_apg_scale_phi_matches_frozen_upstream() {
         assert!(max_abs_diff(&outputs[0], &outputs[1]) > 1e-5);
         assert!(max_abs_diff(&outputs[1], &outputs[2]) > 1e-5);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_sampler_cfg_apg_scale_phi_matches_frozen_upstream"
+    );
 }
 
 /// One-case resource probe selected by explicit immutable snapshot/P0 paths. Run it in a fresh
@@ -1139,4 +1159,7 @@ fn real_default_sampler_resource_probe() {
         estimate.total_host_to_device_elements,
         estimate.total_host_to_device_elements * std::mem::size_of::<f32>(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_default_sampler_resource_probe");
 }

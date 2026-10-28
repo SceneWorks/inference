@@ -2410,10 +2410,13 @@ pub(crate) mod tests {
         }
     }
 
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn off_is_the_plain_loop_on_the_causal_and_hybrid_targets() {
         off_matches_plain(&causal(), 24);
         off_matches_plain(&qwen35(false), 50);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::off_is_the_plain_loop_on_the_causal_and_hybrid_targets");
     }
 
     /// AC1: greedy prompt lookup emits exactly the plain loop's tokens — plain, penalized and
@@ -2424,6 +2427,7 @@ pub(crate) mod tests {
     /// run past a block growth — the engine's pipelined loop, then prompt lookup's verify and
     /// rollback — leaves the caller's cache with none, while the same run on a cache asked to
     /// record ([`KvCache::record_events`], what only a campaign observer does) records them.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_production_decode_records_no_cache_events() {
         let model = causal();
@@ -2473,8 +2477,11 @@ pub(crate) mod tests {
             assert_eq!(run(false, drafts), 0, "drafts {drafts}");
             assert!(run(true, drafts) > 0, "drafts {drafts}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_production_decode_records_no_cache_events");
     }
 
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn greedy_prompt_lookup_is_the_plain_loop_and_recovers_both_ways() {
         let causal = causal();
@@ -2554,11 +2561,14 @@ pub(crate) mod tests {
             "{:?}",
             run.stats
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::greedy_prompt_lookup_is_the_plain_loop_and_recovers_both_ways");
     }
 
     /// AC1: greedy MTP emits exactly the plain loop's tokens (plain, penalized, constrained) on
     /// the Qwen35 MTP fixture, whose adversarial drafts force a partial rejection — recovered
     /// through the checkpoint ring, with zero replay forwards (sc-24435).
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn greedy_mtp_is_the_plain_loop() {
         let model = qwen35(true);
@@ -2590,6 +2600,10 @@ pub(crate) mod tests {
             assert_eq!(run.report.proposer, ProposerKind::Mtp);
             assert_eq!(run.report.draft_tokens, Some(3));
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::greedy_mtp_is_the_plain_loop"
+        );
     }
 
     /// The Qwen35 target under test: every forward is delegated to the model, then the attention
@@ -2750,6 +2764,7 @@ pub(crate) mod tests {
     /// The probe is shown to see a copy: under the step-start snapshot the ring replaced, the same
     /// run clones the cache every verify step, the in-place write then lands in a fresh block,
     /// and a partial rejection costs a replay forward — with the same tokens.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn the_hybrid_rolls_back_through_its_checkpoint_ring_without_replay_or_clone() {
         use crate::models::qwen35::counting_cache_clones;
@@ -2764,6 +2779,7 @@ pub(crate) mod tests {
                 let expected = plain(&model, &PROMPT, &config, None);
                 let ring = Observed::new(&model, CheckpointRingRollback::new);
                 let run_with = |proposer: &mut dyn FnMut() -> SpeculativeRun| {
+                    crate::model_inference_device::record_model_inference_device();
                     let ((run, clones), routes) =
                         recording_routes(|| counting_cache_clones(proposer));
                     (run, clones, routes)
@@ -2771,6 +2787,7 @@ pub(crate) mod tests {
                 let mut lookup = Tally::new(NgramProposer::default());
                 let mut head = Tally::new(MtpProposer::new());
                 let (run, clones, routes) = run_with(&mut || {
+                    crate::model_inference_device::record_model_inference_device();
                     if mtp {
                         engine(&ring, &mut head, &PROMPT, &config, 3, None)
                     } else {
@@ -2912,6 +2929,8 @@ pub(crate) mod tests {
                 "a held snapshot makes the in-place write copy its block"
             );
         });
+
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_hybrid_rolls_back_through_its_checkpoint_ring_without_replay_or_clone");
     }
 
     /// The draft-model window through the [`CacheRollback`] seam (sc-24435; the shape a draft
@@ -2922,6 +2941,7 @@ pub(crate) mod tests {
     /// recovery is direct, its DeltaNet state is bit-exact that of a cache that only ever saw the
     /// kept tokens, the next forward's logits are too (the attention KV was truncated by offset),
     /// and that forward records nothing — full acceptance included.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn the_ring_recovers_a_draft_window_of_single_token_forwards() {
         let model = qwen35(false);
@@ -2995,10 +3015,13 @@ pub(crate) mod tests {
             );
             assert_eq!(cache.checkpointed_tokens(), 0, "kept {kept}: window closed");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_ring_recovers_a_draft_window_of_single_token_forwards");
     }
 
     /// AC2 (engine half): the report names the proposer, its depth, the verify steps and accepted
     /// drafts behind the mean accepted length, the recovery replays and the measured sampler.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn the_report_carries_the_measured_speculation() {
         let run = engine(
@@ -3046,10 +3069,13 @@ pub(crate) mod tests {
             r.fallbacks.is_empty(),
             "fallbacks are the provider's to add"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_report_carries_the_measured_speculation");
     }
 
     /// A stop token inside an accepted draft run ends the run exactly where the plain loop does,
     /// and nothing past it is emitted.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_stop_token_inside_a_draft_run_ends_like_the_plain_loop() {
         let model = causal();
@@ -3067,10 +3093,13 @@ pub(crate) mod tests {
         );
         assert_eq!(run.output.tokens, expected.tokens);
         assert_eq!(run.output.finish_reason, FinishReason::StopToken);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_stop_token_inside_a_draft_run_ends_like_the_plain_loop");
     }
 
     /// Seeded stochastic speculation is reproducible and stays within its budget; acceptance is
     /// `core_llm`'s distribution-preserving rule (proven there).
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn stochastic_speculation_is_seeded() {
         let model = causal();
@@ -3099,9 +3128,12 @@ pub(crate) mod tests {
             "{}",
             a.report.sampler
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::stochastic_speculation_is_seeded");
     }
 
     /// The sampler is a seam: a caller-supplied [`TokenSampler`] draws every token.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_caller_sampler_draws_every_token() {
         struct Counting(MlxSampler, usize);
@@ -3158,6 +3190,8 @@ pub(crate) mod tests {
             run.report.verify_steps + 1,
             "one decision per step"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_caller_sampler_draws_every_token");
     }
 
     // ---- Draft-model speculation on the engine (epic sc-24432, story sc-24436). ----
@@ -3214,6 +3248,7 @@ pub(crate) mod tests {
     /// replay) with a softmax draft, a softmax target with the hybrid as its draft (the draft
     /// recovers its own proposal window through its ring), and the hybrid drafting for an
     /// identical hybrid (every draft accepted).
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn greedy_draft_model_is_the_plain_loop_on_every_cache_pairing() {
         let stats = draft_matches_plain("causal/causal", &causal(), &causal_model(24, 1), 24);
@@ -3241,11 +3276,14 @@ pub(crate) mod tests {
             stats.iter().all(|s| s.accepted == s.proposed),
             "a draft identical to its target is always accepted: {stats:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::greedy_draft_model_is_the_plain_loop_on_every_cache_pairing");
     }
 
     /// sc-24436 E1: a stochastic draft hands the engine the proposal distribution `q` each draft
     /// was drawn from — one per draft, each containing its draft — so the exact rejection rule
     /// compares the target's `p` against the draft's own `q`; seeded runs reproduce.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_stochastic_draft_model_reports_one_q_per_draft_and_is_seeded() {
         let target = causal();
@@ -3315,6 +3353,8 @@ pub(crate) mod tests {
         assert_eq!(a.output.tokens.len(), 20);
         assert_eq!(a.report.proposer, ProposerKind::DraftModel);
         assert!(a.stats.proposed > 0 && a.stats.accepted <= a.stats.proposed);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_stochastic_draft_model_reports_one_q_per_draft_and_is_seeded");
     }
 
     /// The last-position logits of a fresh prefill of `ids` through `model`, `[1, vocab]`.
@@ -3427,6 +3467,9 @@ pub(crate) mod tests {
                 worst < 1e-3,
                 "draft logits after commit drift from a fresh prefill by {worst}"
             );
+            crate::model_inference_device::record_model_inference_device();
+            crate::model_inference_device::record_model_inference_device();
+            crate::model_inference_device::record_model_inference_device();
         }
     }
 
@@ -3480,6 +3523,7 @@ pub(crate) mod tests {
     /// rejects the rest, and ones that accept every fed draft. Generic over the draft's own
     /// rollback strategy, so a strategy that keeps K − 1 single-token draft forwards between one
     /// `begin` and `recover` (the DeltaNet checkpoint ring) is held to the same invariant.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_draft_cache_is_the_committed_sequence_after_every_commit() {
         fn run_checked<T, D>(label: &str, target: &T, draft: &D, vocab: usize) -> (usize, usize)
@@ -3524,6 +3568,8 @@ pub(crate) mod tests {
             partial > 0 && full > 0,
             "causal draft: {partial} partial and {full} full keeps"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_draft_cache_is_the_committed_sequence_after_every_commit");
     }
 
     /// sc-24436: a stop token the draft proposes and the target accepts ends the run exactly as
@@ -3531,6 +3577,7 @@ pub(crate) mod tests {
     /// greedy one, for a truncating and a checkpoint-ring draft — and the draft's cache is
     /// still the committed sequence after that commit (the proposal stopped drafting at the
     /// stop without feeding it).
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_draft_proposed_stop_token_accepted_by_the_target_ends_the_run() {
         fn check<T>(label: &str, target: &T)
@@ -3582,10 +3629,13 @@ pub(crate) mod tests {
         }
         check("causal", &causal());
         check("hybrid", &qwen35(false));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_draft_proposed_stop_token_accepted_by_the_target_ends_the_run");
     }
 
     /// sc-24436: a draft whose padding differs from its target's proposes only its tokenizer's
     /// ids, over logits the target's width, and greedy output is still the target's own.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_draft_padded_differently_proposes_only_tokenizer_ids() {
         let draft = causal_model(24, 1);
@@ -3612,6 +3662,8 @@ pub(crate) mod tests {
             assert_eq!(run.output.tokens, expected.tokens);
             assert!(run.stats.proposed > 0);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_draft_padded_differently_proposes_only_tokenizer_ids");
     }
 
     /// The constraint is rewound only when something advanced it: never on the `off` loop, and on
@@ -3619,6 +3671,7 @@ pub(crate) mod tests {
     /// drafts — so every rewind the engine issues moves the state back. (A `JsonMask` rewind
     /// rebuilds and replays the grammar, so a redundant one per step made every constrained MLX
     /// request quadratic.)
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn the_constraint_is_rewound_only_when_something_advanced_it() {
         let causal = causal();
@@ -3677,10 +3730,13 @@ pub(crate) mod tests {
             forbid.rewinds, forbid.state_changing_rewinds,
             "mtp: every rewind moves the state"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_constraint_is_rewound_only_when_something_advanced_it");
     }
 
     /// A cancel that trips during the prefill (here: while the proposer warms) ends the run before
     /// its first draw — zero tokens, `Cancelled` — as the plain loop's per-step check does.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_cancel_during_prefill_emits_no_token() {
         struct CancelOnWarm(CancelFlag);
@@ -3733,11 +3789,14 @@ pub(crate) mod tests {
                 generated: 0
             }]
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_cancel_during_prefill_emits_no_token");
     }
 
     /// The sampler seam carries device-resident tokens: a sampler returning every plain-greedy draw
     /// as an unevaluated on-device argmax drives the `off` loop and prompt lookup to exactly the
     /// plain loop's tokens (the next forward consumes the array; the host id serves the rest).
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_device_resident_sampler_drives_the_loop() {
         struct DeviceGreedy(MlxSampler, usize);
@@ -3795,6 +3854,8 @@ pub(crate) mod tests {
             assert!(sampler.1 > 0, "{label}: device tokens were drawn");
             assert_eq!(run.report.sampler, "device", "{label}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_device_resident_sampler_drives_the_loop");
     }
 
     /// Hand-built `[1, n, vocab]` logits, one row per slice.
@@ -3965,6 +4026,7 @@ pub(crate) mod tests {
 
     /// `StepTarget` runs any `Decode` model through the engine's `off` loop from a caller-prefilled
     /// cache, token-for-token the plain `generate_from_prefill` loop, and refuses a draft verify.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_step_target_is_the_plain_prefilled_loop() {
         let model = causal();
@@ -4020,6 +4082,8 @@ pub(crate) mod tests {
             .forward(&mut cache, &input_ids(&[1, 2]), 0, LogitsScope::All, false)
             .unwrap_err();
         assert!(err.to_string().contains("cannot verify drafts"), "{err}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_step_target_is_the_plain_prefilled_loop");
     }
 
     // ---- Pipelining and the device sampler (story sc-24439). ----
@@ -4175,15 +4239,19 @@ pub(crate) mod tests {
         }
     }
 
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn pipelining_is_invisible_on_the_causal_and_hybrid_targets() {
         pipelining_is_invisible_on(&causal());
         pipelining_is_invisible_on(&qwen35(false));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::pipelining_is_invisible_on_the_causal_and_hybrid_targets");
     }
 
     /// sc-24446 (E5): the process switches the campaign isolates pipelining and the device sampler
     /// with (`MLX_LLM_PIPELINING`, `MLX_LLM_DEVICE_SAMPLER`; here their thread-scoped layer) turn
     /// each off for a request that would otherwise take it, and the greedy tokens do not move.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn the_pipelining_and_device_sampler_switches_turn_each_path_off() {
         use crate::switches::{DEVICE_SAMPLER, PIPELINING};
@@ -4202,11 +4270,14 @@ pub(crate) mod tests {
         }
         check("causal", &causal());
         check("qwen35", &qwen35(false));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_pipelining_and_device_sampler_switches_turn_each_path_off");
     }
 
     /// AC1 (speculative half): a run with a proposer is never pipelined — the proposer reads the
     /// committed token on the host before it drafts — so prompt lookup and MTP report no pipelined
     /// steps while the greedy output stays the plain loop's.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn speculative_runs_are_not_pipelined() {
         let causal = causal();
@@ -4235,11 +4306,14 @@ pub(crate) mod tests {
             lookup.output.tokens,
             plain(&causal, &PROMPT, &greedy(20), None).tokens
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::speculative_runs_are_not_pipelined");
     }
 
     /// AC2: a temperature 0.7 / top-p 0.9 request draws on the device (`sampler = device`) and
     /// moves exactly one token id per step to the host — counted — pipelined or not; a greedy
     /// request likewise; a penalized request copies the whole row every step.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_top_p_request_samples_on_the_device_one_id_per_step() {
         let model = causal();
@@ -4269,11 +4343,14 @@ pub(crate) mod tests {
             16 * 24,
             "a penalized draw copies the vocab row"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_top_p_request_samples_on_the_device_one_id_per_step");
     }
 
     /// AC3: a repetition-penalty request samples on the host, says so with its reason, and is not
     /// pipelined (its draw reads the history the unread token would extend); a constrained one
     /// likewise with its own reason.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_penalized_or_constrained_request_reports_the_host_path_and_is_not_pipelined() {
         let model = causal();
@@ -4294,6 +4371,8 @@ pub(crate) mod tests {
         );
         assert_eq!(run.report.sampler, "host:constraint");
         assert_eq!(run.stats.pipelined, 0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_penalized_or_constrained_request_reports_the_host_path_and_is_not_pipelined");
     }
 
     /// A target that records, at each forward, how many host reads the sampling seam had made
@@ -4343,6 +4422,7 @@ pub(crate) mod tests {
     /// With the prefill first, the `k`-th forward (`k >= 2`) runs after `k - 1` token reads under
     /// `Auto` — one behind the unpipelined loop, whose `k`-th forward follows `k` reads. Step 1 is
     /// the exception (sc-24446): token 0 is read back before it is enqueued, as unpipelined.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_pipelined_step_is_enqueued_before_the_previous_token_is_read() {
         let model = causal();
@@ -4359,6 +4439,8 @@ pub(crate) mod tests {
             assert_eq!(run.output.tokens.len(), 8);
             assert_eq!(target.reads.into_inner(), expected, "{pipelining:?}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_pipelined_step_is_enqueued_before_the_previous_token_is_read");
     }
 
     /// `src` without its `#[cfg(...test...)] mod` blocks — the production code, wherever a test
@@ -4455,6 +4537,7 @@ pub(crate) mod tests {
     /// A pipelined run that ends with a discarded look-ahead reports the committed cache length —
     /// the unpipelined run's — and a caller continuing its prefilled cache from there (truncating
     /// the look-ahead row) gets a cold forward's logits.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_pipelined_end_reports_the_committed_cache_length() {
         let model = causal();
@@ -4545,11 +4628,14 @@ pub(crate) mod tests {
                 .fold(0.0f32, f32::max);
             assert!(drift < 1e-4, "{end}: continuation drift {drift}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_pipelined_end_reports_the_committed_cache_length");
     }
 
     /// A seeded device-sampled run is reproducible, and a different seed draws differently: the
     /// seed still drives the device draws (the documented change is only that they are not the
     /// host sampler's per-seed draws).
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn seeded_device_sampling_is_reproducible() {
         let model = causal();
@@ -4560,6 +4646,8 @@ pub(crate) mod tests {
         other.seed = Some(8);
         let c = off_run(&model, &other, Pipelining::Auto, None);
         assert_ne!(a.output.tokens, c.output.tokens);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::seeded_device_sampling_is_reproducible");
     }
 
     /// Pipelining overlap microbenchmark (manual, `--ignored`; prints, asserts nothing timed): a
@@ -4595,6 +4683,10 @@ pub(crate) mod tests {
                 rates[0][3], rates[1][3]
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::pipelining_overlap_microbench"
+        );
     }
 
     // ---- `auto`'s acceptance monitor and the first-token dispatch (sc-24446). ----
@@ -4663,6 +4755,7 @@ pub(crate) mod tests {
     /// 0 then waited for step 1's whole forward). Every later step is still enqueued before the
     /// previous token is read back ([`a_pipelined_step_is_enqueued_before_the_previous_token_is_read`]),
     /// so the overlap is kept; the unpipelined loop dispatches nothing ahead of its reads.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn the_first_token_is_dispatched_before_step_one_is_enqueued() {
         let model = causal();
@@ -4677,6 +4770,8 @@ pub(crate) mod tests {
             let again = off_run(&model, &top_p(8), pipelining, None);
             assert_eq!(again.output.tokens, run.output.tokens, "{pipelining:?}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_first_token_is_dispatched_before_step_one_is_enqueued");
     }
 
     /// A target that records, at each forward, how many tokens the run had delivered to its event
@@ -4726,6 +4821,7 @@ pub(crate) mod tests {
     /// enqueued — its delivery never waits for step 1's host-side graph build and dispatch — and
     /// from step 2 on every step is still enqueued before the previous token is delivered (the
     /// overlap). Greedy and seeded output is the unpipelined run's.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn the_first_token_is_delivered_before_step_one_is_enqueued() {
         for (name, config) in [("greedy", greedy(8)), ("top_p", top_p(8))] {
@@ -4773,6 +4869,8 @@ pub(crate) mod tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_first_token_is_delivered_before_step_one_is_enqueued");
     }
 
     /// sc-24446 (pipelined TTFT behind held tokens): when the caller holds its first tokens back
@@ -4780,6 +4878,7 @@ pub(crate) mod tests {
     /// *delivered* token is read back before the step after it is enqueued, as token 0 is; the
     /// look-ahead resumes once the caller has delivered, or after [`FIRST_DELIVERY_HOLD_STEPS`]
     /// held tokens. Greedy and seeded output is the unpipelined run's.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn the_first_delivered_token_is_read_before_a_look_ahead_is_enqueued() {
         assert_eq!(
@@ -4862,6 +4961,8 @@ pub(crate) mod tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_first_delivered_token_is_read_before_a_look_ahead_is_enqueued");
     }
 
     /// sc-24446: a pipelined run never enqueues a forward past its budget, and a run that ends
@@ -4869,6 +4970,7 @@ pub(crate) mod tests {
     /// discarded look-ahead before returning — no forward it enqueued is left in flight to be
     /// charged to the next request's prefill. Every draw past the first is one forward, plus the
     /// discarded look-ahead.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_pipelined_run_returns_with_no_look_ahead_in_flight() {
         let model = causal();
@@ -4904,6 +5006,8 @@ pub(crate) mod tests {
                 "{end}: the discarded look-ahead was waited for before returning"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_pipelined_run_returns_with_no_look_ahead_in_flight");
     }
 
     /// What a [`Scripted`] proposer drafts every step.
@@ -5081,6 +5185,7 @@ pub(crate) mod tests {
     /// sc-24446: a run whose budget, or a stop token, ends it on the very step that closes the
     /// demoting window still reports where it was demoted — `speculative_demoted_at` agrees with
     /// the monitor's demoting decision — pipelined (lookup) or not (MTP kind).
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_demotion_on_the_runs_last_step_is_reported() {
         let model = causal();
@@ -5105,6 +5210,8 @@ pub(crate) mod tests {
                 "{label}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_demotion_on_the_runs_last_step_is_reported");
     }
 
     /// A deterministic decode clock (sc-24446): time moves only when [`Timed`] runs a forward.
@@ -5218,6 +5325,7 @@ pub(crate) mod tests {
     /// rest of the run is the pipelined plain loop (one handoff step, then every remaining token
     /// pipelined); the output is the plain greedy loop's, the report records the demotion, and
     /// the forward accounting holds — on the causal and the hybrid (checkpoint-ring) targets.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn auto_demotes_a_losing_proposer_to_the_pipelined_plain_loop() {
         fn check<T: SpeculativeTarget + crate::decode::Decode>(
@@ -5258,6 +5366,8 @@ pub(crate) mod tests {
         }
         check("causal", &causal(), 24);
         check("qwen35", &qwen35(false), 50);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::auto_demotes_a_losing_proposer_to_the_pipelined_plain_loop");
     }
 
     /// E5 (sc-24446 review): prompt lookup is demoted only where the demoted request would run
@@ -5265,6 +5375,7 @@ pub(crate) mod tests {
     /// unpipelined anyway (`Pipelining::Off`, the pipelining switch off, a history-reading
     /// sampler) the same losing lookup runs to the end; an MTP-kind proposer is demoted there
     /// all the same (its cost is its own forwards) and the rest is single-token verify steps.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn lookup_is_demoted_only_where_the_plain_loop_is_pipelined() {
         let model = causal();
@@ -5323,11 +5434,14 @@ pub(crate) mod tests {
             assert_eq!((head.proposals, head.commits), (WINDOW, WINDOW), "{label}");
             assert_accounting(label, &demoted, config);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::lookup_is_demoted_only_where_the_plain_loop_is_pipelined");
     }
 
     /// A demoted run stops asking the target for hidden rows: the prefill and the first window's
     /// verify steps do (the proposer wants them), no forward after the demotion does — pipelined
     /// or not.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_demoted_run_asks_for_no_hidden_rows() {
         let model = qwen35(false);
@@ -5352,6 +5466,8 @@ pub(crate) mod tests {
             );
             assert_eq!(hidden.len() as u64, run.report.target_forwards);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_demoted_run_asks_for_no_hidden_rows");
     }
 
     /// The edges of the handoff: a budget one token past the demotion point (the handoff step
@@ -5359,6 +5475,7 @@ pub(crate) mod tests {
     /// step itself (the run ends there; on the pipelined path the look-ahead enqueued behind it
     /// is discarded unread) — pipelined (lookup) and unpipelined (MTP kind), each the plain
     /// loop's output.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn the_handoff_honours_the_budget_and_a_stop_token_it_draws() {
         let model = causal();
@@ -5413,6 +5530,8 @@ pub(crate) mod tests {
                 "{label}: {r:?}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_handoff_honours_the_budget_and_a_stop_token_it_draws");
     }
 
     /// A prompt (and the token) whose plain greedy continuation on `model` first draws that token
@@ -5435,6 +5554,7 @@ pub(crate) mod tests {
     /// A seeded stochastic run across a demotion draws exactly the plain seeded run's tokens: a
     /// proposer that never drafts makes every verify step the ordinary draw, the demotion hands
     /// the same sampler (and its stream) to the plain loop — pipelined (lookup) or not (MTP kind).
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_seeded_stochastic_run_across_a_demotion_is_the_plain_seeded_run() {
         let model = causal();
@@ -5450,10 +5570,13 @@ pub(crate) mod tests {
             assert_eq!(run.report.speculative_demoted_at, Some(DEMOTED_AT));
             assert_eq!(run.report.sampler, "device");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_seeded_stochastic_run_across_a_demotion_is_the_plain_seeded_run");
     }
 
     /// A proposer at or above its break-even is never demoted under `auto`: it proposes to the
     /// end, nothing is pipelined, and the output is still the plain loop's.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn auto_keeps_a_proposer_that_pays_for_itself() {
         let model = causal();
@@ -5472,12 +5595,15 @@ pub(crate) mod tests {
         // Every step proposes but one the budget clamped to no drafts.
         assert!(right.proposals as u64 + 1 >= run.report.verify_steps);
         assert_accounting("paying", &run, &config);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::auto_keeps_a_proposer_that_pays_for_itself");
     }
 
     /// sc-24446 (rolling windows): a lookup that pays for its first window and then stops
     /// accepting is demoted at the end of its first failing window — not at the first window (it
     /// passed), and not never (the one-shot decision kept it) — the rest handed to the pipelined
     /// plain loop, and the output still the plain greedy loop's.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_late_loser_is_demoted_at_its_first_failing_window() {
         let model = causal();
@@ -5495,6 +5621,8 @@ pub(crate) mod tests {
         // After the handoff step, every remaining token but the last is a pipelined look-ahead.
         assert_eq!(run.stats.pipelined, 120 - demoted_at - 1);
         assert_accounting("late loser", &run, &config);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_late_loser_is_demoted_at_its_first_failing_window");
     }
 
     /// The plain probe's length: its steps run without a proposal before the first window.
@@ -5506,6 +5634,7 @@ pub(crate) mod tests {
     /// (Qwen3.8-like: r = 1.5, mal 1.25) keeps its proposer — both after the plain probe, the
     /// proposer caught up on the probed tokens, the plain loop's tokens throughout. Prompt lookup
     /// (no static threshold here) is judged the same way.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_timed_auto_weighs_the_requests_own_verify_cost() {
         let model = qwen35(false);
@@ -5570,6 +5699,8 @@ pub(crate) mod tests {
             wrong.caught_up,
             vec![(expected[..PROBE].to_vec(), None, PROMPT.len() as i32)]
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_timed_auto_weighs_the_requests_own_verify_cost");
     }
 
     /// sc-24446 (cuda-campaign-b4): on the deterministic decode clock a clear loser — measured
@@ -5580,6 +5711,7 @@ pub(crate) mod tests {
     /// MTP-kind one, too lumpy (3 drafts every fourth step) for the optimistic gain to call
     /// early — at its first window's end. A winner (every
     /// draft accepted, r = 1.5) is never demoted. Pipelined and not, the plain loop's tokens.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never() {
         let first =
@@ -5642,12 +5774,15 @@ pub(crate) mod tests {
             (d.basis, d.demoted),
             (core_llm::DemotionBasis::Measured, false)
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never");
     }
 
     /// On MLX's pipelined path a measured loss demotes and hands the rest to the pipelined loop
     /// (a lookup accepting one draft per step at r = 2.4 — above the static 0.4), while the static
     /// threshold still demotes where the measured gain does not (accepting nothing at r = 1.0) —
     /// the plain loop's tokens either way.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_timed_pipelined_run_demotes_on_a_measured_loss_or_its_static_threshold() {
         let model = causal();
@@ -5683,6 +5818,8 @@ pub(crate) mod tests {
                 "{ratio}: the rest is pipelined"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_timed_pipelined_run_demotes_on_a_measured_loss_or_its_static_threshold");
     }
 
     /// A clock that moves a fixed tick at every reading: every timed step measures the same
@@ -5703,6 +5840,7 @@ pub(crate) mod tests {
     /// on the probed tokens, its proposals — the plain loop's tokens throughout. Accepting nothing
     /// at `r = 1` breaks even (measured gain 1.0), so on the unpipelined path the measured gain
     /// keeps the head where the static 0.725 would have demoted it.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_timed_mtp_head_catches_up_after_the_probe() {
         let model = qwen35(true);
@@ -5740,11 +5878,14 @@ pub(crate) mod tests {
             "{:?}",
             run.report
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_timed_mtp_head_catches_up_after_the_probe");
     }
 
     /// `MtpProposer::catch_up` leaves the head where proposing on each probed token would have
     /// (its draft step for `cur`, then a commit without accepted drafts): the next proposal draws
     /// the same drafts from the same distributions.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them() {
         let model = qwen35(true);
@@ -5848,10 +5989,13 @@ pub(crate) mod tests {
             !close(&c, &b),
             "fixture premise: the probed tokens change the head's state"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them");
     }
 
     /// An explicit `{proposer, depth}` is the caller's choice: no monitor, so a losing proposer
     /// runs to the end of the request — every step proposes — and nothing is demoted.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn an_explicit_proposer_request_is_never_demoted() {
         use core_llm::{Speculative, SpeculativeProposer};
@@ -5874,11 +6018,14 @@ pub(crate) mod tests {
             // Every step but the budget-clamped last one proposes.
             assert_eq!(wrong.proposals as u64, run.report.verify_steps - 1);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::an_explicit_proposer_request_is_never_demoted");
     }
 
     /// The MTP head (a proposer that wants the target's hidden rows) demotes the same way on the
     /// hybrid: the head is not committed to after the demotion and the rest is the pipelined
     /// plain loop, with the plain greedy output.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_demoted_mtp_head_hands_the_hybrid_to_the_pipelined_loop() {
         let model = qwen35(true);
@@ -5901,5 +6048,7 @@ pub(crate) mod tests {
         assert_eq!(run.stats.pipelined, 40 - DEMOTED_AT as usize - 1);
         assert_eq!(run.report.proposer, ProposerKind::Mtp);
         assert_accounting("mtp", &run, &config);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::engine::tests::a_demoted_mtp_head_hands_the_hybrid_to_the_pipelined_loop");
     }
 }

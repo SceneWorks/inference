@@ -2007,7 +2007,13 @@ impl LlamaProvider {
             None
         };
 
-        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+        let tokenizer = crate::__model_input_reader!(
+            Tokenizer::from_file(dir.join("tokenizer.json")),
+            "crates/llm/mlx-llm/src/provider.rs::load_admitted::Tokenizer::from_file@87862",
+            Tokenizer,
+            dir.join("tokenizer.json"),
+            |__model_input_path| Tokenizer::from_file(__model_input_path)
+        )?;
         let stop_tokens = eos_token_ids(dir);
         let (
             template,
@@ -2779,7 +2785,14 @@ pub(crate) fn campaign_preflight_cancellation_tokens(snapshot: &Path) -> CoreRes
 ///
 /// BOS/EOS still come from `tokenizer_config.json`; the sidecar carries only the template body.
 fn sidecar_chat_template(dir: &Path) -> Option<JinjaChatTemplate> {
-    let source = std::fs::read_to_string(dir.join("chat_template.jinja")).ok()?;
+    let source = crate::__model_input_reader!(
+        std::fs::read_to_string(dir.join("chat_template.jinja")),
+        "crates/llm/mlx-llm/src/provider.rs::sidecar_chat_template::std::fs::read_to_string@120781",
+        ArtifactInput,
+        dir.join("chat_template.jinja"),
+        |__model_input_path| std::fs::read_to_string(__model_input_path)
+    )
+    .ok()?;
     if source.trim().is_empty() {
         return None;
     }
@@ -5189,8 +5202,14 @@ fn admit_companion_head(
 /// Read and parse `config.json` from a snapshot directory into a JSON value (used to dispatch the
 /// architecture before constructing the architecture-specific config).
 fn read_config_value(dir: &Path) -> CoreResult<serde_json::Value> {
-    let text = std::fs::read_to_string(dir.join("config.json"))
-        .map_err(|e| CoreError::Load(format!("read {}: {e}", dir.join("config.json").display())))?;
+    let text = crate::__model_input_reader!(
+        std::fs::read_to_string(dir.join("config.json")),
+        "crates/llm/mlx-llm/src/provider.rs::read_config_value::std::fs::read_to_string@232605",
+        ArtifactInput,
+        dir.join("config.json"),
+        |__model_input_path| std::fs::read_to_string(__model_input_path)
+    )
+    .map_err(|e| CoreError::Load(format!("read {}: {e}", dir.join("config.json").display())))?;
     serde_json::from_str(&text)
         .map_err(|e| CoreError::Load(format!("parse {}: {e}", dir.join("config.json").display())))
 }
@@ -5230,7 +5249,14 @@ fn prompt_opens_thinking(prompt: &str) -> bool {
 
 /// Read and parse a JSON file from a snapshot dir, or `None` if missing/invalid.
 fn read_json(dir: &Path, name: &str) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(dir.join(name)).ok()?;
+    let text = crate::__model_input_reader!(
+        std::fs::read_to_string(dir.join(name)),
+        "crates/llm/mlx-llm/src/provider.rs::read_json::std::fs::read_to_string@234545",
+        ArtifactInput,
+        dir.join(name),
+        |__model_input_path| std::fs::read_to_string(__model_input_path)
+    )
+    .ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -6648,9 +6674,11 @@ pub(crate) mod tests {
     /// `<|image_pad|>` (151655) per image is what the processor emits *before* patch-count expansion;
     /// these fixtures pin that pre-expansion prompt. Self-skips cleanly when the snapshot is absent.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn chat_template_byte_matches_hf_processor() {
         let Some(dir) = qwen3vl_snapshot_dir() else {
             eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in chat_template_byte_matches_hf_processor; see preceding skip diagnostic");
             return;
         };
         let oracle: serde_json::Value = serde_json::from_str(include_str!(
@@ -6714,6 +6742,8 @@ pub(crate) mod tests {
                 "case {case}: tokenized prompt ids must byte-match HF processor"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::chat_template_byte_matches_hf_processor");
     }
 
     #[test]
@@ -7150,6 +7180,7 @@ pub(crate) mod tests {
     /// `DecodeReport` naming the proposer, its depth, the verify steps behind the mean accepted
     /// length and the sampler path.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn speculative_requests_emit_the_off_tokens_and_off_is_the_plain_loop() {
         use core_llm::Speculative;
         // The absolute accounting of a budget-bound run without stop tokens: the first token
@@ -7281,6 +7312,8 @@ pub(crate) mod tests {
                 assert_eq!(report.replay_forwards, 0, "{label}: {report:?}");
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::speculative_requests_emit_the_off_tokens_and_off_is_the_plain_loop");
     }
 
     /// sc-24446 (E5): `auto` reaches the engine with its acceptance monitor and an explicit
@@ -7289,6 +7322,7 @@ pub(crate) mod tests {
     /// the report says where, while the same proposer asked for explicitly runs to the end; both
     /// stream exactly `off`'s tokens.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn auto_is_demoted_and_an_explicit_proposer_is_not() {
         use core_llm::Speculative;
         let provider = qwen35_mtp_provider();
@@ -7329,6 +7363,8 @@ pub(crate) mod tests {
             auto.proposed_tokens,
             asked.proposed_tokens
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::auto_is_demoted_and_an_explicit_proposer_is_not");
     }
 
     /// AC2: the speculative resolution's fallback reaches `DecodeReport::fallbacks` through
@@ -7338,6 +7374,7 @@ pub(crate) mod tests {
     /// dropping the resolution's fallback anywhere between `resolve_speculative` and the output
     /// turns this red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_resolution_fallback_reaches_the_decode_report() {
         use core_llm::Speculative;
         let mut provider = causal_provider();
@@ -7391,11 +7428,14 @@ pub(crate) mod tests {
                 )]
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::the_resolution_fallback_reaches_the_decode_report");
     }
 
     /// E2: a plan the request cannot run falls back to plain decoding with the reason named,
     /// never silently and never as a failure.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_speculative_route_names_every_downgrade() {
         let run = |proposer, depth| SpeculativePlan::Run { proposer, depth };
         let causal = causal_provider();
@@ -7433,6 +7473,8 @@ pub(crate) mod tests {
             why[0].contains("`draft_model` has no draft model"),
             "{why:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::the_speculative_route_names_every_downgrade");
     }
 
     /// The causal fixture with its own first layer resident as the draft model (sc-24436).
@@ -7460,6 +7502,7 @@ pub(crate) mod tests {
     /// shape and decodes exactly `off`'s greedy stream with a report naming it; admission prices
     /// the draft's own prefill and cache on top of the target's (E7).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_resident_draft_routes_draft_model_and_is_priced() {
         use core_llm::Speculative;
         let provider = causal_provider_with_draft();
@@ -7521,6 +7564,8 @@ pub(crate) mod tests {
             ),
             Some(lookup)
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_resident_draft_routes_draft_model_and_is_priced");
     }
 
     /// sc-24436 E2: a `draft_model` route whose request outruns the draft's context window — the
@@ -7827,6 +7872,7 @@ pub(crate) mod tests {
     /// `DecodeReport::fallbacks`, emitting exactly `off`'s stream: prompt lookup on both
     /// decoders, and MTP (the new option and the legacy field) on the Qwen3.8 head.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp() {
         use core_llm::{MtpMode, Speculative};
         let clamp = |proposer: &str, asked: u32, max: u32| {
@@ -7876,6 +7922,8 @@ pub(crate) mod tests {
         legacy.mtp = Some(MtpMode::Enabled { draft_tokens: 40 });
         let fallbacks = check(&hybrid, legacy, ProposerKind::Mtp, mtp_max, "legacy");
         assert_eq!(fallbacks, clamp("mtp", 40, mtp_max));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp");
     }
 
     /// sc-24438 AC2: a sparse-MoE Qwen35 snapshot carrying an MTP head — its predictor layer a
@@ -7885,6 +7933,7 @@ pub(crate) mod tests {
     /// `enabled 3` and `auto` each report the MTP proposer with drafts proposed, and emit exactly
     /// `off`'s stream.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_moe_snapshot_with_an_mtp_head_runs_mtp() {
         use crate::models::qwen35::tests::{cfg_json_moe_mtp, seeded_moe_mtp_tensors};
         use core_llm::{MtpMode, Speculative};
@@ -7960,6 +8009,8 @@ pub(crate) mod tests {
                 assert_eq!(ids, off_ids, "{label} {case}: greedy-exact");
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp");
     }
 
     /// Admission prices what each route holds: prompt lookup on a softmax decoder pays only its
@@ -8118,6 +8169,7 @@ pub(crate) mod tests {
     /// config declares a native MTP head it stores no tensor of loads the target plain, names the
     /// `mtp:` fallback in the load report, advertises no MTP and decodes.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_configured_mtp_head_the_snapshot_does_not_carry_is_a_named_load_fallback() {
         let target = crate::test_fixture::Fixture::new("mlx-mtp-absent-", None);
         crate::synthetic::write_prism_snapshot(&target, 6);
@@ -8142,6 +8194,8 @@ pub(crate) mod tests {
         assert!(provider.descriptor().capabilities.mtp.is_none());
         let (_, ids) = run(&provider, &prism_request(core_llm::Speculative::Off));
         assert_eq!(ids.len(), 20);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_configured_mtp_head_the_snapshot_does_not_carry_is_a_named_load_fallback");
     }
 
     /// Per step of `req`'s plain greedy run on `provider`'s hybrid decoder: whether the step is a
@@ -8202,6 +8256,7 @@ pub(crate) mod tests {
     /// engine — emits exactly `off`'s greedy tokens, with the report naming the head as the
     /// proposer that ran.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prism_with_a_companion_head_decodes_mtp_with_the_off_tokens() {
         use core_llm::Speculative;
         let fx = prism_load(None);
@@ -8259,12 +8314,15 @@ pub(crate) mod tests {
             .proposer(SpeculativeProposer::Mtp)
             .is_none());
         assert_eq!(run(&bare, &prism_request(Speculative::Off)).1, off_ids);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::prism_with_a_companion_head_decodes_mtp_with_the_off_tokens");
     }
 
     /// The f32 twin of the BF16 companion-head parity above: the same Prism fixture computing in
     /// f32 keeps `off`'s greedy tokens exactly over the whole run — every MTP depth, `auto`, and a
     /// prefix-cache hit — so the BF16 run's only allowance is its rounding.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prism_companion_head_in_f32_keeps_the_off_tokens_exactly() {
         use core_llm::Speculative;
         crate::models::qwen35::with_compute_dtype(Dtype::Float32, || {
@@ -8298,6 +8356,8 @@ pub(crate) mod tests {
                 off_ids,
                 "auto"
             );
+            crate::model_inference_device::record_model_inference_device();
+            println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::prism_companion_head_in_f32_keeps_the_off_tokens_exactly");
         })
     }
 
@@ -8305,6 +8365,7 @@ pub(crate) mod tests {
     /// named for a non-Qwen3.5 target are each refused with a named load fallback; the model still
     /// loads, advertises no MTP and decodes plainly.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure() {
         use core_llm::Speculative;
         let mut text = crate::synthetic::prism_qwen35_config()["text_config"].clone();
@@ -8370,6 +8431,8 @@ pub(crate) mod tests {
             "{fallbacks:?}"
         );
         assert!(causal.descriptor.capabilities.mtp.is_none());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure");
     }
 
     /// Story sc-24444 E7: the head's resident bytes are its safetensors payload plus the header's
@@ -8524,6 +8587,7 @@ pub(crate) mod tests {
     /// `auto`, and on the Qwen3.8 head MTP at depths 1 and 3, each emitting exactly `off`'s
     /// stream with a report naming its proposer; and something was actually drafted and accepted.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_backend_neutral_parity_suite_holds_on_both_decoders() {
         use core_llm::Speculative;
         use core_llm_testkit::{BenchPrompt, ParityCase, PromptClass};
@@ -8598,6 +8662,8 @@ pub(crate) mod tests {
                 assert!(drafted(ProposerKind::Mtp), "{label}: the head drafted");
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::the_backend_neutral_parity_suite_holds_on_both_decoders");
     }
 
     /// Epic AT1 at a production SDPA geometry: the shared fixture's hybrid target — 6 query heads
@@ -8609,6 +8675,7 @@ pub(crate) mod tests {
     /// verify (5 rows) in one call — the kernels `vector_verify_rows` / `speculative_max_depth`
     /// are justified by, which the narrow-head-dim fixtures never reach.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn every_proposer_is_greedy_exact_on_the_vector_kernel_geometry() {
         use crate::primitives::attention::kernel_tally::{record, SdpaKernel};
         let root = tempfile::tempdir().unwrap();
@@ -8676,6 +8743,8 @@ pub(crate) mod tests {
                 "{proposer:?}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::every_proposer_is_greedy_exact_on_the_vector_kernel_geometry");
     }
 
     // ---- The cross-turn prefix cache (sc-24437). ----
@@ -8723,6 +8792,7 @@ pub(crate) mod tests {
     /// it restores the shared run of turn 1's cached `prompt + reply` (N), and decodes exactly
     /// what a cold run (the non-engine plain loop, and a fresh provider) decodes.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run() {
         use core_llm::Speculative;
         let provider = causal_provider();
@@ -8764,6 +8834,8 @@ pub(crate) mod tests {
         assert_eq!(ids2, plain_loop(&provider, &turn2));
         assert_eq!(ids2, run(&causal_provider(), &turn2).1);
         assert!(provider.prefix_cache_resident_bytes() <= provider.prefix_cache_budget());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run");
     }
 
     /// AC2 through the provider: the hybrid snapshots at the end of turn 1's rendered
@@ -8771,6 +8843,7 @@ pub(crate) mod tests {
     /// restores the recurrent state there and matches a cold run — plain and with the MTP head
     /// resuming its warm-up from the stored boundary.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run() {
         use core_llm::Speculative;
         for speculative in [
@@ -8813,6 +8886,8 @@ pub(crate) mod tests {
                 assert_eq!(ids, run(&qwen35_mtp_provider(), &turn).1, "{speculative:?}");
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run");
     }
 
     fn speculative_kind(speculative: core_llm::Speculative) -> ProposerKind {
@@ -8987,6 +9062,7 @@ pub(crate) mod tests {
     /// caches (its compute dtype), and only the eager score term at F32. The Prism/Bonsai path is
     /// held at F32 until its frozen allocator peaks are re-taken.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn memory_geometry_prices_kv_at_the_cached_width() {
         let decoder = Decoder::Causal(Box::new(tiny_packed_capable_model()));
         let geometry = decoder.memory_geometry();
@@ -9009,6 +9085,8 @@ pub(crate) mod tests {
             dtype_bytes(Dtype::Float32),
             "Prism admission holds the pre-fix width until its peaks are re-taken"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::memory_geometry_prices_kv_at_the_cached_width");
     }
 
     #[derive(Default)]
@@ -9051,6 +9129,7 @@ pub(crate) mod tests {
     /// records its reason instead.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn compressed_prefix_hit_imports_the_reused_prefix_into_the_compressed_cache() {
         let model = tiny_packed_capable_model();
         // Longer than one 32-token group, so the import packs a K group and keeps a residual. The
@@ -9148,6 +9227,8 @@ pub(crate) mod tests {
             capture.evidence.is_empty(),
             "the dense seed carries the request"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::compressed_prefix_hit_imports_the_reused_prefix_into_the_compressed_cache");
     }
 
     /// Prefill logits, packed evidence and fallbacks of one observed generation.
@@ -9182,6 +9263,7 @@ pub(crate) mod tests {
     /// imported prefix moves the compressed logits by far more than that.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn compressed_8bit_multi_turn_prompt_cache_reuse_agrees_with_dense() {
         let model = tiny_packed_capable_model();
         let vocab = model.config().vocab_size;
@@ -9283,6 +9365,8 @@ pub(crate) mod tests {
         );
         assert_eq!(hit_tokens, dense_tokens, "compressed reuse vs dense turn 2");
         assert_eq!(cold_tokens, dense_tokens, "compressed cold vs dense turn 2");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::compressed_8bit_multi_turn_prompt_cache_reuse_agrees_with_dense");
     }
 
     /// A tiny packed-capable on-disk snapshot (head dim 64, 32-word vocabulary, a 2048-token
@@ -9443,6 +9527,7 @@ pub(crate) mod tests {
     /// campaign constant, while a production load keeps the template's own clock dating.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn campaign_multi_turn_prompt_ids_do_not_depend_on_the_date() {
         let snapshot = tiny_packed_capable_snapshot();
         let pinned: serde_json::Value = serde_json::from_str(include_str!(
@@ -9504,6 +9589,8 @@ pub(crate) mod tests {
             "{production_two}"
         );
         assert_ne!(production_ids_one, production_ids_two);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::campaign_multi_turn_prompt_ids_do_not_depend_on_the_date");
     }
 
     /// SC-20671 contract v4 multi-turn prompt-cache fixture on the product provider path, at
@@ -9513,6 +9600,7 @@ pub(crate) mod tests {
     /// agrees at >= 0.999 of 1024 positions. A turn 2 the cache did not serve is refused.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn multi_turn_prompt_cache_fixture_agrees_at_8_bit_and_requires_a_turn_two_hit() {
         let snapshot = tiny_packed_capable_snapshot();
         let provider = LlamaProvider::load_for_campaign(&core_llm::LoadSpec::dense(
@@ -9642,6 +9730,8 @@ pub(crate) mod tests {
             error.contains("not served by a prompt-cache hit"),
             "{error}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::multi_turn_prompt_cache_fixture_agrees_at_8_bit_and_requires_a_turn_two_hit");
     }
 
     /// A packed cache whose retained reader fails to bind still records the selection's own
@@ -9684,6 +9774,7 @@ pub(crate) mod tests {
     /// persistent KV it reports is the packed storage it later releases.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn compressed_campaign_decoder_keeps_prefill_and_decode_on_the_fused_reader() {
         let model = tiny_packed_capable_model();
         let arm = crate::campaign::CompressedKvMethod::GroupAffine
@@ -9723,6 +9814,8 @@ pub(crate) mod tests {
         assert_eq!(capture.reconstructions, 0);
         assert!(!capture.snapshots.is_empty());
         assert_eq!(capture.releases, vec![*capture.snapshots.last().unwrap()]);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::compressed_campaign_decoder_keeps_prefill_and_decode_on_the_fused_reader");
     }
 
     /// SC-20671 prefill attribution through the real decode loop, at 2- and 4-bit. An empty
@@ -9735,6 +9828,7 @@ pub(crate) mod tests {
     /// equals the 80-token dense K/V).
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn compressed_prefill_sample_holds_the_reported_packed_store() {
         #[derive(Default)]
         struct PrefillCapture {
@@ -9813,6 +9907,8 @@ pub(crate) mod tests {
                 capture.prefill_kv
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::compressed_prefill_sample_holds_the_reported_packed_store");
     }
 
     /// SC-20671 storage reconciliation through the real decode loop, at 2- and 4-bit: a prompt
@@ -9824,6 +9920,7 @@ pub(crate) mod tests {
     /// against a kvLength of 32843).
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn compressed_coordinate_storage_reconciles_across_a_block_plateau() {
         #[derive(Default)]
         struct StorageCapture {
@@ -9910,6 +10007,8 @@ pub(crate) mod tests {
             )
             .unwrap_or_else(|error| panic!("{method:?}: {error}"));
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::compressed_coordinate_storage_reconciles_across_a_block_plateau");
     }
 
     /// SC-20671 steady decode on a tiny model: both arms decode exactly the fixed length through
@@ -9917,6 +10016,7 @@ pub(crate) mod tests {
     /// refused fails closed instead of timing a dense decode under the compressed label.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn campaign_steady_decode_is_fixed_length_on_both_arms_and_refuses_a_dense_compressed_arm() {
         let model = Decoder::Causal(Box::new(tiny_packed_capable_model()));
         let every_id = (0..32).collect::<Vec<i32>>();
@@ -9950,6 +10050,8 @@ pub(crate) mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("fused compressed reader"), "{error}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::campaign_steady_decode_is_fixed_length_on_both_arms_and_refuses_a_dense_compressed_arm");
     }
 
     /// SC-20671 forced continuation on a tiny model: the dense arm continues greedily through
@@ -9959,6 +10061,7 @@ pub(crate) mod tests {
     /// compressed reader fails closed.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn campaign_forced_continuation_teacher_forces_the_compressed_arm_on_the_dense_stream() {
         let model = Decoder::Causal(Box::new(tiny_packed_capable_model()));
         let every_id = (0..32).collect::<Vec<i32>>();
@@ -10072,6 +10175,8 @@ pub(crate) mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("fused compressed reader"), "{error}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::campaign_forced_continuation_teacher_forces_the_compressed_arm_on_the_dense_stream");
     }
 
     // ---- sc-20679: production compressed KV ----
@@ -10348,6 +10453,7 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn compressed_kv_decode_logits_match_dense_within_8_bit_rounding() {
         for (identity, qk_norm, family) in [
             (
@@ -10371,6 +10477,8 @@ pub(crate) mod tests {
                 "{family:?}: K8V8 decode logits drifted {error}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::compressed_kv_decode_logits_match_dense_within_8_bit_rounding");
     }
 
     /// sc-20688 review (finding 1) at the provider: `generate_batch` decodes the plain text
@@ -10382,6 +10490,7 @@ pub(crate) mod tests {
     /// batched prompt reaches the compressed prefix store.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn generate_batch_decodes_concurrent_qualified_requests_dense_as_batched() {
         use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
         let provider = load_tiny(&tiny_snapshot(
@@ -10471,6 +10580,8 @@ pub(crate) mod tests {
         let alone = outputs[3].kv_cache.as_ref().unwrap();
         assert!(alone.ran_compressed(), "{alone:?}");
         assert_eq!(alone.counters.pool_held_bytes, 0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::generate_batch_decodes_concurrent_qualified_requests_dense_as_batched");
     }
 
     /// sc-20688 review round 2: a batch whose other request is cancelled before it starts leaves
@@ -10478,6 +10589,7 @@ pub(crate) mod tests {
     /// it runs alone through the single-request path, compressed on the contiguous cache.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_lone_batch_survivor_runs_on_the_contiguous_path_not_paged() {
         use core_llm::KvCompressionPolicy as Policy;
         let provider = load_tiny(&tiny_snapshot(
@@ -10512,6 +10624,8 @@ pub(crate) mod tests {
             report.counters.pool_held_bytes, 0,
             "the contiguous cache, not a shared page pool"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_lone_batch_survivor_runs_on_the_contiguous_path_not_paged");
     }
 
     /// The two epics together (sc-24432 × sc-20669): a qualified compressed request runs through
@@ -10521,6 +10635,7 @@ pub(crate) mod tests {
     /// store holds dense K/V and a compressed cache never re-enters it, by name.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_compressed_request_speculates_on_the_compressed_cache() {
         use core_llm::{KvCompressionPolicy as Policy, Speculative, SpeculativeProposer};
         let row = core_llm::KV_COMPRESSION_QUALIFICATIONS
@@ -10576,6 +10691,8 @@ pub(crate) mod tests {
             Some(core_llm::PREFIX_COMPRESSED_NOT_STORED)
         );
         assert!(provider.prefix.borrow().is_empty(), "nothing was stored");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_compressed_request_speculates_on_the_compressed_cache");
     }
 
     /// The Qwen3 fixture at its compressed qualification row, and the row's minimum context.
@@ -10599,6 +10716,7 @@ pub(crate) mod tests {
     /// store is left as the dense turn left it (a compressed cache never re-enters it).
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_compressed_turn_imports_the_dense_turns_prefix() {
         use core_llm::KvCompressionPolicy as Policy;
         let (snapshot, words) = qualified_qwen3_fixture();
@@ -10639,6 +10757,8 @@ pub(crate) mod tests {
             stored,
             "the compressed turn leaves the store unchanged"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_compressed_turn_imports_the_dense_turns_prefix");
     }
 
     /// A compressed turn whose cache declines the stored dense prefix (here: a reader its cache
@@ -10646,6 +10766,7 @@ pub(crate) mod tests {
     /// reported, the declined import named.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_declined_prefix_import_is_named_not_counted_as_reuse() {
         use core_llm::KvCompressionPolicy as Policy;
         let (snapshot, words) = qualified_qwen3_fixture();
@@ -10667,31 +10788,40 @@ pub(crate) mod tests {
             decode.prefix_cache.reason.as_deref(),
             Some(core_llm::PREFIX_COMPRESSED_IMPORT_DECLINED)
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_declined_prefix_import_is_named_not_counted_as_reuse");
     }
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn qwen3_compressed_kv_matches_dense_at_its_qualified_context() {
         assert_compressed_matches_dense(
             json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
             true,
             core_llm::KvModelFamily::Qwen3,
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::qwen3_compressed_kv_matches_dense_at_its_qualified_context");
     }
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn llama_compressed_kv_matches_dense_at_its_qualified_context() {
         assert_compressed_matches_dense(
             json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama"}),
             false,
             core_llm::KvModelFamily::Llama,
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::llama_compressed_kv_matches_dense_at_its_qualified_context");
     }
 
     /// AC1: a model whose family has no qualification row stays dense when opted in, and says so;
     /// so does every non-text path the plan refuses before any cache exists.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn unqualified_models_stay_dense_with_their_reason() {
         use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
         // Mistral shares the Llama decoder but is not the family the evidence measured.
@@ -10738,6 +10868,8 @@ pub(crate) mod tests {
             qwen.plan_kv_cache(Policy::Qualified, 40_448, 513, 1, false),
             KvPlan::Dense(report) if report.fallback == Some(Reason::AboveQualifiedContext)
         ));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::unqualified_models_stay_dense_with_their_reason");
     }
 
     /// AC1 at the production entry point: the request's token budget counts against the
@@ -10745,6 +10877,7 @@ pub(crate) mod tests {
     /// only while prompt + `max_new_tokens` stays inside it.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_final_context_bounds_a_production_compressed_request() {
         use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
         let provider = load_tiny(&tiny_snapshot(
@@ -10779,6 +10912,8 @@ pub(crate) mod tests {
                 None
             ))
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::the_final_context_bounds_a_production_compressed_request");
     }
 
     /// A provider assembled from parts cannot tell Llama from a Mistral or dense Qwen2 checkpoint
@@ -10948,6 +11083,7 @@ pub(crate) mod tests {
     /// A load that settled a zero budget never reads or feeds the cache: no lookup, no store,
     /// and every turn reports `off`.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn an_off_cache_is_never_read_or_fed() {
         use core_llm::Speculative;
         for provider in [causal_provider(), qwen35_mtp_provider()] {
@@ -10963,6 +11099,10 @@ pub(crate) mod tests {
             assert_eq!(report.prefix_hit_tokens, 0);
             assert_eq!(provider.prefix_cache_stats(), PrefixStats::default());
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED provider::tests::an_off_cache_is_never_read_or_fed"
+        );
     }
 
     /// A tied-embedding decoder snapshot at `vocab × h` (h = 256: every projection a whole number
@@ -11058,6 +11198,7 @@ pub(crate) mod tests {
     /// MUTATION: return `Some(0)` from `Decoder::promoted_request_bytes` and the pinned cases go
     /// RED; make `CausalLm::activations_promote` ignore the role and the LLM-decode Gemma cases do.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_one_token_request_working_set_is_priced_under_either_activation_dtype() {
         use crate::primitives::activation::ActivationRole;
         for (model_type, arch, gemma) in [
@@ -11153,6 +11294,8 @@ pub(crate) mod tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_one_token_request_working_set_is_priced_under_either_activation_dtype");
     }
 
     /// The final hidden state is `f32` exactly when `m` reports promoting activations.
@@ -11566,6 +11709,7 @@ pub(crate) mod tests {
     /// holds is admitted after evicting it; one byte shorter still is refused and leaves the
     /// cache as it was.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_request_reclaims_the_prefix_cache_up_to_the_admission_boundary() {
         use core_llm::Speculative;
         let provider = causal_provider();
@@ -11619,11 +11763,14 @@ pub(crate) mod tests {
                 "only this request's entry"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_request_reclaims_the_prefix_cache_up_to_the_admission_boundary");
     }
 
     /// E7 for the snapshot a hybrid request leaves behind: admitted with the request when the
     /// memory holds both, and at one byte short the request still runs — without keeping it.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_qwen35_request_keeps_its_snapshot_only_when_admission_holds_it() {
         use core_llm::Speculative;
         let req = chat(vec![Message::user("t3 t9 t4 t11")], Speculative::Off);
@@ -11659,12 +11806,15 @@ pub(crate) mod tests {
                 vec![prompt[..boundary].to_vec()]
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_qwen35_request_keeps_its_snapshot_only_when_admission_holds_it");
     }
 
     /// sc-24446 (E5): a provider loads with the MLX defaults-table speculative default, and a
     /// request that leaves the option unset runs whatever the provider's default is — here set to
     /// `auto` so the hook is observable — while an explicit off (new or legacy spelling) wins.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn an_unset_speculative_option_runs_the_providers_default() {
         let root = tempfile::tempdir().unwrap();
         let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
@@ -11689,6 +11839,8 @@ pub(crate) mod tests {
             prompt,
             8,
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::an_unset_speculative_option_runs_the_providers_default");
     }
 
     /// An 8-bit reader for the K8V8 identity whose backend the cache refuses to bind.
@@ -11722,6 +11874,7 @@ pub(crate) mod tests {
     /// then refuses the compressed cache is admitted again at the dense price before it runs.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn admission_prices_compressed_kv_only_when_the_request_runs_it() {
         use core_llm::{KvCompressionFormat as Format, KvCompressionPolicy as Policy};
         let row = core_llm::KV_COMPRESSION_QUALIFICATIONS
@@ -11801,6 +11954,8 @@ pub(crate) mod tests {
             report.fallback,
             Some(core_llm::KvCacheFallbackReason::ReaderUnavailable)
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::admission_prices_compressed_kv_only_when_the_request_runs_it");
     }
 
     /// A tiny hybrid (Qwen3.5-style GatedDeltaNet + full attention) snapshot the provider loads
@@ -11967,6 +12122,7 @@ pub(crate) mod tests {
     /// request run dense (the price a dense re-admission charges) must fit their estimates.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn admission_estimates_cover_the_measured_peak_compressed_and_dense() {
         use core_llm::{KvCompressionFormat as Format, KvCompressionPolicy as Policy};
         use mlx_rs::memory;
@@ -12014,6 +12170,8 @@ pub(crate) mod tests {
                 "{policy:?}: measured peak {peak} B exceeds the admission estimate {estimate} B"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::admission_estimates_cover_the_measured_peak_compressed_and_dense");
     }
 
     /// A reader that binds to the K8V8 cache and faults on every dispatch.
@@ -12045,6 +12203,7 @@ pub(crate) mod tests {
     /// selection refuses, reports the dense outcome with its reason — never a compressed label.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_reader_fault_or_refusal_is_reported_as_a_dense_fallback() {
         use core_llm::{KvCacheFallbackReason as Reason, KvCompressionFormat as Format};
         let model = tiny_packed_capable_model();
@@ -12141,6 +12300,8 @@ pub(crate) mod tests {
             .detail
             .as_deref()
             .is_some_and(|detail| detail.contains("head dimension")));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::a_reader_fault_or_refusal_is_reported_as_a_dense_fallback");
     }
 
     /// AC2: no dense K/V mirror survives an attention call on the compressed path. After the
@@ -12150,6 +12311,7 @@ pub(crate) mod tests {
     /// K or V of the same tokens would add.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn no_dense_kv_mirror_survives_a_compressed_attention_call() {
         use mlx_rs::memory;
         // Four K/V heads of 128 make one layer's dense K (1.5 MB at 1536 bf16 tokens) dwarf the
@@ -12227,6 +12389,8 @@ pub(crate) mod tests {
         let evidence = cache.packed_evidence().unwrap();
         assert!(evidence.accepted_direct_calls >= 2 * 40, "{evidence:?}");
         cache.reset().unwrap();
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::no_dense_kv_mirror_survives_a_compressed_attention_call");
     }
 
     /// sc-20680: the K8V8 page pool and dense block pool one synthetic model's paged requests
@@ -12293,6 +12457,7 @@ pub(crate) mod tests {
     /// cache's. Every decode attention call is fused; no call gathers.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn paged_compressed_kv_logits_match_contiguous_compressed_and_dense_paged() {
         let model = tiny_causal_model(4, 2, 64);
         let reader =
@@ -12338,6 +12503,8 @@ pub(crate) mod tests {
         assert!(error < 0.02, "paged K8V8 vs dense paged: {error}");
         drop(selection);
         assert_eq!(packed_pool.borrow().live_pages(), 0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::paged_compressed_kv_logits_match_contiguous_compressed_and_dense_paged");
     }
 
     /// sc-20680 AC3 and the policy's refusals: with the policy off the selection is the existing
@@ -12345,6 +12512,7 @@ pub(crate) mod tests {
     /// with the reason the report names.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn paged_selection_is_the_dense_paged_cache_when_off_or_refused() {
         use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
         let model = tiny_causal_model(4, 2, 64);
@@ -12444,6 +12612,8 @@ pub(crate) mod tests {
                 .fallback,
             Some(Reason::UnsupportedGeometry)
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::paged_selection_is_the_dense_paged_cache_when_off_or_refused");
     }
 
     /// sc-20680 AC2 page reuse, fragmentation and cancellation at the model boundary: requests
@@ -12452,6 +12622,7 @@ pub(crate) mod tests {
     /// fresh pool; the pool's live pages return to zero.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn paged_compressed_requests_share_a_fragmented_pool_and_cancellation_frees_pages() {
         let model = tiny_causal_model(4, 2, 64);
         let reader =
@@ -12557,6 +12728,8 @@ pub(crate) mod tests {
         drop(b);
         drop(c);
         assert_eq!(shared.borrow().live_pages(), 0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::paged_compressed_requests_share_a_fragmented_pool_and_cancellation_frees_pages");
     }
 
     /// sc-20680 AC1: a fused paged attention call neither builds nor keeps a dense K/V copy.
@@ -12567,6 +12740,7 @@ pub(crate) mod tests {
     /// call shows up in the peak even though nothing survives it).
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn no_dense_kv_copy_survives_a_paged_compressed_attention_call() {
         use mlx_rs::memory;
         let model = tiny_causal_model(4, 4, 128);
@@ -12667,5 +12841,7 @@ pub(crate) mod tests {
             selection.report().unwrap().counters.fused_attention_calls,
             2 * 40
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::no_dense_kv_copy_survives_a_paged_compressed_attention_call");
     }
 }

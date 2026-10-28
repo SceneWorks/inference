@@ -44,6 +44,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [features]
+model-inference-proof = ["candle-quant-kernels/model-inference-proof", "sceneworks-gen-core/model-inference-proof", "candle-core/model-inference-proof"]
 # Default works on Mac with NO extra features: candle-core defaults to the CPU backend.
 default = []
 # Test-support helpers (sc-9055 / F-069): the shared `testkit` module (PPM IO / cosine / env-path /

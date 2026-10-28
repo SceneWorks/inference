@@ -284,6 +284,20 @@ fn indexed_shard_names(
             ),
         ));
     }
+    #[cfg(feature = "model-inference-proof")]
+    match family {
+        "master" => crate::model_input_proof::record_reader_paths(
+            "gen-core::sd3_encoder_artifacts::indexed_shard_names/master",
+            crate::model_input_proof::InputRole::Configuration,
+            &[index_path],
+        ),
+        "fp16" => crate::model_input_proof::record_reader_paths(
+            "gen-core::sd3_encoder_artifacts::indexed_shard_names/fp16",
+            crate::model_input_proof::InputRole::Configuration,
+            &[index_path],
+        ),
+        _ => {}
+    }
     Ok(names)
 }
 

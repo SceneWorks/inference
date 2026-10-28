@@ -516,10 +516,15 @@ impl Pipeline {
     /// fails LOUD rather than silently repacking to garbage (sc-9474). Every hosted SD3.5 tier packs at 64.
     fn transformer_packed_config(&self) -> Option<candle_gen::quant::PackedConfig> {
         let path = self.root.join("transformer").join("config.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+        candle_gen::gen_core::__model_input_result!(
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v)),
+            "candle-gen-sd3::pipeline::Pipeline::transformer_packed_config/configuration",
+            Configuration,
+            &[&path]
+        )
     }
 
     /// Build the conditioning for a prompt: the aggregated pooled + context. For CFG the
@@ -1403,27 +1408,41 @@ mod tests {
 
     /// Full Large pipeline (CFG on) end-to-end on CPU → a decoded image of the right dimensions.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn large_cfg_pipeline_decodes_on_cpu() {
         let img = run_variant(Variant::Large, &Device::Cpu);
         // Sanity: 32×32 RGB.
         assert_eq!(img.width, 32);
         assert_eq!(img.height, 32);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::large_cfg_pipeline_decodes_on_cpu"
+        );
     }
 
     /// Full Turbo pipeline (4-step, CFG-off) end-to-end on CPU → a decoded image.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn turbo_distilled_pipeline_decodes_on_cpu() {
         let _ = run_variant(Variant::LargeTurbo, &Device::Cpu);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::turbo_distilled_pipeline_decodes_on_cpu");
     }
 
     /// Full **Medium** (MMDiT-X dual-attention, CFG-on) pipeline end-to-end on CPU → a decoded image
     /// of the right dimensions. Drives the dual-attention transformer through the SAME flow-match
     /// render core as Large (CFG cond + uncond), confirming the Medium config + dual blocks render.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn medium_mmdit_x_pipeline_decodes_on_cpu() {
         let img = run_variant_cfg(Variant::Medium, &tiny_medium_cfg(), &Device::Cpu);
         assert_eq!(img.width, 32);
         assert_eq!(img.height, 32);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::medium_mmdit_x_pipeline_decodes_on_cpu");
     }
 
     /// Determinism: with the SAME weights, the same seed reproduces the same image (the render core
@@ -1431,6 +1450,7 @@ mod tests {
     /// Builds one harness and renders twice; a differing result would mean hidden nondeterminism in
     /// the sampler/decode.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn render_is_deterministic_for_a_seed() {
         let device = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1465,6 +1485,11 @@ mod tests {
         let a = render(7);
         let b = render(7);
         assert_eq!(a.pixels, b.pixels, "same seed + weights must reproduce");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::render_is_deterministic_for_a_seed"
+        );
     }
 
     /// sc-8993: at `cfg_scale == 1.0` the CFG blend `uncond + 1·(cond − uncond)` is exactly `cond`
@@ -1483,6 +1508,7 @@ mod tests {
     /// CFG regression at cfg=1.0 (e.g. dropping the cond term, or a sign/scale error in the blend) shifts
     /// the image by far more than one gray level across many pixels.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cfg_scale_one_equals_cond_only_path() {
         let device = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1534,6 +1560,11 @@ mod tests {
             "cfg_scale 1.0 blend must equal cond-only (skipping the uncond branch is a no-op); \
              max per-pixel abs diff was {max_abs_diff} (>1 u8 => not just FP non-associativity)"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::cfg_scale_one_equals_cond_only_path"
+        );
     }
 
     /// **img2img blend invariants (sc-11784), CPU structural.** With a tiny random-weight MMDiT + the
@@ -1546,6 +1577,7 @@ mod tests {
     ///    `x_t = clean`, an empty (0-step) tail ⇒ the decode is exactly `vae.decode(clean)`;
     ///  - an interior `start_step` decodes a finite, right-shaped image (the path is wired).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn img2img_blend_edges_on_cpu() {
         let device = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1607,6 +1639,9 @@ mod tests {
         );
         assert_ne!(mid.pixels, txt2img.pixels);
         assert_ne!(mid.pixels, roundtrip.pixels);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::img2img_blend_edges_on_cpu");
     }
 
     /// **CUDA random-weight smoke (sc-7877).** Asserts the tiny MMDiT + VAE render core compiles, runs
@@ -1616,6 +1651,7 @@ mod tests {
     /// `CUDA_COMPUTE_CAP=80`). Both the CFG (Large) and distilled (Turbo) paths are exercised.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cuda_random_weight_forward_smoke() {
         let device = Device::new_cuda(0).expect("CUDA device 0");
         // Large (CFG) path.
@@ -1630,6 +1666,11 @@ mod tests {
             turbo.pixels.len(),
             (turbo.width * turbo.height * 3) as usize
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::cuda_random_weight_forward_smoke"
+        );
     }
 
     /// **CUDA Medium MMDiT-X random-weight smoke (sc-7878).** The Medium dual-attention transformer
@@ -1639,6 +1680,7 @@ mod tests {
     /// Built at `CUDA_COMPUTE_CAP=80` (dense PTX JIT — no quant), runs under `scripts/check-cuda.ps1`.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cuda_medium_mmdit_x_forward_smoke() {
         let device = Device::new_cuda(0).expect("CUDA device 0");
         let img = run_variant_cfg(Variant::Medium, &tiny_medium_cfg(), &device);
@@ -1646,6 +1688,11 @@ mod tests {
         // No NaN/Inf can escape the u8 decode clamp; the assertion above plus a successful decode is
         // the GPU-side "shapes + finite" smoke.
         assert_eq!(img.width, 4 * SPATIAL_SCALE);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::cuda_medium_mmdit_x_forward_smoke"
+        );
     }
 
     /// **CUDA Q4/Q8 quant smoke (sc-7879).** Build a tiny MMDiT (inner=32 so every contraction is at
@@ -1657,6 +1704,7 @@ mod tests {
     /// `CUDA_COMPUTE_CAP=80` under `scripts/check-cuda.ps1`.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cuda_quant_forward_smoke() {
         use candle_gen::gen_core::Quant;
 
@@ -1705,6 +1753,9 @@ mod tests {
             );
             eprintln!("sc-7879 {quant:?} CUDA quant smoke: max|v|={max_abs:.4} (finite, non-zero)");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::cuda_quant_forward_smoke");
     }
 
     /// **CUDA guidance-gate validation (sc-8993).** On the Blackwell GPU, prove the two AC halves:
@@ -1716,6 +1767,7 @@ mod tests {
     /// `CUDA_COMPUTE_CAP=80` under `scripts/check-cuda.ps1`.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cuda_cfg_gate_matches_cond_only_and_preserves_guided() {
         let device = Device::new_cuda(0).expect("CUDA device 0");
         let cfg = tiny_cfg();
@@ -1784,6 +1836,9 @@ mod tests {
         eprintln!(
             "sc-8993 CUDA gate: cfg1.0==cond-only (byte-eq), cfg4.0 guided distinct + decoded"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::cuda_cfg_gate_matches_cond_only_and_preserves_guided");
     }
 
     /// **Real-weight memory profile — GATED (sc-7879 / C6).** Measures the TRUE peak CUDA memory of a
@@ -1871,6 +1926,9 @@ mod tests {
             }
             other => panic!("expected images, got {other:?}"),
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::real_weight_render");
     }
 
     /// C6 coherence floor for a real-weight render: every pixel is finite (a `u8` buffer is finite by
@@ -1971,6 +2029,9 @@ mod tests {
             mean > 2.0,
             "adapted render barely differs from base (mean delta {mean:.2}) — did the LoRA merge?"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::lora_before_after_render");
     }
 
     /// **Medium real-weight smoke — GATED (sc-7878 / C6).** A real SD3.5-Medium (MMDiT-X) render
@@ -2010,5 +2071,8 @@ mod tests {
             }
             other => panic!("expected images, got {other:?}"),
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::medium_real_weight_render");
     }
 }

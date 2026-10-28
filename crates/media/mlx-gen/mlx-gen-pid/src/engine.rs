@@ -438,8 +438,15 @@ fn detect_v1pt5(w: &Weights) -> Result<bool> {
     let gate_rows = w
         .require("lq_proj.gate_modules.0.content_proj.weight")?
         .shape()[0];
+    detect_v1pt5_signals(
+        gate_rows,
+        w.get("pit_lq_gate.content_proj.weight").is_some(),
+    )
+}
+
+/// The actual student-version gate, also used by header-only configured overlay facts.
+pub fn detect_v1pt5_signals(gate_rows: i32, has_pit_gate: bool) -> Result<bool> {
     let scalar_gate = gate_rows == 1;
-    let has_pit_gate = w.get("pit_lq_gate.content_proj.weight").is_some();
     if scalar_gate != has_pit_gate {
         return Err(Error::Msg(format!(
             "pid: inconsistent v1.5 checkpoint signals — scalar gate (content_proj rows={gate_rows}) = \
@@ -448,6 +455,53 @@ fn detect_v1pt5(w: &Weights) -> Result<bool> {
         )));
     }
     Ok(scalar_gate)
+}
+
+/// Header-only facts of the same student/Gemma sources selected by `PidEngine::from_spec`.
+/// No model, Array, tokenizer, payload, or allocator observation is constructed. These describe
+/// configured source owners and topology, not a complete decode price or physical bound.
+pub struct PidHeaderFacts {
+    pub config: PidConfig,
+    pub v1pt5: bool,
+    pub student: Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>,
+    pub gemma: Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>,
+}
+
+pub fn configured_header_facts(pid: &PidWeights, backbone: &str) -> Result<PidHeaderFacts> {
+    use mlx_gen::gen_core::weightsmeta as wm;
+    let checkpoint = file_path(&pid.checkpoint, "pid checkpoint")?;
+    let gemma_dir = dir_path(&pid.gemma, "pid gemma encoder")?;
+    let spec = lookup(backbone).ok_or_else(|| {
+        Error::Msg(format!(
+            "pid: unknown/out-of-scope backbone {backbone:?} (no PiD latent-space mapping)"
+        ))
+    })?;
+    let student = wm::safetensors_path_tensor_headers(checkpoint).map_err(Error::from)?;
+    let gate = student
+        .iter()
+        .find(|h| h.name == "lq_proj.gate_modules.0.content_proj.weight")
+        .ok_or_else(|| Error::Msg("pid: missing LQ gate content projection".into()))?;
+    let rows =
+        gate.shape.first().copied().ok_or_else(|| {
+            Error::Msg("pid: LQ gate content projection has no row dimension".into())
+        })?;
+    let rows = i32::try_from(rows)
+        .map_err(|_| Error::Msg("pid: gate rows exceed native shape range".into()))?;
+    let v1pt5 = detect_v1pt5_signals(
+        rows,
+        student
+            .iter()
+            .any(|h| h.name == "pit_lq_gate.content_proj.weight"),
+    )?;
+    let merged = gemma_dir.join(GEMMA_MERGED_FILE);
+    let gemma_source = if merged.is_file() { merged } else { gemma_dir };
+    let gemma = wm::safetensors_path_tensor_headers(gemma_source).map_err(Error::from)?;
+    Ok(PidHeaderFacts {
+        config: config_for_spec(&spec, v1pt5),
+        v1pt5,
+        student,
+        gemma,
+    })
 }
 
 /// Extract the single-file path from a [`WeightsSource`], rejecting a directory.
@@ -737,6 +791,29 @@ mod selected_tiling_tests {
                 8192
             )
             .is_ok());
+        }
+    }
+}
+
+#[cfg(test)]
+mod header_facts_tests {
+    use super::*;
+    #[test]
+    fn configured_student_version_reuses_actual_two_signal_gate() {
+        assert!(!detect_v1pt5_signals(1536, false).unwrap());
+        assert!(detect_v1pt5_signals(1, true).unwrap());
+        assert!(detect_v1pt5_signals(1, false).is_err());
+        assert!(detect_v1pt5_signals(1536, true).is_err());
+        let spec = lookup("zimage-turbo").unwrap();
+        for version in [false, true] {
+            let cfg = config_for_spec(&spec, version);
+            assert_eq!(cfg.lq_latent_channels, spec.latent_channels);
+            assert_eq!(
+                cfg.latent_spatial_down_factor,
+                spec.latent_spatial_down_factor
+            );
+            assert_eq!(cfg.sr_scale, spec.pid_scale);
+            assert_eq!(cfg.pit_lq_inject, version);
         }
     }
 }

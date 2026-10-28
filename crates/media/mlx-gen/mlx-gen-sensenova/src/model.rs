@@ -36,7 +36,7 @@ use mlx_gen::{
 
 use crate::config::NeoChatConfig;
 use crate::distill::{resolve_distill_lora, DISTILL_MERGED_MARKER};
-use crate::loader::{check_coverage, load_raw};
+use crate::loader::{check_coverage, load_raw_with_companion};
 use crate::t2i::{request_phase_bounds, smart_resize, StepReporter, T2iModel, T2iOptions};
 use crate::text::load_tokenizer;
 use mlx_gen::weights::Weights;
@@ -443,11 +443,34 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<SenseNova> {
     // A single-file artifact is verified once and then becomes the source of truth for the initial
     // load, calibration identity, and every deferred Gen window. Sharded/multi-file layouts
     // retain the historical eager directory loader but truthfully do not advertise rung 4.
-    let pinned_artifact = crate::memory_strategy::verified_artifact(spec);
+    let pinned_artifact = crate::memory_strategy::verified_artifact_with_companion(
+        spec,
+        distill_lora_path.as_deref(),
+    );
     let weights = if let Some(artifact) = pinned_artifact.as_ref() {
-        artifact.open_weights()?
+        mlx_gen::gen_core::__model_input_choose!(
+            artifact.open_weights(),
+            mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+                if distill_lora_path.is_some() {
+                    "sensenova/runtime-base/merge-planned"
+                } else {
+                    "sensenova/runtime-base/no-runtime-merge"
+                },
+                || artifact.open_weights(),
+            )
+        )?
     } else {
-        load_raw(root)?
+        mlx_gen::gen_core::__model_input_choose!(
+            load_raw_with_companion(root, distill_lora_path.as_deref()),
+            mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+                if distill_lora_path.is_some() {
+                    "sensenova/runtime-base/merge-planned"
+                } else {
+                    "sensenova/runtime-base/no-runtime-merge"
+                },
+                || load_raw_with_companion(root, distill_lora_path.as_deref()),
+            )
+        )?
     };
     // F-137: diff the checkpoint against the canonical key set before building modules (the loader
     // module doc promised this validation). Missing keys still fail via `require` with the exact
@@ -485,7 +508,13 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<SenseNova> {
     // id at a *packed base* tier — no marker — stays a loud `merge_dense_delta` "base is quantized"
     // error, never a silent double-merge or half-load.)
     if let Some(lora_path) = distill_lora_path {
-        let lora = Weights::from_file(&lora_path)?;
+        let lora = mlx_gen::gen_core::__model_input_choose!(
+            Weights::from_file(&lora_path),
+            mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+                "sensenova/runtime-distill",
+                || Weights::from_file(&lora_path),
+            )
+        )?;
         let applied = model.merge_distill_lora(&lora)?;
         // The merge is lazy: read the LoRA factors now, before `quantize`/the first forward (sc-24245).
         lora.materialize_accessed()?;

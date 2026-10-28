@@ -129,7 +129,7 @@ fn assert_dit_is_packed(c: &mut AnimaComponents, bits: i32) {
 // -------------------------------------------------------------------------------------------------
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots; SLOW (packs a 3.9 GB DiT)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots; SLOW (packs a 3.9 GB DiT)"]
 fn packed_dit_lora_is_additive_over_packed_codes() {
     let tmp = tempfile::tempdir().unwrap();
     let lw = Weights::from_file(style_lora()).expect("style LoRA");
@@ -234,6 +234,9 @@ fn packed_dit_lora_is_additive_over_packed_codes() {
             "q{bits}: a scale-0 LoRA must be a no-op over the packed base (rel_err {err0:.3e})"
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED packed_adapters::packed_dit_lora_is_additive_over_packed_codes");
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -344,7 +347,7 @@ fn write_ppm(path: &Path, pixels: &[u8], w: u32, h: u32) {
 }
 
 #[test]
-#[ignore = "needs both Anima snapshots; VERY SLOW (packs a 3.9 GB DiT, then two 30-step 1024² denoises)"]
+#[ignore = "model inference; explicit model-proof workflow; needs both Anima snapshots; VERY SLOW (packs a 3.9 GB DiT, then two 30-step 1024² denoises)"]
 fn packed_q4_plus_style_lora_generates_a_visibly_restyled_image() {
     let tmp = tempfile::tempdir().unwrap();
     use mlx_gen::runtime::CancelFlag;
@@ -408,4 +411,7 @@ fn packed_q4_plus_style_lora_generates_a_visibly_restyled_image() {
         diff > 2.0,
         "the style LoRA left the q4 output essentially unchanged (mean |Δ| {diff:.2}) — it is inert"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED packed_adapters::packed_q4_plus_style_lora_generates_a_visibly_restyled_image");
 }

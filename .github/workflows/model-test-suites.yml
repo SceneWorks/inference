@@ -1,0 +1,107 @@
+name: Explicit exhaustive model test suites
+
+# CI_IMPACT: dispatch only. No PR/push learned execution or added automatic runner cost.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  candle-cpu:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: base
+            packages: '-p candle-llm -p candle-quant-kernels -p candle-audio -p runtime-cpu'
+            targets: '--lib'
+          - group: gen
+            packages: '-p candle-gen*'
+            targets: '--lib --tests'
+    env:
+      CARGO_BUILD_JOBS: '1'
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate exact checked-out source and registry
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 scripts/ci/test_suites.py check
+      - name: Run only registered exhaustive CPU cases
+        shell: bash
+        env:
+          PACKAGES: ${{ matrix.packages }}
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          read -r -a packages <<< "$PACKAGES"
+          read -r -a targets <<< "$TARGETS"
+          python3 scripts/ci/test_suites.py --deadline-seconds 7200 exhaustive -- cargo test --locked "${targets[@]}" -j 1 "${packages[@]}"
+
+  mlx-metal:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: '1'
+      RUST_TEST_THREADS: '1'
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate exact checked-out source and registry
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 scripts/ci/test_suites.py check
+      - name: Provision pinned MLX native dependency
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then sudo xcodebuild -downloadComponent MetalToolchain; fi
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" != 0 ] && [ "$rc" != 1 ]; then exit "$rc"; fi
+      - name: Run only registered exhaustive MLX cases
+        run: |
+          python3 scripts/ci/test_suites.py --deadline-seconds 7200 exhaustive -- cargo test --locked --lib --tests -j 1 -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
+
+  candle-cuda:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'SceneWorks/inference'
+    runs-on: [self-hosted, windows, cuda]
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: '4'
+      RUST_TEST_THREADS: '1'
+      CUDA_COMPUTE_CAP: '80'
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+      VCVARS: 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Bind physical GPU1 before any exhaustive model case
+        shell: powershell
+        run: |
+          if ((git rev-parse HEAD) -ne $env:GITHUB_SHA) { throw 'source mismatch' }
+          $rows = @(nvidia-smi -i 1 --query-gpu=index,uuid,memory.free --format=csv,noheader,nounits)
+          if ($LASTEXITCODE -ne 0 -or $rows.Count -ne 1) { throw 'GPU1 identity unavailable' }
+          $match = [regex]::Match($rows[0], '^1, (GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}), ([0-9]+)$')
+          if (-not $match.Success -or [int]$match.Groups[2].Value -le 0) { throw 'GPU1 identity or free memory unavailable' }
+          $encoding = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "CUDA_VISIBLE_DEVICES=$($match.Groups[1].Value)`nCUDA_DEVICE_ORDER=PCI_BUS_ID`nSCENEWORKS_GPU_ID=1`n", $encoding)
+      - name: Run only registered exhaustive CUDA cases
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          python scripts/ci/test_suites.py --deadline-seconds 7200 exhaustive -- cargo test --locked --lib --tests -j 1 -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast

@@ -740,6 +740,9 @@ fn tier_quality_against_the_f32_reference() {
             _ => {}
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quality::tier_quality_against_the_f32_reference");
 }
 
 /// `(config, top-1 agreement ≥, mean KL ≤, latents SNR ≥ dB, backends the bound was measured on)`

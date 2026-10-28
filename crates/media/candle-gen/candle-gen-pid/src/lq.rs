@@ -61,7 +61,7 @@ impl Conv {
             Some(p) => x.pad_with_same(2, p, p)?.pad_with_same(3, p, p)?,
             None => x.clone(),
         };
-        Ok(self.conv.forward(&x)?)
+        Ok(__model_proof_output!(self.conv.forward(&x))?)
     }
 }
 
@@ -92,8 +92,12 @@ impl ResBlock {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = self.conv2.forward(&self.gn0.forward(x)?.silu()?)?;
-        let h = self.conv5.forward(&self.gn3.forward(&h)?.silu()?)?;
+        let h = self
+            .conv2
+            .forward(&__model_proof_output!(self.gn0.forward(x))?.silu()?)?;
+        let h = self
+            .conv5
+            .forward(&__model_proof_output!(self.gn3.forward(&h))?.silu()?)?;
         Ok((x + h)?)
     }
 }
@@ -151,11 +155,11 @@ impl SigmaGate {
     /// `x`, `lq`: `[B, N, D]`; `sigma`: `[B]`.
     fn forward(&self, x: &Tensor, lq: &Tensor, sigma: &Tensor) -> Result<Tensor> {
         let cat = Tensor::cat(&[x, lq], candle_gen::candle_core::D::Minus1)?;
-        let logit = self.content_proj.forward(&cat)?; // [B,N,D]
+        let logit = __model_proof_output!(self.content_proj.forward(&cat))?; // [B,N,D]
         let b = sigma.dim(0)?;
         // exp(log_alpha)·σ  →  [D] · [B,1,1] = [B,1,D] (broadcast)
         let alpha = self.log_alpha.exp()?;
-        let sigma_off = sigma.reshape((b, 1, 1))?.broadcast_mul(&alpha)?;
+        let sigma_off = __model_proof_output!(sigma.reshape((b, 1, 1))?.broadcast_mul(&alpha))?;
         let gate = sigmoid(&logit.broadcast_sub(&sigma_off)?)?;
         // broadcast_mul (not mul): v1.5's scalar gate is [B,N,1] and must broadcast across lq's D.
         Ok((x + gate.broadcast_mul(lq)?)?)

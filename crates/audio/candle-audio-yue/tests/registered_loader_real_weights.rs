@@ -36,6 +36,16 @@
 //! `yue_en_icl` (4 s stereo clip, 0–3 s window) 102 s, 6.8 GB; repo-root `yue_en_cot` 75 s,
 //! 9.7 GB. Peaks vary run to run (7.4–9.7 GB observed for the same CoT case).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -207,6 +217,11 @@ fn en_cot_renders_one_segment_through_the_registered_loader() {
         Layout::WorkerTierDirs,
         &one_segment_request(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED en_cot_renders_one_segment_through_the_registered_loader"
+    );
 }
 
 #[test]
@@ -217,6 +232,11 @@ fn en_cot_renders_one_segment_from_the_tiered_repo_roots() {
         "yue-s1-7b-anneal-en-cot-candle",
         Layout::RepoRoots,
         &one_segment_request(),
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED en_cot_renders_one_segment_from_the_tiered_repo_roots"
     );
 }
 
@@ -229,7 +249,15 @@ fn en_icl_renders_one_segment_with_a_single_track_reference() {
          scripts/reference/yue_icl_reference.py)",
     );
     let path = ref_dir.join("sceneworks-derived").join("pop.00001.f32le");
-    let raw = std::fs::read(&path).unwrap_or_else(|e| {
+    let raw = candle_audio::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/audio/candle-audio-yue/tests/registered_loader_real_weights.rs::en_icl_renders_one_segment_with_a_single_track_reference::std::fs::read@9830",
+Reference,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = candle_audio::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap_or_else(|e| {
         panic!(
             "{}: {e} — run scripts/reference/yue_icl_reference.py to decode it",
             path.display()
@@ -266,5 +294,10 @@ fn en_icl_renders_one_segment_with_a_single_track_reference() {
         "yue-s1-7b-anneal-en-icl-candle",
         Layout::WorkerTierDirs,
         &req,
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED en_icl_renders_one_segment_with_a_single_track_reference"
     );
 }

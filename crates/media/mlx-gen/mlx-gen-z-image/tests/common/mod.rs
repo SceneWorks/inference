@@ -62,3 +62,8 @@ pub fn rel(a: &Array, b: &Array) -> (f32, f32) {
     let mean_diff = xs.iter().zip(ys).map(|(x, y)| (x - y).abs()).sum::<f32>() / xs.len() as f32;
     (max_diff / peak, mean_diff / mabs)
 }
+
+// Test-only evidence readback; no model/device change, Array evaluation or normal library export.
+#[cfg(target_os = "macos")]
+#[path = "../../../mlx-gen-iris/tests/common/metal_guard.rs"]
+pub mod metal_guard;

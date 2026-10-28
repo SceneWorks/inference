@@ -777,4 +777,7 @@ fn fit_preview_rgb() {
         "HOLDOUT overall R2 {holdout_overall:.8} below the epic bar {HOLDOUT_OVERALL_R2_FLOOR} — \
          this is a NO-GO and no fit may ship"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED fit_preview_rgb::fit_preview_rgb");
 }

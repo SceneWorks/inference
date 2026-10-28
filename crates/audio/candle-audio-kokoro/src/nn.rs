@@ -70,7 +70,7 @@ impl BiLstm {
         let rev_in = reverse_time(x)?;
         let states = self.bwd.seq(&rev_in)?;
         let bwd_out = reverse_time(&self.bwd.states_to_tensor(&states)?)?;
-        Ok(Tensor::cat(&[&fwd_out, &bwd_out], 2)?)
+        __model_proof_output!(Ok(Tensor::cat(&[&fwd_out, &bwd_out], 2)?))
     }
 }
 
@@ -96,10 +96,10 @@ impl ChannelLayerNorm {
         let centered = xt.broadcast_sub(&mean)?;
         let var = centered.sqr()?.mean_keepdim(2)?;
         let normed = centered.broadcast_div(&(var + 1e-5)?.sqrt()?)?;
-        let out = normed
-            .broadcast_mul(&self.gamma)?
-            .broadcast_add(&self.beta)?;
-        Ok(out.transpose(1, 2)?)
+        let out = __model_proof_output!(
+            __model_proof_output!(normed.broadcast_mul(&self.gamma))?.broadcast_add(&self.beta)
+        )?;
+        __model_proof_output!(Ok(out.transpose(1, 2)?))
     }
 }
 
@@ -125,7 +125,7 @@ impl AdaLayerNorm {
 
     /// `x: [1, C, T]`, `s: [1, style_dim] → [1, C, T]`.
     pub fn forward(&self, x: &Tensor, s: &Tensor) -> Result<Tensor> {
-        let h = self.fc.forward(s)?; // [1, 2C]
+        let h = __model_proof_output!(self.fc.forward(s))?; // [1, 2C]
         let c = h.dim(1)? / 2;
         let gamma = h.i((.., ..c))?.unsqueeze(1)?; // [1, 1, C]
         let beta = h.i((.., c..))?.unsqueeze(1)?;
@@ -159,7 +159,7 @@ impl AdaIn1d {
         let var = centered.sqr()?.mean_keepdim(2)?;
         let normed = centered.broadcast_div(&(var + 1e-5)?.sqrt()?)?;
 
-        let h = self.fc.forward(s)?; // [1, 2C]
+        let h = __model_proof_output!(self.fc.forward(s))?; // [1, 2C]
         let c = h.dim(1)? / 2;
         let gamma = h.i((.., ..c))?.unsqueeze(2)?; // [1, C, 1]
         let beta = h.i((.., c..))?.unsqueeze(2)?;
@@ -258,10 +258,10 @@ impl AdainResBlk1d {
             Some(p) => p.forward(&x)?,
             None => x,
         };
-        let x = self.conv1.forward(&x)?;
+        let x = __model_proof_output!(self.conv1.forward(&x))?;
         let x = self.norm2.forward(&x, s)?;
         let x = ops::leaky_relu(&x, LRELU_SLOPE_BLOCKS)?;
-        Ok(self.conv2.forward(&x)?)
+        Ok(__model_proof_output!(self.conv2.forward(&x))?)
     }
 
     /// `x: [1, C_in, T]`, `s: [1, style_dim] → [1, C_out, T·(1|2)]`.
@@ -401,6 +401,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn channel_layer_norm_normalizes_channels() {
         let dev = Device::Cpu;
         let vb = vb_from(vec![
@@ -420,6 +421,11 @@ mod tests {
         assert!(
             (y[0] + 1.0).abs() < 1e-3 && (y[1] - 1.0).abs() < 1e-3,
             "{y:?}"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED nn::tests::channel_layer_norm_normalizes_channels"
         );
     }
 

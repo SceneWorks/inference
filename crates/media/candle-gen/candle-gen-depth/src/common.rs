@@ -144,7 +144,9 @@ impl Linear {
         let in_features = *dims.last().expect("linear input has rank >= 1");
         let lead: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((lead, in_features))?;
-        let y = x2.matmul(&self.weight_t)?.broadcast_add(&self.bias)?;
+        let y = __model_proof_output!(
+            __model_proof_output!(x2.matmul(&self.weight_t))?.broadcast_add(&self.bias)
+        )?;
         let mut out_shape = dims;
         *out_shape.last_mut().unwrap() = self.out_features;
         Ok(y.reshape(out_shape)?)

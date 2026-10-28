@@ -1415,5 +1415,10 @@ mod tests {
                 "frame {i}: masks differ — clip A leaked into clip B",
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED video::tests::propagate_twice_matches_fresh_model"
+        );
     }
 }
