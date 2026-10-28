@@ -213,7 +213,7 @@ impl SigmaSchedule {
     ///
     /// Finiteness is checked **first and separately** rather than folded into the ordering test: a
     /// `NaN` compares false against everything, so `w[1] >= w[0]` would wave it through, and
-    /// [`crate::dit::adaln::TimestepSchedule`] keys on bit patterns where a `NaN` timestep can
+    /// each engine's `dit::adaln::TimestepSchedule` keys on bit patterns where a `NaN` timestep can
     /// never be looked up again.
     pub fn from_sigmas(modality: DenoiseModality, shift: f32, sigmas: Vec<f32>) -> Result<Self> {
         if sigmas.len() < MIN_INFERENCE_STEPS
