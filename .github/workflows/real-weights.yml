@@ -6995,7 +6995,7 @@ jobs:
           "%REVIEWED_PYTHON%" -m scripts.ci.moss_edit_cuda
       - name: Preserve bounded numerical and owned-process receipts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: moss-edit-cuda-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -7020,7 +7020,7 @@ jobs:
       - name: Compile and list the exact oracle without allocating a Metal device
         run: python3.12 scripts/ci/moss_edit_metal.py prepare
       - name: Publish prepared source, runtime, binary, and test identities
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: moss-metal-prepared-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -7032,7 +7032,7 @@ jobs:
         run: python3.12 scripts/ci/moss_edit_metal.py execute
       - name: Preserve numerical and owned-process receipts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: moss-metal-result-${{ github.run_id }}-${{ github.run_attempt }}
           path: |

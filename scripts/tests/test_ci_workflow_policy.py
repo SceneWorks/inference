@@ -5711,5 +5711,20 @@ class Qwen21TerminalPhysicalCeilingTests(unittest.TestCase):
                 self.assertTrue(self.ceiling_errors(mutant))
 
 
+class ActionPinConsistencyTests(unittest.TestCase):
+    """sc-27365: one artifact-upload action pin across every workflow, so a drifted SHA cannot hide."""
+
+    def test_upload_artifact_resolves_to_a_single_sha(self) -> None:
+        pins = set()
+        for workflow in sorted(WORKFLOW.parent.glob("*.yml")):
+            pins.update(
+                re.findall(
+                    r"uses:\s*actions/upload-artifact@([0-9a-f]{40})",
+                    workflow.read_text(encoding="utf-8"),
+                )
+            )
+        self.assertEqual(len(pins), 1, f"actions/upload-artifact pinned to {sorted(pins)}")
+
+
 if __name__ == "__main__":
     unittest.main()
