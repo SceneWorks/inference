@@ -1433,14 +1433,8 @@ impl AdaptableHost for Krea2Transformer {
 
 // ── Shared helpers ──────────────────────────────────────────────────────────────────────────
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix.
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;
 
 /// Split `[b, L, ...]` at the sequence-axis (axis 1) boundary `at`, returning `[x[..at], x[at..]]` —
 /// a contiguous split (`split_axis`), not an arange-gather (F-114). `at` must satisfy `0 ≤ at ≤ L`.

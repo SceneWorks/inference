@@ -23,13 +23,14 @@ use std::path::PathBuf;
 use mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::media::Image;
+use mlx_gen::testing::max_abs;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Quant, WeightsSource,
 };
 use mlx_gen_krea::{load, load_transformer};
-use mlx_rs::ops::{abs, max, subtract};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::ops::subtract;
+use mlx_rs::Dtype;
 
 /// The bypass file's single diff-patch key.
 const PROJECTOR_DIFF_KEY: &str = "diffusion_model.txtfusion.projector.diff";
@@ -40,10 +41,6 @@ fn turbo_dir() -> Option<PathBuf> {
 
 fn bypass_file() -> Option<PathBuf> {
     std::env::var("KREA_BYPASS_FILE").ok().map(PathBuf::from)
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), false).unwrap().item::<f32>()
 }
 
 /// The bypass file folds `W += δ` into the dense projector base bit-for-bit — the direct proof the

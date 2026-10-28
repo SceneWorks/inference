@@ -28,6 +28,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use mlx_gen::testing::max_abs;
 use mlx_gen_qwen_image::loader::{load_transformer, load_transformer_edit};
 use mlx_gen_qwen_image::transformer::{set_compile_glue, QwenTransformer};
 use mlx_rs::{random, Array, Dtype};
@@ -68,16 +69,6 @@ fn max_abs_diff(a: &Array, b: &Array) -> f32 {
     let b = b.as_dtype(Dtype::Float32).unwrap();
     let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&a, &b).unwrap()).unwrap();
     mlx_rs::ops::max(&d, None).unwrap().item::<f32>()
-}
-
-/// Peak magnitude of `a`, the denominator of the relative bound (printed so any future run log
-/// carries the ratio, not just the numerator — the gap sc-17513 had to close before it could set a
-/// bound at all).
-fn max_abs(a: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    mlx_rs::ops::max(mlx_rs::ops::abs(&a).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
 }
 
 /// Peak-**relative** bound on the compiled-glue-vs-eager divergence of the **whole 60-layer T2I

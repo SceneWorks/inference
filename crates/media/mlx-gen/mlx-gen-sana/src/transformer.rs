@@ -45,6 +45,7 @@ use mlx_rs::ops::{
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::array::scalar;
 use mlx_gen::attention::{slice_axis, AttentionBudget};
 use mlx_gen::block_residency::BlockPlan;
 use mlx_gen::nn::{conv2d_general, gelu_tanh, silu, timestep_sincos};
@@ -121,10 +122,6 @@ fn record_chunk_count(n: usize) {
 #[cfg(not(test))]
 #[inline(always)]
 fn record_chunk_count(_n: usize) {}
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 fn relu(x: &Array) -> Result<Array> {
     Ok(mlx_rs::nn::relu(x)?)

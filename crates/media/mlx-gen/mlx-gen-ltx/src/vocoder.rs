@@ -25,16 +25,13 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{Error, Result};
 
 use crate::config::{VocoderConfig, VocoderGenConfig};
 
 const LRELU_SLOPE: f32 = 0.1;
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 fn f32(w: &Weights, key: &str) -> Result<Array> {
     to_dtype(w.require(key)?, Dtype::Float32)

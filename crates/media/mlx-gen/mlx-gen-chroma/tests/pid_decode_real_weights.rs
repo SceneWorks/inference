@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use mlx_gen::testing::save_png;
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_chroma::load_flash;
 
@@ -52,17 +53,6 @@ fn stats(img: &Image) -> (u8, u8, f64) {
         sum += p as u64;
     }
     (lo, hi, sum as f64 / img.pixels.len() as f64)
-}
-
-fn save_png(img: &Image, path: &str) {
-    image::save_buffer(
-        path,
-        &img.pixels,
-        img.width,
-        img.height,
-        image::ColorType::Rgb8,
-    )
-    .unwrap();
 }
 
 #[test]
@@ -130,8 +120,8 @@ fn chroma_flash_pid_decode_vs_vae() {
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/golden/pid");
     let _ = std::fs::create_dir_all(dir);
-    save_png(&vae_img, &format!("{dir}/chroma_vae_{}.png", vae_img.width));
-    save_png(&pid_img, &format!("{dir}/chroma_pid_{}.png", pid_img.width));
+    save_png(&vae_img, format!("{dir}/chroma_vae_{}.png", vae_img.width));
+    save_png(&pid_img, format!("{dir}/chroma_pid_{}.png", pid_img.width));
     eprintln!(
         "wrote {dir}/chroma_vae_{}.png + chroma_pid_{}.png  (PiD {:.1}× slower than VAE)",
         vae_img.width,

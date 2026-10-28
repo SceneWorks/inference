@@ -179,7 +179,7 @@ pub fn memory_strategy_contract(
             projected_safetensors_bytes(path, |_| match spec.quantize {
                 Some(quant) => ResidentProjection::GroupQuantized {
                     bits: quant.bits(),
-                    group_size: crate::quant::GROUP_SIZE as usize,
+                    group_size: mlx_gen::quant::DEFAULT_GROUP_SIZE as usize,
                 },
                 None => ResidentProjection::Stored,
             })?
@@ -203,7 +203,7 @@ fn projected_component_bytes(
     projected_safetensors_bytes(path, |_| match quant {
         Some(quant) => ResidentProjection::GroupQuantized {
             bits: quant.bits(),
-            group_size: crate::quant::GROUP_SIZE as usize,
+            group_size: mlx_gen::quant::DEFAULT_GROUP_SIZE as usize,
         },
         None => ResidentProjection::Stored,
     })
@@ -938,7 +938,7 @@ mod tests {
         let transformer = projected_safetensors_bytes(root.join("transformer"), |_| {
             ResidentProjection::GroupQuantized {
                 bits: 4,
-                group_size: crate::quant::GROUP_SIZE as usize,
+                group_size: mlx_gen::quant::DEFAULT_GROUP_SIZE as usize,
             }
         })
         .unwrap();
@@ -947,7 +947,7 @@ mod tests {
         let overlay =
             projected_safetensors_bytes(&control, |_| ResidentProjection::GroupQuantized {
                 bits: 4,
-                group_size: crate::quant::GROUP_SIZE as usize,
+                group_size: mlx_gen::quant::DEFAULT_GROUP_SIZE as usize,
             })
             .unwrap();
         let contract = memory_strategy_contract_with_asset_facts(

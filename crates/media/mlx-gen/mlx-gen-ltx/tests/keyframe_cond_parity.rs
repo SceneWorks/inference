@@ -8,9 +8,9 @@
 //! the frame-offset RoPE positions (causal-fixed only at `frame_idx == 0`, `+= frame_idx`, `÷ fps`).
 //! No model weights / IC-LoRA needed: it's a pure tensor op, so this runs without `--ignored`.
 
-use mlx_rs::ops::{abs, max as max_op, subtract};
 use mlx_rs::Array;
 
+use mlx_gen::testing::max_abs_diff;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::{append_keyframe_clip, VideoTokenState};
 
@@ -18,11 +18,6 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/ltx_keyframe_cond_golden.safetensors"
 );
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let d = abs(subtract(a, b).unwrap()).unwrap();
-    max_op(&d, None).unwrap().item::<f32>()
-}
 
 /// A trivial 1-token zero base state (matching the dump's base) with `C` channels.
 fn base_state(c: i32) -> VideoTokenState {

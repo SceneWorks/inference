@@ -572,13 +572,15 @@ fn small_real_native_solver_allocation_checks_logical_adapter_assumptions() {
             mlx_rs::memory::reset_peak_memory();
             let mut callbacks = 0;
             let output = crate::run_curated_sampler(
-                Some(solver.name()),
+                crate::SamplerRun {
+                    sampler_name: Some(solver.name()),
+                    sigmas: &sigmas,
+                    seed: 0,
+                    cancel: &crate::CancelFlag::new(),
+                    on_progress: &mut |_| {},
+                },
                 &ms,
-                &sigmas,
                 initial,
-                0,
-                &crate::CancelFlag::new(),
-                &mut |_| {},
                 |_, _| {
                     callbacks += 1;
                     let prediction = mlx_rs::Array::from_slice(&[0.25f32; 16], &[16])

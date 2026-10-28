@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use mlx_gen::testing::save_png;
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, WeightsSource};
 
 const MODEL_ID: &str = "flux2_klein_9b";
@@ -83,17 +84,6 @@ fn stats(img: &Image) -> (u8, u8, f64) {
         sum += p as u64;
     }
     (lo, hi, sum as f64 / img.pixels.len() as f64)
-}
-
-fn save_png(img: &Image, path: &str) {
-    image::save_buffer(
-        path,
-        &img.pixels,
-        img.width,
-        img.height,
-        image::ColorType::Rgb8,
-    )
-    .unwrap();
 }
 
 fn one_image(out: GenerationOutput) -> Image {
@@ -169,8 +159,8 @@ fn flux2_klein_pid_decode_vs_vae() {
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/golden/pid");
     let _ = std::fs::create_dir_all(dir);
-    save_png(&vae_img, &format!("{dir}/flux2_vae_{}.png", vae_img.width));
-    save_png(&pid_img, &format!("{dir}/flux2_pid_{}.png", pid_img.width));
+    save_png(&vae_img, format!("{dir}/flux2_vae_{}.png", vae_img.width));
+    save_png(&pid_img, format!("{dir}/flux2_pid_{}.png", pid_img.width));
     eprintln!(
         "wrote {dir}/flux2_vae_{}.png + flux2_pid_{}.png  (PiD {:.1}× slower than VAE)",
         vae_img.width,
@@ -269,13 +259,10 @@ fn flux2_pid_from_ldm_early_stop() {
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/golden/pid");
     let _ = std::fs::create_dir_all(dir);
-    save_png(
-        &clean,
-        &format!("{dir}/flux2_pid_clean_{}.png", clean.width),
-    );
+    save_png(&clean, format!("{dir}/flux2_pid_clean_{}.png", clean.width));
     save_png(
         &early,
-        &format!("{dir}/flux2_pid_fromldm_{}.png", early.width),
+        format!("{dir}/flux2_pid_fromldm_{}.png", early.width),
     );
     eprintln!("wrote {dir}/flux2_pid_clean_*.png + flux2_pid_fromldm_*.png");
     crate::model_inference_device::record_model_inference_device();

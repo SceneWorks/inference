@@ -70,6 +70,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use mlx_gen::testing::max_abs;
 use mlx_gen::weights::Weights;
 use mlx_gen_krea_realtime::{
     convert_krea_realtime_tier, convert_krea_realtime_tier_sharded,
@@ -657,17 +658,6 @@ fn stock_wan_companions_load_at_the_krea_geometry() {
     );
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED rehost_real_weights::stock_wan_companions_load_at_the_krea_geometry");
-}
-
-/// Largest absolute element of `a`, as f32.
-fn max_abs(a: &Array) -> f32 {
-    a.as_dtype(Dtype::Float32)
-        .expect("f32")
-        .abs()
-        .expect("abs")
-        .max(None)
-        .expect("max")
-        .item::<f32>()
 }
 
 /// **Content** fidelity of the emitted tier — the check that shape-level verification cannot make.

@@ -900,10 +900,9 @@ impl QwenImage21Transformer {
     /// one) takes 32, and a width below 32 stays dense rather than failing the load.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         fn quantize_one(lin: &mut AdaptableLinear, bits: i32) -> Result<()> {
-            let width = lin.base_shape()[1];
-            let group = if width % GROUP_SIZE == 0 {
+            let group = if lin.is_quant_aligned(Some(GROUP_SIZE)) {
                 GROUP_SIZE
-            } else if width % 32 == 0 {
+            } else if lin.is_quant_aligned(Some(32)) {
                 32
             } else {
                 return Ok(());

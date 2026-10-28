@@ -35,7 +35,7 @@ use mlx_gen::{
     require_control, run_flow_sampler_with_latent_hook, AcceptedControlKinds, Capabilities,
     ConditioningKind, ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Quant, Residency, Result, TimestepConvention,
+    Quant, Residency, Result, SamplerRun, TimestepConvention,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -302,13 +302,15 @@ impl Flux1DevControl {
                     let latents = create_noise(seed, req.width, req.height)?;
                     let previews = mlx_gen::preview::PreviewCounter::new(&sigmas);
                     let final_latents = run_flow_sampler_with_latent_hook(
-                        Some(sampler_name),
+                        SamplerRun {
+                            sampler_name: Some(sampler_name),
+                            sigmas: &sigmas,
+                            seed,
+                            cancel: &req.cancel,
+                            on_progress,
+                        },
                         TimestepConvention::Sigma,
-                        &sigmas,
                         latents,
-                        seed,
-                        &req.cancel,
-                        on_progress,
                         |latents, sigma| {
                             crate::preview::emit_preview(
                                 &req.preview,

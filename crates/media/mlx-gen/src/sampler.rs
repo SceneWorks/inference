@@ -417,6 +417,19 @@ impl GuidanceOps for MlxLatentOps {
     }
 }
 
+/// The per-run inputs every curated sampling driver shares (sc-27427): which solver, the σ
+/// schedule, the noise seed, the cancel flag and the progress sink.
+pub struct SamplerRun<'a> {
+    /// Canonical curated solver name (`None` / unknown → the driver's documented fallback).
+    pub sampler_name: Option<&'a str>,
+    /// Descending σ schedule, length `steps + 1`, trailing `0.0`.
+    pub sigmas: &'a [f32],
+    /// Noise seed for stochastic solvers (the CFG++ solvers are deterministic and ignore it).
+    pub seed: u64,
+    pub cancel: &'a CancelFlag,
+    pub on_progress: &'a mut dyn FnMut(Progress),
+}
+
 /// Drive a curated gen-core unified [`gen_core::sampling::Sampler`] over ANY prediction type — the
 /// generalized core behind [`run_flow_sampler`] (epic 7114 P3, the per-engine adoption seam).
 ///
@@ -428,10 +441,11 @@ impl GuidanceOps for MlxLatentOps {
 /// ancestral / LCM / DDIM) never sees the prediction type — it integrates `x0` in k-diffusion sigma
 /// space regardless. This is what lets one solver library serve flow, EPS, and EDM engines alike.
 ///
-/// - `sampler_name`: the canonical curated solver name. Unknown / `None` / a non-solver alias falls
-///   back to plain Euler (N3 — never hard-fail a generation over a sampling knob).
+/// - `run`: the shared [`SamplerRun`] inputs. `run.sampler_name` is the canonical curated solver
+///   name; unknown / `None` / a non-solver alias falls back to plain Euler (N3 — never hard-fail a
+///   generation over a sampling knob). `run.sigmas` is the descending schedule, length
+///   `num_steps + 1`, trailing `0.0`; `run.seed` seeds the stochastic solvers.
 /// - `ms`: the engine's prediction-type + noise-schedule contract.
-/// - `sigmas`: the descending schedule, length `num_steps + 1`, trailing `0.0`.
 /// - `predict(x_in, timestep)`: the engine's model forward returning the RAW (already CFG-combined)
 ///   output the prediction type expects — velocity for FLOW, ε for EPS, v for V. `x_in` is the
 ///   `c_in`-scaled latent (`crate::ModelSampling::input_scale`; identity for FLOW) and `timestep` is the
@@ -440,28 +454,13 @@ impl GuidanceOps for MlxLatentOps {
 /// Cancellation, the per-step `eval` (so a mid-render cancel lands within ~1 model eval instead of at
 /// VAE decode, and peak graph memory stays bounded — the sc-5399 rationale), and progress all route
 /// through the `denoise` callback, the sole per-eval hook the callback-form `Sampler` exposes.
-#[allow(clippy::too_many_arguments)]
 pub fn run_curated_sampler(
-    sampler_name: Option<&str>,
+    run: SamplerRun<'_>,
     ms: &dyn gen_core::sampling::ModelSampling,
-    sigmas: &[f32],
     latents: Array,
-    seed: u64,
-    cancel: &CancelFlag,
-    on_progress: &mut dyn FnMut(Progress),
     mut predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
-    run_curated_sampler_with_latent_hook(
-        sampler_name,
-        ms,
-        sigmas,
-        latents,
-        seed,
-        cancel,
-        on_progress,
-        |_, _| {},
-        &mut predict,
-    )
+    run_curated_sampler_with_latent_hook(run, ms, latents, |_, _| {}, &mut predict)
 }
 
 /// Tracks the callback phase for curated solvers that evaluate the model twice per outer step.
@@ -516,19 +515,22 @@ impl CuratedStepObserver {
 /// each actual solver step. Heun corrector evaluations and DPM++ SDE midpoint evaluations are
 /// deliberately suppressed. The legacy wrapper supplies a no-op hook, preserving the exact
 /// numerical integration path and output bytes.
-#[allow(clippy::too_many_arguments)]
 pub fn run_curated_sampler_with_latent_hook(
-    sampler_name: Option<&str>,
+    run: SamplerRun<'_>,
     ms: &dyn gen_core::sampling::ModelSampling,
-    sigmas: &[f32],
     latents: Array,
-    seed: u64,
-    cancel: &CancelFlag,
-    on_progress: &mut dyn FnMut(Progress),
     mut on_latent: impl FnMut(&Array, f32),
     mut predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
     use gen_core::sampling::{denoise as gc_denoise, Sampler, Solver};
+
+    let SamplerRun {
+        sampler_name,
+        sigmas,
+        seed,
+        cancel,
+        on_progress,
+    } = run;
 
     let ops = MlxLatentOps;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
@@ -613,46 +615,30 @@ pub fn run_curated_sampler_with_latent_hook(
 /// The CFG++ twin of [`run_curated_sampler`] (epic 7434, sc-8256). Drives a
 /// [`gen_core::sampling::CfgPpSampler`] — which lands each step on the GUIDED `x0` but renoises from the
 /// UNCONDITIONAL `x0` — over the engine's `predict_pair` closure, which surfaces the `(guided, uncond)`
-/// raw-model pair the plain CFG path collapses into one output. `base_sampler_name` is the BASE solver
-/// the user selected (`euler`/`ddim` → `euler_cfg++`, `dpmpp_2m` → `dpmpp_2m_cfg++`); a base with no
+/// raw-model pair the plain CFG path collapses into one output. `run.sampler_name` ([`SamplerRun`]) is
+/// the BASE solver the user selected (`euler`/`ddim` → `euler_cfg++`, `dpmpp_2m` → `dpmpp_2m_cfg++`); a base with no
 /// paper-validated CFG++ form, or `None`, falls back to `euler_cfg++` (N3 — never hard-fail over the
 /// knob). The engine routes here ONLY when `req.guidance_method == "cfg_pp"` and the base solver
-/// supports it, so the default path ([`run_curated_sampler`]) is byte-untouched.
+/// supports it, so the default path ([`run_curated_sampler`]) is byte-untouched. The CFG++ solvers are
+/// deterministic, so `run.seed` is ignored.
 ///
 /// Cancellation, the per-step `eval` boundary, and progress mirror [`run_curated_sampler`] exactly.
-#[allow(clippy::too_many_arguments)]
 pub fn run_cfgpp_sampler(
-    base_sampler_name: Option<&str>,
+    run: SamplerRun<'_>,
     ms: &dyn gen_core::sampling::ModelSampling,
-    sigmas: &[f32],
     latents: Array,
-    cancel: &CancelFlag,
-    on_progress: &mut dyn FnMut(Progress),
     mut predict_pair: impl FnMut(&Array, f32) -> Result<(Array, Array)>,
 ) -> Result<Array> {
-    run_cfgpp_sampler_with_latent_hook(
-        base_sampler_name,
-        ms,
-        sigmas,
-        latents,
-        cancel,
-        on_progress,
-        |_, _| {},
-        &mut predict_pair,
-    )
+    run_cfgpp_sampler_with_latent_hook(run, ms, latents, |_, _| {}, &mut predict_pair)
 }
 
 /// [`run_cfgpp_sampler`] with the same actual-step raw-latent observer offered by
 /// [`run_curated_sampler_with_latent_hook`]. Every shipped CFG++ solver performs exactly one model
 /// evaluation per outer step, so no correction/midpoint filtering is required here.
-#[allow(clippy::too_many_arguments)]
 pub fn run_cfgpp_sampler_with_latent_hook(
-    base_sampler_name: Option<&str>,
+    run: SamplerRun<'_>,
     ms: &dyn gen_core::sampling::ModelSampling,
-    sigmas: &[f32],
     latents: Array,
-    cancel: &CancelFlag,
-    on_progress: &mut dyn FnMut(Progress),
     mut on_latent: impl FnMut(&Array, f32),
     mut predict_pair: impl FnMut(&Array, f32) -> Result<(Array, Array)>,
 ) -> Result<Array> {
@@ -660,6 +646,15 @@ pub fn run_cfgpp_sampler_with_latent_hook(
         base_supports_cfgpp, cfgpp_denoise as gc_cfgpp_denoise, cfgpp_sampler_for, CfgPpSampler,
         Solver,
     };
+
+    // `seed` is unused: every shipped CFG++ solver is deterministic.
+    let SamplerRun {
+        sampler_name: base_sampler_name,
+        sigmas,
+        seed: _,
+        cancel,
+        on_progress,
+    } = run;
 
     let ops = MlxLatentOps;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
@@ -746,64 +741,34 @@ pub fn run_cfgpp_sampler_with_latent_hook(
 /// Drive a curated solver over a flow-match (rectified-flow) sigma schedule — the thin
 /// [`run_curated_sampler`] wrapper for the FLOW cohort (FLUX / Qwen / Chroma / Z-Image / Boogu / LTX /
 /// Wan). `conv` selects whether the model is fed the raw sigma ([`TimestepConvention::Sigma`]) or
-/// `1 − σ` ([`TimestepConvention::OneMinusSigma`]); `predict` returns the RAW (already CFG-combined)
-/// velocity. `euler` over FLOW reproduces the legacy [`FlowMatchSampler`] loop within the N1 tolerance.
+/// `1 − σ` ([`TimestepConvention::OneMinusSigma`]); `run` carries the shared [`SamplerRun`] inputs;
+/// `predict` returns the RAW (already CFG-combined) velocity. `euler` over FLOW reproduces the legacy [`FlowMatchSampler`] loop within the N1 tolerance.
 ///
-/// The time-shift lives entirely in `sigmas` (resolved by [`resolve_flow_schedule`]), so
+/// The time-shift lives entirely in `run.sigmas` (resolved by [`resolve_flow_schedule`]), so
 /// `FlowModelSampling::new(conv)` (mu = 0) is the correct integration contract here — its `timestep` /
 /// `denoised_coeffs` are mu-independent.
-#[allow(clippy::too_many_arguments)]
 pub fn run_flow_sampler(
-    sampler_name: Option<&str>,
+    run: SamplerRun<'_>,
     conv: TimestepConvention,
-    sigmas: &[f32],
     latents: Array,
-    seed: u64,
-    cancel: &CancelFlag,
-    on_progress: &mut dyn FnMut(Progress),
     predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
-    run_flow_sampler_with_latent_hook(
-        sampler_name,
-        conv,
-        sigmas,
-        latents,
-        seed,
-        cancel,
-        on_progress,
-        |_, _| {},
-        predict,
-    )
+    run_flow_sampler_with_latent_hook(run, conv, latents, |_, _| {}, predict)
 }
 
 /// [`run_flow_sampler`] with a best-effort observer of the raw flow latent at each actual outer
 /// solver step. Multi-evaluation solvers expose only their outer-step input: Heun correctors and
 /// DPM++ SDE midpoint evaluations are suppressed by [`run_curated_sampler_with_latent_hook`]. The
 /// legacy wrapper supplies an inert observer and therefore preserves the numerical path exactly.
-#[allow(clippy::too_many_arguments)]
 pub fn run_flow_sampler_with_latent_hook(
-    sampler_name: Option<&str>,
+    run: SamplerRun<'_>,
     conv: TimestepConvention,
-    sigmas: &[f32],
     latents: Array,
-    seed: u64,
-    cancel: &CancelFlag,
-    on_progress: &mut dyn FnMut(Progress),
     on_latent: impl FnMut(&Array, f32),
     predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
-    run_curated_sampler_with_latent_hook(
-        sampler_name,
-        &ms,
-        sigmas,
-        latents,
-        seed,
-        cancel,
-        on_progress,
-        on_latent,
-        predict,
-    )
+    run_curated_sampler_with_latent_hook(run, &ms, latents, on_latent, predict)
 }
 
 // =================================================================================================
@@ -874,19 +839,22 @@ impl LatentOps for MlxAvLatentOps {
 /// `(video_velocity, audio_velocity)`. The per-step `eval`/cancel/progress contract matches
 /// [`run_curated_sampler`], evaluating both streams each step. Used for LTX's distilled T2V+A path
 /// (the per-token-σ I2V path with its post-step `apply_denoise_mask` blend stays native).
-#[allow(clippy::too_many_arguments)]
 pub fn run_av_curated_sampler(
-    sampler_name: Option<&str>,
-    sigmas: &[f32],
+    run: SamplerRun<'_>,
     latents: AvLatents,
-    seed: u64,
-    cancel: &CancelFlag,
-    on_progress: &mut dyn FnMut(Progress),
     mut predict: impl FnMut(&AvLatents, f32) -> Result<AvLatents>,
 ) -> Result<AvLatents> {
     use gen_core::sampling::{
         denoise as gc_denoise, sampler_by_name, Euler, FlowModelSampling, Sampler,
     };
+
+    let SamplerRun {
+        sampler_name,
+        sigmas,
+        seed,
+        cancel,
+        on_progress,
+    } = run;
 
     let ops = MlxAvLatentOps;
     let ms = FlowModelSampling::new(TimestepConvention::Sigma);
@@ -1548,13 +1516,15 @@ mod tests {
         let cancel = CancelFlag::new();
         let mut progress = |_p: Progress| {};
         let out = run_curated_sampler(
-            Some("euler"),
+            SamplerRun {
+                sampler_name: Some("euler"),
+                sigmas: &sigmas,
+                seed: 0,
+                cancel: &cancel,
+                on_progress: &mut progress,
+            },
             &ms,
-            &sigmas,
             x_init.clone(),
-            0,
-            &cancel,
-            &mut progress,
             |_xin, _t| Ok(arr(&eps)),
         )
         .unwrap();
@@ -1598,13 +1568,15 @@ mod tests {
         let run = || {
             let cancel = CancelFlag::new();
             run_curated_sampler(
-                Some("euler"),
+                SamplerRun {
+                    sampler_name: Some("euler"),
+                    sigmas: &sigmas,
+                    seed: 0,
+                    cancel: &cancel,
+                    on_progress: &mut |_| {},
+                },
                 &ms,
-                &sigmas,
                 x_init.clone(),
-                0,
-                &cancel,
-                &mut |_| {},
                 |_xin, _t| {
                     calls.set(calls.get() + 1);
                     Ok(arr(&eps))
@@ -1686,13 +1658,15 @@ mod tests {
         let cancel = CancelFlag::new();
         let mut progress = |_p: Progress| {};
         run_curated_sampler_with_latent_hook(
-            Some("heun"),
+            SamplerRun {
+                sampler_name: Some("heun"),
+                sigmas: &sigmas,
+                seed: 0,
+                cancel: &cancel,
+                on_progress: &mut progress,
+            },
             &ms,
-            &sigmas,
             arr(&[0.3, -1.1, 2.0]),
-            0,
-            &cancel,
-            &mut progress,
             |_latent, sigma| observed.push(sigma),
             |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
         )
@@ -1709,13 +1683,15 @@ mod tests {
         let cancel = CancelFlag::new();
         let mut progress = |_p: Progress| {};
         run_curated_sampler_with_latent_hook(
-            Some("dpmpp_sde"),
+            SamplerRun {
+                sampler_name: Some("dpmpp_sde"),
+                sigmas: &sigmas,
+                seed: 7,
+                cancel: &cancel,
+                on_progress: &mut progress,
+            },
             &ms,
-            &sigmas,
             arr(&[0.3, -1.1, 2.0]),
-            7,
-            &cancel,
-            &mut progress,
             |_latent, sigma| observed.push(sigma),
             |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
         )
@@ -1732,25 +1708,29 @@ mod tests {
         let cancel = CancelFlag::new();
         let mut progress = |_p: Progress| {};
         let legacy = run_curated_sampler(
-            Some("euler"),
+            SamplerRun {
+                sampler_name: Some("euler"),
+                sigmas: &sigmas,
+                seed: 42,
+                cancel: &cancel,
+                on_progress: &mut progress,
+            },
             &ms,
-            &sigmas,
             init.clone(),
-            42,
-            &cancel,
-            &mut progress,
             |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
         )
         .unwrap();
         let mut progress = |_p: Progress| {};
         let explicit = run_curated_sampler_with_latent_hook(
-            Some("euler"),
+            SamplerRun {
+                sampler_name: Some("euler"),
+                sigmas: &sigmas,
+                seed: 42,
+                cancel: &cancel,
+                on_progress: &mut progress,
+            },
             &ms,
-            &sigmas,
             init,
-            42,
-            &cancel,
-            &mut progress,
             |_, _| {},
             |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
         )
@@ -1768,13 +1748,15 @@ mod tests {
             let mut observed = Vec::new();
             let mut progress = |_p: Progress| {};
             run_flow_sampler_with_latent_hook(
-                Some(solver),
+                SamplerRun {
+                    sampler_name: Some(solver),
+                    sigmas: &sigmas,
+                    seed: 7,
+                    cancel: &cancel,
+                    on_progress: &mut progress,
+                },
                 TimestepConvention::Sigma,
-                &sigmas,
                 init.clone(),
-                7,
-                &cancel,
-                &mut progress,
                 |_latent, sigma| observed.push(sigma),
                 |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
             )
@@ -1784,25 +1766,29 @@ mod tests {
 
         let mut progress = |_p: Progress| {};
         let legacy = run_flow_sampler(
-            Some("euler"),
+            SamplerRun {
+                sampler_name: Some("euler"),
+                sigmas: &sigmas,
+                seed: 42,
+                cancel: &cancel,
+                on_progress: &mut progress,
+            },
             TimestepConvention::Sigma,
-            &sigmas,
             init.clone(),
-            42,
-            &cancel,
-            &mut progress,
             |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
         )
         .unwrap();
         let mut progress = |_p: Progress| {};
         let explicit = run_flow_sampler_with_latent_hook(
-            Some("euler"),
+            SamplerRun {
+                sampler_name: Some("euler"),
+                sigmas: &sigmas,
+                seed: 42,
+                cancel: &cancel,
+                on_progress: &mut progress,
+            },
             TimestepConvention::Sigma,
-            &sigmas,
             init,
-            42,
-            &cancel,
-            &mut progress,
             |_, _| {},
             |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
         )
@@ -1819,23 +1805,29 @@ mod tests {
         let cancel = CancelFlag::new();
         let mut progress = |_p: Progress| {};
         let legacy = run_cfgpp_sampler(
-            Some("euler"),
+            SamplerRun {
+                sampler_name: Some("euler"),
+                sigmas: &sigmas,
+                seed: 0,
+                cancel: &cancel,
+                on_progress: &mut progress,
+            },
             &ms,
-            &sigmas,
             init.clone(),
-            &cancel,
-            &mut progress,
             |_xin, _t| Ok((arr(&[0.7, -0.2, 0.4]), arr(&[0.1, 0.2, -0.1]))),
         )
         .unwrap();
         let mut progress = |_p: Progress| {};
         let explicit = run_cfgpp_sampler_with_latent_hook(
-            Some("euler"),
+            SamplerRun {
+                sampler_name: Some("euler"),
+                sigmas: &sigmas,
+                seed: 0,
+                cancel: &cancel,
+                on_progress: &mut progress,
+            },
             &ms,
-            &sigmas,
             init,
-            &cancel,
-            &mut progress,
             |_, _| {},
             |_xin, _t| Ok((arr(&[0.7, -0.2, 0.4]), arr(&[0.1, 0.2, -0.1]))),
         )
@@ -1859,12 +1851,14 @@ mod tests {
         let cancel = CancelFlag::new();
         let mut progress = |_p: Progress| {};
         let out = run_av_curated_sampler(
-            Some("euler"),
-            &sigmas,
+            SamplerRun {
+                sampler_name: Some("euler"),
+                sigmas: &sigmas,
+                seed: 0,
+                cancel: &cancel,
+                on_progress: &mut progress,
+            },
             init,
-            0,
-            &cancel,
-            &mut progress,
             |_x, _sigma| {
                 Ok(AvLatents {
                     video: arr(&v_video),
@@ -1902,12 +1896,14 @@ mod tests {
                 audio: arr(&[0.1, -0.2]),
             };
             let out = run_av_curated_sampler(
-                Some(name),
-                &sigmas,
+                SamplerRun {
+                    sampler_name: Some(name),
+                    sigmas: &sigmas,
+                    seed: 7,
+                    cancel: &cancel,
+                    on_progress: &mut progress,
+                },
                 init,
-                7,
-                &cancel,
-                &mut progress,
                 |x, _s| {
                     Ok(AvLatents {
                         video: multiply(&x.video, scalar(0.2))?,
@@ -1945,13 +1941,15 @@ mod tests {
             "ddim",
         ] {
             let out = run_curated_sampler(
-                Some(name),
+                SamplerRun {
+                    sampler_name: Some(name),
+                    sigmas: &sigmas,
+                    seed: 7,
+                    cancel: &cancel,
+                    on_progress: &mut progress,
+                },
                 &ms,
-                &sigmas,
                 x_init.clone(),
-                7,
-                &cancel,
-                &mut progress,
                 // A mild v "model": v = 0.1·x_in (the input is c_in-scaled, keeping it bounded).
                 |xin, _t| Ok(multiply(xin, scalar(0.1))?),
             )

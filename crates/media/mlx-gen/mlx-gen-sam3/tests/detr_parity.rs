@@ -8,25 +8,11 @@
 //!   SAM3_DETR_FIXTURE=scripts/spikes/sam3_oracle/detr_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration detr_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{cosine, max_abs_diff};
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::{Sam3Detector, Sam3DetrConfig};
-use mlx_rs::ops::{abs, max, multiply, sigmoid, sqrt, subtract, sum};
+use mlx_rs::ops::{multiply, sigmoid};
 use mlx_rs::Array;
-
-fn f32_of(a: &Array) -> f32 {
-    a.as_dtype(mlx_rs::Dtype::Float32).unwrap().item::<f32>()
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let dot = f32_of(&sum(multiply(a, b).unwrap(), None).unwrap());
-    let na = f32_of(&sqrt(sum(multiply(a, a).unwrap(), None).unwrap()).unwrap());
-    let nb = f32_of(&sqrt(sum(multiply(b, b).unwrap(), None).unwrap()).unwrap());
-    dot / (na * nb)
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    f32_of(&max(abs(subtract(a, b).unwrap()).unwrap(), None).unwrap())
-}
 
 #[test]
 #[ignore = "needs SAM3_WEIGHTS + SAM3_DETR_FIXTURE"]

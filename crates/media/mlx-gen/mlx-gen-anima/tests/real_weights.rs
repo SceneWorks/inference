@@ -14,6 +14,7 @@ use mlx_gen::runtime::CancelFlag;
 use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource};
 
+use mlx_gen::testing::save_png;
 use mlx_gen_anima::conditioner::AnimaTextConditioner;
 use mlx_gen_anima::config::{ConditionerConfig, DitConfig, Variant};
 use mlx_gen_anima::convert::quantize_anima_dit;
@@ -156,12 +157,6 @@ fn maxabs_diff(a: &Array, b: &Array) -> f32 {
     av.iter()
         .zip(&bv)
         .fold(0f32, |m, (x, y)| m.max((x - y).abs()))
-}
-
-fn save_png(img: &Image, path: &std::path::Path) {
-    let buf = image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
-        .expect("valid RGB buffer");
-    buf.save(path).expect("save png");
 }
 
 // Sharpness floor (sc-10818). A clean, detailed Anima render is SHARP — high-frequency edge energy →

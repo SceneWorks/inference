@@ -28,6 +28,7 @@ use std::path::PathBuf;
 
 use mlx_gen::adapters::loader::apply_adapters_strict;
 use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::testing::{max_abs, max_abs_diff};
 use mlx_gen::{AdapterKind, AdapterSpec, Quant};
 use mlx_gen_krea_realtime::{
     convert_krea_realtime_tier, convert_krea_realtime_tier_sharded,
@@ -223,16 +224,6 @@ fn det_latent(c: i32, f: i32, h: i32, w: i32, seed: u64) -> Array {
         data.push((u as f32 - 0.5) * 2.0);
     }
     Array::from_slice(&data, &[c, f, h, w])
-}
-
-fn max_abs(a: &Array) -> f32 {
-    mlx_rs::ops::max(mlx_rs::ops::abs(a).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    max_abs(&mlx_rs::ops::subtract(a, b).unwrap())
 }
 
 /// One deterministic AR chunk forward → the denoised velocity latent `[C, F, H, W]`.

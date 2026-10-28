@@ -2369,6 +2369,10 @@ impl IrisDiT {
 
     /// `TimestepEmbedder`: sinusoid bank (period `timestep_max_period`, 256 frequencies, cos‖sin)
     /// → Linear → SiLU → Linear. `t` is model time `[B]` f32 → `[B, 1, D]`.
+    ///
+    /// Deliberately NOT [`mlx_gen::nn::timestep_sincos`]: the frequencies are built on the host, and the
+    /// shared helper's on-device exponent differs by ~1e-7 (enough to flip bf16 ULPs that this crate's
+    /// single-host parity goldens pin), so migrating would perturb pinned numerics (sc-27334).
     fn timestep_embedding(&self, t: &Array) -> Result<Array> {
         let freqs = iris::timestep_freqs(self.cfg.timestep_max_period);
         let n = freqs.len();

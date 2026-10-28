@@ -102,6 +102,10 @@ impl TimestepEmbedder {
 
 /// GLIDE sinusoidal embedding: `freqs = exp(-ln(max_period)·arange(half)/half)`, then
 /// `cat(cos(t·freqs), sin(t·freqs))`. `dim` is even (256), so no zero-pad branch.
+///
+/// Deliberately NOT [`mlx_gen::nn::timestep_sincos`]: the frequencies are built on the host, and the
+/// shared helper's on-device exponent differs by ~1e-7 (enough to flip bf16 ULPs that this crate's
+/// single-host parity goldens pin), so migrating would perturb pinned numerics (sc-27334).
 fn timestep_embedding(t: &Array, dim: i32) -> Result<Array> {
     const MAX_PERIOD: f32 = 10000.0;
     let half = (dim / 2) as usize;

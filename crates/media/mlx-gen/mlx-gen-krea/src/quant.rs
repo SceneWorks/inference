@@ -11,7 +11,7 @@ use mlx_gen::Result;
 /// **64**. Every Krea quant-target Linear has an input dim divisible by 64 (DiT hidden 6144, FFN
 /// 16384, text 2560, text-FFN 6912; Qwen3-VL TE 4096/1024/9728), so one group size packs the whole
 /// model (unlike Boogu's 3360 hidden, which forced 32). Mirrors [`crate::convert::QUANT_GROUP_SIZE`].
-pub(crate) const GROUP_SIZE: i32 = 64;
+pub(crate) const GROUP_SIZE: i32 = mlx_gen::quant::DEFAULT_GROUP_SIZE;
 
 /// Load `{base}` as an [`AdaptableLinear`] at the Krea [`GROUP_SIZE`] — **packed** (Q4/Q8) when
 /// `{base}.scales` is present (a [`crate::convert::assemble_quantized_snapshot`] turnkey), else

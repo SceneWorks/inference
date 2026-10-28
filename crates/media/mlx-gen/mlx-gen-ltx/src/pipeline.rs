@@ -21,9 +21,10 @@
 //! gap (per-stage latents + decoded frames) rather than writing it off.
 
 use mlx_rs::memory::get_memory_limit;
-use mlx_rs::ops::{add, broadcast_to, divide, maximum, minimum, multiply, subtract};
+use mlx_rs::ops::{add, broadcast_to, divide, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::AudioTrack;
 use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
@@ -71,10 +72,6 @@ pub const TEMPORAL_SIGMAS: [f32; 5] = [0.975, 0.909_375, 0.725, 0.421_875, 0.0];
 /// actually being run. This table is byte-identical to `candle-gen-ltx`'s `STAGE1_SIGMAS`, which is
 /// what makes one lane-agnostic catalog entry legitimate rather than a papered-over difference.
 pub const NATIVE_STEPS: u32 = STAGE1_SIGMAS.len() as u32 - 1;
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// The legacy dtype-preserving Euler update (the `use_legacy_euler` branch): for `σ_next > 0`,
 /// `x' = denoised + σ_next·(x − denoised)/σ`; at the final step (`σ_next = 0`), `x' = denoised`.
@@ -207,31 +204,10 @@ pub(crate) fn decode_to_frames_with_tiling(
 
 /// `(B=1, 3, F, H, W)` video in ~[-1, 1] → `(F, H, W, 3)` uint8. The reference clips `(x+1)/2` to
 /// `[0, 1]` *before* scaling by 255, so the result saturates at 255 (truncating cast).
+/// The body is the shared [`mlx_gen::image::video_bcfhw_to_u8_frames`] (identical to Mochi's;
+/// sc-27319).
 pub fn to_uint8_frames(video: &Array) -> Result<Array> {
-    let sh = video.shape(); // (1, 3, F, H, W)
-                            // The reshape below drops the batch axis; B>1 would interleave frames across batch items (or
-                            // shape-error). Production decode is B==1 — reject anything else with a clear message (F-051).
-    if sh[0] != 1 {
-        return Err(Error::Msg(format!(
-            "ltx to_uint8_frames: batch size must be 1, got {}",
-            sh[0]
-        )));
-    }
-    let (c, f, h, w) = (sh[1], sh[2], sh[3], sh[4]);
-    let dt = video.dtype();
-    let chw = video
-        .reshape(&[c, f, h, w])?
-        .transpose_axes(&[1, 2, 3, 0])?; // (F, H, W, 3)
-    let half = divide(
-        &add(&chw, &scalar(1.0).as_dtype(dt)?)?,
-        &scalar(2.0).as_dtype(dt)?,
-    )?;
-    let clipped = minimum(
-        &maximum(&half, &scalar(0.0).as_dtype(dt)?)?,
-        &scalar(1.0).as_dtype(dt)?,
-    )?;
-    let scaled = multiply(&clipped, &scalar(255.0).as_dtype(dt)?)?;
-    contiguous(&mlx_rs::ops::round(&scaled, None)?.as_dtype(Dtype::Uint8)?)
+    mlx_gen::image::video_bcfhw_to_u8_frames(video, "ltx to_uint8_frames")
 }
 
 // --- sc-6894 F-004: LTX VAE decode budgeting ------------------------------------------------------
@@ -962,12 +938,14 @@ pub fn denoise_av_curated(
         audio: audio.clone(),
     };
     let out = mlx_gen::run_av_curated_sampler(
-        Some(sampler_name),
-        sigmas,
+        mlx_gen::SamplerRun {
+            sampler_name: Some(sampler_name),
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         init,
-        seed,
-        cancel,
-        on_progress,
         |x, sigma| {
             // Flatten: video (B,C,F,H,W)→(B,Sv,C); audio (B,C,T,F)→(B,T,C·F). Uniform per-token σ.
             let vflat = x.video.reshape(&[vb, vc, -1])?.transpose_axes(&[0, 2, 1])?;

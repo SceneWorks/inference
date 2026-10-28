@@ -30,6 +30,7 @@ use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::ltx_checkpoint::{LatentUpsamplerConfig, LatentUpsamplerMode};
+use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::upsampler::{upsample_latents, LatentUpsampler};
 
@@ -60,13 +61,6 @@ fn base_dir() -> std::path::PathBuf {
 
 fn f32(x: &Array) -> Array {
     x.as_dtype(Dtype::Float32).unwrap()
-}
-
-/// `max|Δ| / max|ref|`.
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(f32(got), f32(want)).unwrap()).unwrap();
-    let denom = max_op(abs(f32(want)).unwrap(), None).unwrap().item::<f32>();
-    max_op(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 
 /// `Σ|Δ| / Σ|ref|`.

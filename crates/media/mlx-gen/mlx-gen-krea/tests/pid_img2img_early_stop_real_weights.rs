@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_gen::img2img::init_time_step;
+use mlx_gen::testing::save_png;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_krea::pipeline::turbo_schedule;
 use mlx_gen_krea::{load, TURBO_STEPS};
@@ -90,17 +91,6 @@ fn only_image(out: GenerationOutput) -> Image {
         GenerationOutput::Images(v) => v.into_iter().next().expect("one image"),
         _ => panic!("expected images"),
     }
-}
-
-fn save_png(img: &Image, path: &str) {
-    image::save_buffer(
-        path,
-        &img.pixels,
-        img.width,
-        img.height,
-        image::ColorType::Rgb8,
-    )
-    .unwrap();
 }
 
 #[test]
@@ -256,15 +246,15 @@ fn krea_turbo_img2img_pid_from_ldm_early_stop() {
     let _ = std::fs::create_dir_all(dir);
     save_png(
         &reference,
-        &format!("{dir}/krea_img2img_ref_{}.png", reference.width),
+        format!("{dir}/krea_img2img_ref_{}.png", reference.width),
     );
     save_png(
         &clean,
-        &format!("{dir}/krea_img2img_pid_clean_{}.png", clean.width),
+        format!("{dir}/krea_img2img_pid_clean_{}.png", clean.width),
     );
     save_png(
         &early,
-        &format!("{dir}/krea_img2img_pid_earlystop_{}.png", early.width),
+        format!("{dir}/krea_img2img_pid_earlystop_{}.png", early.width),
     );
     eprintln!("wrote reference + clean + early-stop PNGs to {dir}");
     crate::model_inference_device::record_model_inference_device();

@@ -24,6 +24,7 @@ use mlx_rs::Array;
 use crate::control_transformer_block::ZImageControlBlock;
 use crate::transformer::{apply_pad, ZImageTransformer};
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::array::scalar;
 use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -53,10 +54,6 @@ pub(crate) const CONTROL_LAYERS_PLACES: [usize; 15] =
     [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28];
 /// Base `noise_refiner` indices the 2 control refiner blocks inject into.
 pub(crate) const CONTROL_REFINER_PLACES: [usize; 2] = [0, 1];
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 const SITE_ADD_HINT: &str = "z_image::control_transformer::add_hint";
 

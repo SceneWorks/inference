@@ -8,23 +8,10 @@
 //!   SAM3_MEMATTN_FIXTURE=scripts/spikes/sam3_oracle/memattn_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration memattn_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::cosine;
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::Sam3Tracker;
-use mlx_rs::ops::{multiply, sqrt, sum};
-use mlx_rs::{Array, Dtype};
-
-fn scalar(a: &Array) -> f32 {
-    a.as_dtype(Dtype::Float32).unwrap().item::<f32>()
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.reshape(&[-1]).unwrap();
-    let b = b.reshape(&[-1]).unwrap();
-    let dot = scalar(&sum(multiply(&a, &b).unwrap(), None).unwrap());
-    let na = scalar(&sqrt(sum(multiply(&a, &a).unwrap(), None).unwrap()).unwrap());
-    let nb = scalar(&sqrt(sum(multiply(&b, &b).unwrap(), None).unwrap()).unwrap());
-    dot / (na * nb)
-}
+use mlx_rs::Dtype;
 
 #[test]
 #[ignore = "needs SAM3_WEIGHTS=<facebook/sam3 model.safetensors> + SAM3_MEMATTN_FIXTURE"]

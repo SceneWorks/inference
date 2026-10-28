@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::require_env_path;
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::load_text_encoder;
 use mlx_rs::ops::{multiply, sqrt, sum};
@@ -29,10 +30,6 @@ fn cosine(a: &Array, b: &Array) -> f32 {
     (dot / (na * nb)).item::<f32>()
 }
 
-fn snapshot_dir() -> PathBuf {
-    PathBuf::from(std::env::var("BOOGU_BASE_DIR").expect("set BOOGU_BASE_DIR to the snapshot root"))
-}
-
 fn golden_path() -> PathBuf {
     std::env::var("BOOGU_VISION_GOLDEN")
         .map(PathBuf::from)
@@ -46,7 +43,11 @@ fn golden_path() -> PathBuf {
 #[ignore = "needs real weights + golden (dump_boogu_vision_golden.py)"]
 fn mllm_image_matches_reference() {
     let g = Weights::from_file(golden_path()).expect("golden — run dump_boogu_vision_golden.py");
-    let te = load_text_encoder(snapshot_dir()).expect("load Qwen3-VL text tower");
+    let te = load_text_encoder(require_env_path(
+        "BOOGU_BASE_DIR",
+        "the Boogu snapshot root",
+    ))
+    .expect("load Qwen3-VL text tower");
 
     let input_ids = g
         .require("input_ids")

@@ -4,18 +4,11 @@
 //! deterministic given (noise, ε), so this gates the step math bit-for-bit against torch (velocity→x0,
 //! the SDE renoise `(1−t_next)·x0 + t_next·ε`, and the final clamp) — not the production RNG path.
 
+use mlx_gen::testing::{max_abs, max_abs_diff};
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
 use mlx_gen_pid::{ConvPadding, PidConfig, PidNet, Sampler, SamplerConfig};
-use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Array;
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
-}
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    max_abs(&subtract(a, b).unwrap())
-}
 
 fn tiny_cfg() -> PidConfig {
     PidConfig {

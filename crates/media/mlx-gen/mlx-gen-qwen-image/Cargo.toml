@@ -27,6 +27,8 @@ mlx-gen-wan = { path = "../mlx-gen-wan", default-features = false }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }
 sceneworks-gen-core-testkit = { workspace = true }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old

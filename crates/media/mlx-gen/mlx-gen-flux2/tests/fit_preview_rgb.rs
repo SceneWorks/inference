@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::{
-    run_flow_sampler, run_flow_sampler_with_latent_hook, CancelFlag, Progress, TimestepConvention,
+    run_flow_sampler, run_flow_sampler_with_latent_hook, CancelFlag, Progress, SamplerRun,
+    TimestepConvention,
 };
 use mlx_gen_flux2::{
     create_noise, load_text_encoder, load_tokenizer, load_transformer, load_vae, prepare_grid_ids,
@@ -146,25 +147,29 @@ impl Components {
         };
         let packed_tokens = if explicit_inert_preview {
             run_flow_sampler_with_latent_hook(
-                None,
+                SamplerRun {
+                    sampler_name: None,
+                    sigmas: &sched.sigmas,
+                    seed,
+                    cancel: &cancel,
+                    on_progress: &mut progress,
+                },
                 TimestepConvention::Sigma,
-                &sched.sigmas,
                 init,
-                seed,
-                &cancel,
-                &mut progress,
                 |_, _| {},
                 predict,
             )
         } else {
             run_flow_sampler(
-                None,
+                SamplerRun {
+                    sampler_name: None,
+                    sigmas: &sched.sigmas,
+                    seed,
+                    cancel: &cancel,
+                    on_progress: &mut progress,
+                },
                 TimestepConvention::Sigma,
-                &sched.sigmas,
                 init,
-                seed,
-                &cancel,
-                &mut progress,
                 predict,
             )
         }

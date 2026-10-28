@@ -3,10 +3,10 @@
 //! the full decoder forward: embed×√hidden, rotate_half RoPE, GQA, soft-capped attention, gelu-tanh
 //! MLP, the norm-sandwich, final RMSNorm.
 
+use mlx_gen::testing::max_abs;
 use mlx_gen::weights::Weights;
 use mlx_gen_pid::{Gemma2, Gemma2Config};
-use mlx_rs::ops::{abs, max, subtract};
-use mlx_rs::Array;
+use mlx_rs::ops::subtract;
 
 #[cfg(target_os = "macos")]
 #[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
@@ -62,10 +62,6 @@ fn gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
 
     crate::model_inference_device::record_model_inference_device();
     println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma_parity::gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom");
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
 }
 
 fn tiny_cfg() -> Gemma2Config {

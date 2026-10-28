@@ -39,6 +39,12 @@ use crate::config::DitConfig;
 /// size — matching the reference predicate (which leaves e.g. `vid_in.proj`, in=132, dense).
 /// `Clone` clones the refcounted `Array` handles (not the buffers) — shared-block attention uses it
 /// to re-share one packed tensor set across the `_vid`/`_txt` fields after quantization (F-012).
+///
+/// A sanctioned exception to the "every quantizable projection is an `AdaptableLinear`" rule
+/// (sc-27321, listed in `crates/media/mlx-gen/ARCHITECTURE.md`): this dense forward is
+/// `matmul + add` (not `AdaptableLinear`'s fused `addmm`, which rounds differently on the bf16
+/// activations SeedVR2 runs), and the quantized form keeps the bias in its loaded dtype rather than
+/// `AdaptableLinear::quantize`'s bf16 cast, so migrating would move the pinned parity numerics.
 #[derive(Clone)]
 enum LinearWeight {
     Dense(Array),
@@ -91,7 +97,7 @@ impl Linear {
     /// Evals the packed tensors so the dense weight is freed promptly.
     fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
         if let LinearWeight::Dense(w) = &self.w {
-            if *w.shape().last().unwrap() % group != 0 {
+            if !mlx_gen::quant::is_quant_aligned(*w.shape().last().unwrap(), group) {
                 return Ok(());
             }
             let (wq, scales, biases) = quantize_affine(&w.as_dtype(Dtype::Bfloat16)?, group, bits)?;

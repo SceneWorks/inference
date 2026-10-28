@@ -10,23 +10,10 @@
 //!   SAM3_TRACKFRAME_FIXTURE=$PWD/scripts/spikes/sam3_oracle/trackframe_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration trackframe_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{cosine, item_f32};
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::Sam3Tracker;
-use mlx_rs::ops::{multiply, sqrt, sum};
-use mlx_rs::{Array, Dtype};
-
-fn scalar(a: &Array) -> f32 {
-    a.as_dtype(Dtype::Float32).unwrap().item::<f32>()
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.reshape(&[-1]).unwrap();
-    let b = b.reshape(&[-1]).unwrap();
-    let dot = scalar(&sum(multiply(&a, &b).unwrap(), None).unwrap());
-    let na = scalar(&sqrt(sum(multiply(&a, &a).unwrap(), None).unwrap()).unwrap());
-    let nb = scalar(&sqrt(sum(multiply(&b, &b).unwrap(), None).unwrap()).unwrap());
-    dot / (na * nb)
-}
+use mlx_rs::Array;
 
 /// NCHW [1,C,H,W] → NHWC [1,H,W,C].
 fn nhwc(a: &Array) -> Array {
@@ -58,7 +45,7 @@ fn tracked_frame_decode_matches_oracle() {
     let pred_want = fx.require("pred_masks").unwrap().clone(); // [1,1,288,288]
     let high_want = fx.require("high_res_masks").unwrap().clone(); // [1,1,1008,1008]
     let ptr_want = fx.require("object_pointer").unwrap().clone(); // [1,1,256]
-    let score_want = scalar(fx.require("object_score_logits").unwrap());
+    let score_want = item_f32(fx.require("object_score_logits").unwrap());
 
     let c_low = cosine(&out.low_res, &pred_want);
     let c_high = cosine(&out.high_res, &high_want);

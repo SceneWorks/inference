@@ -53,12 +53,13 @@
 
 use std::collections::HashMap;
 
+use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;
 use mlx_gen_krea_realtime::{
     build_block_causal_mask, load_krea_realtime_transformer, CausalKreaTransformer,
     KreaRealtimeConfig,
 };
-use mlx_rs::ops::{abs, max as max_op, subtract, sum};
+use mlx_rs::ops::{abs, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
 const GOLDEN: &str = concat!(
@@ -82,14 +83,6 @@ const PEAK_REL_GATE: f32 = 1e-2;
 
 fn f32a(x: &Array) -> Array {
     x.as_dtype(Dtype::Float32).unwrap()
-}
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(f32a(got), f32a(want)).unwrap()).unwrap();
-    let denom = max_op(abs(f32a(want)).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    max_op(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 
 fn mean_rel(got: &Array, want: &Array) -> f32 {

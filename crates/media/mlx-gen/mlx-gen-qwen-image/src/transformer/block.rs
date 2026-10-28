@@ -320,8 +320,9 @@ fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
 #[cfg(test)]
 mod sc2963 {
     use super::*;
-    use crate::transformer::compile_test_util::{max_abs, rnd};
+    use crate::transformer::compile_test_util::rnd;
     use crate::transformer::set_compile_glue;
+    use mlx_gen::testing::max_abs_diff;
     use mlx_rs::Dtype::{Bfloat16, Float32};
 
     // sc-2963: the compiled adaLN affine + gated residual are bit-identical to eager (`max|Δ|=0`) at
@@ -337,8 +338,8 @@ mod sc2963 {
         set_compile_glue(true);
         let (co, cg) = modulate(&x, &mod_params).unwrap();
         set_compile_glue(false);
-        assert_eq!(max_abs(&co, &eo), 0.0, "modulate out");
-        assert_eq!(max_abs(&cg, &eg), 0.0, "modulate gate");
+        assert_eq!(max_abs_diff(&co, &eo), 0.0, "modulate out");
+        assert_eq!(max_abs_diff(&cg, &eg), 0.0, "modulate gate");
 
         // gated: f32 x + (bf16 gate · f32 y).
         let gate = rnd(&[b, 1, dim], Bfloat16);
@@ -348,7 +349,7 @@ mod sc2963 {
         set_compile_glue(true);
         let c = gated(&x, &gate, &y).unwrap();
         set_compile_glue(false);
-        assert_eq!(max_abs(&c, &e), 0.0, "gated");
+        assert_eq!(max_abs_diff(&c, &e), 0.0, "gated");
     }
 
     #[test]
@@ -375,10 +376,13 @@ mod sc2963 {
         .unwrap();
         for _ in 0..2 {
             assert_eq!(
-                max_abs(&modulate(&x, &params).unwrap().0, &eager_modulate),
+                max_abs_diff(&modulate(&x, &params).unwrap().0, &eager_modulate),
                 0.0
             );
-            assert_eq!(max_abs(&gated(&x, &gate, &y).unwrap(), &eager_gated), 0.0);
+            assert_eq!(
+                max_abs_diff(&gated(&x, &gate, &y).unwrap(), &eager_gated),
+                0.0
+            );
         }
         let report = scope.finish();
         for site in [SITE_MODULATE, SITE_GATED] {
@@ -430,7 +434,8 @@ mod sc2963 {
 #[cfg(test)]
 mod zero_cond_t {
     use super::*;
-    use crate::transformer::compile_test_util::{max_abs, rnd};
+    use crate::transformer::compile_test_util::rnd;
+    use mlx_gen::testing::max_abs_diff;
     use mlx_rs::ops::concatenate_axis;
     use mlx_rs::Dtype::Float32;
 
@@ -448,12 +453,12 @@ mod zero_cond_t {
         let (out0, gate0) = modulate_maybe_indexed(&x, &doubled, Some(&idx0)).unwrap();
         let (er, eg) = modulate(&x, &real).unwrap();
         assert_eq!(
-            max_abs(&out0, &er),
+            max_abs_diff(&out0, &er),
             0.0,
             "all-zero index out == real-half modulate"
         );
         assert_eq!(
-            max_abs(&gate0, &eg),
+            max_abs_diff(&gate0, &eg),
             0.0,
             "all-zero index gate == real-half gate"
         );
@@ -462,12 +467,12 @@ mod zero_cond_t {
         let (out1, gate1) = modulate_maybe_indexed(&x, &doubled, Some(&idx1)).unwrap();
         let (ez, egz) = modulate(&x, &zero).unwrap();
         assert_eq!(
-            max_abs(&out1, &ez),
+            max_abs_diff(&out1, &ez),
             0.0,
             "all-one index out == zero-half modulate"
         );
         assert_eq!(
-            max_abs(&gate1, &egz),
+            max_abs_diff(&gate1, &egz),
             0.0,
             "all-one index gate == zero-half gate"
         );
@@ -487,7 +492,7 @@ mod zero_cond_t {
         let (out, gate) = modulate_maybe_indexed(&x, &doubled, Some(&idx)).unwrap();
 
         // `er`/`ez` are the modulated activations over the full seq (splittable); the plain gates
-        // `egate`/`ezgate` are `[B, 1, dim]` (broadcast over seq) — compared via `max_abs`'s broadcast.
+        // `egate`/`ezgate` are `[B, 1, dim]` (broadcast over seq) — compared via `max_abs_diff`'s broadcast.
         let (er, egate) = modulate(&x, &real).unwrap(); // all-real over the seq
         let (ez, ezgate) = modulate(&x, &zero).unwrap(); // all-zero over the seq
         let out_parts = split(&out, 2, 1).unwrap(); // [rows 0..2, rows 2..4]
@@ -495,22 +500,22 @@ mod zero_cond_t {
         let er_noise = split(&er, 2, 1).unwrap().swap_remove(0); // real, rows 0..2
         let ez_cond = split(&ez, 2, 1).unwrap().swap_remove(1); // zero, rows 2..4
         assert_eq!(
-            max_abs(&out_parts[0], &er_noise),
+            max_abs_diff(&out_parts[0], &er_noise),
             0.0,
             "noise rows use real half"
         );
         assert_eq!(
-            max_abs(&out_parts[1], &ez_cond),
+            max_abs_diff(&out_parts[1], &ez_cond),
             0.0,
             "cond rows use zero half"
         );
         assert_eq!(
-            max_abs(&gate_parts[0], &egate),
+            max_abs_diff(&gate_parts[0], &egate),
             0.0,
             "noise gate uses real half"
         );
         assert_eq!(
-            max_abs(&gate_parts[1], &ezgate),
+            max_abs_diff(&gate_parts[1], &ezgate),
             0.0,
             "cond gate uses zero half"
         );

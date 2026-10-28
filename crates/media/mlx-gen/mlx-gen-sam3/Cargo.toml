@@ -24,3 +24,7 @@ path = "tests/main.rs"
 
 [features]
 model-inference-proof = ["mlx-gen/model-inference-proof"]
+
+[dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }

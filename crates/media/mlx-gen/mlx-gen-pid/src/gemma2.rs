@@ -13,14 +13,13 @@
 //! the local/global distinction collapses and a single causal (+ optional padding) mask suffices.
 
 use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, matmul, multiply, negative, softmax_axis, split, tanh,
-};
+use mlx_rs::ops::{add, matmul, multiply, softmax_axis, tanh};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
-use mlx_gen::nn::{gelu_tanh, TokenEmbedding};
+use mlx_gen::nn::{gelu_tanh, rotate_half, TokenEmbedding};
+use mlx_gen::qkv::{repeat_kv, RotationAxes};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -102,12 +101,6 @@ fn rope_tables(head_dim: i32, seq: i32, theta: f32) -> (Array, Array) {
     )
 }
 
-/// `rotate_half(x) = cat(-x[..,h:], x[..,:h])` for `[B,H,L,D]`.
-fn rotate_half(x: &Array) -> Result<Array> {
-    let p = split(x, 2, 3)?; // [x1, x2] halves along the head-dim axis
-    Ok(concatenate_axis(&[&negative(&p[1])?, &p[0]], 3)?)
-}
-
 /// `q·cos + rotate_half(q)·sin` with `cos`/`sin` `[L, D]` broadcast over `[B,H,L,D]`.
 fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     let (l, d) = (cos.shape()[0], cos.shape()[1]);
@@ -116,18 +109,6 @@ fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     let xc = multiply(x, &cos.as_dtype(x.dtype())?)?;
     let xs = multiply(&rotate_half(x)?, &sin.as_dtype(x.dtype())?)?;
     Ok(add(&xc, &xs)?)
-}
-
-/// Repeat KV heads `n_rep×` along the head axis (`[B,nkv,L,D]` → `[B,nkv·n_rep,L,D]`), matching HF
-/// `repeat_kv` (kv head j → q heads `[j·n_rep .. (j+1)·n_rep)`).
-fn repeat_kv(x: &Array, n_rep: i32) -> Result<Array> {
-    if n_rep == 1 {
-        return Ok(x.clone());
-    }
-    let sh = x.shape();
-    let (b, nkv, l, d) = (sh[0], sh[1], sh[2], sh[3]);
-    let expanded = broadcast_to(&x.reshape(&[b, nkv, 1, l, d])?, &[b, nkv, n_rep, l, d])?;
-    Ok(expanded.reshape(&[b, nkv * n_rep, l, d])?)
 }
 
 struct Attention {
@@ -169,8 +150,8 @@ impl Attention {
         let k = apply_rope(&to_heads(self.k.forward(x)?, self.num_kv_heads)?, cos, sin)?;
         let v = to_heads(self.v.forward(x)?, self.num_kv_heads)?;
         let n_rep = self.num_heads / self.num_kv_heads;
-        let k = repeat_kv(&k, n_rep)?;
-        let v = repeat_kv(&v, n_rep)?;
+        let k = repeat_kv(&k, n_rep, RotationAxes::HeadMajor)?;
+        let v = repeat_kv(&v, n_rep, RotationAxes::HeadMajor)?;
 
         // explicit attention (logit soft-cap blocks fused SDPA)
         let scores = multiply(

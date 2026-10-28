@@ -2459,6 +2459,7 @@ dependencies = [
 name = "mlx-gen"
 version = "0.0.0"
 dependencies = [
+ "image",
  "libc",
  "memmap2",
  "mlx-llm",

@@ -35,6 +35,8 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }
 # `_mlx_array_is_available` — mlx-c's accessor for `mlx::core::array::is_available()`, which
 # `tests/pipeline.rs` reads to observe DIRECTLY that the render's compute landed inside the
 # cancel-checked region, replacing a wall-clock ratio that moved with host load (sc-19452).

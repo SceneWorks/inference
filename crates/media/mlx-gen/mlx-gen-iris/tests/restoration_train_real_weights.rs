@@ -35,6 +35,7 @@ use mlx_gen_iris::IrisRestorer;
 use mlx_rs::Dtype;
 
 use crate::common::{fixture, host_f32};
+use mlx_gen::testing::save_png;
 
 fn req<'a>(g: &'a mlx_gen::weights::Weights, k: &str) -> &'a mlx_rs::Array {
     g.require(k).unwrap()
@@ -119,13 +120,6 @@ fn real_lpips_and_critic_trunk_match_the_reference() {
     #[cfg(target_os = "macos")]
     crate::common::metal_guard::record_model_inference_device();
     eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_real_weights::real_lpips_and_critic_trunk_match_the_reference");
-}
-
-fn save_png(img: &Image, path: &Path) {
-    image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
-        .unwrap()
-        .save(path)
-        .unwrap();
 }
 
 /// Three crops of the repository photo (the trainer re-crops each to 256² and degrades it).
@@ -244,7 +238,7 @@ fn train_export_and_restore(case: &str, mut config: TrainingConfig) {
     let (input, gt) = restore_case();
     let base = env_path("IRIS_UPSCALER_DIR");
     let before = restore(&base, &input);
-    save_png(&before, &out.join("restore_base_x4.png"));
+    save_png(&before, out.join("restore_base_x4.png"));
 
     config
         .model_options
@@ -307,7 +301,7 @@ fn train_export_and_restore(case: &str, mut config: TrainingConfig) {
     assert_eq!(res.steps, 4);
     let export = res.adapter_path.parent().unwrap().to_path_buf();
     let after = restore(&export, &input);
-    save_png(&after, &out.join("restore_trained_x4.png"));
+    save_png(&after, out.join("restore_trained_x4.png"));
     let moved = before
         .pixels
         .iter()

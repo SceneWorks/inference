@@ -29,13 +29,11 @@ use std::collections::HashMap;
 
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{
-    add, concatenate_axis, dequantize, divide, matmul, multiply, power, sigmoid, subtract, tanh,
-};
+use mlx_rs::ops::{add, concatenate_axis, dequantize, divide, matmul, multiply, sigmoid, subtract};
 use mlx_rs::transforms::checkpoint;
-use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::block_residency::BlockPlan;
 
@@ -48,7 +46,7 @@ pub(crate) mod rung4_block_window_tests;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::CancelFlag;
 
-use mlx_gen::nn::{gelu_tanh, linear, quantized_matmul_with_bias};
+use mlx_gen::nn::{linear, quantized_matmul_with_bias, DitCompileGlue, DitGlue};
 use mlx_gen::qkv::{
     self, AttnPrepSpec, QkNormSpec, QkvSource, RopeDtype, RopeSpec, RopeStyle, RopeTables,
     RotationAxes,
@@ -141,10 +139,6 @@ impl Precision {
     }
 }
 
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
-
 const SITE_MODULATE: &str = "ltx::transformer::modulate";
 const SITE_GATED: &str = "ltx::transformer::gated";
 const SITE_GELU_FFN: &str = "ltx::transformer::gelu_ffn";
@@ -158,71 +152,27 @@ fn modulate_impl(
     )
 }
 
-fn gated_impl((x, out, gate): (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
-    add(x, &multiply(out, gate)?)
-}
-
-fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
-    let dt = x.dtype();
-    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-    let x3 = power(x, Array::from_int(3))?;
-    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-    multiply(&multiply(x, &s(0.5)?)?, &gate)
-}
-
-struct LtxRetainedCompileGlue {
-    modulate: mlx_gen::nn::RetainedTernary,
-    gated: mlx_gen::nn::RetainedTernary,
-    gelu_ffn: mlx_gen::nn::RetainedUnary,
-}
-
-impl LtxRetainedCompileGlue {
-    fn new() -> Self {
-        Self {
-            modulate: mlx_gen::nn::RetainedTernary::new(compile_retained(modulate_impl, true)),
-            gated: mlx_gen::nn::RetainedTernary::new(compile_retained(gated_impl, true)),
-            gelu_ffn: mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_ffn_impl, true)),
-        }
-    }
-}
-
 thread_local! {
-    static RETAINED_COMPILE_GLUE: RefCell<Option<LtxRetainedCompileGlue>> =
-        const { RefCell::new(None) };
+    static RETAINED_COMPILE_GLUE: RefCell<Option<DitCompileGlue>> = const { RefCell::new(None) };
 }
 
-fn with_retained_compile_glue<T>(
-    f: impl FnOnce(&mut LtxRetainedCompileGlue) -> std::result::Result<T, Exception>,
-) -> std::result::Result<T, Exception> {
-    mlx_gen::nn::prepare_retained_compilation_thread();
-    RETAINED_COMPILE_GLUE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        f(slot.get_or_insert_with(LtxRetainedCompileGlue::new))
-    })
-}
+/// The LTX DiT's compiled glue (sc-2963) — adaLN `x·(1+scale)+shift`, gated residual `x + out·gate`
+/// and the tanh-GELU FFN activation — through the shared retained/one-shot/eager dispatch
+/// (sc-27339). Each is one fused kernel when the glue toggle is on, bit-identical to the eager form
+/// and dtype-preserving (the modulate `1` is cast to `scale`'s dtype inside). The GELU fusion is by
+/// far the biggest per-step glue cost at video sequence (the FFN expansion runs on `[B, S, ffn]`
+/// tensors of tens-to-hundreds of millions of elements); off ⇒ core `gelu_tanh`, byte-for-byte the
+/// previous behaviour.
+static GLUE: DitGlue = DitGlue::new(
+    [SITE_MODULATE, SITE_GATED, SITE_GELU_FFN],
+    modulate_impl,
+    &RETAINED_COMPILE_GLUE,
+);
 
 /// Exercise every retained handle owned by the LTX transformer once for the release memory audit.
 #[doc(hidden)]
 pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
-    let output = with_retained_compile_glue(|compiled| {
-        compiled.modulate.call(SITE_MODULATE, (input, input, input))
-    })?;
-    output.eval()?;
-    drop(output);
-
-    let output = with_retained_compile_glue(|compiled| {
-        compiled.gated.call(SITE_GATED, (input, input, input))
-    })?;
-    output.eval()?;
-    drop(output);
-
-    let output =
-        with_retained_compile_glue(|compiled| compiled.gelu_ffn.call(SITE_GELU_FFN, input))?;
-    output.eval()?;
-    drop(output);
-    Ok(())
+    GLUE.exercise_retained_compile_inventory(input)
 }
 
 /// Load a non-Linear param (norm weight, scale-shift table) cast to the compute dtype.
@@ -255,69 +205,19 @@ fn apply_keyframes_embedding(
 }
 
 /// `x · (1 + scale) + shift` (adaLN modulation), broadcasting `scale`/`shift` `(B, S', dim)` over the
-/// token axis. One fused kernel when the sc-2963 glue toggle is on (the `1` is cast to `scale`'s dtype
-/// inside, as before — bit-identical and dtype-preserving).
+/// token axis.
 fn modulate(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    if crate::compile_glue() {
-        if mlx_gen::nn::retained_compilation_requested() {
-            Ok(with_retained_compile_glue(|compiled| {
-                compiled.modulate.call(SITE_MODULATE, (x, scale, shift))
-            })?)
-        } else {
-            mlx_gen::diagnostics::record_compile(
-                SITE_MODULATE,
-                mlx_gen::diagnostics::CompileDisposition::OneShot,
-            );
-            Ok(compile(modulate_impl, true)((x, scale, shift))?)
-        }
-    } else {
-        mlx_gen::diagnostics::record_fallback(SITE_MODULATE, "compiled_glue_disabled");
-        Ok(modulate_impl((x, scale, shift))?)
-    }
+    GLUE.modulate(x, scale, shift)
 }
 
-/// Gated residual `x + out·gate` — one fused kernel (multiply + add) when the sc-2963 glue toggle is
-/// on; bit-identical to the eager `add(x, out·gate)`, dtype-preserving.
+/// Gated residual `x + out·gate`.
 fn gated(x: &Array, out: &Array, gate: &Array) -> Result<Array> {
-    if crate::compile_glue() {
-        if mlx_gen::nn::retained_compilation_requested() {
-            Ok(with_retained_compile_glue(|compiled| {
-                compiled.gated.call(SITE_GATED, (x, out, gate))
-            })?)
-        } else {
-            mlx_gen::diagnostics::record_compile(
-                SITE_GATED,
-                mlx_gen::diagnostics::CompileDisposition::OneShot,
-            );
-            Ok(compile(gated_impl, true)((x, out, gate))?)
-        }
-    } else {
-        mlx_gen::diagnostics::record_fallback(SITE_GATED, "compiled_glue_disabled");
-        Ok(gated_impl((x, out, gate))?)
-    }
+    GLUE.gated(x, out, gate)
 }
 
-/// The tanh-GELU FFN activation. Body mirrors [`mlx_gen::nn::gelu_tanh`] exactly (dtype-preserving,
-/// f64-host `√(2/π)`); when the sc-2963 glue toggle is on, MLX fuses its ~8 elementwise ops into one
-/// kernel — by far the biggest per-step glue cost at video sequence (the FFN expansion runs on
-/// `[B, S, ffn]` tensors of tens-to-hundreds of millions of elements). Off ⇒ defers to core
-/// `gelu_tanh`, so the eager path is byte-for-byte the previous behaviour.
+/// The tanh-GELU FFN activation.
 fn gelu_ffn(x: &Array) -> Result<Array> {
-    if !crate::compile_glue() {
-        mlx_gen::diagnostics::record_fallback(SITE_GELU_FFN, "compiled_glue_disabled");
-        return gelu_tanh(x);
-    }
-    if mlx_gen::nn::retained_compilation_requested() {
-        Ok(with_retained_compile_glue(|compiled| {
-            compiled.gelu_ffn.call(SITE_GELU_FFN, x)
-        })?)
-    } else {
-        mlx_gen::diagnostics::record_compile(
-            SITE_GELU_FFN,
-            mlx_gen::diagnostics::CompileDisposition::OneShot,
-        );
-        Ok(compile(gelu_ffn_impl, true)(x)?)
-    }
+    GLUE.gelu_ffn(x)
 }
 
 /// A Linear's base weight — dense or Q8-quantized, selected by [`Precision`] at load. `b` is `None`
