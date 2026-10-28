@@ -185108,11 +185108,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::depth_anchoring_tests::buckets_interleave_with_per_entry_references_at_their_own_edge@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs::training::depth_anchoring_tests::buckets_interleave_with_per_entry_references_at_their_own_edge@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185138,11 +185138,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs::training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185168,11 +185168,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs::training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185203,7 +185203,7 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs",
     "input_contract": {
       "fixture_kind": "external",
       "requirements": [
@@ -185311,7 +185311,7 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::first_step_repro::attn_ckpt_grads_match_retained@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs::training::first_step_repro::attn_ckpt_grads_match_retained@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185342,7 +185342,7 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs",
     "input_contract": {
       "fixture_kind": "external",
       "requirements": [
@@ -185450,7 +185450,7 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::first_step_repro::bf16_grads_decorrelate_justifying_f32@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs::training::first_step_repro::bf16_grads_decorrelate_justifying_f32@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185481,7 +185481,7 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs",
     "input_contract": {
       "fixture_kind": "external",
       "requirements": [
@@ -185589,7 +185589,7 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::first_step_repro::block_ckpt_grads_match_dense@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs::training::first_step_repro::block_ckpt_grads_match_dense@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185620,7 +185620,7 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs",
     "input_contract": {
       "fixture_kind": "external",
       "requirements": [
@@ -185728,7 +185728,7 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::first_step_repro::block_ckpt_reduces_peak_vs_dense@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs::training::first_step_repro::block_ckpt_reduces_peak_vs_dense@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185759,7 +185759,7 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs",
     "input_contract": {
       "fixture_kind": "external",
       "requirements": [
@@ -185867,7 +185867,7 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::first_step_repro::first_step_attn_ckpt_sweep@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs::training::first_step_repro::first_step_attn_ckpt_sweep@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185893,11 +185893,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::ltx25_depth_anchoring_tests::depth_decoder_decodes_each_frame_with_its_predecessor@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs::training::ltx25_depth_anchoring_tests::depth_decoder_decodes_each_frame_with_its_predecessor@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185923,11 +185923,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::ltx25_depth_anchoring_tests::depth_frames_follow_the_generated_frames_and_the_token_layout@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs::training::ltx25_depth_anchoring_tests::depth_frames_follow_the_generated_frames_and_the_token_layout@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185953,11 +185953,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::ltx25_depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_av_step@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs::training::ltx25_depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_av_step@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185983,11 +185983,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::ltx25_depth_anchoring_tests::depth_step_trains_the_lora_through_the_video_stream_only@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs::training::ltx25_depth_anchoring_tests::depth_step_trains_the_lora_through_the_video_stream_only@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -186013,14 +186013,14 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_tiny_production_lifecycle.rs",
     "input_contract": {
       "case_generated_inputs": true,
       "fixture_kind": "source-defined",
       "requirements": [
         {
           "case_generated_write_read": {
-            "case_source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+            "case_source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_tiny_production_lifecycle.rs",
             "case_source_sha256": "68193202ba36aecf6a2b151aa69d901e248b0d04f78a4618c49d6f99ab611303",
             "writer": "Same-case literal numeric AV inputs plus tiny_cfg/tiny_weight_map -> local build_targets_25 -> compute_ltx25_loss_grads -> optimizer.step -> save_lora(&params,&targets,2.0,2,&path) to temporary tiny_ltx25.safetensors -> Weights::from_file(&path); same generated path then AdapterSpec -> apply_ltx25_adapters -> Weights::from_file. Current381 actual root/write/read/numeric and reader-definition anchors are retained in source_facts; both requirements observe this same generated file, not two distinct files."
           },
@@ -186036,7 +186036,7 @@
         },
         {
           "case_generated_write_read": {
-            "case_source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+            "case_source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_tiny_production_lifecycle.rs",
             "case_source_sha256": "68193202ba36aecf6a2b151aa69d901e248b0d04f78a4618c49d6f99ab611303",
             "writer": "Same-case literal numeric AV inputs plus tiny_cfg/tiny_weight_map -> local build_targets_25 -> compute_ltx25_loss_grads -> optimizer.step -> save_lora(&params,&targets,2.0,2,&path) to temporary tiny_ltx25.safetensors -> Weights::from_file(&path); same generated path then AdapterSpec -> apply_ltx25_adapters -> Weights::from_file. Current381 actual root/write/read/numeric and reader-definition anchors are retained in source_facts; both requirements observe this same generated file, not two distinct files."
           },
@@ -186051,7 +186051,7 @@
           "slot": "generated-a51c4ee25b66a0e8d32b974dc83086fa3a8c31f6ea1ba863a721b65a697908af"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::ltx25_tiny_production_lifecycle::train_changes_output_and_strict_save_reloads_on_fresh_av_model@68193202ba36aecf6a2b151aa69d901e248b0d04f78a4618c49d6f99ab611303"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_tiny_production_lifecycle.rs::training::ltx25_tiny_production_lifecycle::train_changes_output_and_strict_save_reloads_on_fresh_av_model@68193202ba36aecf6a2b151aa69d901e248b0d04f78a4618c49d6f99ab611303"
     }
   },
   {
