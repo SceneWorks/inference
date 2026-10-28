@@ -29,9 +29,7 @@ use std::collections::HashMap;
 
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{
-    add, concatenate_axis, dequantize, divide, matmul, multiply, power, sigmoid, subtract, tanh,
-};
+use mlx_rs::ops::{add, concatenate_axis, dequantize, divide, matmul, multiply, sigmoid, subtract};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
@@ -49,7 +47,9 @@ pub(crate) mod rung4_block_window_tests;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::CancelFlag;
 
-use mlx_gen::nn::{gelu_tanh, linear, quantized_matmul_with_bias};
+use mlx_gen::nn::{
+    gated_residual_impl, gelu_tanh, gelu_tanh_ffn_impl, linear, quantized_matmul_with_bias,
+};
 use mlx_gen::qkv::{
     self, AttnPrepSpec, QkNormSpec, QkvSource, RopeDtype, RopeSpec, RopeStyle, RopeTables,
     RotationAxes,
@@ -155,20 +155,6 @@ fn modulate_impl(
     )
 }
 
-fn gated_impl((x, out, gate): (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
-    add(x, &multiply(out, gate)?)
-}
-
-fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
-    let dt = x.dtype();
-    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-    let x3 = power(x, Array::from_int(3))?;
-    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-    multiply(&multiply(x, &s(0.5)?)?, &gate)
-}
-
 struct LtxRetainedCompileGlue {
     modulate: mlx_gen::nn::RetainedTernary,
     gated: mlx_gen::nn::RetainedTernary,
@@ -179,8 +165,8 @@ impl LtxRetainedCompileGlue {
     fn new() -> Self {
         Self {
             modulate: mlx_gen::nn::RetainedTernary::new(compile_retained(modulate_impl, true)),
-            gated: mlx_gen::nn::RetainedTernary::new(compile_retained(gated_impl, true)),
-            gelu_ffn: mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_ffn_impl, true)),
+            gated: mlx_gen::nn::RetainedTernary::new(compile_retained(gated_residual_impl, true)),
+            gelu_ffn: mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_tanh_ffn_impl, true)),
         }
     }
 }
@@ -286,11 +272,11 @@ fn gated(x: &Array, out: &Array, gate: &Array) -> Result<Array> {
                 SITE_GATED,
                 mlx_gen::diagnostics::CompileDisposition::OneShot,
             );
-            Ok(compile(gated_impl, true)((x, out, gate))?)
+            Ok(compile(gated_residual_impl, true)((x, out, gate))?)
         }
     } else {
         mlx_gen::diagnostics::record_fallback(SITE_GATED, "compiled_glue_disabled");
-        Ok(gated_impl((x, out, gate))?)
+        Ok(gated_residual_impl((x, out, gate))?)
     }
 }
 
@@ -313,7 +299,7 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
             SITE_GELU_FFN,
             mlx_gen::diagnostics::CompileDisposition::OneShot,
         );
-        Ok(compile(gelu_ffn_impl, true)(x)?)
+        Ok(compile(gelu_tanh_ffn_impl, true)(x)?)
     }
 }
 

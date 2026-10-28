@@ -369,6 +369,30 @@ fn compiled_gated(args: (&Array, &Array, &Array)) -> std::result::Result<Array, 
     gated_impl(args)
 }
 
+/// Provider compiled-glue body: gated residual `x + y·gate` (argument order `(x, y, gate)`). The
+/// fn the LTX and Wan DiTs hand to `mx.compile` / `compile_retained` and run eagerly when the glue
+/// toggle is off — one shared definition so the fused and eager forms cannot drift (sc-27339).
+/// Distinct from this module's private `(x, gate, y)` [`gated`] body, whose operand order differs.
+pub fn gated_residual_impl(
+    (x, y, gate): (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    add(x, &multiply(y, gate)?)
+}
+
+/// Provider compiled-glue body: the tanh-GELU FFN activation, op-for-op the eager tail of
+/// [`gelu_tanh`] (dtype-preserving, f64-host `√(2/π)`, integer-exponent `x³`). The fn the LTX, Wan,
+/// FLUX.1 and Qwen-Image DiTs hand to `mx.compile` / `compile_retained` for their fused FFN
+/// activation, previously a private byte-identical copy in each (sc-27339).
+pub fn gelu_tanh_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
+    let dt = x.dtype();
+    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+    let x3 = power(x, Array::from_int(3))?;
+    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+    multiply(&multiply(x, &s(0.5)?)?, &gate)
+}
+
 fn rope_rotate_impl(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
     let (real, imag, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
     let out_real = subtract(&multiply(real, cos)?, &multiply(imag, sin)?)?;
