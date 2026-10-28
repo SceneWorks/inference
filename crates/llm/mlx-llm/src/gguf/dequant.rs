@@ -157,7 +157,11 @@ pub fn tensor_byte_len(tag: u32, num_elements: usize) -> Result<usize> {
             "gguf: {num_elements} elements not a multiple of {be} for {ty:?}"
         )));
     }
-    Ok((num_elements / be) * bb)
+    (num_elements / be).checked_mul(bb).ok_or_else(|| {
+        Error::Msg(format!(
+            "gguf: {num_elements} elements of {ty:?} overflow the byte length"
+        ))
+    })
 }
 
 /// Dequantize a tensor's raw block bytes to dense `f32` of length `num_elements`.
