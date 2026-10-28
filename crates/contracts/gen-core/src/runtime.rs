@@ -1013,34 +1013,59 @@ impl ArtifactSeal {
     /// and `link` must name the very same file object. Anything else refuses — the link is left in
     /// place and the caller's ordinary re-pin re-reads and compares the content.
     ///
-    /// The only write this cannot distinguish from the link is one that lands inside the link call
-    /// itself AND preserves size and mtime; outside that one-syscall window the seal's full
-    /// change-time semantics still apply.
+    /// # The window in which the change time is not compared
+    ///
+    /// The change time is ignored only between two stats that bracket the `hard_link` syscall:
+    /// the last pre-link stat of the target and of the entry (each compared IN FULL, change time
+    /// included, against this seal — after [`Self::ensure_unchanged`] has verified the parent
+    /// chain and resolution) and the first post-link stat of the target and of the entry (compared
+    /// against this seal with only the change time cleared). Everything captured after those
+    /// post-link stats — the full re-capture and the link's own stat — must then agree with them
+    /// IN FULL, so a write after the bracket is caught by its change time as usual. The only write
+    /// this cannot distinguish from the link is one that lands inside that bracket (two stats,
+    /// the link syscall, two stats) AND preserves size, mtime and file id.
     pub fn hard_link_with_check(
         &self,
         link: impl AsRef<Path>,
         mut check: impl FnMut() -> crate::Result<()>,
     ) -> crate::Result<Self> {
         let link = link.as_ref();
+        let changed = || {
+            crate::Error::Unsupported(format!(
+                "pinned weights changed while being hard-linked: {}",
+                self.loader_path.display()
+            ))
+        };
         check()?;
         self.ensure_unchanged()?;
+        // Bracket open: the last full-identity proof before the link.
+        if stat_fingerprint(&self.loader_path, true)? != self.target_fingerprint
+            || stat_fingerprint(&self.loader_path, false)? != self.entry_fingerprint
+        {
+            return Err(changed());
+        }
         std::fs::hard_link(&self.canonical_target_path, link)?;
+        // Bracket close: the first stats after the link; only the change time may have moved.
+        let target_after = stat_fingerprint(&self.loader_path, true)?;
+        let entry_after = stat_fingerprint(&self.loader_path, false)?;
+        if without_change_time(&target_after) != without_change_time(&self.target_fingerprint)
+            || without_change_time(&entry_after) != without_change_time(&self.entry_fingerprint)
+        {
+            return Err(changed());
+        }
         let relinked = Self::capture_identity(&self.loader_path)?;
         let linked = stat_fingerprint(link, false)?;
+        // From here on the full identity, change time included, must equal the bracket-close one.
         let unchanged_but_for_the_link = relinked.loader_path == self.loader_path
             && relinked.canonical_target_path == self.canonical_target_path
             && relinked.path_component_fingerprints == self.path_component_fingerprints
-            && without_change_time(&relinked.entry_fingerprint)
-                == without_change_time(&self.entry_fingerprint)
-            && without_change_time(&relinked.target_fingerprint)
-                == without_change_time(&self.target_fingerprint)
+            && relinked.entry_fingerprint == entry_after
+            && relinked.target_fingerprint == target_after
             && !linked.is_symlink
-            && same_file_object(&linked, &relinked.target_fingerprint);
+            && same_file_object(&linked, &relinked.target_fingerprint)
+            && linked == target_after;
         if !unchanged_but_for_the_link {
-            return Err(crate::Error::Unsupported(format!(
-                "pinned weights changed while being hard-linked: {}",
-                self.loader_path.display()
-            )));
+            return Err(changed());
         }
         check()?;
         relinked.remember_digest(PROVEN_DIGEST_STORE.get().map(PathBuf::as_path), self.sha256);
@@ -4301,6 +4326,82 @@ mod tests {
         );
         assert_eq!(sealed.content_sha256(), &sha256_of(b"tampered bytes"));
         assert_ne!(sealed.content_sha256(), attestation.content_sha256());
+    }
+
+    /// Overwrite `file` IN PLACE (same file object, same length) with `bytes`, then restore its
+    /// original mtime — the tamper only the change time (Windows ChangeTime / Unix ctime) can see.
+    /// The sleep first steps past the filesystem clock tick (NTFS / Linux timestamps come from a
+    /// coarse kernel clock), so the rewrite's change time is a later tick than the captured one.
+    fn rewrite_in_place_restoring_mtime(file: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        let before = std::fs::metadata(file).unwrap();
+        assert_eq!(before.len(), bytes.len() as u64, "a same-size rewrite");
+        let mtime = before.modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut handle = std::fs::File::options().write(true).open(file).unwrap();
+        handle.write_all(bytes).unwrap();
+        handle.sync_all().unwrap();
+        handle.set_modified(mtime).unwrap();
+        drop(handle);
+        let after = std::fs::metadata(file).unwrap();
+        assert_eq!(after.modified().unwrap(), mtime, "mtime restored exactly");
+        assert_eq!(after.len(), before.len());
+        assert_eq!(std::fs::read(file).unwrap(), bytes);
+    }
+
+    /// A same-size in-place rewrite that restores the original mtime keeps size, mtime and file
+    /// id — only the change time moves. It must still not redeem the attestation: the pin re-reads
+    /// and seals the real bytes. (Mutation-checked: with the change time not captured, this test
+    /// fails because the attested digest is returned without a read.)
+    #[test]
+    fn an_attestation_never_authorizes_an_mtime_restoring_same_size_rewrite() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("derivative.safetensors");
+        std::fs::write(&file, b"original bytes").expect("write fixture");
+        let attestation =
+            ArtifactDigestAttestation::capture(&file, sha256_of(b"original bytes")).unwrap();
+        rewrite_in_place_restoring_mtime(&file, b"tampered bytes");
+
+        let before = test_full_hash_work_count();
+        let mut acquisitions = Vec::new();
+        let sealed = ArtifactSeal::pin_attested_with_progress(
+            &file,
+            &attestation,
+            || Ok(()),
+            |progress| acquisitions.push(progress.acquisition),
+        )
+        .expect("falls back to a pin");
+        assert!(
+            !acquisitions.contains(&ArtifactSealAcquisition::Attested),
+            "a change-time-only tamper must not redeem the attestation: {acquisitions:?}"
+        );
+        assert!(
+            test_full_hash_work_count() > before,
+            "the tampered file must be re-read"
+        );
+        assert_eq!(sealed.content_sha256(), &sha256_of(b"tampered bytes"));
+    }
+
+    /// The hard-link path's twin: the same change-time-only tamper between the pin and the link
+    /// refuses the relink, so the old digest never labels the rewritten bytes. (Mutation-checked
+    /// like the attestation test above.)
+    #[test]
+    fn a_seal_refuses_to_hard_link_after_an_mtime_restoring_same_size_rewrite() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("derivative.safetensors");
+        std::fs::write(&file, b"derivative bytes").expect("write fixture");
+        let sealed = ArtifactSeal::pin(&file).expect("pin");
+        rewrite_in_place_restoring_mtime(&file, b"tampered!! bytes");
+
+        let link = dir.path().join("staged.safetensors");
+        let error = sealed
+            .hard_link_with_check(&link, || Ok(()))
+            .expect_err("a change-time-only tamper must never be relinked under the old digest");
+        assert!(error.to_string().contains("changed"), "{error}");
+        assert!(
+            !link.exists(),
+            "the refusal happens before the link is created"
+        );
     }
 
     /// sc-26691: a hard link the seal creates itself carries the digest across the ChangeTime/ctime
