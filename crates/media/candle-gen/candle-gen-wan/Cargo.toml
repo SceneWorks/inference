@@ -23,7 +23,8 @@ rand_distr = { workspace = true }
 safetensors = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
+# Only the SC-20686 campaign observer hashes, so it is optional behind `campaign-observer` (sc-27296).
+sha2 = { workspace = true, optional = true }
 # The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath (depth anchoring
 # through the TAEHV tiny video decoder).
 candle-gen-perceptual = { path = "../candle-gen-perceptual" }
@@ -33,8 +34,14 @@ model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-p
 default = []
 metal = ["candle-gen/metal", "candle-gen-perceptual/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-perceptual/cuda"]
+# SC-20686 K/V campaign observer (epic 20669 measurement tooling, sc-27296). Off by default: the
+# production build compiles an inert hook stub (`src/sc20686_observer_off.rs`). The candle-cuda
+# campaign builds the Wan campaign examples with this feature; never selected by runtime bundles.
+campaign-observer = ["dep:sha2"]
 
 [dev-dependencies]
+# The real SC-20686 observer also compiles into this crate's own unit-test build (sc-27296).
+sha2 = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 sceneworks-gen-core-testkit = { workspace = true }
 # Shared test-support helpers (sc-9055 / F-069: candle_gen::testkit gpu_peak sampler).

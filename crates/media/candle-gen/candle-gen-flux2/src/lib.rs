@@ -58,6 +58,12 @@ pub mod pipeline;
 pub mod pos_embed;
 pub mod preview;
 pub mod quant;
+// SC-20686 campaign observer (sc-27288): the real recorder only under the `campaign-observer`
+// feature (and in this crate's unit tests); production builds get the inert hook stub.
+#[cfg(any(test, feature = "campaign-observer"))]
+pub mod sc20686_observer;
+#[cfg(not(any(test, feature = "campaign-observer")))]
+#[path = "sc20686_observer_off.rs"]
 pub mod sc20686_observer;
 pub mod single_file;
 pub mod text_encoder;
