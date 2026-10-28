@@ -106,7 +106,10 @@ pub(crate) enum Phase {
     Checkpoint,
 }
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Component diagnostics and peak are optional to the trainer, exercised purely.
+// The phase totals drive admission; the component diagnostics (`context_token_bound`, `cache_bytes`,
+// `trainable_elements`, and the backward breakdown) are read only by the `test-support` memory-plan
+// probe and the guard tests.
+#[allow(dead_code)]
 pub(crate) struct MemoryEstimate {
     pub load: u64,
     pub cast: u64,
@@ -158,7 +161,9 @@ impl MemoryEstimate {
         }
         Ok(())
     }
-    #[allow(dead_code)] // Optional aggregate diagnostic; phase guards do not depend on it.
+    /// Aggregate diagnostic: reported by the `test-support` memory-plan probe; phase guards do not
+    /// depend on it.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn peak(&self) -> u64 {
         self.load
             .max(self.cast)

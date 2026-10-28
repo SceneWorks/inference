@@ -2936,6 +2936,7 @@ dependencies = [
  "mlx-gen-z-image",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
