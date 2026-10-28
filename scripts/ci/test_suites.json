@@ -1867,7 +1867,7 @@
       "kind": "lib",
       "target": "mlx_llm",
       "test": "primitives::paged_packed_kv::tests::paged_reader_matches_the_independent_fp32_oracle_across_paths_and_page_orders",
-      "source": "crates/llm/mlx-llm/src/primitives/paged_packed_kv.rs",
+      "source": "crates/llm/mlx-llm/src/primitives/paged_packed_kv/tests.rs",
       "reason": "Six dtype/head/page/query/mask geometries x PackedCodeBits::ALL. Helper builds three fragmented/recycled sequences with uneven appends, compares fused kernels and independent fp32 paged oracles across paths.",
       "platforms": [
         "darwin"
@@ -1878,7 +1878,7 @@
       "kind": "lib",
       "target": "mlx_llm",
       "test": "primitives::paged_packed_kv::tests::speculative_rollback_is_byte_and_position_exact",
-      "source": "crates/llm/mlx-llm/src/primitives/paged_packed_kv.rs",
+      "source": "crates/llm/mlx-llm/src/primitives/paged_packed_kv/tests.rs",
       "reason": "Two dtypes x four retained positions, each followed by 1/33/1-token continuations, compares storage and numerical output to independent cache reference.",
       "platforms": [
         "darwin"
@@ -1933,7 +1933,7 @@
       "kind": "lib",
       "target": "mlx_llm",
       "test": "provider::tests::a_one_token_request_working_set_is_priced_under_either_activation_dtype",
-      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "source": "crates/llm/mlx-llm/src/provider/tests.rs",
       "reason": "Allocator/physical-footprint campaign despite one-token name: Llama/Gemma x dense/Q4 65,536-vocabulary snapshots, warmup and repeated second_run_peak measurements, plus pinned-f32 Gemma forwards.",
       "platforms": [
         "darwin"
@@ -1944,7 +1944,7 @@
       "kind": "lib",
       "target": "mlx_llm",
       "test": "provider::tests::admission_estimates_cover_the_measured_peak_compressed_and_dense",
-      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "source": "crates/llm/mlx-llm/src/provider/tests.rs",
       "reason": "Measured allocator stress, not arithmetic estimation: 28-layer KV-dominant model, family-qualified prompt, warm both routes, then 600 generated tokens per compressed/dense arm with measured peak memory.",
       "platforms": [
         "darwin"
@@ -1955,7 +1955,7 @@
       "kind": "lib",
       "target": "mlx_llm",
       "test": "provider::tests::llama_compressed_kv_matches_dense_at_its_qualified_context",
-      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "source": "crates/llm/mlx-llm/src/provider/tests.rs",
       "reason": "Hidden assert_compressed_matches_dense performs family-qualified long-context dense/compressed/control generations of 24 tokens, teacher-forced per-position parity, and short dense fallback runs.",
       "platforms": [
         "darwin"
@@ -1966,7 +1966,7 @@
       "kind": "lib",
       "target": "mlx_llm",
       "test": "provider::tests::no_dense_kv_copy_survives_a_paged_compressed_attention_call",
-      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "source": "crates/llm/mlx-llm/src/provider/tests.rs",
       "reason": "Paged memory-retention/peak campaign: 1536-token warmup and measured prefill then 40 decode steps, resets peak memory each step, validates page-pool growth and absence of transient dense gather.",
       "platforms": [
         "darwin"
@@ -1977,7 +1977,7 @@
       "kind": "lib",
       "target": "mlx_llm",
       "test": "provider::tests::no_dense_kv_mirror_survives_a_compressed_attention_call",
-      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "source": "crates/llm/mlx-llm/src/provider/tests.rs",
       "reason": "Memory-retention numerical campaign: 1536-token GQA prefill warmup, repeat prefill, 40 evaluated decode steps with active-memory and per-layer dense-mirror accounting.",
       "platforms": [
         "darwin"
@@ -1988,7 +1988,7 @@
       "kind": "lib",
       "target": "mlx_llm",
       "test": "provider::tests::paged_compressed_kv_logits_match_contiguous_compressed_and_dense_paged",
-      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "source": "crates/llm/mlx-llm/src/provider/tests.rs",
       "reason": "Three-arm teacher-forced numerical comparison: 150-token prompt and 60 decode tokens through paged compressed, contiguous compressed, and dense paged caches.",
       "platforms": [
         "darwin"
@@ -1999,7 +1999,7 @@
       "kind": "lib",
       "target": "mlx_llm",
       "test": "provider::tests::paged_compressed_requests_share_a_fragmented_pool_and_cancellation_frees_pages",
-      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "source": "crates/llm/mlx-llm/src/provider/tests.rs",
       "reason": "Long interleaved numerical lifecycle comparison: requests decode 30/50/50 tokens, cancellation and fragmented page reuse, plus standalone reference reruns for every stream.",
       "platforms": [
         "darwin"
@@ -2010,7 +2010,7 @@
       "kind": "lib",
       "target": "mlx_llm",
       "test": "provider::tests::qwen3_compressed_kv_matches_dense_at_its_qualified_context",
-      "source": "crates/llm/mlx-llm/src/provider.rs",
+      "source": "crates/llm/mlx-llm/src/provider/tests.rs",
       "reason": "Hidden assert_compressed_matches_dense performs family-qualified long-context dense/compressed/control generations of 24 tokens, teacher-forced per-position parity, and short dense fallback runs.",
       "platforms": [
         "darwin"
