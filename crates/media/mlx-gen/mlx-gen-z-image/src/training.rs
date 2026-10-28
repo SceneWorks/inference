@@ -48,6 +48,7 @@ pub use mlx_gen::train::lora::LoraTarget;
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::vocab::{sample_timestep, validate_common_request};
 use mlx_gen::{
     FlowMatchEuler, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
     TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -202,33 +203,6 @@ mlx_gen::register_trainer! {
     pub(crate) const REGISTRATION = trainer_descriptor => load_trainer
 }
 
-/// Recognized `timestep_type` values — the noise-schedule samplers [`sample_sigma`] branches on
-/// (`linear`/`uniform`/`weighted`) plus the `sigmoid` default it falls back to. Any other string
-/// would silently sample sigmoid (F-041).
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values — the high/low-noise tilts [`sample_sigma`] branches on plus
-/// the neutral default (`balanced`/`none`/`neutral`) it falls back to.
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` select MAE, `mse`/`l2` the MSE default; any other
-/// string would silently train MSE (F-041).
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
-
-/// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,
-/// `-`/space → `_`) so validation accepts exactly the spellings the run would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
 /// Capability-free training-request validation, factored out of [`Trainer::validate`] so it can be
 /// unit-tested without a loaded trainer (mirrors the inference-side `validate_request`). Rejects an
 /// empty dataset, zero rank, **zero steps** (F-040 — a 0-step run would otherwise fall straight
@@ -237,48 +211,7 @@ fn normalize_cfg(s: &str) -> String {
 /// `timestep_type` / `timestep_bias` / `loss_type`. The non-empty target-module resolution (also
 /// F-041) is checked in [`Trainer::validate`], which has the loaded DiT to match suffixes against.
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    if req.items.is_empty() {
-        return Err("z_image_turbo trainer: dataset is empty".into());
-    }
-    if req.config.rank == 0 {
-        return Err("z_image_turbo trainer: rank must be > 0".into());
-    }
-    if req.config.steps == 0 {
-        return Err("z_image_turbo trainer: steps must be > 0".into());
-    }
-    if !TrainOptimizer::is_supported(&req.config.optimizer) {
-        return Err(format!(
-            "z_image_turbo trainer: optimizer '{}' is not available on MLX training (supported: \
-             adamw, adam, rose, prodigy)",
-            req.config.optimizer
-        )
-        .into());
-    }
-    if !TIMESTEP_TYPES.contains(&normalize_cfg(&req.config.timestep_type).as_str()) {
-        return Err(format!(
-            "z_image_turbo trainer: timestep_type '{}' is not recognized (supported: {})",
-            req.config.timestep_type,
-            TIMESTEP_TYPES.join(", ")
-        )
-        .into());
-    }
-    if !TIMESTEP_BIASES.contains(&normalize_cfg(&req.config.timestep_bias).as_str()) {
-        return Err(format!(
-            "z_image_turbo trainer: timestep_bias '{}' is not recognized (supported: {})",
-            req.config.timestep_bias,
-            TIMESTEP_BIASES.join(", ")
-        )
-        .into());
-    }
-    if !LOSS_TYPES.contains(&normalize_cfg(&req.config.loss_type).as_str()) {
-        return Err(format!(
-            "z_image_turbo trainer: loss_type '{}' is not recognized (supported: {})",
-            req.config.loss_type,
-            LOSS_TYPES.join(", ")
-        )
-        .into());
-    }
-    Ok(())
+    validate_common_request("z_image_turbo trainer", req)
 }
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
@@ -1019,7 +952,7 @@ fn run_train_step(
     let sample = step_sample(perceptual, step, schedule);
     let entry = sample.entry;
     let (x0, cap, mask_weight) = &cache[entry];
-    let mut sigma = sample_sigma(
+    let mut sigma = sample_timestep(
         &cfg.timestep_type,
         &cfg.timestep_bias,
         cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
@@ -1211,40 +1144,6 @@ fn decode_image(path: &Path) -> Result<Image> {
         height,
         pixels: rgb.into_raw(),
     })
-}
-
-/// Sample a normalised flow-match timestep (interpolation coefficient) `σ ∈ [1e-3, 1-1e-3]` — a
-/// faithful port of the SceneWorks `sample_training_timestep`: `sigmoid(randn)` by default,
-/// `uniform` for linear, `(uniform + sigmoid(randn))/2` for weighted; bias `high` → `√σ`,
-/// `low` → `σ²`. Deterministic in `seed`.
-fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let ttype = timestep_type.trim().to_ascii_lowercase().replace('-', "_");
-    let t = match ttype.as_str() {
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            // wrapping_add (Fibonacci-hash mixing) rather than an XOR-sibling seed, whose two draws
-            // can correlate depending on `key()`'s splat (F-058).
-            let k2 = random::key(seed.wrapping_add(0x9E37_79B9))?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
-    };
-    let bias = timestep_bias
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '-'], "_");
-    let t = match bias.as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    Ok(t.clamp(1e-3, 1.0 - 1e-3))
 }
 
 /// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr), run the
@@ -2795,7 +2694,7 @@ mod depth_anchoring_tests {
             {
                 let key =
                     mlx_gen::train::perceptual::AuxAlternation::new(schedule.epoch_len(), 1).key(n);
-                let raw = sample_sigma(
+                let raw = sample_timestep(
                     &cfg.timestep_type,
                     &cfg.timestep_bias,
                     cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(n as u64),
@@ -2921,7 +2820,7 @@ mod depth_anchoring_tests {
 
         // The pre-sc-2125 `compute_loss_grads` body for step 1 (same item / sigma / noise).
         let (x0, cap, _) = &cache[0];
-        let sigma = sample_sigma(
+        let sigma = sample_timestep(
             &cfg.timestep_type,
             &cfg.timestep_bias,
             cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),
