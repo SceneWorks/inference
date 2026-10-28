@@ -143,10 +143,10 @@ pub struct Bundle {
     pub q: Vec<Vec<u16>>,
     pub k: Vec<Vec<u16>>,
 }
-/// Round-to-nearest-even BF16, AFTER FP8 decode and per-head FP32 scaling.
+/// Round-to-nearest-even BF16, AFTER FP8 decode and per-head FP32 scaling. A NaN stays NaN (the
+/// shared [`crate::numeric::bf16_bits`] guard, sc-27419); every non-NaN input is unchanged.
 pub fn bf16(x: f32) -> u16 {
-    let b = x.to_bits();
-    ((b.wrapping_add(0x7fff + ((b >> 16) & 1))) >> 16) as u16
+    crate::numeric::bf16_bits(x)
 }
 pub fn fp8(b: u8) -> f32 {
     let e = (b >> 3) & 15;
