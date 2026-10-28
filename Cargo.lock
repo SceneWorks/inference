@@ -3739,6 +3739,7 @@ dependencies = [
  "candle-gen-catalog",
  "candle-llm",
  "runtime-catalog",
+ "sceneworks-gen-core-testkit",
  "tempfile",
 ]
 
