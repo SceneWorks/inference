@@ -1773,7 +1773,7 @@ impl Ltx {
 
         on_progress(Progress::Decoding);
         let frames = self.decode_video(req, &video_latents, seed)?;
-        let images = frames_to_images(&frames)?;
+        let images = mlx_gen::image::u8_frames_to_images(&frames)?;
         // Audio always denoised (it conditions the video); decode it unless `--no-audio`.
         let audio = if Self::no_audio(req) {
             None
@@ -2941,24 +2941,6 @@ fn validate_request_for(
         }
     }
     Ok(())
-}
-
-/// `(F, H, W, 3)` uint8 → one [`Image`] per frame.
-pub(crate) fn frames_to_images(frames: &Array) -> Result<Vec<Image>> {
-    let sh = frames.shape(); // (F, H, W, 3)
-    let (f, h, w) = (sh[0] as usize, sh[1] as u32, sh[2] as u32);
-    // `as_slice` reads the physical buffer: force logical row-major order rather than rely on
-    // `pipeline::to_uint8_frames` ending in a `contiguous` copy.
-    let owned = mlx_gen::array::contiguous(frames)?;
-    let data = owned.as_slice::<u8>();
-    let per = (h as usize) * (w as usize) * 3;
-    Ok((0..f)
-        .map(|i| Image {
-            width: w,
-            height: h,
-            pixels: data[i * per..(i + 1) * per].to_vec(),
-        })
-        .collect())
 }
 
 /// Request-local calibration fault injection at a completed physical phase boundary.
@@ -4519,31 +4501,5 @@ mod tests {
             Conditioning::MultiReference { images: vec![img] },
         ]);
         assert!(err.contains("replace_person latent frame index 7"), "{err}");
-    }
-
-    #[test]
-    fn frames_to_images_splits_per_frame() {
-        // (F=2, H=1, W=2, 3): each frame = 6 bytes.
-        let data: Vec<u8> = (0..12).collect();
-        let frames = Array::from_slice(&data, &[2, 1, 2, 3]);
-        let imgs = frames_to_images(&frames).unwrap();
-        assert_eq!(imgs.len(), 2);
-        assert_eq!((imgs[0].width, imgs[0].height), (2, 1));
-        assert_eq!(imgs[0].pixels, vec![0, 1, 2, 3, 4, 5]);
-        assert_eq!(imgs[1].pixels, vec![6, 7, 8, 9, 10, 11]);
-    }
-
-    #[test]
-    fn frames_to_images_reads_a_strided_view_logically() {
-        // Physical (3, F=2, H=1, W=2) planes → logical (F, H, W, 3) through a transpose view; a raw
-        // `as_slice` would return the planes in physical order.
-        let planes: Vec<u8> = (0..12).collect();
-        let frames = Array::from_slice(&planes, &[3, 2, 1, 2])
-            .transpose_axes(&[1, 2, 3, 0])
-            .unwrap();
-        frames.eval().unwrap();
-        let imgs = frames_to_images(&frames).unwrap();
-        assert_eq!(imgs[0].pixels, vec![0, 4, 8, 1, 5, 9]);
-        assert_eq!(imgs[1].pixels, vec![2, 6, 10, 3, 7, 11]);
     }
 }
