@@ -185108,11 +185108,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::depth_anchoring_tests::buckets_interleave_with_per_entry_references_at_their_own_edge@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs::training::depth_anchoring_tests::buckets_interleave_with_per_entry_references_at_their_own_edge@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185138,11 +185138,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs::training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185168,11 +185168,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/depth_anchoring_tests.rs::training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185203,7 +185203,7 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs",
     "input_contract": {
       "fixture_kind": "external",
       "requirements": [
@@ -185311,7 +185311,7 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::first_step_repro::attn_ckpt_grads_match_retained@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs::training::first_step_repro::attn_ckpt_grads_match_retained@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185342,7 +185342,7 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs",
     "input_contract": {
       "fixture_kind": "external",
       "requirements": [
@@ -185450,7 +185450,7 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::first_step_repro::bf16_grads_decorrelate_justifying_f32@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs::training::first_step_repro::bf16_grads_decorrelate_justifying_f32@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185481,7 +185481,7 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs",
     "input_contract": {
       "fixture_kind": "external",
       "requirements": [
@@ -185589,7 +185589,7 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::first_step_repro::block_ckpt_grads_match_dense@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs::training::first_step_repro::block_ckpt_grads_match_dense@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185620,7 +185620,7 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs",
     "input_contract": {
       "fixture_kind": "external",
       "requirements": [
@@ -185728,7 +185728,7 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::first_step_repro::block_ckpt_reduces_peak_vs_dense@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs::training::first_step_repro::block_ckpt_reduces_peak_vs_dense@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185759,7 +185759,7 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs",
     "input_contract": {
       "fixture_kind": "external",
       "requirements": [
@@ -185867,7 +185867,7 @@
           "when": "external-present"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::first_step_repro::first_step_attn_ckpt_sweep@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/first_step_repro.rs::training::first_step_repro::first_step_attn_ckpt_sweep@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185893,11 +185893,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::ltx25_depth_anchoring_tests::depth_decoder_decodes_each_frame_with_its_predecessor@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs::training::ltx25_depth_anchoring_tests::depth_decoder_decodes_each_frame_with_its_predecessor@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185923,11 +185923,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::ltx25_depth_anchoring_tests::depth_frames_follow_the_generated_frames_and_the_token_layout@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs::training::ltx25_depth_anchoring_tests::depth_frames_follow_the_generated_frames_and_the_token_layout@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185953,11 +185953,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::ltx25_depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_av_step@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs::training::ltx25_depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_av_step@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -185983,11 +185983,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::ltx25_depth_anchoring_tests::depth_step_trains_the_lora_through_the_video_stream_only@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_depth_anchoring_tests.rs::training::ltx25_depth_anchoring_tests::depth_step_trains_the_lora_through_the_video_stream_only@a8abe8620c792a041dce5d25c93c61baa7b3d93dbef419de536a53519777805a"
     }
   },
   {
@@ -186013,14 +186013,14 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_tiny_production_lifecycle.rs",
     "input_contract": {
       "case_generated_inputs": true,
       "fixture_kind": "source-defined",
       "requirements": [
         {
           "case_generated_write_read": {
-            "case_source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+            "case_source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_tiny_production_lifecycle.rs",
             "case_source_sha256": "68193202ba36aecf6a2b151aa69d901e248b0d04f78a4618c49d6f99ab611303",
             "writer": "Same-case literal numeric AV inputs plus tiny_cfg/tiny_weight_map -> local build_targets_25 -> compute_ltx25_loss_grads -> optimizer.step -> save_lora(&params,&targets,2.0,2,&path) to temporary tiny_ltx25.safetensors -> Weights::from_file(&path); same generated path then AdapterSpec -> apply_ltx25_adapters -> Weights::from_file. Current381 actual root/write/read/numeric and reader-definition anchors are retained in source_facts; both requirements observe this same generated file, not two distinct files."
           },
@@ -186036,7 +186036,7 @@
         },
         {
           "case_generated_write_read": {
-            "case_source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+            "case_source": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_tiny_production_lifecycle.rs",
             "case_source_sha256": "68193202ba36aecf6a2b151aa69d901e248b0d04f78a4618c49d6f99ab611303",
             "writer": "Same-case literal numeric AV inputs plus tiny_cfg/tiny_weight_map -> local build_targets_25 -> compute_ltx25_loss_grads -> optimizer.step -> save_lora(&params,&targets,2.0,2,&path) to temporary tiny_ltx25.safetensors -> Weights::from_file(&path); same generated path then AdapterSpec -> apply_ltx25_adapters -> Weights::from_file. Current381 actual root/write/read/numeric and reader-definition anchors are retained in source_facts; both requirements observe this same generated file, not two distinct files."
           },
@@ -186051,7 +186051,7 @@
           "slot": "generated-a51c4ee25b66a0e8d32b974dc83086fa3a8c31f6ea1ba863a721b65a697908af"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::training::ltx25_tiny_production_lifecycle::train_changes_output_and_strict_save_reloads_on_fresh_av_model@68193202ba36aecf6a2b151aa69d901e248b0d04f78a4618c49d6f99ab611303"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/training/ltx25_tiny_production_lifecycle.rs::training::ltx25_tiny_production_lifecycle::train_changes_output_and_strict_save_reloads_on_fresh_av_model@68193202ba36aecf6a2b151aa69d901e248b0d04f78a4618c49d6f99ab611303"
     }
   },
   {
@@ -186397,11 +186397,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs::transformer::tests::disabled_ltx_adapters_residual_is_never_evaluated@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs::transformer::tests::disabled_ltx_adapters_residual_is_never_evaluated@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
     }
   },
   {
@@ -186432,11 +186432,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs::transformer::tests::dtype_narrowing_keeps_a_bf16_ltx_linear_bf16_under_f32_factors@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs::transformer::tests::dtype_narrowing_keeps_a_bf16_ltx_linear_bf16_under_f32_factors@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
     }
   },
   {
@@ -186462,11 +186462,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs::transformer::tests::empty_pass_scale_forward_errors_not_panics@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs::transformer::tests::empty_pass_scale_forward_errors_not_panics@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
     }
   },
   {
@@ -186492,11 +186492,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs::transformer::tests::ff_bias_flag_changes_constructed_params_and_forward@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs::transformer::tests::ff_bias_flag_changes_constructed_params_and_forward@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
     }
   },
   {
@@ -186522,11 +186522,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs::transformer::tests::lokr_scale_zero_is_noop_nonzero_matches_delta_and_per_pass@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs::transformer::tests::lokr_scale_zero_is_noop_nonzero_matches_delta_and_per_pass@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
     }
   },
   {
@@ -186552,11 +186552,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs::transformer::tests::lora_and_lokr_stack_on_one_linear@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs::transformer::tests::lora_and_lokr_stack_on_one_linear@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
     }
   },
   {
@@ -186582,11 +186582,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs::transformer::tests::lora_pass_index_clamps_into_uniform_scale@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs::transformer::tests::lora_pass_index_clamps_into_uniform_scale@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
     }
   },
   {
@@ -186612,11 +186612,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs::transformer::tests::lora_per_pass_selects_strength@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs::transformer::tests::lora_per_pass_selects_strength@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
     }
   },
   {
@@ -186642,11 +186642,11 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
       "requirements": [],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer.rs::transformer::tests::lora_scale_zero_is_bit_exact_noop_and_nonzero_has_effect@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-ltx/src/transformer/tests.rs::transformer::tests::lora_scale_zero_is_bit_exact_noop_and_nonzero_has_effect@a9a657a1c08c29f6f15d76005a3c72045129947ae84d268d435529e8643b4acf"
     }
   },
   {
@@ -250082,14 +250082,14 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
     "input_contract": {
       "case_generated_inputs": true,
       "fixture_kind": "source-defined",
       "requirements": [
         {
           "case_generated_write_read": {
-            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
             "case_source_sha256": "77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783",
             "writer": "adapters::tests::additive_lokr_matches_folded_merge_dense -> write_lokr: numeric factor arrays -> Array::save_safetensors(&path) -> returned PathBuf -> exact root AdapterSpec.path -> install_one_additive/merge_one Weights::from_file(&spec.path); synthetic_weights numeric base -> Array::save_safetensors(&path) -> Weights::from_file(&path)"
           },
@@ -250104,7 +250104,7 @@
           "slot": "same-case-written-and-read-inputs"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs::adapters::tests::additive_lokr_matches_folded_merge_dense@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs::adapters::tests::additive_lokr_matches_folded_merge_dense@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
     }
   },
   {
@@ -250130,14 +250130,14 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
     "input_contract": {
       "case_generated_inputs": true,
       "fixture_kind": "source-defined",
       "requirements": [
         {
           "case_generated_write_read": {
-            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
             "case_source_sha256": "77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783",
             "writer": "adapters::tests::additive_lora_matches_folded_merge_dense -> write_lora: numeric factor arrays -> Array::save_safetensors(&path) -> returned PathBuf -> exact root AdapterSpec.path -> install_one_additive/merge_one Weights::from_file(&spec.path); synthetic_weights numeric base -> Array::save_safetensors(&path) -> Weights::from_file(&path)"
           },
@@ -250152,7 +250152,7 @@
           "slot": "same-case-written-and-read-inputs"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs::adapters::tests::additive_lora_matches_folded_merge_dense@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs::adapters::tests::additive_lora_matches_folded_merge_dense@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
     }
   },
   {
@@ -250178,14 +250178,14 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
     "input_contract": {
       "case_generated_inputs": true,
       "fixture_kind": "source-defined",
       "requirements": [
         {
           "case_generated_write_read": {
-            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
             "case_source_sha256": "77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783",
             "writer": "adapters::tests::additive_lora_on_quantized_base_no_error_and_nondegenerate -> write_lora: numeric factor arrays -> Array::save_safetensors(&path) -> returned PathBuf -> exact root AdapterSpec.path -> install_one_additive/merge_one Weights::from_file(&spec.path); numeric QuantWanHost::new in memory"
           },
@@ -250200,7 +250200,7 @@
           "slot": "same-case-written-and-read-inputs"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs::adapters::tests::additive_lora_on_quantized_base_no_error_and_nondegenerate@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs::adapters::tests::additive_lora_on_quantized_base_no_error_and_nondegenerate@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
     }
   },
   {
@@ -250226,14 +250226,14 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
     "input_contract": {
       "case_generated_inputs": true,
       "fixture_kind": "source-defined",
       "requirements": [
         {
           "case_generated_write_read": {
-            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
             "case_source_sha256": "77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783",
             "writer": "adapters::tests::additive_no_adapter_is_byte_identical -> synthetic_weights: numeric q/fc1 -> Array::save_safetensors(&path) -> Weights::from_file(&path)"
           },
@@ -250248,7 +250248,7 @@
           "slot": "same-case-written-and-read-inputs"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs::adapters::tests::additive_no_adapter_is_byte_identical@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs::adapters::tests::additive_no_adapter_is_byte_identical@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
     }
   },
   {
@@ -250274,14 +250274,14 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
     "input_contract": {
       "case_generated_inputs": true,
       "fixture_kind": "source-defined",
       "requirements": [
         {
           "case_generated_write_read": {
-            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
             "case_source_sha256": "77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783",
             "writer": "adapters::tests::additive_scale_zero_is_bit_exact_noop -> write_lora: numeric factor arrays -> Array::save_safetensors(&path) -> returned PathBuf -> exact root AdapterSpec.path -> install_one_additive/merge_one Weights::from_file(&spec.path); synthetic_weights numeric base -> Array::save_safetensors(&path) -> Weights::from_file(&path)"
           },
@@ -250296,7 +250296,7 @@
           "slot": "same-case-written-and-read-inputs"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs::adapters::tests::additive_scale_zero_is_bit_exact_noop@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs::adapters::tests::additive_scale_zero_is_bit_exact_noop@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
     }
   },
   {
@@ -250322,14 +250322,14 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+    "source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
     "input_contract": {
       "case_generated_inputs": true,
       "fixture_kind": "source-defined",
       "requirements": [
         {
           "case_generated_write_read": {
-            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs",
+            "case_source": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs",
             "case_source_sha256": "77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783",
             "writer": "adapters::tests::structured_lokr_on_quantized_matches_dense_and_stays_packed -> write_lokr_quant: numeric factors -> Array::save_safetensors(&path) -> returned PathBuf -> lokr_spec/AdapterSpec.path -> install_one_additive Weights::from_file(&spec.path)"
           },
@@ -250344,7 +250344,7 @@
           "slot": "same-case-written-and-read-inputs"
         }
       ],
-      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters.rs::adapters::tests::structured_lokr_on_quantized_matches_dense_and_stays_packed@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
+      "source_identity": "crates/media/mlx-gen/mlx-gen-wan/src/adapters/tests.rs::adapters::tests::structured_lokr_on_quantized_matches_dense_and_stays_packed@77154c410119cf0f9098c599eea2d48839557fede77bd286aefa0dc4c424f783"
     }
   },
   {
@@ -273044,10 +273044,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/campaign.rs",
+    "source": "crates/llm/mlx-llm/src/campaign/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/campaign.rs::campaign::tests::eight_b_sessions_run_their_own_coordinates_and_refuse_the_other_architecture@43228a47464ae1656118237fe69498e9b2d2372a54a898505a1242f990bd122e",
+      "source_identity": "crates/llm/mlx-llm/src/campaign/tests.rs::campaign::tests::eight_b_sessions_run_their_own_coordinates_and_refuse_the_other_architecture@43228a47464ae1656118237fe69498e9b2d2372a54a898505a1242f990bd122e",
       "requirements": []
     }
   },
@@ -277512,6 +277512,7 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
+      "campaign",
       "model-inference-proof"
     ],
     "cargo_target_metadata": {
@@ -277542,6 +277543,7 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
+      "campaign",
       "model-inference-proof"
     ],
     "cargo_target_metadata": {
@@ -277572,6 +277574,7 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
+      "campaign",
       "model-inference-proof"
     ],
     "cargo_target_metadata": {
@@ -277752,6 +277755,7 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
+      "campaign",
       "model-inference-proof"
     ],
     "cargo_target_metadata": {
@@ -277782,6 +277786,7 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
+      "campaign",
       "model-inference-proof"
     ],
     "cargo_target_metadata": {
@@ -278022,6 +278027,7 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
+      "campaign",
       "model-inference-proof"
     ],
     "cargo_target_metadata": {

@@ -9,9 +9,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def sparse_writer():
-    text = (ROOT / 'crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy.rs').read_text(encoding='utf-8')
-    start = text.index('    fn sparse_snapshot(')
-    end = text.index('\n    /// Write the DiT', start)
+    text = (ROOT / 'crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy/tests.rs').read_text(encoding='utf-8')
+    start = text.index('fn sparse_snapshot(')
+    end = text.index('\n/// Write the DiT', start)
     return text[start:end]
 
 
@@ -234,8 +234,8 @@ mod mlx_gen {
         self.compile_run(self.z_read_source(True), False)
 
     def audio_source(self, mutation=False):
-        text = (ROOT / 'crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy.rs').read_text(encoding='utf-8')
-        start = text.index('        let audio_f32: u64 =')
+        text = (ROOT / 'crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy/tests.rs').read_text(encoding='utf-8')
+        start = text.index('    let audio_f32: u64 =')
         expression = text[start:text.index('.sum();', start) + len('.sum();')]
         if mutation:
             expression = expression.replace('* 4)', '* 1)')
