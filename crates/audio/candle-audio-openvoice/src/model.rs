@@ -38,6 +38,8 @@ use candle_audio::gen_core::{
 
 use crate::config;
 use crate::pipeline::{OpenVoicePipeline, CHECKPOINT_FILE, CONFIG_FILE};
+use candle_audio::dsp::to_mono;
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes an audio-transform request to this exact id).
 pub const MODEL_ID: &str = "openvoice_v2";
@@ -97,14 +99,6 @@ pub fn descriptor() -> AudioTransformDescriptor {
     }
 }
 
-/// Recover a poisoned mutex — the audio twin of `candle_gen::lock_recover`.
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 /// A loaded (lazy) OpenVoice V2 converter. The pipeline (reference encoder + converter weights) is
 /// built on first `apply`, not at [`load`] — the sibling providers' lazy-load discipline.
 pub struct OpenVoiceTransform {
@@ -124,18 +118,6 @@ impl OpenVoiceTransform {
         *guard = Some(built.clone());
         Ok(built)
     }
-}
-
-/// Down-mix interleaved `channels`-channel PCM to mono by averaging (a no-op for mono).
-fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
-    if channels <= 1 {
-        return samples.to_vec();
-    }
-    let ch = channels as usize;
-    samples
-        .chunks(ch)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-        .collect()
 }
 
 /// Shared request validation (weightless): a VoiceConversion converter needs a source clip long

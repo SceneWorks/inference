@@ -60,7 +60,9 @@ use candle_audio_stable_audio_3::dit::{Guidance, StableAudio3Dit};
 use candle_audio_stable_audio_3::gen_core::{
     AudioParams, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource,
 };
-use candle_audio_stable_audio_3::sampler::{padding_mask, sample_dit, InjectedNoise, SamplerKind};
+use candle_audio_stable_audio_3::sampler::{
+    padding_mask, sample_dit, DitConditioning, InjectedNoise, SampleDitArgs, SamplerKind,
+};
 use candle_audio_stable_audio_3::t5gemma::T5GemmaConditioner;
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
 use candle_audio_stable_audio_3::Variant;
@@ -186,18 +188,22 @@ fn one_euler_step(
     let mut noise = InjectedNoise::new(Vec::new());
     let output = sample_dit(
         model,
-        SamplerKind::Euler,
+        SampleDitArgs::new(
+            SamplerKind::Euler,
+            &candle_audio_stable_audio_3::sampler::Schedule::Shared(vec![0.5, 0.0]),
+            DitConditioning {
+                positive_prompt: positive,
+                negative_prompt: negative,
+                negative_prompt_mask: negative_mask,
+                seconds_total: seconds,
+                local_conditioning: local,
+                padding: Some(mask),
+            },
+            guidance,
+        ),
         initial,
-        &candle_audio_stable_audio_3::sampler::Schedule::Shared(vec![0.5, 0.0]),
-        positive,
-        negative,
-        negative_mask,
-        seconds,
-        local,
-        Some(mask),
-        guidance,
         &mut noise,
-        false,
+        None,
     )
     .expect("single Euler step");
     assert_eq!(output.model_calls, 1);

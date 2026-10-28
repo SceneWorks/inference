@@ -41,6 +41,7 @@
 
 use mlx_gen::image::resize_lanczos_rgba_u8;
 use mlx_gen::{Error, Result, RgbaImage};
+use mlx_llm::image::Qwen35Preprocess;
 use mlx_rs::Array;
 
 pub use mlx_gen::gen_core::qwen_image_2_1::reference::*;
@@ -91,7 +92,7 @@ pub fn reference_fit(size: (u32, u32), index: usize, vision: &VisionConfig) -> R
     let (sh, sw) = vision
         .processor
         .smart_resize(rh as usize, rw as usize)
-        .map_err(from_llm)?;
+        .map_err(|e| from_llm(e.into()))?;
     if (sh, sw) != (rh as usize, rw as usize) {
         let patch = vision.processor.patch_size.max(1);
         return Err(reference_rebind_refusal(

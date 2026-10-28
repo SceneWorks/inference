@@ -186,7 +186,7 @@ impl AceStepPipeline {
         .map_err(|e| AudioError::Msg(format!("load {}: {e}", tokenizer_path.display())))?;
 
         let te_shards = safetensors_shards(&root.join("text_encoder"), "model")?;
-        let text_encoder = Qwen3Encoder::new(&config.text_encoder, mmap_vb(&te_shards, device)?)
+        let text_encoder = crate::qwen::load(&config.text_encoder, mmap_vb(&te_shards, device)?)
             .map_err(|e| AudioError::Msg(format!("build qwen text encoder: {e}")))?;
 
         let ce_path = root.join("condition_encoder/diffusion_pytorch_model.safetensors");
@@ -773,14 +773,7 @@ impl AceStepPipeline {
 /// `[1, C, T]` → interleaved `[t0c0, t0c1, t1c0, …]`.
 fn interleave(audio: &Tensor, channels: usize) -> Result<Vec<f32>> {
     let planar: Vec<f32> = audio.flatten_all()?.to_vec1::<f32>()?;
-    let t = planar.len() / channels;
-    let mut out = Vec::with_capacity(planar.len());
-    for i in 0..t {
-        for c in 0..channels {
-            out.push(planar[c * t + i]);
-        }
-    }
-    Ok(out)
+    Ok(candle_audio::dsp::planar_to_interleaved(&planar, channels))
 }
 
 /// Equal-power crossfade half-width (frames) for an edit window: 20 ms at 48 kHz (960 frames),

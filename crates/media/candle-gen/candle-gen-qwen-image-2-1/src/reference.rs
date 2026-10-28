@@ -43,6 +43,7 @@ use candle_core::{Device, Tensor};
 use candle_gen::gen_core::imageops::resize_lanczos_rgba_u8;
 use candle_gen::gen_core::RgbaImage;
 use candle_gen::{CandleError as Error, Result};
+use candle_llm::image::Qwen35Preprocess;
 
 pub use candle_gen::gen_core::qwen_image_2_1::reference::*;
 
@@ -92,7 +93,7 @@ pub fn reference_fit(size: (u32, u32), index: usize, vision: &VisionConfig) -> R
     let (sh, sw) = vision
         .processor
         .smart_resize(rh as usize, rw as usize)
-        .map_err(from_llm)?;
+        .map_err(|e| from_llm(e.into()))?;
     if (sh, sw) != (rh as usize, rw as usize) {
         let patch = vision.processor.patch_size.max(1);
         return Err(reference_rebind_refusal(

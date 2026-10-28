@@ -16,6 +16,7 @@ use crate::audio::AudioTower;
 use crate::config;
 use crate::mel;
 use crate::text::TextTower;
+use candle_audio::lock_recover;
 
 /// The routing id.
 pub const MODEL_ID: &str = "clap_htsat_unfused";
@@ -114,13 +115,6 @@ pub struct ClapEmbedder {
     descriptor: AudioEmbedderDescriptor,
     root: PathBuf,
     loaded: Mutex<Option<Loaded>>,
-}
-
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    }
 }
 
 /// L2-normalize a host vector (CLAP's native retrieval feature) — infallible; a zero vector is

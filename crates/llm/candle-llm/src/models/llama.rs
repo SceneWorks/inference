@@ -30,7 +30,7 @@
 
 use candle_core::{DType, Device, Tensor};
 
-use crate::config::{Architecture, LayerAttentionType, ModelConfig};
+use crate::config::{Architecture, LayerAttentionType, LayerRope, ModelConfig};
 use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};

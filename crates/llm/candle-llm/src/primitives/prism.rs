@@ -815,12 +815,16 @@ pub(crate) const PRISM_SRC: candle_quant_kernels::KernelSource =
     };
 
 #[cfg(feature = "cuda")]
+// Every `unsafe` block here carries the invariant it relies on (sc-27399, sc-27400).
+#[warn(clippy::undocumented_unsafe_blocks)]
 mod cuda {
     use super::*;
     use candle_core::backend::BackendStorage;
     use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
     use candle_core::cuda_backend::WrapErr;
     use candle_core::{CpuStorage, CudaStorage, CustomOp2, CustomOp3, Layout, Shape};
+
+    use crate::primitives::{launch_elems, launch_grid_x, launch_u32};
 
     fn function(
         dev: &candle_core::CudaDevice,
@@ -832,16 +836,15 @@ mod cuda {
             .map_err(|e| candle_core::Error::Msg(format!("Prism CUDA kernel: {e}")))
     }
 
-    fn map_args(map: Option<GdnRowMap>) -> (u32, u32, u32, u32) {
-        map.map(|m| {
-            (
-                m.prefix as u32,
-                m.groups as u32,
-                m.repetitions as u32,
-                m.unit as u32,
-            )
+    fn map_args(map: Option<GdnRowMap>) -> candle_core::Result<(u32, u32, u32, u32)> {
+        map.map_or(Ok((0, 0, 0, 0)), |m| {
+            Ok((
+                launch_u32(m.prefix, "Prism GDN row-map prefix")?,
+                launch_u32(m.groups, "Prism GDN row-map groups")?,
+                launch_u32(m.repetitions, "Prism GDN row-map repetitions")?,
+                launch_u32(m.unit, "Prism GDN row-map unit")?,
+            ))
         })
-        .unwrap_or((0, 0, 0, 0))
     }
 
     struct MlxMatmul {
@@ -881,12 +884,19 @@ mod cuda {
             let x = contiguous_cuda::<f32>(sx, lx)?;
             let words = contiguous_cuda::<u32>(sw, lw)?;
             let scales = contiguous_cuda::<f32>(ss, ls)?;
-            let mut output = unsafe { dev.alloc::<f32>(self.tokens * self.rows) }?;
+            let elems = launch_elems(self.tokens, self.rows, "Prism matmul tokens x rows")?;
+            // SAFETY: one block per output element writes it, so the uninitialised buffer is
+            // fully overwritten before it is read.
+            let mut output = unsafe { dev.alloc::<f32>(elems) }?;
             let function = function(&dev, "prism_mlx_affine2_matmul_f32")?;
-            let (prefix, groups, repetitions, unit) = map_args(self.map);
-            let (tokens, rows, width) = (self.tokens as u32, self.rows as u32, self.width as u32);
+            let (prefix, groups, repetitions, unit) = map_args(self.map)?;
+            let (tokens, rows, width) = (
+                launch_u32(self.tokens, "Prism matmul tokens")?,
+                launch_u32(self.rows, "Prism matmul rows")?,
+                launch_u32(self.width, "Prism matmul width")?,
+            );
             let config = LaunchConfig {
-                grid_dim: ((self.tokens * self.rows) as u32, 1, 1),
+                grid_dim: (launch_grid_x(elems, "Prism matmul blocks")?, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
             };
@@ -901,6 +911,9 @@ mod cuda {
                 .arg(&groups)
                 .arg(&repetitions)
                 .arg(&unit);
+            // SAFETY: the arguments match `prism_mlx_affine2_matmul_f32` in `prism_cuda.cu` in
+            // order and type; `tokens * rows` blocks fit the kernel's u32 job index (checked
+            // above), and each reads in-bounds rows of the contiguous inputs.
             unsafe { builder.launch(config) }.w()?;
             Ok((
                 CudaStorage::wrap_cuda_slice(output, dev),
@@ -942,16 +955,23 @@ mod cuda {
             let dev = sx.device().clone();
             let x = contiguous_cuda::<f32>(sx, lx)?;
             let packed = contiguous_cuda::<u8>(sw, lw)?;
-            let mut output = unsafe { dev.alloc::<f32>(self.tokens * self.rows) }?;
+            let elems = launch_elems(self.tokens, self.rows, "Prism matmul tokens x rows")?;
+            // SAFETY: one block per output element writes it, so the uninitialised buffer is
+            // fully overwritten before it is read.
+            let mut output = unsafe { dev.alloc::<f32>(elems) }?;
             let kernel = match self.kind {
                 PrismPackedKind::Pq2_0 => "prism_pq2_matmul_f32",
                 PrismPackedKind::Ptq1_0 => "prism_ptq_matmul_f32",
             };
             let function = function(&dev, kernel)?;
-            let (prefix, groups, repetitions, unit) = map_args(self.map);
-            let (tokens, rows, width) = (self.tokens as u32, self.rows as u32, self.width as u32);
+            let (prefix, groups, repetitions, unit) = map_args(self.map)?;
+            let (tokens, rows, width) = (
+                launch_u32(self.tokens, "Prism matmul tokens")?,
+                launch_u32(self.rows, "Prism matmul rows")?,
+                launch_u32(self.width, "Prism matmul width")?,
+            );
             let config = LaunchConfig {
-                grid_dim: ((self.tokens * self.rows) as u32, 1, 1),
+                grid_dim: (launch_grid_x(elems, "Prism matmul blocks")?, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
             };
@@ -966,6 +986,9 @@ mod cuda {
                 .arg(&groups)
                 .arg(&repetitions)
                 .arg(&unit);
+            // SAFETY: the arguments match the `PRISM_GGUF_MATMUL` kernels in `prism_cuda.cu` in
+            // order and type; `tokens * rows` blocks fit the kernel's u32 job index (checked
+            // above), and each reads in-bounds rows of the contiguous inputs.
             unsafe { builder.launch(config) }.w()?;
             Ok((
                 CudaStorage::wrap_cuda_slice(output, dev),
@@ -1103,10 +1126,18 @@ mod cuda {
         rows: usize,
         width: usize,
     ) -> candle_core::Result<(CudaStorage, Shape)> {
-        let mut output = unsafe { dev.alloc::<f32>(count * width) }?;
+        let elems = launch_elems(count, width, "Prism embedding count x width")?;
+        // SAFETY: one thread per output element writes it, so the uninitialised buffer is fully
+        // overwritten before it is read.
+        let mut output = unsafe { dev.alloc::<f32>(elems) }?;
         let function = function(dev, kernel)?;
-        let (count_u, rows_u, width_u) = (count as u32, rows as u32, width as u32);
-        let config = LaunchConfig::for_num_elems((count * width) as u32);
+        let (count_u, rows_u, width_u) = (
+            launch_u32(count, "Prism embedding count")?,
+            launch_u32(rows, "Prism embedding rows")?,
+            launch_u32(width, "Prism embedding width")?,
+        );
+        let config =
+            LaunchConfig::for_num_elems(launch_u32(elems, "Prism embedding output elements")?);
         let stream = dev.cuda_stream();
         let mut builder = stream.launch_builder(&function);
         builder.arg(ids);
@@ -1123,6 +1154,9 @@ mod cuda {
             .arg(&count_u)
             .arg(&rows_u)
             .arg(&width_u);
+        // SAFETY: the arguments match the `*_embedding_f32` kernels in `prism_cuda.cu` in order
+        // and type; `count * width` fits their u32 element index (checked above), and an
+        // out-of-range id writes NaN instead of reading past the table.
         unsafe { builder.launch(config) }.w()?;
         Ok((
             CudaStorage::wrap_cuda_slice(output, dev.clone()),
@@ -1181,11 +1215,21 @@ mod cuda {
         let inverse = i32::from(rotation == Rotation::Inverse);
         let function = function(dev, "prism_rotate")?;
         let config = LaunchConfig {
-            grid_dim: ((width / block) as u32, rows as u32, 1),
+            grid_dim: (
+                launch_grid_x(width / block, "Prism rotation blocks")?,
+                launch_u32(rows, "Prism rotation rows")?,
+                1,
+            ),
             block_dim: ((block / 2).clamp(1, 256) as u32, 1, 1),
-            shared_mem_bytes: (block * std::mem::size_of::<f32>()) as u32,
+            shared_mem_bytes: launch_u32(
+                block.saturating_mul(std::mem::size_of::<f32>()),
+                "Prism rotation shared bytes",
+            )?,
         };
-        let (width_u, block_u) = (width as u32, block as u32);
+        let (width_u, block_u) = (
+            launch_u32(width, "Prism rotation width")?,
+            launch_u32(block, "Prism rotation block")?,
+        );
         let stream = dev.cuda_stream();
         let (xs, xl) = x.storage_and_layout();
         let (ss, sl) = signs.storage_and_layout();

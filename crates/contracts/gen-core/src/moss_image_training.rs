@@ -1,6 +1,7 @@
 //! Portable MOSS adapter contract shared by native backends. The named sampler adapts the
 //! published *pretraining* final Stage3 recipe (arXiv:2610.23374v1, Appendix A.2 Eq4), not an
 //! unpublished official LoRA/SFT recipe. Posterior-mean caching is a SceneWorks choice.
+pub mod admission;
 pub mod recovery;
 
 use crate::moss_image::MossImageVariant;

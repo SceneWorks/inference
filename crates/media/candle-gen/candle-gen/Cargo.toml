@@ -44,6 +44,10 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 image = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# `geteuid` for the per-user, owner-checked temp-dir cache fallback (sc-27414). Already in the lock.
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 # Stable std exposes Windows write time but not the handle's file ID/change time. The sidecar warm
 # memo needs both so same-size corruption cannot hide behind a restored mtime.

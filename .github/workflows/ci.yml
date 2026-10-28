@@ -631,7 +631,10 @@ jobs:
         run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --features media --lib -p runtime-cpu
 
   macos-metal:
-    timeout-minutes: 75
+    # Main runs 40691949793 and 40732695026 passed every product step, then the
+    # 75m job deadline cancelled the main-only cache upload. Keep the same target
+    # and suite watchdogs; allow cache/compression/cleanup headroom after the tests.
+    timeout-minutes: 90
     name: MLX + Candle Metal packages (macOS)
     needs: changes
     if: >-

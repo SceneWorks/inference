@@ -43,17 +43,9 @@ pub fn mel_filters(num_mel_bins: usize) -> candle_audio::Result<Vec<f32>> {
         .collect())
 }
 
-/// Down-mix interleaved `channels`-channel PCM to mono by averaging (a no-op for mono).
-pub fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
-    if channels <= 1 {
-        return samples.to_vec();
-    }
-    let ch = channels as usize;
-    samples
-        .chunks(ch)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-        .collect()
-}
+/// Down-mix interleaved `channels`-channel PCM to mono by averaging (a no-op for mono) — the
+/// shared commons helper, re-exported so this path stays stable (sc-27357).
+pub use candle_audio::dsp::to_mono;
 
 /// Prepare a raw [`gen_core::AudioTrack`](candle_audio::gen_core::AudioTrack)'s interleaved PCM for
 /// the encoder: downmix to mono, resample to 16 kHz, and project to a flat log-mel vector of length

@@ -240,11 +240,7 @@ fn rope_tables(
 }
 
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CandleResult<Tensor> {
-    let dim = x.dim(D::Minus1)?;
-    let half = dim / 2;
-    let first = x.narrow(D::Minus1, 0, half)?;
-    let second = x.narrow(D::Minus1, half, half)?;
-    let rotated = Tensor::cat(&[&second.neg()?, &first], D::Minus1)?;
+    let rotated = candle_audio::ops::rotate_half(x)?;
     x.broadcast_mul(cos)?
         .broadcast_add(&rotated.broadcast_mul(sin)?)
 }

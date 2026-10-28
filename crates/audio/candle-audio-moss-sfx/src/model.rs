@@ -41,6 +41,7 @@ use candle_audio::gen_core::{
 use crate::pipeline::{
     MossSfxPipeline, SynthesisParams, DEFAULT_CFG_SCALE, DEFAULT_SECONDS, DEFAULT_STEPS,
 };
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes `payload.model` to this exact id).
 pub const MODEL_ID: &str = "moss_sfx_v2";
@@ -208,15 +209,6 @@ impl MossSfxGenerator {
         let built = Arc::new(MossSfxPipeline::from_snapshot(&self.root, &device)?);
         *guard = Some(built.clone());
         Ok(built)
-    }
-}
-
-/// Recover a poisoned mutex (a prior panic mid-build leaves `None`/stale state, which the lazy
-/// builder tolerates) — the audio twin of `candle_gen::lock_recover`.
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
