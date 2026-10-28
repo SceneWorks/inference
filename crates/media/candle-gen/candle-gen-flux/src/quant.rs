@@ -75,7 +75,7 @@ impl QEmbedding {
 
     /// Whether this embedding loaded directly from an MLX-packed tier — used by the loaders/tests to
     /// assert a packed tier fired the packed path (and did not silently fall back to dense).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_packed(&self) -> bool {
         matches!(self, Self::Packed(_))
     }

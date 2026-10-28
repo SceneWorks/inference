@@ -90,7 +90,7 @@ impl QLinear {
     /// Whether this projection loaded directly from an MLX-packed tier (the packed path). Distinguishes
     /// a packed load from the dense path — used by the loader tests to assert a packed tier fired the
     /// packed path (and did not silently fall back to dense).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_packed(&self) -> bool {
         self.0.is_packed()
     }

@@ -124,7 +124,7 @@ impl QLinear {
 
     /// Whether this projection loaded directly from the MLX-packed tier (the packed path) — used by
     /// the loaders + tests to assert a packed tier fired the packed path (not a silent dense fallback).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_packed(&self) -> bool {
         matches!(self, Self::Packed { .. })
     }
@@ -174,7 +174,7 @@ impl QEmbedding {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_packed(&self) -> bool {
         matches!(self, Self::Packed(_))
     }

@@ -444,14 +444,14 @@ impl QLinear {
     /// Whether this projection loaded directly from the MLX-packed tier (its `Adapt` base is packed) —
     /// used by the loaders + tests to assert a packed tier fired the packed path (not a silent dense
     /// fallback).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_packed(&self) -> bool {
         matches!(self, Self::Adapt(a) if a.is_packed())
     }
 
     /// Whether this projection loaded as an INT8-ConvRot int8 layer (sc-9300) — the detect-arm assertion
     /// (a ConvRot checkpoint's quantized surface fired the int8 path, not a silent dense fallback).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_convrot_int8(&self) -> bool {
         matches!(self, Self::ConvRotInt8(_))
     }
@@ -629,7 +629,7 @@ impl QEmbedding {
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_packed(&self) -> bool {
         matches!(self, Self::Packed(_))
     }

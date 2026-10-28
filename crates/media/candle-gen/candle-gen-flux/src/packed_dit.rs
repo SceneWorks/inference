@@ -860,7 +860,7 @@ impl PackedFluxDit {
             time_text_embed,
             blocks: PackedFluxBlocks::Resident { double, single },
             output: OutputHead::new(d, cfg.in_channels, &vb)?,
-            pe_embedder: EmbedNd::new(d.head_dim, cfg.theta, cfg.axes_dim.clone()),
+            pe_embedder: EmbedNd::new(cfg.theta, cfg.axes_dim.clone()),
             device,
         })
     }
@@ -921,7 +921,7 @@ impl PackedFluxDit {
             single_sidecars,
         };
         let output = OutputHead::new(d, cfg.in_channels, &vb)?;
-        let pe_embedder = EmbedNd::new(d.head_dim, cfg.theta, cfg.axes_dim.clone());
+        let pe_embedder = EmbedNd::new(cfg.theta, cfg.axes_dim.clone());
         Ok(Self {
             x_embedder,
             context_embedder,

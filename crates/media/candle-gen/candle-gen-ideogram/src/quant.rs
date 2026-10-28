@@ -89,7 +89,7 @@ impl QEmbedding {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_packed(&self) -> bool {
         matches!(self, Self::Packed(_))
     }
