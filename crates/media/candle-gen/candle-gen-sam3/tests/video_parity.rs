@@ -10,14 +10,8 @@ use std::path::Path;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::ops::sigmoid;
 use candle_gen::default_device;
+use candle_gen::testkit::cosine;
 use candle_gen_sam3::{Sam3ImageSegmenter, Sam3VideoModel, Weights};
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(&x, &y)| x * y).sum();
-    let na: f32 = a.iter().map(|&x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|&x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb)
-}
 
 fn fx_i32(fx: &Weights, key: &str) -> Vec<i32> {
     fx.require(key)

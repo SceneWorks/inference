@@ -14,6 +14,7 @@
 //! and high structural correlation with a bicubic baseline (a transcription bug in RoPE / window
 //! partition / AdaLN / the conv3d decomposition would destroy that correlation).
 
+use crate::support::pearson;
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{imageops, Image};
 use candle_gen_seedvr2::config::DitConfig;
@@ -52,23 +53,6 @@ fn pixel_cosine(a: &[u8], b: &[u8]) -> f32 {
         nb += (*y as f64).powi(2);
     }
     (dot / (na.sqrt() * nb.sqrt()).max(1e-12)) as f32
-}
-
-/// Pearson correlation over two equal-length sequences.
-fn pearson(a: &[f32], b: &[f32]) -> f64 {
-    let n = a.len() as f64;
-    let (ma, mb) = (
-        a.iter().map(|&v| v as f64).sum::<f64>() / n,
-        b.iter().map(|&v| v as f64).sum::<f64>() / n,
-    );
-    let (mut cov, mut va, mut vb) = (0f64, 0f64, 0f64);
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let (dx, dy) = (x as f64 - ma, y as f64 - mb);
-        cov += dx * dy;
-        va += dx * dx;
-        vb += dy * dy;
-    }
-    cov / (va.sqrt() * vb.sqrt()).max(1e-12)
 }
 
 /// Mean |gradient| (a crude sharpness proxy) of an interleaved RGB8 buffer.

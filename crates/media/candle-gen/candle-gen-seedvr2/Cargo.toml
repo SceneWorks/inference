@@ -28,6 +28,8 @@ cuda = ["candle-gen/cuda"]
 
 [dev-dependencies]
 sceneworks-gen-core-testkit = { workspace = true }
+# Shared test-support helpers (`candle_gen::testkit::tensor_cosine`, sc-27381).
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # CUDA smoke harness (tests/cuda_smoke.rs): save the upscaled result as a PNG to eyeball.
 image = { version = "0.25", default-features = false, features = ["png"] }
 

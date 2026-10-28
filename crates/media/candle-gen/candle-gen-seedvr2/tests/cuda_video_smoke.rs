@@ -21,6 +21,7 @@
 //!      overlapping feather-blended tiles must match the untiled single-pass upscale (high correlation),
 //!      proving the tile partition + feather assembly is numerically sound.
 
+use crate::support::pearson;
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{imageops, CancelFlag, Image};
 use candle_gen::CandleError;
@@ -60,22 +61,6 @@ fn synth_clip(side: usize, n: usize, motion: i32) -> Vec<Image> {
     (0..n)
         .map(|t| synth_frame(side, t as i32 * motion, (t as i32 * motion) / 2))
         .collect()
-}
-
-fn pearson(a: &[f32], b: &[f32]) -> f64 {
-    let n = a.len() as f64;
-    let (ma, mb) = (
-        a.iter().map(|&v| v as f64).sum::<f64>() / n,
-        b.iter().map(|&v| v as f64).sum::<f64>() / n,
-    );
-    let (mut cov, mut va, mut vb) = (0f64, 0f64, 0f64);
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let (dx, dy) = (x as f64 - ma, y as f64 - mb);
-        cov += dx * dy;
-        va += dx * dx;
-        vb += dy * dy;
-    }
-    cov / (va.sqrt() * vb.sqrt()).max(1e-12)
 }
 
 /// Mean |byte difference| between two equal-size RGB8 frames (a frame-to-frame change proxy).

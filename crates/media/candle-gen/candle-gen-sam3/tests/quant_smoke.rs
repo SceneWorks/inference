@@ -18,38 +18,11 @@
 
 use std::path::Path;
 
+use crate::support::{cosine, iou};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::default_device;
 use candle_gen::gen_core::Quant;
 use candle_gen_sam3::{Instance, Sam3ImageSegmenter, Sam3Tracker, Weights};
-
-fn sum_scalar(t: Tensor) -> f32 {
-    t.sum_all().unwrap().to_scalar::<f32>().unwrap()
-}
-
-fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-    let a = a.flatten_all().unwrap();
-    let b = b.flatten_all().unwrap();
-    let dot = sum_scalar((&a * &b).unwrap());
-    let na = sum_scalar((&a * &a).unwrap()).sqrt();
-    let nb = sum_scalar((&b * &b).unwrap()).sqrt();
-    dot / (na * nb)
-}
-
-/// IoU of two binary (or sign-thresholded) masks.
-fn iou(a: &Tensor, b: &Tensor) -> f32 {
-    let af = a.to_dtype(DType::F32).unwrap();
-    let bf = b.to_dtype(DType::F32).unwrap();
-    let inter = sum_scalar((&af * &bf).unwrap());
-    let sa = sum_scalar(af);
-    let sb = sum_scalar(bf);
-    let union = sa + sb - inter;
-    if union <= 0.0 {
-        1.0
-    } else {
-        inter / union
-    }
-}
 
 /// Sign-threshold mask logits at 0 → {0,1} f32 (the binary mask depends only on the logit sign).
 fn binarize(logits: &Tensor) -> Tensor {
