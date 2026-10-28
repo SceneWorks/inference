@@ -50,9 +50,12 @@
 //! `runtime_sha256` the same way), so work done on another backend or by other code is never
 //! reused; the run identity additionally binds the decoder's pinned identity.
 //!
-//! A run holds an exclusive claim on `D.partial` for its whole duration ([`LOCK_FILE`], created
-//! with `create_new`): a second run — fresh or resumed — is refused with [`RunError::Locked`]
-//! while it is held. The claim is released when the run publishes, fails or is cancelled.
+//! A run holds an exclusive claim on `D.partial` for its whole duration: an OS advisory lock
+//! (`File::try_lock`) on [`LOCK_FILE`]. A second run — fresh or resumed — is refused with
+//! [`RunError::Locked`] while it is held. The claim is released (and the lock file removed) when the
+//! run publishes, fails or is cancelled; because the lock belongs to the open handle, the OS also
+//! releases it when the process dies (SIGKILL, OOM, power loss), so a lock file left behind by a
+//! crashed run no longer blocks the resume that crash needs (sc-27347).
 //!
 //! A cached decode refuses an output that is, is inside, or contains its source (paths resolved
 //! through symlinks and `..`), and carries the source's latent bytes over — checked against the
@@ -627,35 +630,96 @@ struct WorkDir {
     _claim: Claim,
 }
 
-/// An exclusive claim on a working directory: [`LOCK_FILE`] created with `create_new` (so two runs
-/// can never hold it at once), removed when the run publishes, fails or is cancelled.
+/// An exclusive claim on a working directory: an OS advisory lock held on [`LOCK_FILE`] for the
+/// claim's lifetime (so two runs can never hold it at once), with the file removed when the run
+/// publishes, fails or is cancelled. A lock file nobody holds is stale — its run died without
+/// releasing it — and is taken over (sc-27347).
 struct Claim {
     path: PathBuf,
+    /// The locked handle; `None` once [`Self::release_handle`] closed it.
+    file: std::sync::Mutex<Option<fs::File>>,
 }
 
 impl Claim {
     fn take(work: &Path) -> Result<Self, RunError> {
         let path = work.join(LOCK_FILE);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(format!("pid {}\n", std::process::id()).as_bytes())
-                    .map_err(io(&path))?;
-                Ok(Self { path })
+        // A releasing holder removes the file while still locked, then closes it: a handle opened
+        // just before that removal can lock the orphaned file. Such a lock is detected (the path no
+        // longer names the locked file) and the claim is retried on the current file.
+        for _ in 0..8 {
+            let mut file = match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match fs::OpenOptions::new().read(true).write(true).open(&path) {
+                        Ok(file) => file,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(RunError::Io { path, source: e }),
+                    }
+                }
+                Err(e) => return Err(RunError::Io { path, source: e }),
+            };
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(fs::TryLockError::WouldBlock) => return Err(RunError::Locked(path)),
+                Err(fs::TryLockError::Error(e)) => return Err(RunError::Io { path, source: e }),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(RunError::Locked(path)),
-            Err(e) => Err(RunError::Io { path, source: e }),
+            if !names_file(&path, &file).map_err(io(&path))? {
+                continue;
+            }
+            // Ours (fresh, or taken over from a dead run): record the holder.
+            file.set_len(0).map_err(io(&path))?;
+            file.write_all(format!("pid {}\n", std::process::id()).as_bytes())
+                .map_err(io(&path))?;
+            return Ok(Self {
+                path,
+                file: std::sync::Mutex::new(Some(file)),
+            });
         }
+        Err(RunError::Locked(path))
+    }
+
+    /// Close the locked handle early. Windows cannot rename a directory holding an open handle,
+    /// so the publisher closes it immediately before renaming the working directory.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn release_handle(&self) {
+        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        file.take();
+    }
+}
+
+/// Whether `path` still names the open `file` (not a file removed or replaced since it was opened).
+#[cfg(unix)]
+fn names_file(path: &Path, file: &fs::File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata()?;
+    match fs::metadata(path) {
+        Ok(now) => Ok(now.dev() == held.dev() && now.ino() == held.ino()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `path` still names the open `file`. Without a portable file identity this checks only
+/// that the path still exists.
+#[cfg(not(unix))]
+fn names_file(path: &Path, _file: &fs::File) -> std::io::Result<bool> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        // After publication the working directory was renamed away and the claim travelled
-        // with it (the publisher removes it there); nothing is left to remove here.
+        // Remove the file while still holding the lock, then close (unlocking) the handle when the
+        // `file` field drops. After publication the working directory was renamed away and the
+        // claim travelled with it (the publisher removes it there); nothing is left to remove here.
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -825,6 +889,8 @@ impl WorkDir {
             // An empty target directory (checked when the run opened) is replaced.
             fs::remove_dir(&self.target).map_err(io(&self.target))?;
         }
+        #[cfg(windows)]
+        self._claim.release_handle();
         fs::rename(&self.work, &self.target).map_err(io(&self.target))?;
         // The claim moved with the directory; it is not an artifact (never hashed) — release it.
         let moved = self.target.join(LOCK_FILE);
