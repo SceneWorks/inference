@@ -832,6 +832,8 @@ pub(crate) const SAMPLER_SRC: candle_quant_kernels::KernelSource =
     };
 
 #[cfg(feature = "cuda")]
+// Every `unsafe` block here carries the invariant it relies on (sc-27399, sc-27400).
+#[warn(clippy::undocumented_unsafe_blocks)]
 mod cuda {
     use super::SamplingParams;
     use crate::error::Result;
@@ -924,11 +926,17 @@ mod cuda {
                 candle_core::Error::Msg("device sampler input must be contiguous".into())
             })?;
             let x = storage.as_cuda_slice::<f32>()?.slice(start..end);
+            // SAFETY: one block per row, whose thread 0 writes that row's id, so the
+            // uninitialised buffer is fully overwritten before it is read.
             let mut out = unsafe { dev.alloc::<u32>(rows) }?;
             let function = function(&dev, "candle_llm_sample_rows_f32")?;
-            let vocab = vocab as u32;
+            let vocab = crate::primitives::launch_u32(vocab, "sampler vocab")?;
             let config = LaunchConfig {
-                grid_dim: (rows as u32, 1, 1),
+                grid_dim: (
+                    crate::primitives::launch_grid_x(rows, "sampler rows")?,
+                    1,
+                    1,
+                ),
                 block_dim: (THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -944,6 +952,9 @@ mod cuda {
                 .arg(&self.state)
                 .arg(&self.u_override)
                 .arg(&mut out);
+            // SAFETY: the arguments match `candle_llm_sample_rows_f32` in `sampler_cuda.cu` in
+            // order and type; `x` is the contiguous `[rows, vocab]` input and `out` holds `rows`
+            // ids, one per block.
             unsafe { builder.launch(config) }.w()?;
             Ok((CudaStorage::wrap_cuda_slice(out, dev), Shape::from(rows)))
         }
@@ -972,13 +983,17 @@ mod cuda {
     /// `n` SplitMix64 uniforms from `state`, generated on `device`.
     pub(super) fn uniform(state: u64, n: usize, device: &Device) -> Result<Tensor> {
         let dev = device.as_cuda_device()?.clone();
+        // SAFETY: one thread per element writes it (`i < n`), so the uninitialised buffer is
+        // fully overwritten before it is read; an empty buffer is never read.
         let mut out = unsafe { dev.alloc::<f32>(n) }?;
         if n > 0 {
             let function = function(&dev, "candle_llm_splitmix_uniform_f32")?;
-            let count = n as u32;
+            let count = crate::primitives::launch_u32(n, "uniform count")?;
             let stream = dev.cuda_stream();
             let mut builder = stream.launch_builder(&function);
             builder.arg(&state).arg(&count).arg(&mut out);
+            // SAFETY: the arguments match `candle_llm_splitmix_uniform_f32(u64, u32, float*)` in
+            // `sampler_cuda.cu`, and `out` holds the `count` elements the bounded threads write.
             unsafe { builder.launch(LaunchConfig::for_num_elems(count)) }.w()?;
         }
         let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev));
