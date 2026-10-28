@@ -159,7 +159,7 @@ pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling, VideoDecodeMemoryProfile};
 pub use train::{
     LrSchedule, NetworkType, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
-    TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest,
+    TrainingItem, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
 };
 pub use transform::{
     InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,

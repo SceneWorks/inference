@@ -1278,6 +1278,32 @@ pub struct TrainingOutput {
     pub final_loss: f32,
 }
 
+/// What [`Trainer::train_with_report`] returns: the [`TrainingOutput`] plus the run's non-fatal
+/// conditions (a preview sample that failed to render, …) in the order they occurred (sc-27451).
+/// The training analog of [`GenerationReport`](crate::generator::GenerationReport).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrainingReport {
+    pub output: TrainingOutput,
+    /// Empty when there is nothing to report.
+    pub warnings: Vec<crate::generator::GenerationWarning>,
+}
+
+/// [`TrainingReport::warnings`] code for a periodic preview sample
+/// ([`TrainingProgress::Sample`]) that failed to render; the run continues without it.
+pub const PREVIEW_SAMPLE_FAILED: &str = "preview_sample_failed";
+
+/// The [`PREVIEW_SAMPLE_FAILED`] warning for prompt `index` (1-based) of the step-`step` preview.
+pub fn preview_sample_failed(
+    step: u32,
+    index: u32,
+    error: &dyn std::fmt::Display,
+) -> crate::generator::GenerationWarning {
+    crate::generator::GenerationWarning {
+        code: PREVIEW_SAMPLE_FAILED.to_owned(),
+        message: format!("preview sample {index} at step {step} failed to render: {error}"),
+    }
+}
+
 /// Identity + capabilities of a trainer (drives `validate` and consumer introspection). The
 /// training analog of [`ModelDescriptor`](crate::generator::ModelDescriptor).
 #[derive(Clone, Copy, Debug)]
@@ -2180,11 +2206,40 @@ pub trait Trainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> crate::Result<TrainingOutput>;
+
+    /// **Train and report** (sc-27451): the [`TrainingReport`] — the output plus the run's non-fatal
+    /// warnings (e.g. a preview sample that failed to render), which [`train`](Self::train) has no
+    /// channel for. Additive for the reason
+    /// [`Generator::generate_with_report`](crate::generator::Generator::generate_with_report) is: a
+    /// default-implemented method instead of a new [`TrainingProgress`] variant or
+    /// [`TrainingOutput`] field, whose exhaustive matches and literals span consumers. The default
+    /// wraps [`train`](Self::train) with no warnings; a trainer that reports warnings overrides this
+    /// and derives `train` from it.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> crate::Result<TrainingReport> {
+        self.train(req, on_progress).map(|output| TrainingReport {
+            output,
+            warnings: Vec::new(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_sample_failed_warning_is_coded_and_names_the_sample() {
+        let w = preview_sample_failed(40, 2, &"out of memory");
+        assert_eq!(w.code, PREVIEW_SAMPLE_FAILED);
+        assert_eq!(
+            w.message,
+            "preview sample 2 at step 40 failed to render: out of memory"
+        );
+    }
 
     #[test]
     fn training_item_ctors_set_control() {

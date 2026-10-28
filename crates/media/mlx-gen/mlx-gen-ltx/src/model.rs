@@ -60,6 +60,7 @@ use mlx_gen::gen_core::ltx_checkpoint::{
     layout_for_declared_version, LtxBundle, LtxCheckpointLayout, LtxComponent,
 };
 use mlx_gen::gen_core::reject_unknown_components;
+use mlx_gen::gen_core::{GenerationReport, GenerationWarning};
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::{to_dtype, Weights};
@@ -430,8 +431,15 @@ enum StagedTextEncoder {
     Gemma4(Box<Ltx25TextEncoder>),
 }
 
+/// [`GenerationReport::warnings`] code: the best-effort LTX-2.3 prompt enhancer failed (or returned
+/// nothing) and the render used the original prompt (sc-27451).
+pub const PROMPT_ENHANCER_FALLBACK: &str = "prompt_enhancer_fallback";
+
 struct StagedTextConditioning {
     enhanced_prompt: Option<String>,
+    /// Why the best-effort 2.3 prompt enhancer fell back to the original prompt (sc-27451), surfaced
+    /// as a [`PROMPT_ENHANCER_FALLBACK`] render warning.
+    enhancer_fallback: Option<String>,
     video: Array,
     audio: Array,
     negative_video: Option<Array>,
@@ -1270,12 +1278,12 @@ impl Ltx {
         let te = self.build_text_encoder()?;
         // Prompt enhancement (sc-2845) reuses the just-built Gemma backbone (the censored path); the
         // uncensored path loads its own. Running it here keeps BOTH TE uses inside one staged load.
-        let enhanced = match &te {
+        let (enhanced, enhancer_fallback) = match &te {
             StagedTextEncoder::Gemma3(te) => self.maybe_enhance(te, req),
             // Unlike the legacy 2.3 best-effort enhancer, the declared 2.5 stock-snapshot route
             // is fail-closed: an asset, version, template, or decode mismatch must not silently
             // turn an enhancement request into ordinary conditioning.
-            StagedTextEncoder::Gemma4(_) => self.maybe_enhance_gemma4(req)?,
+            StagedTextEncoder::Gemma4(_) => (self.maybe_enhance_gemma4(req)?, None),
         };
         let prompt = enhanced.as_deref().unwrap_or(req.prompt.as_str());
         let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
@@ -1305,6 +1313,7 @@ impl Ltx {
         };
         Ok(StagedTextConditioning {
             enhanced_prompt: enhanced,
+            enhancer_fallback,
             video: video_ctx,
             audio: audio_ctx,
             negative_video,
@@ -2000,23 +2009,31 @@ impl Ltx {
     /// Prompt enhancement (sc-2845). Returns the rewritten prompt when `req.enhance_prompt` is set and
     /// the enhancer produces non-empty output; `None` (use the original prompt) when off, or — matching
     /// `generate_av.py`'s try/except — on **any** enhancer failure or empty output. Failures are logged
-    /// to stderr with the reference's `ENHANCER_FALLBACK:` token; success with `ENHANCED_PROMPT:`.
-    fn maybe_enhance(&self, te: &LtxTextEncoder, req: &GenerationRequest) -> Option<String> {
+    /// to stderr with the reference's `ENHANCER_FALLBACK:` token (success with `ENHANCED_PROMPT:`)
+    /// and returned as the fallback reason, which the render reports as a warning (sc-27451).
+    fn maybe_enhance(
+        &self,
+        te: &LtxTextEncoder,
+        req: &GenerationRequest,
+    ) -> (Option<String>, Option<String>) {
         if !req.enhance_prompt {
-            return None;
+            return (None, None);
         }
         match self.run_enhance(te, req) {
             Ok(p) if !p.trim().is_empty() => {
                 eprintln!("ENHANCED_PROMPT:{p}");
-                Some(p)
+                (Some(p), None)
             }
             Ok(_) => {
                 eprintln!("ENHANCER_FALLBACK:EmptyOutput:prompt enhancer returned empty output");
-                None
+                (
+                    None,
+                    Some("prompt enhancer returned empty output".to_owned()),
+                )
             }
             Err(e) => {
                 eprintln!("ENHANCER_FALLBACK:{e}");
-                None
+                (None, Some(e.to_string()))
             }
         }
     }
@@ -2685,6 +2702,18 @@ impl Generator for Ltx25 {
         route.generate(req, on_progress)
     }
 
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationReport> {
+        self.validate(req)?;
+        let route = build_ltx25(&self.spec, Rc::clone(&self.enhancer_cache))
+            .map_err(mlx_gen::gen_core::Error::from)?;
+        debug_assert_eq!(route.transformer_variant(), self.variant);
+        route.generate_with_report(req, on_progress)
+    }
+
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
         Some(&self.memory_strategy)
     }
@@ -2999,7 +3028,24 @@ impl Generator for Ltx {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        self.generate_impl(req, on_progress, &mut Vec::new())
+            .map_err(Into::into)
+    }
+
+    /// The render plus its non-fatal warnings (sc-27451): a best-effort 2.3 prompt enhancement that
+    /// fell back to the original prompt is a [`PROMPT_ENHANCER_FALLBACK`] warning, not only a
+    /// stderr line.
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationReport> {
+        let mut warnings = Vec::new();
+        let output = self.generate_impl(req, on_progress, &mut warnings)?;
+        Ok(GenerationReport {
+            warnings,
+            ..GenerationReport::from_output(output)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -3054,6 +3100,7 @@ impl Ltx {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
+        warnings: &mut Vec<GenerationWarning>,
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         // sc-10976 staged text phase: build the Gemma TE, run the optional prompt enhancer (sc-2845 —
@@ -3070,6 +3117,14 @@ impl Ltx {
             })?;
         // The TE is dropped; free the allocator cache so the DiT loads into the low-water footprint.
         mlx_rs::memory::clear_cache();
+        if let Some(reason) = &conditioning.enhancer_fallback {
+            warnings.push(GenerationWarning {
+                code: PROMPT_ENHANCER_FALLBACK.to_owned(),
+                message: format!(
+                    "prompt enhancement failed, the original prompt was used: {reason}"
+                ),
+            });
+        }
         let prompted = request_with_effective_prompt(req, conditioning.enhanced_prompt.clone());
         let owned = self.apply_auto_frames(&prompted, &conditioning.video, &conditioning.audio)?;
         // Auto-duration supplies `frames` only after the text phase.  Re-run the ordinary provider
