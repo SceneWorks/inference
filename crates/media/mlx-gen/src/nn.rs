@@ -1411,6 +1411,46 @@ mod tests {
     use mlx_rs::ops::{abs, array_eq, max, subtract};
     use mlx_rs::Dtype;
 
+    /// sc-27453: the Wan / Z-Image / Qwen-Image RoPE glue computed the imaginary part as
+    /// `real·sin + imag·cos`, core [`rope_rotate`] as `imag·cos + real·sin`. IEEE addition is
+    /// commutative, so the two are bit-identical — eager and compiled (no fused-multiply-add
+    /// contraction reorders the products inside the fused kernel; retained handles compile the same
+    /// kernel, and the runtime-macos audit counts every literal retained constructor). Pins
+    /// the premise that let those crates drop their private copies.
+    #[test]
+    fn rope_rotate_imag_operand_order_is_bit_irrelevant() {
+        fn sin_first(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
+            let (real, imag, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+            let out_real = subtract(&multiply(real, cos)?, &multiply(imag, sin)?)?;
+            let out_imag = add(&multiply(real, sin)?, &multiply(imag, cos)?)?;
+            Ok(vec![out_real, out_imag])
+        }
+        let same = |a: &[Array], b: &[Array]| {
+            a.iter()
+                .zip(b)
+                .all(|(x, y)| array_eq(x, y, None).unwrap().item::<bool>())
+        };
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            let args: Vec<Array> = (0..4u64)
+                .map(|i| {
+                    let key = mlx_rs::random::key(0x2745_3000 + i).unwrap();
+                    mlx_rs::random::normal::<f32>(&[4, 64, 512], None, None, Some(&key))
+                        .unwrap()
+                        .as_dtype(dtype)
+                        .unwrap()
+                })
+                .collect();
+            assert!(same(
+                &rope_rotate_impl(&args).unwrap(),
+                &sin_first(&args).unwrap()
+            ));
+            assert!(same(
+                &compile(rope_rotate_impl, true)(&args).unwrap(),
+                &compile(sin_first, true)(&args).unwrap()
+            ));
+        }
+    }
+
     // The retained handles are thread-local, but the trace probes behind [`COMPILE_TRACE_COUNTS`]
     // are process-global: every test that resets, asserts, or increments them must hold this lock,
     // or a concurrently scheduled sibling corrupts the exact-count assertions. Poison-tolerant so

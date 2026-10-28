@@ -166,7 +166,7 @@ cargo run --release --locked -p runtime-macos --no-default-features --features p
 ```
 
 The command launches one fresh child process, verifies exact inference/mlx-rs build provenance, and
-executes all 24 retained handles (23 logical sites) twice before releasing every request tensor. A
+executes all 21 retained handles (20 logical sites) twice before releasing every request tensor. A
 single-f32 drain then replaces the completed default Metal command buffer's shallow references to
 the last large input/output, so the final sample measures handle ownership rather than command-buffer
 retirement. Its JSON receipt binds that four-byte drain and contains the child PID, handle/site

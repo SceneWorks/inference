@@ -46,7 +46,7 @@ const RETENTION_MEMORY_AUDIT_SCHEMA_VERSION: &str = "sceneworks.mlx-retention-me
 /// deliberately appears twice because its matching-dtype and strong-f32-literal policies own
 /// separate compiler handles. The audit executes this exact handle multiset twice in one child
 /// process: one miss and one hit per entry.
-const RETAINED_COMPILE_HANDLES: [&str; 24] = [
+const RETAINED_COMPILE_HANDLES: [&str; 21] = [
     "mlx_gen::nn::gated",
     "mlx_gen::nn::rope_rotate",
     "mlx_gen::nn::modulate",
@@ -58,16 +58,13 @@ const RETAINED_COMPILE_HANDLES: [&str; 24] = [
     "ltx::transformer::modulate",
     "ltx::transformer::gated",
     "ltx::transformer::gelu_ffn",
-    "qwen_image::attention::rope_rotate",
     "qwen_image::block::modulate",
     "qwen_image::block::gated",
     "qwen_image::feed_forward::gelu_ffn",
     "sdxl::silu_glue",
-    "wan::rope::rope_rotate",
     "wan::transformer::modulate",
     "wan::transformer::gated",
     "wan::transformer::gelu_ffn",
-    "z_image::attention::rope_rotate",
     "z_image::control_transformer::add_hint",
     "z_image::feed_forward::swiglu",
     "z_image::transformer_block::gated",
@@ -291,8 +288,6 @@ fn exercise_retained_compile_inventory(input: &mlx_rs::Array) -> Result<(), Stri
         .map_err(|error| format!("audit Flux2 retained handles: {error}"))?;
     runtime_macos::providers::ltx::transformer::exercise_retained_compile_inventory(input)
         .map_err(|error| format!("audit LTX transformer retained handles: {error}"))?;
-    runtime_macos::providers::qwen_image::transformer::attention::exercise_retained_compile_inventory(input)
-        .map_err(|error| format!("audit Qwen attention retained handles: {error}"))?;
     runtime_macos::providers::qwen_image::transformer::block::exercise_retained_compile_inventory(
         input,
     )
@@ -301,12 +296,8 @@ fn exercise_retained_compile_inventory(input: &mlx_rs::Array) -> Result<(), Stri
         .map_err(|error| format!("audit Qwen FFN retained handles: {error}"))?;
     runtime_macos::providers::sdxl::exercise_retained_compile_inventory(input)
         .map_err(|error| format!("audit SDXL retained handles: {error}"))?;
-    runtime_macos::providers::wan::rope::exercise_retained_compile_inventory(input)
-        .map_err(|error| format!("audit Wan RoPE retained handles: {error}"))?;
     runtime_macos::providers::wan::transformer::exercise_retained_compile_inventory(input)
         .map_err(|error| format!("audit Wan transformer retained handles: {error}"))?;
-    runtime_macos::providers::z_image::attention::exercise_retained_compile_inventory(input)
-        .map_err(|error| format!("audit Z-Image attention retained handles: {error}"))?;
     runtime_macos::providers::z_image::control_transformer::exercise_retained_compile_inventory(
         input,
     )
@@ -349,7 +340,7 @@ fn run_retention_memory_child() -> Result<(), String> {
     drop(compile_guard);
 
     // The audit helpers evaluate and drop every output before returning. This releases the final
-    // request-owned tensor before allocator/cache sampling while the 24 retained compiler handles
+    // request-owned tensor before allocator/cache sampling while the 21 retained compiler handles
     // remain alive in their thread-local owners.
     drop(input);
     // MLX's completed default Metal command buffer keeps shallow references to its most recent
@@ -2040,16 +2031,16 @@ mod tests {
             .contains("exact full-inventory miss/hit"));
 
         let expected = expected_retention_diagnostics();
-        assert_eq!(RETAINED_COMPILE_HANDLES.len(), 24);
+        assert_eq!(RETAINED_COMPILE_HANDLES.len(), 21);
         assert_eq!(
             RETAINED_COMPILE_HANDLES
                 .iter()
                 .copied()
                 .collect::<BTreeSet<_>>()
                 .len(),
-            23
+            20
         );
-        assert_eq!(expected.len(), 47);
+        assert_eq!(expected.len(), 41);
         assert_eq!(
             expected
                 .get(&(
@@ -2074,7 +2065,7 @@ mod tests {
                     None,
                 ))
                 .copied(),
-            Some(48)
+            Some(42)
         );
     }
 
