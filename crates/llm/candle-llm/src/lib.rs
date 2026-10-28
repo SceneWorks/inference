@@ -58,6 +58,7 @@ mod prism_vision_gguf;
 pub mod provider;
 pub mod starvector;
 pub mod starvector_8b;
+mod starvector_common;
 
 // Re-export the contract crate so consumers can reach it as `candle_llm::core_llm::…`.
 pub use core_llm;

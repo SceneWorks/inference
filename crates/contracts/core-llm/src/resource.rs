@@ -374,9 +374,29 @@ pub fn effective_memory_budget(capacity: Option<u64>, budget: Option<u64>) -> Re
 }
 
 /// Fresh host/unified-memory availability snapshot. This is never used as CUDA capacity.
+///
+/// This is the one host-availability probe for both contracts: gen-core's MOSS recovery
+/// (`gen_core::moss_image_training::recovery::host::available_bytes`) wraps it (sc-27317). Every
+/// arm queries the kernel in-process; it never spawns a helper process by bare name, so admission
+/// carries no per-request process start-up cost and no Windows application-directory search
+/// (sc-27306, sc-27311).
+///
+/// - Linux: `/proc/meminfo` `MemAvailable`.
+/// - Windows: `GlobalMemoryStatusEx` `ullAvailPhys`.
+/// - macOS: `host_statistics64(HOST_VM_INFO64)` free + purgeable + reclaimable file-backed pages
+///   (external minus speculative, since the kernel free count already includes speculative
+///   read-ahead). Inactive *anonymous* pages are deliberately not credited: reclaiming them means
+///   compression or swap, so they are not available for a new allocation.
+///
+/// Returns `None` when the platform query fails or reports zero; callers fail closed through
+/// [`effective_memory_budget`].
 pub fn available_host_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
+    host_memory::available_bytes().filter(|bytes| *bytes > 0)
+}
+
+#[cfg(target_os = "linux")]
+mod host_memory {
+    pub(super) fn available_bytes() -> Option<u64> {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
         let kib = text.lines().find_map(|line| {
             line.strip_prefix("MemAvailable:")?
@@ -385,55 +405,77 @@ pub fn available_host_memory_bytes() -> Option<u64> {
                 .parse::<u64>()
                 .ok()
         })?;
-        return kib.checked_mul(1024);
+        kib.checked_mul(1024)
     }
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("vm_stat").output().ok()?;
-        let text = String::from_utf8(output.stdout).ok()?;
-        let page_size = text
-            .lines()
-            .next()?
-            .split("page size of ")
-            .nth(1)?
-            .split_whitespace()
-            .next()?
-            .parse::<u64>()
-            .ok()?;
-        let pages = text
-            .lines()
-            .skip(1)
-            .filter_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                matches!(name, "Pages free" | "Pages inactive" | "Pages speculative")
-                    .then(|| value.trim().trim_end_matches('.').parse::<u64>().ok())?
-            })
-            .sum::<u64>();
-        return pages.checked_mul(page_size);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let output = std::process::Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory",
-            ])
-            .output()
-            .ok()?;
-        if !output.status.success() {
+}
+
+#[cfg(target_os = "windows")]
+mod host_memory {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    pub(super) fn available_bytes() -> Option<u64> {
+        // SAFETY: MEMORYSTATUSEX is a plain-data struct for which all-zero bytes are valid.
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: `status` is a live, writable MEMORYSTATUSEX whose dwLength is set as the API
+        // requires; the call only writes into it.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
             return None;
         }
-        return String::from_utf8(output.stdout)
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()?
-            .checked_mul(1024);
+        Some(status.ullAvailPhys)
     }
-    #[allow(unreachable_code)]
-    None
+}
+
+#[cfg(target_os = "macos")]
+mod host_memory {
+    // libc 0.2.186 exposes the Mach types and host query, but not this System symbol.
+    // Release the send right returned by mach_host_self.
+    unsafe extern "C" {
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+
+    #[allow(deprecated)]
+    pub(super) fn available_bytes() -> Option<u64> {
+        // SAFETY: vm_statistics64 is a plain-data struct for which all-zero bytes are valid.
+        let mut info: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        // SAFETY: sysconf has no memory-safety preconditions.
+        let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+        // SAFETY: mach_host_self has no preconditions; the send right is released below.
+        let host = unsafe { libc::mach_host_self() };
+        // SAFETY: `info` is a live vm_statistics64 and `count` holds its size in integer_t units,
+        // which is exactly the buffer contract of HOST_VM_INFO64.
+        let result = unsafe {
+            libc::host_statistics64(
+                host,
+                libc::HOST_VM_INFO64,
+                &mut info as *mut _ as libc::host_info64_t,
+                &mut count,
+            )
+        };
+        // SAFETY: `host` is the send right obtained above and is not used after this call.
+        unsafe { mach_port_deallocate(libc::mach_task_self(), host) };
+        if result != libc::KERN_SUCCESS || page_size == 0 || count != libc::HOST_VM_INFO64_COUNT {
+            return None;
+        }
+        let reclaimable = info
+            .external_page_count
+            .saturating_sub(info.speculative_count);
+        u64::from(info.free_count)
+            .checked_add(u64::from(info.purgeable_count))
+            .and_then(|pages| pages.checked_add(u64::from(reclaimable)))
+            .and_then(|pages| pages.checked_mul(page_size))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+mod host_memory {
+    pub(super) fn available_bytes() -> Option<u64> {
+        None
+    }
 }
 
 /// Sum only checkpoint payload files without reading weights into memory.

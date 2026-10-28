@@ -119240,7 +119240,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119258,8 +119258,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens; source setup helpers=load,load_record,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens; source setup helpers=load,load_record,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119269,7 +119269,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119289,7 +119289,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens",
       "requirements": []
     }
   },
@@ -119298,7 +119298,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119316,8 +119316,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback; source setup helpers=load,load_report,synthetic_cfg_json,synthetic_snapshot_weights,write_snapshot; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback; source setup helpers=load,load_report,synthetic_cfg_json,synthetic_snapshot_weights,write_snapshot; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119327,7 +119327,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119347,7 +119347,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback",
       "requirements": []
     }
   },
@@ -119356,7 +119356,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119374,8 +119374,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft; source setup helpers=draft_model_prompts,load,write_draft_model_fixture; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft; source setup helpers=draft_model_prompts,load,write_draft_model_fixture; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly2successful libtest summaries; child0 late BODY exactFQN#child=0 +actual learned DEVICE, one root PARENT; no unindexed root BODY",
@@ -119385,7 +119385,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119413,7 +119413,7 @@
     },
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft",
       "requirements": []
     }
   },
@@ -119422,7 +119422,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119440,8 +119440,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp; source setup helpers=fixture_prompts,load,load_memory_estimate,loaded_census,q8_capable_qwen35_snapshot,qwen35_snapshot; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp; source setup helpers=fixture_prompts,load,load_memory_estimate,loaded_census,q8_capable_qwen35_snapshot,qwen35_snapshot; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119451,7 +119451,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119471,7 +119471,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp",
       "requirements": []
     }
   },
@@ -119480,7 +119480,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119498,8 +119498,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks; source setup helpers=load,phi3_snapshot; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks; source setup helpers=load,phi3_snapshot; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119509,7 +119509,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119529,7 +119529,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks",
       "requirements": []
     }
   },
@@ -119538,7 +119538,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119556,8 +119556,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes; source setup helpers=load,q8_capable_qwen35_snapshot; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes; source setup helpers=load,q8_capable_qwen35_snapshot; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119567,7 +119567,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119587,7 +119587,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes",
       "requirements": []
     }
   },
@@ -119596,7 +119596,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119614,8 +119614,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks; source setup helpers=load,qwen35_snapshot,snapshot_tensor_headers; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks; source setup helpers=load,qwen35_snapshot,snapshot_tensor_headers; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119625,7 +119625,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119645,7 +119645,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks",
       "requirements": []
     }
   },
@@ -119654,7 +119654,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119672,8 +119672,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback; source setup helpers=fixture_prompts,image_fixture_prompts,synthetic_qwen3vl_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback; source setup helpers=fixture_prompts,image_fixture_prompts,synthetic_qwen3vl_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119683,7 +119683,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119703,7 +119703,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback",
       "requirements": []
     }
   },
@@ -119712,7 +119712,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119730,8 +119730,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one; source setup helpers=synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one; source setup helpers=synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119741,7 +119741,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119761,7 +119761,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one",
       "requirements": []
     }
   },
@@ -119770,7 +119770,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119788,8 +119788,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot,synthetic_causal_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot,synthetic_causal_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119799,7 +119799,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119819,7 +119819,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp",
       "requirements": []
     }
   },
@@ -119828,7 +119828,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119846,8 +119846,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure; source setup helpers=load,load_record,load_report,q8_capable_qwen35_snapshot,synthetic_causal_provider,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure; source setup helpers=load,load_record,load_report,q8_capable_qwen35_snapshot,synthetic_causal_provider,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119857,7 +119857,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119877,7 +119877,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure",
       "requirements": []
     }
   },
@@ -119886,7 +119886,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::an_unset_speculative_option_runs_the_providers_default",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119904,8 +119904,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default; source setup helpers=draft_model_prompts,load,write_draft_model_fixture; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default; source setup helpers=draft_model_prompts,load,write_draft_model_fixture; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119915,7 +119915,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119935,7 +119935,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default",
       "requirements": []
     }
   },
@@ -119944,7 +119944,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119962,8 +119962,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119973,7 +119973,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119993,7 +119993,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not",
       "requirements": []
     }
   },
@@ -120002,7 +120002,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120020,8 +120020,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain; source setup helpers=synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain; source setup helpers=synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120031,7 +120031,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120051,7 +120051,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain",
       "requirements": []
     }
   },
@@ -120060,7 +120060,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120078,14 +120078,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run; source setup helpers=inline source-declared tensors/parameters; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run; source setup helpers=inline source-declared tensors/parameters; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run",
       "requirements": []
     }
   },
@@ -120094,7 +120094,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120112,14 +120112,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot; source setup helpers=tiny_causal_from,tiny_llama_parts; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot; source setup helpers=tiny_causal_from,tiny_llama_parts; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot",
       "requirements": []
     }
   },
@@ -120128,7 +120128,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120146,14 +120146,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run; source setup helpers=prefix_snapshot_bytes; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run; source setup helpers=prefix_snapshot_bytes; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run",
       "requirements": []
     }
   },
@@ -120162,7 +120162,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120180,14 +120180,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it; source setup helpers=prefix_snapshot_bytes; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it; source setup helpers=prefix_snapshot_bytes; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it",
       "requirements": []
     }
   },
@@ -120196,7 +120196,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120214,14 +120214,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why; source setup helpers=inline source-declared tensors/parameters; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why; source setup helpers=inline source-declared tensors/parameters; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why",
       "requirements": []
     }
   },
@@ -120230,7 +120230,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120248,8 +120248,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot,synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot,synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120259,7 +120259,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120279,7 +120279,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures",
       "requirements": []
     }
   },
@@ -120288,7 +120288,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120306,8 +120306,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request; source setup helpers=image_fixture_prompts,synthetic_qwen35_vl_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request; source setup helpers=image_fixture_prompts,synthetic_qwen35_vl_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120317,7 +120317,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120337,7 +120337,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request",
       "requirements": []
     }
   },
@@ -120346,7 +120346,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120364,8 +120364,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture; source setup helpers=fixture_prompts,synthetic_causal_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture; source setup helpers=fixture_prompts,synthetic_causal_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120375,7 +120375,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120395,7 +120395,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture",
       "requirements": []
     }
   },
@@ -120404,7 +120404,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120422,14 +120422,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds; source setup helpers=checkpoint_offsets,max_checkpoints,memory_geometry_with_checkpoints,text_model; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds; source setup helpers=checkpoint_offsets,max_checkpoints,memory_geometry_with_checkpoints,text_model; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds",
       "requirements": []
     }
   },
@@ -120438,7 +120438,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120456,8 +120456,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop; source setup helpers=image_fixture_prompts,synthetic_qwen3vl_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop; source setup helpers=image_fixture_prompts,synthetic_qwen3vl_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120467,7 +120467,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120487,7 +120487,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop",
       "requirements": []
     }
   },
@@ -120496,7 +120496,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120514,8 +120514,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model; source setup helpers=synthetic_causal_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model; source setup helpers=synthetic_causal_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120525,7 +120525,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120545,7 +120545,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model",
       "requirements": []
     }
   },
@@ -120554,7 +120554,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120572,8 +120572,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports; source setup helpers=load,load_record,load_report,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports; source setup helpers=load,load_record,load_report,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120583,7 +120583,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120603,7 +120603,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports",
       "requirements": []
     }
   },
@@ -120612,7 +120612,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120630,8 +120630,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run; source setup helpers=load,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run; source setup helpers=load,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120641,7 +120641,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120661,7 +120661,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
       "requirements": []
     }
   },

@@ -254,7 +254,7 @@ impl StarVector8bProvider {
         let (first_logits, mut cache) = self.model.prefill(image, &prompt).map_err(to_core)?;
         let config = GenerationConfig {
             max_new_tokens: request.text_request.max_new_tokens as usize,
-            sampling: sampling(&request.text_request.sampling),
+            sampling: SamplingParams::from(&request.text_request.sampling),
             seed: request.text_request.seed,
             stop_tokens: vec![EOS_TOKEN_ID],
         };
@@ -641,19 +641,6 @@ fn preprocess_image(image: &core_llm::ImageRef) -> Result<Array> {
     .preprocess(&image.pixels, image.width as usize, image.height as usize)
 }
 
-fn sampling(value: &core_llm::Sampling) -> SamplingParams {
-    SamplingParams {
-        temperature: value.temperature,
-        top_p: value.top_p,
-        top_k: value.top_k,
-        presence_penalty: value.presence_penalty,
-        presence_penalty_generated_only: value.presence_penalty_generated_only,
-        presence_penalty_prompt_len: 0,
-        repetition_penalty: value.repetition_penalty,
-        repetition_context: value.repetition_context,
-    }
-}
-
 fn map_finish(reason: StarVectorFinishReason) -> FinishReason {
     match reason {
         StarVectorFinishReason::CompleteRoot | StarVectorFinishReason::Eos => FinishReason::Stop,
@@ -964,7 +951,7 @@ mod tests {
             ..SamplingParams::default()
         };
         for (name, params) in [
-            ("greedy", sampling(&request.sampling)),
+            ("greedy", SamplingParams::from(&request.sampling)),
             ("stochastic", stochastic),
         ] {
             let config = GenerationConfig {

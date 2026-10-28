@@ -103,6 +103,55 @@ pub use weights::Weights;
 pub const NVRTC_SOURCES: &[candle_quant_kernels::KernelSource] =
     &[prism::PRISM_SRC, sampler::SAMPLER_SRC];
 
+/// A CUDA kernel's `u32` launch argument or block dimension, refused rather than wrapped when
+/// `n` does not fit (sc-27400): a wrapped size silently launches a partial grid.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn launch_u32(n: usize, what: &str) -> candle_core::Result<u32> {
+    u32::try_from(n)
+        .map_err(|_| candle_core::Error::Msg(format!("CUDA launch: {what} {n} does not fit u32")))
+}
+
+/// A CUDA grid's x dimension (at most `2^31 - 1` blocks), refused rather than wrapped
+/// (sc-27400).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn launch_grid_x(n: usize, what: &str) -> candle_core::Result<u32> {
+    if n > i32::MAX as usize {
+        candle_core::bail!(
+            "CUDA launch: {what} {n} exceeds the grid x limit {}",
+            i32::MAX
+        );
+    }
+    launch_u32(n, what)
+}
+
+/// `a * b` elements for a kernel's output or grid, refused on overflow (sc-27400).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn launch_elems(a: usize, b: usize, what: &str) -> candle_core::Result<usize> {
+    a.checked_mul(b).ok_or_else(|| {
+        candle_core::Error::Msg(format!("CUDA launch: {what} {a} x {b} overflows usize"))
+    })
+}
+
+#[cfg(test)]
+mod launch_param_tests {
+    use super::{launch_elems, launch_grid_x, launch_u32};
+
+    /// sc-27400: launch sizes that do not fit are refused, never wrapped into a small grid.
+    #[test]
+    fn launch_params_refuse_instead_of_wrapping() {
+        assert_eq!(launch_u32(7, "rows").unwrap(), 7);
+        assert_eq!(launch_u32(u32::MAX as usize, "rows").unwrap(), u32::MAX);
+        assert!(launch_u32(u32::MAX as usize + 1, "rows").is_err());
+        assert_eq!(
+            launch_grid_x(i32::MAX as usize, "grid").unwrap(),
+            i32::MAX as u32
+        );
+        assert!(launch_grid_x(i32::MAX as usize + 1, "grid").is_err());
+        assert_eq!(launch_elems(3, 5, "tokens x rows").unwrap(), 15);
+        assert!(launch_elems(usize::MAX, 2, "tokens x rows").is_err());
+    }
+}
+
 #[cfg(test)]
 mod nvrtc_source_tests {
     use super::NVRTC_SOURCES;

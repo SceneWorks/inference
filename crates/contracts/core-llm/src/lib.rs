@@ -65,6 +65,7 @@ pub mod detok;
 pub mod error;
 pub mod kv_compression;
 pub mod message;
+pub mod model_config;
 pub mod mtp_head;
 pub mod output;
 pub mod paging;

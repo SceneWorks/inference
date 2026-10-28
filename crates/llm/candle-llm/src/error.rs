@@ -71,6 +71,16 @@ pub enum Error {
 /// Crate result alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The shared tensor-free config parser's two refusals keep their typed variants (sc-27255).
+impl From<core_llm::model_config::ModelConfigError> for Error {
+    fn from(e: core_llm::model_config::ModelConfigError) -> Self {
+        match e {
+            core_llm::model_config::ModelConfigError::Config(m) => Error::Config(m),
+            core_llm::model_config::ModelConfigError::Unsupported(m) => Error::Unsupported(m),
+        }
+    }
+}
+
 impl From<String> for Error {
     fn from(s: String) -> Self {
         Error::Msg(s)

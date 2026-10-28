@@ -976,6 +976,9 @@ mod cuda {
     impl Drop for Recorded {
         fn drop(&mut self) {
             if !self.graph.is_null() && self.stream.context().bind_to_thread().is_ok() {
+                // SAFETY: `self.graph` is the non-null graph `cuStreamEndCapture` returned, owned
+                // solely by this wrapper (`instantiate` nulls it when it takes ownership), and the
+                // stream's context was just bound to this thread. It is destroyed exactly once.
                 unsafe { sys::cuGraphDestroy(self.graph) };
             }
         }
@@ -986,12 +989,17 @@ mod cuda {
         pub(super) fn census(&self) -> GraphCensus {
             let mut c = GraphCensus::default();
             let mut count = 0usize;
+            // SAFETY: `self.graph` is the live recorded graph this wrapper owns; a null node
+            // array asks only for the count, which the driver writes into the live `count`.
             if ok(unsafe { sys::cuGraphGetNodes(self.graph, std::ptr::null_mut(), &mut count) })
                 .is_err()
             {
                 return c;
             }
             let mut nodes: Vec<sys::CUgraphNode> = vec![std::ptr::null_mut(); count];
+            // SAFETY: `nodes` holds `count` writable slots and `count` tells the driver that
+            // capacity; it writes at most that many handles and updates `count` to the number
+            // written.
             if ok(unsafe { sys::cuGraphGetNodes(self.graph, nodes.as_mut_ptr(), &mut count) })
                 .is_err()
             {
@@ -1003,6 +1011,8 @@ mod cuda {
             let mut freed: HashSet<u64> = HashSet::new();
             for node in nodes {
                 let mut kind = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
+                // SAFETY: `node` is a handle the driver just returned for the live `self.graph`;
+                // `kind` is a live, initialised out-parameter.
                 if ok(unsafe { sys::cuGraphNodeGetType(node, &mut kind) }).is_err() {
                     c.other += 1;
                     continue;
@@ -1014,9 +1024,13 @@ mod cuda {
                         // The driver fills every field (the enums have no zero value, so the
                         // struct cannot be zero-initialised).
                         let mut params = std::mem::MaybeUninit::<sys::CUDA_MEMCPY3D>::uninit();
+                        // SAFETY: `node` is a memcpy node of the live graph (its type was just
+                        // queried) and `params` is writable storage for one CUDA_MEMCPY3D.
                         if ok(unsafe { sys::cuGraphMemcpyNodeGetParams(node, params.as_mut_ptr()) })
                             .is_ok()
                         {
+                            // SAFETY: the query returned CUDA_SUCCESS, so the driver filled
+                            // every field of `params`.
                             let params = unsafe { params.assume_init() };
                             let host = sys::CUmemorytype::CU_MEMORYTYPE_HOST;
                             if params.srcMemoryType == host {
@@ -1034,17 +1048,23 @@ mod cuda {
                         c.mem_allocs += 1;
                         let mut params =
                             std::mem::MaybeUninit::<sys::CUDA_MEM_ALLOC_NODE_PARAMS>::uninit();
+                        // SAFETY: `node` is a mem-alloc node of the live graph (its type was just
+                        // queried) and `params` is writable storage for its parameter struct.
                         if ok(unsafe {
                             sys::cuGraphMemAllocNodeGetParams(node, params.as_mut_ptr())
                         })
                         .is_ok()
                         {
+                            // SAFETY: the query returned CUDA_SUCCESS, so the driver filled
+                            // `params`.
                             allocated.insert(unsafe { params.assume_init() }.dptr);
                         }
                     }
                     sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE => {
                         c.mem_frees += 1;
                         let mut dptr: sys::CUdeviceptr = 0;
+                        // SAFETY: `node` is a mem-free node of the live graph (its type was just
+                        // queried) and `dptr` is a live out-parameter.
                         if ok(unsafe { sys::cuGraphMemFreeNodeGetParams(node, &mut dptr) }).is_ok()
                         {
                             freed.insert(dptr);
@@ -1066,6 +1086,9 @@ mod cuda {
         /// Instantiate (flags 0) and upload; the recorded graph is consumed either way.
         pub(super) fn instantiate(mut self) -> std::result::Result<Graph, Abandoned> {
             let mut exec: sys::CUgraphExec = std::ptr::null_mut();
+            // SAFETY: `self.graph` is the live recorded graph this wrapper owns and `exec` is a
+            // live out-parameter; flags 0 is a valid instantiation. On failure `exec` stays null
+            // and `self` still owns (and destroys) the graph.
             let instantiated =
                 unsafe { sys::cuGraphInstantiateWithFlags(&mut exec, self.graph, 0) };
             if let Err(e) = ok(instantiated) {
@@ -1077,6 +1100,9 @@ mod cuda {
                 exec,
                 stream: self.stream.clone(),
             };
+            // SAFETY: `graph.exec` was just instantiated successfully and `graph` owns it; the
+            // stream is the live stream the graph was captured on. A failed upload drops `graph`,
+            // which destroys the exec and the graph once.
             if let Err(e) = ok(unsafe { sys::cuGraphUpload(graph.exec, graph.stream.cu_stream()) })
             {
                 eprintln!("[cuda-graph] upload failed: {e:?}");
@@ -1111,6 +1137,9 @@ mod cuda {
                 return Err(sys::CUresult::CUDA_ERROR_LAUNCH_FAILED);
             }
             self.stream.context().bind_to_thread().map_err(|e| e.0)?;
+            // SAFETY: `self.exec` is the live executable this wrapper owns (destroyed only in
+            // `drop`), its context was just bound to this thread, and the launch is ordered on the
+            // stream it was captured on, whose staging tensors the `Captured` owner keeps alive.
             ok(unsafe { sys::cuGraphLaunch(self.exec, self.stream.cu_stream()) })
         }
     }
@@ -1121,13 +1150,19 @@ mod cuda {
                 return;
             }
             if !self.exec.is_null() {
+                // SAFETY: the non-null executable is owned solely by this wrapper, the context is
+                // bound to this thread above, and it is destroyed once, before its graph.
                 unsafe { sys::cuGraphExecDestroy(self.exec) };
             }
             if !self.graph.is_null() {
+                // SAFETY: the non-null graph is owned solely by this wrapper (taken from
+                // `Recorded` with `mem::replace`), with the context bound; destroyed once.
                 unsafe { sys::cuGraphDestroy(self.graph) };
             }
             // Graph memory stays reserved in the device-wide pool after its graph is gone until
             // it is trimmed; give it back (only memory no live, scheduled graph uses is freed).
+            // SAFETY: the device handle comes from the stream's live context, bound above; the
+            // trim releases only pool memory no live graph uses.
             unsafe { sys::cuDeviceGraphMemTrim(self.stream.context().cu_device()) };
         }
     }
@@ -1202,6 +1237,8 @@ mod cuda {
         let stream = dev.cuda_stream();
         let device = stream.context().cu_device();
         let mut value = 0u64;
+        // SAFETY: `device` is the live device of the stream's context, and every graph-memory
+        // attribute is a `cuuint64_t`, so `value` is a correctly sized, writable out-parameter.
         let result = unsafe {
             sys::cuDeviceGetGraphMemAttribute(
                 device,
@@ -1272,6 +1309,9 @@ mod cuda {
         fn end(mut self) -> (sys::CUresult, sys::CUgraph) {
             self.open = false;
             let mut graph: sys::CUgraph = std::ptr::null_mut();
+            // SAFETY: the stream is in the thread-local capture `begin` opened on this thread
+            // (`open` was true), and `graph` is a live out-parameter; ownership of the returned
+            // graph passes to the caller.
             let ended = unsafe { sys::cuStreamEndCapture(self.stream.cu_stream(), &mut graph) };
             (ended, graph)
         }
@@ -1287,8 +1327,12 @@ mod cuda {
                 return;
             }
             let mut graph: sys::CUgraph = std::ptr::null_mut();
+            // SAFETY: the capture `begin` opened is still open (`open` is true) and the stream's
+            // context is bound above; `graph` is a live out-parameter.
             unsafe { sys::cuStreamEndCapture(self.stream.cu_stream(), &mut graph) };
             if !graph.is_null() {
+                // SAFETY: the graph the interrupted capture returned is owned only here and is
+                // destroyed once, with the context bound.
                 unsafe { sys::cuGraphDestroy(graph) };
             }
             // Drain what the interrupted step left recorded on cudarc's context.
@@ -3275,6 +3319,7 @@ mod cuda_tests {
         assert!(!capturing(), "the capture flag is cleared");
         // A failed query leaves `ACTIVE`, which the assertion rejects.
         let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE;
+        // SAFETY: the device's live stream and a live out-parameter; the query only reads state.
         let _ = unsafe { sys::cuStreamIsCapturing(dev.cuda_stream().cu_stream(), &mut status) };
         assert_eq!(
             status,
@@ -3296,6 +3341,7 @@ mod cuda_tests {
             return;
         };
         // Earlier tests' graphs are gone (each trims as it goes); start from an empty pool.
+        // SAFETY: the device of the live stream's context; the trim frees only unused pool memory.
         unsafe { sys::cuDeviceGraphMemTrim(dev.cuda_stream().context().cu_device()) };
         assert_eq!(reserved(&dev), 0, "no graph memory reserved at the start");
         let model = Synthetic::new(&device, None);

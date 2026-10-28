@@ -165,6 +165,24 @@ impl SamplingParams {
     }
 }
 
+/// The contract's sampling knobs as the sampler's — the one mapping every provider uses
+/// (sc-27398), the inverse of [`SamplingParams::to_core`]. `presence_penalty_prompt_len` starts at
+/// `0`: it is request-local and the decode engine resets it after prefill.
+impl From<&core_llm::Sampling> for SamplingParams {
+    fn from(s: &core_llm::Sampling) -> Self {
+        Self {
+            temperature: s.temperature,
+            top_p: s.top_p,
+            top_k: s.top_k,
+            presence_penalty: s.presence_penalty,
+            presence_penalty_generated_only: s.presence_penalty_generated_only,
+            presence_penalty_prompt_len: 0,
+            repetition_penalty: s.repetition_penalty,
+            repetition_context: s.repetition_context,
+        }
+    }
+}
+
 /// The largest vocabulary the device sampler serves: its fixed-point weight sums (`w * 2^40`) stay
 /// below `2^63` up to `2^23` tokens.
 pub const DEVICE_SAMPLER_MAX_VOCAB: usize = 1 << 23;
@@ -924,11 +942,17 @@ mod cuda {
                 candle_core::Error::Msg("device sampler input must be contiguous".into())
             })?;
             let x = storage.as_cuda_slice::<f32>()?.slice(start..end);
+            // SAFETY: one block per row, whose thread 0 writes that row's id, so the
+            // uninitialised buffer is fully overwritten before it is read.
             let mut out = unsafe { dev.alloc::<u32>(rows) }?;
             let function = function(&dev, "candle_llm_sample_rows_f32")?;
-            let vocab = vocab as u32;
+            let vocab = crate::primitives::launch_u32(vocab, "sampler vocab")?;
             let config = LaunchConfig {
-                grid_dim: (rows as u32, 1, 1),
+                grid_dim: (
+                    crate::primitives::launch_grid_x(rows, "sampler rows")?,
+                    1,
+                    1,
+                ),
                 block_dim: (THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -944,6 +968,9 @@ mod cuda {
                 .arg(&self.state)
                 .arg(&self.u_override)
                 .arg(&mut out);
+            // SAFETY: the arguments match `candle_llm_sample_rows_f32` in `sampler_cuda.cu` in
+            // order and type; `x` is the contiguous `[rows, vocab]` input and `out` holds `rows`
+            // ids, one per block.
             unsafe { builder.launch(config) }.w()?;
             Ok((CudaStorage::wrap_cuda_slice(out, dev), Shape::from(rows)))
         }
@@ -972,13 +999,17 @@ mod cuda {
     /// `n` SplitMix64 uniforms from `state`, generated on `device`.
     pub(super) fn uniform(state: u64, n: usize, device: &Device) -> Result<Tensor> {
         let dev = device.as_cuda_device()?.clone();
+        // SAFETY: one thread per element writes it (`i < n`), so the uninitialised buffer is
+        // fully overwritten before it is read; an empty buffer is never read.
         let mut out = unsafe { dev.alloc::<f32>(n) }?;
         if n > 0 {
             let function = function(&dev, "candle_llm_splitmix_uniform_f32")?;
-            let count = n as u32;
+            let count = crate::primitives::launch_u32(n, "uniform count")?;
             let stream = dev.cuda_stream();
             let mut builder = stream.launch_builder(&function);
             builder.arg(&state).arg(&count).arg(&mut out);
+            // SAFETY: the arguments match `candle_llm_splitmix_uniform_f32(u64, u32, float*)` in
+            // `sampler_cuda.cu`, and `out` holds the `count` elements the bounded threads write.
             unsafe { builder.launch(LaunchConfig::for_num_elems(count)) }.w()?;
         }
         let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev));
@@ -1001,6 +1032,26 @@ mod tests {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^= z >> 31;
         ((z >> 40) as f32) / ((1u64 << 24) as f32)
+    }
+
+    /// sc-27398: the contract mapping is the exact inverse of `to_core` for a prompt-free lane.
+    #[test]
+    fn contract_sampling_round_trips() {
+        let params = SamplingParams {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            repetition_penalty: 1.1,
+            repetition_context: 64,
+            presence_penalty: 1.5,
+            presence_penalty_generated_only: true,
+            presence_penalty_prompt_len: 0,
+        };
+        assert_eq!(SamplingParams::from(&params.to_core()), params);
+        assert_eq!(
+            SamplingParams::from(&params.for_prompt(9).to_core()).presence_penalty_prompt_len,
+            0
+        );
     }
 
     #[test]

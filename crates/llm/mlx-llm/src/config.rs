@@ -425,7 +425,9 @@ impl Architecture {
         // free.
         if hay.contains("qwen3_vl") || hay.contains("qwen3vl") {
             Ok(Architecture::Qwen3Vl)
-        } else if hay.contains("qwen3_5") || hay.contains("qwen35") {
+        } else if hay.contains("qwen3_5") || hay.contains("qwen35") || hay.contains("qwen3_next") {
+            // sc-27255: every Qwen3.5 spelling Candle accepts too (`qwen3_next`); the shared
+            // tensor-free parser is `core_llm::model_config::Architecture`.
             Ok(Architecture::Qwen35)
         } else if hay.contains("qwen3") {
             Ok(Architecture::Qwen3)

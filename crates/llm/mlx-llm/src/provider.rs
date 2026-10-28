@@ -3254,7 +3254,7 @@ impl LlamaProvider {
                 let req = &reqs[*i];
                 crate::decode::BatchRequest {
                     prompt_ids: prompt_ids.clone(),
-                    sampling: map_sampling(&req.sampling),
+                    sampling: SamplingParams::from(&req.sampling),
                     seed: req.seed,
                     max_new_tokens: req.max_new_tokens as usize,
                     stop_tokens: self.stop_tokens.clone(),
@@ -4056,7 +4056,7 @@ impl LlamaProvider {
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
-            sampling: map_sampling(&req.sampling),
+            sampling: SamplingParams::from(&req.sampling),
             seed: req.seed,
             stop_tokens: self.stop_tokens.clone(),
         };
@@ -5271,19 +5271,6 @@ fn parse_token_ids(v: Option<&serde_json::Value>) -> Option<Vec<i32>> {
         _ => return None,
     };
     (!ids.is_empty()).then_some(ids)
-}
-
-fn map_sampling(s: &Sampling) -> SamplingParams {
-    SamplingParams {
-        temperature: s.temperature,
-        top_p: s.top_p,
-        top_k: s.top_k,
-        presence_penalty: s.presence_penalty,
-        presence_penalty_generated_only: s.presence_penalty_generated_only,
-        presence_penalty_prompt_len: 0,
-        repetition_penalty: s.repetition_penalty,
-        repetition_context: s.repetition_context,
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -7156,7 +7143,7 @@ pub(crate) mod tests {
             .collect();
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
-            sampling: map_sampling(&req.sampling),
+            sampling: SamplingParams::from(&req.sampling),
             seed: req.seed,
             stop_tokens: provider.stop_tokens.clone(),
         };
