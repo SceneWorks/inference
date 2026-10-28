@@ -537,12 +537,14 @@ class CandleGenCiTargetCoverageTests(unittest.TestCase):
             f"{OWNING_JOB} is no longer gated on {JOB_CONDITION!r}; an `if:` that cannot be true "
             "for a candle change (`if: false`, a renamed output) silently disables this step.",
         )
-        self.assertNotRegex(
-            step_block(self.workflow),
-            r"^\s*if:",
-            f"the {STEP_NAME!r} step gained its own `if:`. This step must run whenever its job "
-            "does; a step-level condition is a second, unpinned off switch.",
-        )
+        import yaml
+
+        job = yaml.safe_load(self.workflow)["jobs"][OWNING_JOB]
+        self.assertEqual(job["strategy"], {"fail-fast": False, "matrix": {"group": ["base", "gen"]}})
+        step = next(step for step in job["steps"] if step.get("name") == STEP_NAME)
+        self.assertEqual(step["if"], "matrix.group == 'gen'")
+        self.assertNotIn("continue-on-error", job)
+        self.assertNotIn("continue-on-error", step)
         self.assertIn(
             OWNING_JOB,
             job_needs(self.workflow, GATE_JOB),
@@ -752,16 +754,17 @@ class CandleGenCiTargetCoverageTests(unittest.TestCase):
 
     def test_the_coverage_check_discriminates_mutations(self) -> None:
         """Each mutation is applied ALONE — a batch would let one survivor hide behind another."""
-        step = "cargo test --locked --lib --tests -j 1\n          -p 'candle-gen*'"
+        selector = "select --scope \"$TEST_SCOPE\" -p 'candle-gen*')"
+        command = 'cargo test --locked --lib --tests -j 1 "${packages[@]}"'
         mutations = {
             "--tests dropped": self.workflow.replace(
-                step, "cargo test --locked --lib -j 1\n          -p 'candle-gen*'"
+                command, 'cargo test --locked --lib -j 1 "${packages[@]}"'
             ),
             "glob narrowed to one crate": self.workflow.replace(
-                step, "cargo test --locked --lib --tests -j 1\n          -p candle-gen-minimax-h3"
+                selector, 'select --scope "$TEST_SCOPE" -p candle-gen-minimax-h3)'
             ),
             "glob narrowed away from the epic crate": self.workflow.replace(
-                step, "cargo test --locked --lib --tests -j 1\n          -p 'candle-gen-s*'"
+                selector, "select --scope \"$TEST_SCOPE\" -p 'candle-gen-s*')"
             ),
         }
         for label, mutant in mutations.items():

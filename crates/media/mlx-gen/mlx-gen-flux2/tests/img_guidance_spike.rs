@@ -18,9 +18,17 @@ fn snapshot() -> PathBuf {
 }
 
 fn load_ref(path: &str) -> Image {
-    let rgb = image::open(path)
-        .unwrap_or_else(|e| panic!("open REF_PNG {path}: {e}"))
-        .to_rgb8();
+    let rgb = mlx_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/mlx-gen/mlx-gen-flux2/tests/img_guidance_spike.rs::load_ref::image::open@1149",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
+    .unwrap_or_else(|e| panic!("open REF_PNG {path}: {e}"))
+    .to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Image {
         width,
@@ -101,4 +109,8 @@ fn flux2_klein_edit_image_guidance_sweep() {
             println!("SWEEP p{pi} scale={raw} -> {out_png}  [{prompt}]");
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED img_guidance_spike::flux2_klein_edit_image_guidance_sweep"
+    );
 }

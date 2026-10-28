@@ -373,6 +373,7 @@ fn latent_fidelity(tier: &mut Yue2Nar, reference: &mut Yue2Nar) -> f64 {
 /// Bounds: see `SYNTHETIC_BOUNDS`. A loader that read a GGML tensor densely, a transposed or
 /// mis-blocked conversion, or a tier-unaware loader fails the labels or the bounds.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_tier_loads_at_its_precision_map_and_stays_close_to_the_original() {
     let src = source();
     let reference = original(&src);
@@ -436,6 +437,9 @@ fn a_tier_loads_at_its_precision_map_and_stays_close_to_the_original() {
         );
         previous = (rel, latent_rel);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tier::tests::a_tier_loads_at_its_precision_map_and_stays_close_to_the_original");
 }
 
 /// `(logits rel L2, latents rel L2)` bounds of the synthetic q8 and q4 tiers against the BF16

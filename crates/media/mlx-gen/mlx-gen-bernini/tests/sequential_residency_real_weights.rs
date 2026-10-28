@@ -152,6 +152,8 @@ fn staged_peak_bounds_below_whole_model_sum() {
     );
     drop(model);
     clear_cache();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::staged_peak_bounds_below_whole_model_sum");
 }
 
 /// sc-18609 — the resident-versus-selected rung-4 A/B, driven through the **loaded generator's**
@@ -287,4 +289,6 @@ fn windowed_trunk_lowers_the_request_peak_and_preserves_the_render() {
     );
     drop(model);
     clear_cache();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::windowed_trunk_lowers_the_request_peak_and_preserves_the_render");
 }

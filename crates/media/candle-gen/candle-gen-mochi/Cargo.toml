@@ -28,6 +28,7 @@ rand = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
+model-inference-proof = ["candle-gen-flux/model-inference-proof", "candle-gen/model-inference-proof"]
 default = []
 # Pass the backend selection through to the core crate AND the reused flux stack so a downstream
 # `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.

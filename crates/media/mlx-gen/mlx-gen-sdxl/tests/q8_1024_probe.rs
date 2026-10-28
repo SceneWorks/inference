@@ -45,14 +45,21 @@ fn render(q: Quant, size: u32, steps: u32) -> Image {
         guidance: Some(5.0),
         ..Default::default()
     };
-    match model.generate(&req, &mut |_| {}).unwrap() {
+    match (
+        crate::common::record_model_inference_device(),
+        model.generate(&req, &mut |_| {}),
+    )
+        .1
+        .unwrap()
+    {
         GenerationOutput::Images(mut v) => v.pop().unwrap(),
         other => panic!("expected Images, got {other:?}"),
     }
 }
 
 #[test]
-#[ignore = "needs the SDXL base snapshot"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the SDXL base snapshot"]
 fn base_sdxl_quant_coherent_at_512_and_1024() {
     for q in [Quant::Q8, Quant::Q4] {
         let s512 = std_dev(&render(q, 512, 12));
@@ -70,4 +77,8 @@ fn base_sdxl_quant_coherent_at_512_and_1024() {
              conv_shortcut must stay dense (sc-3329)"
         );
     }
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED q8_1024_probe::base_sdxl_quant_coherent_at_512_and_1024"
+    );
 }

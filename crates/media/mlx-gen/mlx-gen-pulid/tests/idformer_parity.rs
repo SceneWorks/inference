@@ -77,6 +77,8 @@ fn idformer_matches_torch_f32() {
     println!("id_embedding: peak-rel {peak:.3e} mean-rel {mean:.3e} cos {cos:.6}");
     assert!(cos > 0.9995, "id_embedding cosine {cos:.6}");
     assert!(mean < 1.0e-2, "id_embedding mean-rel {mean:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED idformer_parity::idformer_matches_torch_f32");
 }
 
 #[test]
@@ -95,4 +97,6 @@ fn idformer_bf16_floor() {
     let cos = cosine(&got, g.require("id_embedding").unwrap());
     println!("bf16 id_embedding: cos {cos:.6}");
     assert!(cos > 0.99, "bf16 id_embedding cosine {cos:.6}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED idformer_parity::idformer_bf16_floor");
 }

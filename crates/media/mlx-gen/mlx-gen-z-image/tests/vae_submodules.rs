@@ -18,6 +18,7 @@ fn close(a: &Array, b: &Array) -> bool {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn resnet_block_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let rb = ResnetBlock2D::from_weights(&w, "rb.w").unwrap();
@@ -28,9 +29,13 @@ fn resnet_block_matches_fork() {
         close(&out, want),
         "ResnetBlock2D (incl. 1x1 shortcut) diverged"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_submodules::resnet_block_matches_fork");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn vae_attention_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let attn = VaeAttention::from_weights(&w, "attn.w").unwrap();
@@ -38,9 +43,13 @@ fn vae_attention_matches_fork() {
     let want = w.require("attn.out").unwrap();
     assert_eq!(out.shape(), want.shape());
     assert!(close(&out, want), "VAE mid-block attention diverged");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_submodules::vae_attention_matches_fork");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn up_sampler_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let up = UpSampler::from_weights(&w, "up.w").unwrap();
@@ -48,4 +57,7 @@ fn up_sampler_matches_fork() {
     let want = w.require("up.out").unwrap();
     assert_eq!(out.shape(), want.shape());
     assert!(close(&out, want), "UpSampler (nearest-2x + conv) diverged");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_submodules::up_sampler_matches_fork");
 }

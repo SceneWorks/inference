@@ -172,6 +172,8 @@ fn cpu_vb(path: &Path) -> candle_gen::candle_nn::VarBuilder<'static> {
 fn stage2_qwen3_last_hidden_state() {
     let Some(split) = split_files() else {
         eprintln!("stage2: Anima snapshot absent -> skip");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-anima/tests/parity_real_weights.rs:175 (stage2_qwen3_last_hidden_state): Required Anima snapshot resolver returns None, causing named reference-layer/conditioner/DiT work to return without execution.");
         return;
     };
     let g = load_golden("qwen3_hidden_golden.json");
@@ -236,6 +238,11 @@ fn stage2_qwen3_last_hidden_state() {
     // f32 candle vs bf16 torch reference: gate on aggregate stats (tight) + a looser sampled rel-L2.
     let flat = assert_stats(&hidden, &g["last_hidden_state"], "stage2_qwen3", 2e-2);
     assert_sampled_rel_l2(&flat, &g["last_hidden_state"], "stage2_qwen3", 5e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED parity_real_weights::stage2_qwen3_last_hidden_state"
+    );
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -247,6 +254,8 @@ fn stage2_qwen3_last_hidden_state() {
 fn stage3_conditioner_output() {
     let Some(split) = split_files() else {
         eprintln!("stage3: Anima snapshot absent -> skip");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-anima/tests/parity_real_weights.rs:250 (stage3_conditioner_output): Required Anima snapshot resolver returns None, causing named reference-layer/conditioner/DiT work to return without execution.");
         return;
     };
     let g = load_golden("conditioner_golden.json");
@@ -297,6 +306,9 @@ fn stage3_conditioner_output() {
     let active = out.narrow(1, 0, st).unwrap();
     let flat_active = assert_stats(&active, &g["active"], "stage3_active", 1e-2);
     assert_sampled_rel_l2(&flat_active, &g["active"], "stage3_active", 1e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED parity_real_weights::stage3_conditioner_output");
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -308,6 +320,8 @@ fn stage3_conditioner_output() {
 fn stage4_dit_full_velocity() {
     let Some(split) = split_files() else {
         eprintln!("stage4: Anima snapshot absent -> skip");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-anima/tests/parity_real_weights.rs:311 (stage4_dit_full_velocity): Required Anima snapshot resolver returns None, causing named reference-layer/conditioner/DiT work to return without execution.");
         return;
     };
     let g = load_golden("dit_forward_golden.json");
@@ -351,6 +365,9 @@ fn stage4_dit_full_velocity() {
     let v = dit.forward(&latent, &s, &encoder, DType::F32).unwrap();
     let flat = assert_stats(&v, &g["full"], "stage4_dit_full", 1e-2);
     assert_sampled_rel_l2(&flat, &g["full"], "stage4_dit_full", 2e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED parity_real_weights::stage4_dit_full_velocity");
 }
 
 // ------------------------------------------------------------------------------------------------

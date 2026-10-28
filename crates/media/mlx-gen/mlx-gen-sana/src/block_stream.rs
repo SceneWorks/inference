@@ -220,6 +220,7 @@ mod tests {
     /// has no score tensor, so it is never handed a budget and the block's output under a tight
     /// budget is bit-identical rather than merely close.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_block_forward_threads_the_attention_budget_to_attn2() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg(false);
@@ -252,6 +253,10 @@ mod tests {
             "rung 3 through a whole block must stay bit-exact"
         );
         std::fs::remove_dir_all(dir).ok();
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_stream::tests::a_block_forward_threads_the_attention_budget_to_attn2");
     }
 
     fn run(block: &SanaBlock, cfg: &SanaTransformerConfig) -> Vec<f32> {
@@ -337,6 +342,7 @@ mod tests {
 
     /// A streamed block is the resident block: same constructor, same tensors, same arithmetic.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_materialized_block_matches_its_resident_twin() {
         let tmp = tempfile::tempdir().unwrap();
         for qk_norm in [false, true] {
@@ -354,6 +360,10 @@ mod tests {
             );
             std::fs::remove_dir_all(dir).ok();
         }
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_stream::tests::a_materialized_block_matches_its_resident_twin");
     }
 
     /// **The present-but-wrong class.** A stream carrying the wrong config over Sprint weights
@@ -361,6 +371,7 @@ mod tests {
     /// fails, and the block is wrong. This asserts the difference is observable, which is what makes
     /// carrying the trunk's own config load-bearing rather than decorative.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_base_config_stream_over_sprint_weights_is_present_but_wrong() {
         let tmp = tempfile::tempdir().unwrap();
         let sprint = cfg(true);
@@ -379,6 +390,10 @@ mod tests {
             "a base-config stream over Sprint weights must not silently reproduce the Sprint block"
         );
         std::fs::remove_dir_all(dir).ok();
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_stream::tests::a_base_config_stream_over_sprint_weights_is_present_but_wrong");
     }
 
     /// A MISSING tensor fails loudly rather than defaulting.

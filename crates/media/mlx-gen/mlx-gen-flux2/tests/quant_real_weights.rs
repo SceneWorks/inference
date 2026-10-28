@@ -156,12 +156,16 @@ fn v0_matches_fork(bits: i32) {
 #[ignore = "needs real FLUX.2-klein-9b snapshot + tools/golden/flux2_quant_q8.safetensors"]
 fn q8_v0_matches_fork() {
     v0_matches_fork(8);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_real_weights::q8_v0_matches_fork");
 }
 
 #[test]
 #[ignore = "needs real FLUX.2-klein-9b snapshot + tools/golden/flux2_quant_q4.safetensors"]
 fn q4_v0_matches_fork() {
     v0_matches_fork(4);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_real_weights::q4_v0_matches_fork");
 }
 
 fn render(quant: Option<Quant>, size: u32) -> Image {
@@ -183,6 +187,7 @@ fn render(quant: Option<Quant>, size: u32) -> Image {
     let GenerationOutput::Images(mut images) = gen.generate(&req, &mut |_| {}).unwrap() else {
         panic!("expected images");
     };
+    crate::model_inference_device::record_model_inference_device();
     images.pop().unwrap()
 }
 
@@ -258,4 +263,6 @@ fn quant_render_full_path() {
         q8_fork_512 < q8_fork_256,
         "Q8 vs-fork did not shrink at 512² ({q8_fork_512}%) vs 256² ({q8_fork_256}%)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_real_weights::quant_render_full_path");
 }

@@ -24,6 +24,128 @@ use mlx_gen::ios_quantum::{
 /// Maximum formula/measurement ratio every SANA/DC-AE proof accepts (never above 2.0).
 pub const MAX_RATIO: f64 = 1.5;
 
+/// Every iOS quantum label this crate's guards pass, one string per quantum. A device capture
+/// attributes its kernel peak to a phase by label ([`crate::ios_pricing::ios_quantum_phase`]), so no
+/// label may be shared between two phases (the DC-AE encoder's blocks are labelled apart from the
+/// decoder's for exactly that reason).
+pub mod labels {
+    /// Capture preflight: the full mandatory eager resident warm pair, before any component loads.
+    pub const RESIDENT_LOAD: &str = "SANA resident load";
+    /// Gemma-2 caption encoder load floor.
+    pub const TEXT_LOAD: &str = "SANA text load";
+    /// Joined selected captions/masks, before the text encoder can be shed.
+    pub const TEXT_SELECTED: &str = "SANA selected captions";
+    /// Sequential img2img: the DC-AE encoder alone.
+    pub const REFERENCE_ENCODER_LOAD: &str = "SANA reference encoder load";
+    /// The trunk + DC-AE decoder (+ encoder where the bundle builds it).
+    pub const HEAVY_LOAD: &str = "SANA heavy load";
+    /// Trunk entry (patchify, timestep/guidance, caption projection) + the pending sampler update.
+    pub const ENTRY: &str = "SANA patch/caption/timestep";
+    /// One Linear-DiT block.
+    pub const BLOCK: &str = "SANA block";
+    /// Trunk output (modulated norm, `proj_out`, unpatchify).
+    pub const OUTPUT: &str = "SANA output projection";
+    /// Sprint: one SCM update materialized.
+    pub const SCM_STEP: &str = "SANA SCM step";
+    /// Sprint: the final `denoised / sigma_data`.
+    pub const SCM_FINAL: &str = "SANA SCM final";
+    /// The standalone pipeline's final latent.
+    pub const LATENT: &str = "SANA latent";
+    /// The generator's batch of final latents.
+    pub const LATENT_BATCH: &str = "SANA latent batch";
+    /// img2img: the scaled reference latent.
+    pub const REFERENCE_LATENT: &str = "SANA reference latent";
+    /// DC-AE decoder `conv_in` + channel shortcut on the latent.
+    pub const DECODER_INPUT: &str = "DC-AE head input";
+    /// DC-AE decoder upsample block.
+    pub const DECODER_UPSAMPLE: &str = "DC-AE upsample";
+    /// DC-AE decoder `ResBlock` / `EfficientViT` block.
+    pub const DECODER_BLOCK: &str = "DC-AE block";
+    /// DC-AE decoder `norm_out → ReLU → conv_out`.
+    pub const DECODER_OUTPUT: &str = "DC-AE output";
+    /// Tiled decode: one tile folded into the accumulators.
+    pub const TILE_FOLD: &str = "DC-AE tile fold";
+    /// Tiled decode: the final normalization.
+    pub const TILE_FINALIZE: &str = "DC-AE final normalize";
+    /// The actual decoded RGB tensor's F32 denormalize/clamp/round/readback.
+    pub const DECODED_PIXELS: &str = "SANA decoded pixels";
+    /// Actual certified-retirement EfficientViT attention/GLU subquanta.
+    pub const DECODER_ATTENTION: &str = "DC-AE decoder attention joined";
+    pub const DECODER_GLU: &str = "DC-AE decoder GLU joined";
+    pub const ENCODER_ATTENTION: &str = "DC-AE encoder attention joined";
+    pub const ENCODER_GLU: &str = "DC-AE encoder GLU joined";
+    /// DC-AE encoder `conv_in`.
+    pub const ENCODER_INPUT: &str = "DC-AE encoder input";
+    /// DC-AE encoder `ResBlock` / `EfficientViT` block.
+    pub const ENCODER_BLOCK: &str = "DC-AE encoder block";
+    /// DC-AE encoder stride-2 downsample.
+    pub const ENCODER_DOWNSAMPLE: &str = "DC-AE downsample";
+    /// Bounded encode: the tiles' prefix features stitched.
+    pub const ENCODER_STITCH: &str = "DC-AE encode tile stitch";
+    /// DC-AE encoder `conv_out` + out-shortcut.
+    pub const ENCODER_OUTPUT: &str = "DC-AE encoder output";
+
+    /// Every label above.
+    pub const ALL: &[&str] = &[
+        RESIDENT_LOAD,
+        TEXT_LOAD,
+        TEXT_SELECTED,
+        REFERENCE_ENCODER_LOAD,
+        HEAVY_LOAD,
+        ENTRY,
+        BLOCK,
+        OUTPUT,
+        SCM_STEP,
+        SCM_FINAL,
+        LATENT,
+        LATENT_BATCH,
+        REFERENCE_LATENT,
+        DECODER_INPUT,
+        DECODER_UPSAMPLE,
+        DECODER_BLOCK,
+        DECODER_OUTPUT,
+        TILE_FOLD,
+        TILE_FINALIZE,
+        DECODED_PIXELS,
+        DECODER_ATTENTION,
+        DECODER_GLU,
+        ENCODER_ATTENTION,
+        ENCODER_GLU,
+        ENCODER_INPUT,
+        ENCODER_BLOCK,
+        ENCODER_DOWNSAMPLE,
+        ENCODER_STITCH,
+        ENCODER_OUTPUT,
+    ];
+}
+
+/// Only the actual configured invocation selects the joined source program.
+/// Observers, ordinary budgets, Some(memory), and holding a scope do not.
+pub(crate) fn retired_lifecycle() -> mlx_gen::Result<bool> {
+    mlx_gen::ios_quantum::validate_native_retirement_scope()?;
+    match mlx_gen::ios_quantum::native_retirement_binding() {
+        None => Ok(false),
+        Some(binding) if matches!(binding.provider, crate::MODEL_ID | crate::SPRINT_MODEL_ID) => {
+            if !mlx_gen::ios_quantum::enabled() {
+                return Err(mlx_gen::Error::Unsupported(
+                    "SANA retired lifecycle lost its actual quantum scope".into(),
+                ));
+            }
+            Ok(true)
+        }
+        Some(_) => Err(mlx_gen::Error::Unsupported(
+            "SANA graph does not match the active native-retirement provider".into(),
+        )),
+    }
+}
+
+/// Caption gather targets, selected masks and their shared selected-index
+/// uploads. Full hidden parents are existing owners, separately held/priced.
+pub(crate) fn selected_caption_bytes(caption_elements: u64, mask_elements: u64) -> u64 {
+    tensor_bytes(4, &[caption_elements])
+        .saturating_add(tensor_bytes(4, &[mask_elements]).saturating_mul(2))
+}
+
 fn sum(values: &[u64]) -> u64 {
     values.iter().fold(0u64, |a, b| a.saturating_add(*b))
 }
@@ -371,8 +493,17 @@ const RES_LIVE: u64 = 6;
 ///   product fits in released halves), plus the 1x1 point conv's explicit-GEMM workspace over its
 ///   `4C` input.
 pub fn dcae_evit_block_bytes(b: u64, h: u64, w: u64, c: u64, scales: u64) -> u64 {
-    let attention = stage(b, h, w, c, c, 7 + 6 * scales + 11 * (1 + scales), 0);
-    let glu = stage(b, h, w, c, 8 * c, 1, GLU_EXPANDED_LIVE).saturating_add(conv_workspace_bytes(
+    dcae_attention_bytes(b, h, w, c, scales).saturating_add(dcae_glu_bytes(b, h, w, c))
+}
+/// Existing attention half's SAME raw counted formula. Separate execution is
+/// legal only when the actual certified source regime joins its result.
+pub fn dcae_attention_bytes(b: u64, h: u64, w: u64, c: u64, scales: u64) -> u64 {
+    stage(b, h, w, c, c, 7 + 6 * scales + 11 * (1 + scales), 0)
+}
+/// Existing GLUMBConv half's SAME raw formula; original feature ownership
+/// outside this half must remain in the source held-owner ledger.
+pub fn dcae_glu_bytes(b: u64, h: u64, w: u64, c: u64) -> u64 {
+    stage(b, h, w, c, 8 * c, 1, GLU_EXPANDED_LIVE).saturating_add(conv_workspace_bytes(
         b,
         (h, w),
         (h, w),
@@ -380,8 +511,7 @@ pub fn dcae_evit_block_bytes(b: u64, h: u64, w: u64, c: u64, scales: u64) -> u64
         c,
         1,
         0,
-    ));
-    attention.saturating_add(glu)
+    ))
 }
 const GLU_EXPANDED_LIVE: u64 = 5;
 
@@ -523,427 +653,156 @@ pub fn tile_finalize_bytes(out_h: u64, out_w: u64) -> u64 {
     ])
 }
 
-/// **Reachable-sizes prediction** (host-derived; a prediction, never evidence): for `sana_1600m`
-/// and `sana_sprint_1600m` at q4/q8/bf16 × 512/768/1024, text-to-image and img2img, under the iOS
-/// ladder (Sequential residency — text, then for img2img the reference encode with ONLY the DC-AE
-/// encoder resident, then the trunk + decoder, then the decoder alone — bounded DC-AE decode AND
-/// encode at the 192-pixel tile, unbounded attention), print each phase's resident bytes (from the snapshot's safetensors HEADERS), its
-/// largest counted quantum scratch, and whether `resident + scratch + 512 MiB reserve` fits the
-/// 6142 MiB entitled launch headroom. Header-only reads of the on-disk snapshot (`SANA_SNAPSHOT`
-/// / `SANA_SPRINT_SNAPSHOT`, caller-provided snapshot roots) plus the Gemma tokenizer for
-/// the CHI-prompt token count.
+/// **Reachable-sizes prediction** (host-derived from the snapshot's safetensors HEADERS; a
+/// prediction, never evidence): for `sana_1600m` and `sana_sprint_1600m` at q4/q8/bf16 × text /
+/// reference (img2img) × 512/768/1024 on the iOS load (`Sequential`, as
+/// `mlx_gen_ios_catalog::sana_load_spec` builds it), print every phase's resident bytes, its largest
+/// counted quantum and `resident + scratch + 512 MiB reserve` against the 6142 MiB entitled launch
+/// headroom, at (A) the FULLY OPTIMIZED selection — the deepest rung the contract `Implemented`s on
+/// that load, at the last (cheapest) selection of its `selection_space` — and (B) rung 0 Resident.
+/// Every number comes from [`crate::ios_pricing::ios_pricing`] (the library the device prices
+/// with), and every (A) cell must fit. Snapshot roots are caller-provided (`SANA_SNAPSHOT`,
+/// `SANA_SPRINT_SNAPSHOT`).
 ///
 /// `cargo test -p mlx-gen-sana --lib reachable_sizes -- --ignored --nocapture`
 #[cfg(test)]
 mod reachable_sizes {
-    use super::*;
-    use crate::config::{BlockType, DcAeConfig, SanaTransformerConfig};
-    use mlx_gen::attention::AttentionBudget;
-    use mlx_gen::ios_quantum::{sampler_step_bytes, PROCESS_RESERVE_BYTES};
-    use mlx_gen::tiling::{TilingConfig, VaeTiling};
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
+    use mlx_gen::gen_core::{
+        LoadSpec, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryStrategy,
+        MemoryStrategySupport, OffloadPolicy, WeightsSource,
+    };
+    use mlx_gen::ios_pricing::IosPricingRequest;
+    use mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES;
 
     const MIB: u64 = 1024 * 1024;
     const ENTITLED_MIB: u64 = 6142;
 
-    struct Header {
-        bytes: u64,
-        elements: u64,
-    }
-
-    fn headers(path: &Path) -> BTreeMap<String, Header> {
-        mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-            .into_iter()
-            .map(|h| {
-                let elements = h.shape.iter().map(|d| *d as u64).product();
-                (
-                    h.name,
-                    Header {
-                        bytes: h.data_bytes,
-                        elements,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    fn sum_where(h: &BTreeMap<String, Header>, pred: impl Fn(&str) -> bool) -> u64 {
-        h.iter()
-            .filter(|(k, _)| pred(k))
-            .map(|(_, v)| v.bytes)
-            .sum()
-    }
-
-    /// f32 copy bytes of a stored-narrower DENSE weight (packed when `{base}.scales` exists).
-    fn promoted(h: &BTreeMap<String, Header>, base: &str) -> u64 {
-        if h.contains_key(&format!("{base}.scales")) {
-            return 0;
-        }
-        h.get(&format!("{base}.weight"))
-            .filter(|t| t.bytes < 4 * t.elements)
-            .map_or(0, |t| 4 * t.elements)
-    }
-
-    /// The caller-provisioned snapshot (inference never derives a cache path).
-    fn snapshot(var: &str, _repo: &str) -> Option<PathBuf> {
-        std::env::var_os(var).map(PathBuf::from)
-    }
-
-    /// Largest counted DC-AE decode quantum at `edge`, tail tiled at `tile` output pixels.
-    fn decode_scratch(cfg: &DcAeConfig, edge: u64, tile: i32, overlap: i32) -> (u64, &'static str) {
-        let ch = |i: usize| cfg.block_out_channels[i] as u64;
-        let n = cfg.num_stages();
-        let tail = cfg
-            .block_types
-            .iter()
-            .take_while(|t| **t == BlockType::Res)
-            .count();
-        let latent = edge / 32;
-        let mut best = (
-            dcae_decoder_input_bytes(1, latent, latent, 32, ch(n - 1)),
-            "head input",
-        );
-        let mut take = |v: u64, label: &'static str| {
-            if v > best.0 {
-                best = (v, label);
-            }
-        };
-        // Head: deep EfficientViT stages on the whole latent.
-        let mut side = latent;
-        for i in (tail..n).rev() {
-            if i + 1 < n {
-                take(
-                    dcae_upsample_bytes(1, 2 * side, 2 * side, ch(i + 1), ch(i)),
-                    "head upsample",
-                );
-                side *= 2;
-            }
-            for _ in 0..cfg.layers_per_block[i] {
-                take(
-                    dcae_evit_block_bytes(1, side, side, ch(i), 1),
-                    "head EfficientViT block",
-                );
-            }
-        }
-        // Tail: per tile of the head map (tile plan keyed on the tail's x8).
-        let vae = VaeTiling {
-            spatial_scale: 1 << tail,
-            temporal_scale: 1,
-            causal_temporal: false,
-            full_res_channels: 3,
-        };
-        let plan = TilingConfig::spatial_only(tile, overlap).plan(vae, 1, side as i32, side as i32);
-        let t = plan
-            .h
-            .iter()
-            .map(|a| (a.end - a.start) as u64)
-            .max()
-            .unwrap();
-        let mut s = t;
-        for i in (0..tail).rev() {
-            take(
-                dcae_upsample_bytes(1, 2 * s, 2 * s, ch(i + 1), ch(i)),
-                "tail upsample",
-            );
-            s *= 2;
-            for _ in 0..cfg.layers_per_block[i] {
-                take(dcae_res_block_bytes(1, s, s, ch(i)), "tail ResBlock");
-            }
-        }
-        take(dcae_decoder_output_bytes(1, s, s, ch(0), 3), "tail output");
-        take(tile_fold_bytes(s, s, edge, edge, 3), "tile fold");
-        take(tile_finalize_bytes(edge, edge), "finalize");
-        best
-    }
-
-    /// Largest counted DC-AE bounded-encode quantum at `edge` with `core`-pixel tiles.
-    fn encode_scratch(cfg: &DcAeConfig, edge: u64, core: u64) -> (u64, &'static str) {
-        let ch = |i: usize| cfg.block_out_channels[i] as u64;
-        let n = cfg.num_stages();
-        let prefix = cfg
-            .block_types
-            .iter()
-            .take_while(|t| **t == BlockType::Res)
-            .count();
-        // Receptive halo rounded to a prefix cell (see `DcAeEncoder::prefix_halo`).
-        let (mut radius, mut scale) = (1u64, 1u64);
-        for i in 0..prefix {
-            radius += 2 * cfg.encoder_layers_per_block[i] as u64 * scale;
-            radius += scale;
-            scale *= 2;
-        }
-        let halo = radius.div_ceil(scale) * scale;
-        let tile = (core + 2 * halo).min(edge);
-        let mut best = (
-            dcae_encoder_input_bytes(1, tile, tile, 3, ch(0)),
-            "encoder input",
-        );
-        let mut take = |v: u64, label: &'static str| {
-            if v > best.0 {
-                best = (v, label);
-            }
-        };
-        let mut s = tile;
-        for i in 0..n {
-            if i == prefix {
-                take(
-                    dcae_encode_stitch_bytes(1, edge >> prefix, edge >> prefix, ch(i)),
-                    "encode stitch",
-                );
-                s = edge >> prefix;
-            }
-            for _ in 0..cfg.encoder_layers_per_block[i] {
-                let v = match cfg.block_types[i] {
-                    BlockType::Res => dcae_res_block_bytes(1, s, s, ch(i)),
-                    BlockType::EfficientVit => dcae_evit_block_bytes(1, s, s, ch(i), 1),
-                };
-                take(
-                    v,
-                    if i < prefix {
-                        "encode prefix ResBlock"
-                    } else {
-                        "encode EfficientViT block"
-                    },
-                );
-            }
-            if i + 1 < n {
-                take(
-                    dcae_downsample_bytes(1, s, s, ch(i), ch(i + 1)),
-                    "encode downsample",
-                );
-                s /= 2;
-            }
-        }
-        take(
-            dcae_encoder_output_bytes(1, s, s, ch(n - 1), 32),
-            "encoder output",
-        );
-        best
-    }
-
     #[test]
     #[ignore = "prediction table from on-disk snapshot headers; run with --ignored --nocapture"]
     fn reachable_sizes_prediction() {
-        let gemma_cfg = crate::text_encoder::Gemma2Config::gemma_2_2b();
-        let dcae = DcAeConfig::sana_f32c32();
-        for (model, var, repo, cfg) in [
-            (
-                "sana_1600m",
-                "SANA_SNAPSHOT",
-                "SceneWorks--Sana_1600M_1024px_mlx",
-                SanaTransformerConfig::sana_1600m(),
-            ),
-            (
-                "sana_sprint_1600m",
-                "SANA_SPRINT_SNAPSHOT",
-                "SceneWorks--Sana_Sprint_1.6B_1024px_mlx",
-                SanaTransformerConfig::sana_sprint_1600m(),
-            ),
+        let mut misfits = Vec::new();
+        let mut summary = Vec::new();
+        for (provider, var) in [
+            (crate::MODEL_ID, "SANA_SNAPSHOT"),
+            (crate::SPRINT_MODEL_ID, "SANA_SPRINT_SNAPSHOT"),
         ] {
-            let Some(root) = snapshot(var, repo) else {
-                println!("{model}: no snapshot on disk; skipped");
+            let Some(root) = std::env::var_os(var).map(std::path::PathBuf::from) else {
+                println!("{provider}: no snapshot on disk ({var} unset); skipped");
                 continue;
             };
-            // Every advertised tier (`supported_quants: [Q4, Q8]` plus the dense bf16 source).
+            println!(
+                "\n| provider | cfg | tier | mode | edge | phase | resident MiB | scratch MiB | binding quantum | peak MiB | fits 6142 |"
+            );
+            println!("|---|---|---|---|---:|---|---:|---:|---|---:|---|");
             for tier in ["q4", "q8", "bf16"] {
-                let dir = root.join(tier);
-                let te = headers(&dir.join("text_encoder/gemma-2-2b-it.safetensors"));
-                let dit = headers(&dir.join("transformer/diffusion_pytorch_model.safetensors"));
-                let vae = headers(&dir.join("vae/diffusion_pytorch_model.safetensors"));
-                // Gemma token length: CHI prompt (with bos) + 300 − 2.
-                let tok = mlx_gen::tokenizer::TextTokenizer::from_file(
-                    dir.join("text_encoder/tokenizer.json"),
-                    mlx_gen::tokenizer::TokenizerConfig {
-                        max_length: 4096,
-                        pad_token_id: 0,
-                        chat_template: mlx_gen::tokenizer::ChatTemplate::None,
-                        pad_to_max_length: false,
-                    },
-                )
-                .unwrap();
-                let chi = tok
-                    .encode_ids(crate::text_encoder::SANA_CHI_PROMPT, true)
-                    .unwrap()
-                    .len() as u64;
-                let gemma_tokens = chi + 300 - 2;
-                let te_bytes = sum_where(&te, |_| true);
-                // Gemma activations are the embedding's stored dtype (bf16 in both tiers).
-                let text_scratch = [
-                    mlx_gen_pid::gemma2::gemma_layer_bytes(&gemma_cfg, 1, gemma_tokens, 2, 0),
-                    mlx_gen_pid::gemma2::gemma_embedding_bytes(&gemma_cfg, 1, gemma_tokens, 2),
-                    mlx_gen_pid::gemma2::gemma_final_norm_bytes(&gemma_cfg, 1, gemma_tokens, 2),
-                ]
-                .into_iter()
-                .max()
-                .unwrap();
-                let dit_bytes = sum_where(&dit, |_| true);
-                let dec_bytes = sum_where(&vae, |k| k.starts_with("decoder."));
-                let enc_bytes = sum_where(&vae, |k| k.starts_with("encoder."));
-                // The Sequential img2img heavy bundle never builds the encoder (its reference was
-                // encoded in its own phase), so the heavy load prices transformer + decoder only.
-                // Every promoted weight copy of a block (and of the entry) is summed: the whole
-                // quantum's ops fit MLX's in-flight command-buffer window (`SanaBlock::quantum`).
-                let block_weight = ["ff.conv_inverted", "ff.conv_depth", "ff.conv_point"]
-                    .iter()
-                    .map(|c| {
-                        let t = &dit[&format!("transformer_blocks.0.{c}.weight")];
-                        if t.bytes < 4 * t.elements {
-                            4 * t.elements
-                        } else {
-                            0
-                        }
-                    })
-                    .chain(
-                        [
-                            "attn1.to_q",
-                            "attn1.to_k",
-                            "attn1.to_v",
-                            "attn1.to_out.0",
-                            "attn2.to_q",
-                            "attn2.to_k",
-                            "attn2.to_v",
-                            "attn2.to_out.0",
-                        ]
-                        .iter()
-                        .map(|l| promoted(&dit, &format!("transformer_blocks.0.{l}"))),
-                    )
-                    .sum::<u64>();
-                let ts = if cfg.guidance_embeds {
-                    "time_embed.timestep_embedder"
-                } else {
-                    "time_embed.emb.timestep_embedder"
+                // The iOS load: `mlx_gen_ios_catalog::sana_load_spec` (a Sequential load of the
+                // tier directory); the catalog depends on this crate, so it is mirrored, not called.
+                let spec = LoadSpec::new(WeightsSource::Dir(root.join(tier)))
+                    .with_offload_policy(OffloadPolicy::Sequential);
+                let contract =
+                    crate::memory_strategy::memory_strategy_contract(provider, &spec).unwrap();
+                let numeric = MemoryNumericTier {
+                    precision: spec.precision,
+                    quant: spec.quantize,
+                    component_precision_floors: &[],
                 };
-                let entry_weight = [
-                    format!("{ts}.linear_1"),
-                    format!("{ts}.linear_2"),
-                    "time_embed.linear".into(),
-                    "caption_projection.linear_1".into(),
-                    "caption_projection.linear_2".into(),
-                    "time_embed.guidance_embedder.linear_1".into(),
-                    "time_embed.guidance_embedder.linear_2".into(),
-                    "patch_embed.proj".into(),
-                ]
-                .iter()
-                .map(|b| promoted(&dit, b))
-                .sum::<u64>();
-                println!(
-                    "\n{model} {tier}: text_encoder {} MiB, transformer {} MiB, vae decoder {} MiB, vae encoder {} MiB; Gemma tokens {gemma_tokens}",
-                    te_bytes / MIB,
-                    dit_bytes / MIB,
-                    dec_bytes / MIB,
-                    enc_bytes / MIB
-                );
-                let row = |phase: &str, resident: u64, scratch: u64, what: &str| {
-                    let total = resident + scratch + PROCESS_RESERVE_BYTES;
-                    println!(
-                        "  {phase:<26} resident {:>5} MiB + scratch {:>5} MiB ({what}) + reserve 512 = {:>5} MiB -> {}",
-                        resident / MIB,
-                        scratch.div_ceil(MIB),
-                        total.div_ceil(MIB),
-                        if total <= ENTITLED_MIB * MIB { "FITS 6142" } else { "EXCEEDS 6142" }
-                    );
-                };
-                row(
-                    "text load",
-                    0,
-                    te_bytes,
-                    "header total (the measured-proven `before_load` floor)",
-                );
-                row(
-                    "text (Gemma)",
-                    te_bytes,
-                    text_scratch,
-                    "Gemma layer at L tokens",
-                );
-                row(
-                    "reference encoder load",
-                    0,
-                    enc_bytes,
-                    "vae encoder.* stored bytes",
-                );
-                row(
-                    "heavy load",
-                    0,
-                    dit_bytes + dec_bytes,
-                    "transformer + vae decoder.* stored bytes",
-                );
-                for edge in [512u64, 768, 1024] {
-                    let latent = edge / 32;
-                    let tokens = latent * latent;
-                    let caption = 300u64;
-                    let q = crate::transformer::configured_block_quantum(
-                        &cfg,
-                        1,
-                        latent as i32,
-                        latent as i32,
-                        caption as i32,
-                        AttentionBudget::UNBOUNDED,
-                    );
-                    let block = block_bytes(SanaBlockQuantum {
-                        weight_bytes: block_weight,
-                        ..q
-                    });
-                    let latent_elems = 32 * tokens;
-                    let entry = entry_bytes(SanaEntryQuantum {
-                        batch: 1,
-                        latent_channels: 32,
-                        tokens,
-                        patch: 1,
-                        dim: cfg.inner_dim() as u64,
-                        caption_tokens: caption,
-                        caption_channels: 2304,
-                        caption_element_bytes: 2,
-                        element_bytes: 4,
-                        weight_bytes: entry_weight,
-                    }) + sampler_step_bytes(latent_elems);
-                    let output = output_bytes(SanaOutputQuantum {
-                        batch: 1,
-                        tokens,
-                        dim: cfg.inner_dim() as u64,
-                        out_features: 32,
-                        element_bytes: 4,
-                        weight_bytes: promoted(&dit, "proj_out"),
-                    });
-                    let denoise = [
-                        (block, "SANA block"),
-                        (entry, "trunk entry + sampler"),
-                        (output, "trunk output"),
-                        (scm_step_bytes(latent_elems), "SCM step"),
-                    ]
+                let deepest = MemoryStrategy::ALL
                     .into_iter()
-                    .max_by_key(|(v, _)| *v)
+                    .rev()
+                    .find(|s| {
+                        contract
+                            .capability(*s)
+                            .is_some_and(|c| c.support == MemoryStrategySupport::Implemented)
+                    })
                     .unwrap();
-                    let (decode, decode_what) = decode_scratch(&dcae, edge, 192, 48);
-                    let (encode, encode_what) = encode_scratch(&dcae, edge, 192);
-                    // Conditioning carried into the heavy phase: cond (+ uncond for base CFG).
-                    let cond = (if cfg.guidance_embeds { 1 } else { 2 }) * 300 * 2304 * 2;
-                    println!("  -- {edge}x{edge} (latent {latent}x{latent}, {tokens} tokens)");
-                    row(
-                        "denoise txt2img",
-                        dit_bytes + dec_bytes + cond,
-                        denoise.0,
-                        denoise.1,
+                for (config, strategy) in [("A", deepest), ("B", MemoryStrategy::Resident)] {
+                    let selection = *contract
+                        .selection_space(strategy, numeric, false)
+                        .unwrap()
+                        .last()
+                        .unwrap();
+                    let execution = contract.generation_memory(&selection).unwrap_or_default();
+                    println!(
+                        "| {provider} | {config} = {strategy:?} {:?} | {tier} | | | | | | | | |",
+                        selection.parameters
                     );
-                    // Sequential img2img: the reference encodes with only the DC-AE encoder (and
-                    // the conditioning) resident; the trunk phase then carries the f32 reference
-                    // latent instead of the encoder.
-                    row(
-                        "img2img encode (tile 192)",
-                        enc_bytes + cond,
-                        encode,
-                        encode_what,
-                    );
-                    row(
-                        "denoise img2img",
-                        dit_bytes + dec_bytes + cond + 4 * latent_elems,
-                        denoise.0,
-                        denoise.1,
-                    );
-                    row("decode (tile 192)", dec_bytes, decode, decode_what);
+                    for (mode_name, mode, refs) in [
+                        ("text", MemoryMode::TextToImage, 0),
+                        ("reference", MemoryMode::ImageToImage, 1),
+                    ] {
+                        for edge in [512u32, 768, 1024] {
+                            // Explicit native-default sampling request for this header diagnostic;
+                            // mode/reference geometry is carried below, without fake media payloads.
+                            let generation = mlx_gen::gen_core::GenerationRequest {
+                                width: edge,
+                                height: edge,
+                                count: 1,
+                                memory: Some(execution),
+                                ..Default::default()
+                            };
+                            let req = IosPricingRequest {
+                                provider,
+                                spec: &spec,
+                                mode: &mode,
+                                geometry: MemoryGeometry {
+                                    width: edge,
+                                    height: edge,
+                                    batch: 1,
+                                    frames: 1,
+                                    reference_count: refs,
+                                },
+                                selection: &selection,
+                                execution: &execution,
+                                token_window: 0,
+                                generation: Some(&generation),
+                                transform: None,
+                                depth: None,
+                            };
+                            let pricing = crate::ios_pricing::ios_pricing(&req).unwrap();
+                            for p in &pricing.phases {
+                                let peak = p.peak_bytes() + PROCESS_RESERVE_BYTES;
+                                let fits = peak <= ENTITLED_MIB * MIB;
+                                println!(
+                                    "| {provider} | {config} | {tier} | {mode_name} | {edge} | {} | {} | {} | {} | {} | {} |",
+                                    p.phase.as_key(),
+                                    p.resident_bytes.div_ceil(MIB),
+                                    p.scratch_bytes.div_ceil(MIB),
+                                    p.binding,
+                                    peak.div_ceil(MIB),
+                                    if fits { "yes" } else { "NO" }
+                                );
+                                if !fits && config == "A" {
+                                    misfits.push(format!(
+                                        "{provider} {tier} {mode_name} {edge} {}",
+                                        p.phase.as_key()
+                                    ));
+                                }
+                            }
+                            let worst = pricing
+                                .phases
+                                .iter()
+                                .max_by_key(|p| p.peak_bytes())
+                                .unwrap();
+                            summary.push(format!(
+                                "| {provider} | {mode_name} | {tier} | {edge} | {config} | {} | {} / {} |",
+                                (worst.peak_bytes() + PROCESS_RESERVE_BYTES).div_ceil(MIB),
+                                worst.phase.as_key(),
+                                worst.binding
+                            ));
+                        }
+                    }
                 }
             }
         }
+        println!("\nWhole-run peak (worst phase, + 512 MiB reserve) per cell:");
+        println!("| provider | mode | tier | edge | cfg | peak MiB | binding phase / quantum |");
+        println!("|---|---|---|---:|---|---:|---|");
+        for row in summary {
+            println!("{row}");
+        }
+        assert!(
+            misfits.is_empty(),
+            "fully optimized cells over budget: {misfits:?}"
+        );
     }
 }

@@ -101,4 +101,6 @@ fn dit_forward_matches_reference() {
         mean_rel < 1.5e-1,
         "DiT output mean_rel {mean_rel:.3e} too high"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED s3_parity::dit_forward_matches_reference");
 }

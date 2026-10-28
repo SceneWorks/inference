@@ -89,6 +89,7 @@ fn single_vs_tiled_diff(vae: &WanVae, frames: i32) -> f64 {
 fn wan_z16_single_pass_matches_tiled_within_the_96ch_cap() {
     let Some(vae_path) = discover_vae() else {
         eprintln!("skip: no Z16_VAE and no bf16 vae.safetensors under the HF cache");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_z16_single_pass_matches_tiled_within_the_96ch_cap; see preceding skip diagnostic");
         return;
     };
     let weights = Weights::from_file(&vae_path).expect("read z16 vae.safetensors");
@@ -112,4 +113,6 @@ fn wan_z16_single_pass_matches_tiled_within_the_96ch_cap() {
              under-stated and the widest materialized write is wider."
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae16_write_bound_real::wan_z16_single_pass_matches_tiled_within_the_96ch_cap");
 }

@@ -160,6 +160,8 @@ pub fn env_path_opt(tag: &str, key: &str) -> Option<PathBuf> {
         Ok(v) => Some(PathBuf::from(v)),
         Err(_) => {
             println!("[{tag}] SKIP: {key} not set");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/rung4_support/mod.rs:161 (env_path_opt): Implicit None is missing required tier ONLY in selected E neural rung scope; generic helper remains optional elsewhere.");
             None
         }
     }

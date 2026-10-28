@@ -103,10 +103,16 @@ fn run(kind: NetworkType) {
 #[ignore = "needs KOLORS_TRAIN_SNAPSHOT and explicitly scheduled CUDA"]
 fn kolors_lora_real_cuda() {
     run(NetworkType::Lora);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::kolors_lora_real_cuda");
 }
 
 #[test]
 #[ignore = "needs KOLORS_TRAIN_SNAPSHOT and explicitly scheduled CUDA"]
 fn kolors_lokr_real_cuda() {
     run(NetworkType::Lokr);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::kolors_lokr_real_cuda");
 }

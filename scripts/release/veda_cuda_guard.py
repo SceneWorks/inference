@@ -31,11 +31,12 @@ def command(args: list[str], deadline: float | None = None) -> str:
 
 def inventory(out: Path | None = None, label: str = "snapshot",
               deadline: float | None = None) -> tuple[list[dict], list[list[str]]]:
-    rows = command(["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,utilization.gpu", "--format=csv,noheader,nounits"], deadline)
+    rows = command(["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,memory.free,utilization.gpu", "--format=csv,noheader,nounits"], deadline)
     devices = []
     for row in csv.reader(rows.splitlines()):
-        i, uuid, name, driver, total, used, utilization = [v.strip() for v in row]
-        devices.append(dict(index=int(i), uuid=uuid, name=name, driver=driver, total_mib=int(total), used_mib=int(used), utilization_percent=int(utilization)))
+        i, uuid, name, driver, total, used, free, utilization = [v.strip() for v in row]
+        devices.append(dict(index=int(i), uuid=uuid, name=name, driver=driver, total_mib=int(total),
+                            used_mib=int(used), free_mib=int(free), utilization_percent=int(utilization)))
     xml = command(["nvidia-smi", "-q", "-x"], deadline)
     if out is not None:
         (out / f"{label}-nvidia-smi.xml").write_text(xml, encoding="utf-8", newline="\n")
@@ -89,7 +90,8 @@ def process_identities(uuid: str, processes: list[list[str]]) -> list[tuple[str,
 
 
 def sample_baseline(device: dict, out: Path, phase: str,
-                    baseline: dict | None = None) -> tuple[dict, dict]:
+                    baseline: dict | None = None, idle_check=None, identity_key=None,
+                    permit_bounded_growth: bool = False) -> tuple[dict, dict]:
     """Admit one physical UUID only after bounded, stable driver observations."""
     samples = []
     started = time.monotonic()
@@ -105,16 +107,19 @@ def sample_baseline(device: dict, out: Path, phase: str,
             if len(matches) != 1 or time.monotonic() - started > MAX_SAMPLING_SECONDS:
                 raise RuntimeError(f"physical GPU identity or sampling deadline changed during {phase}")
             current = matches[0]
-            identities = process_identities(device["uuid"], processes)
-            if not idle(current, processes):
+            identities = (identity_key or process_identities)(device["uuid"], processes)
+            if not (idle_check or idle)(current, processes):
                 raise RuntimeError(f"physical GPU occupied during {phase}")
             if index == 0 and baseline is None:
                 baseline = dict(uuid=device["uuid"], reserved_baseline_mib=current["used_mib"],
                                 process_identities=identities)
             if (identities != baseline["process_identities"]
-                    or current["used_mib"] > baseline["reserved_baseline_mib"]
-                    or (index and current["used_mib"] > samples[index - 1]["selected_used_mib"])):
+                    or (not permit_bounded_growth and
+                        (current["used_mib"] > baseline["reserved_baseline_mib"] or
+                         (index and current["used_mib"] > samples[index - 1]["selected_used_mib"])))):
                 raise RuntimeError(f"physical GPU baseline changed during {phase}")
+            if permit_bounded_growth:
+                baseline["reserved_baseline_mib"] = max(baseline["reserved_baseline_mib"], current["used_mib"])
             sample["selected_used_mib"] = current["used_mib"]
         return current, baseline
     finally:
@@ -152,8 +157,10 @@ def claim_device(out: Path):
     raise RuntimeError("no unclaimed idle physical CUDA device; refusing benchmark")
 
 
-def verify_idle(device: dict, out: Path, phase: str, baseline: dict):
-    sample_baseline(device, out, phase, baseline)
+def verify_idle(device: dict, out: Path, phase: str, baseline: dict, idle_check=None,
+                identity_key=None, permit_bounded_growth: bool = False):
+    sample_baseline(device, out, phase, baseline, idle_check=idle_check,
+                    identity_key=identity_key, permit_bounded_growth=permit_bounded_growth)
 
 
 def persist_receipt(out: Path, receipt: dict):

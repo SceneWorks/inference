@@ -85,6 +85,15 @@
 //! [`QwenImage21Vae::decode_rgba_tiled`]: crate::vae::QwenImage21Vae::decode_rgba_tiled
 //! [`VaeTiling::QWEN_IMAGE_2_1`]: candle_gen::gen_core::tiling::VaeTiling::QWEN_IMAGE_2_1
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::path::Path;
 use std::sync::Mutex;
 

@@ -44,7 +44,13 @@ fn render(cfg: f32, guidance_method: Option<&str>) -> Image {
         guidance_method: guidance_method.map(Into::into),
         ..Default::default()
     };
-    match generator.generate(&req, &mut |_| {}).unwrap() {
+    match (
+        crate::common::record_model_inference_device(),
+        generator.generate(&req, &mut |_| {}),
+    )
+        .1
+        .unwrap()
+    {
         GenerationOutput::Images(mut v) => v.pop().unwrap(),
         other => panic!("expected Images, got {other:?}"),
     }
@@ -123,7 +129,8 @@ fn save_png(name: &str, img: &Image) -> PathBuf {
 /// review. The quantitative claim asserted here: in its design range cfg_pp stays coherent and is NOT
 /// blown out (low clipping), and it is a genuinely distinct trajectory from plain CFG.
 #[test]
-#[ignore = "needs the real SDXL snapshot (set SDXL_SNAPSHOT or HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot (set SDXL_SNAPSHOT or HF cache)"]
 fn cfgpp_operating_range_and_ab() {
     if snapshot().is_none() {
         eprintln!("skipping: no SDXL snapshot");
@@ -162,12 +169,15 @@ fn cfgpp_operating_range_and_ab() {
             );
         }
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cfgpp_real_weights::cfgpp_operating_range_and_ab");
 }
 
 /// N1 (structural): CFG++ is strictly opt-in. On a CFG++-compatible sampler, `guidance_method = None`
 /// and `"cfg"` both take the plain curated path → byte-identical output (the cfg_pp branch never fires).
 #[test]
-#[ignore = "needs the real SDXL snapshot (set SDXL_SNAPSHOT or HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot (set SDXL_SNAPSHOT or HF cache)"]
 fn cfgpp_is_opt_in_default_unchanged() {
     if snapshot().is_none() {
         eprintln!("skipping: no SDXL snapshot");
@@ -180,5 +190,9 @@ fn cfgpp_is_opt_in_default_unchanged() {
     assert_eq!(
         d, 0.0,
         "default/`cfg` must be byte-identical (cfg_pp is opt-in)"
+    );
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED cfgpp_real_weights::cfgpp_is_opt_in_default_unchanged"
     );
 }

@@ -288,6 +288,7 @@ fn cold_second_load_token_embedding_incidence_probe() {
             "the screened ref2va token embedding must not refuse after sc-23402"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
 }
 
 /// Probe 2 — see the module docs.
@@ -392,7 +393,12 @@ fn reference_partition_step_cost_against_base() {
                 }
                 format!("step-{current}/{total}")
             }
+            Progress::PromptUpsamplingComplete => "prompt-upsampling-complete".to_owned(),
+            Progress::ConditioningComplete => "conditioning-complete".to_owned(),
             Progress::Decoding => "decode-start".to_owned(),
+            Progress::Upsampling { tokens, max_tokens } => {
+                format!("upsample-{tokens}/{max_tokens}")
+            }
         };
         marks.push((label, started.elapsed().as_secs_f64(), get_peak_memory()));
     };
@@ -453,6 +459,7 @@ fn reference_partition_step_cost_against_base() {
         base_rows + i64::from(reference_rows),
     );
     assert_every_evaluation_reported_a_step(steps_reported, steps);
+    crate::model_inference_device::record_model_inference_device();
 }
 
 /// The completeness check of probe 2, on two plain counts: the `Step` events observed and the

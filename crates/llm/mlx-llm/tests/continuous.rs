@@ -225,9 +225,14 @@ fn run_suite(fx: Fixture) {
 fn continuous_llama() {
     let Some(fx) = load_from("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in continuous_llama; see preceding skip diagnostic",
+        );
         return;
     };
     run_suite(fx);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED continuous::continuous_llama");
 }
 
 #[test]
@@ -235,9 +240,14 @@ fn continuous_llama() {
 fn continuous_qwen3() {
     let Some(fx) = load_from("MLX_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set MLX_LLM_QWEN3_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in continuous_qwen3; see preceding skip diagnostic",
+        );
         return;
     };
     run_suite(fx);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED continuous::continuous_qwen3");
 }
 
 /// Acceptance #2 — throughput scales with batch occupancy. Aggregate decode tok/s (total generated
@@ -250,6 +260,7 @@ fn continuous_qwen3() {
 fn throughput_scales_with_occupancy() {
     let Some(fx) = load_from("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in throughput_scales_with_occupancy; see preceding skip diagnostic");
         return;
     };
     let prompt = encode(&fx.tok, "Count slowly and describe the number:");
@@ -290,6 +301,8 @@ fn throughput_scales_with_occupancy() {
         thru8 > exact8 * 1.3,
         "Throughput@8 ({thru8:.0}) should beat Exact@8 ({exact8:.0}) via batched matmul"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED continuous::throughput_scales_with_occupancy");
 }
 
 /// A mid-stream cancel stops the whole continuous run promptly; every request finishes `Cancelled`
@@ -299,6 +312,9 @@ fn throughput_scales_with_occupancy() {
 fn cancel_stops_continuous() {
     let Some(fx) = load_from("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in cancel_stops_continuous; see preceding skip diagnostic",
+        );
         return;
     };
     let prompts = [
@@ -337,6 +353,8 @@ fn cancel_stops_continuous() {
             "cancel should stop well before the budget"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED continuous::cancel_stops_continuous");
 }
 
 /// The streaming contract under cancel with a **queue**: with `max_batch < n`, some requests are
@@ -348,6 +366,7 @@ fn cancel_stops_continuous() {
 fn cancel_emits_one_done_per_request() {
     let Some(fx) = load_from("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in cancel_emits_one_done_per_request; see preceding skip diagnostic");
         return;
     };
     let texts = [
@@ -410,6 +429,8 @@ fn cancel_emits_one_done_per_request() {
             "request {i} output Cancelled"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED continuous::cancel_emits_one_done_per_request");
 }
 
 /// A zero-budget request (`max_new_tokens == 0`) returns empty with `MaxTokens` and emits exactly one
@@ -419,6 +440,7 @@ fn cancel_emits_one_done_per_request() {
 fn zero_budget_request_completes_empty() {
     let Some(fx) = load_from("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in zero_budget_request_completes_empty; see preceding skip diagnostic");
         return;
     };
     let reqs = vec![
@@ -453,4 +475,6 @@ fn zero_budget_request_completes_empty() {
         "the budgeted request still generates"
     );
     assert_eq!(done_count[1], 1);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED continuous::zero_budget_request_completes_empty");
 }

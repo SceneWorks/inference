@@ -29,6 +29,15 @@
 //! `depth_footprint` does); it does not compare enums or functions, so a `DecoderSpec` variant
 //! or a builder change must be mirrored by hand.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 use std::path::Path;
 
 use candle_gen::candle_core::Device;
@@ -958,6 +967,7 @@ mod tests {
     /// is a named error. Mutations: drop either arm from `ARMS` ⇒ the loss names / footprint go red;
     /// enable the identity arm on the landmark knob ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn face_arms_build_and_count() {
         let tmp = tempfile::tempdir().unwrap();
         let dec_dir = tmp.path().join("tae");
@@ -1015,6 +1025,9 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains("face_analysis_dir"), "{e}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::face_arms_build_and_count");
     }
 
     /// A latent-input arm (the shape of S12's E-LatentLPIPS) runs on a family with no decoder:
@@ -1105,6 +1118,7 @@ mod tests {
     /// the arm `PerceptualInput::DecodedPixels` ⇒ the `DecoderSpec::None` build errors ⇒ red; ignore
     /// `ctx.latent_lpips` ⇒ the no-family build succeeds ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_latent_lpips_arm_runs_without_a_decoder_on_its_family_weights() {
         let tmp = tempfile::tempdir().unwrap();
         write_lpips_checkpoint(&tmp.path().join("sdxl_latest_vgg16_tuned.safetensors"));
@@ -1146,6 +1160,9 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains("latent_lpips.model_dir"), "{e}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::the_latent_lpips_arm_runs_without_a_decoder_on_its_family_weights");
     }
 
     /// sc-24833: the VAE anchor is a decoded-x0 loss — a family with no decoder gets a typed error

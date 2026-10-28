@@ -42,8 +42,8 @@ impl FmHead {
     }
 
     pub fn forward(&self, x: &Tensor) -> CResult<Tensor> {
-        let h = self.l0.forward(x)?.gelu_erf()?;
-        self.l2.forward(&h)
+        let h = __model_proof_output!(self.l0.forward(x))?.gelu_erf()?;
+        __model_proof_output!(self.l2.forward(&h))
     }
 
     /// Merge the distill LoRA (the 8-step `fast` variant) into the two FM-head Linears (`{prefix}.0`
@@ -83,8 +83,8 @@ impl TimestepEmbedder {
     /// Embed scalar timesteps `t` `[N]` → `[N, hidden]`.
     pub fn forward(&self, t: &Tensor) -> CResult<Tensor> {
         let freq = timestep_embedding(t, self.freq_size)?;
-        let h = ops::silu(&self.mlp0.forward(&freq)?)?;
-        self.mlp2.forward(&h)
+        let h = ops::silu(&__model_proof_output!(self.mlp0.forward(&freq))?)?;
+        __model_proof_output!(self.mlp2.forward(&h))
     }
 }
 

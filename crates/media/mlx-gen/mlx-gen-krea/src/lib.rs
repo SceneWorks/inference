@@ -892,6 +892,7 @@ mod explicit_registry_tests {
         std::fs::remove_dir_all(root).ok();
 
         let context = mlx_gen::gen_core::MemoryRunContext {
+            reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: mlx_gen::gen_core::MemorySelection {
                 strategy: mlx_gen::gen_core::MemoryStrategy::BoundedDecode,
@@ -966,3 +967,6 @@ mod reexport_tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

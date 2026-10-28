@@ -207,7 +207,7 @@ fn image_delta(left: &Image, right: &Image) -> u8 {
 }
 
 #[test]
-#[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn deferred_materialization_is_independent_from_staged_residency() {
     let req = request(None, false);
     println!(
@@ -399,4 +399,7 @@ fn deferred_materialization_is_independent_from_staged_residency() {
         0,
         "mixed-scope transition changed the rendered image"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED deferred_materialization_real_weights::deferred_materialization_is_independent_from_staged_residency");
 }

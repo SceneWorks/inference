@@ -76,4 +76,6 @@ fn memory_attention_matches_oracle() {
     println!("memory_attention output (num_obj_ptr={n_optr}): cosine={c:.7}");
     // 4 stacked attention layers over 5184 tokens; MLX Metal matmul is reduced-precision.
     assert!(c > 0.999, "memory_attention cosine {c}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memattn_parity::memory_attention_matches_oracle");
 }

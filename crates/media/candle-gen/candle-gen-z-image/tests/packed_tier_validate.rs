@@ -293,6 +293,8 @@ fn assert_q4_cuda_ladder_parity(
 fn render_tier(env: &str, tag: &str) {
     let Ok(dir) = std::env::var(env) else {
         eprintln!("SKIP {tag}: set {env} to the packed tier subdir");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-z-image/tests/packed_tier_validate.rs:296 (render_tier): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&dir)));
@@ -404,6 +406,7 @@ fn render_base_ladder_at(
     contract.validate_selection(&selection).unwrap();
     let calibration = contract.calibration.as_ref().unwrap();
     let context = MemoryRunContext {
+        reference_resources: None,
         optimization_authority: MemoryOptimizationAuthority::Calibrated,
         selection,
         calibration_abi: calibration.abi,
@@ -532,6 +535,9 @@ fn packed_base_all_rungs_preserve_fixed_seed_output() {
         let (adapted, _) = render_base_ladder(generator.as_ref(), strategy, window, Quant::Q4, 1);
         assert_q4_cuda_ladder_parity(&reference, &adapted, strategy, Quant::Q4, 256, 256, 15815);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_base_all_rungs_preserve_fixed_seed_output");
 }
 
 #[test]
@@ -574,6 +580,9 @@ fn packed_base_q4_production_host_decode_parity() {
         1024,
         15815,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_base_q4_production_host_decode_parity");
 }
 
 #[test]
@@ -603,6 +612,9 @@ fn packed_base_q8_rung_four_preserves_fixed_seed_output() {
         1,
     );
     assert_eq!(streamed, resident, "real q8 sidecar output changed");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_base_q8_rung_four_preserves_fixed_seed_output");
 }
 
 #[cfg(feature = "cuda")]
@@ -718,6 +730,9 @@ fn sc16510_real_q4_q8_sidecar_lifecycle_evidence() {
         profile_sidecar_preparation(&tier, tag);
         profile_rung_four_steps(&tier, quant, tag);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::sc16510_real_q4_q8_sidecar_lifecycle_evidence");
 }
 
 #[test]
@@ -884,6 +899,9 @@ fn packed_base_control_q4_honors_control_cfg_warm_repeat_and_cleanup() {
         .generate(&cancelled, &control_image, &mut |_| {})
         .expect_err("pre-cancel must stop before generation");
     assert!(matches!(error, candle_gen::CandleError::Canceled));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_base_control_q4_honors_control_cfg_warm_repeat_and_cleanup");
 }
 
 /// The q4 packed tier renders a coherent image straight from the packed parts (the primary sc-9408
@@ -892,6 +910,9 @@ fn packed_base_control_q4_honors_control_cfg_warm_repeat_and_cleanup() {
 #[ignore = "needs Z_IMAGE_PACKED_Q4 (packed q4 tier subdir) + a CUDA/Metal GPU; run with the matching feature --ignored"]
 fn packed_q4_renders_coherent() {
     render_tier("Z_IMAGE_PACKED_Q4", "q4");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q4_renders_coherent");
 }
 
 /// The q8 packed tier renders a coherent image (double-quant Q8_0 path); only runs when the q8 tier is
@@ -900,4 +921,7 @@ fn packed_q4_renders_coherent() {
 #[ignore = "needs Z_IMAGE_PACKED_Q8 (packed q8 tier subdir) + a CUDA/Metal GPU; run with the matching feature --ignored"]
 fn packed_q8_renders_coherent() {
     render_tier("Z_IMAGE_PACKED_Q8", "q8");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q8_renders_coherent");
 }

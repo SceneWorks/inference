@@ -89,4 +89,6 @@ fn mid_encode_cancel_is_honored_not_false_green() {
         "a cancel issued mid-encode must be honored (Error::Canceled), not swallowed by the lazy \
          single-eval false green (F-029); got {res:?} after {elapsed:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED encoder_cancel::mid_encode_cancel_is_honored_not_false_green");
 }

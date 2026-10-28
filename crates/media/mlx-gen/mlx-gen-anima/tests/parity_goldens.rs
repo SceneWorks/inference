@@ -630,6 +630,7 @@ fn assert_synth(got: &Array, g: &Value, label: &str, stat_rtol: f64, max_rel_l2:
 /// **CI numeric protection for the DiT forward** — runs the synthetic-weight Cosmos DiT on Metal (no
 /// licensed weights, no snapshot) and asserts block0 + the full velocity against the committed golden.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn synthetic_dit_forward_golden() {
     let g = load_golden("dit_synthetic_golden.json");
     let (block0, full) = synth_run();
@@ -647,12 +648,15 @@ fn synthetic_dit_forward_golden() {
     // accumulated) cross-device spread with ~6× headroom yet catches ALL three mutations with margin —
     // measured: drop-concat 1.29 (258×), adaLN-swap 0.313 (63×), RoPE-h/w-swap 0.065 (13×, the smallest).
     assert_synth(&full, &g["full"], "synth_full", 3e-3, 5e-3);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED parity_goldens::synthetic_dit_forward_golden");
 }
 
 /// Regenerate `dit_synthetic_golden.json` (gated on `ANIMA_BLESS_SYNTH=1` so a bare `--ignored` run is a
 /// no-op and never rewrites the committed fixture). Run only when the forward legitimately changes.
 #[test]
-#[ignore = "golden regenerator — set ANIMA_BLESS_SYNTH=1 to write the fixture"]
+#[ignore = "model inference; explicit model-proof workflow; golden regenerator — set ANIMA_BLESS_SYNTH=1 to write the fixture"]
 fn bless_synthetic_dit_golden() {
     if std::env::var("ANIMA_BLESS_SYNTH").is_err() {
         println!("bless_synthetic_dit_golden: set ANIMA_BLESS_SYNTH=1 to regenerate (skipping)");
@@ -700,4 +704,7 @@ fn bless_synthetic_dit_golden() {
     );
     std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
     println!("wrote {path}");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED parity_goldens::bless_synthetic_dit_golden");
 }

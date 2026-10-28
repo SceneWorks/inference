@@ -28,6 +28,7 @@ sceneworks-gen-core-testkit = { workspace = true }
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 
 [features]
+model-inference-proof = ["candle-gen/model-inference-proof"]
 default = []
 # Apple Metal GPU backend (Mac) — forwarded to the candle backend. Not in `default`.
 metal = ["candle-gen/metal"]

@@ -88,14 +88,26 @@ impl Krea2Config {
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let path = root.join("transformer").join("config.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Msg(format!("krea: read {}: {e}", path.display())))?;
+        let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-krea/src/config.rs::from_snapshot::std::fs::read_to_string@4411",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+        .map_err(|e| Error::Msg(format!("krea: read {}: {e}", path.display())))?;
         let v: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("krea: parse {}: {e}", path.display())))?;
         let mut cfg = Self::from_json(&v)?;
         // `patch_size` lives in the pipeline manifest, not the transformer config; read it if present.
         let idx = root.join("model_index.json");
-        if let Ok(t) = std::fs::read_to_string(&idx) {
+        if let Ok(t) = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&idx),
+"crates/media/mlx-gen/mlx-gen-krea/src/config.rs::from_snapshot::std::fs::read_to_string@4898",
+ArtifactInput,
+&idx,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
             if let Ok(mv) = serde_json::from_str::<serde_json::Value>(&t) {
                 if let Some(p) = mv.get("patch_size").and_then(serde_json::Value::as_u64) {
                     cfg.patch_size = p as usize;

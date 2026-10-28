@@ -124,11 +124,11 @@ impl Backbone {
         let t = frames.len();
         let text_ids: Vec<u32> = frames.iter().map(|f| f.text).collect();
         let text_t = Tensor::from_vec(text_ids, (1, t), &self.device)?;
-        let mut sum = self.embed_text.forward(&text_t)?;
+        let mut sum = __model_proof_output!(self.embed_text.forward(&text_t))?;
         for (c, embed) in self.embed_audio.iter().enumerate() {
             let ids: Vec<u32> = frames.iter().map(|f| f.audio[c]).collect();
             let ids_t = Tensor::from_vec(ids, (1, t), &self.device)?;
-            sum = (sum + embed.forward(&ids_t)?)?;
+            sum = (sum + __model_proof_output!(embed.forward(&ids_t))?)?;
         }
         Ok(sum)
     }
@@ -146,7 +146,7 @@ impl Backbone {
         for layer in &self.layers {
             h = layer.forward(&h, &cos, &sin, mask.as_ref())?;
         }
-        self.norm.forward(&h)
+        __model_proof_output!(self.norm.forward(&h))
     }
 
     /// Full-sequence forward, returning only the **last** position's hidden state `[1, 1, H]` —
@@ -221,7 +221,7 @@ impl Backbone {
             h = layer.forward_cached(&h, &cos, &sin, mask.as_ref(), slot, t)?;
         }
         cache.offset += t;
-        let h = self.norm.forward(&h)?;
+        let h = __model_proof_output!(self.norm.forward(&h))?;
         let last = h.dim(1)?;
         h.i((.., last - 1..last, ..))?.contiguous()
     }
@@ -316,6 +316,7 @@ mod tests {
     /// change the computation beyond fp accumulation order (max-abs-diff well below any real
     /// logic-error scale). Determinism per platform/seed is a separate law and still holds.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn kv_cache_matches_full_recompute() {
         // A KV cache can never be bit-identical to full recompute across all BLAS (accumulation
         // order differs), so compare within a tight tolerance; a real wiring/masking bug diverges by
@@ -367,6 +368,11 @@ mod tests {
             );
             assert_eq!(cache.offset(), all.len());
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED backbone::tests::kv_cache_matches_full_recompute"
+        );
     }
 
     /// **Warm-cache multi-turn prefill** (sc-14151): a SECOND `prefill` onto an already-warm cache
@@ -375,6 +381,7 @@ mod tests {
     /// `prefix_causal_mask` (a `[t, offset+t]` mask, not the fresh-cache `[t, t]`); a wrong mask
     /// (masking the prior turns, or mis-aligning) diverges by orders of magnitude beyond fp rounding.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn warm_cache_second_prefill_matches_full_recompute() {
         const TOL: f32 = 1e-4;
         let assert_close = |a: &Tensor, b: &Tensor, ctx: &str| {
@@ -445,5 +452,8 @@ mod tests {
                 &format!("turn1 step {i}"),
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED backbone::tests::warm_cache_second_prefill_matches_full_recompute");
     }
 }

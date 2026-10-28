@@ -545,6 +545,7 @@ mod tests {
     /// each layer term, the L1 term and the self-distance, for 4- and 16-channel families.
     /// Mutations: `IDENTITY_POOLS = 2`; drop the channel normalization; drop the L1 term ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn matches_the_upstream_reference_on_formula_weights() {
         let fx = fixture();
         for case in fx["latent_lpips"].as_array().unwrap() {
@@ -580,12 +581,16 @@ mod tests {
             );
             assert_eq!(scalar(&n.distance(&in0, &in0).unwrap()), 0.0);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::latent_lpips::tests::matches_the_upstream_reference_on_formula_weights");
     }
 
     /// AC2: zero for identical latents, positive (its learned layer terms too) and growing with the
     /// perturbation, and differentiable in the live latent through candle's autograd. Mutation:
     /// subtract the layer terms in `distance` ⇒ the distance falls below its L1 term ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn is_zero_for_identical_latents_and_positive_when_perturbed() {
         let n = net(4);
         let x = randn(3, (1, 4, 8, 8));
@@ -613,6 +618,9 @@ mod tests {
             .get(live.as_tensor())
             .expect("gradient reaches the live latent");
         assert!(scalar(&g.abs().unwrap().sum_all().unwrap()) > 0.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::latent_lpips::tests::is_zero_for_identical_latents_and_positive_when_perturbed");
     }
 
     /// A checkpoint for another latent family is refused; a missing checkpoint is named.
@@ -684,6 +692,7 @@ mod tests {
     /// Runs on the shared path without a decoder; zero at the clean latent, positive off it, and
     /// silent outside its window. Mutation: report `DecodedPixels` ⇒ `PerceptualPath::new` refuses.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn runs_on_the_shared_path_without_a_decoder() {
         let mut path = PerceptualPath::new(
             None,
@@ -709,6 +718,9 @@ mod tests {
         let off = (&clean + 0.2).unwrap();
         assert!(scalar(&path.aux_loss(&plan, 0, &off).unwrap().unwrap().weighted) > 0.0);
         assert!(path.plan(1, 0, 0.8).unwrap().aux.is_empty());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::latent_lpips::tests::runs_on_the_shared_path_without_a_decoder");
     }
 
     /// E7: weights + a working set that scales with the latent + one latent per image; identical

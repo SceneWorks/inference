@@ -134,6 +134,8 @@ fn hyper_flux_scale_zero_is_bit_exact_noop() {
         base.len()
     );
     assert_eq!(base, zero, "scale-0 Hyper LoRA must be a bit-exact no-op");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED hyper_flux_real_weights::hyper_flux_scale_zero_is_bit_exact_noop");
 }
 
 /// Inject the diffusers golden's init + prompt embeds + sigmas, run our transformer (optionally with
@@ -236,6 +238,8 @@ fn hyper_flux_injected_denoise_matches_diffusers() {
         "Hyper LoRA had a negligible effect on the injected render ({effect:.2}% px>8) — globals/residual dropped?"
     );
     println!("✓ Hyper-FLUX injected denoise: the LoRA renders coherent few-step output that tracks the diffusers reference");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED hyper_flux_real_weights::hyper_flux_injected_denoise_matches_diffusers");
 }
 
 /// (4) The public `generate(sampler="hyper")` with the Hyper LoRA loaded visibly differs from the base
@@ -302,4 +306,6 @@ fn hyper_flux_public_render_differs_from_base() {
         "vs diffusers Hyper render: base {base_vs_ref:.2}% px>8 → hyper {hyper_vs_ref:.2}% px>8"
     );
     println!("✓ Hyper-FLUX public path renders coherent few-step output (saved rust_hyper_flux_public.png)");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED hyper_flux_real_weights::hyper_flux_public_render_differs_from_base");
 }

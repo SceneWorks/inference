@@ -1065,6 +1065,7 @@ mod tests {
     /// deterministic, and a bounded perturbation of the dense forward. No golden / real weights — the
     /// CI-green counterpart to the fixture bit-exact gate (`tests/quant_parity.rs`).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn packed_linear_round_trip_matches_dense_within_quant_error() {
         // `[out, in]` weight (in divisible by group 64) + f32 activations, the Mochi compute regime.
         let (out_f, in_f, b) = (128i32, 256i32, 5i32);
@@ -1120,6 +1121,8 @@ mod tests {
                 "Q{bits} round-trip rel {rel:.3e} exceeds {bound}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::packed_linear_round_trip_matches_dense_within_quant_error");
     }
 
     /// Deterministic small "random" fill, bounded so the block stays well-conditioned.
@@ -1195,6 +1198,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn block_forward_shapes_and_determinism() {
         let cfg = tiny_cfg();
         let w = tiny_block_weights(&cfg, "transformer_blocks.0");
@@ -1235,6 +1239,8 @@ mod tests {
         assert!(close(&h1, &h2));
         assert!(close(&e1, &e2));
         assert!(h1.as_slice::<f32>().iter().all(|x| x.is_finite()));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::block_forward_shapes_and_determinism");
     }
 
     /// A tiny full-model config: 2 heads × 8 head-dim → inner 16, pooled 8, 4 latent channels, 2
@@ -1324,6 +1330,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn full_model_forward_shapes_and_determinism() {
         let cfg = tiny_full_cfg();
         let w = tiny_full_weights(&cfg);
@@ -1351,6 +1358,8 @@ mod tests {
         .unwrap()
         .item::<f32>();
         assert_eq!(d, 0.0, "forward is deterministic");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::full_model_forward_shapes_and_determinism");
     }
 
     /// The **bf16 production path** must run end-to-end and track the f32 truth. This is the guard for
@@ -1360,6 +1369,7 @@ mod tests {
     /// matmul/SDPA/conv boundary lines up. It must also stay finite (no NaN from the `log`-built mask or
     /// a bad reduction) and stay a bounded rounding of the f32 velocity field (not a structural break).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn full_model_forward_bf16_runs_and_tracks_f32() {
         let cfg = tiny_full_cfg();
         let w = tiny_full_weights(&cfg);
@@ -1399,9 +1409,12 @@ mod tests {
             rel < 0.2,
             "bf16 vs f32 rel {rel:.3e} exceeds 0.2 — structural divergence"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::full_model_forward_bf16_runs_and_tracks_f32");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn context_pre_only_block_returns_enc_unchanged() {
         // The final block drops the text output path: enc must be returned identical to the input.
         let cfg = tiny_cfg();
@@ -1443,5 +1456,7 @@ mod tests {
             .unwrap()
             .item::<f32>();
         assert_eq!(same, 0.0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tests::context_pre_only_block_returns_enc_unchanged");
     }
 }

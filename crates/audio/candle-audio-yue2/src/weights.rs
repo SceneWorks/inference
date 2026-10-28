@@ -66,8 +66,9 @@ impl Proj {
             Proj::Dense(w) => linear(x, w, bias).map_err(candle_err),
             Proj::Ggml(q) => {
                 let dtype = x.dtype();
-                let y = QMatMul::QTensor(Arc::clone(q))
-                    .forward(&x.to_dtype(DType::F32)?.contiguous()?)?
+                let y =
+                    __model_proof_output!(QMatMul::QTensor(Arc::clone(q))
+                        .forward(&x.to_dtype(DType::F32)?.contiguous()?))?
                     .to_dtype(dtype)?;
                 match bias {
                     Some(b) => y.broadcast_add(&b.to_dtype(dtype)?),
@@ -75,7 +76,7 @@ impl Proj {
                 }
             }
             #[cfg(feature = "cuda")]
-            Proj::Fp8(w) => w.forward(x, bias),
+            Proj::Fp8(w) => __model_proof_output!(w.forward(x, bias)),
         }
     }
 

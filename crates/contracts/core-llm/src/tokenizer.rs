@@ -47,7 +47,12 @@ impl Tokenizer {
         let path = path.as_ref();
         let inner = tokenizers::Tokenizer::from_file(path)
             .map_err(|e| Error::Load(format!("tokenizer {}: {e}", path.display())))?;
-        Ok(Self { inner })
+        crate::__model_input_result!(
+            Ok(Self { inner }),
+            "core-llm::tokenizer::Tokenizer::from_file",
+            Tokenizer,
+            &[path]
+        )
     }
 
     /// Load from an in-memory `tokenizer.json` string.
@@ -153,7 +158,12 @@ impl Tokenizer {
                 "merges": merges,
             },
         });
-        Self::from_json(&document.to_string())
+        crate::__model_input_result!(
+            Self::from_json(&document.to_string()),
+            "core-llm::tokenizer::Tokenizer::from_hf_byte_level_bpe",
+            Tokenizer,
+            &[vocab_path, merges_path, tokenizer_config_path]
+        )
     }
 
     /// Encode `text` to token ids. `add_special_tokens` controls auto BOS/EOS per the tokenizer's

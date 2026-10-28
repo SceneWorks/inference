@@ -135,4 +135,7 @@ fn registered_tier_matches_independent_oracle_and_vram_budget() {
         "{tier}: measured physical peak {:.2} GB exceeds SceneWorks gate row {max_peak_gb:.2} GB",
         report.peak_gb
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_real_weights::registered_tier_matches_independent_oracle_and_vram_budget");
 }

@@ -441,4 +441,6 @@ fn record_mlx_decode_for_the_candle_cross_backend_gate() {
         metadata["audio_fixture_fnv1a64"],
     );
     assert!(written > 1024, "the record is implausibly small");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED cross_backend_record::record_mlx_decode_for_the_candle_cross_backend_gate");
 }

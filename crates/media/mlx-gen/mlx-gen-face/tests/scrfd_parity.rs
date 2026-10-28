@@ -102,4 +102,6 @@ fn scrfd_network_and_detect_parity() {
         max_kps_l2 < 1.0,
         "kps L2 vs insightface too high: {max_kps_l2}px"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED scrfd_parity::scrfd_network_and_detect_parity");
 }

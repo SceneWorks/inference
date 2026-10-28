@@ -1,4 +1,5 @@
 import re
+import copy
 import unittest
 from pathlib import Path
 
@@ -6,6 +7,9 @@ import yaml
 
 from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
 from scripts.release.resolve_snapshot_paths import resolve
+from scripts.tests.test_manual_model_workflow_relocation import (
+    STEP_DIGESTS, REPAIRED_H3_STEP_DIGESTS, digest,
+)
 
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/real-weights.yml"
@@ -287,6 +291,67 @@ PRESERVED_LOCAL_SNAPSHOT_MARKERS = (
 )
 
 
+# Reuse the source-preservation receipts for committed-fixture execution. These
+# are command contracts, independent of job names: an added snapshot reader or
+# changed controller no longer matches and must select a provisioned weight set.
+FIXTURE_ROUTES = {
+    ('macOS', STEP_DIGESTS['moss-edit-metal']):
+        "github.event_name == 'workflow_dispatch' && inputs.profile == 'moss-edit-metal'",
+    ('windows', STEP_DIGESTS['moss-edit-cuda']):
+        "github.event_name == 'workflow_dispatch' && inputs.profile == 'moss-edit-cuda'",
+    ('windows', REPAIRED_H3_STEP_DIGESTS['synthetic-w4a8-cuda']):
+        "github.event_name == 'workflow_dispatch' && (inputs.profile == 'synthetic-w4a8-cuda' || inputs.profile == 'synthetic-w4a8-both')",
+}
+
+
+def committed_fixture_route(job, platform):
+    steps = copy.deepcopy(job.get('steps', []))
+    if platform == 'macOS':
+        # The relocation receipt predates the reviewed python3.12 spelling.
+        # Match that receipt only after rejecting the unpinned old interpreter.
+        for step in steps:
+            command = step.get('run', '')
+            if re.search(r'\bpython3\s', command):
+                return False
+            if 'run' in step:
+                step['run'] = command.replace('python3.12 ', 'python3 ')
+    expected = FIXTURE_ROUTES.get((platform, digest(steps)))
+    return expected is not None and job.get('if') == expected
+
+
+def primary_cpu_cache_route_errors(job):
+    """The pinned CPU converter consumes the primary cache, not an rw-* set."""
+    errors = []
+    if job.get('runs-on') != ['self-hosted', 'macOS', 'ARM64', 'nax', 'real-weights']:
+        errors.append('CPU cache conversion must select the primary Mac capability set')
+    if job.get('if') != "github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-prequant'":
+        errors.append('CPU cache conversion must remain explicitly dispatched')
+    steps = job.get('steps', [])
+    guards = [i for i, step in enumerate(steps)
+              if '[[ "$RUNNER_NAME" == nax-macos ]]' in step.get('run', '')]
+    checkouts = [i for i, step in enumerate(steps) if 'checkout@' in step.get('uses', '')]
+    if len(guards) != 1 or not checkouts or guards[0] >= min(checkouts):
+        errors.append('primary cache identity must be checked before checkout')
+    if job.get('env', {}).get('IOS_PREQUANT_BINDING') != '${{ inputs.ios_pricing_compile_binding }}':
+        errors.append('CPU conversion lost its frozen source/route binding')
+    return errors
+
+
+def cuda_weight_route_errors(workflow):
+    errors = []
+    for name, job in workflow['jobs'].items():
+        labels = job.get('runs-on') or []
+        fixture = committed_fixture_route(job, 'windows')
+        if not fixture and 'windows' not in [label.lower() for label in labels]:
+            continue
+        if fixture:
+            if labels != ['self-hosted', 'windows', 'cuda']:
+                errors.append(f'{name} changed its committed-fixture CUDA pool selector')
+        elif 'real-weights' not in labels:
+            errors.append(f'{name} requires provisioned snapshots or a reviewed committed-fixture route')
+    return errors
+
+
 def weight_set_label_errors(workflow: dict) -> list[str]:
     """Return weight-set routing violations, including drift in the one local exception."""
     errors: list[str] = []
@@ -294,6 +359,9 @@ def weight_set_label_errors(workflow: dict) -> list[str]:
         name: job
         for name, job in workflow["jobs"].items()
         if "macOS" in (job.get("runs-on") or [])
+        or committed_fixture_route(job, 'macOS')
+        or any(step.get('run', '').strip() == 'python3.12 -I scripts/ci/ios_prequant.py'
+               for step in job.get('steps', []))
     }
     if not macos:
         return ["found no macOS jobs — the label scheme moved"]
@@ -336,6 +404,14 @@ def weight_set_label_errors(workflow: dict) -> list[str]:
                     errors.append(f"{name} no longer binds preserved snapshot {marker}")
             continue
 
+        if any(step.get('run', '').strip() == 'python3.12 -I scripts/ci/ios_prequant.py'
+               for step in job.get('steps', [])):
+            errors.extend(f'{name}: {error}' for error in primary_cpu_cache_route_errors(job))
+            continue
+        if committed_fixture_route(job, 'macOS'):
+            if runs_on != ['self-hosted', 'macOS', 'ARM64', 'nax']:
+                errors.append(f'{name} changed its snapshot-free NAX fixture route')
+            continue
         selected = KNOWN_WEIGHT_SET_LABELS.intersection(runs_on)
         if len(selected) != 1:
             errors.append(f"{name} selects {sorted(selected) or 'no'} weight-set label")
@@ -347,12 +423,11 @@ def weight_set_label_errors(workflow: dict) -> list[str]:
 
 
 class WeightSetLabelTests(unittest.TestCase):
-    """Every macOS job selects one weight set or the exact preserved-snapshot route.
+    """Snapshot jobs select their weight set; other routes prove their asset contract.
 
-    A job left on the old shared `real-weights` label is the failure this guards: that label no
-    longer identifies a generally schedulable macOS weight set, so an ordinary lane can queue
-    silently until someone cancels it. The one exception is a dispatch-only recovery campaign
-    pinned to a named runner and exact frozen paths; the mutation test keeps it from widening.
+    Snapshot lanes must identify their provisioned set. Primary-cache conversion
+    instead proves its exact host, frozen source and dispatch contract. Committed
+    fixtures prove the reviewed commands without requiring a shared snapshot set.
     """
 
     def setUp(self) -> None:
@@ -442,11 +517,58 @@ class WeightSetLabelTests(unittest.TestCase):
         self.assertTrue(weight_set_label_errors(workflow), "copied expression")
 
     def test_the_cuda_pool_keeps_its_shared_label(self) -> None:
-        """Both Windows boxes share `real-weights` and already load-balance; do not split them."""
-        windows = [j for j in self.workflow["jobs"].values() if "windows" in (j.get("runs-on") or [])]
-        self.assertTrue(windows)
-        for job in windows:
-            self.assertIn("real-weights", job["runs-on"])
+        """Snapshot jobs use the provisioned pair; committed fixtures may use all four."""
+        self.assertEqual(cuda_weight_route_errors(self.workflow), [])
+        for name in ('moss-edit-cuda', 'synthetic-w4a8-cuda'):
+            for mutation in ('snapshot reader', 'dispatch widened', 'cuda removed', 'platform removed'):
+                workflow = copy.deepcopy(self.workflow)
+                job = workflow['jobs'][name]
+                if mutation == 'snapshot reader':
+                    job['steps'].append({'run': 'python read_snapshot.py --root E:/huggingface/hub'})
+                elif mutation == 'dispatch widened':
+                    job['if'] = "github.event_name == 'workflow_dispatch'"
+                else:
+                    job['runs-on'].remove('cuda' if mutation == 'cuda removed' else 'windows')
+                self.assertTrue(cuda_weight_route_errors(workflow), (name, mutation))
+        workflow = copy.deepcopy(self.workflow)
+        snapshot_job = next(job for job in workflow['jobs'].values()
+                            if 'windows' in (job.get('runs-on') or [])
+                            and 'real-weights' in job['runs-on'])
+        snapshot_job['runs-on'].remove('real-weights')
+        self.assertTrue(cuda_weight_route_errors(workflow))
+
+    def test_primary_cache_and_snapshot_free_routes_discriminate_mutations(self):
+        for name in ('ios-prequant', 'moss-edit-metal'):
+            for mutation in ('identity', 'platform', 'command', 'dispatch'):
+                workflow = copy.deepcopy(self.workflow)
+                job = workflow['jobs'][name]
+                if mutation == 'identity':
+                    job['runs-on'].remove('nax')
+                elif mutation == 'platform':
+                    job['runs-on'].remove('macOS')
+                elif mutation == 'command':
+                    if name == 'ios-prequant':
+                        job['steps'][0]['run'] = 'true'
+                    else:
+                        job['steps'].append({'run': 'python read_snapshot.py'})
+                else:
+                    job['if'] = "github.event_name == 'workflow_dispatch'"
+                self.assertTrue(weight_set_label_errors(workflow), (name, mutation))
+        # A copied name cannot grant permission; identical source-bound commands
+        # retain the same asset requirements under a different name.
+        workflow = copy.deepcopy(self.workflow)
+        workflow['jobs']['renamed-fixture-route'] = workflow['jobs'].pop('moss-edit-metal')
+        self.assertEqual(weight_set_label_errors(workflow), [])
+        source = (WORKFLOW.parents[2] / 'scripts/ci/ios_prequant.py').read_text(encoding='utf-8')
+        for marker in ('Path.home() / ".cache/huggingface/hub"',
+                       'os.environ.get("RUNNER_NAME") != "nax-macos"',
+                       'binding["source_sha"]', 'input_headers(name, source)',
+                       'admit_memory(', 'run_guarded(', 'metal_trap_required'):
+            self.assertIn(marker, source)
+        metal = (WORKFLOW.parents[2] / 'scripts/ci/moss_edit_metal.py').read_text(encoding='utf-8')
+        for marker in ("HF_HUB_OFFLINE='1'", "HF_HOME=str(out / 'hf')",
+                       "'--exact', '--ignored'", 'frozen_edit_oracle_on_metal'):
+            self.assertIn(marker, metal)
 
 
 if __name__ == "__main__":

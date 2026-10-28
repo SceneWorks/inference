@@ -82,13 +82,21 @@ fn run_conformance(tag: &str, make: fn(&Path) -> Vec<TrainingItem>) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn qwen_image_2_1_trainer_satisfies_gen_core_contract() {
     run_conformance("t2i", make_dataset);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_conformance::qwen_image_2_1_trainer_satisfies_gen_core_contract");
 }
 
 /// sc-24162: the same contract over an instruction-edit dataset, with the trainer's cap > 0 — the
 /// completed run, its progress and its cancellation go through the edit path.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn qwen_image_2_1_edit_trainer_satisfies_gen_core_contract() {
     run_conformance("edit", make_edit_dataset);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_conformance::qwen_image_2_1_edit_trainer_satisfies_gen_core_contract");
 }

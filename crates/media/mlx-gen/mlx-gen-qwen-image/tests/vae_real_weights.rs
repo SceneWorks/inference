@@ -49,6 +49,8 @@ fn vae_decode_matches_fork_golden() {
     // bound tolerates the few image-border pixels that diverge in f32 after upsample+conv.
     assert!(mean < 2e-3, "VAE decode mean-rel regressed: {mean:.3e}");
     assert!(peak < 1.5e-2, "VAE decode peak-rel regressed: {peak:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_real_weights::vae_decode_matches_fork_golden");
 }
 
 /// SC-18309 N1 hardware gate: the native Qwen trait entry is exactly the former direct VAE call.
@@ -89,6 +91,8 @@ fn native_decode_seam_is_byte_exact_and_precancelled() {
             Err(Error::Canceled)
         ));
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_real_weights::native_decode_seam_is_byte_exact_and_precancelled");
 }
 
 #[test]
@@ -103,4 +107,6 @@ fn vae_encode_matches_fork_golden() {
     println!("VAE encode: peak-rel = {peak:.3e}, mean-rel = {mean:.3e}");
     assert!(mean < 2e-3, "VAE encode mean-rel regressed: {mean:.3e}");
     assert!(peak < 5e-3, "VAE encode peak-rel regressed: {peak:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_real_weights::vae_encode_matches_fork_golden");
 }

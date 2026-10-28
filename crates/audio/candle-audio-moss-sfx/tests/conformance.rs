@@ -14,6 +14,16 @@
 //! `moss_sfx_wav_conformance` also writes the synthesized WAV next to the test output
 //! (`MOSS_SFX_WAV_OUT` overrides the path) so a human can listen to the evidence.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_moss_sfx::candle_audio;
@@ -63,6 +73,9 @@ fn moss_sfx_conformance() {
         },
         &profile,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_sfx_conformance");
 }
 
 /// The real-WAV DoD: fixed prompt + seed + duration → non-empty, 48 kHz, mono, finite,
@@ -113,7 +126,10 @@ fn moss_sfx_wav_conformance() {
         .generate(&req, &mut |p| match p {
             Progress::Step { .. } => steps += 1,
             Progress::Decoding => decoding += 1,
-            Progress::Loading(_) => {}
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .expect("generate");
     assert_eq!(steps, STEPS);
@@ -273,6 +289,9 @@ fn moss_sfx_wav_conformance() {
         track.samples, track2.samples,
         "seeded synthesis must be deterministic"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_sfx_wav_conformance");
 }
 
 /// The **default sampler path** must produce audible audio.
@@ -353,4 +372,7 @@ fn moss_sfx_default_steps_produce_audible_audio() {
          peak-normalizing consumer would amplify it into full-scale noise",
         candle_audio_moss_sfx::pipeline::DEFAULT_STEPS
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_sfx_default_steps_produce_audible_audio");
 }

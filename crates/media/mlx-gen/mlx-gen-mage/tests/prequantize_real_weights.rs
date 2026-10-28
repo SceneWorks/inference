@@ -166,6 +166,8 @@ fn a_packed_tier_renders_identically_to_load_time_quantization() {
         "a pre-quantized q4 tier must be BIT-IDENTICAL to load-time q4 quantization \
          (quantize_map runs the same op); got max_abs {max_abs}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prequantize_real_weights::a_packed_tier_renders_identically_to_load_time_quantization");
 }
 
 /// The packed tier must arrive already packed — the whole point is skipping the dense read. If
@@ -201,6 +203,8 @@ fn a_packed_tier_is_packed_on_arrival_and_needs_no_load_time_quantization() {
         253,
         "all 253 text-encoder projections arrive packed from disk"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prequantize_real_weights::a_packed_tier_is_packed_on_arrival_and_needs_no_load_time_quantization");
 }
 
 /// Serving a Q4 request from a Q8 artifact (or vice versa) must fail loudly. `quantize` is a no-op
@@ -212,6 +216,7 @@ fn a_tier_mismatch_is_a_hard_error_not_a_silent_downgrade() {
     let (tiers, components) = ensure_trees();
     let Ok(q8) = std::fs::metadata(tiers.join("q8")) else {
         eprintln!("skipping: no q8 tier built (set MAGE_TIER_ROOT to a full tree)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in a_tier_mismatch_is_a_hard_error_not_a_silent_downgrade; see preceding skip diagnostic");
         return;
     };
     assert!(q8.is_dir());
@@ -227,6 +232,8 @@ fn a_tier_mismatch_is_a_hard_error_not_a_silent_downgrade() {
         message.contains("Q8") && message.contains("Q4"),
         "the mismatch must name both tiers; got {message}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prequantize_real_weights::a_tier_mismatch_is_a_hard_error_not_a_silent_downgrade");
 }
 
 /// The bf16 tier is a byte-exact passthrough of the dense DiT, so the checkpoint-identity

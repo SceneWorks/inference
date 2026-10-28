@@ -182,6 +182,7 @@ fn assert_bit_exact(actual: &Array, expected: &Array, context: &str) {
 }
 
 /// A production block forward takes the retained and fused arms, and returns identical tensors.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_production_block_forward_reaches_retention_and_exact_epilogues() {
     let tmp = tempfile::tempdir().unwrap();
@@ -299,4 +300,6 @@ fn a_production_block_forward_reaches_retention_and_exact_epilogues() {
             &format!("hidden_states, forward {index}"),
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED production_capability_reach::a_production_block_forward_reaches_retention_and_exact_epilogues");
 }

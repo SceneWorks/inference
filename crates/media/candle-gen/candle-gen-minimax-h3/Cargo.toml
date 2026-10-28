@@ -41,6 +41,7 @@ rand = { workspace = true }
 serde_json = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen-boogu/model-inference-proof", "candle-gen/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]

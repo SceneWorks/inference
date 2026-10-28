@@ -456,7 +456,7 @@ impl Generator {
         check_cancel(cancel)?;
         // F.leaky_relu's default slope (0.01) — distinct from the 0.1 used inside the loop.
         let x = ops::leaky_relu(&x, 0.01)?;
-        let x = self.conv_post.forward(&x)?; // [1, n_fft + 2, Fr]
+        let x = __model_proof_output!(self.conv_post.forward(&x))?; // [1, n_fft + 2, Fr]
         check_cancel(cancel)?;
         let frames = x.dim(2)?;
         let spec = x
@@ -534,12 +534,12 @@ impl Decoder {
         let device = asr.device();
         let f0_t = Tensor::from_slice(f0_curve, (1, 1, f0_curve.len()), device)?;
         let n_t = Tensor::from_slice(n_curve, (1, 1, n_curve.len()), device)?;
-        let f0_down = self.f0_conv.forward(&f0_t)?; // [1, 1, F]
-        let n_down = self.n_conv.forward(&n_t)?;
+        let f0_down = __model_proof_output!(self.f0_conv.forward(&f0_t))?; // [1, 1, F]
+        let n_down = __model_proof_output!(self.n_conv.forward(&n_t))?;
         let mut x = Tensor::cat(&[asr, &f0_down, &n_down], 1)?;
         x = self.encode.forward(&x, s)?;
         check_cancel(cancel)?;
-        let asr_res = self.asr_res.forward(asr)?; // [1, 64, F]
+        let asr_res = __model_proof_output!(self.asr_res.forward(asr))?; // [1, 64, F]
         let mut res = true;
         for (i, block) in self.decode.iter().enumerate() {
             if res {

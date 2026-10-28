@@ -157,6 +157,7 @@ fn probe_ids(cfg: &MiniMaxH3TeConfig) -> (Array, Array) {
 ///
 /// Bit-identical forwards is the bar. A predicate that missed `.embed_tokens`, or picked up
 /// `.q_norm`, or packed at a different width, moves the output.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn converter_pack_matches_the_encoders_own_quantize() {
     let cfg = tiny_config();
@@ -193,12 +194,15 @@ fn converter_pack_matches_the_encoders_own_quantize() {
             "q{bits}: the converter left the token table dense"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_policy::converter_pack_matches_the_encoders_own_quantize");
 }
 
 /// Quantization must actually change the conditioning, or the equality above proves nothing.
 ///
 /// Also pins the direction of the tier ladder: q8 is closer to dense than q4 is. Relative
 /// max-abs-diff against the dense context, which is the same gate `quant_tiers_real.rs` uses.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn packing_moves_the_context_and_q8_moves_it_less_than_q4() {
     let cfg = tiny_config();
@@ -229,10 +233,13 @@ fn packing_moves_the_context_and_q8_moves_it_less_than_q4() {
         q8 < q4,
         "q8 relative max-abs-diff {q8} must be under q4's {q4}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_policy::packing_moves_the_context_and_q8_moves_it_less_than_q4");
 }
 
 /// The trim survives packing: a packed tier still loads only `select_hidden` layers, and the
 /// unloaded tail's presence or absence in the map cannot change the context.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_packed_tier_still_loads_only_the_selected_layers() {
     let cfg = tiny_config();
@@ -259,6 +266,8 @@ fn a_packed_tier_still_loads_only_the_selected_layers() {
         ),
         0.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_policy::a_packed_tier_still_loads_only_the_selected_layers");
 }
 
 /// A tier assembled at two widths is a mis-built artifact, and reporting the first layer's width

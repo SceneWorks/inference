@@ -57,6 +57,7 @@ sceneworks-gen-core-testkit = { workspace = true }
 sha2 = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen-flux2/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "candle-llm/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-gen-pid/metal", "candle-gen-perceptual/metal", "candle-llm/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-gen-pid/cuda", "candle-gen-perceptual/cuda", "candle-llm/cuda"]

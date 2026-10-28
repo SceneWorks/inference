@@ -39,6 +39,7 @@ fn load(name: &str) -> Weights {
 
 use common::max_abs;
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn batched_b2_forward_bit_identical_to_two_b1_forwards() {
     let w = load("s5_low.safetensors");
@@ -73,4 +74,6 @@ fn batched_b2_forward_bit_identical_to_two_b1_forwards() {
     // Bit-exact: stacking the branches on the batch axis must not perturb either output.
     assert_eq!(cond_d, 0.0, "cond branch diverged under batching");
     assert_eq!(uncond_d, 0.0, "uncond branch diverged under batching");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED batched_forward::batched_b2_forward_bit_identical_to_two_b1_forwards");
 }

@@ -59,6 +59,7 @@ fn stream(w: &Weights, name: &str) -> StreamState {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn mar_loop_matches_reference_f32() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
@@ -166,4 +167,6 @@ fn mar_loop_matches_reference_f32() {
         w.require("out.wotxt_wovit").unwrap(),
         1e-2,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED mar_parity::mar_loop_matches_reference_f32");
 }

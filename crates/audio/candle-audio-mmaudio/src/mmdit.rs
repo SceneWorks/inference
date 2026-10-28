@@ -269,7 +269,7 @@ impl ChannelLastConv1d {
     fn forward(&self, x: &Tensor) -> CResult<Tensor> {
         // (B, L, C) -> (B, C, L) -> conv -> (B, C', L) -> (B, L, C')
         let x = x.transpose(1, 2)?.contiguous()?;
-        let x = self.conv.forward(&x)?;
+        let x = __model_proof_output!(self.conv.forward(&x))?;
         x.transpose(1, 2)?.contiguous()
     }
 }
@@ -291,9 +291,9 @@ impl Mlp {
         })
     }
     fn forward(&self, x: &Tensor) -> CResult<Tensor> {
-        let a = silu(&self.w1.forward(x)?)?;
-        let b = self.w3.forward(x)?;
-        self.w2.forward(&(a * b)?)
+        let a = silu(&__model_proof_output!(self.w1.forward(x))?)?;
+        let b = __model_proof_output!(self.w3.forward(x))?;
+        __model_proof_output!(self.w2.forward(&(a * b)?))
     }
 }
 
@@ -434,8 +434,8 @@ impl Attention {
         let (b, n, _d) = x.dims3()?;
         let h = self.num_heads;
         let hd = self.head_dim;
-        let qkv = self.qkv.forward(x)?; // (B, N, 3D)
-                                        // reference `b n (h d j) -> b h n d j` with j=3: layout is [head, dim, {q,k,v}].
+        let qkv = __model_proof_output!(self.qkv.forward(x))?; // (B, N, 3D)
+                                                               // reference `b n (h d j) -> b h n d j` with j=3: layout is [head, dim, {q,k,v}].
         let qkv = qkv.reshape((b, n, h, hd, 3))?;
         let take = |idx: usize| -> CResult<Tensor> {
             qkv.narrow(4, idx, 1)? // (B,N,H,hd,1)
@@ -488,7 +488,7 @@ impl AdaLn {
     }
     /// `c`: `(B, 1, D)` (global) or `(B, N, D)` (frame-aligned) → `chunks` tensors of the same rank.
     fn forward(&self, c: &Tensor) -> CResult<Vec<Tensor>> {
-        let m = self.linear.forward(&silu(c)?)?; // (..., chunks*D)
+        let m = __model_proof_output!(self.linear.forward(&silu(c)?))?; // (..., chunks*D)
         let dim = m.dim(D::Minus1)? / self.chunks;
         (0..self.chunks)
             .map(|i| m.narrow(D::Minus1, i * dim, dim))
@@ -717,8 +717,8 @@ impl TimestepEmbedder {
             .reshape((b, 1))?
             .broadcast_mul(&self.freqs.reshape((1, half))?)?;
         let emb = Tensor::cat(&[&args.cos()?, &args.sin()?], D::Minus1)?; // (B, freq_embed_size)
-        let x = self.fc1.forward(&emb)?;
-        self.fc2.forward(&silu(&x)?)
+        let x = __model_proof_output!(self.fc1.forward(&emb))?;
+        __model_proof_output!(self.fc2.forward(&silu(&x)?))
     }
 }
 
@@ -924,7 +924,7 @@ impl MmAudioDit {
     }
     fn clip_input_proj(&self, x: &Tensor) -> CResult<Tensor> {
         // v1: Linear then ConvMLP, no activation between. v2: Linear → SiLU → ConvMLP.
-        let x = self.clip_in_lin.forward(x)?;
+        let x = __model_proof_output!(self.clip_in_lin.forward(x))?;
         let x = if self.cfg.v2 { silu(&x)? } else { x };
         self.clip_in_ffn.forward(&x)
     }
@@ -934,7 +934,7 @@ impl MmAudioDit {
     }
     fn text_input_proj(&self, x: &Tensor) -> CResult<Tensor> {
         // v1: Linear then MLP, no activation between. v2: Linear → SiLU → MLP.
-        let x = self.text_in_lin.forward(x)?;
+        let x = __model_proof_output!(self.text_in_lin.forward(x))?;
         let x = if self.cfg.v2 { silu(&x)? } else { x };
         self.text_in_ffn.forward(&x)
     }
@@ -961,8 +961,8 @@ impl MmAudioDit {
         // nearest-exact upsample sync along the token axis: gather (B, latent_seq_len, D).
         let sync_f = sync_f.index_select(&self.sync_up_idx, 1)?;
 
-        let clip_f_c = self.clip_cond_proj.forward(&clip_f.mean(1)?)?;
-        let text_f_c = self.text_cond_proj.forward(&text_f.mean(1)?)?;
+        let clip_f_c = __model_proof_output!(self.clip_cond_proj.forward(&clip_f.mean(1)?))?;
+        let text_f_c = __model_proof_output!(self.text_cond_proj.forward(&text_f.mean(1)?))?;
         Ok(Conditions {
             clip_f,
             sync_f,

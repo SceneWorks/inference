@@ -14,6 +14,15 @@
 //! crop explicitly (candle's Conv2D backward breaks on unequal H/W remainders), resamples are
 //! index-selects, so the gradient reaches the decoded pixels and through them the adapter.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod hybrik;
 pub mod sapiens;
 pub mod vitpose;

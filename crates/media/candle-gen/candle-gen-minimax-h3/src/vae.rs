@@ -268,7 +268,12 @@ impl MiniMaxH3VideoVae {
                 dir.display()
             )));
         }
-        Ok(vae)
+        candle_gen::gen_core::__model_input_result!(
+            Ok(vae),
+            "candle-gen-minimax-h3::vae::MiniMaxH3VideoVae::load/configuration",
+            Configuration,
+            &[&config_path]
+        )
     }
 
     /// Load **only the decode half** from a snapshot root.
@@ -292,7 +297,12 @@ impl MiniMaxH3VideoVae {
         let files = sorted_safetensors(&dir, "minimax-h3 vae")?;
         let w =
             Weights::from_files_filtered(&files, device, dtype, &["decoder.", "post_quant_conv."])?;
-        Self::from_weights(&w, &cfg, device, dtype)
+        candle_gen::gen_core::__model_input_result!(
+            Self::from_weights(&w, &cfg, device, dtype),
+            "candle-gen-minimax-h3::vae::MiniMaxH3VideoVae::load_decode_only/configuration",
+            Configuration,
+            &[&config_path]
+        )
     }
 
     /// The config in force.
@@ -615,7 +625,7 @@ impl MiniMaxH3VideoVae {
         let z = z.to_dtype(self.dtype)?;
         // Pointwise channel map in NDHWC, then back to NCTHW for the decoder's own packing.
         let nhwc = z.permute((0, 2, 3, 4, 1))?.contiguous()?;
-        let mapped = linear(&nhwc, &self.post_quant_w, &self.post_quant_b)?;
+        let mapped = __model_proof_output!(linear(&nhwc, &self.post_quant_w, &self.post_quant_b))?;
         let z2 = mapped.permute((0, 4, 1, 2, 3))?.contiguous()?;
         self.decoder.forward(&z2)
     }

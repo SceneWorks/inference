@@ -114,7 +114,7 @@ impl ConvRotLinear {
                 self.rotation.get_or_init(|| rotation)
             };
             let rotated = shared::convrot_rotate(x, rotation)?;
-            self.linear.forward(&rotated)
+            __model_proof_output!(self.linear.forward(&rotated))
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -131,9 +131,9 @@ impl QLinear {
     /// shared [`LoraLinear`].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let output = match &self.base {
-            QLinearBase::Adapt(linear) => linear.forward(x),
-            QLinearBase::ConvRot(linear) => linear.forward(x),
-            QLinearBase::Nvfp4(linear) => linear.forward(x),
+            QLinearBase::Adapt(linear) => __model_proof_output!(linear.forward(x)),
+            QLinearBase::ConvRot(linear) => __model_proof_output!(linear.forward(x)),
+            QLinearBase::Nvfp4(linear) => __model_proof_output!(linear.forward(x)),
         }?;
         record_projection_execution(
             self.path.clone(),
@@ -431,7 +431,7 @@ impl QEmbedding {
     /// / any consumer that prefers the wrapped forward).
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         let hidden = self.table.dim(1)?;
-        Embedding::new(self.table.clone(), hidden).forward(indexes)
+        __model_proof_output!(Embedding::new(self.table.clone(), hidden).forward(indexes))
     }
 
     /// Whether the table loaded from the MLX-packed tier (vs a dense `{key}.weight`).
@@ -556,6 +556,7 @@ mod tests {
     /// silent dense fallback), the dense gate must stay dense, and the packed forward must match the
     /// affine grid the pack represents (bit-exact repack + dequant-on-forward).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn qlinear_packed_detect_on_avdit_key_layout() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -649,6 +650,8 @@ mod tests {
             .to_scalar::<f32>()?;
         assert_eq!(zero_diff, 0.0, "scale=0 must equal the packed base");
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::qlinear_packed_detect_on_avdit_key_layout");
         Ok(())
     }
 
@@ -656,6 +659,7 @@ mod tests {
     /// [+ `.bias`] at the vb dtype) — a dense checkpoint (no `.scales` anywhere) loads every leaf dense,
     /// unchanged. Confirms the current single-file LTX checkpoint path is untouched.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn qlinear_dense_path_unchanged() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -685,7 +689,7 @@ mod tests {
         let output = lin.forward(&x)?;
         let after_forward = crate::advanced_quant::finish_operator_attestation()?;
         assert_eq!(after_forward.executed_projection_count, 1);
-        let dev_max = (output.sub(&ref_lin.forward(&x)?)?)
+        let dev_max = (output.sub(&__model_proof_output!(ref_lin.forward(&x))?)?)
             .abs()?
             .max_all()?
             .to_scalar::<f32>()?;
@@ -694,6 +698,8 @@ mod tests {
             "dense arm deviates from the legacy linear read"
         );
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::qlinear_dense_path_unchanged");
         Ok(())
     }
 
@@ -701,6 +707,7 @@ mod tests {
     /// double-quantized (the LTX seam relies on the shared idempotence when composing loads). The stored
     /// `Q4_1` weight and the forward stay unchanged.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_quantize_is_noop() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
@@ -713,6 +720,8 @@ mod tests {
         let after = packed.forward(&x)?;
         let dev_max = (before.sub(&after)?).abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "no-op quantize changed the packed forward");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_quantize_is_noop");
         Ok(())
     }
 

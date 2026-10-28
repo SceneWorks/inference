@@ -85,4 +85,6 @@ fn clip_parity_tiny_seeded() {
         cos > 0.9999,
         "clip cosine {cos} below 0.9999 (max|Δ| {max_abs})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED clip_parity::clip_parity_tiny_seeded");
 }

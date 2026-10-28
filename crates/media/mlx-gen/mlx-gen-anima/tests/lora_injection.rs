@@ -301,7 +301,7 @@ fn lokr_loads_and_applies_to_dit_and_conditioner() {
 }
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots"]
 fn stacked_lora_plus_lokr_mixed() {
     let tmp = tempfile::tempdir().unwrap();
     // Apply the turbo LoRA (508 targets) AND the synthetic LoKr (2 targets) in one strict call.
@@ -326,6 +326,9 @@ fn stacked_lora_plus_lokr_mixed() {
     // A forward runs (both residuals compose over the shared base).
     let x = randn(&[1, 8, 2048]);
     assert_eq!(lin.forward(&x).unwrap().shape(), &[1, 8, 2048]);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED lora_injection::stacked_lora_plus_lokr_mixed");
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -344,7 +347,7 @@ fn grayscale_std(pixels: &[u8]) -> f32 {
 }
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots; SLOW (2B DiT denoise)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots; SLOW (2B DiT denoise)"]
 fn base_plus_turbo_lora_generates_coherent_image() {
     use mlx_gen::runtime::CancelFlag;
     use mlx_gen::Progress;
@@ -387,4 +390,7 @@ fn base_plus_turbo_lora_generates_coherent_image() {
         std > 8.0,
         "base+turbo-LoRA output is near-blank (std {std:.2}) — injection likely broken"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED lora_injection::base_plus_turbo_lora_generates_coherent_image");
 }

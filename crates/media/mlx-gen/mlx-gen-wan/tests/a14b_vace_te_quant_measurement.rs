@@ -124,4 +124,6 @@ fn a14b_and_vace_fun_q8_te_are_small_and_near_lossless() {
         "WANVACE_FUN_DIR must be a VACE-Fun A14B snapshot"
     );
     measure("Wan2.2 VACE-Fun A14B", &vace, &vace_cfg.base);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED a14b_vace_te_quant_measurement::a14b_and_vace_fun_q8_te_are_small_and_near_lossless");
 }

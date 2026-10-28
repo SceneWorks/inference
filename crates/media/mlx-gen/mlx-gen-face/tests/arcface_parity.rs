@@ -64,4 +64,6 @@ fn arcface_cosine_parity() {
         min_cos >= 0.9999,
         "ArcFace embedding cosine {min_cos:.8} < 0.9999 vs glintr100 onnx (max abs {max_abs:.6})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED arcface_parity::arcface_cosine_parity");
 }

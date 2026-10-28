@@ -633,6 +633,9 @@ fn run(req: &GenerationRequest, expected_chunks: usize, label: &str) -> RunResul
                 phase_peaks.push(("after the AR denoise loop", a, t));
             }
             Progress::Loading(phase) => println!("  {label}: loading {phase:?}"),
+            Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .unwrap_or_else(|e| panic!("{label}: generate must succeed: {e}"));
     let total = t0.elapsed();
@@ -2428,6 +2431,8 @@ fn sc20684_packed_campaign_observer() {
         "SC20684_KREA_PROVIDER_OBSERVATION {}",
         serde_json::to_string(&observation).expect("serialize SC-20684 observation")
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_smoke::sc20684_packed_campaign_observer");
 }
 
 /// **The S13 product-path run:** timing, memory, and the *structural* coherence floor.
@@ -2691,6 +2696,10 @@ fn v2v_strength_zero_preserves_the_source() {
     );
     assert!(b > 0.0, "B is exactly zero — the clips are the same object");
     assert_coherent(&r.frames, w, h, "v2v/strength=0");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED generate_smoke::v2v_strength_zero_preserves_the_source"
+    );
 }
 
 /// **sc-15325 real-weight regression guard — the new policy reaches single-pass quality at the OLD
@@ -2902,6 +2911,8 @@ fn decode_policy_matches_single_pass_at_the_old_memory_peak() {
          model is under-predicting and `mlx.minMemoryGb` cannot be trusted",
         gib(new_peak)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_smoke::decode_policy_matches_single_pass_at_the_old_memory_peak");
 }
 
 /// **sc-15325 root cause: decode the SAME real t2v latents single-pass vs. every tiling candidate.**
@@ -3258,6 +3269,10 @@ fn decode_tiling_sweep_against_single_pass() {
         "the product decode plan is {d_product:.2}/255 from single-pass (old window: {d_old:.2}) — \
          sc-15325 has regressed"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED generate_smoke::decode_tiling_sweep_against_single_pass"
+    );
 }
 
 /// Highlight-clipping statistics, returned rather than printed: `(mean %, worst-frame %)` of pixels
@@ -3455,6 +3470,8 @@ fn v2v_strength_zero_is_latent_identity() {
          zero-strength schedule is NOT an identity on the latents",
         100.0 * mean_abs / src_scale
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_smoke::v2v_strength_zero_is_latent_identity");
 }
 
 /// **Measured KV-cache residency at the production geometry, per storage tier.** The self-attention
@@ -4929,6 +4946,8 @@ fn long_clip_coherence_under_the_bounded_window() {
              generate_smoke::s18_verdict_from_accumulated_cells --exact --ignored --nocapture`)"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_smoke::long_clip_coherence_under_the_bounded_window");
 }
 
 /// **Re-aggregate a piecewise S18 sweep and apply the verdict rule to it.**

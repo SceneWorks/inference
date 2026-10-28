@@ -25,6 +25,15 @@
 //! decode is memory-bounded: the temporal axis streams per-frame ([`vae::WanVae::decode`]) and a
 //! budgeted **spatial** tiler ([`vae::WanVae::decode_budgeted`], sc-7111) caps high-resolution VRAM.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapters;
 pub mod candle_tier_build;
 // ComfyUI single-file Wan2.2 expert → in-memory remap+dequant seam (epic 10451 Phase 2c, sc-10671):

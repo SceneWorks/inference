@@ -181,28 +181,37 @@ fn spec_or_skip(test: &str) -> Option<LoadSpec> {
 }
 
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image base snapshot + Z-Image-Fun-Controlnet-Union-2.1 control ckpt"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image base snapshot + Z-Image-Fun-Controlnet-Union-2.1 control ckpt"]
 fn base_control_pose_steers_render() {
     let Some(spec) = spec_or_skip("base_control_pose_steers_render") else {
         return;
     };
     steering_run(&spec, ControlKind::Pose, "pose");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED base_control_real_weights::base_control_pose_steers_render");
 }
 
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image base snapshot + Z-Image-Fun-Controlnet-Union-2.1 control ckpt"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image base snapshot + Z-Image-Fun-Controlnet-Union-2.1 control ckpt"]
 fn base_control_canny_steers_render() {
     let Some(spec) = spec_or_skip("base_control_canny_steers_render") else {
         return;
     };
     steering_run(&spec, ControlKind::Canny, "canny");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED base_control_real_weights::base_control_canny_steers_render");
 }
 
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image base snapshot + Z-Image-Fun-Controlnet-Union-2.1 control ckpt"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image base snapshot + Z-Image-Fun-Controlnet-Union-2.1 control ckpt"]
 fn base_control_depth_steers_render() {
     let Some(spec) = spec_or_skip("base_control_depth_steers_render") else {
         return;
     };
     steering_run(&spec, ControlKind::Depth, "depth");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED base_control_real_weights::base_control_depth_steers_render");
 }

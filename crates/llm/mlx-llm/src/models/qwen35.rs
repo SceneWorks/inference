@@ -19,7 +19,9 @@
 
 use std::cell::Cell;
 
-use mlx_rs::ops::{add, concatenate_axis, multiply, rsqrt, sigmoid, split_sections, sum_axis};
+use mlx_rs::ops::{
+    add, concatenate_axis, mean_axis, multiply, rsqrt, sigmoid, split_sections, sum_axis,
+};
 use mlx_rs::transforms::async_eval;
 use mlx_rs::{Array, Dtype};
 
@@ -27,7 +29,8 @@ use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
-    causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache,
+    causal_depthwise_conv_traced, causal_depthwise_conv_traced_f32_accum, compute_g,
+    rms_norm_gated, ConvTrace, DeltaNetCache,
 };
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
@@ -46,6 +49,91 @@ fn checkpoint_norm_weight(weight: Array, prism: bool) -> Result<Array> {
             &weight,
             &Array::from_f32(1.0).as_dtype(weight.dtype())?,
         )?)
+    }
+}
+
+/// The shared decoder keeps its established MLX-LM arithmetic. MOSS explicitly selects
+/// the frozen Transformers intermediate precision without changing BF16 projections/outputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PrecisionProfile {
+    #[default]
+    Native,
+    MossFrozenHf,
+}
+
+impl PrecisionProfile {
+    fn norm_weight(self, weight: Array, prism: bool) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            debug_assert!(!prism);
+            Ok(add(
+                &weight.as_dtype(Dtype::Float32)?,
+                Array::from_f32(1.0),
+            )?)
+        } else {
+            checkpoint_norm_weight(weight, prism)
+        }
+    }
+
+    fn norm(self, x: &Array, weight: &Array, eps: f32) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            // Both fused-kernel inputs are F32, so normalization AND multiplication precede
+            // the single output narrowing, without relying on mixed-input promotion.
+            Ok(rms_norm(&x.as_dtype(Dtype::Float32)?, weight, eps)?.as_dtype(x.dtype())?)
+        } else {
+            rms_norm(x, weight, eps)
+        }
+    }
+
+    fn scaled_query(self, normalized: &Array, inverse_head_dim: f32) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            scale(&normalized.as_dtype(Dtype::Float32)?, inverse_head_dim)
+        } else {
+            scale(normalized, inverse_head_dim)
+        }
+    }
+
+    fn gated_norm(self, x: &Array, weight: &Array, gate: &Array, eps: f32) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            // Frozen Qwen3_5RMSNormGated differs from its zero-centered RMSNorm:
+            // narrow the normalized values BEFORE the direct weight multiplication,
+            // then apply the F32 SiLU gate before the final narrowing.
+            let x32 = x.as_dtype(Dtype::Float32)?;
+            let variance = mean_axis(&multiply(&x32, &x32)?, -1, true)?;
+            let normalized = multiply(&x32, &rsqrt(&add(&variance, Array::from_f32(eps))?)?)?
+                .as_dtype(x.dtype())?;
+            let weighted = multiply(weight, &normalized)?;
+            Ok(multiply(
+                &weighted.as_dtype(Dtype::Float32)?,
+                &silu(&gate.as_dtype(Dtype::Float32)?)?,
+            )?
+            .as_dtype(x.dtype())?)
+        } else {
+            rms_norm_gated(x, weight, gate, eps)
+        }
+    }
+
+    fn convolve(self, x: &Array, weight: &Array, state: &Array) -> Result<(Array, ConvTrace)> {
+        if self == Self::MossFrozenHf {
+            causal_depthwise_conv_traced_f32_accum(x, weight, state)
+        } else {
+            causal_depthwise_conv_traced(x, weight, state)
+        }
+    }
+
+    fn silu(self, x: &Array) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            Ok(silu(&x.as_dtype(Dtype::Float32)?)?.as_dtype(x.dtype())?)
+        } else {
+            silu(x)
+        }
+    }
+
+    fn decay(self, a: &Array, a_log: &Array, dt_bias: &Array) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            compute_g(&a.as_dtype(Dtype::Float32)?, a_log, dt_bias)
+        } else {
+            compute_g(a, a_log, dt_bias)
+        }
     }
 }
 
@@ -364,6 +452,7 @@ fn l2norm(x: &Array, eps: f32) -> Result<Array> {
 /// `[key_dim, key_dim, value_dim]` channels (no head interleaving).
 #[derive(Debug)]
 struct GatedDeltaNet {
+    precision: PrecisionProfile,
     in_proj_qkv: Projection, // [key_dim·2 + value_dim, hidden]  → conv'd
     in_proj_z: Projection,   // [value_dim, hidden]              → output gate
     in_proj_a: Projection,   // [Hv, hidden]                     → decay input
@@ -385,6 +474,11 @@ struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
+    fn normalize_output(&self, x: &Array, gate: &Array) -> Result<Array> {
+        self.precision
+            .gated_norm(x, &self.norm_weight, gate, self.eps)
+    }
+
     fn push_arrays(&self, out: &mut Vec<Array>) {
         for p in [
             &self.in_proj_qkv,
@@ -424,7 +518,8 @@ impl GatedDeltaNet {
             None => zeros3(b, self.conv_kernel - 1, self.conv_dim, dt)?,
         };
         let (conv_out, conv_trace) =
-            causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
+            self.precision
+                .convolve(&mixed, &self.conv_weight, &conv_state)?;
         let cp = split_sections(&conv_out, &[self.key_dim, 2 * self.key_dim], 2)?;
         let qc = cp[0].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
         let kc = cp[1].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
@@ -432,7 +527,7 @@ impl GatedDeltaNet {
 
         // L2-normalize q/k (eps 1e-6), then scale q by 1/√head_k_dim — `use_qk_l2norm_in_kernel`.
         let inv = (self.head_k_dim as f32).powf(-0.5);
-        let qn = scale(&l2norm(&qc, 1e-6)?, inv)?;
+        let qn = self.precision.scaled_query(&l2norm(&qc, 1e-6)?, inv)?;
         let kn = l2norm(&kc, 1e-6)?;
 
         // The gated delta recurrence, accumulated in f32 (matching the reference kernel). GQA
@@ -440,7 +535,7 @@ impl GatedDeltaNet {
         // The cache advances itself: an armed (speculative verify) forward also keeps every
         // token's state for the checkpoint ring (sc-24435).
         let beta = sigmoid(&b_in)?;
-        let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
+        let g = self.precision.decay(&a_in, &self.a_log, &self.dt_bias)?;
         let f32 = Dtype::Float32;
         let y = cache.advance(
             conv_trace,
@@ -452,7 +547,7 @@ impl GatedDeltaNet {
         )?;
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
-        let out = rms_norm_gated(&y.as_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
+        let out = self.normalize_output(&y.as_dtype(dt)?, &z)?;
         self.out_proj
             .forward(&out.reshape(&[b, s, self.value_dim])?)
     }
@@ -461,6 +556,7 @@ impl GatedDeltaNet {
 /// The gated full-attention layer (`Qwen3NextAttention`).
 #[derive(Debug)]
 struct Qwen35Attention {
+    precision: PrecisionProfile,
     q_proj: Projection, // out = num_heads · head_dim · 2 (queries ‖ gate)
     k_proj: Projection,
     v_proj: Projection,
@@ -491,10 +587,10 @@ impl Qwen35Attention {
             .forward(x)?
             .reshape(&[b, s, self.num_heads, 2 * self.head_dim])?;
         let qp = split_sections(&qg, &[self.head_dim], 3)?;
-        let q = rms_norm(&qp[0], &self.q_norm, self.eps)?; // [B,S,H,hd]
+        let q = self.precision.norm(&qp[0], &self.q_norm, self.eps)?; // [B,S,H,hd]
         let gate = qp[1].reshape(&[b, s, self.num_heads * self.head_dim])?;
 
-        let k = rms_norm(
+        let k = self.precision.norm(
             &self
                 .k_proj
                 .forward(x)?
@@ -538,8 +634,8 @@ impl Mlp {
         }
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let gate = silu(&self.gate.forward(x)?)?;
+    fn forward(&self, x: &Array, precision: PrecisionProfile) -> Result<Array> {
+        let gate = precision.silu(&self.gate.forward(x)?)?;
         let up = self.up.forward(x)?;
         self.down.forward(&multiply(&gate, &up)?)
     }
@@ -564,9 +660,9 @@ impl Ffn {
         }
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Array, precision: PrecisionProfile) -> Result<Array> {
         match self {
-            Ffn::Dense(m) => m.forward(x),
+            Ffn::Dense(m) => m.forward(x, precision),
             Ffn::Moe(m) => m.forward(x),
         }
     }
@@ -580,6 +676,7 @@ enum Mixer {
 
 #[derive(Debug)]
 struct DecoderLayer {
+    precision: PrecisionProfile,
     input_ln: Array,
     post_ln: Array,
     mixer: Mixer,
@@ -606,14 +703,17 @@ impl DecoderLayer {
         sin: &Array,
         cache: &mut Qwen35LayerCache,
     ) -> Result<Array> {
-        let normed = rms_norm(x, &self.input_ln, self.eps)?;
+        let normed = self.precision.norm(x, &self.input_ln, self.eps)?;
         let r = match (&self.mixer, cache) {
             (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward(&normed, c)?,
             (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(&normed, cos, sin, c)?,
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
         let h = add(x, &r)?;
-        let m = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
+        let m = self.ffn.forward(
+            &self.precision.norm(&h, &self.post_ln, self.eps)?,
+            self.precision,
+        )?;
         Ok(add(&h, &m)?)
     }
 }
@@ -1031,10 +1131,11 @@ impl Qwen35Cache {
 /// A loaded Qwen3.6 (`qwen3_5`) hybrid decoder.
 #[derive(Debug)]
 pub struct Qwen35Model {
+    precision: PrecisionProfile,
     embed_tokens: TokenEmbedding,
     layers: Vec<DecoderLayer>,
     norm: Array,
-    lm_head: Projection,
+    lm_head: Option<Projection>,
     rope: Rope,
     mtp: Option<MtpPredictor>,
     /// Why a configured native MTP head was not built (E2): the snapshot stores none of it, or it
@@ -1120,7 +1221,9 @@ impl Qwen35Model {
         let mut top = Vec::new();
         self.embed_tokens.push_arrays(&mut top);
         top.push(self.norm.clone());
-        self.lm_head.push_arrays(&mut top);
+        if let Some(head) = &self.lm_head {
+            head.push_arrays(&mut top);
+        }
         let mut groups = vec![top];
         groups.extend(self.layers.iter().map(DecoderLayer::arrays));
         if let Some(mtp) = &self.mtp {
@@ -1220,6 +1323,50 @@ impl Qwen35Model {
         self.hidden_from_embeds(&h, &cos, &sin, cache)
     }
 
+    /// Final RMS-normalized decoder states `[B, S, hidden]`, without a vocabulary projection.
+    /// Use an individual unpadded prompt with a fresh cache for text-encoder inference.
+    pub fn forward_hidden(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+    ) -> Result<Array> {
+        self.forward_hidden_with_block_hook(input_ids, cache, offset, &mut |_, _| Ok(()))
+    }
+
+    /// Final-normalized hidden states with a cooperative block execution boundary.
+    /// Boundary zero supplies embeddings before the first block; subsequent boundaries supply
+    /// each block output, then the final-normalized output. The hook may evaluate each lazy
+    /// output before checking cancellation. The ordinary hidden-only entry point uses a no-op
+    /// hook and preserves its existing lazy execution. Discard the per-prompt cache after error.
+    pub fn forward_hidden_with_block_hook(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+        hook: &mut dyn FnMut(usize, &Array) -> Result<()>,
+    ) -> Result<Array> {
+        let h = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
+        let (cos, sin) = self.rope.cos_sin(h.shape()[1], offset, compute())?;
+        let h = walk_hidden_blocks(
+            h,
+            self.layers.iter().zip(cache.layers.iter_mut()),
+            |h, (layer, slot)| layer.forward(&h, &cos, &sin, slot),
+            &mut *hook,
+        )?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
+        hook(self.layers.len() + 1, &normalized)?;
+        Ok(normalized)
+    }
+
+    fn language_head(&self) -> Result<&Projection> {
+        self.lm_head.as_ref().ok_or_else(|| {
+            Error::Config(
+                "Qwen35Model was loaded headless; vocabulary logits are unavailable".into(),
+            )
+        })
+    }
+
     /// Final-normalized target hidden states and logits for every supplied position. Qwen3.8 MTP
     /// consumes the same final-normalized states the upstream runtime exposes to its predictor.
     pub(crate) fn hidden_and_logits(
@@ -1229,8 +1376,8 @@ impl Qwen35Model {
         offset: i32,
     ) -> Result<(Array, Array)> {
         let h = self.hidden(input_ids, cache, offset)?;
-        let normalized = rms_norm(&h, &self.norm, self.eps)?;
-        let logits = self.lm_head.forward(&normalized)?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
+        let logits = self.language_head()?.forward(&normalized)?;
         Ok((normalized, logits))
     }
 
@@ -1242,10 +1389,10 @@ impl Qwen35Model {
         offset: i32,
     ) -> Result<(Array, Array)> {
         let h = self.hidden(input_ids, cache, offset)?;
-        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
         let s = normalized.shape()[1];
         let last = normalized.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
-        let logits = self.lm_head.forward(&last)?;
+        let logits = self.language_head()?.forward(&last)?;
         Ok((
             normalized,
             logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?,
@@ -1281,8 +1428,8 @@ impl Qwen35Model {
             layers.len(),
             |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
         )?;
-        let normalized = rms_norm(&h, &self.norm, self.eps)?;
-        let logits = self.lm_head.forward(&normalized)?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
+        let logits = self.language_head()?.forward(&normalized)?;
         Ok((normalized, logits))
     }
 
@@ -1310,10 +1457,10 @@ impl Qwen35Model {
             layers.len(),
             |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
         )?;
-        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
         let s = normalized.shape()[1];
         let last = normalized.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
-        let logits = self.lm_head.forward(&last)?;
+        let logits = self.language_head()?.forward(&last)?;
         Ok((
             normalized,
             logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?,
@@ -1350,7 +1497,7 @@ impl Qwen35Model {
         positions: [&[i32]; 3],
     ) -> Result<(Array, Array)> {
         let normalized = self.mtp_hidden_from_embeds(embeds, hidden_states, cache, positions)?;
-        let logits = self.lm_head.forward(&normalized)?;
+        let logits = self.language_head()?.forward(&normalized)?;
         let last = logits.take_axis(Array::from_slice(&[normalized.shape()[1] - 1], &[1]), 1)?;
         Ok((
             normalized,
@@ -1440,8 +1587,8 @@ impl Qwen35Model {
 
     /// Final RMSNorm + `lm_head` over hidden states `[B, n, hidden]` → logits `[B, n, vocab]`.
     fn project(&self, h: &Array) -> Result<Array> {
-        let normed = rms_norm(h, &self.norm, self.eps)?;
-        self.lm_head.forward(&normed)
+        let normed = self.precision.norm(h, &self.norm, self.eps)?;
+        self.language_head()?.forward(&normed)
     }
 
     /// Project the **last** position of `h` `[B, S, hidden]` → logits `[B, vocab]`.
@@ -1641,6 +1788,42 @@ impl Qwen35Model {
         Self::from_weights_with(w, prefix, cfg, None)
     }
 
+    /// Build only the text decoder and final norm, without reading or allocating an LM head.
+    /// `prefix` is the exact decoder root, including any frozen `language_model` wrapper.
+    /// Parse wrapped configurations with [`Qwen35Config::from_json`].
+    pub fn from_weights_headless(w: &Weights, prefix: &str, cfg: Qwen35Config) -> Result<Self> {
+        Self::materialized(w, Self::build_headless_lazy(w, prefix, cfg)?)
+    }
+
+    /// Headless dense BF16 decoder with the frozen MOSS Transformers precision boundaries.
+    /// Norms, normalized-Q scaling, delta decay and depthwise convolution follow the frozen HF
+    /// intermediate casts; weights/projections and hidden outputs remain BF16.
+    /// Shared constructors retain their native arithmetic. This profile does not support
+    /// quantized, MoE or Prism decoders.
+    pub fn from_weights_headless_moss_frozen_hf(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35Config,
+    ) -> Result<Self> {
+        Self::materialized(
+            w,
+            Self::from_weights_layout(
+                w,
+                prefix,
+                cfg,
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf,
+            )?,
+        )
+    }
+
+    // Keep headless graph construction private: production loads cross the same coherence boundary.
+    fn build_headless_lazy(w: &Weights, prefix: &str, cfg: Qwen35Config) -> Result<Self> {
+        Self::from_weights_layout(w, prefix, cfg, None, None, false, PrecisionProfile::Native)
+    }
+
     /// Build from a loaded checkpoint, optionally quantizing the large projections on load.
     ///
     /// `prefix` is the **decoder root** path: keys are read as `{prefix}.embed_tokens.weight`,
@@ -1673,7 +1856,7 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
-        Self::from_weights_layout(w, prefix, cfg, quant, None)
+        Self::from_weights_layout(w, prefix, cfg, quant, None, true, PrecisionProfile::Native)
     }
 
     /// [`Qwen35Model::from_prism_weights`] without evaluating anything (see
@@ -1683,7 +1866,15 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         pack: &PrismMlxPack,
     ) -> Result<Self> {
-        Self::from_weights_layout(w, "language_model.model", cfg, None, Some(pack))
+        Self::from_weights_layout(
+            w,
+            "language_model.model",
+            cfg,
+            None,
+            Some(pack),
+            true,
+            PrecisionProfile::Native,
+        )
     }
 
     /// The caller-owned-map load boundary: every source this constructor read is verified
@@ -1701,14 +1892,29 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         quant: Option<QuantSpec>,
         prism: Option<&PrismMlxPack>,
+        with_lm_head: bool,
+        precision: PrecisionProfile,
     ) -> Result<Self> {
+        if precision == PrecisionProfile::MossFrozenHf
+            && (with_lm_head
+                || prism.is_some()
+                || quant.is_some()
+                || cfg.quantization.is_some()
+                || cfg.moe.is_some()
+                || compute() != Dtype::Bfloat16)
+        {
+            return Err(Error::Config(
+                "MOSS frozen-HF precision requires a dense unquantized BF16 headless decoder"
+                    .into(),
+            ));
+        }
         let eps = cfg.rms_norm_eps;
         let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(compute())?) };
         // Dense HF Qwen3.6 norms are zero-centered. Frozen Prism/Bonsai artifacts have already
         // converted every ordinary RMSNorm tensor to its direct multiplier and must remain raw.
         let norm_w = |key: String| -> Result<Array> {
             let t = req(key)?;
-            checkpoint_norm_weight(t, prism.is_some())
+            precision.norm_weight(t, prism.is_some())
         };
         let stored_quant = cfg.quantization;
         if prism.is_some() && (stored_quant.is_some() || quant.is_some()) {
@@ -1732,7 +1938,13 @@ impl Qwen35Model {
         let proj_dense = |key: String| -> Result<Projection> {
             Projection::load(w.require(&key)?.as_dtype(compute())?, None)
         };
-        let dp = |s: &str| format!("{prefix}.{s}");
+        let dp = |s: &str| {
+            if prefix.is_empty() {
+                s.to_string()
+            } else {
+                format!("{prefix}.{s}")
+            }
+        };
 
         let embed_key = dp("embed_tokens.weight");
         let embed_weight = if prism.is_none() {
@@ -1746,18 +1958,22 @@ impl Qwen35Model {
             TokenEmbedding::Dense(embed_weight.clone().expect("dense embedding"))
         };
         let norm = norm_w(dp("norm.weight"))?;
-        let lm_head = if cfg.tie_word_embeddings {
-            if prism.is_some() {
-                return Err(Error::Config(
-                    "Prism requires an explicit packed lm_head; tied embeddings are unsupported"
-                        .into(),
-                ));
-            }
-            Projection::load(embed_weight.expect("dense embedding"), None)?
-        } else if let Some(pack) = prism {
-            Projection::Prism(pack.linear(w, "language_model.lm_head.weight", compute())?)
+        let lm_head = if !with_lm_head {
+            None
         } else {
-            Projection::load(req("lm_head.weight".to_string())?, None)?
+            Some(if cfg.tie_word_embeddings {
+                if prism.is_some() {
+                    return Err(Error::Config(
+                        "Prism requires an explicit packed lm_head; tied embeddings are unsupported"
+                            .into(),
+                    ));
+                }
+                Projection::load(embed_weight.expect("dense embedding"), None)?
+            } else if let Some(pack) = prism {
+                Projection::Prism(pack.linear(w, "language_model.lm_head.weight", compute())?)
+            } else {
+                Projection::load(req("lm_head.weight".to_string())?, None)?
+            })
         };
 
         let key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads;
@@ -1772,6 +1988,7 @@ impl Qwen35Model {
                 let conv_weight = req(lp("linear_attn.conv1d.weight"))?
                     .reshape(&[conv_dim, cfg.linear_conv_kernel_dim])?;
                 Mixer::Delta(GatedDeltaNet {
+                    precision,
                     in_proj_qkv: proj_q(lp("linear_attn.in_proj_qkv.weight"))?,
                     in_proj_z: proj_q(lp("linear_attn.in_proj_z.weight"))?,
                     in_proj_a: proj_dense(lp("linear_attn.in_proj_a.weight"))?,
@@ -1793,6 +2010,7 @@ impl Qwen35Model {
                 })
             } else {
                 Mixer::Attn(Qwen35Attention {
+                    precision,
                     q_proj: proj_q(lp("self_attn.q_proj.weight"))?,
                     k_proj: proj_q(lp("self_attn.k_proj.weight"))?,
                     v_proj: proj_q(lp("self_attn.v_proj.weight"))?,
@@ -1808,6 +2026,7 @@ impl Qwen35Model {
             };
             let ffn = build_ffn(w, &dp(&format!("layers.{i}.")), &cfg, quant, &proj_q)?;
             layers.push(DecoderLayer {
+                precision,
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
                 mixer,
@@ -1823,33 +2042,39 @@ impl Qwen35Model {
         // fails the load in `build_mtp_predictor` (a missing tensor is integrity, not absence).
         let mut cfg = cfg;
         let mut mtp_fallback = None;
-        let mtp = match core_llm::native_mtp_plan(
-            cfg.mtp_num_hidden_layers,
-            cfg.mtp_use_dedicated_embeddings,
-            w.keys().any(|key| key.starts_with("mtp.")),
-        )
-        .map_err(|e| Error::Config(e.to_string()))?
-        {
-            core_llm::NativeMtp::Absent => None,
-            // The predictor layer carries the body's FFN choice: the dense MLP (27B) or the
-            // sparse-MoE block (35B-A3B), in either expert layout (vLLM `qwen3_5_mtp.py`,
-            // sc-24438).
-            core_llm::NativeMtp::Build => Some(build_mtp_predictor(
-                &cfg,
-                "mtp.",
-                &|key| proj_q(key),
-                &|key| norm_w(key),
-                &|lp| build_ffn(w, lp, &cfg, quant, &proj_q),
-            )?),
-            core_llm::NativeMtp::Fallback(why) => {
-                mtp_fallback = Some(why);
-                cfg.mtp_num_hidden_layers = 0;
-                None
+        let mtp = if !with_lm_head {
+            cfg.mtp_num_hidden_layers = 0;
+            None
+        } else {
+            match core_llm::native_mtp_plan(
+                cfg.mtp_num_hidden_layers,
+                cfg.mtp_use_dedicated_embeddings,
+                w.keys().any(|key| key.starts_with("mtp.")),
+            )
+            .map_err(|e| Error::Config(e.to_string()))?
+            {
+                core_llm::NativeMtp::Absent => None,
+                // The predictor layer carries the body's FFN choice: the dense MLP (27B) or the
+                // sparse-MoE block (35B-A3B), in either expert layout (vLLM `qwen3_5_mtp.py`,
+                // sc-24438).
+                core_llm::NativeMtp::Build => Some(build_mtp_predictor(
+                    &cfg,
+                    "mtp.",
+                    &|key| proj_q(key),
+                    &|key| norm_w(key),
+                    &|lp| build_ffn(w, lp, &cfg, quant, &proj_q),
+                )?),
+                core_llm::NativeMtp::Fallback(why) => {
+                    mtp_fallback = Some(why);
+                    cfg.mtp_num_hidden_layers = 0;
+                    None
+                }
             }
         };
 
         let rope = Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false);
         let model = Self {
+            precision,
             embed_tokens,
             layers,
             norm,
@@ -2062,9 +2287,11 @@ fn build_mtp_predictor(
     let eps = cfg.rms_norm_eps;
     let lp = |s: &str| format!("{prefix}layers.0.{s}");
     let layer = DecoderLayer {
+        precision: PrecisionProfile::Native,
         input_ln: norm(lp("input_layernorm.weight"))?,
         post_ln: norm(lp("post_attention_layernorm.weight"))?,
         mixer: Mixer::Attn(Qwen35Attention {
+            precision: PrecisionProfile::Native,
             q_proj: proj(lp("self_attn.q_proj.weight"))?,
             k_proj: proj(lp("self_attn.k_proj.weight"))?,
             v_proj: proj(lp("self_attn.v_proj.weight"))?,
@@ -2376,6 +2603,22 @@ pub fn vision_merged_token_count(grid_thw: [i32; 3], spatial_merge_size: i32) ->
     (t.max(0) * (h.max(0) / merge) * (w.max(0) / merge)) as usize
 }
 
+// Tensor-independent traversal lets CPU contract tests exercise cancellation short-circuiting
+// without initializing a backend device. Production supplies real layer/cache pairs and Arrays.
+fn walk_hidden_blocks<T, L>(
+    mut hidden: T,
+    layers: impl IntoIterator<Item = L>,
+    mut forward: impl FnMut(T, L) -> Result<T>,
+    mut hook: impl FnMut(usize, &T) -> Result<()>,
+) -> Result<T> {
+    hook(0, &hidden)?;
+    for (index, layer) in layers.into_iter().enumerate() {
+        hidden = forward(hidden, layer)?;
+        hook(index + 1, &hidden)?;
+    }
+    Ok(hidden)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2494,6 +2737,426 @@ pub(crate) mod tests {
             checkpoint_norm_weight(Array::from_slice(&[0.0583496f32], &[1]), false).unwrap();
         mlx_rs::transforms::eval([&dense]).unwrap();
         assert!((dense.item::<f32>() - source[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu() {
+        on_cpu(|| {
+            let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+            let prefix = "language_model";
+            let mut tensors = synthetic_tensors_with_prefix(&cfg, prefix);
+            let lm = Qwen35Model::build_lazy(
+                &Weights::from_map(tensors.clone()),
+                prefix,
+                cfg.clone(),
+                None,
+            )
+            .unwrap();
+            tensors.remove("lm_head.weight");
+            let weights = Weights::from_map(tensors);
+            assert!(Qwen35Model::build_lazy(&weights, prefix, cfg.clone(), None).is_err());
+            // The public constructor explicitly verifies GPU views; test the shared loader and
+            // decoder on their CPU stream without invoking that Metal-only boundary.
+            let encoder = Qwen35Model::build_headless_lazy(&weights, prefix, cfg.clone()).unwrap();
+            assert!(encoder.lm_head.is_none());
+            let mut lm_cache = lm.new_cache();
+            let mut cache = encoder.new_cache();
+            let ids = Array::from_slice(&[1i32, 7, 3], &[1, 3]);
+            let (expected, logits) = lm.hidden_and_logits(&ids, &mut lm_cache, 0).unwrap();
+            let hidden = encoder.forward_hidden(&ids, &mut cache, 0).unwrap();
+            assert_eq!(hidden.shape(), &[1, 3, cfg.hidden_size]);
+            assert_eq!(logits.shape(), &[1, 3, cfg.vocab_size]);
+            assert_eq!(host(&hidden), host(&expected));
+            assert_eq!(cache.offset(), 3);
+            let next_ids = Array::from_slice(&[42i32], &[1, 1]);
+            let next = encoder.forward_hidden(&next_ids, &mut cache, 3).unwrap();
+            let (expected, _) = lm.hidden_and_logits(&next_ids, &mut lm_cache, 3).unwrap();
+            assert_eq!(host(&next), host(&expected));
+            assert_eq!(cache.offset(), 4);
+            cache.reset().unwrap();
+            let repeated = encoder.forward_hidden(&ids, &mut cache, 0).unwrap();
+            assert_eq!(host(&repeated), host(&hidden));
+            assert!(encoder.forward(&ids, &mut encoder.new_cache(), 0).is_err());
+            crate::model_inference_device::record_model_inference_device();
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu");
+        });
+    }
+
+    #[test]
+    fn moss_frozen_hf_precision_matches_independent_cpu_cast_fixtures() {
+        on_cpu(|| {
+            let fixture: serde_json::Value =
+                serde_json::from_str(include_str!("testdata/moss_qwen_precision.json")).unwrap();
+            let data = |case: &str, key: &str| -> Vec<f32> {
+                fixture["cases"][case][key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_f64().unwrap() as f32)
+                    .collect()
+            };
+            let bf = |v: &[f32], shape: &[i32]| {
+                Array::from_slice(v, shape)
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap()
+            };
+            let check = |case: &str, got: &Array, tolerance: f32| {
+                let expected = data(case, "expected");
+                let old = data(case, "old");
+                assert!(expected
+                    .iter()
+                    .zip(&old)
+                    .any(|(a, b)| (a - b).abs() > tolerance));
+                for (actual, expected) in host(got).iter().zip(&expected) {
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "{case}: {actual} != {expected}"
+                    );
+                }
+            };
+            let hf = PrecisionProfile::MossFrozenHf;
+            let native = PrecisionProfile::default();
+            assert_eq!(native, PrecisionProfile::Native);
+            let a = bf(&data("decay", "a"), &[1, 1, 16]);
+            let log = bf(&data("decay", "a_log"), &[16]);
+            let bias = bf(&data("decay", "bias"), &[16]);
+            let decay = hf.decay(&a, &log, &bias).unwrap();
+            assert_eq!(decay.dtype(), Dtype::Float32);
+            check("decay", &decay, 2e-7);
+            assert_eq!(
+                host(&native.decay(&a, &log, &bias).unwrap()),
+                host(&compute_g(&a, &log, &bias).unwrap())
+            );
+            assert_ne!(host(&decay), host(&native.decay(&a, &log, &bias).unwrap()));
+
+            let q = bf(&data("query", "normalized"), &[1, 128]);
+            let inverse = fixture["cases"]["query"]["inverse_head_dim"]
+                .as_f64()
+                .unwrap() as f32;
+            let scaled = hf.scaled_query(&q, inverse).unwrap();
+            assert_eq!(scaled.dtype(), Dtype::Float32);
+            check("query", &scaled, 1e-8);
+            assert_eq!(
+                host(&native.scaled_query(&q, inverse).unwrap()),
+                host(&scale(&q, inverse).unwrap())
+            );
+            assert_ne!(
+                host(&scaled),
+                host(&native.scaled_query(&q, inverse).unwrap())
+            );
+
+            let x = bf(&data("norm", "x"), &[2, 8]);
+            let source = bf(&data("norm", "weight"), &[8]);
+            let multiplier = hf.norm_weight(source.clone(), false).unwrap();
+            let old_multiplier = native.norm_weight(source.clone(), false).unwrap();
+            assert_eq!(multiplier.dtype(), Dtype::Float32);
+            assert_eq!(old_multiplier.dtype(), Dtype::Bfloat16);
+            assert_eq!(
+                host(&old_multiplier),
+                host(&checkpoint_norm_weight(source.clone(), false).unwrap())
+            );
+            assert_eq!(
+                host(&native.norm_weight(source.clone(), true).unwrap()),
+                host(&source)
+            );
+            let norm = hf.norm(&x, &multiplier, 1e-6).unwrap();
+            assert_eq!(norm.dtype(), Dtype::Bfloat16);
+            check("norm", &norm, 0.0);
+            assert_ne!(
+                host(&norm),
+                host(
+                    &hf.norm(&x, &old_multiplier.as_dtype(Dtype::Float32).unwrap(), 1e-6)
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                host(&native.norm(&x, &old_multiplier, 1e-6).unwrap()),
+                host(&rms_norm(&x, &old_multiplier, 1e-6).unwrap())
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native() {
+        on_cpu(|| {
+            let fixture: serde_json::Value =
+                serde_json::from_str(include_str!("testdata/moss_qwen_gated_norm.json")).unwrap();
+            let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+            let prefix = "language_model";
+            let weights = Weights::from_map(synthetic_tensors_with_prefix(&cfg, prefix));
+            let mut model = Qwen35Model::from_weights_layout(
+                &weights,
+                prefix,
+                cfg,
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf,
+            )
+            .unwrap();
+            let delta = model
+                .layers
+                .iter_mut()
+                .find_map(|layer| {
+                    if let Mixer::Delta(delta) = &mut layer.mixer {
+                        Some(delta)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert_eq!(delta.precision, PrecisionProfile::MossFrozenHf);
+            let mut distinguished_native = false;
+            for case in fixture["cases"].as_array().unwrap() {
+                let values = |key: &str| -> Vec<f32> {
+                    case[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|value| {
+                            value.as_array().map_or_else(
+                                || vec![value.as_f64().unwrap() as f32],
+                                |row| row.iter().map(|x| x.as_f64().unwrap() as f32).collect(),
+                            )
+                        })
+                        .collect()
+                };
+                let bf = |key: &str, shape: &[i32]| {
+                    Array::from_slice(&values(key), shape)
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap()
+                };
+                let x = bf("x", &[1, 2]);
+                let gate = bf("gate", &[1, 2]);
+                delta.norm_weight = bf("weight", &[2]);
+                delta.eps = case["eps"].as_f64().unwrap() as f32;
+                let expected = values("expected");
+                assert_ne!(
+                    expected,
+                    values("wrong_fused_norm_early_gate"),
+                    "fixture must reject incorrect casts"
+                );
+                delta.precision = PrecisionProfile::MossFrozenHf;
+                let actual = delta.normalize_output(&x, &gate).unwrap();
+                assert_eq!(actual.dtype(), Dtype::Bfloat16);
+                assert_eq!(actual.shape(), x.shape());
+                assert_eq!(host(&actual), expected, "{}", case["name"]);
+                delta.precision = PrecisionProfile::Native;
+                let native = delta.normalize_output(&x, &gate).unwrap();
+                assert_eq!(
+                    host(&native),
+                    host(&rms_norm_gated(&x, &delta.norm_weight, &gate, delta.eps).unwrap()),
+                );
+                distinguished_native |= host(&native) != expected;
+                if case["name"] == "sigmoid_rounding_dense_ffn" {
+                    let identity = Array::from_slice(&[1f32, 0., 0., 1.], &[2, 2])
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap();
+                    let gates = values("gate");
+                    let gate_weight = Array::from_slice(&[gates[0], 0., 0., gates[1]], &[2, 2])
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap();
+                    let ffn = Ffn::Dense(Mlp {
+                        gate: Projection::load(gate_weight, None).unwrap(),
+                        up: Projection::load(identity.clone(), None).unwrap(),
+                        down: Projection::load(identity, None).unwrap(),
+                    });
+                    assert_eq!(
+                        host(&ffn.forward(&x, PrecisionProfile::MossFrozenHf).unwrap()),
+                        expected,
+                    );
+                    let native = ffn.forward(&x, PrecisionProfile::Native).unwrap();
+                    assert_eq!(host(&native), values("wrong_fused_norm_early_gate"));
+                }
+            }
+            assert!(
+                distinguished_native,
+                "fixtures must discriminate the unchanged Native path"
+            );
+        });
+        #[cfg(feature = "model-inference-proof")]
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native");
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace() {
+        on_cpu(|| {
+            let fixture: serde_json::Value =
+                serde_json::from_str(include_str!("testdata/moss_qwen_conv.json")).unwrap();
+            for case in fixture["cases"].as_array().unwrap() {
+                let values = |key: &str| -> Vec<f32> {
+                    case[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_f64().unwrap() as f32)
+                        .collect()
+                };
+                let bf = |key: &str, shape: &[i32]| {
+                    Array::from_slice(&values(key), shape)
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap()
+                };
+                let x = bf("x", &[1, 4, 1]);
+                let weight = bf("weight", &[1, 4]);
+                let state = bf("state", &[1, 3, 1]);
+                let (actual, trace) = PrecisionProfile::MossFrozenHf
+                    .convolve(&x, &weight, &state)
+                    .unwrap();
+                assert_eq!(actual.dtype(), Dtype::Bfloat16);
+                assert_eq!(actual.shape(), x.shape());
+                assert_eq!(host(&actual), values("expected"));
+                if case["name"] == "tap_rounding" {
+                    assert_ne!(host(&actual), values("old"));
+                } else {
+                    assert_ne!(host(&actual), values("wrong_post_silu_narrowing"));
+                }
+                let (native, native_trace) = PrecisionProfile::Native
+                    .convolve(&x, &weight, &state)
+                    .unwrap();
+                let (old, old_trace) = causal_depthwise_conv_traced(&x, &weight, &state).unwrap();
+                assert_eq!(host(&native), values("old"));
+                assert_eq!(host(&native), host(&old));
+                assert_eq!(trace.tokens(), 4);
+                assert_eq!(trace.tail_len(), 3);
+                for token in 0..4 {
+                    let tail = trace.tail_after(token).unwrap();
+                    assert_eq!(tail.dtype(), Dtype::Bfloat16);
+                    assert_eq!(tail.shape(), &[1, 3, 1]);
+                    assert_eq!(host(&tail), host(&native_trace.tail_after(token).unwrap()));
+                    assert_eq!(host(&tail), host(&old_trace.tail_after(token).unwrap()));
+                }
+                assert_eq!(host(&trace.tail_after(3).unwrap()), values("tail"));
+                let first = x.take_axis(Array::from_slice(&[0i32, 1], &[2]), 1).unwrap();
+                let second = x.take_axis(Array::from_slice(&[2i32, 3], &[2]), 1).unwrap();
+                let (head, head_trace) = PrecisionProfile::MossFrozenHf
+                    .convolve(&first, &weight, &state)
+                    .unwrap();
+                let (tail, tail_trace) = PrecisionProfile::MossFrozenHf
+                    .convolve(&second, &weight, &head_trace.tail_after(1).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    host(&concatenate_axis(&[head, tail], 1).unwrap()),
+                    values("expected")
+                );
+                assert_eq!(host(&tail_trace.tail_after(1).unwrap()), values("tail"));
+            }
+        });
+        #[cfg(feature = "model-inference-proof")]
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace");
+    }
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays() {
+        on_cpu(|| {
+            let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+            let prefix = "language_model";
+            let mut tensors = synthetic_tensors_with_prefix(&cfg, prefix);
+            tensors.remove("lm_head.weight");
+            let w = Weights::from_map(tensors);
+            let native = Qwen35Model::build_headless_lazy(&w, prefix, cfg.clone()).unwrap();
+            let hf = Qwen35Model::from_weights_layout(
+                &w,
+                prefix,
+                cfg.clone(),
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf,
+            )
+            .unwrap();
+            assert_eq!(native.precision, PrecisionProfile::Native);
+            assert_eq!(hf.precision, PrecisionProfile::MossFrozenHf);
+            assert!(hf.lm_head.is_none() && hf.mtp.is_none() && !hf.prism && !hf.quantized);
+            assert_eq!(hf.norm.dtype(), Dtype::Float32);
+            let mut norm_elements = cfg.hidden_size as usize;
+            for layer in &hf.layers {
+                assert_eq!(layer.precision, PrecisionProfile::MossFrozenHf);
+                assert_eq!(layer.input_ln.dtype(), Dtype::Float32);
+                assert_eq!(layer.post_ln.dtype(), Dtype::Float32);
+                norm_elements += 2 * cfg.hidden_size as usize;
+                match &layer.mixer {
+                    Mixer::Attn(a) => {
+                        assert_eq!(a.precision, PrecisionProfile::MossFrozenHf);
+                        assert_eq!(a.q_norm.dtype(), Dtype::Float32);
+                        assert_eq!(a.k_norm.dtype(), Dtype::Float32);
+                        norm_elements += 2 * cfg.head_dim as usize;
+                    }
+                    Mixer::Delta(d) => {
+                        assert_eq!(d.precision, PrecisionProfile::MossFrozenHf);
+                        assert_eq!(d.norm_weight.dtype(), Dtype::Bfloat16);
+                        assert_eq!(d.conv_weight.dtype(), Dtype::Bfloat16);
+                        assert_eq!(d.a_log.dtype(), Dtype::Bfloat16);
+                        assert_eq!(d.dt_bias.dtype(), Dtype::Bfloat16);
+                    }
+                }
+            }
+            let bytes = |m: &Qwen35Model| {
+                m.param_groups()
+                    .iter()
+                    .flatten()
+                    .map(Array::nbytes)
+                    .sum::<usize>()
+            };
+            assert_eq!(bytes(&hf) - bytes(&native), norm_elements * 2);
+            let ids = Array::from_slice(&[1i32, 7, 3], &[1, 3]);
+            let hidden = hf.forward_hidden(&ids, &mut hf.new_cache(), 0).unwrap();
+            assert_eq!(hidden.dtype(), Dtype::Bfloat16);
+            assert_eq!(hidden.shape(), &[1, 3, cfg.hidden_size]);
+            assert!(host(&hidden).iter().all(|x| x.is_finite()));
+            assert!(Qwen35Model::from_weights_layout(
+                &w,
+                prefix,
+                cfg.clone(),
+                None,
+                None,
+                true,
+                PrecisionProfile::MossFrozenHf
+            )
+            .is_err());
+            let mut quantized = cfg.clone();
+            quantized.quantization = Some(QuantSpec::q4());
+            assert!(Qwen35Model::from_weights_layout(
+                &w,
+                prefix,
+                quantized,
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf
+            )
+            .is_err());
+            assert!(Qwen35Model::from_weights_layout(
+                &w,
+                prefix,
+                Qwen35Config::from_json(&cfg_json_moe()).unwrap(),
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf
+            )
+            .is_err());
+            assert!(
+                with_compute_dtype(Dtype::Float32, || Qwen35Model::from_weights_layout(
+                    &w,
+                    prefix,
+                    cfg,
+                    None,
+                    None,
+                    false,
+                    PrecisionProfile::MossFrozenHf
+                ))
+                .is_err()
+            );
+            crate::model_inference_device::record_model_inference_device();
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays");
+        });
     }
 
     pub(crate) fn cfg_json() -> serde_json::Value {
@@ -2743,6 +3406,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn assembled_forward_produces_finite_logits() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let w = synthetic_weights(&cfg);
@@ -2757,9 +3421,12 @@ pub(crate) mod tests {
         }
         // The full-attention layer (layer 3) advanced the KV cache to 5 positions.
         assert_eq!(cache.offset(), 5);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::assembled_forward_produces_finite_logits");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn flat_text_and_wrapped_qwen35_match_target_and_mtp() {
         let wrapped_json = cfg_json_mtp();
         let flat_json = wrapped_json["text_config"].clone();
@@ -2807,9 +3474,12 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(values(&wrapped_draft), values(&flat_draft));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::flat_text_and_wrapped_qwen35_match_target_and_mtp");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn mtp_loads_all_frozen_components_and_executes() {
         let cfg = Qwen35Config::from_json(&cfg_json_mtp()).unwrap();
         let model = Qwen35Model::from_weights(
@@ -2837,9 +3507,12 @@ pub(crate) mod tests {
         for x in logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>() {
             assert!(x.is_finite());
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::mtp_loads_all_frozen_components_and_executes");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn mtp_prefill_projects_only_last_row_and_warm_cache_matches_full() {
         let cfg = Qwen35Config::from_json(&cfg_json_mtp()).unwrap();
         let model = Qwen35Model::from_weights(
@@ -2915,7 +3588,11 @@ pub(crate) mod tests {
                 [&seed_positions, &seed_positions, &seed_positions],
             )
             .unwrap();
-        let all_mtp_logits = model.lm_head.forward(&full_mtp_hidden).unwrap();
+        let all_mtp_logits = model
+            .language_head()
+            .unwrap()
+            .forward(&full_mtp_hidden)
+            .unwrap();
         let expected_mtp_last = all_mtp_logits
             .take_axis(Array::from_slice(&[1i32], &[1]), 1)
             .unwrap();
@@ -2944,6 +3621,8 @@ pub(crate) mod tests {
             .mtp_step(&next, &previous, &mut warm_mtp_cache, 3)
             .unwrap();
         assert_eq!(as_f32(&warm_next), as_f32(&full_next));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::mtp_prefill_projects_only_last_row_and_warm_cache_matches_full");
     }
 
     /// E2 (sc-24432 feature-end review): a config declaring a native head the snapshot stores
@@ -3026,6 +3705,8 @@ pub(crate) mod tests {
                 top_p: 1.0,
                 top_k: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },
@@ -3049,6 +3730,7 @@ pub(crate) mod tests {
     /// signs, one Gated DeltaNet and one attention layer) the fused rotation leaves the prefill
     /// logits bit-identical and the greedy tokens unchanged.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prism_greedy_tokens_and_logits_are_unchanged_by_the_fused_rotation() {
         use crate::decode::{generate, CancelFlag};
         use crate::primitives::prism::tests::with_unfused_rotation;
@@ -3082,10 +3764,12 @@ pub(crate) mod tests {
                 .count()
         };
         let (fused, fused_routes) = mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+            crate::model_inference_device::record_model_inference_device();
             recording_rotation_routes(run)
         });
         let (unfused, unfused_routes) =
             mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+                crate::model_inference_device::record_model_inference_device();
                 recording_rotation_routes(|| with_unfused_rotation(run))
             });
         assert!(
@@ -3111,12 +3795,15 @@ pub(crate) mod tests {
             "fixture must not be degenerate: {:?}",
             fused.2
         );
+
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::prism_greedy_tokens_and_logits_are_unchanged_by_the_fused_rotation");
     }
 
     /// Story sc-24444 AC2 (model level): a companion MTP head attached to a Prism target borrows
     /// the packed embedding and `lm_head`, drafts, and every depth emits exactly the target's
     /// greedy tokens.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prism_target_with_a_companion_head_drafts_and_keeps_greedy_tokens() {
         use crate::decode::{generate, generate_qwen35_mtp, CancelFlag};
 
@@ -3159,12 +3846,15 @@ pub(crate) mod tests {
             assert_eq!(speculative.tokens, plain.tokens, "depth {depth}");
             assert!(stats.proposed > 0, "depth {depth}: the head drafted");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::prism_target_with_a_companion_head_drafts_and_keeps_greedy_tokens");
     }
 
     /// Story sc-24444 AC2 / E2: a head whose geometry disagrees with the target is refused with a
     /// reason naming each disagreement, and the target is left exactly as it was — still loaded,
     /// no predictor, same greedy tokens.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_mismatched_companion_head_is_refused_by_name_and_leaves_the_target_intact() {
         use crate::decode::{generate, CancelFlag};
 
@@ -3275,6 +3965,8 @@ pub(crate) mod tests {
             err.contains("already carries its own MTP predictor"),
             "{err}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_mismatched_companion_head_is_refused_by_name_and_leaves_the_target_intact");
     }
 
     /// Story sc-24444: a companion head's RMSNorm vectors follow the zero-centred Qwen3.8
@@ -3312,6 +4004,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn mtp_generation_covers_verification_rollback_stop_and_cancel() {
         use crate::decode::{
             generate, generate_qwen35_mtp, generate_speculative, CancelFlag, ConstraintMask,
@@ -3359,6 +4052,8 @@ pub(crate) mod tests {
                 top_p: 1.0,
                 top_k: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },
@@ -3463,6 +4158,8 @@ pub(crate) mod tests {
                 top_p: 0.95,
                 top_k: 20,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },
@@ -3504,9 +4201,12 @@ pub(crate) mod tests {
             "a permissive transactional constraint must preserve stochastic p/q sampling"
         );
         assert_eq!(sampled_constraint.accepted, constrained_sampled.tokens);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::mtp_generation_covers_verification_rollback_stop_and_cancel");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn multimodal_mtp_seed_uses_fused_embeddings_and_matches_text_equivalent() {
         use std::time::Instant;
 
@@ -3540,6 +4240,8 @@ pub(crate) mod tests {
                 top_p: 1.0,
                 top_k: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },
@@ -3661,9 +4363,12 @@ pub(crate) mod tests {
                 .any(|(text, fused)| (text - fused).abs() > 1.0e-5),
             "an encoded visual row must change the MTP seed distribution"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::multimodal_mtp_seed_uses_fused_embeddings_and_matches_text_equivalent");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn decode_after_prefill_advances_cache() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model = Qwen35Model::from_weights(
@@ -3686,6 +4391,8 @@ pub(crate) mod tests {
         for x in logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>() {
             assert!(x.is_finite());
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::decode_after_prefill_advances_cache");
     }
 
     /// The whole Gated DeltaNet layer, validated against a numeric oracle from the exact
@@ -3700,6 +4407,7 @@ pub(crate) mod tests {
     /// oracles (sc-7627); cross-token cache carry by `prefill_equals_stepwise_decode`. Regenerate the
     /// fixture with `/tmp/gen_s1.py` (see story sc-7629).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn deltanet_layer_matches_qwen3_5_reference() {
         let json: serde_json::Value =
             serde_json::from_str(include_str!("testdata/qwen35_deltanet_oracle.json")).unwrap();
@@ -3722,6 +4430,7 @@ pub(crate) mod tests {
         let mk = |k: &str, shape: &[i32]| Array::from_slice(&arr(k), shape);
         let proj = |k: &str, shape: &[i32]| Projection::load(mk(k, shape), None).unwrap();
         let layer = GatedDeltaNet {
+            precision: PrecisionProfile::Native,
             in_proj_qkv: proj("in_proj_qkv", &[conv_dim, h]),
             in_proj_z: proj("in_proj_z", &[value_dim, h]),
             in_proj_a: proj("in_proj_a", &[hv, h]),
@@ -3766,6 +4475,8 @@ pub(crate) mod tests {
         // The cache advanced and holds both the recurrent and conv state for a follow-on decode step.
         assert_eq!(cache.offset(), s);
         assert!(cache.conv_state.is_some() && cache.ssm_state.is_some());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::deltanet_layer_matches_qwen3_5_reference");
     }
 
     /// A model-level invariant the hybrid cache must satisfy: prefilling a sequence in one pass must
@@ -3774,6 +4485,7 @@ pub(crate) mod tests {
     /// production bf16 path (MLX-vs-MLX, so no f32-GEMM-floor concern) — this is what guarantees the
     /// short conv and delta recurrence resume correctly at decode time on real weights.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prefill_equals_stepwise_decode() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let w = synthetic_weights(&cfg);
@@ -3824,6 +4536,10 @@ pub(crate) mod tests {
             md < 5e-2,
             "prefill vs stepwise last-token logits diverged: max abs diff {md}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::prefill_equals_stepwise_decode"
+        );
     }
 
     /// AC (sc-24443): the Gated DeltaNet dispatch (fused Metal kernel for prefill, decode and
@@ -3832,8 +4548,10 @@ pub(crate) mod tests {
     /// steps after it — on the production bf16 path, with every logit within one bf16 ULP of the
     /// reference's. Runs on a GPU stream (the kernel's route) whatever the process default device.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn greedy_tokens_match_the_ops_reference_recurrence() {
         mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), greedy_tokens_match_on_the_gpu);
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::greedy_tokens_match_the_ops_reference_recurrence");
     }
 
     fn greedy_tokens_match_on_the_gpu() {
@@ -3925,6 +4643,8 @@ pub(crate) mod tests {
                 prompt.len()
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        crate::model_inference_device::record_model_inference_device();
     }
 
     /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape, scaled down): 6 experts, top-2, with a shared
@@ -4030,6 +4750,7 @@ pub(crate) mod tests {
     /// (Qwen3.5) expert layouts of the same seeded non-zero weights give identical target logits
     /// and identical `mtp_step` logits / hidden state.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_moe_mtp_head_runs_identically_in_both_expert_layouts() {
         let cfg = Qwen35Config::from_json(&cfg_json_moe_mtp()).unwrap();
         let fused = load_moe_mtp(&cfg, seeded_moe_mtp_tensors(&cfg, true));
@@ -4061,6 +4782,8 @@ pub(crate) mod tests {
         assert_eq!(a.0, b.0, "target hidden");
         assert_eq!(a.1, b.1, "MTP hidden");
         assert_eq!(a.2, b.2, "MTP logits");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_moe_mtp_head_runs_identically_in_both_expert_layouts");
     }
 
     /// sc-24438 AC2 (b): the MTP predictor layer's FFN, built by the loader under the
@@ -4068,6 +4791,7 @@ pub(crate) mod tests {
     /// fused layout and the per-expert split of it), reproduces the oracle's output — the check
     /// [`moe_ffn_matches_qwen3_5_moe_reference`] holds the block itself to, at bf16 tolerance.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_mtp_layer_ffn_matches_the_moe_reference() {
         let json: serde_json::Value =
             serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
@@ -4129,8 +4853,11 @@ pub(crate) mod tests {
             let model = load_moe_mtp(&cfg, m);
             let ffn = &model.mtp.as_ref().unwrap().layers[0].ffn;
             let got = host_f32(
-                &ffn.forward(&Array::from_slice(&arr("x"), &[1, 1, h]))
-                    .unwrap(),
+                &ffn.forward(
+                    &Array::from_slice(&arr("x"), &[1, 1, h]),
+                    PrecisionProfile::Native,
+                )
+                .unwrap(),
             );
             let exp = arr("expected_output");
             let md = got
@@ -4146,6 +4873,8 @@ pub(crate) mod tests {
                  exp {exp:?}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::the_mtp_layer_ffn_matches_the_moe_reference");
     }
 
     /// The MoE FFN block, validated against a numeric oracle from the exact
@@ -4154,6 +4883,7 @@ pub(crate) mod tests {
     /// as the loader (`experts.gate_up_proj` → stacked gate / up banks). Single token (S=1) so
     /// MLX runs the exact GEMV path and the match is tight; regenerate with `/tmp/gen_moe.py`.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn moe_ffn_matches_qwen3_5_moe_reference() {
         let json: serde_json::Value =
             serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
@@ -4217,9 +4947,12 @@ pub(crate) mod tests {
             md < 2e-4,
             "moe ffn vs reference: max abs diff {md}\n got {got:?}\n exp {exp:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moe_ffn_matches_qwen3_5_moe_reference");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn moe_model_forward_and_prefill_equals_stepwise() {
         let cfg = Qwen35Config::from_json(&cfg_json_moe()).unwrap();
         assert!(cfg.moe.is_some());
@@ -4283,6 +5016,8 @@ pub(crate) mod tests {
             md < 5e-2,
             "MoE prefill vs stepwise diverged: max abs diff {md}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moe_model_forward_and_prefill_equals_stepwise");
     }
 
     /// sc-24442 AC2: the Qwen35 hybrid decoder (gated full attention with partial M-RoPE
@@ -4290,6 +5025,7 @@ pub(crate) mod tests {
     /// the pre-sc-24442 one, compared in-process — head dims 8 (unserved), 64 (full kernel) and 256
     /// (vector-only) × GQA 2 / GQA 8 × prompts inside one tile, across tiles, and across many.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn greedy_tokens_match_pre_sc24442_sdpa_routing() {
         use crate::primitives::attention::route_override::{
             assert_greedy_matches_pre_sc24442, GreedyComparison,
@@ -4354,6 +5090,8 @@ pub(crate) mod tests {
             seen.compared_steps > seen.tie_steps,
             "most greedy steps must be decisive enough to compare: {seen:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::greedy_tokens_match_pre_sc24442_sdpa_routing");
     }
 
     fn synthetic_model() -> (Qwen35Config, Qwen35Model) {
@@ -4602,6 +5340,7 @@ pub(crate) mod tests {
     /// interleaved M-RoPE collapses to 1D and the embeds path is the same compute. This is the gate
     /// that the multimodal hook doesn't perturb the (verified) text decoder.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn decode_from_embeds_text_only_equals_decode_logits() {
         let (_cfg, model) = synthetic_model();
         let toks = [1i32, 7, 3, 42, 9, 2];
@@ -4636,6 +5375,8 @@ pub(crate) mod tests {
             md == 0.0,
             "embeds text path must equal token-id path bit-for-bit; max abs diff {md}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::decode_from_embeds_text_only_equals_decode_logits");
     }
 
     /// The splice hook overwrites exactly the image-token rows (in order) with the feature rows and
@@ -4681,6 +5422,7 @@ pub(crate) mod tests {
     /// and (b) **differ** from the same prefill with the fusion disabled (empty taps) — proving the
     /// tapped features are consumed in the decoder layers, not computed and dropped.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn deepstack_fused_path_consumes_features_and_differs() {
         let (cfg, model) = synthetic_model();
         let img = 49i32;
@@ -4799,6 +5541,8 @@ pub(crate) mod tests {
             trait_vs_inherent, 0.0,
             "VlmDecode::prefill_with_deepstack must equal the inherent fused path (cache downcast seam)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::deepstack_fused_path_consumes_features_and_differs");
     }
 
     #[test]
@@ -4905,6 +5649,7 @@ pub(crate) mod tests {
     /// Smoke: the full image+text path (embed → splice features → M-RoPE positions →
     /// decode_logits_from_embeds) runs end to end and yields finite `[1, vocab]` logits.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn image_text_decode_from_embeds_runs() {
         let (cfg, model) = synthetic_model();
         let img = 49i32; // within the synthetic vocab (50) so embed gather is in-bounds
@@ -4933,6 +5678,8 @@ pub(crate) mod tests {
             .as_slice::<f32>()
             .iter()
             .all(|x| x.is_finite()));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::image_text_decode_from_embeds_runs");
     }
 
     // ---- The DeltaNet checkpoint ring at the model level (sc-24435). ----
@@ -4967,6 +5714,7 @@ pub(crate) mod tests {
     /// drops the rest by offset — after which the next forward's logits are exactly those of a
     /// cache that never saw the dropped tokens.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_checkpoint_window_over_several_forwards_truncates_to_each_position() {
         let model = crate::decode::engine::tests::qwen35(false);
         let p = RING_PROMPT.len() as i32;
@@ -5015,6 +5763,8 @@ pub(crate) mod tests {
         // The kept states came out of a 3-token forward, the reference's out of single-token
         // ones: equal up to the multi-row projection's bf16 rounding.
         assert!(max < 5e-2, "restored-from-verify logits differ by {max}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_checkpoint_window_over_several_forwards_truncates_to_each_position");
     }
 
     /// `truncate` is refused (typed, cache untouched) outside the checkpoint window — with no
@@ -5022,6 +5772,7 @@ pub(crate) mod tests {
     /// next forward records nothing and drops it. `0` is a reset and the current length a no-op,
     /// through the [`KvCache`] trait too.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn truncate_outside_the_checkpoint_window_is_refused_and_closes_it() {
         let model = crate::decode::engine::tests::qwen35(false);
         let p = RING_PROMPT.len() as i32;
@@ -5059,12 +5810,15 @@ pub(crate) mod tests {
         assert_eq!(cache.offset(), p + 4);
         KvCache::truncate(&mut cache, 0).unwrap();
         assert_eq!(cache.offset(), 0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::truncate_outside_the_checkpoint_window_is_refused_and_closes_it");
     }
 
     /// sc-24435: a checkpoint window armed for `2` tokens refuses a 3-token forward (typed)
     /// before any layer runs — the offset, every DeltaNet state and the attention KV are as they
     /// were, so the next forward's logits are a never-refused cache's.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_forward_past_the_armed_window_is_refused_untouched() {
         let model = crate::decode::engine::tests::qwen35(false);
         let p = RING_PROMPT.len() as i32;
@@ -5091,6 +5845,8 @@ pub(crate) mod tests {
         let got = step_each(&model, &mut cache, &[4, 11]);
         let want = step_each(&model, &mut prefilled(&model, &RING_PROMPT), &[4, 11]);
         assert_eq!(got, want);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_forward_past_the_armed_window_is_refused_untouched");
     }
 
     /// E7 (sc-24435): the checkpoint ring's resident memory — the window's start state plus every
@@ -5101,6 +5857,7 @@ pub(crate) mod tests {
     /// `truncate(offset())` — closes the window, so the next forward records nothing and releases
     /// the ring.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_checkpoint_ring_footprint_is_what_admission_prices() {
         let model = crate::decode::engine::tests::qwen35(false);
         for width in [1usize, 4, 8] {
@@ -5143,12 +5900,15 @@ pub(crate) mod tests {
             released(&mut cache, live, &format!("verify {width}"));
         }
         assert!(model.checkpoint_ring_bytes(8) > model.checkpoint_ring_bytes(4));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::the_checkpoint_ring_footprint_is_what_admission_prices");
     }
 
     /// sc-20671: stored quantized projections whose `scales`/`biases` are F16 (the mlx-community
     /// convention) must not promote the BF16 activations to F32 — the hidden states and the full-
     /// attention K/V stay in the compute dtype. The BF16-scale twin is the unchanged control.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn stored_quantized_scales_keep_activations_and_kv_in_compute_dtype() {
         use crate::primitives::quant::QuantizedLinear;
         let mut value = cfg_json();
@@ -5213,5 +5973,64 @@ pub(crate) mod tests {
             }
             assert_eq!(attention_layers, 1);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::stored_quantized_scales_keep_activations_and_kv_in_compute_dtype");
+    }
+}
+
+#[cfg(test)]
+mod hidden_block_hook_cpu_tests {
+    use super::*;
+    #[test]
+    fn noop_preserves_values_and_hooks_observe_completed_boundaries() {
+        let mut boundaries = Vec::new();
+        let output = walk_hidden_blocks(
+            1u32,
+            [2, 3, 4],
+            |v, n| Ok(v + n),
+            |index, v| {
+                boundaries.push((index, *v));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(output, 10);
+        assert_eq!(boundaries, [(0, 1), (1, 3), (2, 6), (3, 10)]);
+        assert_eq!(
+            walk_hidden_blocks(1u32, [2, 3, 4], |v, n| Ok(v + n), |_, _| Ok(())).unwrap(),
+            output
+        );
+    }
+    #[test]
+    fn typed_cancel_prevents_later_blocks_and_initial_cancel_runs_none() {
+        let mut forwards = 0;
+        let result = walk_hidden_blocks(
+            0,
+            [1, 2, 3],
+            |v, n| {
+                forwards += 1;
+                Ok(v + n)
+            },
+            |index, _| {
+                if index == 1 {
+                    Err(Error::Canceled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert_eq!(forwards, 1);
+        let result = walk_hidden_blocks(
+            0,
+            [1, 2, 3],
+            |v, n| {
+                forwards += 1;
+                Ok(v + n)
+            },
+            |_, _| Err(Error::Canceled),
+        );
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert_eq!(forwards, 1);
     }
 }

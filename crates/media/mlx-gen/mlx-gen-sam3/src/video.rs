@@ -1537,5 +1537,9 @@ mod tests {
             0.0,
             "detector masks must be bit-identical between two-pass and single-pass",
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED video::tests::single_backbone_pass_matches_two_pass"
+        );
     }
 }

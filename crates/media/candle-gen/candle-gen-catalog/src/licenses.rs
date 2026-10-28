@@ -107,8 +107,8 @@ use candle_gen::gen_core::ProviderComponents;
 /// Sorted so a reader can find an id and a future diff stays local; the emitted manifest sorts
 /// independently, so this ordering carries no meaning beyond readability.
 ///
-/// One row per **distinct** id: fifteen Candle trainer ids (`krea_2_raw`, `lens`, `sdxl`,
-/// `qwen_image_2_1`, `iris_3b`, `z_image_turbo`, …) are also generator ids and load the same checkpoints, so
+/// One row per **distinct** id: sixteen Candle trainer ids (`krea_2_raw`, `lens`, `sdxl`,
+/// `qwen_image_2_1`, `iris_3b`, `flux3_klein_base`, `z_image_turbo`, …) are also generator ids and load the same checkpoints, so
 /// they appear once — a duplicate `provider_id` is rejected by the conformance gate. `krea_2_control`
 /// and `ltx_2_3` are trainer-**only** ids with no Candle generator, which is why they appear here
 /// and in no generator list.
@@ -196,6 +196,29 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "flux2_klein_9b",
         components: &["flux2_klein_9b"],
+    },
+    // --- flux3 -------------------------------------------------------------------------------
+    // The distilled FLUX 3 Image Klein package (DiT + autoencoder under the FLUX Kommunity
+    // License) and its bundled `text_encoder/`, which is byte-identical (LFS sha256 of both
+    // shards) to the pinned Qwen/Qwen3-VL-4B-Instruct snapshot, so that row is loaded too. The
+    // same complete row the MLX twin's catalog names (sc-26234 / sc-26235), including the optional
+    // separately provisioned Apache-2.0 prompt upsampler (sc-26238); the census is a component union,
+    // not a claim that the optional model is required or downloaded for every request.
+    ProviderComponents {
+        provider_id: "flux3_klein",
+        components: &[
+            "flux3_image_klein",
+            "qwen3_vl_4b_instruct",
+            "flux3_image_klein_pup",
+        ],
+    },
+    ProviderComponents {
+        provider_id: "flux3_klein_base",
+        components: &[
+            "flux3_image_klein_base",
+            "qwen3_vl_4b_instruct",
+            "flux3_image_klein_pup",
+        ],
     },
     // --- ideogram ---------------------------------------------------------------------------
     // Both DiTs, the VAE and the text encoder ship in one gated snapshot. `ideogram_4_turbo`
@@ -308,6 +331,16 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "mochi_1",
         components: &["mochi_1_preview", "t5_v1_1_xxl"],
     },
+    // Frozen MOSS Base transformer uses the SFT bundled encoder/tokenizer/VAE.
+    // Optional DMD is disclosed from actual execution assets, never asserted for ordinary runs.
+    ProviderComponents {
+        provider_id: "moss_image_base",
+        components: &["moss_image_base", "moss_image_sft"],
+    },
+    ProviderComponents {
+        provider_id: "moss_image_sft",
+        components: &["moss_image_sft"],
+    },
     // --- qwen-image -------------------------------------------------------------------------
     // Candle registers the base id only; control and edit are bespoke and unregistered. The VAE
     // rides the repository row, the Qwen2.5-VL tower is a pinned hole, and the fast tokenizer is
@@ -417,6 +450,13 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "sensenova_u1_8b_fast",
         components: &["sensenova_u1_8b_mot", "sensenova_u1_8b_mot_loras"],
+    },
+    // --- supra2 (sc-24214) --------------------------------------------------------------------
+    // The locally converted denoiser bundle plus the pinned Flan-T5-Base encoder and SD VAE — the
+    // MLX twin's row, unchanged.
+    ProviderComponents {
+        provider_id: "supra2_img",
+        components: &["supra2_img", "flan_t5_base", "sd_vae_ft_mse"],
     },
     // --- svd --------------------------------------------------------------------------------
     // UNet, temporal-decoder VAE and the ViT-H image encoder all ship in one ungated snapshot.
@@ -588,7 +628,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 55);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 60);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -620,10 +660,11 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            65,
-            "65 distinct Candle provider ids: 58 generators (qwen_image_2_1_turbo joined in \
-             sc-25901) + 19 trainers (15 of them also \
-             generator ids — iris_3b joined in sc-25686; iris_3b_restore, sc-25688, is the \
+            70,
+            "70 distinct Candle provider ids: 63 generators (qwen_image_2_1_turbo joined in \
+             sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239, MOSS Base/SFT in sc-26323, \
+             supra2_img in sc-24214) + 20 trainers (16 of them also \
+             generator ids — iris_3b joined in sc-25686, flux3_klein_base in sc-26240; iris_3b_restore, sc-25688, is the \
              transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
              1 transform (iris_3b_restore, sc-25683)"
         );
@@ -776,6 +817,8 @@ mod tests {
                 "chroma1_base",
                 "chroma1_flash",
                 "chroma1_hd",
+                "flux3_klein",
+                "flux3_klein_base",
                 "iris_3b",
                 "iris_3b_depth",
                 "iris_3b_restore",
@@ -783,6 +826,8 @@ mod tests {
                 "ltx_2_3_distilled",
                 "minimax_h3",
                 "mochi_1",
+                "moss_image_base",
+                "moss_image_sft",
                 "qwen_image_2_1",
                 "qwen_image_2_1_turbo",
                 "sana_1600m",
@@ -792,6 +837,7 @@ mod tests {
                 "seedvr2_7b",
                 "sensenova_u1_8b",
                 "sensenova_u1_8b_fast",
+                "supra2_img",
                 "svd_xt",
                 "wan2_2_i2v_14b",
                 "wan2_2_t2v_14b",
@@ -869,6 +915,7 @@ mod tests {
             "controlnet_openpose_sdxl_1_0",
             // Caller-selected add-ons, deliberately out of scope for a list with no optionality.
             "anima_official_loras",
+            "moss_image_sft_8_steps_dmd",
             "hyper_sd_flux1_dev_8steps_lora",
             "ip_adapter",
             "kolors_ip_adapter_plus",

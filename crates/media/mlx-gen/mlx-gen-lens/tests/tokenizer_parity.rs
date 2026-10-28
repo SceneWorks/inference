@@ -68,4 +68,6 @@ fn lens_tokenizer_matches_reference() {
             got.len()
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tokenizer_parity::lens_tokenizer_matches_reference");
 }

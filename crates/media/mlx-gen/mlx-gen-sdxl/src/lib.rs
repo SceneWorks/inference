@@ -22,6 +22,7 @@ pub(crate) mod block_stream;
 pub mod config;
 pub mod convert;
 pub mod inpaint;
+pub mod ios_pricing;
 pub mod ip_adapter;
 pub mod ldm;
 pub mod loader;
@@ -45,6 +46,8 @@ mod quantum_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod default_path_golden;
 pub mod sampler;
+/// Shared host-only SDXL sampling resolution, replay and logical lifetime facts.
+pub mod sampling;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
 pub(crate) mod test_metal_guard;
@@ -64,6 +67,11 @@ pub mod vision_encoder;
 /// following test in the same (single-threaded) binary is unaffected.
 #[cfg(test)]
 pub(crate) mod test_device {
+    pub(crate) fn record_model_inference_device() {
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+    }
+
     pub(crate) struct DeviceGuard(mlx_rs::Device);
 
     impl Drop for DeviceGuard {
@@ -98,9 +106,9 @@ pub use loader::{
 };
 pub use long_prompt::ChunkedTokens;
 pub use model::{
-    conditioning_window_count, descriptor, load, load_concrete, load_from_ldm_file,
-    snapshot_component_footprint, DecodeQualitySample, Sdxl, LDM_TOKENIZER_COMPONENT, MODEL_ID,
-    PID_BACKBONE, SIZE_MULTIPLE,
+    conditioning_window_count, conditioning_window_count_with_source_capacity, descriptor, load,
+    load_concrete, load_from_ldm_file, snapshot_component_footprint, DecodeQualitySample, Sdxl,
+    LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
 };
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,
@@ -498,3 +506,7 @@ mod sc2963 {
         super::RETAINED_SILU_GLUE.with(|slot| *slot.borrow_mut() = None);
     }
 }
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

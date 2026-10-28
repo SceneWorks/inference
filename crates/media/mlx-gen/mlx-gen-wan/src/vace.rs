@@ -1351,6 +1351,7 @@ mod tests {
     /// mask. The product's padded context drives the forward bit-identically to that reference, and
     /// the pre-fix unpadded context does not.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn vace_text_context_is_the_reference_zero_padded_context() {
         let (weights, config) = tiny_vace_fixture();
         let dit = WanVaceTransformer::from_weights(&weights, &config, Dtype::Float32).unwrap();
@@ -1379,6 +1380,8 @@ mod tests {
             max_abs_diff(&unpadded, &expected) > 1e-4,
             "zero padding must reach the cross-attention (projected pads are not zeros)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vace::tests::vace_text_context_is_the_reference_zero_padded_context");
     }
 
     /// SC-20686: Wan2.1-VACE-1.3B ships its main blocks F32 beside BF16 VACE blocks. The attn/FFN/VACE
@@ -1387,6 +1390,7 @@ mod tests {
     /// embedders, modulation tables, the affine `norm2`, the output projection — stays f32. A bf16
     /// forward then tracks the all-f32 reference within bf16 tolerance.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn mixed_checkpoint_projections_load_at_the_compute_dtype() {
         let (f32_weights, config) = tiny_vace_fixture();
         let mut mixed = tiny_vace_fixture().0;
@@ -1439,9 +1443,12 @@ mod tests {
             error <= 0.05 * scale.max(1.0),
             "bf16 forward drifted: {error} (scale {scale})"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vace::tests::mixed_checkpoint_projections_load_at_the_compute_dtype");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn vace_range_split_matches_per_step_resident_selection() {
         let (weights, config) = tiny_vace_fixture();
         let low = WanVaceTransformer::from_weights(&weights, &config, Dtype::Float32).unwrap();
@@ -1514,6 +1521,8 @@ mod tests {
             resident.as_slice::<f32>(),
             "range split changed VACE denoise numerics"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vace::tests::vace_range_split_matches_per_step_resident_selection");
     }
 
     #[test]

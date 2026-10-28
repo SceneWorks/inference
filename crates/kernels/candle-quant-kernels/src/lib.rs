@@ -45,8 +45,18 @@
 //! Device code is behind `cfg(feature = "cuda")`; a CPU or Metal build compiles the codec, the
 //! capability floors, the kernel descriptors and the fused primitives' input checks only.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod cublaslt;
 pub mod decode_attention;
+pub mod flux3_quant;
 pub mod fused_decode;
 pub mod moe_gemv;
 pub mod nvfp4;
@@ -116,6 +126,9 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     FUSED_DECODE_SRC,
     NVFP4_GEMV_SRC,
     cublaslt::NVFP4_QUANT_SRC,
+    cublaslt::W4A8_DEQUANT_SOURCE,
+    cublaslt::KITCHEN_INT8_SOURCE,
+    flux3_quant::FLUX3_QUANT_SRC,
     DECODE_ATTENTION_SRC,
     MOE_GEMV_SRC,
     yue2_stable_conv::YUE2_STABLE_CONV_SRC,

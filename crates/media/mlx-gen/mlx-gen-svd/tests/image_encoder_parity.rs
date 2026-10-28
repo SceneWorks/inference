@@ -57,4 +57,6 @@ fn svd_image_encoder_matches_transformers() {
     // ~0.2% peak-rel is f32 cross-backend accumulation over the 32-layer ViT (matmul/sdpa ordering),
     // not a structural gap — and image_embeds only feed cross-attn conditioning (robust to it).
     assert!(rel < 3e-3, "image_embeds peak-rel {rel} (max|Δ| {max_abs})");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED image_encoder_parity::svd_image_encoder_matches_transformers");
 }

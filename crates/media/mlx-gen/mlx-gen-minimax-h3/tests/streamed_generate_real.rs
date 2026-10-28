@@ -272,4 +272,6 @@ fn the_streamed_request_peak_is_the_declared_one() {
         &stages.values().copied().collect::<Vec<_>>(),
         request_peak,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED streamed_generate_real::the_streamed_request_peak_is_the_declared_one");
 }

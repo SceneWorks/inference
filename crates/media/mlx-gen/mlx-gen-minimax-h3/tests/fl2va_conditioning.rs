@@ -245,6 +245,7 @@ fn all_four_conditioning_shapes_build_and_differ() {
 
 /// Every shape produces conditioning rows of the size its layout reserved, and the two-image shape
 /// really carries two distinct anchors rather than one image twice.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn every_shape_produces_the_rows_its_layout_reserves() {
     use KeyframeAnchor::{First, Last};
@@ -290,6 +291,8 @@ fn every_shape_produces_the_rows_its_layout_reserves() {
         delta > MUTATION_FLOOR,
         "the two anchor blocks are identical ({delta:.3e}) — the second keyframe is being ignored"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fl2va_conditioning::every_shape_produces_the_rows_its_layout_reserves");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -301,6 +304,7 @@ fn every_shape_produces_the_rows_its_layout_reserves() {
 /// Two structurally different probe images must produce measurably different conditioning rows. An
 /// implementation that encoded a constant, the canvas mean, or pure noise would produce the same
 /// rows for both and fail here.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_conditioning_latent_depends_on_the_keyframe_pixels() {
     let a = condition_rows(&[KeyframeAnchor::First], &[0]).unwrap();
@@ -325,6 +329,8 @@ fn the_conditioning_latent_depends_on_the_keyframe_pixels() {
         "the same keyframe encoded differently twice ({same:.3e}); the conditioning seed is not \
          fixed, so the difference measured above is not attributable to the image"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fl2va_conditioning::the_conditioning_latent_depends_on_the_keyframe_pixels");
 }
 
 /// **Claim 2: the conditioning latent reaches the model's input.**
@@ -332,6 +338,7 @@ fn the_conditioning_latent_depends_on_the_keyframe_pixels() {
 /// Runs the real joint loop with a recording model and asserts the video row block it was handed
 /// begins with exactly the conditioning rows. The mutation is a different keyframe: what the model
 /// sees must change with it.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_model_sees_the_keyframe_in_its_video_rows() {
     let anchors = vec![KeyframeAnchor::First];
@@ -396,6 +403,8 @@ fn the_model_sees_the_keyframe_in_its_video_rows() {
         seen_a.shape()[1],
         "the keyframe run must carry exactly {n} more video rows than the t2va one"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fl2va_conditioning::the_model_sees_the_keyframe_in_its_video_rows");
 }
 
 /// **Claim 3: the anchors survive the loop untouched.**
@@ -404,6 +413,7 @@ fn the_model_sees_the_keyframe_in_its_video_rows() {
 /// only the tail. If it wrote the whole block, the anchors would be denoised away over the run —
 /// the conditioning would be destroyed by the very loop that is supposed to honour it, and the
 /// output would still be plausible video.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_anchors_are_never_denoised() {
     let anchors = vec![KeyframeAnchor::First, KeyframeAnchor::Last];
@@ -460,6 +470,8 @@ fn the_anchors_are_never_denoised() {
         mlx_gen_minimax_h3::KEYFRAME_NOISE_AUG,
         "the anchors are held at 0.999, not at the video timestep"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fl2va_conditioning::the_anchors_are_never_denoised");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -524,6 +536,7 @@ fn the_keyframe_path_does_not_soften_the_geometry_gate() {
 
 /// A keyframe is fitted to the request's canvas before **either** path sees it, so the vision tower
 /// and the VAE encode cannot disagree about what the image is.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn keyframes_are_fitted_to_the_canvas_before_encoding() {
     let odd = probe_image(37, 0);
@@ -549,6 +562,8 @@ fn keyframes_are_fitted_to_the_canvas_before_encoding() {
         latent.mean().shape()[3],
         KEYFRAME_EDGE as i32 / encode_fixture_config(3).patch_size
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fl2va_conditioning::keyframes_are_fitted_to_the_canvas_before_encoding");
 }
 
 /// The vision-block rows a keyframe contributes to the PROMPT stream are tagged **video**, not

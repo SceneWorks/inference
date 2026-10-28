@@ -171,6 +171,7 @@ fn t2v_expert_swap_drops_the_peak_and_preserves_output() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_A14B_MODEL_DIR to a converted T2V-A14B snapshot tier dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in t2v_expert_swap_drops_the_peak_and_preserves_output; see preceding skip diagnostic");
             return;
         }
     };
@@ -190,6 +191,8 @@ fn t2v_expert_swap_drops_the_peak_and_preserves_output() {
         vec![],
     );
     assert_swap_wins("t2v", &res, &seq);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED expert_swap_footprint::t2v_expert_swap_drops_the_peak_and_preserves_output");
 }
 
 #[test]
@@ -199,6 +202,7 @@ fn t2v_curated_heun_swap_drops_the_peak_and_preserves_output() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_A14B_MODEL_DIR to a converted T2V-A14B snapshot tier dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in t2v_curated_heun_swap_drops_the_peak_and_preserves_output; see preceding skip diagnostic");
             return;
         }
     };
@@ -219,6 +223,8 @@ fn t2v_curated_heun_swap_drops_the_peak_and_preserves_output() {
         vec![],
     );
     assert_swap_wins("t2v-curated-heun", &res, &seq);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED expert_swap_footprint::t2v_curated_heun_swap_drops_the_peak_and_preserves_output");
 }
 
 #[test]
@@ -228,6 +234,7 @@ fn i2v_expert_swap_drops_the_peak_and_preserves_output() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_I2V_MODEL_DIR to a converted I2V-A14B snapshot tier dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in i2v_expert_swap_drops_the_peak_and_preserves_output; see preceding skip diagnostic");
             return;
         }
     };
@@ -254,4 +261,6 @@ fn i2v_expert_swap_drops_the_peak_and_preserves_output() {
         reference(),
     );
     assert_swap_wins("i2v", &res, &seq);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED expert_swap_footprint::i2v_expert_swap_drops_the_peak_and_preserves_output");
 }

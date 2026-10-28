@@ -225,6 +225,7 @@ fn upsample_matches_the_reference_sample_for_sample() {
 
 /// `x + sin²(α·x) / (β + 1e-9)` with log-scale α/β, and the proof that the log scale matters.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn snakebeta_matches_the_reference() {
     let f = fixture();
     let x = f.tensor("in.snake.x");
@@ -252,10 +253,14 @@ fn snakebeta_matches_the_reference() {
         gap > MUTATION_FLOOR,
         "the two snake scales agree (rel {gap:.3e}); the golden cannot pin snake_logscale"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::snakebeta_matches_the_reference");
 }
 
 /// The composed `Activation1d`: 2× up → SnakeBeta → 2× down.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn activation1d_matches_the_reference() {
     let f = fixture();
     let filter = f.tensor("const.resample.up_filter");
@@ -267,6 +272,11 @@ fn activation1d_matches_the_reference() {
     );
     let got = act.forward(&f.tensor("in.act1d.x")).expect("forward");
     assert_parity(&got, &f.tensor("out.act1d.y"), UNIT_TOL, "Activation1d");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::activation1d_matches_the_reference"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -276,6 +286,7 @@ fn activation1d_matches_the_reference() {
 /// One `AMPBlock1` in isolation: three dilated conv pairs, six anti-aliased activations paired
 /// `activations[::2]` / `activations[1::2]`, residual after each pair.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn amp_block_matches_the_reference() {
     let f = fixture();
     let block = AmpBlock1::from_weights(
@@ -289,11 +300,15 @@ fn amp_block_matches_the_reference() {
     .expect("amp block");
     let got = block.forward(&f.tensor("in.amp.x")).expect("forward");
     assert_parity(&got, &f.tensor("out.amp.y"), BLOCK_TOL, "AMPBlock1");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::amp_block_matches_the_reference");
 }
 
 /// The activation pairing is observable: swapping `activations.0` with `activations.1` moves the
 /// block's output. A port that paired them `0,1,2` / `3,4,5` loads every tensor and looks correct.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn amp_block_activation_pairing_is_load_bearing() {
     let f = fixture();
     let x = f.tensor("in.amp.x");
@@ -327,11 +342,15 @@ fn amp_block_activation_pairing_is_load_bearing() {
         "swapping two activations did not change the block (rel {peak:.3e}); the pairing is not \
          being exercised"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::amp_block_activation_pairing_is_load_bearing");
 }
 
 /// The BigVGAN vocoder alone: `conv_pre`, 7 upsample stages each averaging 3 AMP blocks,
 /// `activation_post`, `conv_post`, and the final CLAMP (not tanh).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn bigvgan_matches_the_reference() {
     let f = fixture();
     let cfg = audio_fixture_config();
@@ -341,10 +360,14 @@ fn bigvgan_matches_the_reference() {
     // 4 tokens x the real 800x hop.
     assert_eq!(got.dims(), &[1, 1, 3200]);
     assert_parity(&got, &f.tensor("out.bigvgan.y"), TOL, "BigVGAN");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::bigvgan_matches_the_reference");
 }
 
 /// `DacAudioVAE.decode` = `dec_in_proj` → BigVGAN. Reference-exact: no de-normalization.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn decode_matches_the_reference() {
     let f = fixture();
     let got = vae(&f).decode(&f.tensor("in.decode.z")).expect("decode");
@@ -359,10 +382,14 @@ fn decode_matches_the_reference() {
         TOL,
         "DacAudioVAE.decode",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::decode_matches_the_reference");
 }
 
 /// De-normalization, stereo folding and the interleave, each against its own golden.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn stereo_decode_matches_the_reference() {
     let f = fixture();
     let vae = vae(&f);
@@ -389,10 +416,16 @@ fn stereo_decode_matches_the_reference() {
         TOL,
         "AudioTrack interleave",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::stereo_decode_matches_the_reference"
+    );
 }
 
 /// The `gen-core` output contract: 32 kHz, 2 channels, interleaved f32, no stems.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn audio_track_is_the_gen_core_contract() {
     let f = fixture();
     let track = vae(&f)
@@ -405,11 +438,17 @@ fn audio_track_is_the_gen_core_contract() {
     assert_eq!(track.samples.len(), 4 * 800 * 2);
     assert!(track.samples.iter().all(|s| s.is_finite()));
     assert!(track.samples.iter().all(|s| (-1.0..=1.0).contains(s)));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::audio_track_is_the_gen_core_contract"
+    );
 }
 
 /// The interleave is `L0, R0, L1, R1, …` — and the two channels are GENUINELY different, so a
 /// mono-duplicating port cannot pass.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn stereo_channels_are_independent_and_interleaved() {
     let f = fixture();
     let vae = vae(&f);
@@ -457,11 +496,15 @@ fn stereo_channels_are_independent_and_interleaved() {
     let (sl, sr) = swapped.split_at(3200);
     assert_eq!(sl, right, "swapping inputs must swap outputs exactly");
     assert_eq!(sr, left);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::stereo_channels_are_independent_and_interleaved");
 }
 
 /// A latent packed `[B, latent_channels, output_channels, T]` — the plausible transposition — is
 /// rejected rather than decoded into nonsense, and so is a batch the interleave cannot represent.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn mis_packed_latents_are_rejected() {
     let f = fixture();
     let vae = vae(&f);
@@ -477,6 +520,9 @@ fn mis_packed_latents_are_rejected() {
         vae.decode_stereo(&two).is_ok(),
         "but decode_stereo batches fine"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::mis_packed_latents_are_rejected");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -593,6 +639,7 @@ fn fixture_is_not_degenerate() {
 /// without changing the output, it is not wired into the graph and the parity test is not
 /// covering it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_weight_is_load_bearing() {
     let f = fixture();
     let z = f.tensor("in.decode.z");
@@ -655,12 +702,16 @@ fn every_weight_is_load_bearing() {
         "replacing a stored resampler filter did not change the decode ({peak:.3e}); the buffers \
          are not being used"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::every_weight_is_load_bearing");
 }
 
 /// The three `sample_rate`-branch knobs that appear in no config file and leave no tensor behind
 /// must each change the decode — otherwise nothing in this crate would notice a port that took
 /// BigVGAN's upstream defaults.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn config_only_knobs_are_load_bearing() {
     let f = fixture();
     let z = f.tensor("in.decode.z");
@@ -699,11 +750,17 @@ fn config_only_knobs_are_load_bearing() {
         DType::F32
     )
     .is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::config_only_knobs_are_load_bearing"
+    );
 }
 
 /// De-normalization is APPLIED, and applied per channel — the pipeline path must differ from the
 /// reference-exact one, and the closed form must hold element-wise.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn latent_denormalization_is_applied_per_channel() {
     let f = fixture();
     let vae = vae(&f);
@@ -747,6 +804,9 @@ fn latent_denormalization_is_applied_per_channel() {
         peak > MUTATION_FLOOR,
         "decode ignored latents_mean/std ({peak:.3e})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_parity::latent_denormalization_is_applied_per_channel");
 }
 
 /// The shipped decoder weights are bf16 while the joint denoiser's scheduler emits f32 latents.

@@ -391,6 +391,7 @@ fn the_descriptor_advertises_what_is_actually_installable() {
 /// *Mutation that reds this:* swapping the `scales` and `biases` reads inside
 /// `candle_gen::quant::lin_gs`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_packed_loader_reconstructs_the_dense_projection() {
     use candle_core::{DType, Device, Tensor};
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
@@ -526,6 +527,9 @@ fn the_packed_loader_reconstructs_the_dense_projection() {
             tier.dir_name()
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tiers::the_packed_loader_reconstructs_the_dense_projection");
 }
 
 /// **A mislabelled tier is caught by reading the weights, not the label.**
@@ -563,6 +567,7 @@ fn a_mislabelled_tier_is_refused_by_reading_the_packed_shapes() {
 /// A packed tier loads through the production catalog path and renders. Both the DiT **and** the
 /// Qwen3 tower are packed in an installed tier, so this exercises the packed-detect seam on both.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn packed_tiers_reload_and_render_within_the_declared_bars() {
     let tmp = tempfile::tempdir().unwrap();
     let req = request(EDGE, EDGE);
@@ -596,6 +601,9 @@ fn packed_tiers_reload_and_render_within_the_declared_bars() {
         mean_by_tier[1],
         mean_by_tier[0]
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tiers::packed_tiers_reload_and_render_within_the_declared_bars");
 }
 
 // ── memory strategies ────────────────────────────────────────────────────────────────────────────
@@ -603,6 +611,7 @@ fn packed_tiers_reload_and_render_within_the_declared_bars() {
 /// Staged residency is an execution decision, not a numeric one: dropping the tower between
 /// conditioning and denoise reproduces the resident render **exactly**, at every tier.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn staged_residency_preserves_the_resident_output_at_every_tier() {
     let tmp = tempfile::tempdir().unwrap();
     let req = request(EDGE, EDGE);
@@ -613,6 +622,9 @@ fn staged_residency_preserves_the_resident_output_at_every_tier() {
             "{label}: staged residency must be byte-identical to the resident render"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tiers::staged_residency_preserves_the_resident_output_at_every_tier");
 }
 
 // ── the shared seam on the LOADED generator ─────────────────────────────────────────────────────
@@ -690,6 +702,7 @@ fn loads_renderer(events: &[candle_gen::gen_core::Progress]) -> bool {
 /// an implemented optimized rung); reverting `generate_impl` from `run_request_scoped(stage, …)`
 /// to `run(…)` (the staged request then renders warm and emits no `Loading` event).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_staged_selection_through_the_generator_trait_stages_and_preserves_the_resident_output() {
     use candle_gen::gen_core::{MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy};
 
@@ -773,6 +786,9 @@ fn a_staged_selection_through_the_generator_trait_stages_and_preserves_the_resid
         assert_eq!(again.pixels, resident.pixels, "{label}");
         assert!(!loads_renderer(&again_events), "{label}: {again_events:?}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tiers::a_staged_selection_through_the_generator_trait_stages_and_preserves_the_resident_output");
 }
 
 /// **Bounded decode through the trait** (sc-24114): a `BoundedDecode` selection inside the
@@ -786,6 +802,7 @@ fn a_staged_selection_through_the_generator_trait_stages_and_preserves_the_resid
 /// *Mutation that reds this:* removing the `begin_memory_strategy_request` override, or the
 /// scope no longer writing `GenerationMemory::tile_vae_decode` (the tiling assertions fail).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_bounded_decode_selection_through_the_generator_trait_tiles_the_decode() {
     use candle_gen::gen_core::{MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy};
 
@@ -841,6 +858,9 @@ fn a_bounded_decode_selection_through_the_generator_trait_tiles_the_decode() {
         24.0,
         2.0,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tiers::a_bounded_decode_selection_through_the_generator_trait_tiles_the_decode");
 }
 
 /// A selection **outside** the published decode domain is refused at the trait's safety check —
@@ -888,6 +908,7 @@ fn an_unpublished_decode_geometry_is_refused_through_the_generator_trait() {
 /// *Mutation that reds this:* `load_text_encoder_from_at` building its `VarBuilder` at a literal
 /// `DType::F32` again (the f16 tower's dtype and conditioning come back f32).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_text_encoder_is_materialized_at_the_compute_dtype() {
     use candle_core::IndexOp;
     use candle_core::{DType, Device};
@@ -958,6 +979,9 @@ fn the_text_encoder_is_materialized_at_the_compute_dtype() {
         &f32_embeds.i(0).unwrap(),
         3e-2,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tiers::the_text_encoder_is_materialized_at_the_compute_dtype");
 }
 
 /// **A CPU device materializes every component at f32 on every build**, a CUDA/Metal one
@@ -999,6 +1023,7 @@ fn a_cpu_device_materializes_every_component_at_f32_on_every_build() {
 /// Bounded (tiled) decode is a memory lever, not a quality one: the head-once/tail-tiled decode
 /// reproduces the untiled decode to within seam-blend noise, at every tier.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn bounded_decode_preserves_the_untiled_output_at_every_tier() {
     let tmp = tempfile::tempdir().unwrap();
     for (label, root, quant) in tier_cases(tmp.path()) {
@@ -1022,6 +1047,9 @@ fn bounded_decode_preserves_the_untiled_output_at_every_tier() {
             2.0,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tiers::bounded_decode_preserves_the_untiled_output_at_every_tier");
 }
 
 /// The memory contract prices the tier actually on disk: a packed tier's components are smaller than

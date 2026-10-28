@@ -70,7 +70,14 @@ impl QwenVlTextConfig {
     /// Read from a `qwen2_5_vl_config.json` (the sc-5144 snapshot copy of `mllm/config.json`). The
     /// text fields live at the top level; `head_dim = hidden_size / num_attention_heads`.
     pub fn from_config_json(path: &std::path::Path) -> Result<Self> {
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
+        let v: serde_json::Value =
+            serde_json::from_slice(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(path),
+"crates/media/mlx-gen/mlx-gen-bernini/src/qwen2_5_vl.rs::from_config_json::std::fs::read@3425",
+ArtifactInput,
+path,
+|__model_input_path| std::fs::read(__model_input_path)
+)?)
             .map_err(|e| Error::Msg(format!("parse {}: {e}", path.display())))?;
         let i = |k: &str, d: i64| v.get(k).and_then(serde_json::Value::as_i64).unwrap_or(d) as i32;
         let f = |k: &str, d: f64| v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(d) as f32;

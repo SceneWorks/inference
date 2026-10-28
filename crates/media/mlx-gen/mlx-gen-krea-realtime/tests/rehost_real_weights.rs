@@ -297,11 +297,22 @@ fn emit_tier_sharded_and_validate_every_shard() {
 
     let cfg = KreaRealtimeConfig::krea_realtime_14b();
     // The sanitized source, to compare each shard against as it lands.
-    let source = sanitize_krea_realtime_transformer(read_native(&src)).expect("sanitize source");
+    let source = sanitize_krea_realtime_transformer(mlx_gen::gen_core::__model_input_choose!(
+        read_native(&src),
+        mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+            if delete_after_check {
+                "krea-realtime/rehost-source/delete-planned"
+            } else {
+                "krea-realtime/rehost-source/retain-planned"
+            },
+            || read_native(&src),
+        )
+    ))
+    .expect("sanitize source");
 
     let t0 = std::time::Instant::now();
     let mut checked = 0usize;
-    let shards =
+    let shards = mlx_gen::gen_core::__model_input_choose!(
         convert_krea_realtime_tier_sharded(&src, &dst, quant, &cfg, budget, &mut |shard| {
             let bytes = std::fs::metadata(shard).expect("shard metadata").len();
             // Verify BEFORE the shard can be handed off/removed — this is the only per-shard
@@ -322,8 +333,37 @@ fn emit_tier_sharded_and_validate_every_shard() {
                 }
             );
             Ok(())
-        })
-        .unwrap_or_else(|e| panic!("sharded emit of the {label} tier: {e}"));
+        }),
+        mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+            if delete_after_check {
+                "krea-realtime/rehost-source/delete-planned"
+            } else {
+                "krea-realtime/rehost-source/retain-planned"
+            },
+            || convert_krea_realtime_tier_sharded(&src, &dst, quant, &cfg, budget, &mut |shard| {
+                let bytes = std::fs::metadata(shard).expect("shard metadata").len();
+                // Verify BEFORE the shard can be handed off/removed — this is the only per-shard
+                // integrity check in the delete-as-you-go flow.
+                let compared = check_shard_against_source(shard, &source, &label, quant);
+                checked += compared;
+                if delete_after_check {
+                    std::fs::remove_file(shard).expect("remove the checked shard");
+                }
+                println!(
+                    "  shard {} ({:.2} GB): {compared} tensor(s) exact vs. source{}",
+                    shard.file_name().unwrap().to_string_lossy(),
+                    bytes as f64 / 1e9,
+                    if delete_after_check {
+                        " — checked, then deleted"
+                    } else {
+                        ""
+                    }
+                );
+                Ok(())
+            }),
+        )
+    )
+    .unwrap_or_else(|e| panic!("sharded emit of the {label} tier: {e}"));
 
     // On a **dense** tier every tensor is comparable, so the per-shard check must have covered the
     // whole audited inventory — not merely "something". That is what makes the delete-as-you-go flow
@@ -370,7 +410,13 @@ fn emit_tier_sharded_and_validate_every_shard() {
     // Hold the sharded tier to the SAME bar as the single-file one: it must load back through the
     // production path at the tier it claims, and reconstruct the source weights.
     let dir = dst.join(mlx_gen_krea_realtime::TRANSFORMER_DIR);
-    let raw = read_native(&dir);
+    let raw = mlx_gen::gen_core::__model_input_choose!(
+        read_native(&dir),
+        mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+            "krea-realtime/rehost-retained-output",
+            || read_native(&dir),
+        )
+    );
     assert_eq!(
         raw.len(),
         AUDIT_TENSOR_COUNT + if quant.is_some() { 800 } else { 0 },
@@ -385,6 +431,8 @@ fn emit_tier_sharded_and_validate_every_shard() {
         "{label}: the sharded tier must resolve to the requested quantization"
     );
     check_tier_reconstructs_the_source(&src, &dir, &label, quant);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED rehost_real_weights::emit_tier_sharded_and_validate_every_shard");
 }
 
 /// Do `a` and `b` differ in **any** element? Element-wise `!=` reduced with `any`, staying in the
@@ -419,7 +467,14 @@ fn check_shard_against_source(
     quant: Option<(i32, i32)>,
 ) -> usize {
     let packed_tier = quant.is_some();
-    let w = Weights::from_file(shard).expect("read the shard back");
+    let w = mlx_gen::gen_core::__model_input_choose!(
+        Weights::from_file(shard),
+        mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+            "krea-realtime/rehost-shard-readback",
+            || Weights::from_file(shard),
+        )
+    )
+    .expect("read the shard back");
     let mut names: Vec<&str> = w.keys().collect();
     names.sort();
 
@@ -600,6 +655,8 @@ fn stock_wan_companions_load_at_the_krea_geometry() {
         context.shape(),
         z.shape()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED rehost_real_weights::stock_wan_companions_load_at_the_krea_geometry");
 }
 
 /// Largest absolute element of `a`, as f32.

@@ -275,7 +275,9 @@ impl TimestepEmbedder {
 #[derive(Debug, Clone)]
 pub struct AdaLayerNormOut {
     norm: RmsNorm,
-    linear: LinearBias,
+    /// `None` on a pruned topology, whose final projection is the reduced
+    /// [`crate::dit::pruned_adaln::PrunedFinalProjection`] instead.
+    linear: Option<LinearBias>,
     hidden_size: i32,
 }
 
@@ -298,12 +300,29 @@ impl AdaLayerNormOut {
         let dtype = norm_weight.dtype();
         Ok(Self {
             norm: RmsNorm::from_weights(w, &format!("{prefix}.norm"), cfg.final_norm_eps, dtype)?,
-            linear: LinearBias::from_weights(
+            linear: Some(LinearBias::from_weights(
                 w,
                 &format!("{prefix}.linear"),
                 cfg.time_embed_dim,
                 2 * cfg.hidden_size,
-            )?,
+            )?),
+            hidden_size: cfg.hidden_size,
+        })
+    }
+
+    /// Load only `{prefix}.norm` — the shared RMSNorm a **pruned** model keeps — leaving `linear`
+    /// `None`. The reduced final projection is owned by
+    /// [`crate::dit::pruned_adaln::PrunedFinalProjection`].
+    pub fn from_weights_norm_only(
+        w: &mut Weights,
+        prefix: &str,
+        cfg: &MiniMaxH3DitConfig,
+    ) -> Result<Self> {
+        let norm_weight = w.require(&format!("{prefix}.norm.weight"))?.clone();
+        let dtype = norm_weight.dtype();
+        Ok(Self {
+            norm: RmsNorm::from_weights(w, &format!("{prefix}.norm"), cfg.final_norm_eps, dtype)?,
+            linear: None,
             hidden_size: cfg.hidden_size,
         })
     }
@@ -317,14 +336,25 @@ impl AdaLayerNormOut {
 
     /// Device bytes held.
     pub fn nbytes(&self) -> usize {
-        self.linear.nbytes()
+        self.linear.as_ref().map_or(0, LinearBias::nbytes)
     }
 
     /// Project the timestep embedding into `(shift, scale)` — **shift is the FIRST half**.
     ///
     /// As in [`crate::dit::block::AdaLnProjection::forward`], the activation runs at `temb`'s own
     /// (float32) precision and only its result is cast to the projection's dtype.
+    ///
+    /// A pruned topology has no full `linear`; its reduced projection is
+    /// [`crate::dit::pruned_adaln::PrunedFinalProjection`] and this method refuses rather than
+    /// falling back.
     pub fn modulation(&self, temb: &Array) -> Result<NormOutModulation> {
+        let linear = self.linear.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "minimax-h3 dit norm_out: this is a pruned topology; modulate through \
+                 PrunedFinalProjection, not the full norm_out.linear"
+                    .into(),
+            )
+        })?;
         let s = temb.shape();
         if s.len() != 2 {
             return Err(Error::Msg(format!(
@@ -332,7 +362,7 @@ impl AdaLayerNormOut {
                  {s:?}"
             )));
         }
-        let projected = self.linear.forward(&silu(temb)?)?;
+        let projected = linear.forward(&silu(temb)?)?;
         Ok(NormOutModulation {
             shift: slice_axis(&projected, 1, 0, self.hidden_size)?,
             scale: slice_axis(&projected, 1, self.hidden_size, 2 * self.hidden_size)?,
@@ -343,7 +373,6 @@ impl AdaLayerNormOut {
     ///
     /// `timestep_indices` is one entry per row of the packed sequence — the row's index into the
     /// **distinct timestep** table, with no modality factor. Bounds-checked here because MLX
-    /// gathers out of bounds silently.
     pub fn apply(
         &self,
         x: &Array,
@@ -422,8 +451,9 @@ pub struct DitProjections {
     /// The text encoder's 5120-wide context → the residual stream. bfloat16, and it runs **before**
     /// the token refiner.
     pub context_embedder: LinearBias,
-    /// `time_proj` + `time_embedder`. **float32**.
-    pub time_embedder: TimestepEmbedder,
+    /// `time_proj` + `time_embedder`. **float32**. `None` on a pruned topology, whose coordinates
+    /// come straight from the `adaln_t_table`.
+    pub time_embedder: Option<TimestepEmbedder>,
     /// The packed sequence's final modulated norm. bfloat16.
     pub norm_out: AdaLayerNormOut,
     /// The residual stream → the video patch dim. **float32**.
@@ -458,8 +488,49 @@ impl DitProjections {
                 cfg.text_dim,
                 cfg.hidden_size,
             )?,
-            time_embedder: TimestepEmbedder::from_weights(w, "time_embedder", cfg)?,
+            time_embedder: Some(TimestepEmbedder::from_weights(w, "time_embedder", cfg)?),
             norm_out: AdaLayerNormOut::from_weights(w, "norm_out", cfg)?,
+            proj_out: LinearBias::from_weights(
+                w,
+                "proj_out",
+                cfg.hidden_size,
+                cfg.video_patch_dim(),
+            )?,
+            audio_proj_out: LinearBias::from_weights(
+                w,
+                "audio_proj_out",
+                cfg.hidden_size,
+                cfg.audio_in_channels,
+            )?,
+        })
+    }
+
+    /// Load the **pruned** surface: the five unchanged input/output projections and `norm_out.norm`,
+    /// with `time_embedder` left `None` and `norm_out.linear` reduced. The table and reduced
+    /// projections themselves are owned by [`crate::dit::pruned_adaln::PrunedAdaLnRuntime`].
+    pub fn from_weights_pruned(w: &mut Weights, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
+        cfg.validate()?;
+        Ok(Self {
+            proj_in: LinearBias::from_weights(
+                w,
+                "proj_in",
+                cfg.video_patch_dim(),
+                cfg.hidden_size,
+            )?,
+            audio_proj_in: LinearBias::from_weights(
+                w,
+                "audio_proj_in",
+                cfg.audio_in_channels,
+                cfg.hidden_size,
+            )?,
+            context_embedder: LinearBias::from_weights(
+                w,
+                "context_embedder",
+                cfg.text_dim,
+                cfg.hidden_size,
+            )?,
+            time_embedder: None,
+            norm_out: AdaLayerNormOut::from_weights_norm_only(w, "norm_out", cfg)?,
             proj_out: LinearBias::from_weights(
                 w,
                 "proj_out",
@@ -492,7 +563,10 @@ impl DitProjections {
         self.proj_in.nbytes()
             + self.audio_proj_in.nbytes()
             + self.context_embedder.nbytes()
-            + self.time_embedder.nbytes()
+            + self
+                .time_embedder
+                .as_ref()
+                .map_or(0, TimestepEmbedder::nbytes)
             + self.norm_out.nbytes()
             + self.proj_out.nbytes()
             + self.audio_proj_out.nbytes()
@@ -613,6 +687,7 @@ mod tests {
     /// Built over a projection whose two halves are trivially distinguishable, so a reversed
     /// reading cannot pass.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn norm_out_modulation_is_shift_then_scale() {
         // A 1-row temb of width 1 projected to [shift = 5, scale = 0.5] by an identity-ish linear.
         let mut w = Weights::empty();
@@ -649,5 +724,7 @@ mod tests {
         n.apply(&x, &m, &Array::from_slice(&[0i32], &[1])).unwrap();
         assert!(n.apply(&x, &m, &Array::from_slice(&[1i32], &[1])).is_err());
         assert!(n.apply(&x, &m, &Array::from_slice(&[-1i32], &[1])).is_err());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED dit::heads::tests::norm_out_modulation_is_shift_then_scale");
     }
 }

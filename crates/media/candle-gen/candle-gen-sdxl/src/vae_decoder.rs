@@ -85,7 +85,7 @@ impl Norm {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        Ok(self.dense.forward(xs)?)
+        __model_proof_output!(Ok(self.dense.forward(xs)?))
     }
 
     fn global(&self, xs: &Tensor) -> Result<GlobalGroupNorm> {

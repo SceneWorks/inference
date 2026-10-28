@@ -146,4 +146,9 @@ fn comfyui_zimage_renders_in_place() {
         let _ = buf.save(&out_path);
         eprintln!("[comfyui] wrote {}", out_path.display());
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED comfyui_real_weights::comfyui_zimage_renders_in_place"
+    );
 }

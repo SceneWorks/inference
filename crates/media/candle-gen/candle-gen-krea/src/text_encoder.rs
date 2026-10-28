@@ -185,6 +185,12 @@ impl KreaTeConfig {
                 }
             }
         }
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::record_reader_paths(
+            "candle-gen-krea::text_encoder::KreaTeConfig::from_snapshot",
+            candle_gen::gen_core::model_input_proof::InputRole::Configuration,
+            &[&path],
+        );
         Ok(cfg)
     }
 }
@@ -792,6 +798,7 @@ mod tests {
     /// dtype-mismatch error, so this test goes RED — it is not a tautology that passes with the win
     /// ripped out. Runs on CPU precisely because the compute never leaves f32 (no bf16 matmul).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn bf16_store_forward_is_bit_identical_to_f32_store() {
         let tmp = tempfile::tempdir().unwrap();
         let (map, cfg) = tiny_te_map();
@@ -826,12 +833,16 @@ mod tests {
         assert_eq!(w_f32.get(q).unwrap().dtype(), DType::F32);
 
         let _ = std::fs::remove_file(&path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::bf16_store_forward_is_bit_identical_to_f32_store");
     }
 
     /// The **image-grounded edit** path (`forward_with_images`) is bit-identical under the bf16 store
     /// too (sc-12828): same shared decoder layers as the text path (`forward_upcast`), plus the
     /// vision-embed splice + deepstack injection on the f32 hidden. Pins that the edit encode stays f32.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn bf16_store_grounded_is_bit_identical_to_f32_store() {
         let tmp = tempfile::tempdir().unwrap();
         let (map, mut cfg) = tiny_te_map();
@@ -872,5 +883,8 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::bf16_store_grounded_is_bit_identical_to_f32_store");
     }
 }

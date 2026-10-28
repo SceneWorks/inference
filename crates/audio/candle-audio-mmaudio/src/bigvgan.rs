@@ -182,9 +182,15 @@ impl Conv1d {
     }
 
     fn forward(&self, x: &Tensor) -> CResult<Tensor> {
-        let y = x.conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?;
+        let y = __model_proof_output!(x.conv1d(
+            &self.weight,
+            self.padding,
+            self.stride,
+            self.dilation,
+            1
+        ))?;
         match &self.bias {
-            Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1))?),
+            Some(b) => __model_proof_output!(y.broadcast_add(&b.reshape((1, b.dim(0)?, 1))?)),
             None => Ok(y),
         }
     }
@@ -215,8 +221,15 @@ impl ConvTranspose1d {
     }
 
     fn forward(&self, x: &Tensor) -> CResult<Tensor> {
-        let y = x.conv_transpose1d(&self.weight, self.padding, 0, self.stride, 1, 1)?;
-        y.broadcast_add(&self.bias.reshape((1, self.bias.dim(0)?, 1))?)
+        let y = __model_proof_output!(x.conv_transpose1d(
+            &self.weight,
+            self.padding,
+            0,
+            self.stride,
+            1,
+            1
+        ))?;
+        __model_proof_output!(y.broadcast_add(&self.bias.reshape((1, self.bias.dim(0)?, 1))?))
     }
 }
 
@@ -297,7 +310,7 @@ impl Activation1d {
     fn forward(&self, x: &Tensor) -> CResult<Tensor> {
         let x = self.upsample(x)?;
         let x = snakebeta(&x, &self.alpha, &self.beta)?;
-        self.downsample(&x)
+        __model_proof_output!(self.downsample(&x))
     }
 }
 

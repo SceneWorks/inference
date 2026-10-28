@@ -160,6 +160,7 @@ fn profile() -> gen_core_testkit::Profile {
 
 /// The Turbo-shaped fixture loads under the Turbo id and passes the shared generator contract
 /// (validate honesty, progress, cancellation, seeded determinism) under both residency policies.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn turbo_fixture_passes_the_generator_contract() {
     let tmp = tempfile::tempdir().unwrap();
@@ -174,6 +175,8 @@ fn turbo_fixture_passes_the_generator_contract() {
         assert_eq!(generator.descriptor().id, TURBO);
         gen_core_testkit::conformance(|| load(TURBO, &root, policy).unwrap(), &profile());
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo::turbo_fixture_passes_the_generator_contract");
 }
 
 /// No step count, and the saved length named explicitly, both denoise over exactly the
@@ -182,6 +185,7 @@ fn turbo_fixture_passes_the_generator_contract() {
 /// *Mutations that red this:* a 40-step default on the Turbo id; running the saved sigmas through
 /// the base shift/stretch; reading a hardcoded list instead of the snapshot's (the second half
 /// rewrites the snapshot's `sample_sigmas` and the render must follow).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn turbo_default_and_eight_steps_render_over_the_snapshots_saved_sigmas() {
     let tmp = tempfile::tempdir().unwrap();
@@ -199,8 +203,14 @@ fn turbo_default_and_eight_steps_render_over_the_snapshots_saved_sigmas() {
     // The schedule is the SNAPSHOT's: a different saved list is a different render, of that
     // list's own length.
     let index = root.join("model_index.json");
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(
+        &mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read(&index),
+            mlx_gen::gen_core::model_input_proof::read_configuration_bytes(&index)
+        )
+        .unwrap(),
+    )
+    .unwrap();
     value["sample_sigmas"] = serde_json::json!([1.0, 0.9, 0.6, 0.3]);
     std::fs::write(&index, serde_json::to_string(&value).unwrap()).unwrap();
     let generator = load(TURBO, &root, OffloadPolicy::Resident).unwrap();
@@ -211,6 +221,8 @@ fn turbo_default_and_eight_steps_render_over_the_snapshots_saved_sigmas() {
         render_over(&root, &request(None), &[1.0, 0.9, 0.6, 0.3, 0.0])
     );
     assert_ne!(rewritten, want);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo::turbo_default_and_eight_steps_render_over_the_snapshots_saved_sigmas");
 }
 
 /// The prefix KV cache (sc-25903) on the Turbo schedule: over the snapshot's eight saved sigmas the
@@ -225,6 +237,7 @@ fn turbo_default_and_eight_steps_render_over_the_snapshots_saved_sigmas() {
 /// *Mutations that red this:* the denoise loop not keeping the extracted cache (every evaluation
 /// then re-extracts instead of decoding from it); the generator ignoring a `Cached` selection
 /// (its report says `prefill`).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn turbo_saved_sigma_render_extracts_once_then_decodes_from_the_prefix_cache() {
     let tmp = tempfile::tempdir().unwrap();
@@ -276,6 +289,8 @@ fn turbo_saved_sigma_render_extracts_once_then_decodes_from_the_prefix_cache() {
         .expect("the path is reported on every render");
     assert_eq!(ran.path, PrefixKvCacheMode::Cached);
     assert_eq!(ran.cache_bytes, report.kv_cache_bytes as u64);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo::turbo_saved_sigma_render_extracts_once_then_decodes_from_the_prefix_cache");
 }
 
 /// Twelve steps on the Turbo id denoise over the 12-point resample of the saved curve
@@ -284,6 +299,7 @@ fn turbo_saved_sigma_render_extracts_once_then_decodes_from_the_prefix_cache() {
 ///
 /// *Mutation that reds this:* ignoring the requested step count on the Turbo id (the render
 /// would equal the 8-step one and report 8 steps).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn turbo_twelve_steps_render_over_the_resample_and_the_base_id_is_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
@@ -314,6 +330,8 @@ fn turbo_twelve_steps_render_over_the_resample_and_the_base_id_is_unchanged() {
     assert_eq!(steps, every_step(12));
     assert_eq!(base_pixels, render_over(&base_root, &req, &base_sigmas));
     assert_ne!(base_sigmas, resampled);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo::turbo_twelve_steps_render_over_the_resample_and_the_base_id_is_unchanged");
 }
 
 /// Each id refuses the other checkpoint's snapshot with a typed error that names the mismatch
@@ -353,8 +371,14 @@ fn each_id_refuses_the_other_checkpoints_snapshot_by_name() {
     mlx_gen::quant::copy_dir(&tiny_snapshot(), &malformed).unwrap();
     for bad in [serde_json::json!([]), serde_json::json!("1.0, 0.5")] {
         let index = malformed.join("model_index.json");
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &mlx_gen::gen_core::__model_input_choose!(
+                std::fs::read(&index),
+                mlx_gen::gen_core::model_input_proof::read_configuration_bytes(&index)
+            )
+            .unwrap(),
+        )
+        .unwrap();
         value["sample_sigmas"] = bad.clone();
         std::fs::write(&index, serde_json::to_string(&value).unwrap()).unwrap();
         let err = refusal(BASE, &malformed);
@@ -369,8 +393,14 @@ fn each_id_refuses_the_other_checkpoints_snapshot_by_name() {
     }
     // An explicit null is "no saved schedule": the base snapshot still loads under the base id.
     let index = malformed.join("model_index.json");
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(
+        &mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read(&index),
+            mlx_gen::gen_core::model_input_proof::read_configuration_bytes(&index)
+        )
+        .unwrap(),
+    )
+    .unwrap();
     value["sample_sigmas"] = serde_json::Value::Null;
     std::fs::write(&index, serde_json::to_string(&value).unwrap()).unwrap();
     assert!(load(BASE, &malformed, OffloadPolicy::Resident).is_ok());
@@ -407,6 +437,7 @@ fn each_id_refuses_the_other_checkpoints_snapshot_by_name() {
 /// shared seam the base id uses: a curated scheduler is built over an unshifted flow model
 /// (`mu = 0`) and **replaces** the saved sigmas, a name outside the menu is refused, and a curated
 /// sampler integrates the saved sigmas.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn turbo_honours_the_curated_scheduler_and_sampler_axes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -438,6 +469,8 @@ fn turbo_honours_the_curated_scheduler_and_sampler_axes() {
     let (heun, steps) = render(generator.as_ref(), &sampler);
     assert_eq!(steps.last(), Some(&(8, 8)));
     assert_ne!(heun, native);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo::turbo_honours_the_curated_scheduler_and_sampler_axes");
 }
 
 /// A `model_index.json` that is present but does not parse is refused under BOTH ids, each under
@@ -549,6 +582,7 @@ fn the_base_trainer_refuses_a_turbo_snapshot_by_name() {
 ///
 /// *Mutation that reds this:* dropping `labelled` from `QwenImage21::validate` or `generate`
 /// (the Turbo message keeps the base label).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_shared_refusal_names_the_engine_id_it_was_reached_through() {
     use mlx_gen::gen_core::Conditioning;
@@ -587,4 +621,6 @@ fn a_shared_refusal_names_the_engine_id_it_was_reached_through() {
             "the Turbo refusal is the base one under the Turbo label: {message}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo::a_shared_refusal_names_the_engine_id_it_was_reached_through");
 }

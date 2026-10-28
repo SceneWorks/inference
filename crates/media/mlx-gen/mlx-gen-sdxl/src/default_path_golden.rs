@@ -282,38 +282,65 @@ fn run_default_paths() -> Vec<(&'static str, Array)> {
     let shape = [1, (HEIGHT / 2) as i32, (WIDTH / 2) as i32, 4];
     let prior = euler.sample_prior(&shape).unwrap();
     let sampler = AncestralEuler::new(&euler, STEPS, max_time).unwrap();
-    let t2i = denoise(
-        &Denoiser::new(&unet, &sampler),
-        prior,
-        &cond,
-        &pooled,
-        &ids,
-        CFG,
-        &cancel,
-        &mut |_| {},
+    let t2i = (
+        crate::test_device::record_model_inference_device(),
+        denoise(
+            &Denoiser::new(&unet, &sampler),
+            prior,
+            &cond,
+            &pooled,
+            &ids,
+            CFG,
+            &cancel,
+            &mut |_| {},
+        ),
     )
-    .unwrap();
-    let t2i_pixels = pixels(&decode_image(&vae, &t2i, None).unwrap());
+        .1
+        .unwrap();
+    let t2i_pixels = pixels(
+        &(
+            crate::test_device::record_model_inference_device(),
+            decode_image(&vae, &t2i, None),
+        )
+            .1
+            .unwrap(),
+    );
 
     // img2img: the whole-image init encode, noised to `max_time · strength`.
-    let init = encode_init_latents(&vae, &init_image(), WIDTH, HEIGHT).unwrap();
+    let init = (
+        crate::test_device::record_model_inference_device(),
+        encode_init_latents(&vae, &init_image(), WIDTH, HEIGHT),
+    )
+        .1
+        .unwrap();
     mlx_rs::random::seed(SEED + 1).unwrap();
     let eff = (STEPS as f32 * STRENGTH) as usize;
     let start = max_time * STRENGTH;
     let x_t = euler.add_noise(&init, start).unwrap();
     let sampler = AncestralEuler::new(&euler, eff, start).unwrap();
-    let i2i = denoise(
-        &Denoiser::new(&unet, &sampler),
-        x_t,
-        &cond,
-        &pooled,
-        &ids,
-        CFG,
-        &cancel,
-        &mut |_| {},
+    let i2i = (
+        crate::test_device::record_model_inference_device(),
+        denoise(
+            &Denoiser::new(&unet, &sampler),
+            x_t,
+            &cond,
+            &pooled,
+            &ids,
+            CFG,
+            &cancel,
+            &mut |_| {},
+        ),
     )
-    .unwrap();
-    let i2i_pixels = pixels(&decode_image(&vae, &i2i, None).unwrap());
+        .1
+        .unwrap();
+    let i2i_pixels = pixels(
+        &(
+            crate::test_device::record_model_inference_device(),
+            decode_image(&vae, &i2i, None),
+        )
+            .1
+            .unwrap(),
+    );
     // Row-major f32 copies: an output may be a strided view (the encode's channel gather), whose
     // raw buffer is not in logical order.
     let f32 = |a: Array| Array::from_slice(&host(&a), a.shape());
@@ -365,6 +392,7 @@ fn cpu_child(name: &str) -> bool {
             "--exact",
             &format!("default_path_golden::{name}"),
             "--nocapture",
+            "--ignored",
         ])
         .env(CHILD, "1")
         .status()
@@ -379,12 +407,17 @@ fn golden() -> Weights {
 
 /// The Mac default txt2img / img2img outputs match the pre-epic (`91ffb4a81`) golden. With
 /// `SDXL_GOLDEN_WRITE=<path>` set it writes that golden instead (how it was produced, at the base).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn default_txt2img_and_img2img_match_the_base_rev_golden() {
     if !cpu_child("default_txt2img_and_img2img_match_the_base_rev_golden") {
         return;
     }
-    let outputs = run_default_paths();
+    let outputs = (
+        crate::test_device::record_model_inference_device(),
+        run_default_paths(),
+    )
+        .1;
     if let Some(path) = std::env::var_os("SDXL_GOLDEN_WRITE") {
         let named: Vec<(&str, &Array)> = outputs.iter().map(|(k, a)| (*k, a)).collect();
         Array::save_safetensors(named, None, std::path::Path::new(&path)).unwrap();
@@ -411,6 +444,8 @@ fn default_txt2img_and_img2img_match_the_base_rev_golden() {
             );
         }
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED default_path_golden::default_txt2img_and_img2img_match_the_base_rev_golden");
 }
 
 /// The production compute dtype the f32 golden chain stands in for (see the module doc): the
@@ -422,6 +457,7 @@ fn the_default_compute_dtype_is_fp16() {
 
 /// Item 3: the bounded-decode rung's tiled img2img encode tracks the base rev's whole-image encode
 /// of the same init image within the f32 tiled parity standard, at an even and a ragged tile edge.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiled_init_encode_tracks_the_base_rev_whole_image_encode() {
     if !cpu_child("tiled_init_encode_tracks_the_base_rev_whole_image_encode") {
@@ -431,15 +467,19 @@ fn tiled_init_encode_tracks_the_base_rev_whole_image_encode() {
     let vae = vae();
     for edge in [8, 12, 16] {
         let tiling = mlx_gen::tiling::TilingConfig::spatial_only(edge, 0);
-        let tiled = crate::pipeline::encode_init_latents_tiled(
-            &vae,
-            &init_image(),
-            WIDTH,
-            HEIGHT,
-            Some(&tiling),
-            None,
+        let tiled = (
+            crate::test_device::record_model_inference_device(),
+            crate::pipeline::encode_init_latents_tiled(
+                &vae,
+                &init_image(),
+                WIDTH,
+                HEIGHT,
+                Some(&tiling),
+                None,
+            ),
         )
-        .unwrap();
+            .1
+            .unwrap();
         let delta = relative_max_delta(&reference, &tiled);
         eprintln!("TILED ENCODE edge {edge}: relative max Δ {delta:.3e} vs 91ffb4a81");
         assert!(
@@ -448,10 +488,15 @@ fn tiled_init_encode_tracks_the_base_rev_whole_image_encode() {
         );
     }
     // The untiled route (no rung) is still the whole-image encode.
-    let untiled =
-        crate::pipeline::encode_init_latents_tiled(&vae, &init_image(), WIDTH, HEIGHT, None, None)
-            .unwrap();
+    let untiled = (
+        crate::test_device::record_model_inference_device(),
+        crate::pipeline::encode_init_latents_tiled(&vae, &init_image(), WIDTH, HEIGHT, None, None),
+    )
+        .1
+        .unwrap();
     let delta = relative_max_delta(&reference, &untiled);
     eprintln!("UNTILED ENCODE: relative max Δ {delta:.3e} vs 91ffb4a81");
     assert!(delta <= 1e-4);
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED default_path_golden::tiled_init_encode_tracks_the_base_rev_whole_image_encode");
 }

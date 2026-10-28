@@ -208,6 +208,8 @@ fn prepared_q4_snapshot_runs_full_vlm() {
         Some(generated.usage),
         "terminal Done usage must equal returned generation usage"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED joycaption::prepared_q4_snapshot_runs_full_vlm");
 }
 
 /// Model-level parity: vision tower → projector → splice → Llama decode reproduces the reference
@@ -237,6 +239,8 @@ fn joycaption_model_matches_golden_tokens() {
         top_p: 1.0,
         top_k: 0,
         presence_penalty: 0.0,
+        presence_penalty_generated_only: false,
+        presence_penalty_prompt_len: 0,
         repetition_penalty: 1.0,
         repetition_context: 0,
     };
@@ -266,6 +270,8 @@ fn joycaption_model_matches_golden_tokens() {
         "greedy tokens must match the reference engine"
     );
     assert_eq!(text.trim(), GOLDEN_TEXT);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED joycaption::joycaption_model_matches_golden_tokens");
 }
 
 /// Resize-path parity: a non-square (512×384) image is bicubic-resized to the model's 384 input and
@@ -300,6 +306,8 @@ fn joycaption_resize_path_matches_golden() {
         top_p: 1.0,
         top_k: 0,
         presence_penalty: 0.0,
+        presence_penalty_generated_only: false,
+        presence_penalty_prompt_len: 0,
         repetition_penalty: 1.0,
         repetition_context: 0,
     };
@@ -327,6 +335,8 @@ fn joycaption_resize_path_matches_golden() {
         "resized-image greedy tokens must match the reference engine"
     );
     assert_eq!(text.trim(), GRAD_TEXT);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED joycaption::joycaption_resize_path_matches_golden");
 }
 
 /// Provider-level parity through the `core-llm` multimodal contract: a `Content::Image` + text
@@ -390,6 +400,8 @@ fn joycaption_provider_streams_caption_through_contract() {
         ..Default::default()
     };
     assert!(provider.generate(&no_image, &mut |_| {}).is_err());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED joycaption::joycaption_provider_streams_caption_through_contract");
 }
 
 /// Drop-regression for this suite's fixture helper: the guarded root leaves with the value — the

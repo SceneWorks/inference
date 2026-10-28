@@ -11,7 +11,7 @@ use mlx_gen::array::host_i32;
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface (`mlx_gen_z_image::…`) and internal callers are unchanged.
-use mlx_gen::gen_core::TransformerComponent;
+use mlx_gen::gen_core::{GenerationMemory, TransformerComponent};
 pub use mlx_gen::img2img::{
     add_noise_by_interpolation, init_time_step, preprocess_init_image, resolve_reference,
 };
@@ -148,8 +148,27 @@ pub fn denoise_with_progress_and_preview(
     // Rung 4 (SC-15754): the window is built once for the whole loop (it is loop-constant), and the
     // per-window cancellation check inside `run_windowed` joins the per-step one below.
     let window = transformer.block_window(block_window, cancel)?;
-    let predict =
-        |x: &Array, timestep: f32| transformer.forward_with_rungs(&prep, x, timestep, plan, window);
+    let mut evaluations = 0u64;
+    let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        evaluations += 1;
+        // This provider consumes an unbatched C,T,H,W latent: one actual forward row, not C.
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model::MODEL_ID,
+            "forward_argument",
+            evaluations,
+            1,
+            x,
+        );
+        let result = transformer.forward_with_rungs(&prep, x, timestep, plan, window)?;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model::MODEL_ID,
+            "forward_return",
+            evaluations,
+            1,
+            &result,
+        );
+        Ok(result)
+    };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
     let sigmas = &scheduler.sigmas[start..];
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
@@ -372,8 +391,24 @@ pub fn denoise_control_with_progress_and_preview(
     // `predict` closure (the fork's `ZImageControl._control_predict`).
     let plan = AttentionPlan::budgeted(budget).with_cancel(cancel);
     let window = transformer.control_block_window(block_window, cancel)?;
-    let predict = |x: &Array, timestep: f32| {
-        transformer.forward_with_control_rungs(
+    mlx_gen::sampler::diagnostic_sampling_tensor(
+        crate::model_control::MODEL_ID,
+        "control_context",
+        0,
+        1,
+        control_context,
+    );
+    let mut evaluations = 0u64;
+    let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        evaluations += 1;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model_control::MODEL_ID,
+            "forward_argument",
+            evaluations,
+            1,
+            x,
+        );
+        let result = transformer.forward_with_control_rungs(
             &prep,
             x,
             timestep,
@@ -381,7 +416,15 @@ pub fn denoise_control_with_progress_and_preview(
             None,
             plan,
             window,
-        )
+        )?;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model_control::MODEL_ID,
+            "forward_return",
+            evaluations,
+            1,
+            &result,
+        );
+        Ok(result)
     };
     let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
     let sigmas = &scheduler.sigmas[start..];
@@ -562,7 +605,7 @@ pub(crate) fn init_image_quantum(
     if quanta {
         mlx_gen::ios_quantum::before(
             crate::quantum::INIT_IMAGE,
-            crate::quantum::ab(4, &[target_height as u64, target_width as u64, 3]),
+            init_image_bytes(target_width, target_height),
         )?;
     }
     let image_nchw = preprocess_init_image(image, target_width, target_height)?;
@@ -570,6 +613,11 @@ pub(crate) fn init_image_quantum(
         mlx_gen::ios_quantum::finish(crate::quantum::INIT_IMAGE, &[&image_nchw])?;
     }
     Ok(image_nchw)
+}
+
+/// [`init_image_quantum`]'s price: the uploaded `[H, W, 3]` f32 image.
+pub(crate) fn init_image_bytes(target_width: u32, target_height: u32) -> u64 {
+    crate::quantum::ab(4, &[target_height as u64, target_width as u64, 3])
 }
 
 /// Build the 33-channel VAE-encoded **control context** from a control image (e.g. a rendered
@@ -595,22 +643,9 @@ pub(crate) fn control_context_quantum(control_latents: &Array) -> Result<Array> 
     let control_latents = control_latents.clone();
     let sh = control_latents.shape(); // [16, 1, H/8, W/8]
     let (c, fdim, h, w) = (sh[0], sh[1], sh[2], sh[3]);
-    // iOS: the zero mask / inpaint channels and the 33-channel concatenation are one quantum: the
-    // zero channels' uploads and the concatenation (f32).
-    let plane = |channels: i32| {
-        crate::quantum::ab(
-            4,
-            &[
-                channels.max(0) as u64,
-                fdim.max(0) as u64,
-                h.max(0) as u64,
-                w.max(0) as u64,
-            ],
-        )
-    };
     crate::quantum::conv_quantum(
         crate::quantum::CONTROL_CONTEXT,
-        |_| plane(1) + plane(c) + plane(2 * c + 1),
+        |_| control_context_bytes(c, fdim, h, w),
         || {
             // i64 intermediates before the usize cast — bounded by the validated max resolution
             // today, but a raw i32 product is a latent overflow footgun if the caps change (F-056).
@@ -625,6 +660,23 @@ pub(crate) fn control_context_quantum(control_latents: &Array) -> Result<Array> 
             Ok(concatenate_axis(&[&control_latents, &mask, &inpaint], 0)?)
         },
     )
+}
+
+/// [`control_context_quantum`]'s price over `[c, f, h, w]` control latents: the zero mask and zero
+/// inpaint channels' uploads and the `2c + 1`-channel concatenation (f32).
+pub(crate) fn control_context_bytes(c: i32, f: i32, h: i32, w: i32) -> u64 {
+    let plane = |channels: i32| {
+        crate::quantum::ab(
+            4,
+            &[
+                channels.max(0) as u64,
+                f.max(0) as u64,
+                h.max(0) as u64,
+                w.max(0) as u64,
+            ],
+        )
+    };
+    plane(1) + plane(c) + plane(2 * c + 1)
 }
 
 /// Port of `ZImageLatentCreator.pack_latents`: VAE-encoder latent `[1, C, H/8, W/8]` (or a 5-D
@@ -661,7 +713,25 @@ pub(crate) fn encode_prompt(
     if num_valid == 0 {
         return Err(Error::Msg(format!("{id}: empty prompt")));
     }
-    let enc = EncoderWindow::encode(encoder_window, text_encoder, &input_ids, &attention_mask)?;
+    encode_tokens(
+        text_encoder,
+        &input_ids,
+        &attention_mask,
+        num_valid,
+        encoder_window,
+    )
+}
+
+/// [`encode_prompt`] after tokenization: the encoder (under `encoder_window`, or resident) over the
+/// padded `[1, S]` ids, then the caption features' valid-token gather ([`caption_quantum`]).
+pub(crate) fn encode_tokens(
+    text_encoder: &TextEncoder,
+    input_ids: &Array,
+    attention_mask: &Array,
+    num_valid: i32,
+    encoder_window: Option<EncoderWindow<'_>>,
+) -> Result<Array> {
+    let enc = EncoderWindow::encode(encoder_window, text_encoder, input_ids, attention_mask)?;
     caption_quantum(&enc, num_valid, |enc| slice_valid(enc, num_valid))
 }
 
@@ -674,21 +744,27 @@ pub(crate) fn caption_quantum(
 ) -> Result<Array> {
     crate::quantum::conv_quantum(
         crate::quantum::CAPTION_FEATURES,
-        |_| {
-            let hidden = enc.shape().last().copied().unwrap_or(0);
-            let n = crate::quantum::u(num_valid);
-            // The gather index and the gathered `[valid, hidden]` rows (f32).
-            crate::quantum::ab(4, &[n]) + crate::quantum::ab(4, &[n, crate::quantum::u(hidden)])
-        },
+        |_| caption_features_bytes(num_valid, enc.shape().last().copied().unwrap_or(0)),
         || build(enc),
     )
+}
+
+/// [`caption_quantum`]'s price: the gather index and the gathered `[valid, hidden]` rows (f32).
+pub(crate) fn caption_features_bytes(num_valid: i32, hidden: i32) -> u64 {
+    let n = crate::quantum::u(num_valid);
+    crate::quantum::ab(4, &[n]) + crate::quantum::ab(4, &[n, crate::quantum::u(hidden)])
+}
+
+/// [`caption_cast_quantum`]'s price over `elements` caption-feature elements: the bf16 copy.
+pub(crate) fn caption_cast_bytes(elements: u64) -> u64 {
+    crate::quantum::ab(2, &[elements])
 }
 
 /// The caption features' bf16 cast (the txt2img DiT conditioning) as one iOS quantum.
 pub(crate) fn caption_cast_quantum(cap: &Array) -> Result<Array> {
     crate::quantum::conv_quantum(
         crate::quantum::CAPTION_FEATURES,
-        |_| crate::quantum::ab(2, &[cap.size() as u64]),
+        |_| caption_cast_bytes(cap.size() as u64),
         || Ok(cap.as_dtype(Dtype::Bfloat16)?),
     )
 }
@@ -781,6 +857,15 @@ pub(crate) fn resolve_request_rungs<'a>(
 /// statistics and only halo-expanded convolution work tiles, so smaller edges no longer introduce
 /// per-crop normalization drift.
 pub(crate) fn decode_tiling(req: &GenerationRequest, is_sequential: bool) -> Option<TilingConfig> {
+    decode_tiling_for(req.memory, req.width, req.height, is_sequential)
+}
+
+pub(crate) fn decode_tiling_for(
+    memory: Option<GenerationMemory>,
+    width: u32,
+    height: u32,
+    is_sequential: bool,
+) -> Option<TilingConfig> {
     // SC-15615: the shared selector's explicit bounded-decode signal (`GenerationMemory::tile_vae_decode`)
     // joins the two historical triggers. The ladder is cumulative — a selector that picks rung 3
     // (bounded attention) also sets rung 2 — so without this a contract-driven rung-3 selection on a
@@ -791,17 +876,21 @@ pub(crate) fn decode_tiling(req: &GenerationRequest, is_sequential: bool) -> Opt
     // a selection that names no geometry, keep the 512/64 default this VAE was tuned at (sc-13571).
     // Publishing a one-element candidate list was what blocked SC-15508's "a single-point pass cannot
     // mark untested production parameters Verified".
-    let requested = req.memory.is_some_and(|m| m.tile_vae_decode);
-    (is_sequential || requested || req.width.max(req.height) > 2048).then(|| {
-        let (edge, overlap) = decode_tile_geometry(req);
+    let requested = memory.is_some_and(|m| m.tile_vae_decode);
+    (is_sequential || requested || width.max(height) > 2048).then(|| {
+        let (edge, overlap) = decode_tile_geometry_for(memory);
         TilingConfig::spatial_only(edge as i32, overlap as i32)
     })
 }
 
 /// The (edge, overlap) a request decodes at: the selection's values when it names them, else the
 /// provider default. Pure, so the ladder's plumbing is unit-testable without a VAE.
+#[cfg(test)]
 pub(crate) fn decode_tile_geometry(req: &GenerationRequest) -> (u32, u32) {
-    let memory = req.memory;
+    decode_tile_geometry_for(req.memory)
+}
+
+fn decode_tile_geometry_for(memory: Option<GenerationMemory>) -> (u32, u32) {
     (
         memory
             .and_then(|m| m.decode_tile_edge)
@@ -818,8 +907,13 @@ pub(crate) fn decode_tile_geometry(req: &GenerationRequest) -> (u32, u32) {
 /// `transformer_window_size` its parameter; a selection that sets the flag without a size falls back
 /// to the provider's default window. `None` — every request that did not select rung 4 — is the
 /// historical resident stack, untouched.
+#[cfg(test)]
 pub(crate) fn block_window_size(req: &GenerationRequest) -> Option<usize> {
-    let memory = req.memory?;
+    block_window_size_for(req.memory)
+}
+
+fn block_window_size_for(memory: Option<GenerationMemory>) -> Option<usize> {
+    let memory = memory?;
     memory.stream_transformer_blocks.then(|| {
         memory
             .transformer_window_size
@@ -827,7 +921,7 @@ pub(crate) fn block_window_size(req: &GenerationRequest) -> Option<usize> {
     })
 }
 
-/// [`block_window_size`] plus the load-shape precondition, shared by all four generators.
+/// [`block_window_size_for`] plus the load-shape precondition, shared by all four generators.
 ///
 /// **Why this rejects instead of degrading.** Streaming bounds transformer residency only if the
 /// resident `layers` are *not* also materialized. SC-15998 makes that an explicit deferred-
@@ -845,13 +939,21 @@ pub(crate) fn resolve_block_window(
     supports_deferred_materialization: bool,
     id: &str,
 ) -> Result<Option<usize>> {
-    let requested = resolve_window_for(req, supports_deferred_materialization, id)?;
+    resolve_block_window_for(req.memory, supports_deferred_materialization, id)
+}
+
+pub(crate) fn resolve_block_window_for(
+    memory: Option<GenerationMemory>,
+    supports_deferred_materialization: bool,
+    id: &str,
+) -> Result<Option<usize>> {
+    let requested = resolve_window_for_memory(memory, supports_deferred_materialization, id)?;
     if !supports_deferred_materialization {
         return Ok(None);
     }
     Ok(Some(
         requested
-            .filter(|_| block_window_component(req).includes_dit())
+            .filter(|_| block_window_component_for(memory).includes_dit())
             .unwrap_or_else(|| crate::transformer::ZImageTransformerConfig::turbo().n_layers),
     ))
 }
@@ -859,7 +961,11 @@ pub(crate) fn resolve_block_window(
 /// The rung-4 **component scope** for this request (SC-15794). `None` ⇒ [`TransformerComponent::Dit`],
 /// the by-convention scope every request had before the component existed.
 pub(crate) fn block_window_component(req: &GenerationRequest) -> TransformerComponent {
-    req.memory
+    block_window_component_for(req.memory)
+}
+
+fn block_window_component_for(memory: Option<GenerationMemory>) -> TransformerComponent {
+    memory
         .and_then(|m| m.transformer_window_component)
         .unwrap_or_default()
 }
@@ -886,7 +992,15 @@ fn resolve_window_for(
     supports_deferred_materialization: bool,
     id: &str,
 ) -> Result<Option<usize>> {
-    let window = block_window_size(req);
+    resolve_window_for_memory(req.memory, supports_deferred_materialization, id)
+}
+
+fn resolve_window_for_memory(
+    memory: Option<GenerationMemory>,
+    supports_deferred_materialization: bool,
+    id: &str,
+) -> Result<Option<usize>> {
+    let window = block_window_size_for(memory);
     if window.is_some() && !supports_deferred_materialization {
         return Err(Error::Unsupported(format!(
             "{id}: bounded transformer residency needs a deferred-materialization load shape — this \
@@ -965,7 +1079,11 @@ pub(crate) fn calibration_fault(
 /// re-validated by the request scope's `configure_attention`. Anything else — including a warm
 /// request that carried a rung last time — is the unbounded, byte-identical forward.
 pub(crate) fn attention_budget(req: &GenerationRequest) -> AttentionBudget {
-    match req.memory {
+    attention_budget_for(req.memory)
+}
+
+pub(crate) fn attention_budget_for(memory: Option<GenerationMemory>) -> AttentionBudget {
+    match memory {
         Some(memory) if memory.chunk_attention => AttentionBudget::CONSTRAINED,
         _ => AttentionBudget::UNBOUNDED,
     }
@@ -989,6 +1107,21 @@ pub(crate) fn denoise_batch(
     let _compile_glue = crate::CompileGlueGuard::enable();
     let mut latents = Vec::with_capacity(req.count as usize);
     for i in 0..req.count {
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "z_image",
+            "serial",
+            &[
+                ("schema", 1),
+                ("serial", i as u64),
+                ("completed_batches", latents.len() as u64),
+                ("forward_rows", 1),
+                ("init_present", u64::from(clean.is_some())),
+                (
+                    "init_logical_bytes",
+                    clean.map(mlx_gen::ios_quantum::bytes).unwrap_or(0),
+                ),
+            ],
+        );
         let seed = base_seed.wrapping_add(i as u64);
         // iOS: the seeded noise, its bf16 cast and the img2img blend are one quantum
         // ([`crate::quantum::latents_bytes`]).
@@ -1018,11 +1151,27 @@ pub(crate) fn denoise_batch(
         if quanta {
             mlx_gen::ios_quantum::finish(crate::quantum::LATENTS, &[&init])?;
         }
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            "z_image",
+            "solver_initial_state",
+            0,
+            1,
+            &init,
+        );
         let out = denoise(init, seed, on_progress)?;
         // Materialize so the DiT is no longer referenced through MLX's lazy graph (the caller's shed
         // would otherwise free nothing).
         mlx_rs::transforms::eval([&out])?;
         latents.push(out);
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "z_image",
+            "serial_complete",
+            &[
+                ("schema", 1),
+                ("serial", i as u64),
+                ("completed_batches", latents.len() as u64),
+            ],
+        );
     }
     Ok(latents)
 }

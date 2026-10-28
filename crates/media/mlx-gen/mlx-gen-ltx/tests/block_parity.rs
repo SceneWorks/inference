@@ -69,4 +69,6 @@ fn block_matches_reference() {
     let pr = peak_rel(&got, want);
     eprintln!("block peak_rel = {pr:.3e} shape={:?}", got.shape());
     assert!(pr < 5e-3, "block peak_rel {pr:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_parity::block_matches_reference");
 }

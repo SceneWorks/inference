@@ -89,7 +89,13 @@ impl MageEdit {
         device: &Device,
         adapters: &[AdapterSpec],
     ) -> Result<Self> {
-        let cfg_text = std::fs::read_to_string(dirs.transformer.join("config.json"))?;
+        let cfg_text = candle_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(dirs.transformer.join("config.json")),
+            candle_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+                dirs.transformer.join("config.json"),
+                "candle-gen-mage::edit_provider::MageEdit::load_components",
+            )
+        )?;
         let cfg = MageConfig::from_json(&cfg_text)?;
         let mut transformer =
             MageTransformer::load_with_quant(&dirs.transformer, &cfg, quant, device)?;

@@ -252,4 +252,6 @@ fn tier_renders_coherently_and_is_close_to_bf16() {
             "tier {tier} is not rendering the reference scene: relative max-abs-diff {rel:.4}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_tiers_real::tier_renders_coherently_and_is_close_to_bf16");
 }

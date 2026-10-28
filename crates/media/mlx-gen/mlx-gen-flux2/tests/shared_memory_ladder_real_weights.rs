@@ -177,6 +177,8 @@ fn full_ladder_runs_the_exact_true_v2_family_artifact() {
         gib(full.request_peak()),
         full.seconds,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::full_ladder_runs_the_exact_true_v2_family_artifact");
 }
 
 fn image_delta(a: &Image, b: &Image) -> (u8, f64) {
@@ -375,6 +377,8 @@ fn full_shared_ladder_reduces_request_peak_and_preserves_output() {
         decode_max,
         decode_mean,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::full_shared_ladder_reduces_request_peak_and_preserves_output");
 }
 
 #[test]
@@ -394,6 +398,8 @@ fn full_ladder_covers_single_and_multi_edit_routes() {
     println!(
         "RESULT status=pass provider=flux2_klein_9b routes=single-edit,multi-reference steps=2"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::full_ladder_covers_single_and_multi_edit_routes");
 }
 
 #[test]
@@ -450,6 +456,8 @@ fn full_ladder_composes_with_the_pid_decode_domain() {
         image.width,
         image.height,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::full_ladder_composes_with_the_pid_decode_domain");
 }
 
 /// sc-23207: the application may admit Resident after selecting a deferred load shape.
@@ -510,4 +518,6 @@ fn deferred_true_v2_executes_resident_requests() {
     }
     drop(generator);
     clear_cache();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::deferred_true_v2_executes_resident_requests");
 }

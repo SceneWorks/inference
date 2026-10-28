@@ -40,6 +40,16 @@
 //! detector. See `SC_15178_SA3_LISTENING_PROTOCOL.md` §1 for why any agreement threshold wide
 //! enough to admit honest cross-checkpoint output also admits an unrelated take.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_stable_audio_3::gen_core::{
@@ -285,6 +295,9 @@ fn medium_serves_both_domains_and_diverges_from_each_specialist() {
         worst < MAX_CROSS_CHECKPOINT_COSINE,
         "measured worst {worst} is not inside the bound"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED medium_serves_both_domains_and_diverges_from_each_specialist");
 }
 
 /// The bound's own control, without weights.

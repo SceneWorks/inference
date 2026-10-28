@@ -57,6 +57,7 @@ fn gen_core_conformance_sequential() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Sequential), &profile());
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
     let g = load(OffloadPolicy::Resident);
@@ -85,8 +86,11 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
         }
         other => panic!("expected images, got {other:?}"),
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn sequential_policy_reports_loading_phases_and_matches_resident_pixels() {
     let resident = load(OffloadPolicy::Resident);
@@ -111,8 +115,11 @@ fn sequential_policy_reports_loading_phases_and_matches_resident_pixels() {
         a[0].pixels, b[0].pixels,
         "residency policy never changes the render"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generator_contract::sequential_policy_reports_loading_phases_and_matches_resident_pixels");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn count_and_seed_reach_the_runtime() {
     let g = load(OffloadPolicy::Resident);
@@ -136,6 +143,8 @@ fn count_and_seed_reach_the_runtime() {
         seeded.pixels_of(0),
         "seed + 1 == second image of the batch"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generator_contract::count_and_seed_reach_the_runtime");
 }
 
 trait PixelsOf {
@@ -148,6 +157,7 @@ impl PixelsOf for Vec<mlx_gen::Image> {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn guidance_with_a_negative_prompt_changes_the_render() {
     let g = load(OffloadPolicy::Resident);
@@ -166,6 +176,8 @@ fn guidance_with_a_negative_prompt_changes_the_render() {
         panic!("images expected");
     };
     assert_eq!(a[0].pixels, off[0].pixels);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generator_contract::guidance_with_a_negative_prompt_changes_the_render");
 }
 
 #[test]
@@ -188,6 +200,7 @@ fn invalid_requests_fail_with_actionable_errors_before_any_work() {
     assert!(g.validate(&req).is_err());
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_pre_tripped_cancel_is_typed_and_a_mid_run_cancel_stops_within_a_step() {
     let g = load(OffloadPolicy::Resident);
@@ -216,6 +229,8 @@ fn a_pre_tripped_cancel_is_typed_and_a_mid_run_cancel_stops_within_a_step() {
         seen <= 2,
         "stopped within a step of the trip, saw {seen} steps"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generator_contract::a_pre_tripped_cancel_is_typed_and_a_mid_run_cancel_stops_within_a_step");
 }
 
 /// A load-time tier is **whole-pipeline or nothing** (sc-24112).

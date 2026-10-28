@@ -92,18 +92,24 @@ impl DecoderLayer {
         let (b, s, _) = x.dims3()?;
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
 
-        let q = self
-            .q_proj
-            .forward(&normed)?
-            .reshape((b, s, self.n_heads, self.head_dim))?;
-        let k = self
-            .k_proj
-            .forward(&normed)?
-            .reshape((b, s, self.n_kv_heads, self.head_dim))?;
-        let v = self
-            .v_proj
-            .forward(&normed)?
-            .reshape((b, s, self.n_kv_heads, self.head_dim))?;
+        let q = __model_proof_output!(self.q_proj.forward(&normed))?.reshape((
+            b,
+            s,
+            self.n_heads,
+            self.head_dim,
+        ))?;
+        let k = __model_proof_output!(self.k_proj.forward(&normed))?.reshape((
+            b,
+            s,
+            self.n_kv_heads,
+            self.head_dim,
+        ))?;
+        let v = __model_proof_output!(self.v_proj.forward(&normed))?.reshape((
+            b,
+            s,
+            self.n_kv_heads,
+            self.head_dim,
+        ))?;
 
         // Per-head q/k RMSNorm over head_dim (Qwen3 q_norm/k_norm), then half-split RoPE.
         let q = rms_norm(&q, &self.q_norm, self.eps)?;
@@ -120,12 +126,13 @@ impl DecoderLayer {
         let attn = attn
             .transpose(1, 2)?
             .reshape((b, s, self.n_heads * self.head_dim))?;
-        let x = (x + self.o_proj.forward(&attn)?)?;
+        let x = (x + __model_proof_output!(self.o_proj.forward(&attn))?)?;
 
         // SwiGLU MLP.
         let normed = rms_norm(&x, &self.post_ln, self.eps)?;
-        let gated = (self.gate.forward(&normed)?.silu()? * self.up.forward(&normed)?)?;
-        Ok((x + self.down.forward(&gated)?)?)
+        let gated = (__model_proof_output!(self.gate.forward(&normed))?.silu()?
+            * __model_proof_output!(self.up.forward(&normed))?)?;
+        Ok((x + __model_proof_output!(self.down.forward(&gated))?)?)
     }
 }
 
@@ -175,7 +182,7 @@ impl AnimaQwen3 {
     /// f32 for CPU parity). Attention is causal; padding is applied by the pipeline's mask-multiply.
     pub fn forward(&self, input_ids: &Tensor, dtype: DType) -> Result<Tensor> {
         let s = input_ids.dim(1)?;
-        let mut h = self.embed.forward(input_ids)?.to_dtype(dtype)?;
+        let mut h = __model_proof_output!(self.embed.forward(input_ids))?.to_dtype(dtype)?;
         let (cos, sin) = text_rope(s, self.head_dim, self.rope_theta, &self.device)?;
         let mask = self.causal_mask(s, dtype)?;
         for layer in &self.layers {

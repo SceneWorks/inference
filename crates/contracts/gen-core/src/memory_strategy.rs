@@ -747,6 +747,8 @@ pub enum MemoryComponentKind {
     /// object *does* build both halves at load charges those in `decoder_bytes` and declares here
     /// only the encoder copy it builds lazily on the first reference.
     ReferenceEncoder,
+    /// A separately loaded optional caption-rewriting VLM, outside the image model's encoder.
+    PromptUpsampler,
 }
 
 /// How long one declared component's bytes stay resident within a single render (SC-18665).
@@ -1021,6 +1023,7 @@ impl MemoryComponentKind {
                 | Self::IpAdapter
                 | Self::IdentityEncoder
                 | Self::ReferenceEncoder
+                | Self::PromptUpsampler
         )
     }
 }
@@ -1102,7 +1105,7 @@ impl MemoryPeakBreakdown {
 ///
 /// **Auxiliary means outside the base model, not merely outside the usual three names.** The set is
 /// closed and enumerated by [`MemoryComponentKind::is_auxiliary`]: a control branch, an adapter
-/// stack, an IP-Adapter, an identity encoder, a reference (VAE) encoder — networks a *request* opts
+/// stack, an IP-Adapter, an identity encoder, a reference (VAE) encoder, a prompt upsampler — networks a *request* opts
 /// into, which a plain render of the same checkpoint does not load. Those are the ones
 /// `overlay_bytes` exists for, and the reason it is excluded from `base_bytes` is precisely that a
 /// fit decision for a request without them must not carry them.
@@ -3741,6 +3744,18 @@ impl MemoryMode {
     }
 }
 
+/// Reference-only geometry resolved from actual owned image carriers before
+/// admission/cache sizing, not user-authored numeric hints. `conditioning_tokens`
+/// excludes TEXT tokens and is not multiplied by CFG/job/decode batch. A backend
+/// prices encoder work by evaluating ALL ordered `(width, height)` canvases at
+/// its actual precision/tile strategy and taking the largest allocation demand.
+/// There is deliberately no caller-supplied peak or preselected maximum canvas.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryReferenceResourceFacts {
+    pub conditioning_tokens: u64,
+    pub prepared_canvases: Vec<(u32, u32)>,
+}
+
 /// Context for provider safety and lifecycle hooks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRunContext {
@@ -3759,6 +3774,9 @@ pub struct MemoryRunContext {
     pub use_pid: bool,
     pub has_phases: bool,
     pub geometry: MemoryGeometry,
+    /// Actual ordered reference geometry, when the provider requires full token/
+    /// encoder-workspace proof. `None` preserves legacy/no-reference callers.
+    pub reference_resources: Option<MemoryReferenceResourceFacts>,
     /// Exact overlay identity used for evidence keying. Structured request data belongs in typed
     /// context or geometry fields; key/value encodings such as `references=2` are rejected.
     pub overlay: Option<String>,
@@ -3808,6 +3826,7 @@ pub fn standard_memory_behavior_context(
         ))
     })?;
     Ok(MemoryRunContext {
+        reference_resources: None,
         selection: contract.representative_selection(strategy, tier, route.use_pid)?,
         optimization_authority: MemoryOptimizationAuthority::Calibrated,
         calibration_abi: calibration.abi,
@@ -3857,6 +3876,15 @@ pub trait MemoryRequestScope {
     /// Translate the selected strategy into the provider's existing request controls. This is the
     /// executable bridge for providers that predate the shared contract.
     fn configure_request(&mut self, request: &mut GenerationRequest) -> Result<()>;
+    /// Configure an ALREADY canonical, admission-bound immutable request. No
+    /// media/prompt clone and no fabricated metadata carrier is permitted.
+    /// Existing providers keep the old mutable contract unless they explicitly
+    /// implement this source-backed path; unsupported stops before generation.
+    fn configure_admitted_request(&mut self, _request: &GenerationRequest) -> Result<()> {
+        Err(Error::Unsupported(
+            "provider lifecycle does not support immutable admitted configuration".into(),
+        ))
+    }
     fn enter_phase(&mut self, phase: MemoryPhase) -> Result<()>;
     fn leave_phase(&mut self, phase: MemoryPhase) -> Result<()>;
     fn configure_decode(
@@ -4402,11 +4430,7 @@ const fn precision_key(precision: Precision) -> &'static str {
 }
 
 const fn quant_key(quant: Quant) -> &'static str {
-    match quant {
-        Quant::Q4 => "q4",
-        Quant::Q8 => "q8",
-        Quant::Nvfp4 => "nvfp4",
-    }
+    quant.key()
 }
 
 impl MemoryEvidence {
@@ -4845,6 +4869,7 @@ mod tests {
     fn admitted_context(contract: &MemoryProviderContract) -> MemoryRunContext {
         let calibration = contract.calibration.as_ref().expect("calibration");
         MemoryRunContext {
+            reference_resources: None,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: MemoryStrategyParameters::default(),
@@ -5774,6 +5799,50 @@ mod tests {
             default_memory_strategy_safety_check(&mutated, &context),
             MemorySafetyDecision::Accept,
             "explicitly authorized conservative estimates preserve calibration-free optimized fallback"
+        );
+    }
+
+    #[test]
+    fn prompt_upsampler_is_a_separate_once_charged_auxiliary_network() {
+        let mut contract = adopted_contract();
+        contract.asset_facts = MemoryAssetFacts {
+            base_bytes: 60,
+            conditioning_bytes: 10,
+            transformer_bytes: 40,
+            decoder_bytes: 10,
+            overlay_bytes: 0,
+        };
+        assert_eq!(contract.total_resident_bytes(), 60);
+        contract.asset_facts.overlay_bytes = 37;
+        contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases: contract.lifecycle.phases.clone(),
+            variables: vec![
+                MemoryFormulaVariable::AssetBytes,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+            resident_components: vec![MemoryResidentComponent {
+                id: "prompt_upsampler".into(),
+                kind: MemoryComponentKind::PromptUpsampler,
+                resident_bytes: 37,
+                bounded_by: None,
+                residency: MemoryComponentResidency::WholeRender,
+            }],
+        };
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+        assert_eq!(contract.asset_facts.base_bytes, 60);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 10);
+        assert_eq!(contract.auxiliary_resident_bytes(), 37);
+        assert_eq!(contract.total_resident_bytes(), 97);
+        let breakdown = contract.decompose_predicted_peak(1000);
+        assert_eq!(breakdown.unattributed_bytes, 963);
+        assert_eq!(breakdown.components.len(), 1);
+        assert_eq!(
+            breakdown.components[0].kind,
+            MemoryComponentKind::PromptUpsampler
         );
     }
 

@@ -63,23 +63,89 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// ```
 #[cfg(feature = "media")]
 pub mod media {
-    pub use mlx_gen_ios_catalog::admit;
     #[cfg(feature = "device-capture")]
-    use mlx_gen_ios_catalog::capture_permit as catalog_capture_permit;
+    use mlx_gen_ios_catalog::capture_permit_with_key_capacity as catalog_capture_permit;
     pub use mlx_gen_ios_catalog::control_required;
     pub use mlx_gen_ios_catalog::{
-        anima, anima_turbo_ios_selection, anima_turbo_load_spec, anima_turbo_memory_selection,
-        anima_turbo_planning_decision, build_candidate, capacity_budget, evidence, evidence_key,
-        ios_memory_budget, ios_quantum, sana_decode_plan, sana_decode_tile_edge,
-        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
-        zimage, Admission, AdmissionError, AdmissionResult, BoundDepth, BoundGenerator,
-        BoundTransform, FootprintBound, IosCandidate, IosWork, Refusal, RefusalKind,
-        SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, CONTROL_REQUIRED_ROUTES,
-        IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
-        IRIS_DEPTH_ID, IRIS_RESTORE_ID, SANA_DEVICE_FOOTPRINTS,
+        admit, admit_with_baseline, admit_with_boundary, admit_with_sana_lifecycle_fallback,
+        PremisePolicy, SelectedAdmissionView, SourceCapacityBoundary,
     };
+    pub use mlx_gen_ios_catalog::{
+        anchor, anima, anima_turbo_ios_selection, anima_turbo_load_spec,
+        anima_turbo_memory_selection, anima_turbo_planning_decision, architecture_digest,
+        build_candidate, capacity_budget, capture_adapters, capture_artifact_stem,
+        configured_load_form, configured_variant_digest, evidence, hex, ios_memory_budget,
+        ios_quantum, pricing, record_source_context, sampling, sana_decode_plan,
+        sana_decode_tile_edge, sana_footprint_bound, sana_generation_memory, sana_load_spec,
+        sana_snapshot_profile, sdxl, serialize_capture_failure, serialize_capture_row,
+        source_context_requested_bytes, work_mode, zimage, Admission, AdmissionBasis,
+        AdmissionError, AdmissionResult, BoundDepth, BoundGenerator, BoundTransform,
+        FootprintBound, GeneratorAdmissionInfo, IosCandidate, IosWork, Refusal, RefusalKind,
+        SanaDeviceFootprint, SanaSnapshotProfile, SourceRequestBudget, ANIMA_TURBO_ID,
+        CONTROL_REQUIRED_ROUTES, IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB,
+        IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
+        SANA_DEVICE_FOOTPRINTS,
+    };
+    pub use mlx_gen_ios_catalog::{
+        bind_sana_retirement_key, capture_evidence_key, capture_evidence_key_with_key_capacity,
+        evidence_key, evidence_key_with_key_capacity, sana_capture_observation_plan,
+        SanaCaptureObservationPlan,
+    };
+    pub use mlx_gen_ios_catalog::{engineering, source_identity};
+    pub use mlx_gen_ios_catalog::{
+        IosCallbackHost, IosExecutionFacts, IosExecutionStream, IosNativeRetirementExecution,
+    };
+    pub use mlx_gen_ios_catalog::{IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain};
 
     use crate::gen_core::{Error, ProviderRegistry, Result};
+
+    static INSTALLED_ADMISSION_POLICY: std::sync::OnceLock<
+        std::result::Result<PremisePolicy, String>,
+    > = std::sync::OnceLock::new();
+
+    /// Install an explicitly reviewed policy before the first admission. Original capture commits
+    /// remain provenance; the executable/native closure, actual hardware and OS determine reuse.
+    /// Hardware and OS build come from the live runtime. Approval is never inferred from a model
+    /// file or capture. Source certificates, model margins and live guards remain independent.
+    pub fn install_admission_policy(policy: PremisePolicy) -> Result<()> {
+        if let Some(model) = policy.engineering_process() {
+            model
+                .validate_runtime(
+                    &super::device_machine(),
+                    &super::os_build(),
+                    &source_identity::BuildIdentity::current(),
+                )
+                .map_err(Error::Unsupported)?;
+        }
+        match INSTALLED_ADMISSION_POLICY.set(Ok(policy.clone())) {
+            Ok(()) => Ok(()),
+            Err(_) if INSTALLED_ADMISSION_POLICY.get() == Some(&Ok(policy)) => Ok(()),
+            Err(_) => Err(Error::Unsupported(
+                "iOS admission policy is already fixed by an earlier installation or admission"
+                    .into(),
+            )),
+        }
+    }
+
+    /// The same immutable policy is consumed by product facades and the explicit campaign.
+    /// Without installation it approves nothing. First admission fixes that default atomically,
+    /// so a racing or late install cannot change the policy of an already admitted request.
+    pub fn admission_policy() -> AdmissionResult<&'static PremisePolicy> {
+        INSTALLED_ADMISSION_POLICY
+            .get_or_init(|| {
+                let policy = engineering::reviewed_policy()?;
+                if let Some(model) = policy.engineering_process() {
+                    model.validate_runtime(
+                        &super::device_machine(),
+                        &super::os_build(),
+                        &source_identity::BuildIdentity::current(),
+                    )?;
+                }
+                Ok(policy)
+            })
+            .as_ref()
+            .map_err(|reason| AdmissionError::refused(RefusalKind::NoEvidence, reason.clone()))
+    }
 
     fn require_limits_bound() -> AdmissionResult<()> {
         if super::PLATFORM_LIMITS_BOUND.load(std::sync::atomic::Ordering::Acquire) {
@@ -93,15 +159,18 @@ pub mod media {
 
     /// The capacity check at admission, before load and before every bound call (E4).
     ///
-    /// `demand_bytes` is the admitted work's own growth: the capture's peak minus the capture
-    /// process's starting footprint (the evidence row's baseline). Nothing this process already
-    /// holds is credited as reusable. On a recheck only the growth realized SINCE ADMISSION is
-    /// credited, `remaining = demand - (F_now - F_admission)`, so a loaded generator's second render
-    /// is not charged its weights twice while an unrelated resident never makes room. The
-    /// [`ios_quantum::PROCESS_RESERVE_BYTES`] reserve is part of the boundary: `remaining + reserve`
-    /// must fit live headroom; the projected absolute footprint must fit the single cap.
+    /// `required_bytes` is the admitted work's own growth plus its margin
+    /// ([`Admission::required_bytes`]): the anchor-measured (or anchor-law derived) growth over the
+    /// capture's starting footprint, plus the anchor's measured repeat spread. Nothing this process
+    /// already holds is credited as reusable. On a recheck only the growth realized SINCE ADMISSION
+    /// is credited, `remaining = required - (F_now - F_admission)`, so a loaded generator's second
+    /// render is not charged its weights twice while an unrelated resident never makes room.
+    /// `remaining` must fit live headroom; the projected absolute footprint must fit the single cap.
+    /// The anchor's measured margin replaces the 512 MiB formula reserve here: a kernel
+    /// `phys_footprint` anchor already contains the driver and allocator overhead that reserve
+    /// guessed at, and stacking it on a measurement would make the low end inaccurate.
     pub(crate) fn incremental_capacity(
-        demand_bytes: u64,
+        required_bytes: u64,
         now: super::ProcessMemory,
         at_admission: super::ProcessMemory,
     ) -> Result<()> {
@@ -113,7 +182,7 @@ pub mod media {
                 _ => 0,
             },
         };
-        let remaining = demand_bytes.saturating_sub(realized);
+        let remaining = required_bytes.saturating_sub(realized);
         let held = now
             .footprint
             .or_else(|| at_admission.footprint.map(|f| f.saturating_add(realized)))
@@ -127,16 +196,14 @@ pub mod media {
             // Off-iOS / no live reading: nothing to refuse on beyond the cap.
             return Ok(());
         };
-        let required = remaining.saturating_add(ios_quantum::PROCESS_RESERVE_BYTES);
-        if required > available {
+        if remaining > available {
             record_capacity_refusal();
             return Err(Error::Unsupported(format!(
-                "iOS admission: {} MiB still to come (demand {} MiB, {} MiB realized since \
-                 admission) + {} MiB reserve exceeds the {} MiB of per-process headroom left",
+                "iOS admission: {} MiB still to come (demand + margin {} MiB, {} MiB realized \
+                 since admission) exceeds the {} MiB of per-process headroom left",
                 remaining >> 20,
-                demand_bytes >> 20,
+                required_bytes >> 20,
                 realized >> 20,
-                ios_quantum::PROCESS_RESERVE_BYTES >> 20,
                 available >> 20
             )));
         }
@@ -162,13 +229,58 @@ pub mod media {
         move |bytes| incremental_capacity(bytes, super::process_memory(), at_admission)
     }
 
+    /// The facade's authoritative statement of the execution it will run, made at the admission
+    /// boundary by the execution owner (never defaulted inside a pure pricing function): the MLX
+    /// default device's stream family, whether the iOS quantum scope is active, the live host
+    /// allowance as the exact-analysis budget (0 when no live reading exists, so a
+    /// schedule-dependent derivation refuses rather than guesses), and the CALLER's statement of
+    /// its own callbacks' host allocations (`None`: unstated; a provider whose host certificate
+    /// needs it then refuses, naming the term).
+    pub fn execution_facts(
+        callbacks: Option<IosCallbackHost>,
+    ) -> AdmissionResult<IosExecutionFacts> {
+        let stream = mlx_rs::Stream::task_local_or_default();
+        // A task-local CPU stream may coexist with explicit default-GPU load
+        // checks. State the actual selected compute family, never infer it
+        // from the global default device. The metadata handle is dropped inside
+        // this safe helper before any allocation window is claimed.
+        let cpu = ios_quantum::retirement_stream_is_cpu(&stream).map_err(|e| {
+            AdmissionError::Failed(Error::Unsupported(format!(
+                "iOS admission cannot state the selected execution stream: {e}"
+            )))
+        })?;
+        Ok(IosExecutionFacts {
+            native_retirement: mlx_gen_ios_catalog::IosNativeRetirementExecution::Ordinary,
+            stream: if cpu {
+                IosExecutionStream::Cpu
+            } else {
+                IosExecutionStream::Metal
+            },
+            ios_quantum_scope: ios_quantum::enabled(),
+            analysis_budget_bytes: super::process_memory().available.unwrap_or(0),
+            callback_host: callbacks,
+        })
+    }
+
     /// Admit the caller's highest-preference candidate for one of `providers` (the facade's own
-    /// surface; a candidate for another provider is a typed `mode` refusal).
+    /// surface; a candidate for another provider is a typed `mode` refusal). `callbacks` is the
+    /// caller's statement of the host allocations its own progress callbacks make.
     fn admitted(
         providers: &[&str],
         candidates: &[IosCandidate],
+        callbacks: Option<IosCallbackHost>,
+    ) -> AdmissionResult<(ProviderRegistry, Admission, super::ProcessMemory)> {
+        admitted_observing(providers, candidates, callbacks, &mut |_| Ok(()))
+    }
+
+    fn admitted_observing(
+        providers: &[&str],
+        candidates: &[IosCandidate],
+        callbacks: Option<IosCallbackHost>,
+        observer: &mut dyn FnMut(SelectedAdmissionView<'_>) -> AdmissionResult<()>,
     ) -> AdmissionResult<(ProviderRegistry, Admission, super::ProcessMemory)> {
         require_limits_bound()?;
+        let premise_policy = admission_policy()?;
         if let Some(c) = candidates
             .iter()
             .find(|c| !providers.contains(&c.provider.as_str()))
@@ -182,28 +294,101 @@ pub mod media {
             ));
         }
         let registry = mlx_gen_ios_catalog::provider_registry()?;
-        // The captured footprint is an absolute process peak: what this process already holds is
-        // committed (subtracted from the prediction exactly once), and the total is the smaller of
-        // the fixed cap and what the process could reach now.
+        // Actual boundary: caller media carriers already exist; no model load/admission pricing
+        // has run. Keep the same snapshot for baseline, committed budget and capacity rechecks.
+        // Construct fixed provenance before the query so this scaffold is already in the baseline.
+        let baseline_source = String::from(
+            "TASK_VM_INFO.phys_footprint after request construction, before model admission/load",
+        );
+        // The safe stream query owns allocating metadata handles. Resolve and
+        // DROP them before the baseline; no getter runs in later OOM cleanup.
+        let mut facts = execution_facts(callbacks)?;
         let now = super::process_memory();
+        let baseline = IosMemoryBaseline {
+            domain: IosMemoryDomain::ProcessGrowth,
+            coordinate: IosMemoryCoordinate::BeforeModelLoad,
+            bytes: now.footprint.filter(|bytes| *bytes > 0).ok_or_else(|| {
+                AdmissionError::Failed(Error::Unsupported(
+                    "iOS admission requires an actual BeforeModelLoad process footprint snapshot"
+                        .into(),
+                ))
+            })?,
+            source: baseline_source,
+        };
         let mut budget = mlx_gen_ios_catalog::capacity_budget(
             u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20,
-            now.footprint.unwrap_or(0),
+            baseline.bytes,
             now.available,
         );
-        budget.reserved_headroom_bytes = ios_quantum::PROCESS_RESERVE_BYTES;
-        let admission = admit(&registry, candidates, &super::device_machine(), budget)?;
+        // No blanket reserve: the predicted peak is the anchor's demand plus its MEASURED margin.
+        budget.reserved_headroom_bytes = 0;
+        // Initialize NEW source-context payloads under the real next-allocation hook, at the
+        // existing reviewed-table phase, before catalog admission reaches key tokenization.
+        // General parser/key strings remain separate; fresh tokenizer work has its own guard.
+        let mut source_capacity_refused = false;
+        let mut source_next = |bytes| {
+            let checked = source_metadata_capacity(bytes);
+            if checked.is_err() {
+                source_capacity_refused = true;
+            }
+            checked.map_err(Into::into)
+        };
+        let reviewed = evidence::rows_with_source_capacity(&mut source_next);
+        reviewed.map_err(|e| {
+            AdmissionError::refused(
+                if source_capacity_refused {
+                    RefusalKind::Capacity
+                } else {
+                    RefusalKind::NoEvidence
+                },
+                e,
+            )
+        })?;
+        // The full SDK boundary: baseline AND stated execution facts. The default policy approves
+        // no premise, so native certificates still refuse process-domain derivation by default.
+        // Refresh only allocation-free live scope/analysis facts after source
+        // parsing. The selected stream metadata was already dropped pre-baseline.
+        facts.ios_quantum_scope = ios_quantum::enabled();
+        facts.analysis_budget_bytes = super::process_memory().available.unwrap_or(0);
+        let mut key_next = |bytes| source_metadata_capacity(bytes).map_err(Into::into);
+
+        let admission = mlx_gen_ios_catalog::admit_with_sana_lifecycle_fallback(
+            &registry,
+            candidates,
+            &super::device_machine(),
+            budget,
+            mlx_gen_ios_catalog::SourceCapacityBoundary {
+                request_baseline: &baseline,
+                execution_facts: &facts,
+                premise_policy,
+                source_metadata_capacity: &mut key_next,
+            },
+        )?;
         // The cap/headroom check the generic guard runs, BEFORE any weight payload.
-        incremental_capacity(admission.demand_bytes(), now, now)
+        incremental_capacity(admission.required_bytes(), now, now)
             .map_err(|e| AdmissionError::refused(RefusalKind::Capacity, e.to_string()))?;
+        // Selection is final for this load. Observe the SAME sealed admission and
+        // original candidate, under the SAME source boundary, before ANY weight payload.
+        // In particular this sees a late native fallback, not an earlier host prediction.
+        observer(SelectedAdmissionView {
+            candidate: &candidates[admission.index()],
+            admission: &admission,
+            boundary: SourceCapacityBoundary {
+                request_baseline: &baseline,
+                execution_facts: &facts,
+                premise_policy,
+                source_metadata_capacity: &mut key_next,
+            },
+        })?;
         Ok((registry, admission, now))
     }
 
     fn generator(
         providers: &[&str],
         candidates: &[IosCandidate],
+        callbacks: Option<IosCallbackHost>,
     ) -> AdmissionResult<(usize, BoundGenerator)> {
-        let (registry, admission, at) = admitted(providers, candidates)?;
+        let (registry, admission, at) = admitted(providers, candidates, callbacks)?;
         let index = admission.index();
         Ok((
             index,
@@ -215,13 +400,54 @@ pub mod media {
     /// admitted candidate's index and a wrapper bound to its exact request (geometry, decode tile,
     /// mode, prompt, execution), which rechecks live capacity before every call.
     pub fn load_sana(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundGenerator)> {
-        generator(&["sana_1600m", "sana_sprint_1600m"], candidates)
+        generator(&["sana_1600m", "sana_sprint_1600m"], candidates, None)
+    }
+
+    /// [`load_sana`] with the caller's statement of its progress callbacks' host allocations.
+    pub fn load_sana_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(
+            &["sana_1600m", "sana_sprint_1600m"],
+            candidates,
+            Some(callbacks),
+        )
+    }
+
+    /// [`load_sana_with`] with a synchronous metadata-only observer of the actual selected
+    /// admission. Called after ordinary-first/native-fallback selection and before model load;
+    /// observer failure propagates without allocating model weights. No permission is conveyed.
+    pub fn load_sana_with_observer(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+        observer: &mut dyn FnMut(SelectedAdmissionView<'_>) -> AdmissionResult<()>,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        let (registry, admission, at) = admitted_observing(
+            &["sana_1600m", "sana_sprint_1600m"],
+            candidates,
+            Some(callbacks),
+            observer,
+        )?;
+        let index = admission.index();
+        Ok((
+            index,
+            admission.load_generator(&registry, capacity_from(at))?,
+        ))
     }
 
     /// The SDXL family (every checkpoint route): text, image-to-image, edit/inpaint, control and
     /// IP-adapter.
     pub fn load_sdxl(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundGenerator)> {
-        generator(&[sdxl::SDXL_ID], candidates)
+        generator(&[sdxl::SDXL_ID], candidates, None)
+    }
+
+    /// [`load_sdxl`] with the caller's statement of its progress callbacks' host allocations.
+    pub fn load_sdxl_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(&[sdxl::SDXL_ID], candidates, Some(callbacks))
     }
 
     /// Anima Turbo. The host-planned selection ([`anima_turbo_ios_selection`]) is what to offer;
@@ -229,7 +455,15 @@ pub mod media {
     pub fn load_anima_turbo(
         candidates: &[IosCandidate],
     ) -> AdmissionResult<(usize, BoundGenerator)> {
-        generator(&[ANIMA_TURBO_ID], candidates)
+        generator(&[ANIMA_TURBO_ID], candidates, None)
+    }
+
+    /// [`load_anima_turbo`] with the caller's statement of its callbacks' host allocations.
+    pub fn load_anima_turbo_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(&[ANIMA_TURBO_ID], candidates, Some(callbacks))
     }
 
     /// Z-Image Turbo: `z_image_turbo` (text, image-to-image, LoRA/LoKr) and its Fun-Controlnet-Union
@@ -241,19 +475,55 @@ pub mod media {
         generator(
             &[zimage::Z_IMAGE_TURBO_ID, zimage::Z_IMAGE_TURBO_CONTROL_ID],
             candidates,
+            None,
+        )
+    }
+
+    /// [`load_z_image_turbo`] with the caller's statement of its callbacks' host allocations.
+    pub fn load_z_image_turbo_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(
+            &[zimage::Z_IMAGE_TURBO_ID, zimage::Z_IMAGE_TURBO_CONTROL_ID],
+            candidates,
+            Some(callbacks),
         )
     }
 
     /// Iris 3B generation, including prompt batches.
     pub fn load_iris(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundGenerator)> {
-        generator(&["iris_3b"], candidates)
+        generator(&["iris_3b"], candidates, None)
+    }
+
+    /// [`load_iris`] with the caller's statement of its progress callbacks' host allocations.
+    pub fn load_iris_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(&["iris_3b"], candidates, Some(callbacks))
     }
 
     /// The Iris 3B restoration transform.
     pub fn load_iris_restore(
         candidates: &[IosCandidate],
     ) -> AdmissionResult<(usize, BoundTransform)> {
-        let (registry, admission, at) = admitted(&[IRIS_RESTORE_ID], candidates)?;
+        restorer(candidates, None)
+    }
+
+    /// [`load_iris_restore`] with the caller's statement of its callbacks' host allocations.
+    pub fn load_iris_restore_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundTransform)> {
+        restorer(candidates, Some(callbacks))
+    }
+
+    fn restorer(
+        candidates: &[IosCandidate],
+        callbacks: Option<IosCallbackHost>,
+    ) -> AdmissionResult<(usize, BoundTransform)> {
+        let (registry, admission, at) = admitted(&[IRIS_RESTORE_ID], candidates, callbacks)?;
         let index = admission.index();
         Ok((
             index,
@@ -263,7 +533,22 @@ pub mod media {
 
     /// The Iris 3B depth task.
     pub fn load_iris_depth(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundDepth)> {
-        let (_, admission, at) = admitted(&[IRIS_DEPTH_ID], candidates)?;
+        depth(candidates, None)
+    }
+
+    /// [`load_iris_depth`] with the caller's statement of its callbacks' host allocations.
+    pub fn load_iris_depth_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundDepth)> {
+        depth(candidates, Some(callbacks))
+    }
+
+    fn depth(
+        candidates: &[IosCandidate],
+        callbacks: Option<IosCallbackHost>,
+    ) -> AdmissionResult<(usize, BoundDepth)> {
+        let (_, admission, at) = admitted(&[IRIS_DEPTH_ID], candidates, callbacks)?;
         let index = admission.index();
         Ok((index, admission.load_depth(capacity_from(at))?))
     }
@@ -282,8 +567,80 @@ pub mod media {
             require_limits_bound()?;
         }
         let registry = mlx_gen_ios_catalog::provider_registry()?;
-        let permit = catalog_capture_permit(&registry, candidate, &super::device_machine())?;
+        let mut key_next = |bytes| source_metadata_capacity(bytes).map_err(Into::into);
+        let permit = catalog_capture_permit(
+            &registry,
+            candidate,
+            &super::device_machine(),
+            &mut key_next,
+        )?;
         Ok((registry, permit))
+    }
+
+    /// Simulator-only functional execution under the external app-PID supervisor. No production
+    /// admission or physical-device capacity evidence is implied by this permit.
+    #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+    pub fn simulator_functional_permit(
+        candidate: &IosCandidate,
+    ) -> AdmissionResult<(ProviderRegistry, Admission)> {
+        let registry = mlx_gen_ios_catalog::provider_registry()?;
+        let permit = mlx_gen_ios_catalog::simulator_functional_permit(
+            &registry,
+            candidate,
+            &super::device_machine(),
+        )?;
+        Ok((registry, permit))
+    }
+
+    /// Labelled capture with the caller's ACTUAL source boundary and a synchronous
+    /// pre-load metadata observer. Uses the same next-layout callback for capture
+    /// key construction and observation. This remains a bounded diagnostic permit,
+    /// not evidence admission or approval of a physical/process premise.
+    #[cfg(feature = "device-capture")]
+    pub fn capture_permit_with_observer(
+        candidate: &IosCandidate,
+        boundary: SourceCapacityBoundary<'_>,
+        observer: &mut dyn FnMut(SelectedAdmissionView<'_>) -> AdmissionResult<()>,
+    ) -> AdmissionResult<(ProviderRegistry, Admission)> {
+        if cfg!(target_os = "ios") {
+            require_limits_bound()?;
+        }
+        let registry = mlx_gen_ios_catalog::provider_registry()?;
+        let permit = catalog_capture_permit(
+            &registry,
+            candidate,
+            &super::device_machine(),
+            &mut *boundary.source_metadata_capacity,
+        )?;
+        observer(SelectedAdmissionView {
+            candidate,
+            admission: &permit,
+            boundary: SourceCapacityBoundary {
+                request_baseline: boundary.request_baseline,
+                execution_facts: boundary.execution_facts,
+                premise_policy: boundary.premise_policy,
+                source_metadata_capacity: &mut *boundary.source_metadata_capacity,
+            },
+        })?;
+        Ok((registry, permit))
+    }
+
+    /// Requested-layout metadata preflight. This is byte-sensitive, unlike capture_capacity.
+    /// It uses a fresh boundary (no old admission growth credit); requested bytes are NOT a
+    /// certificate of malloc/RSS/process growth. Fresh tokenizer phases use this same callback.
+    pub fn source_metadata_capacity(next_request_bytes: u64) -> Result<()> {
+        let now = super::process_memory();
+        incremental_capacity(next_request_bytes, now, now)
+    }
+
+    /// Explicit current allowance for newly retained source metadata; unavailable stays unknown.
+    pub fn source_metadata_allowance() -> Result<u64> {
+        super::process_memory().available.ok_or_else(|| {
+            Error::Unsupported(
+                "source metadata needs an explicit live or fixture requested-layout allowance"
+                    .into(),
+            )
+        })
     }
 
     /// The bounded-execution check a capture load and every capture call run: the quanta are only
@@ -395,19 +752,17 @@ pub const MLX_CACHE_LIMIT_CAP_MIB: u32 = 1024;
 
 /// The iOS per-app memory cap admission refuses against, MiB (epic 16774, E4).
 ///
-/// **PROVISIONAL — UNMEASURED.** With `media` this IS `mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB`
-/// (the one cap constant; see its docs): 4096 is an *assumed* 8 GB-device cap carried from the
-/// `claude/ios-strategy` branch. The iPhone 16 Pro Max launch readings were 6142 MiB entitled
-/// and 3374 MiB unentitled (three identical readings each). Those are diagnostics, not a validated
-/// safe rendering envelope: DO NOT replace this provisional cap with a launch reading.
+/// **Observed entitled OS process limit, not a safe render budget.** On iPhone17,2,
+/// iOS 26.6.2 (23G90), the 2026-10-26 available-memory + footprint A/B observed 6144 MiB
+/// entitled and 3376 MiB off; restoration confirmed 6144 MiB. Original e49f5345 receipts:
+/// `docs/evidence/ios-process-limit-2026-10-26/`. With `media` this IS the catalog's constant.
+/// Live OS headroom and the existing evidence, growth/margin and quantum guards still apply.
 #[cfg(feature = "media")]
 pub const IOS_APP_MEMORY_CAP_MIB: u32 = mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB;
-/// The iOS per-app memory cap admission refuses against, MiB. **PROVISIONAL — UNMEASURED.**
-///
-/// An LLM-only build does not compile the catalog, so it carries the value itself; a test asserts it
-/// equals the catalog's constant, so the two cannot drift.
+/// The same observed entitled-target OS process ceiling, MiB; not a safe model working budget.
+/// An LLM-only build omits the catalog and carries the value; a test prevents mirror drift.
 #[cfg(not(feature = "media"))]
-pub const IOS_APP_MEMORY_CAP_MIB: u32 = 4096;
+pub const IOS_APP_MEMORY_CAP_MIB: u32 = 6144;
 
 /// Admit a request whose footprint estimate is `estimate_mib`, against [`IOS_APP_MEMORY_CAP_MIB`].
 ///
@@ -497,6 +852,35 @@ pub fn device_machine() -> String {
             }
         }
         "unknown-ios-device".into()
+    }
+    #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
+    {
+        "non-device-host".into()
+    }
+}
+
+/// Actual Darwin OS build, used to invalidate explicitly installed engineering admission models.
+#[cfg(feature = "media")]
+pub fn os_build() -> String {
+    #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
+    {
+        let mut buffer = [0u8; 128];
+        let mut size = buffer.len();
+        let status = unsafe {
+            libc::sysctlbyname(
+                c"kern.osversion".as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status == 0 && size > 1 && size <= buffer.len() {
+            if let Ok(value) = std::str::from_utf8(&buffer[..size - 1]) {
+                return value.to_owned();
+            }
+        }
+        "unknown-ios-os-build".into()
     }
     #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
     {
@@ -732,12 +1116,14 @@ mod tests {
             super::admit_within_headroom(1223, Some(1223.0)).unwrap(),
             1223
         );
-        assert_eq!(super::admit_within_headroom(4096, None).unwrap(), 4096);
+        let cap = super::IOS_APP_MEMORY_CAP_MIB;
+        assert_eq!(super::admit_within_headroom(cap, None).unwrap(), cap);
     }
 
     /// There is ONE cap constant: the LLM-only literal must equal the catalog's.
     #[test]
     fn the_app_memory_cap_is_the_catalogs_single_constant() {
+        assert_eq!(super::IOS_APP_MEMORY_CAP_MIB, 6144);
         assert_eq!(
             super::IOS_APP_MEMORY_CAP_MIB,
             mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB
@@ -819,6 +1205,15 @@ mod tests {
                 "model.embed_tokens.weight",
             );
             tensor(&sana.join("vae/a.safetensors"), "conv.weight");
+            // Real source pricing needs Gemma tokenizer metadata if derivation reaches it;
+            // the no-anchor precheck deliberately leaves the source unopened.
+            std::fs::write(
+                sana.join("text_encoder/tokenizer.json"),
+                include_str!(
+                    "../../../contracts/gen-core/tests/fixtures/tiny_gemma3_tokenizer.json"
+                ),
+            )
+            .unwrap();
             let sdxl = root.join("sdxl");
             for c in ["unet", "vae", "text_encoder", "text_encoder_2"] {
                 tensor(&sdxl.join(c).join("model.safetensors"), "x");
@@ -947,15 +1342,18 @@ mod tests {
     }
 
     /// Findings 3/4: every image surface has an admitted facade; each requires the platform limits
-    /// bound (a typed failure, before evidence), then refuses with the typed `no_evidence` kind
-    /// while the reviewed table has no row — before any weight load. A candidate offered to the
+    /// bound (a typed failure, before evidence). iOS then refuses `no_evidence` without a row;
+    /// other platforms fail the actual-footprint boundary first. No synthetic baseline is supplied.
+    /// The metadata-only catalog still refuses an empty reviewed table before source/budget use.
+    /// A candidate offered to the
     /// wrong facade is a typed `mode` refusal, never silently routed elsewhere.
     #[cfg(feature = "media")]
     #[test]
     fn every_admitted_facade_requires_bound_limits_and_refuses_without_evidence() {
         use crate::media::{self, AdmissionError, RefusalKind};
         let root = tempfile::tempdir().unwrap();
-        let candidates = fixtures::candidates(root.path());
+        let artifacts = root.path().join("artifacts");
+        let candidates = fixtures::candidates(&artifacts);
         type Facade = fn(&[media::IosCandidate]) -> Result<usize, AdmissionError>;
         let facades: [(&str, Facade); 8] = [
             ("sana_1600m", |c| media::load_sana(c).map(|r| r.0)),
@@ -981,20 +1379,34 @@ mod tests {
         super::PLATFORM_LIMITS_BOUND.store(false, super::Ordering::Release);
         for (id, facade) in facades.iter() {
             let candidate = candidates.iter().find(|c| c.provider == *id).unwrap();
-            assert_eq!(
-                kind(facade(std::slice::from_ref(candidate))),
-                None,
-                "{id}: limits must be bound first"
+            assert!(
+                matches!(
+                    facade(std::slice::from_ref(candidate)),
+                    Err(AdmissionError::Failed(crate::gen_core::Error::Unsupported(reason)))
+                        if reason == "iOS admission requires bound_mlx_to_platform_limits first"
+                ),
+                "{id}: limits must fail before any later boundary/evidence check"
             );
         }
         super::PLATFORM_LIMITS_BOUND.store(true, super::Ordering::Release);
         let by_id = |id: &str| candidates.iter().find(|c| c.provider == id).unwrap();
+        let registry = mlx_gen_ios_catalog::provider_registry().unwrap();
         for (id, facade) in facades.iter() {
             let candidate = by_id(id);
+            #[cfg(target_os = "ios")]
             assert_eq!(
                 kind(facade(std::slice::from_ref(candidate))),
                 Some(RefusalKind::NoEvidence),
                 "{id}"
+            );
+            #[cfg(not(target_os = "ios"))]
+            assert!(
+                matches!(
+                    facade(std::slice::from_ref(candidate)),
+                    Err(AdmissionError::Failed(crate::gen_core::Error::Unsupported(reason)))
+                        if reason == "iOS admission requires an actual BeforeModelLoad process footprint snapshot"
+                ),
+                "{id}: off-iOS must not fabricate a process baseline or reach admission"
             );
             let other = candidates
                 .iter()
@@ -1007,61 +1419,186 @@ mod tests {
                 other.provider
             );
         }
+        // Prove the metadata seam refuses BEFORE source access or budget work:
+        // NONE of the candidates' artifact paths now exists; a source read would
+        // fail, and consuming the zero budget would refuse capacity instead.
+        // No process baseline or live permit is fabricated for this pure query.
+        std::fs::rename(&artifacts, root.path().join("unreachable-artifacts")).unwrap();
+        assert!(!artifacts.exists());
+        for candidate in &candidates {
+            let refusal = match mlx_gen_ios_catalog::ios_admission::admit_with_rows(
+                &registry,
+                std::slice::from_ref(candidate),
+                "no-reviewed-device",
+                crate::gen_core::MemoryBudget {
+                    total_bytes: 0,
+                    committed_bytes: 0,
+                    reclaimable_bytes: 0,
+                    reserved_headroom_bytes: 0,
+                },
+                &[],
+            ) {
+                Err(AdmissionError::Refused(refusal)) => refusal,
+                _ => panic!("metadata-only empty-row query must refuse before work"),
+            };
+            assert_eq!(
+                refusal.kind,
+                RefusalKind::NoEvidence,
+                "{}",
+                candidate.provider
+            );
+            assert!(
+                refusal.reason.contains("(source unopened)"),
+                "{}",
+                refusal.reason
+            );
+        }
+        // Tokenizer corruption is tested at SANA's actual gemma_window parser.
+        // This facade cannot test it: the platform baseline and source-unopened
+        // no-anchor precheck deliberately precede tokenizer parsing.
         super::PLATFORM_LIMITS_BOUND.store(false, super::Ordering::Release);
     }
 
     /// The per-call recheck charges only the demand still to come: weights loaded since admission
     /// are in the process footprint and already absent from live headroom, so they are not counted
     /// twice. First and second renders on a loaded generator fit; a genuinely short headroom and an
-    /// over-cap footprint still refuse.
+    /// over-cap footprint still refuse. The charge is `demand + measured margin`, with no 512 MiB
+    /// formula reserve stacked on the measurement.
     #[cfg(feature = "media")]
     #[test]
     fn the_loaded_generator_recheck_charges_only_incremental_demand() {
         use super::media::incremental_capacity;
         use super::ProcessMemory;
         const MIB: u64 = 1 << 20;
-        // The evidence row: capture peak 3600 MiB from a 200 MiB harness baseline.
-        let demand = 3400 * MIB;
+        // The anchor: 3368 MiB of growth over its capture baseline + its 32 MiB margin.
+        let required = 3400 * MIB;
         let read = |footprint: u64, available: u64| ProcessMemory {
             footprint: Some(footprint * MIB),
             available: Some(available * MIB),
         };
-        // Admission needs the demand plus the reserve: 3400 + 512 = 3912 MiB > 3600 refuses.
-        let short = read(200, 3600);
-        assert!(incremental_capacity(demand, short, short).is_err());
+        // Admission needs exactly demand + margin of live headroom: 3400 fits, 3399 does not.
+        let exact = read(200, 3400);
+        incremental_capacity(required, exact, exact).unwrap();
+        let short = read(200, 3399);
+        assert!(incremental_capacity(required, short, short).is_err());
         let fresh = read(200, 5900);
-        incremental_capacity(demand, fresh, fresh).unwrap();
-        // An unrelated resident (SANA ~2 GB still loaded): 1800 MiB available. The old absolute
-        // arithmetic (3600 - 2200 = 1400 <= 1800) would admit; the growth is 3400: refused.
+        incremental_capacity(required, fresh, fresh).unwrap();
+        // An unrelated resident (SANA ~2 GB still loaded): 1800 MiB available. The growth is 3400:
+        // refused (a product's residents are never credited).
         let busy = read(2200, 1800);
         let _ = super::media::take_capacity_refusal();
-        assert!(incremental_capacity(demand, busy, busy).is_err());
+        assert!(incremental_capacity(required, busy, busy).is_err());
         assert!(
             super::media::take_capacity_refusal(),
             "typed capacity record"
         );
-        // First render after loading 2000 MiB of weights: 1400 still to come + 512 <= 3900.
-        incremental_capacity(demand, read(2200, 3900), fresh).unwrap();
-        // Second render on the same generator: the whole demand already realized (headroom did
-        // not recover): only the reserve must fit.
-        incremental_capacity(demand, read(3600, 2500), fresh).unwrap();
-        // The reserve is part of the boundary: exactly remaining + reserve fits, one MiB less not.
-        incremental_capacity(demand, read(2200, 1400 + 512), fresh).unwrap();
-        assert!(incremental_capacity(demand, read(2200, 1400 + 511), fresh).is_err());
+        // First render after loading 2000 MiB of weights: 1400 still to come <= 3900.
+        incremental_capacity(required, read(2200, 3900), fresh).unwrap();
+        // Second render on the same generator: the whole demand already realized.
+        incremental_capacity(required, read(3600, 2500), fresh).unwrap();
+        // The boundary is the remaining growth itself: exactly 1400 fits, one MiB less not.
+        incremental_capacity(required, read(2200, 1400), fresh).unwrap();
+        assert!(incremental_capacity(required, read(2200, 1399), fresh).is_err());
         // Kernel footprint unavailable: realized growth derived from the headroom consumed.
         let blind = ProcessMemory {
             footprint: None,
             available: Some(3900 * MIB),
         };
-        incremental_capacity(demand, blind, fresh).unwrap();
-        // Over the single cap: 3000 held + 1400 to come > 4096.
-        assert!(incremental_capacity(demand, read(3000, 9000), read(1600, 9000)).is_err());
+        incremental_capacity(required, blind, fresh).unwrap();
+        // Isolate the absolute process ceiling while live headroom remains ample: the
+        // baseline plus required growth fits exactly, then one MiB more refuses.
+        let at_cap_baseline = u64::from(super::IOS_APP_MEMORY_CAP_MIB) - 3400;
+        incremental_capacity(
+            required,
+            read(at_cap_baseline + 1400, 9000),
+            read(at_cap_baseline, 9000),
+        )
+        .unwrap();
+        assert!(incremental_capacity(
+            required,
+            read(at_cap_baseline + 1401, 9000),
+            read(at_cap_baseline + 1, 9000)
+        )
+        .is_err());
         // Off-device (no live reading): only the cap applies.
-        incremental_capacity(demand, ProcessMemory::default(), ProcessMemory::default()).unwrap();
+        incremental_capacity(required, ProcessMemory::default(), ProcessMemory::default()).unwrap();
+    }
+
+    /// The source-metadata callback delegates to this existing injectable decision with the
+    /// SAME supplied snapshot on both sides: no OS query and no prior-growth credit. The
+    /// requested-layout ledger's retained total is not an additional process allocation.
+    #[cfg(feature = "media")]
+    #[test]
+    fn source_metadata_next_request_boundary_and_overflow() {
+        use super::media::incremental_capacity;
+        use super::ProcessMemory;
+
+        let cap = u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20;
+        let retained = 128_u64;
+        let next = 64_u64;
+        let at_cap_boundary = ProcessMemory {
+            // This current footprint ALREADY contains the retained source ledger bytes.
+            footprint: Some(cap - next),
+            available: Some(next),
+        };
+        incremental_capacity(next, at_cap_boundary, at_cap_boundary).unwrap();
+        assert!(incremental_capacity(next + 1, at_cap_boundary, at_cap_boundary).is_err());
+        assert!(
+            incremental_capacity(retained + next, at_cap_boundary, at_cap_boundary).is_err(),
+            "passing retained ledger + next would double-charge bytes already in the snapshot"
+        );
+
+        // Independently exercise live-headroom refusal well below the absolute process cap.
+        let at_headroom_boundary = ProcessMemory {
+            footprint: Some(retained),
+            available: Some(next),
+        };
+        incremental_capacity(next, at_headroom_boundary, at_headroom_boundary).unwrap();
+        assert!(
+            incremental_capacity(next + 1, at_headroom_boundary, at_headroom_boundary).is_err()
+        );
+
+        // Overflow/range errors must refuse rather than wrap into a small admitted estimate.
+        let overflow = ProcessMemory {
+            footprint: Some(retained),
+            available: Some(u64::MAX),
+        };
+        assert!(incremental_capacity(u64::MAX, overflow, overflow).is_err());
+        // The helper's existing refusal recorder is not read or cleared here: the decision
+        // assertions do not depend on shared flag state and cannot consume another test's flag.
     }
 
     /// The capture permit is not an admission and is unavailable off-device: without bounded
     /// quanta it is a typed failure before any load.
+    /// HOST: the facade states its execution facts at the admission boundary: the caller's
+    /// callback statement is carried exactly (unstated stays `None`, never defaulted), the
+    /// quantum scope is the live `ios_quantum` state, and the stream is the MLX default device's.
+    #[cfg(feature = "media")]
+    #[test]
+    fn the_facade_states_execution_facts_with_the_callers_callback_term() {
+        use super::media::{execution_facts, ios_quantum, IosCallbackHost, IosExecutionStream};
+        let stated = IosCallbackHost::Bounded {
+            fixed_bytes: 1,
+            per_progress_event_bytes: 2,
+            per_preview_event_bytes: 3,
+            per_quantum_mark_bytes: 4,
+            per_quantum_label_byte_bytes: 5,
+        };
+        let facts = execution_facts(Some(stated)).unwrap();
+        assert_eq!(facts.callback_host, Some(stated));
+        assert_eq!(facts.ios_quantum_scope, ios_quantum::enabled());
+        let cpu = mlx_rs::Device::try_default().unwrap() == mlx_rs::Device::cpu();
+        assert_eq!(
+            facts.stream,
+            if cpu {
+                IosExecutionStream::Cpu
+            } else {
+                IosExecutionStream::Metal
+            }
+        );
+        assert_eq!(execution_facts(None).unwrap().callback_host, None);
+    }
+
     #[cfg(all(feature = "device-capture", not(target_os = "ios")))]
     #[test]
     fn capture_permit_requires_bounded_quanta() {

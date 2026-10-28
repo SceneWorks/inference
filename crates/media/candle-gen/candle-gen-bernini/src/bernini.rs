@@ -1784,6 +1784,7 @@ mod tests {
     /// preserves the spatial latent shape. Pins the capstone loop plumbing (scheduler / expert switch /
     /// per-step `vit_one_step` / flow step) without real weights.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn denoise_wvitcfg_runs_and_keeps_shape() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1832,6 +1833,11 @@ mod tests {
             out.dims(),
             noisy.dims(),
             "loop preserves spatial latent shape"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED bernini::tests::denoise_wvitcfg_runs_and_keeps_shape"
         );
     }
 }

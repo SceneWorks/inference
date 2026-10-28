@@ -240,7 +240,14 @@ fn packed_marker(transformer: &Path) -> gen_core::Result<Option<Quant>> {
         return Ok(None);
     }
     let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+        serde_json::from_slice(&candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/candle-gen/candle-gen-wan/src/memory_strategy.rs::packed_marker::std::fs::read@11155",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+)?)
+        .map_err(|error| {
             gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: invalid transformer quantize_config.json at {}: {error}",
                 path.display()
@@ -349,6 +356,11 @@ fn validate_packed_triple(
         Quant::Nvfp4 => {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: NVFP4 is not a Wan affine-packed tier"
+            )))
+        }
+        Quant::Fp8Rowwise => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: FP8 rowwise is not a Wan affine-packed tier"
             )))
         }
     };
@@ -608,6 +620,7 @@ const fn tier_label(quant: Option<Quant>) -> &'static str {
         Some(Quant::Q4) => "q4",
         Some(Quant::Q8) => "q8",
         Some(Quant::Nvfp4) => "nvfp4",
+        Some(Quant::Fp8Rowwise) => "fp8r",
     }
 }
 
@@ -1321,7 +1334,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            Some(Quant::Nvfp4) => unreachable!(),
+            Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => unreachable!(),
         }
         temp
     }

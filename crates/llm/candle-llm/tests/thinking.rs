@@ -10,6 +10,15 @@
 //! reason. A model that *actually reasons* is covered by the gated `real_qwen3_produces_reasoning`
 //! below (and by the Qwen3 conformance run in `conformance.rs`, now thinking-aware).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Tensor};
@@ -101,6 +110,7 @@ fn write_thinking_snapshot() -> tempfile::TempDir {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn thinking_provider_passes_core_llm_conformance() {
     let guard = write_thinking_snapshot();
     let dir = guard.path();
@@ -119,6 +129,9 @@ fn thinking_provider_passes_core_llm_conformance() {
         || Box::new(LlamaProvider::load(&spec).expect("load thinking provider")),
         &TextLlmProfile::cheap(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED thinking_provider_passes_core_llm_conformance");
 }
 
 /// The provider records which decode path ran and its measured counters (sc-24129). A plain
@@ -132,6 +145,7 @@ fn thinking_provider_passes_core_llm_conformance() {
 /// sampled request on this random-weight model can turn into a different token — so there only
 /// the paths are compared.)
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn provider_records_the_decode_path_it_ran() {
     use candle_llm::decode::DecodePath;
     use candle_llm::primitives::{AttnFormulation, KvCacheKind};
@@ -213,6 +227,9 @@ fn provider_records_the_decode_path_it_ran() {
         p.last_decode_record().is_none(),
         "a failed request must not expose the previous request's record"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider_records_the_decode_path_it_ran");
 }
 
 /// sc-24134 × sc-24138 × sc-24441: with the CUDA-graph switch on, the llama family's engine path
@@ -226,6 +243,7 @@ fn provider_records_the_decode_path_it_ran() {
 /// (`LoadSpec::cuda_graphs`), since a CUDA load settles the model's stream then and every
 /// generation runs under the switch the load recorded, not the process switch of the moment.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn causal_engine_requests_record_the_graph_runner() {
     use candle_llm::decode::DecodePath;
 
@@ -287,6 +305,9 @@ fn causal_engine_requests_record_the_graph_runner() {
         "{}",
         off.cuda_graphs.describe()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED causal_engine_requests_record_the_graph_runner");
 }
 
 /// sc-24140 (E0 / E2): a llama-family temperature + top-p request — ChatWorks' default — decodes
@@ -294,6 +315,7 @@ fn causal_engine_requests_record_the_graph_runner() {
 /// sampler (zero logits rows copied to the host), on CPU the host reference and the record says
 /// why; every draw is recorded either way.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_stochastic_request_draws_through_the_device_sampler_where_there_is_one() {
     use candle_llm::decode::DecodePath;
 
@@ -331,6 +353,9 @@ fn a_stochastic_request_draws_through_the_device_sampler_where_there_is_one() {
         assert_eq!(record.sampler.label(), "host:device_unavailable");
         assert_eq!(record.sampler.host_draws, draws);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED a_stochastic_request_draws_through_the_device_sampler_where_there_is_one");
 }
 
 /// A model that *actually reasons*: Qwen3's chat template gates `enable_thinking`, so an Enabled
@@ -380,4 +405,7 @@ fn real_qwen3_produces_reasoning() {
         "[qwen3 thinking] reasoning={:?}\n[qwen3 answer] {:?}",
         out.thinking, out.text
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_qwen3_produces_reasoning");
 }

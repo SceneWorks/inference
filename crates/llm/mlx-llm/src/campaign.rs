@@ -13474,6 +13474,7 @@ pub(crate) mod tests {
     /// compressed arm, and still refuse the other architecture's coordinates.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn eight_b_sessions_run_their_own_coordinates_and_refuse_the_other_architecture() {
         let llama8b = crate::provider::tests::tiny_snapshot(
             serde_json::json!({
@@ -13533,6 +13534,8 @@ pub(crate) mod tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED campaign::tests::eight_b_sessions_run_their_own_coordinates_and_refuse_the_other_architecture");
     }
 
     #[test]
@@ -20160,7 +20163,7 @@ pub(crate) mod tests {
         assert_eq!(identity.version, "0.25.8");
         assert_eq!(
             identity.revision,
-            "fe22998bf73e5e785d7659beb2f24d624b785bda"
+            "355e2ae4e81c13032233a4244e956bc3547f49e4"
         );
         assert_eq!(
             identity.source,

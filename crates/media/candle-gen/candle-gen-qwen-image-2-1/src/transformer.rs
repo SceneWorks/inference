@@ -1984,6 +1984,7 @@ mod tests {
     /// CUDA/Metal, where that blend was off by percents and which no forward on this lane reaches
     /// (the select needs no matmul, so it does run in bf16 on CPU).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_prefill_selects_each_modulation_row_exactly() {
         let dit = tiny_dit();
         let (layout, prelude) = edit_prelude(&dit);
@@ -2060,12 +2061,16 @@ mod tests {
                 );
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::the_prefill_selects_each_modulation_row_exactly");
     }
 
     /// The select is correct only because the `t = 0` tokens are the leading prefix and the target
     /// the trailing block. A geometry in which the two do not tile the sequence is refused, not
     /// mis-selected.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_geometry_whose_target_is_not_the_trailing_block_is_refused() {
         let dit = tiny_dit();
         let (_, prelude) = edit_prelude(&dit);
@@ -2079,6 +2084,9 @@ mod tests {
             "qwen_image_2_1: the modulation select needs the target block to be the trailing 12 \
              of 32 tokens, but 19 leading tokens read the t = 0 row"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::a_geometry_whose_target_is_not_the_trailing_block_is_refused");
     }
 
     /// The select stays differentiable in **both** rows: a loss over the selected rows sends each
@@ -2086,6 +2094,7 @@ mod tests {
     /// row the prefix tokens' — and nothing to the other slots. Analytic, so the comparison is to
     /// f32 summation error.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_select_passes_each_rows_gradient_to_its_own_tokens() {
         let dit = tiny_dit();
         let (layout, prelude) = edit_prelude(&dit);
@@ -2126,6 +2135,9 @@ mod tests {
             }
         }
         assert_eq!(reached, [true; 2], "both rows carry a real gradient");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::the_select_passes_each_rows_gradient_to_its_own_tokens");
     }
 
     /// End to end through the trainer's checkpoint pieces: a loss on the velocity reaches the
@@ -2136,6 +2148,7 @@ mod tests {
     /// backward error confined to the `t = 0` row cannot hide behind the sampled row's larger
     /// derivative.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_trainer_pieces_backpropagate_through_the_selected_rows() {
         use candle_core::Var;
 
@@ -2244,6 +2257,9 @@ mod tests {
                 "{name}: gradient {analytic:e} vs finite difference {numeric:e} ({rel:.2e})"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::the_trainer_pieces_backpropagate_through_the_selected_rows");
     }
 
     /// The modulation a cached step's target tokens receive is the sampled-timestep row **bit for

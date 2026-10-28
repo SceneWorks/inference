@@ -9,6 +9,19 @@ use mlx_rs::{Array, Dtype};
 
 use crate::{Error, Result};
 
+/// Create lazy file-backed arrays on MLX's CPU stream even inside a scoped GPU default.
+/// The default safetensors wrapper honors task-local streams, but `Load` has no Metal
+/// implementation. Keep payload reads lazy; callers drain them at their admitted consume boundary.
+#[allow(clippy::type_complexity)]
+pub fn load_safetensors_on_cpu(
+    path: impl AsRef<Path>,
+) -> Result<(HashMap<String, Array>, HashMap<String, String>)> {
+    Ok(Array::load_safetensors_with_metadata_device(
+        path,
+        mlx_rs::Stream::cpu(),
+    )?)
+}
+
 /// A loaded set of named tensors (dotted keys, e.g. `"layers.0.attention.to_q.weight"`)
 /// plus the file's string metadata (e.g. a LoKr adapter's `networkType` / `alpha` / `rank`).
 #[derive(Clone)]
@@ -16,6 +29,7 @@ pub struct Weights {
     tensors: HashMap<String, Array>,
     metadata: HashMap<String, String>,
     accessed: RefCell<std::collections::HashSet<String>>,
+    convrot_rotations: RefCell<HashMap<usize, Array>>,
 }
 
 impl Weights {
@@ -25,6 +39,7 @@ impl Weights {
             tensors,
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
+            convrot_rotations: RefCell::new(HashMap::new()),
         }
     }
 
@@ -35,16 +50,31 @@ impl Weights {
             tensors: HashMap::new(),
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
+            convrot_rotations: RefCell::new(HashMap::new()),
         }
     }
 
     /// Load a single `.safetensors` file (tensors + metadata).
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let (tensors, metadata) = Array::load_safetensors_with_metadata(path.as_ref())?;
+        #[cfg(feature = "model-inference-proof")]
+        let __input_path = path.as_ref();
+        let (tensors, metadata) = gen_core::__model_input_reader!(
+load_safetensors_on_cpu(path.as_ref()),
+"crates/media/mlx-gen/src/weights.rs::from_file::Array::load_safetensors_with_metadata@1543",
+TensorInput,
+path.as_ref(),
+|__model_input_path| load_safetensors_on_cpu(__model_input_path)
+)?;
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_model_weight_paths(
+            "mlx-gen::Weights::from_file",
+            &[__input_path],
+        );
         Ok(Self {
             tensors,
             metadata,
             accessed: RefCell::new(std::collections::HashSet::new()),
+            convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
 
@@ -99,9 +129,19 @@ impl Weights {
     /// (`kIOGPUCommandBufferCallbackErrorTimeout`; sd3, ideogram and seedvr2 in the sc-24245
     /// campaign). Reading the loads first means the GPU only ever sees resident inputs.
     fn materialize_batch(batch: &[(&str, &Array)]) -> Result<()> {
+        let bytes = || {
+            batch.iter().fold(0usize, |total, (_, array)| {
+                total.saturating_add(array.nbytes())
+            })
+        };
+        crate::ios_quantum::diagnostic_load_stage(0, bytes);
         mlx_rs::transforms::eval_pending_loads(batch.iter().map(|(_, array)| *array))?;
+        crate::ios_quantum::diagnostic_load_stage(1, bytes);
         mlx_rs::transforms::eval(batch.iter().map(|(_, array)| *array))?;
-        crate::coherence::verify_gpu_view(batch.iter().copied())
+        crate::ios_quantum::diagnostic_load_stage(2, bytes);
+        crate::coherence::verify_gpu_view(batch.iter().copied())?;
+        crate::ios_quantum::diagnostic_load_stage(3, bytes);
+        Ok(())
     }
 
     /// Evaluate only tensors read through [`Self::get`] / [`Self::require`] since the last drain.
@@ -149,10 +189,10 @@ impl Weights {
 
     /// Load a safetensors file while decoding `F8_E4M3` payloads to bf16.
     ///
-    /// MLX has no fp8 storage dtype, but does expose byte-accurate E4M3
-    /// conversion. The regular loader therefore rejects fp8 files before a
-    /// provider can normalize them; this opt-in loader preserves the ordinary
-    /// path for all other dtypes and converts only fp8 tensor views.
+    /// MLX has no fp8 storage dtype: its safetensors reader maps `F8_E4M3` / `F8_E8M0` to **raw
+    /// uint8 bytes** (`mlx/io/safetensors.cpp`, sc-26685 audit), so the regular loader hands a W4A8
+    /// `weight_s_rel` back as `Dtype::Uint8`. This opt-in loader is the separate fp8→bf16 path for
+    /// the fp8 VAE weights that need the numeric conversion, and is never used by the H3 DiT.
     pub fn from_file_with_fp8(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_file_with_fp8_filter(path, |_| true)
     }
@@ -166,7 +206,12 @@ impl Weights {
         path: impl AsRef<Path>,
         mut include: impl FnMut(&str) -> bool,
     ) -> Result<Self> {
-        let file = std::fs::File::open(path.as_ref())?;
+        #[cfg(feature = "model-inference-proof")]
+        let __input_path = path.as_ref();
+        let file = gen_core::__model_input_choose!(
+            std::fs::File::open(path.as_ref()),
+            std::fs::File::open(__input_path)
+        )?;
         // SAFETY: the mapping is read-only and remains alive until every borrowed
         // TensorView has been copied into MLX-owned array storage below.
         let bytes = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -242,10 +287,17 @@ impl Weights {
             };
             tensors.insert(name.to_owned(), value);
         }
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_reader_paths(
+            "mlx-gen::Weights::from_file_with_fp8_filter",
+            gen_core::model_input_proof::InputRole::ModelWeights,
+            &[__input_path],
+        );
         Ok(Self {
             tensors,
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
+            convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
 
@@ -281,8 +333,14 @@ impl Weights {
         for f in files {
             // Name the offending file: the underlying mlx-c error carries only its own C++ source
             // location, so a corrupt/foreign file in a shard dir was previously undiagnosable.
-            let (t, m) = Array::load_safetensors_with_metadata(f)
-                .map_err(|e| Error::from(format!("loading shard {}: {e}", f.display())))?;
+            let (t, m) = gen_core::__model_input_reader!(
+load_safetensors_on_cpu(f),
+"crates/media/mlx-gen/src/weights.rs::from_paths::Array::load_safetensors_with_metadata@13609",
+TensorInput,
+f,
+|__model_input_path| load_safetensors_on_cpu(__model_input_path)
+)
+            .map_err(|e| Error::from(format!("loading shard {}: {e}", f.display())))?;
             // Shards are expected to be disjoint; a key collision means the shard set is wrong (e.g.
             // a stray extra file in the dir) and a plain `extend` would silently let the later shard
             // win, loading a partially-wrong tensor set. Surface it instead (F-032). Metadata is
@@ -298,11 +356,23 @@ impl Weights {
             }
             metadata.extend(m);
         }
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_model_weight_paths(
+            "mlx-gen::Weights::from_paths",
+            files,
+        );
         Ok(Self {
             tensors,
             metadata,
             accessed: RefCell::new(std::collections::HashSet::new()),
+            convrot_rotations: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// Inspect an array's metadata without consuming its loader key. This borrows the original
+    /// handle: it neither records access, clones a key/array, nor evaluates a lazy tensor.
+    pub fn peek(&self, key: &str) -> Option<&Array> {
+        self.tensors.get(key)
     }
 
     pub fn get(&self, key: &str) -> Option<&Array> {
@@ -323,6 +393,15 @@ impl Weights {
 
     pub fn metadata(&self, key: &str) -> Option<&str> {
         self.metadata.get(key).map(String::as_str)
+    }
+
+    /// Share the tiny immutable ConvRot constants across every projection loaded together.
+    pub(crate) fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
+        self.convrot_rotations
+            .borrow_mut()
+            .entry(group)
+            .or_insert_with(build)
+            .clone()
     }
 
     /// Insert (or overwrite) a tensor under `key`. Used by checkpoint remapping (diffusers →
@@ -484,6 +563,91 @@ pub fn join(prefix: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peek_borrows_without_consuming_or_changing_array_identity() {
+        #[cfg(target_os = "macos")]
+        const CHILD: &str = "MLX_WEIGHTS_PEEK_CPU_CHILD";
+        #[cfg(target_os = "macos")]
+        const DONE: &str = "MLX_WEIGHTS_PEEK_CPU_DONE";
+        #[cfg(target_os = "macos")]
+        {
+            const FQN: &str =
+                "weights::tests::peek_borrows_without_consuming_or_changing_array_identity";
+            if std::env::var(CHILD).as_deref() != Ok(FQN) {
+                let dir = tempfile::tempdir().unwrap();
+                let marker = dir.path().join("done");
+                assert!(marker.is_absolute() && !marker.exists());
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", FQN, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, FQN)
+                    .env(DONE, &marker)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "weights peek CPU child failed");
+                assert_eq!(std::fs::read(marker).unwrap().as_slice(), b"ok");
+                return;
+            }
+            let marker = std::path::PathBuf::from(std::env::var(DONE).unwrap());
+            assert!(marker.is_absolute() && !marker.exists());
+            mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+            assert_eq!(
+                mlx_rs::Device::try_default().unwrap(),
+                mlx_rs::Device::cpu()
+            );
+            assert_eq!(
+                unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+                0
+            );
+            assert_eq!(
+                mlx_rs::Stream::new().get_index().unwrap(),
+                mlx_rs::Stream::cpu().get_index().unwrap()
+            );
+            assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal());
+            assert!(crate::ios_quantum::quantum_metal_guard::metal_forbidden());
+        }
+        let mut weights = Weights::empty();
+        weights.insert("w", Array::from_slice(&[1i32], &[]));
+        assert!(weights.peek("missing").is_none());
+        let inspected = weights.peek("w").unwrap();
+        assert!(std::ptr::eq(inspected, weights.peek("w").unwrap()));
+        assert_eq!(weights.unused_keys(), ["w"]);
+        assert!(std::ptr::eq(inspected, weights.get("w").unwrap()));
+        assert!(weights.unused_keys().is_empty());
+        assert!(weights.get("missing").is_none());
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) },
+                0
+            );
+            std::fs::write(std::env::var(DONE).unwrap(), b"ok").unwrap();
+        }
+    }
+
+    #[test]
+    fn cpu_file_and_shard_ingestion_stays_lazy_until_the_io_boundary() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("weights.safetensors");
+            let source = Array::from_slice(&[1.0f32, -2.0, 3.0, 4.0], &[2, 2]);
+            let metadata = HashMap::from([("networkType".to_owned(), "lora".to_owned())]);
+            Array::save_safetensors([("weight", &source)], Some(&metadata), &path).unwrap();
+            let single = Weights::from_file(&path).unwrap();
+            let shards = Weights::from_paths(std::slice::from_ref(&path), root.path()).unwrap();
+            for loaded in [single, shards] {
+                let raw = loaded.require("weight").unwrap();
+                assert!(
+                    !is_available(raw),
+                    "generic weight construction eagerly read a payload"
+                );
+                assert_eq!(loaded.metadata("networkType"), Some("lora"));
+                mlx_rs::transforms::eval_pending_loads([raw]).unwrap();
+                assert!(is_available(raw));
+                assert_eq!(raw.try_as_slice::<f32>().unwrap(), &[1.0, -2.0, 3.0, 4.0]);
+            }
+        });
+    }
 
     #[test]
     fn round_trip_file_with_metadata() {

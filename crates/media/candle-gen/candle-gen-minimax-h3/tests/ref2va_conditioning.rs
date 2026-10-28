@@ -276,6 +276,7 @@ fn slice(x: &Tensor, start: usize, end: usize) -> Tensor {
 /// [`MUTATION_FLOOR`]; the *same* probe twice must agree to [`DETERMINISM_CEILING`]. The second
 /// half is what makes the first attributable to the image rather than to a per-call RNG draw.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_image_reference_binds_its_own_pixels() {
     let a = image_rows(0);
     let b = image_rows(1);
@@ -291,6 +292,9 @@ fn an_image_reference_binds_its_own_pixels() {
         peak_diff > MUTATION_FLOOR,
         "two different references must encode differently, got {peak_diff:e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ref2va_conditioning::an_image_reference_binds_its_own_pixels");
 }
 
 /// **Claim 2 — a clip reference binds every frame, not just its first.**
@@ -299,6 +303,7 @@ fn an_image_reference_binds_its_own_pixels() {
 /// conditioning. An implementation that encoded only the first frame — a plausible shortcut, since
 /// an image reference *is* a one-frame clip — would pass every shape check and fail here.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_clip_reference_binds_every_frame() {
     let a = clip_rows(&[0, 1, 1, 1, 1, 1]);
     let b = clip_rows(&[0, 2, 2, 2, 2, 2]);
@@ -322,6 +327,11 @@ fn a_clip_reference_binds_every_frame() {
         "a {}-row clip must occupy more rows than a {}-row still",
         a.dims()[1],
         single.dims()[1]
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED ref2va_conditioning::a_clip_reference_binds_every_frame"
     );
 }
 
@@ -520,6 +530,7 @@ fn every_modality_is_constructible_individually_and_combined() {
 /// is a layout with one fewer reference, which must carry strictly fewer rows — so "the model saw
 /// the references" is not satisfied by a sequence that would have those rows anyway.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_model_sees_every_reference_in_its_rows() {
     let latents = 4;
     let l = layout(&[image_geometry(), audio_geometry(latents)], 5);
@@ -558,6 +569,9 @@ fn the_model_sees_every_reference_in_its_rows() {
     let fewer = layout(&[image_geometry()], 5);
     assert_eq!(fewer.num_condition_audio_rows(), 0);
     assert!(fewer.seq_len() < l.seq_len());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ref2va_conditioning::the_model_sees_every_reference_in_its_rows");
 }
 
 /// **Claim 5 — reference rows ride through the loop untouched while the generated tail moves.**
@@ -565,6 +579,7 @@ fn the_model_sees_every_reference_in_its_rows() {
 /// Both halves matter. "The references did not move" is trivially true of an inert loop, so the
 /// generated tail is asserted to move by more than [`MUTATION_FLOOR`] in the same run.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn references_are_never_denoised() {
     let latents = 4;
     let l = layout(&[image_geometry(), audio_geometry(latents)], 5);
@@ -596,6 +611,9 @@ fn references_are_never_denoised() {
         "the generated tail must actually be denoised, got {peak:e} — otherwise 'the references \
          did not move' proves nothing"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ref2va_conditioning::references_are_never_denoised");
 }
 
 // ---------------------------------------------------------------------------------------------

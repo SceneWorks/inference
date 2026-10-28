@@ -70,7 +70,7 @@ fn render_and_check(spec: &LoadSpec, req: &GenerationRequest, tag: &str) {
 }
 
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image base snapshot (set BASE_ZIMAGE_SNAPSHOT or populate the HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image base snapshot (set BASE_ZIMAGE_SNAPSHOT or populate the HF cache)"]
 fn base_t2i_cfg_renders_coherent_image() {
     let Some(snap) = base_snapshot() else {
         eprintln!(
@@ -94,10 +94,13 @@ fn base_t2i_cfg_renders_coherent_image() {
         ..Default::default()
     };
     render_and_check(&spec, &req, "cfg");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED base_t2i_real_weights::base_t2i_cfg_renders_coherent_image");
 }
 
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image base snapshot (set BASE_ZIMAGE_SNAPSHOT or populate the HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image base snapshot (set BASE_ZIMAGE_SNAPSHOT or populate the HF cache)"]
 fn base_t2i_cfg_no_negative_renders_coherent_image() {
     // Regression (sc-8958, MLX twin of candle sc-8646): CFG on (guidance 4.0) with an **unset**
     // negative prompt. The uncond branch
@@ -123,10 +126,13 @@ fn base_t2i_cfg_no_negative_renders_coherent_image() {
         ..Default::default()
     };
     render_and_check(&spec, &req, "cfg_no_negative");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED base_t2i_real_weights::base_t2i_cfg_no_negative_renders_coherent_image");
 }
 
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image base snapshot (set BASE_ZIMAGE_SNAPSHOT or populate the HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image base snapshot (set BASE_ZIMAGE_SNAPSHOT or populate the HF cache)"]
 fn base_t2i_cfg_off_renders_coherent_image() {
     let Some(snap) = base_snapshot() else {
         eprintln!("skip base_t2i_cfg_off_renders_coherent_image: no Tongyi-MAI/Z-Image snapshot");
@@ -145,4 +151,7 @@ fn base_t2i_cfg_off_renders_coherent_image() {
         ..Default::default()
     };
     render_and_check(&spec, &req, "cfg_off");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED base_t2i_real_weights::base_t2i_cfg_off_renders_coherent_image");
 }

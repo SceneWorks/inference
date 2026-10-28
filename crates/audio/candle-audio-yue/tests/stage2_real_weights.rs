@@ -15,6 +15,16 @@
 //! RSS on an M-series Mac: the exact-parity test ~15 GB (a 2-row, 2702-position f32 KV cache
 //! beside the f32 decoder), the all-tier test ~22 GB.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use candle_audio_yue::candle_audio::candle_core::Device;
 use candle_audio_yue::config::{Assets, Tier};
 use candle_audio_yue::gen_core::CancelFlag;
@@ -108,6 +118,11 @@ fn stage2_bf16_cpu_matches_the_upstream_reference_exactly() {
             case.cb0.len()
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED stage2_bf16_cpu_matches_the_upstream_reference_exactly"
+    );
 }
 
 /// The production loader over every published tier (`stage2::load`: tier resolution →
@@ -163,6 +178,9 @@ fn stage2_every_tier_loads_through_production_and_is_characterised() {
         );
         assert_eq!(d.positions, 7 * cases[0].cb0.len());
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage2_every_tier_loads_through_production_and_is_characterised");
 }
 
 /// Bound on `max |Δlogit| / max |logit|` for the dense 1B on Metal (bf16 compute) against the CPU
@@ -230,4 +248,7 @@ fn stage2_metal_bf16_divergence_is_characterised_on_real_weights() {
             d.flip_fraction()
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage2_metal_bf16_divergence_is_characterised_on_real_weights");
 }

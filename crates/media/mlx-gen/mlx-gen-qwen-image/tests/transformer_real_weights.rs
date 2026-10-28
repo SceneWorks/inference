@@ -56,6 +56,8 @@ fn rope_matches_fork() {
         println!("rope {name}: peak-rel {peak:.3e}  mean-rel {mean:.3e}");
         assert!(peak < 1e-3, "rope {name} peak-rel {peak:.3e}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer_real_weights::rope_matches_fork");
 }
 
 #[test]
@@ -87,4 +89,8 @@ fn dual_stream_block_matches_fork() {
         assert!(mean < 2e-3, "block {name} mean-rel {mean:.3e}");
         assert!(peak < 5e-3, "block {name} peak-rel {peak:.3e}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED transformer_real_weights::dual_stream_block_matches_fork"
+    );
 }

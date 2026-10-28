@@ -347,6 +347,28 @@ impl std::fmt::Debug for PreviewHook<'_> {
 ///   from zero while MLX/PyTorch round to even; using the shared helper is what makes this
 ///   byte-identical to the MLX projection for the same latent and constants.
 pub fn project_latents(latents: &Tensor, factors: &[[f32; 3]], bias: [f32; 3]) -> Result<Image> {
+    project_latents_using(latents, factors, bias, |_| {})
+}
+
+/// Opt-in source-bound observation before the existing host RGB readback.
+/// Used only by provider-owned fitted learned preview projections.
+#[cfg(feature = "model-inference-proof")]
+#[doc(hidden)]
+pub fn project_latents_observing(
+    latents: &Tensor,
+    factors: &[[f32; 3]],
+    bias: [f32; 3],
+    observe: impl FnOnce(&Tensor),
+) -> Result<Image> {
+    project_latents_using(latents, factors, bias, observe)
+}
+
+fn project_latents_using(
+    latents: &Tensor,
+    factors: &[[f32; 3]],
+    bias: [f32; 3],
+    observe: impl FnOnce(&Tensor),
+) -> Result<Image> {
     let dims = latents.dims();
     if dims.len() != 4 || dims[0] != 1 {
         return Err(CandleError::Msg(format!(
@@ -381,6 +403,7 @@ pub fn project_latents(latents: &Tensor, factors: &[[f32; 3]], bias: [f32; 3]) -
         .matmul(&factors)?
         .broadcast_add(&bias)?
         .clamp(0f32, 1f32)?;
+    observe(&rgb);
     let pixels = crate::round_rgb8(&rgb.affine(255.0, 0.0)?)?
         .flatten_all()?
         .to_vec1::<u8>()?;

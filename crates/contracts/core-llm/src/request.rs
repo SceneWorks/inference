@@ -283,6 +283,11 @@ pub struct Sampling {
     /// [`repetition_penalty`](Self::repetition_penalty) it applies once per distinct id; it differs
     /// in being additive and in covering the full history rather than a recent window.
     pub presence_penalty: f32,
+    /// Penalize only generated tokens (vLLM semantics), not prompt ids. Defaults to `false`,
+    /// preserving the historical prompt-plus-generation policy. The backend resolves the actual
+    /// expanded multimodal prompt boundary per request, not a caller-estimated text length.
+    /// This does not change the independent repetition-penalty window.
+    pub presence_penalty_generated_only: bool,
     /// CTRL/HF repetition penalty; `1.0` disables it. Multiplicative (a positive logit is divided by
     /// it, a negative one multiplied) and applied once per distinct id among the last
     /// [`repetition_context`](Self::repetition_context) tokens, however often the id occurs there.
@@ -299,6 +304,7 @@ impl Default for Sampling {
             top_p: 0.9,
             top_k: 0,
             presence_penalty: 0.0,
+            presence_penalty_generated_only: false,
             repetition_penalty: 1.0,
             repetition_context: 0,
         }
@@ -343,6 +349,7 @@ impl Sampling {
             top_p: 1.0,
             top_k: 0,
             presence_penalty: 0.0,
+            presence_penalty_generated_only: false,
             repetition_penalty: 1.0,
             repetition_context: 0,
         }

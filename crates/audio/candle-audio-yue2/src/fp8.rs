@@ -346,9 +346,8 @@ impl Fp8Weight {
         };
         let (q, x_scale) = quantize_e4m3(&padded)?;
         let xq = self.lt.stage_fp8(&q)?;
-        let y = self
-            .lt
-            .matmul_fp8_staged(&self.w, self.scale, &xq, x_scale)?;
+        let y =
+            __model_proof_output!(self.lt.matmul_fp8_staged(&self.w, self.scale, &xq, x_scale))?;
         let mut out_dims = dims;
         *out_dims.last_mut().expect("non-empty") = n;
         let y = y.narrow(0, 0, m)?.reshape(out_dims)?;

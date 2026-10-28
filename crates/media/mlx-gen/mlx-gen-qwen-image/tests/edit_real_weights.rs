@@ -169,6 +169,8 @@ fn edit_pipeline_matches_fork() {
     let (dpeak, dmean) = rel_errors(&decoded, want_dec);
     println!("edit decoded: peak-rel {dpeak:.3e}  mean-rel {dmean:.3e}");
     assert!(dmean < 5e-2, "edit decoded mean-rel {dmean:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_pipeline_matches_fork");
 }
 
 /// The deterministic synthetic reference image (matches `tools/dump_qwen_image_edit_golden.py`).
@@ -240,6 +242,10 @@ fn edit_reference_latents_matches_fork() {
     // LANCZOS matches PIL only to ~1/255 (fixed-point resampler not bit-reproduced); the diff is
     // a few border pixels through the VAE, not a math error.
     assert!(mean < 3e-2, "ref latents mean-rel {mean:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_reference_latents_matches_fork"
+    );
 }
 
 /// Debug: my `tokenize_edit` input_ids + pixel_values vs the fork's, for the synthetic reference
@@ -305,6 +311,8 @@ fn edit_vision_stages_debug() {
             got.shape()
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_vision_stages_debug");
 }
 
 /// Debug: my tokenize_edit → VL-encode embeds vs the fork's `pos_embeds` (loads only LM + vision).
@@ -352,6 +360,8 @@ fn edit_pos_embeds_matches_fork() {
     assert_eq!(embeds.shape(), want.shape(), "pos_embeds shape");
     let (peak, mean) = rel_errors(&embeds, want);
     println!("edit pos_embeds: peak-rel {peak:.3e}  mean-rel {mean:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_pos_embeds_matches_fork");
 }
 
 /// Determinism: run the SAME edit (same ref + prompt + seed) twice through the Rust Generator and
@@ -393,6 +403,10 @@ fn edit_generate_is_deterministic_rust() {
         a.pixels.len()
     );
     assert_eq!(differ, 0, "two identical Rust edits must be byte-identical");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_generate_is_deterministic_rust"
+    );
 }
 
 /// Gate 4 (full slice 7a): the **whole** `qwen_image_edit` Generator — load → tokenize_edit →
@@ -444,6 +458,8 @@ fn edit_generate_matches_fork() {
         "edit generate diverges from the fork: {:.3}% px>8",
         frac * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_generate_matches_fork");
 }
 
 /// Slice 7b (denoise isolation): the dual-latent loop with a **Q8-quantized** transformer (group 64,
@@ -506,6 +522,8 @@ fn edit_pipeline_q8_matches_fork() {
     let (_dpeak, dmean) = rel_errors(&decoded, want_dec);
     println!("Q8 edit decoded: mean-rel {dmean:.3e}");
     assert!(dmean < 6e-2, "Q8 edit decoded mean-rel {dmean:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_pipeline_q8_matches_fork");
 }
 
 /// Slice 7b (full e2e): the whole `qwen_image_edit` Generator with a **Q8** `LoadSpec` — bf16
@@ -555,6 +573,8 @@ fn edit_generate_q8_matches_fork() {
         "Q8 edit generate diverges from fork-Q8: {:.3}% px>8",
         frac * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_generate_q8_matches_fork");
 }
 
 /// sc-2529 (multi-image e2e): the whole `qwen_image_edit` Generator with a **`MultiReference`** of
@@ -611,6 +631,8 @@ fn edit_generate_multi_matches_fork() {
         "multi edit generate diverges from the fork: {:.3}% px>8",
         frac * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_generate_multi_matches_fork");
 }
 
 /// sc-2529 (multi-image e2e, Q8): the multi-reference Generator with a **Q8** `LoadSpec` vs the
@@ -664,5 +686,9 @@ fn edit_generate_multi_q8_matches_fork() {
         frac < 0.02,
         "multi Q8 edit generate diverges from fork-Q8: {:.3}% px>8",
         frac * 100.0
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_generate_multi_q8_matches_fork"
     );
 }

@@ -20,6 +20,15 @@
 //!   cargo test --features cuda --test prepare -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -119,6 +128,7 @@ fn write_synthetic_as(tag: &str, hidden: usize, inter: usize, dtype: DType) -> F
 /// `into_causal_lm` hands over the very decoder `causal_lm` borrows (identical logits), and the
 /// owned decoder is `Send` — what an engine that owns it across threads (YuE, sc-19380) needs.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn into_causal_lm_moves_the_loaded_decoder_out() {
     fn assert_send<T: Send>(_: &T) {}
     let src = write_synthetic("into-causal", 8, 16);
@@ -138,6 +148,9 @@ fn into_causal_lm_moves_the_loaded_decoder_out() {
         .to_vec1::<f32>()
         .unwrap();
     assert_eq!(owned, borrowed);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED into_causal_lm_moves_the_loaded_decoder_out");
 }
 
 /// A dense source is detected as safetensors and prepared as a passthrough (returned as-is, nothing
@@ -281,6 +294,7 @@ fn logits(provider: &LlamaProvider) -> Vec<f32> {
 /// rebuilds the stored blocks on that accelerator; the bf16 fixture keeps a load-time quantization
 /// there (bf16 compute) quantizing exactly the weights the preparer did.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn prepared_tiers_store_ggml_blocks_and_load_identically() {
     for (tag, hidden, inter, quant, blocks) in [
         (
@@ -447,12 +461,18 @@ fn prepared_tiers_store_ggml_blocks_and_load_identically() {
             Ok(_) => panic!("{tag}: stored blocks without a quantization block must be refused"),
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED prepared_tiers_store_ggml_blocks_and_load_identically"
+    );
 }
 
 /// Backward compatibility: a snapshot prepared before sc-19375 — dense weights carrying the
 /// rounding plus a bare `quantization` block — still loads quantized, to the same logits as a
 /// load-time quantization of those weights.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn dense_rounded_prepared_snapshot_still_loads_quantized() {
     let src = write_synthetic("legacy", 64, 96);
     let cfg_path = src.join("config.json");
@@ -475,6 +495,11 @@ fn dense_rounded_prepared_snapshot_still_loads_quantized() {
     at_load.quantize = Some(Quantize::Q8);
     let at_load = LlamaProvider::load(&at_load).unwrap();
     assert_eq!(logits(&loaded), logits(&at_load));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED dense_rounded_prepared_snapshot_still_loads_quantized"
+    );
 }
 
 /// A multimodal snapshot (a `vision_config` block) is declined by the text preparer, so
@@ -553,6 +578,9 @@ fn real_hf_dense() {
         None,
         "hf-dense",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_hf_dense");
 }
 
 /// Q8_0 (block size 32) applies broadly — SmolLM2's dims suffice.
@@ -566,6 +594,9 @@ fn real_hf_q8() {
         Some(Quantize::Q8),
         "hf-q8",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_hf_q8");
 }
 
 /// Q4 on a real snapshot. Any 32-aligned model prepares Q4 (Q4_K where an input dim is 256-aligned,
@@ -581,6 +612,9 @@ fn real_hf_q4_qwen3() {
         Some(Quantize::Q4),
         "hf-q4",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_hf_q4_qwen3");
 }
 
 #[test]
@@ -593,6 +627,9 @@ fn real_gguf_dense() {
         None,
         "gguf-dense",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_gguf_dense");
 }
 
 /// Convert a GGUF and bake Q8 in one step (block size 32 — broadly applicable).
@@ -606,4 +643,7 @@ fn real_gguf_q8() {
         Some(Quantize::Q8),
         "gguf-q8",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_gguf_q8");
 }

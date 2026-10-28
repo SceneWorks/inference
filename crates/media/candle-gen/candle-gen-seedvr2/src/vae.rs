@@ -30,7 +30,7 @@ impl Linear {
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        nn::linear(x, &self.wt, Some(&self.b))
+        __model_proof_output!(nn::linear(x, &self.wt, Some(&self.b)))
     }
 }
 

@@ -94,7 +94,19 @@ class S3CudaTests(unittest.TestCase):
     def test_device_gate_source_is_nonignored_and_requires_cuda(self):
         source=(ROOT/"crates/media/candle-gen/candle-gen-minimax-h3/src/veda.rs").read_text(encoding="utf-8")
         before,gate=source.split("fn actual_cuda_kernel_gate()",1)
-        self.assertNotIn("#[ignore",before[before.rfind("/// Coordinator"):])
+        self.assertIn('#[ignore = "model inference; explicit model workflow only"]',
+                      before[before.rfind("/// Coordinator"):])
+        registry=json.loads((ROOT/"scripts/ci/model-inference-proofs.json").read_text(encoding="utf-8"))
+        registered=[row for row in registry if row.get("package")=="candle-gen-minimax-h3"
+                    and row.get("target")=="candle_gen_minimax_h3"
+                    and row.get("target_kind")=="lib" and row.get("fqn")==s3.TEST]
+        self.assertEqual(len(registered),1)
+        configuration=registered[0]["configurations"]["fixed_cuda"]
+        self.assertEqual(configuration["backend"],"candle-cuda")
+        self.assertEqual(configuration["expected_devices"],["candle-cuda"])
+        self.assertTrue({"cuda","model-inference-proof"}.issubset(configuration["cargo_features"]))
+        self.assertIn('argv = [str(binary), TEST, "--exact", "--ignored", "--nocapture"]',
+                      Path(s3.__file__).read_text(encoding="utf-8"))
         self.assertIn('Device::new_cuda(0).expect("S3 requires an exclusively admitted CUDA device")',gate)
         self.assertNotIn("else { return",gate)
         self.assertIn("S3_DEVICE_RECEIPT",gate)

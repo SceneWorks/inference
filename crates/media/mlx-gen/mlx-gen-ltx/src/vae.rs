@@ -1039,6 +1039,7 @@ mod tests {
     /// **2.791e0** against the real block's **0.0**. That is what distinguishes "the port's
     /// normalization is per-position" from "the port merely happens to agree here".
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn dec_res_block_is_spatially_local_but_a_spatially_normalized_variant_is_not() {
         use std::collections::HashMap;
 
@@ -1106,6 +1107,8 @@ mod tests {
             "the spatial-reduction control must destroy crop-locality, got \
              max|Δ|={mutated_delta:.3e}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::tests::dec_res_block_is_spatially_local_but_a_spatially_normalized_variant_is_not");
     }
 
     /// **The real tiling driver reassembles a per-position-normalizing decoder exactly.** Runs
@@ -1123,6 +1126,7 @@ mod tests {
     /// **Executed mutation** (the real [`pixel_norm`] widened to a (C, H, W) reduction): the exact
     /// route degrades 2.384e-7 → **2.021e-1** and this test goes RED.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn tiled_assembly_is_exact_for_a_pixel_norm_decoder_and_wrong_for_a_spatial_one() {
         let (latent, plan) = synthetic_tiled_case();
         let tiles = plan.t.len() * plan.h.len() * plan.w.len();
@@ -1171,6 +1175,8 @@ mod tests {
             "the spatial-reduction control must break tiled reassembly, got max|Δ|={broken:.3e} — \
              the bound above would then be proving nothing"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::tests::tiled_assembly_is_exact_for_a_pixel_norm_decoder_and_wrong_for_a_spatial_one");
     }
 
     #[test]

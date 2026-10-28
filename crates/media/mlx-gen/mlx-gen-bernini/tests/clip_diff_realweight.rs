@@ -77,4 +77,6 @@ fn clip_diff_real_weight_smoke() {
         gen.shape(),
         sample.shape()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED clip_diff_realweight::clip_diff_real_weight_smoke");
 }

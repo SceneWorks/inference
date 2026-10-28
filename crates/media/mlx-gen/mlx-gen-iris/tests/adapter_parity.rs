@@ -27,10 +27,14 @@ fn spec(file: &str, kind: AdapterKind, scale: f32) -> AdapterSpec {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lora_and_lokr_match_upstream_merged_weights() {
     cpu_process(
         "adapter_parity::lora_and_lokr_match_upstream_merged_weights",
-        lora_and_lokr_match_upstream_merged_weights_body,
+        || {
+            lora_and_lokr_match_upstream_merged_weights_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED adapter_parity::lora_and_lokr_match_upstream_merged_weights");
+        },
     );
 }
 

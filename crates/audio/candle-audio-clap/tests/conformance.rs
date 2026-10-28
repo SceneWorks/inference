@@ -20,6 +20,16 @@
 //! cargo test --locked -p candle-audio-clap --test conformance -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_clap::gen_core::{AudioTrack, LoadSpec, WeightsSource};
@@ -195,6 +205,9 @@ fn cross_modal_query_ranks_matching_clip_highest() {
         }
     }
     println!("=== all queries ranked their matching clip first ===\n");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cross_modal_query_ranks_matching_clip_highest");
 }
 
 /// Determinism: the same clip embeds to the same vector twice (no hidden RNG / state leak).
@@ -213,4 +226,7 @@ fn embedding_is_deterministic() {
     let ta = embedder.embed_text("a bell ringing").unwrap();
     let tb = embedder.embed_text("a bell ringing").unwrap();
     assert_eq!(ta, tb, "same text must embed identically");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED embedding_is_deterministic");
 }

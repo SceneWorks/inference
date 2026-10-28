@@ -789,6 +789,7 @@ mod tests {
 
     /// Mutation: insert a `.detach()` in `decode` ⇒ no gradient ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decode_upscales_by_eight_into_unit_range_and_is_differentiable() {
         let cfg = tiny_cfg();
         let dev = Device::Cpu;
@@ -801,11 +802,15 @@ mod tests {
         let v = px.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(v.iter().all(|x| (0.0..=1.0).contains(x)));
         assert!(grad_sum(&dec, &z) > 0.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tae::tests::decode_upscales_by_eight_into_unit_range_and_is_differentiable");
     }
 
     /// A tiny F16 decoder upscales 16× and returns RGB only, differentiably. Mutations: drop the
     /// pixel shuffle ⇒ 8× ⇒ red; drop the RGB narrow ⇒ 4 channels ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn f16_decode_upscales_by_sixteen_to_rgb() {
         let spec = TinyDecoderSpec {
             latent_channels: 8,
@@ -824,10 +829,14 @@ mod tests {
         let v = px.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(v.iter().all(|x| (0.0..=1.0).contains(x)));
         assert!(grad_sum(&dec, &z) > 0.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tae::tests::f16_decode_upscales_by_sixteen_to_rgb");
     }
 
     /// The f16 checkpoint loads as f32 (param bytes counted at f32, decode output f32).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn f16_checkpoints_load_as_f32() {
         let spec = TinyDecoderSpec {
             latent_channels: 8,
@@ -849,6 +858,9 @@ mod tests {
         assert_eq!(dec.param_bytes(), spec.param_count() * 4);
         let z = Tensor::randn(0f32, 1f32, (1, 8, 2, 2), &dev).unwrap();
         assert_eq!(dec.decode(&z).unwrap().dtype(), DType::F32);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tae::tests::f16_checkpoints_load_as_f32");
     }
 
     /// `pixel_shuffle2` is torch `PixelShuffle(2)`. Mutation: swap the `i`/`j` axes ⇒ red.
@@ -891,6 +903,7 @@ mod tests {
     /// The mid-block pool participates and stays differentiable. Mutation: skip `x += pool(x)` ⇒
     /// red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn midblock_pool_changes_the_decode_and_is_differentiable() {
         let spec = TinyDecoderSpec {
             latent_channels: 4,
@@ -922,6 +935,9 @@ mod tests {
             .unwrap();
         assert!(diff > 0.0, "pool had no effect");
         assert!(grad_sum(&with, &z) > 0.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::tae::tests::midblock_pool_changes_the_decode_and_is_differentiable");
     }
 
     /// The composed GroupNorm normalizes each contiguous channel group over (group channels, H, W)

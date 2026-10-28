@@ -45,6 +45,7 @@ fn wan_a14b_generate_produces_coherent_video() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_A14B_MODEL_DIR to the converted A14B model dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_a14b_generate_produces_coherent_video; see preceding skip diagnostic");
             return;
         }
     };
@@ -137,4 +138,6 @@ fn wan_a14b_generate_produces_coherent_video() {
         }
         println!("wrote {} PPM frames to {}", frames.len(), out_dir.display());
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED s6_generate_smoke::wan_a14b_generate_produces_coherent_video");
 }

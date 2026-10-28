@@ -128,6 +128,8 @@ fn tap_reweight_sweep_1024() {
     let tmp = tempfile::tempdir().unwrap();
     let Some(root) = snapshot() else {
         eprintln!("skipping: set KREA_TURBO_DIR");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/tap_reweight_spike.rs:131 (tap_reweight_sweep_1024): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let device = Device::cuda_if_available(0).expect("cuda device");
@@ -187,6 +189,9 @@ fn tap_reweight_sweep_1024() {
             .join("krea_tap_reweight_spike")
             .display()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tap_reweight_spike::tap_reweight_sweep_1024");
 }
 
 /// sc-11878 — validate the **shipped** path: drive `pipeline::render` (the production Turbo txt2img
@@ -199,6 +204,8 @@ fn text_style_gain_sweep_1024() {
     let tmp = tempfile::tempdir().unwrap();
     let Some(root) = snapshot() else {
         eprintln!("skipping: set KREA_TURBO_DIR");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/tap_reweight_spike.rs:202 (text_style_gain_sweep_1024): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let device = Device::cuda_if_available(0).expect("cuda device");
@@ -258,4 +265,7 @@ fn text_style_gain_sweep_1024() {
     // Sanity: g=1.0 must be byte-identical to None (the no-op fast path), and g=1.75 must move the
     // image materially more than g=0.5 (early taps dominate — the spike's core finding on the wire).
     // (Left as eyeball asserts via the printed MAD to avoid over-pinning exact pixels across drivers.)
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tap_reweight_spike::text_style_gain_sweep_1024");
 }

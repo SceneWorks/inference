@@ -281,8 +281,13 @@ fn default_shift() -> f64 {
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| AudioError::Msg(format!("read {}: {e}", path.display())))?;
-    serde_json::from_str(&text)
-        .map_err(|e| AudioError::Msg(format!("parse {}: {e}", path.display())))
+    candle_audio::gen_core::__model_input_result!(
+        serde_json::from_str(&text)
+            .map_err(|e| AudioError::Msg(format!("parse {}: {e}", path.display()))),
+        "candle-audio-acestep::config::read_json",
+        Configuration,
+        &[path]
+    )
 }
 
 /// All configs of one snapshot directory, parsed and cross-checked.

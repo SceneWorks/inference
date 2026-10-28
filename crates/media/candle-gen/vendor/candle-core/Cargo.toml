@@ -20,6 +20,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
+sha2 = { version = "0.10", optional = true }
 accelerate-src = { version = "0.3.2", optional = true }
 byteorder = "1.4.3"
 candle-kernels = { git = "https://github.com/huggingface/candle", rev = "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d", version = "0.10.2", optional = true }
@@ -57,7 +58,10 @@ rayon = "1.7.0"
 safetensors = "0.7.0"
 thiserror = "2"
 yoke = { version = "0.8.1", features = ["derive"] }
-zip = { version = "9.0.0", default-features = false }
+# ZIP 9's `deflate` selects zlib-rs (and zopfli). Use miniz for archive I/O without
+# changing the flate2 encoder backend of downstream consumers (e.g. PNG writers).
+zip = { version = "9.0.0", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokenizers = { version = "0.22.0", default-features = false, features = ["onig"] }
 
@@ -70,6 +74,7 @@ clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
 
 [features]
+model-inference-proof = ["dep:sha2"]
 default = []
 cuda = ["cudarc", "dep:candle-kernels", "candle-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]

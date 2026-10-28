@@ -114,6 +114,8 @@ fn dit_prequantize_loads_packed_and_forwards() {
         out.shape()
     );
     print_disk_size(&dst_transformer.join("diffusion_pytorch_model.safetensors"));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_prequantize_real_weights::dit_prequantize_loads_packed_and_forwards");
 }
 
 #[test]

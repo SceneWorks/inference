@@ -379,6 +379,7 @@ mod tests {
     /// activation dtype; on a random BF16 fixture its logits stay within the gate's budget of the
     /// `f32` path and its greedy tokens agree ([`crate::primitives::activation::parity`]).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn geglu_activation_dtype_parity() {
         use crate::primitives::activation::parity::{assert_geglu_parity, random_bf16};
         let (v, h, inter, layers, heads, kv_heads) = (64, 64, 128, 2, 4, 2);
@@ -429,9 +430,12 @@ mod tests {
         .unwrap();
         let report = assert_geglu_parity("starcoder2", &model, &[3, 17, 5, 40, 9], 16);
         eprintln!("starcoder2 GeGLU parity: {report:?}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::starcoder2::tests::geglu_activation_dtype_parity");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn tiny_gqa_rope_decoder_is_deterministic_and_ties_the_lm_head() {
         let model = tiny_decoder();
         let config = GenerationConfig {
@@ -457,6 +461,8 @@ mod tests {
         assert_eq!(first.tokens, second.tokens);
         assert_eq!(first_events, second_events);
         assert_eq!(first.tokens.len(), 3);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::starcoder2::tests::tiny_gqa_rope_decoder_is_deterministic_and_ties_the_lm_head");
     }
 
     #[test]

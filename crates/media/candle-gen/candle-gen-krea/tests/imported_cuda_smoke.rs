@@ -13,7 +13,17 @@ fn env_path(name: &str) -> PathBuf {
 }
 
 fn read_image(path: &Path) -> Image {
-    let rgb = image::open(path).expect("decode fixture image").to_rgb8();
+    let rgb = candle_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/candle-gen/candle-gen-krea/tests/imported_cuda_smoke.rs::read_image::image::open@503",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
+    .expect("decode fixture image")
+    .to_rgb8();
     let (width, height) = rgb.dimensions();
     Image {
         width,
@@ -108,6 +118,9 @@ fn imported_native_krea_adapter_renders_base_and_kontext_edit() {
         plain_image.pixels, adapted_image.pixels,
         "selected imported-edit adapter must change deterministic output"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED imported_cuda_smoke::imported_native_krea_adapter_renders_base_and_kontext_edit");
 }
 
 #[test]
@@ -147,4 +160,7 @@ fn imported_native_krea_adapter_renders_strict_pose() {
         plain_image.pixels, output.pixels,
         "selected imported strict-control adapter must change deterministic output"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED imported_cuda_smoke::imported_native_krea_adapter_renders_strict_pose");
 }

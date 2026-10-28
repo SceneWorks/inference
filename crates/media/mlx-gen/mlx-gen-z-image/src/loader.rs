@@ -24,13 +24,35 @@ use crate::transformer::{ZImageTransformer, ZImageTransformerConfig};
 use crate::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
 
 /// Qwen3 pad token id (`<|endoftext|>`).
-const PAD_TOKEN_ID: i32 = 151643;
+fn pad_token_id() -> i32 {
+    crate::active_encoder_contract()
+        .bos_token_id
+        .expect("Qwen pad/bos token") as i32
+}
 /// Prompts pad to this length (the fork's `padding="max_length"`).
-const MAX_LENGTH: usize = 512;
+pub(crate) const MAX_LENGTH: usize = 512;
+
+/// The tensors a streamable text-encoder load reads up front: everything but the layer stack, whose
+/// layers are read inside their own priced quanta (an eager load reads everything).
+pub(crate) fn te_load_keeps(streamable: bool, name: &str) -> bool {
+    !(streamable && name.starts_with("model.layers."))
+}
+
+/// The tensors a DiT load reads up front: a streamed stack's block bodies are read inside each
+/// block's own priced quantum instead.
+pub(crate) fn dit_load_keeps(streamed: bool, name: &str) -> bool {
+    !(streamed && name.starts_with("layers."))
+}
+
+/// The tensors a ControlNet load reads up front: a streamed control stack's block bodies are read
+/// inside each block's own priced quantum instead.
+pub(crate) fn control_load_keeps(streamed: bool, name: &str) -> bool {
+    !(streamed && name.starts_with("control_layers."))
+}
 
 /// Load the Qwen tokenizer with the Z-Image chat-template + padding policy.
 pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
-    let source = crate::ENCODER_CONTRACT
+    let source = crate::active_encoder_contract()
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
     load_validated_tokenizer(&source)
 }
@@ -54,7 +76,7 @@ pub(crate) fn load_tokenizer_from_receipt(
             path,
             TokenizerConfig {
                 max_length: MAX_LENGTH,
-                pad_token_id: PAD_TOKEN_ID,
+                pad_token_id: pad_token_id(),
                 chat_template: ChatTemplate::QwenInstruct,
                 pad_to_max_length: true,
             },
@@ -66,16 +88,25 @@ pub(crate) fn load_tokenizer_from_receipt(
 /// Load the Qwen3-style text encoder (prompt → `cap_feats`). The checkpoint keys are prefixed
 /// `model.` (the encoder's own modules); no other remap is needed.
 pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
-    let selected = crate::ENCODER_CONTRACT
+    let selected = crate::active_encoder_contract()
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
     load_validated_text_encoder(&selected)
 }
 
 pub(crate) fn load_text_encoder_from_source(source: &WeightsSource) -> Result<TextEncoder> {
+    load_text_encoder_from_source_with(source, &ZTextEncoderConfig::z_image())
+}
+
+fn load_text_encoder_from_source_with(
+    source: &WeightsSource,
+    cfg: &ZTextEncoderConfig,
+) -> Result<TextEncoder> {
     // iOS: the header-only pre-load floor, checked before any tensor is read.
-    crate::quantum::before_load(crate::quantum::TE_LOAD, source, |_| true)?;
+    crate::quantum::before_load(crate::quantum::TE_LOAD, source, |name| {
+        te_load_keeps(false, name)
+    })?;
     let w = weights_from_source(source)?;
-    let encoder = TextEncoder::from_weights(&w, "model", &ZTextEncoderConfig::z_image())?;
+    let encoder = TextEncoder::from_weights(&w, "model", cfg)?;
     w.materialize_accessed()?;
     Ok(encoder)
 }
@@ -84,6 +115,15 @@ pub(crate) fn load_validated_text_encoder(
     source: &mlx_gen::gen_core::ValidatedEncoderSource,
 ) -> Result<TextEncoder> {
     source.read_unchanged(load_text_encoder_from_source)
+}
+
+/// The same validated eager loader at an explicit encoder geometry, for weights-free fixtures.
+#[cfg(test)]
+pub(crate) fn load_validated_text_encoder_with(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    cfg: &ZTextEncoderConfig,
+) -> Result<TextEncoder> {
+    source.read_unchanged(|weights| load_text_encoder_from_source_with(weights, cfg))
 }
 
 /// The **streamable** encoder for rung 4's text-encoder scope (SC-15794): it records the re-openable
@@ -95,7 +135,7 @@ pub(crate) fn load_validated_text_encoder(
 /// shape with no phase reload, so the repeated materialization is an explicit load-shape cost rather
 /// than an accidental rung-4 fallback.
 pub fn load_text_encoder_streamable(root: &Path) -> Result<TextEncoder> {
-    let selected = crate::ENCODER_CONTRACT
+    let selected = crate::active_encoder_contract()
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
     load_validated_text_encoder_streamable(&selected)
 }
@@ -103,19 +143,24 @@ pub fn load_text_encoder_streamable(root: &Path) -> Result<TextEncoder> {
 pub(crate) fn load_validated_text_encoder_streamable(
     source: &mlx_gen::gen_core::ValidatedEncoderSource,
 ) -> Result<TextEncoder> {
+    load_validated_text_encoder_streamable_with(source, &ZTextEncoderConfig::z_image())
+}
+
+/// [`load_validated_text_encoder_streamable`] at an explicit encoder geometry (the production one,
+/// or a tiny fixture's).
+pub(crate) fn load_validated_text_encoder_streamable_with(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    cfg: &ZTextEncoderConfig,
+) -> Result<TextEncoder> {
     source.read_unchanged(|weights| {
         // iOS: only the token embedding is read here; every layer is read inside its own priced
         // quantum when its window materializes it.
         crate::quantum::before_load(crate::quantum::TE_LOAD, weights, |name| {
-            !name.starts_with("model.layers.")
+            te_load_keeps(true, name)
         })?;
         let w = weights_from_source(weights)?;
-        let encoder = TextEncoder::from_validated_streamable_source(
-            &w,
-            source.clone(),
-            "model",
-            &ZTextEncoderConfig::z_image(),
-        )?;
+        let encoder =
+            TextEncoder::from_validated_streamable_source(&w, source.clone(), "model", cfg)?;
         w.materialize_accessed()?;
         Ok(encoder)
     })
@@ -158,16 +203,28 @@ pub(crate) fn load_transformer_with_stream(
     streamable: bool,
     streamed: bool,
 ) -> Result<ZImageTransformer> {
+    load_transformer_with_stream_cfg(root, ZImageTransformerConfig::turbo(), streamable, streamed)
+}
+
+/// [`load_transformer_with_stream`] at an explicit DiT geometry (the production one, or a tiny
+/// fixture's).
+pub(crate) fn load_transformer_with_stream_cfg(
+    root: &Path,
+    cfg: ZImageTransformerConfig,
+    streamable: bool,
+    streamed: bool,
+) -> Result<ZImageTransformer> {
     let dir = root.join("transformer");
     // iOS: the header-only floor of what this load reads (a streamed stack's block bodies are read
     // inside each block's own priced quantum instead).
     crate::quantum::before_load(
         crate::quantum::DIT_LOAD,
         &WeightsSource::Dir(dir.clone()),
-        |name| !(streamed && name.starts_with("layers.")),
+        |name| dit_load_keeps(streamed, name),
     )?;
     let mut w = Weights::from_dir(&dir)?;
-    let transformer = build_transformer(&mut w)?;
+    remap_transformer_keys(&mut w);
+    let transformer = ZImageTransformer::from_weights(&w, "", cfg)?;
     materialize_built(&w, streamed.then_some("layers."))?;
     // SC-15754: a snapshot directory is re-openable, so rung 4 (bounded transformer residency) can
     // rebuild `layers` per window from exactly these files. `remap_transformer_keys` only aliases the
@@ -225,7 +282,24 @@ pub(crate) fn load_control_transformer_with_stream(
     streamable: bool,
     streamed: bool,
 ) -> Result<ZImageControlTransformer> {
-    let base = load_transformer_with_stream(root, streamable, streamed)?;
+    load_control_transformer_with_stream_cfg(
+        root,
+        control,
+        ZImageTransformerConfig::turbo(),
+        streamable,
+        streamed,
+    )
+}
+
+/// [`load_control_transformer_with_stream`] at an explicit DiT geometry.
+pub(crate) fn load_control_transformer_with_stream_cfg(
+    root: &Path,
+    control: &WeightsSource,
+    cfg: ZImageTransformerConfig,
+    streamable: bool,
+    streamed: bool,
+) -> Result<ZImageControlTransformer> {
+    let base = load_transformer_with_stream_cfg(root, cfg, streamable, streamed)?;
     before_control_load(control, streamed)?;
     let control_weights = match control {
         WeightsSource::File(p) => Weights::from_file(p)?,
@@ -236,6 +310,11 @@ pub(crate) fn load_control_transformer_with_stream(
     // remap), so a streamed control block reads the same names the resident load did.
     let transformer = ZImageControlTransformer::from_weights(base, &control_weights, "")?;
     materialize_built(&control_weights, streamed.then_some("control_layers."))?;
+    let transformer = if streamed {
+        transformer.with_deferred_main_blocks()
+    } else {
+        transformer
+    };
     Ok(if streamable {
         transformer.with_control_block_stream(control.clone(), "")
     } else {
@@ -247,7 +326,7 @@ pub(crate) fn load_control_transformer_with_stream(
 /// stack's block bodies are read inside each block's own priced quantum instead).
 pub(crate) fn before_control_load(control: &WeightsSource, streamed: bool) -> Result<()> {
     crate::quantum::before_load(crate::quantum::CONTROL_LOAD, control, |name| {
-        !(streamed && name.starts_with("control_layers."))
+        control_load_keeps(streamed, name)
     })
 }
 
@@ -274,11 +353,70 @@ pub(crate) fn load_vae_from_weights(mut w: Weights) -> Result<Vae> {
 pub(crate) fn build_vae(w: &mut Weights) -> Result<Vae> {
     remap_vae_decoder(w)?;
     remap_vae_encoder(w)?;
+    build_remapped_vae(w)
+}
+
+/// The SAME constructor factory, after remapping. Keeping this boundary explicit lets metadata
+/// inventory distinguish remapper reads from module fields without changing native load ordering.
+pub(crate) fn build_remapped_vae(w: &Weights) -> Result<Vae> {
     Vae::from_weights(w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
         w,
         "encoder",
         &VaeEncoderConfig::default_z_image(),
     )
+}
+
+pub(crate) const TRANSFORMER_KEY_ALIASES: [(&str, &str); 3] = [
+    ("t_embedder.mlp.0", "t_embedder.linear1"),
+    ("t_embedder.mlp.2", "t_embedder.linear2"),
+    (
+        "all_final_layer.2-1.adaLN_modulation.1",
+        "all_final_layer.2-1.adaLN_modulation.0",
+    ),
+];
+
+/// Source-key identity of each header after the executable loader's ordered, per-suffix aliases.
+/// A source weight does NOT imply a source bias/scales sibling: a missing source suffix leaves the
+/// authored target suffix intact. Both raw spellings remain dictionary entries, but an overwritten
+/// target names the source's same Array handle in the module view. This is logical correspondence,
+/// not proof that distinct source keys have disjoint native backing or that discarded roots release.
+pub(crate) fn transformer_header_origins(
+    headers: &std::collections::BTreeMap<
+        String,
+        mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+    >,
+) -> std::collections::BTreeMap<String, String> {
+    let mut origins = headers
+        .keys()
+        .map(|key| (key.clone(), key.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (from, to) in TRANSFORMER_KEY_ALIASES {
+        for suffix in [".weight", ".bias", ".scales", ".biases"] {
+            if let Some(source) = origins.get(&format!("{from}{suffix}")).cloned() {
+                origins.insert(format!("{to}{suffix}"), source);
+            }
+        }
+    }
+    origins
+}
+
+/// The same aliases as the executable loader, applied only to metadata. Aliases are views of one
+/// source tensor, not new source payloads; callers must never sum both names as separate owners.
+pub(crate) fn remap_transformer_header_keys(
+    headers: &mut std::collections::BTreeMap<
+        String,
+        mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+    >,
+) {
+    for (from, to) in TRANSFORMER_KEY_ALIASES {
+        for suffix in [".weight", ".bias", ".scales", ".biases"] {
+            if let Some(source) = headers.get(&format!("{from}{suffix}")).cloned() {
+                let mut alias = source;
+                alias.name = format!("{to}{suffix}");
+                headers.insert(alias.name.clone(), alias);
+            }
+        }
+    }
 }
 
 /// diffusers DiT checkpoint → internal names: the timestep embedder is `t_embedder.mlp.{0,2}` on
@@ -290,14 +428,7 @@ pub fn remap_transformer_keys(w: &mut Weights) {
     // plus the packed `.scales`+`.biases` for the quantized case. `alias` is a no-op when the source
     // key is absent, so a dense snapshot (no `.scales`/`.biases`) and a packed one are both handled
     // by the same list.
-    for (from, to) in [
-        ("t_embedder.mlp.0", "t_embedder.linear1"),
-        ("t_embedder.mlp.2", "t_embedder.linear2"),
-        (
-            "all_final_layer.2-1.adaLN_modulation.1",
-            "all_final_layer.2-1.adaLN_modulation.0",
-        ),
-    ] {
+    for (from, to) in TRANSFORMER_KEY_ALIASES {
         for suffix in [".weight", ".bias", ".scales", ".biases"] {
             w.alias(&format!("{from}{suffix}"), &format!("{to}{suffix}"));
         }
@@ -334,31 +465,86 @@ fn vae_key_target(rest: &str, sampler_substr: &str) -> (String, bool) {
 /// Inserts the remapped keys alongside the originals. `keep_prefix` controls whether `{prefix}` is
 /// retained on the target key — the encoder keeps it, the decoder drops it, and both must coexist in
 /// one `Weights`. Shared by [`remap_vae_decoder`]/[`remap_vae_encoder`] (F-037).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VaeRemapStep {
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) transpose: bool,
+}
+
+/// Metadata and native execution share the exact one-key selector. The phase snapshot is
+/// deliberately supplied by the caller: encoder keys do not exist until decoder inserts finish.
+pub(crate) fn vae_remap_step(source: &str, encoder: bool) -> Option<VaeRemapStep> {
+    let (prefix, sampler) = if encoder {
+        ("encoder.", ".downsamplers.0.conv.")
+    } else {
+        ("decoder.", ".upsamplers.0.conv.")
+    };
+    let rest = source.strip_prefix(prefix)?;
+    let (suffix, transpose) = vae_key_target(rest, sampler);
+    Some(VaeRemapStep {
+        source: source.to_owned(),
+        target: if encoder {
+            format!("{prefix}{suffix}")
+        } else {
+            suffix
+        },
+        transpose,
+    })
+}
+
 fn remap_vae_tree(
     w: &mut Weights,
     prefix: &str,
     keep_prefix: bool,
     sampler_substr: &str,
+    trace: Option<&mut Vec<VaeRemapStep>>,
 ) -> Result<()> {
     let keys: Vec<String> = w
         .keys()
         .filter(|k| k.starts_with(prefix))
         .map(String::from)
         .collect();
+    remap_vae_keys(w, prefix, keep_prefix, sampler_substr, keys, trace)
+}
+
+/// `keys` is the native HashMap iteration snapshot, NOT sorted. The private seam also allows a
+/// fixture to exercise both real overwrite orders without changing the public loader's behavior.
+fn remap_vae_keys(
+    w: &mut Weights,
+    prefix: &str,
+    keep_prefix: bool,
+    sampler_substr: &str,
+    keys: Vec<String>,
+    mut trace: Option<&mut Vec<VaeRemapStep>>,
+) -> Result<()> {
     for k in keys {
-        let rest = k.strip_prefix(prefix).unwrap();
-        let (suffix, transpose) = vae_key_target(rest, sampler_substr);
-        let target = if keep_prefix {
-            format!("{prefix}{suffix}")
-        } else {
-            suffix
-        };
+        // The wrappers still supply the original unsorted snapshot and native phase order.
+        debug_assert!(k.starts_with(prefix));
+        debug_assert_eq!(
+            sampler_substr,
+            if keep_prefix {
+                ".downsamplers.0.conv."
+            } else {
+                ".upsamplers.0.conv."
+            }
+        );
+        let step = vae_remap_step(&k, keep_prefix).expect("phase snapshot key");
+        let transpose = step.transpose;
+        let target = step.target;
         let t = w.require(&k)?.clone();
         let t = if transpose {
             t.transpose_axes(&[0, 2, 3, 1])? // NCHW -> NHWC conv weight
         } else {
             t
         };
+        if let Some(trace) = trace.as_mut() {
+            trace.push(VaeRemapStep {
+                source: k,
+                target: target.clone(),
+                transpose,
+            });
+        }
         w.insert(target, t);
     }
     Ok(())
@@ -368,13 +554,19 @@ fn remap_vae_tree(
 /// NHWC. Drops the `decoder.` prefix (the encoder remap keeps its prefix; both coexist in one
 /// `Weights`). Up path → `upsamplers`.
 pub fn remap_vae_decoder(w: &mut Weights) -> Result<()> {
-    remap_vae_tree(w, "decoder.", false, ".upsamplers.0.conv.")
+    remap_vae_tree(w, "decoder.", false, ".upsamplers.0.conv.", None)
+}
+
+/// Test-only order seam; the public remapper always snapshots native unsorted `keys()`.
+#[cfg(test)]
+pub(crate) fn remap_vae_decoder_ordered(w: &mut Weights, keys: Vec<String>) -> Result<()> {
+    remap_vae_keys(w, "decoder.", false, ".upsamplers.0.conv.", keys, None)
 }
 
 /// diffusers VAE checkpoint (`encoder.*`) → internal encoder naming, conv weights transposed to
 /// NHWC. Keeps the `encoder.` prefix. Down path → `downsamplers`.
 pub fn remap_vae_encoder(w: &mut Weights) -> Result<()> {
-    remap_vae_tree(w, "encoder.", true, ".downsamplers.0.conv.")
+    remap_vae_tree(w, "encoder.", true, ".downsamplers.0.conv.", None)
 }
 
 #[cfg(test)]

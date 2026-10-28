@@ -137,14 +137,14 @@ fn apply_step(
         StepDtype::F32 => (x.as_dtype(Dtype::Float32)?, out.as_dtype(Dtype::Float32)?),
         StepDtype::Latents => (x.clone(), out.clone()),
     };
-    if c.a_x == 1.0 && c.a_noise == 0.0 {
+    if c.uses_unity_noiseless_update() {
         return Ok(add(&x, &multiply(&out, scalar(c.a_out))?)?);
     }
     let mut acc = add(
         &multiply(&x, scalar(c.a_x))?,
         &multiply(&out, scalar(c.a_out))?,
     )?;
-    if c.a_noise != 0.0 {
+    if c.has_noise() {
         let noise = rng.normal(acc.shape(), step)?;
         acc = add(&acc, &multiply(&noise, scalar(c.a_noise))?)?;
     }
@@ -164,6 +164,60 @@ fn apply_step(
 /// seed regardless of global RNG draw order.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MlxLatentOps;
+
+#[path = "flow_sampling.rs"]
+pub mod flow_sampling;
+#[path = "solver_memory.rs"]
+pub mod solver_memory;
+
+/// The canonical factory selection used by actual curated execution and host-only plans.
+/// Legacy low-level callers retain their unknown/None fallback; validated provider projections
+/// reject unadvertised names before invoking it.
+pub fn canonical_solver(
+    name: Option<&str>,
+    default: gen_core::sampling::Solver,
+) -> gen_core::sampling::Solver {
+    name.and_then(gen_core::sampling::Solver::from_name)
+        .unwrap_or(default)
+}
+
+/// Stable scalar diagnostic dtype vocabulary: 1=F16, 2=BF16, 3=F32, 0=other (reported, never
+/// interpreted as zero storage). This is not model::DTYPE or a tensor-value read.
+pub fn sampling_dtype_code(dtype: Dtype) -> u64 {
+    match dtype {
+        Dtype::Float16 => 1,
+        Dtype::Bfloat16 => 2,
+        Dtype::Float32 => 3,
+        _ => 0,
+    }
+}
+
+/// Observe an ACTUAL argument/return/owned binding at the caller's existing boundary. Counts are
+/// logical shape bytes, not ready/backing/donation facts; no clone, eval, values or heap retention.
+pub fn diagnostic_sampling_tensor(
+    provider: &str,
+    kind: &str,
+    evaluation: u64,
+    rows: u64,
+    tensor: &Array,
+) {
+    let shape = tensor.shape();
+    let fields = [
+        ("schema", 1),
+        ("evaluation", evaluation),
+        ("rows", rows),
+        ("dtype", sampling_dtype_code(tensor.dtype())),
+        ("elements", tensor.size() as u64),
+        ("logical_bytes", crate::ios_quantum::bytes(tensor)),
+        ("rank", shape.len() as u64),
+        ("dim0", shape.first().copied().unwrap_or(0) as u64),
+        ("dim1", shape.get(1).copied().unwrap_or(0) as u64),
+        ("dim2", shape.get(2).copied().unwrap_or(0) as u64),
+        ("dim3", shape.get(3).copied().unwrap_or(0) as u64),
+        ("dim4", shape.get(4).copied().unwrap_or(0) as u64),
+    ];
+    crate::ios_quantum::diagnostic_metadata(provider, kind, &fields);
+}
 
 /// Lift a raw MLX op error into the backend-neutral [`gen_core::Error`] (the `LatentOps` trait is
 /// declared in gen-core, so its methods return `gen_core::Result`). Routes through the existing
@@ -230,6 +284,52 @@ fn step_gate(
 
 impl LatentOps for MlxLatentOps {
     type Latent = Array;
+
+    fn observe_solver(&self, event: gen_core::sampling::solvers::SolverObservation<'_, Array>) {
+        use gen_core::sampling::solvers::{SolverEvaluation, SolverObservationKind};
+        let kind = match event.kind {
+            SolverObservationKind::Callback(SolverEvaluation::Primary) => "solver_primary",
+            SolverObservationKind::Callback(SolverEvaluation::HeunCorrector) => {
+                "solver_heun_corrector"
+            }
+            SolverObservationKind::Callback(SolverEvaluation::SdeMidpoint) => "solver_sde_midpoint",
+            SolverObservationKind::Correction => "solver_correction",
+            SolverObservationKind::Update => "solver_update",
+        };
+        let logical = |owner: Option<&Array>| owner.map(crate::ios_quantum::bytes).unwrap_or(0);
+        let fields = [
+            ("schema", 1),
+            ("solver_code", event.solver as u64),
+            ("step", event.step as u64),
+            ("sigma_bits", event.sigma.to_bits() as u64),
+            ("next_sigma_bits", event.next_sigma.to_bits() as u64),
+            ("zero_next", u64::from(event.next_sigma == 0.0)),
+            ("state_elements", event.current.size() as u64),
+            ("state_dtype", sampling_dtype_code(event.current.dtype())),
+            (
+                "state_logical_bytes",
+                crate::ios_quantum::bytes(event.current),
+            ),
+            ("history_denoised", u64::from(event.history[0].is_some())),
+            ("history_derivative", u64::from(event.history[1].is_some())),
+            ("history_sample", u64::from(event.history[2].is_some())),
+            ("history_denoised_logical_bytes", logical(event.history[0])),
+            (
+                "history_derivative_logical_bytes",
+                logical(event.history[1]),
+            ),
+            ("history_sample_logical_bytes", logical(event.history[2])),
+            ("outer_x_logical_bytes", logical(event.outer[0])),
+            ("outer_x0_logical_bytes", logical(event.outer[1])),
+            ("outer_d_logical_bytes", logical(event.outer[2])),
+            ("update_order", event.correction_order as u64),
+            ("scalar_history", u64::from(event.scalar_history)),
+            ("cfg_pp", u64::from(event.cfg_pp)),
+            ("terminal_alias", u64::from(event.terminal_alias)),
+            ("noise", u64::from(event.noise)),
+        ];
+        crate::ios_quantum::diagnostic_metadata("curated", kind, &fields);
+    }
 
     fn scale(&self, x: &Array, scale: f32) -> gen_core::Result<Array> {
         if scale == 1.0 {
@@ -433,11 +533,10 @@ pub fn run_curated_sampler_with_latent_hook(
     let ops = MlxLatentOps;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
     // N3: a curated name routes to its solver; an unknown name / non-solver alias falls back to Euler.
-    let solver = sampler_name
-        .and_then(Solver::from_name)
-        .unwrap_or(Solver::Euler);
+    let solver = canonical_solver(sampler_name, Solver::Euler);
     let sampler: Box<dyn Sampler<MlxLatentOps>> = solver.boxed();
     let mut step_observer = CuratedStepObserver::new(solver);
+    let mut evaluations = 0u64;
 
     let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<Array> {
         step_gate(cancel, on_progress, sigmas, total, sigma)?;
@@ -446,11 +545,46 @@ pub fn run_curated_sampler_with_latent_hook(
         // neutral. The multistep solvers reuse the previous denoised estimate, but the latent handed
         // back here is always the fresh node to integrate from, so evaluating it is safe.
         step_eval(&[x]).map_err(gen_core::Error::from)?;
+        crate::ios_quantum::diagnostic_metadata(
+            "curated",
+            "callback_evaluated",
+            &[
+                ("schema", 1),
+                ("completed_predict_evaluations", evaluations),
+                ("sigma_bits", sigma.to_bits() as u64),
+                ("state_dtype", sampling_dtype_code(x.dtype())),
+                ("state_logical_bytes", crate::ios_quantum::bytes(x)),
+                ("quantum_barrier", u64::from(crate::ios_quantum::enabled())),
+            ],
+        );
         if step_observer.is_step_start(sigmas, sigma) {
             on_latent(x, sigma);
         }
         gc_denoise(&ops, ms, x, sigma, |xin, t| {
-            predict(xin, t).map_err(Into::into)
+            evaluations += 1;
+            crate::ios_quantum::diagnostic_metadata(
+                "curated",
+                "predict_argument",
+                &[
+                    ("schema", 1),
+                    ("evaluation", evaluations),
+                    ("timestep_bits", t.to_bits() as u64),
+                    ("input_dtype", sampling_dtype_code(xin.dtype())),
+                    ("input_elements", xin.size() as u64),
+                ],
+            );
+            let prediction = predict(xin, t).map_err(gen_core::Error::from)?;
+            crate::ios_quantum::diagnostic_metadata(
+                "curated",
+                "predict_return",
+                &[
+                    ("schema", 1),
+                    ("evaluation", evaluations),
+                    ("output_dtype", sampling_dtype_code(prediction.dtype())),
+                    ("output_elements", prediction.size() as u64),
+                ],
+            );
+            Ok(prediction)
         })
     };
 
@@ -459,6 +593,20 @@ pub fn run_curated_sampler_with_latent_hook(
         .map_err(crate::Error::from)?;
     // Force the final step's advancement (never seen by the callback, which evals only inputs).
     step_eval(&[&out])?;
+    crate::ios_quantum::diagnostic_metadata(
+        "curated",
+        "solve_complete",
+        &[
+            ("schema", 1),
+            ("evaluations", evaluations),
+            (
+                "declared_transitions",
+                sigmas.len().saturating_sub(1) as u64,
+            ),
+            ("final_dtype", sampling_dtype_code(out.dtype())),
+            ("final_elements", out.size() as u64),
+        ],
+    );
     Ok(out)
 }
 
@@ -522,20 +670,76 @@ pub fn run_cfgpp_sampler_with_latent_hook(
         .unwrap_or(Solver::Euler);
     let sampler: Box<dyn CfgPpSampler<MlxLatentOps>> = cfgpp_sampler_for::<MlxLatentOps>(base)
         .expect("base_supports_cfgpp(Euler) holds, so a sampler always resolves");
+    let mut evaluations = 0u64;
 
     let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<(Array, Array)> {
         step_gate(cancel, on_progress, sigmas, total, sigma)?;
         step_eval(&[x]).map_err(gen_core::Error::from)?;
+        crate::ios_quantum::diagnostic_metadata(
+            "curated",
+            "callback_evaluated",
+            &[
+                ("schema", 1),
+                ("cfg_pp", 1),
+                ("completed_predict_evaluations", evaluations),
+                ("sigma_bits", sigma.to_bits() as u64),
+                ("state_dtype", sampling_dtype_code(x.dtype())),
+                ("state_logical_bytes", crate::ios_quantum::bytes(x)),
+                ("quantum_barrier", u64::from(crate::ios_quantum::enabled())),
+            ],
+        );
         on_latent(x, sigma);
-        gc_cfgpp_denoise(&ops, ms, x, sigma, |xin, t| {
-            predict_pair(xin, t).map_err(Into::into)
-        })
+        let denoised = gc_cfgpp_denoise(&ops, ms, x, sigma, |xin, t| {
+            evaluations += 1;
+            let prediction = predict_pair(xin, t).map_err(gen_core::Error::from)?;
+            crate::ios_quantum::diagnostic_metadata(
+                "curated",
+                "predict_pair_return",
+                &[
+                    ("schema", 1),
+                    ("cfg_pp", 1),
+                    ("evaluation", evaluations),
+                    ("guided_dtype", sampling_dtype_code(prediction.0.dtype())),
+                    ("uncond_dtype", sampling_dtype_code(prediction.1.dtype())),
+                    ("guided_elements", prediction.0.size() as u64),
+                    ("uncond_elements", prediction.1.size() as u64),
+                ],
+            );
+            Ok(prediction)
+        })?;
+        crate::ios_quantum::diagnostic_metadata(
+            "curated",
+            "denoised_pair_return",
+            &[
+                ("schema", 1),
+                ("cfg_pp", 1),
+                ("evaluation", evaluations),
+                ("guided_dtype", sampling_dtype_code(denoised.0.dtype())),
+                ("uncond_dtype", sampling_dtype_code(denoised.1.dtype())),
+            ],
+        );
+        Ok(denoised)
     };
 
     let out = sampler
         .sample(&ops, &mut denoise_fn, latents, sigmas)
         .map_err(crate::Error::from)?;
     step_eval(&[&out])?;
+    crate::ios_quantum::diagnostic_metadata(
+        "curated",
+        "solve_complete",
+        &[
+            ("schema", 1),
+            ("cfg_pp", 1),
+            ("evaluations", evaluations),
+            (
+                "declared_transitions",
+                sigmas.len().saturating_sub(1) as u64,
+            ),
+            ("final_dtype", sampling_dtype_code(out.dtype())),
+            ("final_elements", out.size() as u64),
+        ],
+    );
     Ok(out)
 }
 
@@ -1367,13 +1571,13 @@ mod tests {
     /// the next model eval. Off device it is exactly the unguarded eval (byte-identical output).
     #[cfg(target_os = "macos")]
     #[test]
-    fn curated_solver_steps_are_guarded_quanta() {
+    fn curated_solver_step_guards_preserve_parity_and_refuse_before_evaluation() {
         const CHILD: &str = "MLX_GEN_SAMPLER_STEP_QUANTUM_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "sampler::tests::curated_solver_steps_are_guarded_quanta",
+                    "sampler::tests::curated_solver_step_guards_preserve_parity_and_refuse_before_evaluation",
                 ])
                 .env(CHILD, "1")
                 .status()
@@ -1427,14 +1631,6 @@ mod tests {
             .collect();
         // One boundary per model eval (4 steps) plus the final advancement, each 16 latent buffers.
         assert_eq!(checks, vec![16 * 4 * 4; 5]);
-        // The allowance is never below what one Euler step actually allocates.
-        let x = arr(&[0.3, -1.1, 2.0, 0.5]);
-        let measured = crate::ios_quantum::measured_peak_bytes(|| {
-            let d = mlx_rs::ops::multiply(arr(&eps), Array::from_f32(-4.0))?;
-            Ok(vec![mlx_rs::ops::add(&x, &d)?])
-        })
-        .unwrap();
-        assert!(16 * 4 * 4 >= measured, "{measured}");
         // A refusal stops before the next model eval.
         calls.set(0);
         let _ = crate::ios_quantum::take_refusal();
@@ -1444,6 +1640,41 @@ mod tests {
             SAMPLER_STEP_QUANTUM
         );
         assert_eq!(calls.get(), 0, "no model eval past the refused boundary");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
+    fn curated_solver_steps_are_guarded_quanta() {
+        const CHILD: &str = "MLX_GEN_SAMPLER_STEP_CAPTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sampler::tests::curated_solver_steps_are_guarded_quanta",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let x = arr(&[0.3, -1.1, 2.0, 0.5]);
+        let eps = [0.7_f32, -0.2, 0.4, 0.1];
+        let measured = crate::ios_quantum::measured_peak_bytes(|| {
+            let d = mlx_rs::ops::multiply(arr(&eps), Array::from_f32(-4.0))?;
+            Ok(vec![mlx_rs::ops::add(&x, &d)?])
+        })
+        .unwrap();
+        assert!(16 * 4 * 4 >= measured, "{measured}");
+        eprintln!(
+            "IOS_CAPTURE_BODY_COMPLETED sampler::tests::curated_solver_steps_are_guarded_quanta"
+        );
     }
 
     #[test]

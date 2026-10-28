@@ -147,6 +147,7 @@ fn assert_same_files(a: &Path, b: &Path) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gen_core_trainer_conformance() {
     let data = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
@@ -157,6 +158,9 @@ fn gen_core_trainer_conformance() {
     let registry = candle_gen_iris::provider_registry().unwrap();
     gen_core_testkit::trainer::check_trainer_registry(&registry, trainer().as_ref()).unwrap();
     assert_eq!(trainer().descriptor().backend, "candle");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::gen_core_trainer_conformance");
 }
 
 /// Train `cfg` to completion in `out`, cancelling right after the `Training` event of micro-step
@@ -235,6 +239,7 @@ fn resume_case(mut cfg: TrainingConfig, name: &str) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn full_muon_cancel_and_resume_reproduce_the_uninterrupted_run() {
     let mut cfg = config();
     cfg.full_finetune = true;
@@ -242,17 +247,25 @@ fn full_muon_cancel_and_resume_reproduce_the_uninterrupted_run() {
     cfg.weight_decay = 0.01;
     options(&mut cfg, json!({"text_dropout": 0.5, "ema_decay": 0.9}));
     resume_case(cfg, "full.safetensors");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::full_muon_cancel_and_resume_reproduce_the_uninterrupted_run");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lokr_adamw_cancel_and_resume_reproduce_the_uninterrupted_run() {
     let mut cfg = config();
     cfg.network_type = NetworkType::Lokr;
     options(&mut cfg, json!({"text_dropout": 0.5, "ema_decay": 0.9}));
     resume_case(cfg, "lokr.safetensors");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::lokr_adamw_cancel_and_resume_reproduce_the_uninterrupted_run");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run() {
     let mut cfg = config();
     cfg.batch_size = 1;
@@ -297,10 +310,14 @@ fn lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run() {
     let s = read_checkpoint_state(&la).unwrap();
     assert_eq!((s.step, s.epoch, s.batches_consumed), (4, 3, 2));
     assert_same_files(&a.path().join(name), &b.path().join(name));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run");
 }
 
 /// A cancel before the first optimizer step is the typed cancellation and writes nothing.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cancel_before_any_step_is_typed_and_writes_nothing() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -319,9 +336,13 @@ fn a_cancel_before_any_step_is_typed_and_writes_nothing() {
         "{err:?}"
     );
     assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::a_cancel_before_any_step_is_typed_and_writes_nothing");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn resume_identity_retention_and_new_phase() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -366,9 +387,15 @@ fn resume_identity_retention_and_new_phase() {
     let req = request(&items, other, out.path(), name);
     let err = trainer().train(&req, &mut |_| {}).unwrap_err();
     assert!(err.to_string().contains("different state"), "{err}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::resume_identity_retention_and_new_phase"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cached_and_on_the_fly_conditioning_train_identically() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -389,6 +416,9 @@ fn cached_and_on_the_fly_conditioning_train_identically() {
         &a.path().join("c.safetensors"),
         &b.path().join("c.safetensors"),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::cached_and_on_the_fly_conditioning_train_identically");
 }
 
 /// The adapter artifact, installed through the Candle inference route
@@ -523,29 +553,46 @@ fn adapter_round_trip(network: NetworkType, compute: DType) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lora_adapter_exports_and_loads_through_the_provider() {
     adapter_round_trip(NetworkType::Lora, DType::F32);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::lora_adapter_exports_and_loads_through_the_provider");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lokr_adapter_exports_and_loads_through_the_provider() {
     adapter_round_trip(NetworkType::Lokr, DType::F32);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::lokr_adapter_exports_and_loads_through_the_provider");
 }
 
 /// Under bf16 training the base is bf16: the adapter must still reach the forward as a residual
 /// (a delta merged into the bf16 weight would round away) and match the provider's bf16 install.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn bf16_lora_adapter_exports_and_loads_through_the_provider() {
     adapter_round_trip(NetworkType::Lora, DType::BF16);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::bf16_lora_adapter_exports_and_loads_through_the_provider");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn bf16_lokr_adapter_exports_and_loads_through_the_provider() {
     adapter_round_trip(NetworkType::Lokr, DType::BF16);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::bf16_lokr_adapter_exports_and_loads_through_the_provider");
 }
 
 /// The shared contract: empty `sample_prompts` disables sampling whatever `sample_every` says.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn empty_sample_prompts_render_no_previews() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -564,6 +611,11 @@ fn empty_sample_prompts_render_no_previews() {
         })
         .unwrap();
     assert_eq!(samples.get(), 0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::empty_sample_prompts_render_no_previews"
+    );
 }
 
 fn generate(backbone: &Path, steps: u32, guidance: Option<f32>, seed: u64) -> Vec<u8> {
@@ -592,6 +644,7 @@ fn generate(backbone: &Path, steps: u32, guidance: Option<f32>, seed: u64) -> Ve
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn exported_full_model_loads_and_generates_in_the_provider() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -647,9 +700,13 @@ fn exported_full_model_loads_and_generates_in_the_provider() {
         generate(untrained.path(), 2, None, 1),
         "the provider renders the trained backbone, not the base"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::exported_full_model_loads_and_generates_in_the_provider");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn random_init_x_prediction_trains_and_its_export_records_the_objective() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -705,6 +762,9 @@ fn random_init_x_prediction_trains_and_its_export_records_the_objective() {
     };
     assert_eq!(ours(Prediction::Clean), provider);
     assert_ne!(ours(Prediction::Velocity), provider);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::random_init_x_prediction_trains_and_its_export_records_the_objective");
 }
 
 /// The generation trainer needs its frozen text encoder: a load without the `text_encoder`
@@ -727,6 +787,7 @@ fn a_trainer_load_without_the_text_encoder_is_refused() {
 /// `text_dropout` substitutes the CFG null for the dropped rows: at probability 1 every row is the
 /// null, so two datasets differing only in their captions train identically — and at 0 they do not.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn caption_dropout_substitutes_the_null_conditioning() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -748,11 +809,15 @@ fn caption_dropout_substitutes_the_null_conditioning() {
     };
     assert_eq!(train(&items, 1.0), train(&recaptioned, 1.0));
     assert_ne!(train(&items, 0.0), train(&recaptioned, 0.0));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::caption_dropout_substitutes_the_null_conditioning");
 }
 
 /// `train/lr.py`'s warmup ramps from exactly 0: the first optimizer step of a warmed-up run runs at
 /// lr 0 and leaves the (zero-decay) weights untouched; without warmup the same step moves them.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn warmup_starts_the_schedule_at_zero() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -773,12 +838,18 @@ fn warmup_starts_the_schedule_at_zero() {
         tensors(&out.path().join("w").join("model.safetensors")),
         base
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::warmup_starts_the_schedule_at_zero"
+    );
 }
 
 /// The preview renderer is the provider's sampler: on the same backbone, prompt, steps, CFG and
 /// seed it reproduces the catalog generator's image exactly — from the trainer's own in-memory
 /// backbone build (the provider's load dtypes over an in-memory checkpoint).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn preview_renderer_matches_the_provider() {
     let cfg = tiny_config();
     let want = generate(&tiny_backbone(), 4, Some(2.0), 5);
@@ -811,4 +882,9 @@ fn preview_renderer_matches_the_provider() {
     )
     .unwrap();
     assert_eq!(got.pixels, want);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train_lifecycle::preview_renderer_matches_the_provider"
+    );
 }

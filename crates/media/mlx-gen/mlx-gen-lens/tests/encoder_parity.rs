@@ -143,4 +143,6 @@ fn lens_encoder_matches_reference() {
         worst_peak < 0.15,
         "worst peak_rel {worst_peak:.3e} ≥ 0.15 — larger than bf16 massive-activation rounding explains"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED encoder_parity::lens_encoder_matches_reference");
 }

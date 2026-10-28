@@ -153,8 +153,14 @@ impl SenseNovaTokenizer {
                 root.display()
             ))
         })?;
-        let inner = Tokenizer::from_file(&path)
-            .map_err(|e| CandleError::Msg(format!("sensenova: load tokenizer.json: {e}")))?;
+        let inner = candle_gen::gen_core::__model_input_reader!(
+Tokenizer::from_file(&path),
+"crates/media/candle-gen/candle-gen-sensenova/src/text.rs::from_dir::Tokenizer::from_file@8620",
+Tokenizer,
+&path,
+|__model_input_path| Tokenizer::from_file(__model_input_path)
+)
+        .map_err(|e| CandleError::Msg(format!("sensenova: load tokenizer.json: {e}")))?;
         Ok(Self { inner })
     }
 

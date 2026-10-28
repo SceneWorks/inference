@@ -1291,6 +1291,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn conditioning_fault_runs_each_route_then_allows_cleanup_and_warm_follow_up() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -1440,6 +1441,8 @@ mod tests {
         assert_eq!(text_loads.load(Ordering::SeqCst), 1);
         assert_eq!(heavy_loads.load(Ordering::SeqCst), 1);
         assert_eq!(materializations.load(Ordering::SeqCst), 2);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED pipeline::tests::conditioning_fault_runs_each_route_then_allows_cleanup_and_warm_follow_up");
     }
 
     #[test]

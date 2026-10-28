@@ -290,6 +290,7 @@ fn slice(x: &Array, start: i32, end: i32) -> Array {
 /// Two structurally different probes must produce conditioning rows that differ by more than
 /// [`MUTATION_FLOOR`]; the *same* probe twice must agree to [`DETERMINISM_CEILING`]. The second
 /// half is what makes the first attributable to the image rather than to a per-call RNG draw.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn an_image_reference_binds_its_own_pixels() {
     let a = image_rows(0);
@@ -306,6 +307,8 @@ fn an_image_reference_binds_its_own_pixels() {
         peak_diff > MUTATION_FLOOR,
         "two different references must encode differently, got {peak_diff:e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ref2va_conditioning::an_image_reference_binds_its_own_pixels");
 }
 
 /// **Claim 2 — a clip reference binds every frame, not just its first.**
@@ -313,6 +316,7 @@ fn an_image_reference_binds_its_own_pixels() {
 /// Two clips that share frame 0 and differ only from frame 1 onwards must still produce different
 /// conditioning. An implementation that encoded only the first frame — a plausible shortcut, since
 /// an image reference *is* a one-frame clip — would pass every shape check and fail here.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_clip_reference_binds_every_frame() {
     // Same first frame, different tail.
@@ -338,6 +342,10 @@ fn a_clip_reference_binds_every_frame() {
         "a {}-row clip must occupy more rows than a {}-row still",
         a.shape()[1],
         single.shape()[1]
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED ref2va_conditioning::a_clip_reference_binds_every_frame"
     );
 }
 
@@ -517,6 +525,7 @@ fn every_modality_is_constructible_individually_and_combined() {
 /// the soundtrack block, and swapping a reference moves what the model sees. The negative control
 /// is a layout with one fewer reference, which must carry strictly fewer rows — so "the model saw
 /// the references" is not satisfied by a sequence that would have those rows anyway.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_model_sees_every_reference_in_its_rows() {
     let latents = 4;
@@ -557,12 +566,15 @@ fn the_model_sees_every_reference_in_its_rows() {
     let fewer = layout(&[image_geometry()], 5);
     assert_eq!(fewer.num_condition_audio_rows(), 0);
     assert!(fewer.seq_len() < l.seq_len());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ref2va_conditioning::the_model_sees_every_reference_in_its_rows");
 }
 
 /// **Claim 5 — reference rows ride through the loop untouched while the generated tail moves.**
 ///
 /// Both halves matter. "The references did not move" is trivially true of an inert loop, so the
 /// generated tail is asserted to move by more than [`MUTATION_FLOOR`] in the same run.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn references_are_never_denoised() {
     let latents = 4;
@@ -595,6 +607,8 @@ fn references_are_never_denoised() {
         "the generated tail must actually be denoised, got {peak:e} — otherwise 'the references \
          did not move' proves nothing"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ref2va_conditioning::references_are_never_denoised");
 }
 
 // ---------------------------------------------------------------------------------------------

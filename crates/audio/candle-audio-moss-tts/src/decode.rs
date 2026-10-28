@@ -299,6 +299,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn ar_loop_emits_inrange_frames_and_is_deterministic() {
         let dec = tiny_decoder();
         let cfg = &dec.cfg;
@@ -325,9 +326,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(a.frames, b.frames, "seeded AR decode is reproducible");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::ar_loop_emits_inrange_frames_and_is_deterministic");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cancel_stops_the_ar_loop_promptly() {
         let dec = tiny_decoder();
         let cfg = &dec.cfg;
@@ -345,6 +350,11 @@ mod tests {
         assert!(
             seen.get() <= 3,
             "cancel honored within a step, not after the budget"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::cancel_stops_the_ar_loop_promptly"
         );
     }
 }

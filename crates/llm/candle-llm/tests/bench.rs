@@ -18,6 +18,15 @@
 //! tokenizer needed. Each region is timed with a warmup pass and a `device.synchronize()` on both
 //! sides so the wall-clock reflects kernel time, not Candle's async dispatch.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
@@ -144,6 +153,8 @@ fn throughput_sweep() {
         .filter(|v| !v.is_empty())
     else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/bench.rs:147 (throughput_sweep): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let device = select_device().unwrap();
@@ -192,6 +203,9 @@ fn throughput_sweep() {
     for v in &variants {
         bench_variant(&dir, &device, v);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED throughput_sweep");
 }
 
 /// Label for the quantized row: it dequantizes to the device's default compute dtype.

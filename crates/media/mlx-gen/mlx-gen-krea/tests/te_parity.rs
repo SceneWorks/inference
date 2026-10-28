@@ -29,6 +29,7 @@ fn cosine(a: &Array, b: &Array) -> f32 {
     (dot / (na * nb)).item::<f32>()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn te_matches_reference() {
     let w = Weights::from_file(FIXTURE)
@@ -54,11 +55,14 @@ fn te_matches_reference() {
             .item::<bool>(),
         "TE stacked context diverged beyond 1e-2 (cosine {c:.7})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::te_matches_reference");
 }
 
 /// F-081: dropping the template prefix needs strictly more tokens than `prefix_tokens`; a shorter
 /// prompt must be a typed error, not an opaque empty-index `take_axis` panic (the guard the qwen
 /// encoders already have).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn te_rejects_prompt_shorter_than_prefix() {
     let w = Weights::from_file(FIXTURE)
@@ -76,4 +80,6 @@ fn te_rejects_prompt_shorter_than_prefix() {
             "expected the prefix-drop guard for s={s}, got: {e}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::te_rejects_prompt_shorter_than_prefix");
 }

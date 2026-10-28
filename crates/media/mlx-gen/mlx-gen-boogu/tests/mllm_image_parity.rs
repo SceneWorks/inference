@@ -92,4 +92,6 @@ fn mllm_image_matches_reference() {
         c > 0.999,
         "MLLM image-conditioned parity cosine {c} too low"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED mllm_image_parity::mllm_image_matches_reference");
 }

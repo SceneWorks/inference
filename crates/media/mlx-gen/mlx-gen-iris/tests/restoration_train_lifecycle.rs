@@ -208,10 +208,14 @@ fn assert_same(a: &Path, b: &Path) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn every_published_loss_term_moves_the_generator_update() {
     crate::common::cpu_process(
         "restoration_train_lifecycle::every_published_loss_term_moves_the_generator_update",
-        every_published_loss_term_moves_the_generator_update_body,
+        || {
+            every_published_loss_term_moves_the_generator_update_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::every_published_loss_term_moves_the_generator_update");
+        },
     );
 }
 
@@ -322,10 +326,14 @@ fn psnr_lpips(trainer_dir: &Path, items: &[TrainingItem], export: &Path) -> (f64
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn overfitting_a_few_pairs_improves_psnr_and_lpips() {
     crate::common::cpu_process(
         "restoration_train_lifecycle::overfitting_a_few_pairs_improves_psnr_and_lpips",
-        overfitting_a_few_pairs_improves_psnr_and_lpips_body,
+        || {
+            overfitting_a_few_pairs_improves_psnr_and_lpips_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::overfitting_a_few_pairs_improves_psnr_and_lpips");
+        },
     );
 }
 
@@ -349,8 +357,9 @@ fn overfitting_a_few_pairs_improves_psnr_and_lpips_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit() {
-    crate::common::cpu_process("restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit", cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit_body);
+    crate::common::cpu_process("restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit", || { cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit_body(); eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit"); });
 }
 
 fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit_body() {
@@ -362,8 +371,9 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit_body() {
 /// checkpointed run bit for bit (generator, EMA, both optimizers, critic head, data position,
 /// export).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing() {
-    crate::common::cpu_process("restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing", || cancel_and_resume_under(true));
+    crate::common::cpu_process("restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing", || { cancel_and_resume_under(true); eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing"); });
 }
 
 fn cancel_and_resume_under(ac: bool) {
@@ -453,10 +463,14 @@ fn cancel_and_resume_under(ac: bool) {
 /// gradients are the plain graph's; bf16 generator (f32 critic, as the miniature runs): the same
 /// loss terms bit for bit and gradients within the declared bf16 bound.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn activation_checkpointing_gradients_equal_the_plain_graph() {
     crate::common::cpu_process(
         "restoration_train_lifecycle::activation_checkpointing_gradients_equal_the_plain_graph",
-        activation_checkpointing_gradients_equal_the_plain_graph_body,
+        || {
+            activation_checkpointing_gradients_equal_the_plain_graph_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::activation_checkpointing_gradients_equal_the_plain_graph");
+        },
     );
 }
 
@@ -522,10 +536,10 @@ fn activation_checkpointing_gradients_equal_the_plain_graph_body() {
 /// Every factor is set non-zero first (a fresh adapter's zero half gives its other half an exactly
 /// zero gradient, which would compare nothing).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn activation_checkpointing_adapter_gradients_equal_the_plain_graph() {
     crate::common::cpu_process(
-        "restoration_train_lifecycle::activation_checkpointing_adapter_gradients_equal_the_plain_graph",
-        activation_checkpointing_adapter_gradients_equal_the_plain_graph_body,
+        "restoration_train_lifecycle::activation_checkpointing_adapter_gradients_equal_the_plain_graph", || { activation_checkpointing_adapter_gradients_equal_the_plain_graph_body(); eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::activation_checkpointing_adapter_gradients_equal_the_plain_graph"); },
     );
 }
 
@@ -665,10 +679,14 @@ fn activation_checkpointing_adapter_gradients_equal_the_plain_graph_body() {
 /// trainer wires `gradient_checkpointing` into its generator step, the export moves by rounding
 /// only, keeps its stamps and loads in the `iris_3b_restore` transform.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn activation_checkpointing_leaves_the_run_unchanged() {
     crate::common::cpu_process(
         "restoration_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged",
-        activation_checkpointing_leaves_the_run_unchanged_body,
+        || {
+            activation_checkpointing_leaves_the_run_unchanged_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged");
+        },
     );
 }
 
@@ -726,8 +744,9 @@ fn activation_checkpointing_leaves_the_run_unchanged_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse() {
-    crate::common::cpu_process("restoration_train_lifecycle::the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse", the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse_body);
+    crate::common::cpu_process("restoration_train_lifecycle::the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse", || { the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse_body(); eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_lifecycle::the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse"); });
 }
 
 fn the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse_body() {

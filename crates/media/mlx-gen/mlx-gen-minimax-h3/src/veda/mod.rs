@@ -1230,6 +1230,7 @@ mod frozen_tests {
     /// MLX **CPU** device with the fixture predictor; NaN values poison only the attention output
     /// (the predictor scores read Q/K alone), exactly the CUDA A/B failure's signature.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn non_finite_sparse_output_falls_back_to_dense_and_is_reported() {
         use crate::denoise::{JointGeometry, PackedLayout, TEXT_TAG};
         struct Cpu;
@@ -1287,6 +1288,8 @@ mod frozen_tests {
             poisoned.fallback_reason
         );
         assert!(poisoned.kernel.is_none());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED veda::frozen_tests::non_finite_sparse_output_falls_back_to_dense_and_is_reported");
     }
     #[test]
     fn self_test_outcome_is_cached_per_device_and_kernel() {

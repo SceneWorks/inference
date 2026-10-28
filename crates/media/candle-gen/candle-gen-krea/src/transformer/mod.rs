@@ -1130,6 +1130,7 @@ mod tests {
     /// ragged case (window 4 over 6 blocks) is the arm that catches a driver whose last window is
     /// mis-clamped — it would silently skip layers and still return a plausible tensor.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_trunk_is_bit_identical_to_the_resident_trunk_at_every_window() {
         let tmp = tempfile::tempdir().unwrap();
         let (resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
@@ -1172,6 +1173,9 @@ mod tests {
                 "window {window}: streaming must not change the math (max |delta| {max_delta})"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::streamed_trunk_is_bit_identical_to_the_resident_trunk_at_every_window");
     }
 
     /// The parity assertion above is only worth its green if it can go red. A window that silently
@@ -1182,6 +1186,7 @@ mod tests {
     /// Stated as a property of the fixture rather than by mutating the driver: running the trunk
     /// truncated to 4 of its 6 blocks must not coincidentally equal the full trunk.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_trunk_that_skipped_its_tail_would_not_match() {
         let tmp = tempfile::tempdir().unwrap();
         let (resident, _streamed, latent, timestep, context) = streamed_pair(&tmp);
@@ -1222,6 +1227,9 @@ mod tests {
             delta > 0.0,
             "the parity test would be vacuous: a trunk missing two blocks matched the full one"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::a_trunk_that_skipped_its_tail_would_not_match");
     }
 
     /// A cancel tripped mid-trunk surfaces as the TYPED `Canceled` through the streamed driver, and
@@ -1229,6 +1237,7 @@ mod tests {
     /// render as a failed job (sc-4481) — the exact regression SC-15754 had to fix on the MLX twin,
     /// and the path now crosses two `From` conversions either of which could flatten it.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_cancel_is_typed_and_stops_inside_the_trunk() {
         let tmp = tempfile::tempdir().unwrap();
         let (_resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
@@ -1254,11 +1263,15 @@ mod tests {
             candle_gen::gen_core::Error::from(error),
             candle_gen::gen_core::Error::Canceled
         ));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::streamed_cancel_is_typed_and_stops_inside_the_trunk");
     }
 
     /// A degenerate window is a typed error, not a hang. `BlockPlan::new` rejects 0, and the streamed
     /// arm must surface that rather than looping forever on a zero-length step.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_zero_window_is_rejected_rather_than_looping() {
         let tmp = tempfile::tempdir().unwrap();
         let (_resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
@@ -1276,6 +1289,9 @@ mod tests {
             matches!(error, candle_gen::CandleError::Msg(ref m) if m.contains("window")),
             "{error:?}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::a_zero_window_is_rejected_rather_than_looping");
     }
 
     /// **The CPU half of the rung's mutation check.** Every block in the window must be live at
@@ -1324,6 +1340,7 @@ mod tests {
     /// order-preserving off the main thread, so the CUDA arm in
     /// `rung4_block_window_real_weights.rs` has a compiled, exercised path to run.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_output_is_identical_when_driven_from_a_worker_thread() {
         let tmp = tempfile::tempdir().unwrap();
         let (_resident, streamed, latent, timestep, context) = streamed_pair(&tmp);
@@ -1356,12 +1373,16 @@ mod tests {
             delta, 0.0,
             "materializing windows from a worker thread must not change the output"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::streamed_output_is_identical_when_driven_from_a_worker_thread");
     }
 
     /// The prepared seam owns text fusion + RoPE once for a complete request, while each seeded
     /// denoise step retains byte-identical output. The tiny CPU fixture covers the resident and the
     /// streamed storage variants without model weights or accelerator hardware.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_conditioning_is_once_per_request_and_matches_unprepared_for_every_storage_variant()
     {
         let tmp = tempfile::tempdir().unwrap();
@@ -1418,6 +1439,9 @@ mod tests {
                 assert_eq!(max, 0.0, "{name}: prepared output parity at t={time}");
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::prepared_conditioning_is_once_per_request_and_matches_unprepared_for_every_storage_variant");
     }
 
     /// Krea deliberately keeps sampler state independent of the DiT compute dtype. The image embed
@@ -1426,6 +1450,7 @@ mod tests {
     /// The CPU fixture uses the inverse of production's F32-sampler/BF16-model pairing because Candle
     /// CPU does not implement BF16 matmul; the validator and embed conversion contract are symmetric.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_conditioning_accepts_a_normalizable_sampler_dtype_and_binds_model_dtype() {
         let tmp = tempfile::tempdir().unwrap();
         let (dit, cfg) = crate::testfix::tiny_transformer(&tmp);
@@ -1484,9 +1509,13 @@ mod tests {
             matches!(error, candle_gen::CandleError::Msg(ref message) if message.contains("prepared conditioning request identity")),
             "expected model-identity rejection, got {error:?}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::prepared_conditioning_accepts_a_normalizable_sampler_dtype_and_binds_model_dtype");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_conditioning_rejects_a_mismatched_geometry_before_denoising() {
         let tmp = tempfile::tempdir().unwrap();
         let (dit, cfg) = crate::testfix::tiny_transformer(&tmp);
@@ -1509,9 +1538,13 @@ mod tests {
             matches!(error, candle_gen::CandleError::Msg(ref message) if message.contains("prepared conditioning request identity")),
             "expected typed prepared-state rejection, got {error:?}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::prepared_conditioning_rejects_a_mismatched_geometry_before_denoising");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_edit_conditioning_reuses_reference_tokens_with_output_parity() {
         let tmp = tempfile::tempdir().unwrap();
         let (dit, cfg) = crate::testfix::tiny_transformer(&tmp);
@@ -1559,6 +1592,9 @@ mod tests {
                 .unwrap();
             assert_eq!(max, 0.0, "prepared edit parity at sigma={sigma}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::prepared_edit_conditioning_reuses_reference_tokens_with_output_parity");
     }
 
     #[test]
@@ -1709,6 +1745,7 @@ mod tests {
     /// to go unread until the step ended — by which time the worker's bounded wind-down had exhausted its
     /// grace and abandoned a `spawn_blocking` join `abort()` cannot stop, leaving live GPU work behind.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn edit_forward_honors_the_cancel_flag_per_block() {
         use candle_gen::gen_core::CancelFlag;
 
@@ -1763,5 +1800,8 @@ mod tests {
             candle_gen::gen_core::Error::from(error),
             candle_gen::gen_core::Error::Canceled
         ));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::edit_forward_honors_the_cancel_flag_per_block");
     }
 }

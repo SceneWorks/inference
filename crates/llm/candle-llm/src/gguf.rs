@@ -163,19 +163,24 @@ impl GgufCheckpoint {
         let eos_token = meta_u64(meta, "tokenizer.ggml.eos_token_id")
             .and_then(|i| tok_tokens.get(i as usize).cloned());
 
-        Ok(Self {
-            config,
-            config_json,
-            weights,
-            stop_tokens,
-            chat_template,
-            bos_token,
-            eos_token,
-            tok_model: meta_str(meta, "tokenizer.ggml.model").map(str::to_string),
-            tok_tokens,
-            tok_merges: meta_str_array(meta, "tokenizer.ggml.merges").unwrap_or_default(),
-            tok_types: meta_i32_array(meta, "tokenizer.ggml.token_type").unwrap_or_default(),
-        })
+        crate::__model_input_result!(
+            Ok(Self {
+                config,
+                config_json,
+                weights,
+                stop_tokens,
+                chat_template,
+                bos_token,
+                eos_token,
+                tok_model: meta_str(meta, "tokenizer.ggml.model").map(str::to_string),
+                tok_tokens,
+                tok_merges: meta_str_array(meta, "tokenizer.ggml.merges").unwrap_or_default(),
+                tok_types: meta_i32_array(meta, "tokenizer.ggml.token_type").unwrap_or_default(),
+            }),
+            "candle-llm::gguf::GgufCheckpoint::open",
+            ModelWeights,
+            &[path]
+        )
     }
 
     /// Reconstruct the tokenizer from the GGUF's embedded metadata (the `else` branch when there is

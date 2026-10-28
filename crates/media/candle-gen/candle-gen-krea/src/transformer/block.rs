@@ -159,7 +159,7 @@ impl RmsScale {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        rms_scale(x, &self.weight, self.eps)
+        __model_proof_output!(rms_scale(x, &self.weight, self.eps))
     }
 
     pub(crate) fn move_to_device(

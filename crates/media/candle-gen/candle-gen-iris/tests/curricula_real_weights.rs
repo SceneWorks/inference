@@ -42,7 +42,13 @@ fn env_dir(name: &str) -> PathBuf {
 fn dataset(out: &Path) -> Vec<TrainingItem> {
     let photo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../mlx-gen/_vendor/mage_flow/assets/dog.jpg");
-    let rgb = image::open(photo)
+    let rgb = candle_gen::gen_core::__model_input_reader!(
+        image::open(photo),
+        "crates/media/candle-gen/candle-gen-iris/tests/curricula_real_weights.rs::dataset/image::open",
+        Reference,
+        photo,
+        |__model_input_path| image::open(__model_input_path)
+    )
         .expect("the repo photo decodes")
         .to_rgb8();
     let (w, h) = rgb.dimensions();
@@ -206,4 +212,7 @@ fn real_stage_presets_resume_256_to_512_with_repa() {
     )
     .unwrap();
     eprintln!("[[IRIS_CURRICULA_REAL]] stage1 {stage1_secs:.1}s, stage2 {stage2_secs:.1}s");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_real_weights::real_stage_presets_resume_256_to_512_with_repa");
 }

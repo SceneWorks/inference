@@ -108,6 +108,8 @@ fn run_gemma_gate(gemma_dir: &std::path::Path, golden: &str, quant: Option<Gemma
 fn gemma_hidden_states_match_reference() {
     // bf16 Rust vs bf16 reference (mlx 0.31.1 == reference 0.31.0); bf16 drift over 48 layers.
     run_gemma_gate(&gemma_dir(), GOLDEN, None, 2e-2);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma_parity::gemma_hidden_states_match_reference");
 }
 
 #[test]
@@ -126,5 +128,9 @@ fn gemma_quant_hidden_states_match_reference() {
         GOLDEN_Q8,
         Some(GemmaQuant { group, bits }),
         2e-2,
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED gemma_parity::gemma_quant_hidden_states_match_reference"
     );
 }

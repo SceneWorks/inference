@@ -52,11 +52,11 @@ impl TextEncoder {
 
     /// `input_ids: [1, T] (u32) → t_en [1, channels, T]`.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let x = self.embedding.forward(input_ids)?; // [1, T, C]
+        let x = __model_proof_output!(self.embedding.forward(input_ids))?; // [1, T, C]
         let mut x = x.transpose(1, 2)?.contiguous()?; // [1, C, T]
         for (conv, norm) in &self.convs {
-            x = conv.forward(&x)?;
-            x = norm.forward(&x)?;
+            x = __model_proof_output!(conv.forward(&x))?;
+            x = __model_proof_output!(norm.forward(&x))?;
             x = ops::leaky_relu(&x, LRELU_SLOPE_BLOCKS)?;
         }
         let x = x.transpose(1, 2)?.contiguous()?; // [1, T, C]

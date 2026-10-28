@@ -48,11 +48,11 @@ impl Embeddings {
         let position_ids = Tensor::from_vec(positions, (1, seq_len), device)?;
         let token_type_ids = Tensor::zeros((1, seq_len), DType::U32, device)?;
 
-        let words = self.word.forward(input_ids)?;
-        let pos = self.position.forward(&position_ids)?;
-        let types = self.token_type.forward(&token_type_ids)?;
+        let words = __model_proof_output!(self.word.forward(input_ids))?;
+        let pos = __model_proof_output!(self.position.forward(&position_ids))?;
+        let types = __model_proof_output!(self.token_type.forward(&token_type_ids))?;
         let sum = (words.broadcast_add(&pos)?).broadcast_add(&types)?;
-        self.norm.forward(&sum)
+        __model_proof_output!(self.norm.forward(&sum))
     }
 }
 
@@ -85,9 +85,9 @@ impl SelfAttention {
 
     fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
         let (b, seq, h) = hidden.dims3()?;
-        let q = self.shape_heads(&self.query.forward(hidden)?)?;
-        let k = self.shape_heads(&self.key.forward(hidden)?)?;
-        let v = self.shape_heads(&self.value.forward(hidden)?)?;
+        let q = self.shape_heads(&__model_proof_output!(self.query.forward(hidden))?)?;
+        let k = self.shape_heads(&__model_proof_output!(self.key.forward(hidden))?)?;
+        let v = self.shape_heads(&__model_proof_output!(self.value.forward(hidden))?)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let scores = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?)? * scale)?;
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
@@ -122,11 +122,11 @@ impl Layer {
 
     fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
         let attn = self.attention.forward(hidden)?;
-        let attn = self.attn_out.forward(&attn)?;
-        let hidden = self.attn_norm.forward(&(attn + hidden)?)?;
-        let inter = self.intermediate.forward(&hidden)?.gelu_erf()?;
-        let out = self.output.forward(&inter)?;
-        self.output_norm.forward(&(out + &hidden)?)
+        let attn = __model_proof_output!(self.attn_out.forward(&attn))?;
+        let hidden = __model_proof_output!(self.attn_norm.forward(&(attn + hidden)?))?;
+        let inter = __model_proof_output!(self.intermediate.forward(&hidden))?.gelu_erf()?;
+        let out = __model_proof_output!(self.output.forward(&inter))?;
+        __model_proof_output!(self.output_norm.forward(&(out + &hidden)?))
     }
 }
 
@@ -167,6 +167,6 @@ impl TextTower {
         }
         // Pool the first ([CLS]) token: tanh(dense(hidden[:, 0])).
         let first = hidden.narrow(1, 0, 1)?.squeeze(1)?; // (1, hidden)
-        self.pooler.forward(&first)?.tanh()
+        __model_proof_output!(self.pooler.forward(&first))?.tanh()
     }
 }

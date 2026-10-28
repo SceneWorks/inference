@@ -14,6 +14,7 @@ mlx-gen-chroma = { path = "../mlx-gen-chroma" }
 mlx-gen-clip = { path = "../mlx-gen-clip" }
 mlx-gen-flux = { path = "../mlx-gen-flux" }
 mlx-gen-flux2 = { path = "../mlx-gen-flux2" }
+mlx-gen-flux3 = { path = "../mlx-gen-flux3" }
 mlx-gen-depth = { path = "../mlx-gen-depth" }
 mlx-gen-face = { path = "../mlx-gen-face" }
 mlx-gen-ideogram = { path = "../mlx-gen-ideogram" }
@@ -30,6 +31,7 @@ mlx-gen-ltx = { path = "../mlx-gen-ltx" }
 mlx-gen-mage = { path = "../mlx-gen-mage" }
 mlx-gen-minimax-h3 = { path = "../mlx-gen-minimax-h3" }
 mlx-gen-mochi = { path = "../mlx-gen-mochi" }
+mlx-gen-moss-image = { path = "../mlx-gen-moss-image" }
 mlx-gen-pid = { path = "../mlx-gen-pid" }
 mlx-gen-pulid = { path = "../mlx-gen-pulid" }
 mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }
@@ -42,6 +44,7 @@ mlx-gen-sd3 = { path = "../mlx-gen-sd3" }
 mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
 mlx-gen-seedvr2 = { path = "../mlx-gen-seedvr2" }
 mlx-gen-sensenova = { path = "../mlx-gen-sensenova" }
+mlx-gen-supra2 = { path = "../mlx-gen-supra2" }
 mlx-gen-svd = { path = "../mlx-gen-svd" }
 mlx-gen-wan = { path = "../mlx-gen-wan" }
 mlx-gen-z-image = { path = "../mlx-gen-z-image" }
@@ -51,3 +54,6 @@ gen-core-testkit = { package = "sceneworks-gen-core-testkit", path = "../../../c
 image = { workspace = true }
 # The licence-manifest round-trip test in `src/licenses.rs` parses the emitted schema-3 document.
 serde_json = { workspace = true }
+
+[features]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-anima/model-inference-proof", "mlx-gen-bernini/model-inference-proof", "mlx-gen-boogu/model-inference-proof", "mlx-gen-chroma/model-inference-proof", "mlx-gen-clip/model-inference-proof", "mlx-gen-flux/model-inference-proof", "mlx-gen-flux2/model-inference-proof", "mlx-gen-depth/model-inference-proof", "mlx-gen-face/model-inference-proof", "mlx-gen-ideogram/model-inference-proof", "mlx-gen-instantid/model-inference-proof", "mlx-gen-iris/model-inference-proof", "mlx-gen-joycaption/model-inference-proof", "mlx-gen-kolors/model-inference-proof", "mlx-gen-krea/model-inference-proof", "mlx-gen-krea-realtime/model-inference-proof", "mlx-gen-lens/model-inference-proof", "mlx-gen-ltx/model-inference-proof", "mlx-gen-mage/model-inference-proof", "mlx-gen-minimax-h3/model-inference-proof", "mlx-gen-mochi/model-inference-proof", "mlx-gen-pid/model-inference-proof", "mlx-gen-pulid/model-inference-proof", "mlx-gen-qwen-image/model-inference-proof", "mlx-gen-qwen-image-2-1/model-inference-proof", "mlx-gen-sam2/model-inference-proof", "mlx-gen-sam3/model-inference-proof", "mlx-gen-sana/model-inference-proof", "mlx-gen-scail2/model-inference-proof", "mlx-gen-sd3/model-inference-proof", "mlx-gen-sdxl/model-inference-proof", "mlx-gen-seedvr2/model-inference-proof", "mlx-gen-sensenova/model-inference-proof", "mlx-gen-svd/model-inference-proof", "mlx-gen-wan/model-inference-proof", "mlx-gen-z-image/model-inference-proof"]

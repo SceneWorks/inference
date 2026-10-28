@@ -620,7 +620,8 @@ impl KolorsTrainer {
             let timestep = rng.random_range(0..NUM_TRAIN_TIMESTEPS);
             let noise = sample_noise(x0.dims(), noise_seed(cfg.seed, step), device)?;
             let (timestep, aux) = plan_timestep(&sample, timestep)?;
-            let projected = context_projection.forward(&context.to_dtype(dtype)?)?;
+            let projected =
+                __model_proof_output!(context_projection.forward(&context.to_dtype(dtype)?))?;
             let (losses, grads) = kolors_step(
                 &unet,
                 &schedule,
@@ -1075,6 +1076,7 @@ mod tests {
         /// one. Mutations: compute the diffusion term unconditionally ⇒ red; return the sampled `t`
         /// from `plan_timestep` on an aux step ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_only_step_trains_the_adapter_through_depth_alone() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1102,6 +1104,9 @@ mod tests {
             }
             assert!(nonzero_b, "no LoRA B gradient from the depth term");
             assert_eq!(plan_timestep(&StepSample::plain(0, 0), 300).unwrap().0, 300);
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_only_step_trains_the_adapter_through_depth_alone");
         }
 
         /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
@@ -1145,6 +1150,7 @@ mod tests {
         /// < 1), and every adapter gradient is the ungained term's gradient times the gain. Mutations: recover with `alphas_cumprod[timestep - 1]` in `kolors_step` ⇒ red; drop
         /// the gain (`aux_loss` instead of `aux_loss_gained`) ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_term_is_the_gained_depth_loss_of_the_recovered_x0() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1200,11 +1206,15 @@ mod tests {
                 }
             }
             assert!(checked > 0, "no material aux gradient to compare");
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_term_is_the_gained_depth_loss_of_the_recovered_x0");
         }
 
         /// (c) Depth off is bit-identical to the pre-epic-2123 step body (reproduced verbatim).
         /// Mutation: perturb the `None` combine ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn depth_off_is_bit_identical_to_the_legacy_step() {
             let f = fixture();
             let (l, g) = run(&f, 500, None);
@@ -1229,6 +1239,9 @@ mod tests {
             for v in &f.vars {
                 assert_eq!(grad_bits(&g, v), grad_bits(&lg, v));
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::depth_off_is_bit_identical_to_the_legacy_step");
         }
 
         fn depth_on() -> TrainingConfig {

@@ -41,6 +41,7 @@
 pub mod adapters;
 pub mod depth;
 pub mod dit;
+pub mod ios_pricing;
 pub mod memory_strategy;
 pub mod model;
 pub mod nn;
@@ -49,10 +50,13 @@ pub mod pipeline;
 pub mod restoration;
 pub(crate) mod retention;
 pub mod solver;
+pub mod stream;
 pub mod text_encoder;
 #[cfg(feature = "training")]
 pub mod train;
 
+#[cfg(all(test, target_os = "macos"))]
+mod anchor_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod packed_tests;
 #[cfg(all(test, target_os = "macos"))]
@@ -62,10 +66,12 @@ mod quantum_tests;
 #[cfg(test)]
 mod reachable_sizes;
 #[cfg(all(test, target_os = "macos"))]
+mod stream_tests;
+#[cfg(all(test, target_os = "macos"))]
 #[path = "../tests/common/metal_guard.rs"]
 pub(crate) mod test_metal_guard;
 
-pub use dit::{IrisDiT, TextBatch};
+pub use dit::{Execution, IrisDiT, TextBatch};
 pub use mlx_gen::gen_core::iris::{
     IrisTask, TEXT_ENCODER_COMPONENT, TEXT_ENCODER_REPO, TEXT_ENCODER_REVISION,
     UPSTREAM_CODE_REVISION, UPSTREAM_WEIGHTS_REPO, UPSTREAM_WEIGHTS_REVISION,
@@ -173,3 +179,7 @@ mod tests {
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

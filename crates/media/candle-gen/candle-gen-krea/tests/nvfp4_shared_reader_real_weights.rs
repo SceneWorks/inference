@@ -123,6 +123,9 @@ fn linked_and_managed_copies_share_plan_and_fixed_seed_output() {
         managed_image.pixels, linked_image.pixels,
         "linked and managed copies must render byte-identical fixed-seed output"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_shared_reader_real_weights::linked_and_managed_copies_share_plan_and_fixed_seed_output");
 }
 
 #[test]

@@ -111,4 +111,6 @@ fn dit_real_parity() {
         );
     }
     println!("real 40-layer DiT worst-case cosine: {worst:.7}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_real_parity::dit_real_parity");
 }

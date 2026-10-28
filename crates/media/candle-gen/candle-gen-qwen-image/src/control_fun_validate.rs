@@ -174,4 +174,7 @@ fn real_weight_fun_control() {
     println!(
         "Qwen-Image 2512-Fun-Controlnet-Union validation PASS ✅ (eyeball the PPMs for adherence)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED control_fun_validate::real_weight_fun_control");
 }

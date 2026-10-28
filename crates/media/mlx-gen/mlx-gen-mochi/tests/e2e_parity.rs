@@ -262,4 +262,6 @@ fn e2e_final_latents_match_golden() {
         "decoded frames are near-total garbage (px>8 = {:.1}%)",
         px * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_parity::e2e_final_latents_match_golden");
 }

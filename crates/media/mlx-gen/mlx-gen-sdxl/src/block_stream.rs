@@ -156,6 +156,9 @@ pub(crate) struct SdxlBlockStream {
     /// Whether the resident stack carried IP projections at all. A streamed block that comes back
     /// without one when this is set is a hard error, not a silent quality regression.
     ip_expected: bool,
+    /// Per-block streamed weight bytes ([`Self::streamed_bytes`]), read from the source's
+    /// safetensors headers once, on first use.
+    block_bytes: std::sync::Arc<std::sync::OnceLock<Vec<u64>>>,
 }
 
 impl SdxlBlockStream {
@@ -183,7 +186,66 @@ impl SdxlBlockStream {
             adapters: vec![BlockAdapters::default(); n_blocks],
             ip: vec![None; n_blocks],
             ip_expected: false,
+            block_bytes: std::sync::Arc::default(),
         }
+    }
+
+    /// The bytes block `index` brings into the quantum that materializes it from the snapshot (its
+    /// iOS price beside the block's activations — `Transformer2D::block_price`), from the source's
+    /// safetensors headers: every stored tensor of the block as read, plus the copy
+    /// [`crate::loader::cast_for_load`] makes of each tensor it casts (the iOS rule: every differing
+    /// tensor of a dense snapshot; on a packed one the dense float leaves, never the codes or their
+    /// `.scales`/`.biases`), plus the GEGLU `ff.net.0.proj` value/gate halves, row slices that live
+    /// beside the full stored projection they are sliced from, and the two `[hidden]` i32 row
+    /// selections that slice them — each one page-rounded allocation. The captured IP projections and
+    /// adapters are resident, not read. A load-time quantization replay over a dense snapshot never
+    /// arms (`memory_strategy::streamable`), so it is refused here rather than priced.
+    pub(crate) fn streamed_bytes(&self, index: usize) -> Result<u64> {
+        if self.block_bytes.get().is_none() {
+            let bytes = self.read_block_bytes()?;
+            let _ = self.block_bytes.set(bytes);
+        }
+        self.block_bytes
+            .get()
+            .and_then(|bytes| bytes.get(index).copied())
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "sdxl block stream `{}`: block {index} is out of range for a {}-block \
+                     sub-stack",
+                    self.prefix, self.n_blocks
+                ))
+            })
+    }
+
+    fn read_block_bytes(&self) -> Result<Vec<u64>> {
+        use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
+        let files: Vec<std::path::PathBuf> = match &self.source {
+            WeightsSource::File(file) => vec![file.clone()],
+            WeightsSource::Dir(dir) => {
+                let mut files: Vec<_> = std::fs::read_dir(dir)
+                    .map_err(|e| Error::Msg(format!("sdxl block stream: {e}")))?
+                    .filter_map(|entry| entry.ok().map(|e| e.path()))
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+                    .collect();
+                files.sort();
+                files
+            }
+        };
+        let (target, width) = stream_target(self.dtype)?;
+        let mut headers = Vec::new();
+        for file in &files {
+            headers.extend(
+                safetensors_path_tensor_headers(file).map_err(|e| Error::Msg(e.to_string()))?,
+            );
+        }
+        streamed_block_bytes_for_target(
+            &headers,
+            &self.prefix,
+            self.n_blocks,
+            self.quant_bits,
+            target,
+            width,
+        )
     }
 
     pub(crate) fn n_blocks(&self) -> usize {
@@ -323,6 +385,104 @@ impl SdxlBlockStream {
         }
         Ok(block)
     }
+}
+
+// Shared pure header budget. Native reader validation stays before its header reads; the metadata
+// hierarchy uses the same selector and arithmetic without constructing a block stream/model.
+fn stream_target(dtype: Dtype) -> Result<(mlx_gen::gen_core::weightsmeta::Dtype, u64)> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    Ok(match dtype {
+        Dtype::Float16 => (Stored::F16, 2),
+        Dtype::Bfloat16 => (Stored::BF16, 2),
+        Dtype::Float32 => (Stored::F32, 4),
+        other => {
+            return Err(Error::Msg(format!(
+                "sdxl block stream: unsupported compute dtype {other:?}"
+            )))
+        }
+    })
+}
+
+pub(crate) fn streamed_block_bytes_from_headers(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    prefix: &str,
+    n_blocks: usize,
+    dtype: Dtype,
+    quant_bits: Option<i32>,
+) -> Result<Vec<u64>> {
+    let (target, width) = stream_target(dtype)?;
+    streamed_block_bytes_for_target(headers, prefix, n_blocks, quant_bits, target, width)
+}
+
+fn streamed_block_bytes_for_target(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    prefix: &str,
+    n_blocks: usize,
+    quant_bits: Option<i32>,
+    target: mlx_gen::gen_core::weightsmeta::Dtype,
+    width: u64,
+) -> Result<Vec<u64>> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    let packed = headers.iter().any(|h| h.name.ends_with(".scales"));
+    if quant_bits.is_some() && !packed {
+        return Err(Error::Unsupported(format!(
+            "sdxl block stream `{}`: a load-time quantization replay over a dense snapshot is \
+                 not a streamable load and has no iOS price",
+            prefix
+        )));
+    }
+    let stem = format!("{}.transformer_blocks.", prefix);
+    let mut bytes = vec![0u64; n_blocks];
+    for header in headers {
+        let Some(rest) = header.name.strip_prefix(&stem) else {
+            continue;
+        };
+        let Some((index, leaf)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            continue;
+        };
+        let Some(slot) = bytes.get_mut(index) else {
+            continue;
+        };
+        let floating = matches!(
+            header.dtype,
+            Stored::F16 | Stored::BF16 | Stored::F32 | Stored::F64
+        );
+        let companion = header.name.ends_with(".scales") || header.name.ends_with(".biases");
+        let casts = header.dtype != target && (!packed || (floating && !companion));
+        let elements = header
+            .shape
+            .iter()
+            .fold(1u64, |a, &d| a.saturating_mul(d as u64));
+        let page = mlx_gen::ios_quantum::allocated_bytes;
+        let resident = page(if casts {
+            elements.saturating_mul(width)
+        } else {
+            header.data_bytes
+        });
+        let cast_copy = if casts { resident } else { 0 };
+        // The value/gate halves (two row slices together the projection's size) and the two
+        // `[hidden]` i32 row selections that slice them.
+        let geglu = if leaf.starts_with("ff.net.0.proj.") {
+            let half = header.shape.first().copied().unwrap_or(0) as u64 / 2;
+            let selections =
+                if leaf == "ff.net.0.proj.scales" || (leaf == "ff.net.0.proj.weight" && !packed) {
+                    2 * page(half.saturating_mul(4))
+                } else {
+                    0
+                };
+            resident.saturating_add(selections)
+        } else {
+            0
+        };
+        *slot = slot
+            .saturating_add(page(header.data_bytes))
+            .saturating_add(cast_copy)
+            .saturating_add(geglu);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -555,6 +715,7 @@ mod tests {
     /// the resident load casts those leaves to the compute dtype (`loader::cast_for_load`); on the
     /// host it leaves them stored (sc-26270 E2: host bits unchanged). Either way a streamed block
     /// must come back with its resident twin's dtypes and run the same forward, bit for bit.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_streamed_packed_block_casts_its_dense_leaves_like_the_resident_block() {
         let _cpu = crate::test_device::cpu_only();
@@ -653,8 +814,18 @@ mod tests {
             let x = ramp(&[1, 16, DIMS], 0.0);
             let memory = ramp(&[1, 7, DIMS], 3.0);
             let plan = crate::plan::SdxlForwardPlan::default();
-            let r = resident.forward_ip(&x, &memory, None, plan).unwrap();
-            let t = streamed.forward_ip(&x, &memory, None, plan).unwrap();
+            let r = (
+                crate::test_device::record_model_inference_device(),
+                resident.forward_ip(&x, &memory, None, plan),
+            )
+                .1
+                .unwrap();
+            let t = (
+                crate::test_device::record_model_inference_device(),
+                streamed.forward_ip(&x, &memory, None, plan),
+            )
+                .1
+                .unwrap();
             // iOS: the f16 leaves keep the window at f16 (on the host the stored leaves decide it,
             // exactly as every release before sc-26268).
             if ios {
@@ -677,6 +848,8 @@ mod tests {
         };
         check(false).unwrap();
         mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 34, || check(true)).unwrap();
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED block_stream::tests::a_streamed_packed_block_casts_its_dense_leaves_like_the_resident_block");
     }
 
     /// Captured residual adapters travel onto a materialized block, per block — a LoRA installed on

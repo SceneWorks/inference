@@ -197,6 +197,8 @@ fn turbo_sequential_bounds_peak_and_is_byte_identical() {
     assert_ab("krea_2_turbo", "krea_2_turbo", &req, || {
         LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(seq_quant().unwrap())
     });
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::turbo_sequential_bounds_peak_and_is_byte_identical");
 }
 
 #[test]
@@ -222,6 +224,8 @@ fn raw_sequential_bounds_peak_and_is_byte_identical() {
     assert_ab("krea_2_raw", "krea_2_raw", &req, || {
         LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(seq_quant().unwrap())
     });
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::raw_sequential_bounds_peak_and_is_byte_identical");
 }
 
 #[test]
@@ -259,6 +263,8 @@ fn edit_sequential_bounds_peak_and_is_byte_identical() {
             .with_quant(seq_quant().unwrap())
             .with_adapters(vec![AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora)])
     });
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::edit_sequential_bounds_peak_and_is_byte_identical");
 }
 
 /// The pose-control conditioning shared by the bf16 and quantized control A/B tests.
@@ -303,6 +309,8 @@ fn control_sequential_bounds_peak_and_is_byte_identical() {
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_control(WeightsSource::File(overlay.clone()))
     });
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::control_sequential_bounds_peak_and_is_byte_identical");
 }
 
 #[test]
@@ -329,4 +337,6 @@ fn control_quant_sequential_bounds_peak_and_is_byte_identical() {
                 .with_quant(q)
         },
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::control_quant_sequential_bounds_peak_and_is_byte_identical");
 }

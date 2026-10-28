@@ -250,7 +250,7 @@ impl ZImageAttention {
         let v = v.reshape((b, seq_len, self.n_heads, self.head_dim))?;
 
         let (q, k) = if let Some(ref norm) = self.qk_norm {
-            norm.forward(&q, &k)?
+            __model_proof_output!(norm.forward(&q, &k), pair)?
         } else {
             (q, k)
         };
@@ -606,7 +606,7 @@ impl ZImageTransformerBlock {
             let scale_msa = (scale_msa + 1.0)?;
             let scale_mlp = (scale_mlp + 1.0)?;
 
-            let normed = self.attention_norm1.forward(x)?;
+            let normed = __model_proof_output!(self.attention_norm1.forward(x))?;
             let scaled = normed.broadcast_mul(&scale_msa)?;
             let attn_out = self.attention.forward_with_attention_plan(
                 &scaled,
@@ -615,16 +615,16 @@ impl ZImageTransformerBlock {
                 sin,
                 attention_plan,
             )?;
-            let attn_out = self.attention_norm2.forward(&attn_out)?;
+            let attn_out = __model_proof_output!(self.attention_norm2.forward(&attn_out))?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
 
-            let normed = self.ffn_norm1.forward(&x)?;
+            let normed = __model_proof_output!(self.ffn_norm1.forward(&x))?;
             let scaled = normed.broadcast_mul(&scale_mlp)?;
             let ffn_out = self.feed_forward.forward(&scaled)?;
-            let ffn_out = self.ffn_norm2.forward(&ffn_out)?;
+            let ffn_out = __model_proof_output!(self.ffn_norm2.forward(&ffn_out))?;
             Ok((x + gate_mlp.broadcast_mul(&ffn_out)?)?)
         } else {
-            let normed = self.attention_norm1.forward(x)?;
+            let normed = __model_proof_output!(self.attention_norm1.forward(x))?;
             let attn_out = self.attention.forward_with_attention_plan(
                 &normed,
                 attn_mask,
@@ -632,12 +632,12 @@ impl ZImageTransformerBlock {
                 sin,
                 attention_plan,
             )?;
-            let attn_out = self.attention_norm2.forward(&attn_out)?;
+            let attn_out = __model_proof_output!(self.attention_norm2.forward(&attn_out))?;
             let x = (x + attn_out)?;
 
-            let normed = self.ffn_norm1.forward(&x)?;
+            let normed = __model_proof_output!(self.ffn_norm1.forward(&x))?;
             let ffn_out = self.feed_forward.forward(&normed)?;
-            let ffn_out = self.ffn_norm2.forward(&ffn_out)?;
+            let ffn_out = __model_proof_output!(self.ffn_norm2.forward(&ffn_out))?;
             Ok((x + ffn_out)?)
         }
     }
@@ -890,7 +890,7 @@ impl ZImageTransformer2DModel {
     }
 
     pub(crate) fn control_embed_caption(&self, cap_feats: &Tensor) -> Result<Tensor> {
-        let normalized = self.cap_embedder_norm.forward(cap_feats)?;
+        let normalized = __model_proof_output!(self.cap_embedder_norm.forward(cap_feats))?;
         self.cap_embedder_linear.forward(&normalized)
     }
 
@@ -1130,7 +1130,7 @@ impl ZImageTransformer2DModel {
             create_coordinate_grid((f_tokens, h_tokens, w_tokens), (text_len + 1, 0, 0), device)?;
         let (x_cos, x_sin) = self.rope_embedder.forward(&x_pos_ids)?;
 
-        let cap_normed = self.cap_embedder_norm.forward(cap_feats)?;
+        let cap_normed = __model_proof_output!(self.cap_embedder_norm.forward(cap_feats))?;
         let mut cap = self.cap_embedder_linear.forward(&cap_normed)?;
 
         let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
@@ -1472,16 +1472,29 @@ mod parity_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_q4_projection_uses_byte_exact_device_format_sidecar() -> Result<()> {
-        assert_streamed_projection_uses_byte_exact_sidecar(4)
+        __model_proof_inspect!(
+            assert_streamed_projection_uses_byte_exact_sidecar(4),
+            |_| {
+                println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::parity_tests::streamed_q4_projection_uses_byte_exact_device_format_sidecar");
+            }
+        )
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_q8_projection_uses_byte_exact_device_format_sidecar() -> Result<()> {
-        assert_streamed_projection_uses_byte_exact_sidecar(8)
+        __model_proof_inspect!(
+            assert_streamed_projection_uses_byte_exact_sidecar(8),
+            |_| {
+                println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::parity_tests::streamed_q8_projection_uses_byte_exact_device_format_sidecar");
+            }
+        )
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_dense_dit_matches_stock_forward() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1498,22 +1511,20 @@ mod parity_tests {
         let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
         let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
 
-        let y_v = vendored
-            .forward(
-                &prepared.latents,
-                &t,
-                &prepared.cap_feats,
-                &prepared.cap_mask,
-            )
-            .unwrap();
-        let y_s = stock
-            .forward(
-                &prepared.latents,
-                &t,
-                &prepared.cap_feats,
-                &prepared.cap_mask,
-            )
-            .unwrap();
+        let y_v = __model_proof_output!(vendored.forward(
+            &prepared.latents,
+            &t,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+        ))
+        .unwrap();
+        let y_s = __model_proof_output!(stock.forward(
+            &prepared.latents,
+            &t,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+        ))
+        .unwrap();
 
         assert_eq!(y_v.dims(), y_s.dims());
         let diff = (y_v - y_s)
@@ -1528,9 +1539,13 @@ mod parity_tests {
             diff < 1e-5,
             "vendored dense DiT diverged from stock by {diff}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::parity_tests::vendored_dense_dit_matches_stock_forward");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1579,9 +1594,13 @@ mod parity_tests {
         assert!(model
             .forward_prepared_with_memory(&latent, &t, &prepared, plan, cfg.n_layers)
             .is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::parity_tests::prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn attention_query_chunking_matches_the_unbounded_forward() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1593,14 +1612,13 @@ mod parity_tests {
         let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
         let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
 
-        let full = model
-            .forward(
-                &prepared.latents,
-                &t,
-                &prepared.cap_feats,
-                &prepared.cap_mask,
-            )
-            .unwrap();
+        let full = __model_proof_output!(model.forward(
+            &prepared.latents,
+            &t,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+        ))
+        .unwrap();
         let chunked = model
             .forward_with_attention_budget(
                 &prepared.latents,
@@ -1622,9 +1640,13 @@ mod parity_tests {
             diff < 1e-5,
             "query-chunked attention changed the DiT output by {diff}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::parity_tests::attention_query_chunking_matches_the_unbounded_forward");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_windows_match_resident_forward_including_ragged_tail() {
         let dev = Device::Cpu;
         let mut cfg = tiny_cfg();
@@ -1639,14 +1661,13 @@ mod parity_tests {
         let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
         let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
         let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
-        let expected = resident
-            .forward(
-                &prepared.latents,
-                &t,
-                &prepared.cap_feats,
-                &prepared.cap_mask,
-            )
-            .unwrap();
+        let expected = __model_proof_output!(resident.forward(
+            &prepared.latents,
+            &t,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+        ))
+        .unwrap();
 
         for window in [1, 2, 4, 8, 15, 30] {
             let streamed = ZImageTransformer2DModel::new_block_streamed(&cfg, vb.clone()).unwrap();
@@ -1673,9 +1694,13 @@ mod parity_tests {
                 "streamed window {window} changed the DiT output by {diff}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::parity_tests::streamed_windows_match_resident_forward_including_ragged_tail");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_window_rejects_zero_and_preserves_typed_cancellation() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1715,9 +1740,13 @@ mod parity_tests {
             )
             .expect_err("a canceled streamed request must stop before producing output");
         assert!(matches!(canceled, candle_gen::CandleError::Canceled));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::parity_tests::streamed_window_rejects_zero_and_preserves_typed_cancellation");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn plain_forward_drives_streamed_storage_through_bounded_windows() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1772,9 +1801,13 @@ mod parity_tests {
             "the actual plain-forward wiring must schedule the streamed trunk one bounded window \
              at a time"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::parity_tests::plain_forward_drives_streamed_storage_through_bounded_windows");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1805,6 +1838,9 @@ mod parity_tests {
             contract_error,
             candle_gen::gen_core::Error::Canceled
         ));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::parity_tests::constrained_request_cancel_stops_inside_the_packed_dit_as_typed_canceled");
     }
 
     /// **Additive install on the vendored DiT (sc-11105).** A bare-dotted LoRA over two real `layers.0`
@@ -1815,6 +1851,7 @@ mod parity_tests {
     /// additive path is byte-equal on a packed base (the stays-packed / exact-residual property is proven
     /// at the `candle_gen::quant::AdaptLinear` unit level).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn install_additive_lora_on_vendored_dit_applies_and_shifts() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         use std::collections::HashMap as Map;
@@ -1858,22 +1895,20 @@ mod parity_tests {
         let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
         let prepared = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
         let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
-        let y_base = base
-            .forward(
-                &prepared.latents,
-                &t,
-                &prepared.cap_feats,
-                &prepared.cap_mask,
-            )
-            .unwrap();
-        let y_adapt = adapted
-            .forward(
-                &prepared.latents,
-                &t,
-                &prepared.cap_feats,
-                &prepared.cap_mask,
-            )
-            .unwrap();
+        let y_base = __model_proof_output!(base.forward(
+            &prepared.latents,
+            &t,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+        ))
+        .unwrap();
+        let y_adapt = __model_proof_output!(adapted.forward(
+            &prepared.latents,
+            &t,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+        ))
+        .unwrap();
         let shift = (y_adapt - y_base)
             .unwrap()
             .abs()
@@ -1886,6 +1921,9 @@ mod parity_tests {
             shift > 1e-4,
             "additive LoRA did not shift the DiT forward ({shift})"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::parity_tests::install_additive_lora_on_vendored_dit_applies_and_shifts");
     }
 
     /// [`crate::adapters::install_additive`] rejects an off-surface LoRA (no DiT target matched) and a

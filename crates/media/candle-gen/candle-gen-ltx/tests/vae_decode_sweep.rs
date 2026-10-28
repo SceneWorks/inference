@@ -88,6 +88,8 @@ fn ltx_vae_decode_sweep() {
         eprintln!(
             "skip: set LTX_CKPT to a dense LTX-2.3 .safetensors (or LTX_SNAPSHOT to its dir)"
         );
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-ltx/tests/vae_decode_sweep.rs:91 (ltx_vae_decode_sweep): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
     let gpu = env_usize("LTX_GPU", 0);
@@ -221,4 +223,7 @@ fn ltx_vae_decode_sweep() {
         peak_bytes / out_vox as f64,
         peak_bytes / tile_vox as f64,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_decode_sweep::ltx_vae_decode_sweep");
 }

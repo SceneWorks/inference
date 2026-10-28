@@ -32,6 +32,7 @@ sha2 = { workspace = true }
 libc = { workspace = true }
 
 [features]
+model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "candle-core/model-inference-proof"]
 # Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere),
 # and the walking-skeleton audio models synthesize in real time on CPU (audio-backend-strategy.md).
 default = []

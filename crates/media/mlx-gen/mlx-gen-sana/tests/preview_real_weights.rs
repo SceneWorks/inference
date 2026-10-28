@@ -177,4 +177,8 @@ fn public_route_emits_exact_outer_step_cadence_without_changing_output() {
             &active,
         );
     }
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::public_route_emits_exact_outer_step_cadence_without_changing_output");
 }

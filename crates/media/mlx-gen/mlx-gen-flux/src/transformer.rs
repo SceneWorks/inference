@@ -2437,6 +2437,7 @@ mod tests {
     /// scale-0 application is a bit-exact no-op at a resolved Linear, and a mixed LoRA+LoKr spec list
     /// installs both; an off-surface target errors (strict no-silent-drop).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn scale_zero_noop_mixed_stack_and_strict() {
         let tmp = tempfile::tempdir().unwrap();
         // scale-0: a no-op adapter installed on a resolved linear leaves its forward unchanged.
@@ -2557,5 +2558,7 @@ mod tests {
             }],
         )
         .is_err());
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::scale_zero_noop_mixed_stack_and_strict");
     }
 }

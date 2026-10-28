@@ -52,6 +52,8 @@ fn flux2_vae_encode_matches_reference() -> Result<()> {
         Ok(d) => d,
         Err(_) => {
             eprintln!("SKIP: set FLUX2_VAE_DIR to a FLUX.2 / Lens vae snapshot dir");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-flux2/tests/vae_encode_parity.rs:55 (flux2_vae_encode_matches_reference): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
             return Ok(());
         }
     };
@@ -62,6 +64,8 @@ fn flux2_vae_encode_matches_reference() -> Result<()> {
         eprintln!(
             "SKIP: goldens not found at {goldens_path} (run scripts/dump_flux2_vae_encode_golden.py)"
         );
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-flux2/tests/vae_encode_parity.rs:61 (flux2_vae_encode_matches_reference): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return Ok(());
     }
 
@@ -125,5 +129,9 @@ fn flux2_vae_encode_matches_reference() -> Result<()> {
         "encode_packed peak_rel {packed_pr:.3e} ≥ 2e-2"
     );
     eprintln!("ALL PASS");
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED vae_encode_parity::flux2_vae_encode_matches_reference"
+    );
     Ok(())
 }

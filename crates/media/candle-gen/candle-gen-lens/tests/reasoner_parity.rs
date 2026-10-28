@@ -40,6 +40,8 @@ fn lens_reasoner_matches_reference() -> Result<(), AnyErr> {
         Ok(d) => d,
         Err(_) => {
             eprintln!("SKIP: set LENS_SNAPSHOT_DIR to the Lens-Turbo snapshot root");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/reasoner_parity.rs:43 (lens_reasoner_matches_reference): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return Ok(());
         }
     };
@@ -50,6 +52,8 @@ fn lens_reasoner_matches_reference() -> Result<(), AnyErr> {
         eprintln!(
             "SKIP: goldens not found at {goldens_path} (run scripts/dump_lens_reasoner_golden.py)"
         );
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/reasoner_parity.rs:49 (lens_reasoner_matches_reference): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return Ok(());
     }
 
@@ -141,5 +145,7 @@ fn lens_reasoner_matches_reference() -> Result<(), AnyErr> {
         got_new.len()
     );
     eprintln!("ALL PASS");
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED reasoner_parity::lens_reasoner_matches_reference");
     Ok(())
 }

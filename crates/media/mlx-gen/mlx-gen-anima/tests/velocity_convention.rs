@@ -48,7 +48,17 @@ fn example_png(split: &std::path::Path) -> PathBuf {
 
 /// Load `example.png` → NCHW `[1, 3, H, W]` f32 normalised to `[-1, 1]` (the VAE encode input range).
 fn image_to_nchw(path: &std::path::Path) -> Array {
-    let img = image::open(path).expect("open example.png").to_rgb8();
+    let img = mlx_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/mlx-gen/mlx-gen-anima/tests/velocity_convention.rs::image_to_nchw::image::open@2667",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
+    .expect("open example.png")
+    .to_rgb8();
     let (w, h) = (img.width() as usize, img.height() as usize);
     let mut chw = vec![0f32; 3 * h * w];
     for y in 0..h {
@@ -78,7 +88,7 @@ fn cosine(a: &Array, b: &Array) -> f32 {
 }
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot; real weights + Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; real weights + Metal"]
 fn dit_predicts_flow_velocity_eps_minus_x0() {
     let split = split_files().expect("Anima snapshot");
     let pipeline =
@@ -126,4 +136,7 @@ fn dit_predicts_flow_velocity_eps_minus_x0() {
         "DiT velocity does not align with the flow target ε − x0 (cos {cos:.4}); a sign or timestep \
          convention error would produce this"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED velocity_convention::dit_predicts_flow_velocity_eps_minus_x0");
 }

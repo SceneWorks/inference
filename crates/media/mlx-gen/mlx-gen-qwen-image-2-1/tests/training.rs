@@ -144,6 +144,7 @@ fn run(
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn trainer_conformance_on_the_tiny_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
@@ -151,6 +152,8 @@ fn trainer_conformance_on_the_tiny_snapshot() {
     let items = dataset(&data);
     let out = tmp.path().join("out");
     trainer_conformance(trainer, &TrainerProfile::cheap(items, out));
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training::trainer_conformance_on_the_tiny_snapshot");
 }
 
 /// sc-2127: multi-resolution buckets train end to end — a captioned dataset and an edit-pair
@@ -162,6 +165,7 @@ fn trainer_conformance_on_the_tiny_snapshot() {
 /// *Mutations that red this:* `item_branches` building every layout at the first edge (a 64 px
 /// latent then meets a 32 px layout and the step errors); the run caching/scheduling only the
 /// first edge (the adapter equals the single-bucket run's).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_bucketed_run_trains_every_bucket_for_captioned_and_edit_datasets() {
     use mlx_gen::gen_core::ResolutionBucket;
@@ -240,6 +244,8 @@ fn a_bucketed_run_trains_every_bucket_for_captioned_and_edit_datasets() {
             "{label}: the 64 px bucket must change the trained factors (Δ {moved:.3e})"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED training::a_bucketed_run_trains_every_bucket_for_captioned_and_edit_datasets");
 }
 
 /// The velocity of `dit` on a fixed 4×4 latent grid conditioned on 5 fixed text rows.
@@ -265,6 +271,7 @@ fn velocity(dit: &QwenImage21Transformer) -> Array {
 /// AC2/AC3: a trained adapter (LoRA and LoKr) is PEFT/LyCORIS safetensors that the sc-24156 host
 /// installs **strictly** — every key resolves, nothing is converted — and that changes the
 /// velocity; its metadata stamps the family, the base model and the research licence.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_trained_adapter_loads_back_strictly_changes_the_velocity_and_is_stamped() {
     for (network, kind) in [
@@ -348,6 +355,8 @@ fn a_trained_adapter_loads_back_strictly_changes_the_velocity_and_is_stamped() {
             "{network:?}: the trained adapter must change the velocity"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED training::a_trained_adapter_loads_back_strictly_changes_the_velocity_and_is_stamped");
 }
 
 /// One resume scenario: a run of `cfg` cancelled once step `cancel_at` has run resumes from the
@@ -510,6 +519,7 @@ fn copy_dir(from: &Path, to: &Path) {
 /// AC1/AC3: checkpoints + resume. A run cancelled after its step-2 checkpoint (it stops at step
 /// 3) resumes from that checkpoint — steps 3..=4 run again — and writes the same adapter as an
 /// uninterrupted run of the same config.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_cancelled_run_resumes_from_its_last_checkpoint_and_matches_a_straight_run() {
     assert_cancelled_run_resumes(
@@ -522,6 +532,8 @@ fn a_cancelled_run_resumes_from_its_last_checkpoint_and_matches_a_straight_run()
         &[],
         false,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED training::a_cancelled_run_resumes_from_its_last_checkpoint_and_matches_a_straight_run");
 }
 
 /// Resume is exact under gradient accumulation too: with `accum = 2` and `save_every = 3`, the
@@ -532,6 +544,7 @@ fn a_cancelled_run_resumes_from_its_last_checkpoint_and_matches_a_straight_run()
 ///
 /// *Mutation that reds this:* writing the resume bundle on every `save_every` again — the step-3
 /// snapshot then exists, and (cancelled at step 4) a resume would drop step 3's gradients.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn resume_under_gradient_accumulation_restarts_from_an_update_boundary() {
     assert_cancelled_run_resumes(
@@ -545,10 +558,13 @@ fn resume_under_gradient_accumulation_restarts_from_an_update_boundary() {
         &[3],
         true,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED training::resume_under_gradient_accumulation_restarts_from_an_update_boundary");
 }
 
 /// AC1: preview samples render from the in-progress adapter through the crate's render path.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn preview_samples_render_during_training() {
     let tmp = tempfile::tempdir().unwrap();
     let items = dataset(tmp.path());
@@ -580,6 +596,8 @@ fn preview_samples_render_during_training() {
     })
     .unwrap();
     assert_eq!(samples, [(2, 1, 1, 64, 64)]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training::preview_samples_render_during_training");
 }
 
 /// AC1/AC3: QLoRA is a non-goal — a pre-quantized tier and a quantize request are both typed
@@ -645,6 +663,7 @@ fn render(spec: &LoadSpec, req: &GenerationRequest) -> Image {
 /// adapter carries the family/base/licence provenance plus the edit marker; and loaded through the
 /// sc-24156 host it changes a 2.1 **edit** render (same references, prompt and seed) against the
 /// bare base.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn an_edit_adapter_trains_is_marked_and_changes_the_edit_render() {
     let tmp = tempfile::tempdir().unwrap();
@@ -770,6 +789,8 @@ fn an_edit_adapter_trains_is_marked_and_changes_the_edit_render() {
         changed > 0,
         "the trained edit adapter must change the edit render"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED training::an_edit_adapter_trains_is_marked_and_changes_the_edit_render");
 }
 
 /// AC: an edit dataset on a snapshot-level edit trainer is held to the render path's reference
@@ -859,6 +880,7 @@ fn train_refuses_full_finetune_and_control_requests_without_a_prior_validate() {
 /// *Mutation that reds this:* dropping both identity checks (the early metadata admission and
 /// `load_resume_with_identity`) — the swapped-reference run then continues the old adapter.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_changed_reference_set_refuses_resume() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -924,4 +946,6 @@ fn a_changed_reference_set_refuses_resume() {
     let (steps, result) = run(t.as_mut(), &original, |_| {});
     assert_eq!(steps, [2], "the unchanged dataset resumes from step 1");
     assert_eq!(result.unwrap().steps, 2);
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training::a_changed_reference_set_refuses_resume");
 }

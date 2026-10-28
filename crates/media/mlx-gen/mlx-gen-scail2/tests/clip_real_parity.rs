@@ -90,4 +90,6 @@ fn clip_real_parity() {
     println!("real ViT-H/14 penultimate (clip_preprocess → encode): cosine {cos:.7}");
     // f32-vs-f32 over 31 layers; residual is MLX Metal matmul reduced precision.
     assert!(cos > 0.999, "real CLIP cosine {cos} below 0.999");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED clip_real_parity::clip_real_parity");
 }

@@ -204,6 +204,7 @@ fn static_behavior_identity(provider_id: &str, spec: &LoadSpec) -> MemoryCalibra
         Some(mlx_gen::Quant::Q4) => "q4",
         Some(mlx_gen::Quant::Q8) => "q8",
         Some(mlx_gen::Quant::Nvfp4) => "nvfp4",
+        Some(mlx_gen::Quant::Fp8Rowwise) => "fp8r",
     };
     let policy = match spec.offload_policy {
         OffloadPolicy::Resident => "resident",
@@ -779,7 +780,11 @@ mod tests {
         for component in ["text_encoder", "transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("model.safetensors"), [0_u8; 8]).unwrap();
+            let header = br#"{"w":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#;
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header);
+            bytes.extend_from_slice(&[0, 0]);
+            std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
         }
         for component in ["text_encoder", "transformer"] {
             let config = match bits {
@@ -1629,6 +1634,7 @@ mod tests {
 
     fn rung_four_context() -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::BoundedTransformerResidency,

@@ -13,6 +13,15 @@
 //! `ToolCallSegmenter` lifts it out of the answer text and parses it into a structured
 //! `output.tool_calls`. A grounded call (the right function + a Paris-ish location) is the proof.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_llm::LlamaProvider;
 use core_llm::{LoadSpec, Message, Sampling, TextLlm, TextLlmRequest, ToolSpec};
 
@@ -95,4 +104,7 @@ fn qwen35_emits_and_parses_a_tool_call() {
         location.to_lowercase().contains("paris"),
         "the parsed tool call must ground on Paris, got location={location:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen35_emits_and_parses_a_tool_call");
 }

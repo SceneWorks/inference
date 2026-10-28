@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 /// `x @ weightᵀ (+ bias)`. `weight` is `[out, in]` (HF layout); `x` is `[..., in]`.
 pub fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     let lin = Linear::new(weight.clone(), bias.cloned());
-    Ok(lin.forward(x)?)
+    Ok(__model_proof_output!(lin.forward(x))?)
 }
 
 /// RMSNorm: `x / sqrt(mean(x²) + eps) * weight`, computed in f32 and cast back to `x`'s dtype.
@@ -207,6 +207,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_matches_manual_matmul() {
         // x: [1,2], w: [3,2] (out=3, in=2). y = x @ w.t() -> [1,3].
         let x = Tensor::from_vec(vec![1.0f32, 2.0], (1, 2), &Device::Cpu).unwrap();
@@ -216,6 +217,11 @@ mod tests {
         assert_eq!(y.dims(), &[1, 3]);
         let h = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(h, vec![1.0, 2.0, 3.0]); // [x0, x1, x0+x1]
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED primitives::nn::tests::linear_matches_manual_matmul"
+        );
     }
 
     #[test]

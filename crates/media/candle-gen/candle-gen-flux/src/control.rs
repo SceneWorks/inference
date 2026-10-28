@@ -128,9 +128,9 @@ impl AdaLayerNormZero {
         emb: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
         debug_assert_eq!(self.chunks, 6);
-        let p = emb.silu()?.apply(&self.linear)?.chunk(6, D::Minus1)?;
+        let p = __model_proof_output!(emb.silu()?.apply(&self.linear))?.chunk(6, D::Minus1)?;
         // shift = p[0], scale = p[1]; normed = norm(hidden) * (1 + scale) + shift.
-        let normed = self.norm.forward(hidden)?;
+        let normed = __model_proof_output!(self.norm.forward(hidden))?;
         let normed = normed
             .broadcast_mul(&(p[1].unsqueeze(1)? + 1.0)?)?
             .broadcast_add(&p[0].unsqueeze(1)?)?;
@@ -203,9 +203,9 @@ impl JointAttention {
         let (heads, head_dim) = (self.heads, self.head_dim);
         let to_heads =
             |t: Tensor| -> Result<Tensor> { t.reshape((b, s, heads, head_dim))?.transpose(1, 2) };
-        let q = to_heads(x.apply(q)?)?.apply(nq)?;
-        let k = to_heads(x.apply(k)?)?.apply(nk)?;
-        let v = to_heads(x.apply(v)?)?;
+        let q = __model_proof_output!(to_heads(__model_proof_output!(x.apply(q))?)?.apply(nq))?;
+        let k = __model_proof_output!(to_heads(__model_proof_output!(x.apply(k))?)?.apply(nk))?;
+        let v = to_heads(__model_proof_output!(x.apply(v))?)?;
         Ok((q, k, v))
     }
 
@@ -239,8 +239,8 @@ impl JointAttention {
         let out = out.transpose(1, 2)?.flatten_from(2)?; // [B, seq, hidden]
         let txt_seq = encoder.dim(1)?;
         let img_seq = hidden.dim(1)?;
-        let attn_txt = out.narrow(1, 0, txt_seq)?.apply(&self.to_add_out)?;
-        let attn_img = out.narrow(1, txt_seq, img_seq)?.apply(&self.to_out)?;
+        let attn_txt = __model_proof_output!(out.narrow(1, 0, txt_seq)?.apply(&self.to_add_out))?;
+        let attn_img = __model_proof_output!(out.narrow(1, txt_seq, img_seq)?.apply(&self.to_out))?;
         Ok((attn_img, attn_txt))
     }
 
@@ -275,8 +275,8 @@ impl JointAttention {
             .flatten_from(2)?;
         let txt_seq = encoder.dim(1)?;
         let img_seq = hidden.dim(1)?;
-        let attn_txt = out.narrow(1, 0, txt_seq)?.apply(&self.to_add_out)?;
-        let attn_img = out.narrow(1, txt_seq, img_seq)?.apply(&self.to_out)?;
+        let attn_txt = __model_proof_output!(out.narrow(1, 0, txt_seq)?.apply(&self.to_add_out))?;
+        let attn_img = __model_proof_output!(out.narrow(1, txt_seq, img_seq)?.apply(&self.to_out))?;
         Ok((attn_img, attn_txt))
     }
 }
@@ -297,13 +297,13 @@ impl FeedForward {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x.apply(&self.lin1)?;
+        let x = __model_proof_output!(x.apply(&self.lin1))?;
         let x = if self.approx {
             x.gelu()?
         } else {
             x.gelu_erf()?
         };
-        x.apply(&self.lin2)
+        __model_proof_output!(x.apply(&self.lin2))
     }
 }
 
@@ -424,8 +424,7 @@ fn apply_norm_ff(
     let hidden = (hidden + attn.broadcast_mul(&gate_msa.unsqueeze(1)?)?)?;
     // The diffusers `norm2` (parameter-free, elementwise-affine = False), built once at load and
     // reused here rather than re-allocated each call (sc-9039).
-    let normed = norm
-        .forward(&hidden)?
+    let normed = __model_proof_output!(norm.forward(&hidden))?
         .broadcast_mul(&(scale_mlp.unsqueeze(1)? + 1.0)?)?
         .broadcast_add(&shift_mlp.unsqueeze(1)?)?;
     let ff_out = ff.forward(&normed)?;
@@ -447,7 +446,9 @@ impl MlpEmbedder {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.apply(&self.lin1)?.silu()?.apply(&self.lin2)
+        __model_proof_output!(__model_proof_output!(x.apply(&self.lin1))?
+            .silu()?
+            .apply(&self.lin2))
     }
 }
 
@@ -601,9 +602,9 @@ impl FluxControlNet {
         // `x_embedder(x) + controlnet_x_embedder(control_cond)` (diffusers `hidden_states =
         // hidden_states + self.controlnet_x_embedder(controlnet_cond)`). The zero-init
         // `controlnet_x_embedder` means an untrained / scale-0 branch starts as a no-op.
-        let mut hidden = (hidden_states.apply(&self.x_embedder)?
-            + control_cond.apply(&self.controlnet_x_embedder)?)?;
-        let mut encoder = prompt_embeds.apply(&self.context_embedder)?;
+        let mut hidden = (__model_proof_output!(hidden_states.apply(&self.x_embedder))?
+            + __model_proof_output!(control_cond.apply(&self.controlnet_x_embedder))?)?;
+        let mut encoder = __model_proof_output!(prompt_embeds.apply(&self.context_embedder))?;
         let emb = self.time_text_embed.forward(timesteps, guidance, pooled)?;
         let pe = {
             let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
@@ -668,9 +669,9 @@ impl FluxControlNet {
     ) -> candle_gen::Result<Vec<Tensor>> {
         candle_gen::check_cancel(cancel)?;
         prepared.validate(hidden_states, img_ids, prompt_embeds, txt_ids)?;
-        let mut hidden = (hidden_states.apply(&self.x_embedder)?
-            + control_cond.apply(&self.controlnet_x_embedder)?)?;
-        let mut encoder = prompt_embeds.apply(&self.context_embedder)?;
+        let mut hidden = (__model_proof_output!(hidden_states.apply(&self.x_embedder))?
+            + __model_proof_output!(control_cond.apply(&self.controlnet_x_embedder))?)?;
+        let mut encoder = __model_proof_output!(prompt_embeds.apply(&self.context_embedder))?;
         let emb = self.time_text_embed.forward(timesteps, guidance, pooled)?;
         let mut residuals = Vec::with_capacity(self.blocks.len());
         for (block, cn) in self.blocks.iter().zip(&self.controlnet_blocks) {
@@ -899,6 +900,7 @@ mod tests {
     /// one per layer, and zero-init `controlnet_blocks` + zero-init `controlnet_x_embedder` make the
     /// untrained branch emit all-zero residuals (scale-0-equivalent ⇒ base unchanged). GPU-free.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn control_branch_zero_init_residuals_are_zero() -> Result<()> {
         use candle_nn::VarMap;
         let dev = Device::Cpu;
@@ -998,6 +1000,8 @@ mod tests {
                 "zero-init controlnet_blocks ⇒ all-zero residual, got max {max}"
             );
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control::tests::control_branch_zero_init_residuals_are_zero");
         Ok(())
     }
 
@@ -1013,11 +1017,11 @@ mod tests {
 
         // The hoisted norm: built once (as `JointBlock::norm2` is at load).
         let hoisted = layer_norm_no_affine(dim, dtype, &dev)?;
-        let out_hoisted = hoisted.forward(&x)?;
+        let out_hoisted = __model_proof_output!(hoisted.forward(&x))?;
 
         // The old behaviour: a fresh norm constructed inside the call.
         let fresh = layer_norm_no_affine(dim, dtype, &dev)?;
-        let out_fresh = fresh.forward(&x)?;
+        let out_fresh = __model_proof_output!(fresh.forward(&x))?;
 
         // Byte-for-byte equal (no tolerance): identical eps + unit weight ⇒ identical output.
         let diff = (out_hoisted - out_fresh)?

@@ -1517,8 +1517,13 @@ impl RestoreTrainResources {
                         )));
                     }
                 }
-                let text = std::fs::read_to_string(d.join(super::BACKBONE_CONFIG_FILE))
-                    .map_err(|e| Error::Msg(format!("iris: read parent config: {e}")))?;
+                #[cfg(feature = "model-inference-proof")]
+                let parent_config_path = d.join(super::BACKBONE_CONFIG_FILE);
+                let text = crate::__model_input_choose!(
+                    std::fs::read_to_string(d.join(super::BACKBONE_CONFIG_FILE)),
+                    std::fs::read_to_string(&parent_config_path)
+                )
+                .map_err(|e| Error::Msg(format!("iris: read parent config: {e}")))?;
                 if super::downstream::parse_task_settings(&text)?.is_some() {
                     return Err(Error::Unsupported(format!(
                         "{TRAINER_ID} trainer: the '{PARENT_COMPONENT}' component {} is a \
@@ -1534,6 +1539,12 @@ impl RestoreTrainResources {
                         d.display()
                     )));
                 }
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::iris::restoration_train::RestoreTrainResources::from_spec/parent-configuration",
+                    crate::model_input_proof::InputRole::Configuration,
+                    &[&parent_config_path],
+                );
                 Some(d.clone())
             }
             Some(WeightsSource::File(f)) => {
@@ -1594,14 +1605,19 @@ struct Rgb {
 }
 
 fn decode(path: &Path) -> Result<Rgb> {
-    let img = image::open(path)
-        .map_err(|e| {
-            Error::Msg(format!(
-                "iris restore training: decode {}: {e}",
-                path.display()
-            ))
-        })?
-        .to_rgb8();
+    let img = crate::__model_input_result!(
+        image::open(path),
+        "crates/contracts/gen-core/src/iris/restoration_train.rs::decode/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| {
+        Error::Msg(format!(
+            "iris restore training: decode {}: {e}",
+            path.display()
+        ))
+    })?
+    .to_rgb8();
     Ok(Rgb {
         w: img.width() as usize,
         h: img.height() as usize,

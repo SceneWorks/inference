@@ -28,6 +28,16 @@
 //!   `U` and `V` are the identity up to the sign rule. Sign drift is visible as a sign, not a
 //!   distance.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -2938,6 +2948,11 @@ fn first_generate_does_not_reload_or_replan_an_adapter() {
     let samples = render(&generator, "bright plucked strings", 29);
     assert!(!samples.is_empty());
     assert!(samples.iter().all(|sample| sample.is_finite()));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED first_generate_does_not_reload_or_replan_an_adapter"
+    );
 }
 
 /// The two exactly-signed real-weight gates, on all six pinned checkpoints.
@@ -2993,6 +3008,9 @@ fn real_adapters_change_the_render_and_a_zero_scale_one_changes_nothing() {
         );
         assert_eq!(adapted.len(), plain.len());
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_adapters_change_the_render_and_a_zero_scale_one_changes_nothing");
 }
 
 /// Stacking order is observable on real weights, for a type that does not commute.
@@ -3035,6 +3053,9 @@ fn real_stacked_dora_adapters_are_order_dependent() {
              sequential"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_stacked_dora_adapters_are_order_dependent");
 }
 
 /// The `-xs` half, on real weights, deliberately scoped to the conditioner's single `[768, 256]`
@@ -3083,6 +3104,9 @@ fn real_lora_xs_folds_through_the_host_svd() {
         );
         assert!(adapted.iter().all(|value| value.is_finite()));
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_lora_xs_folds_through_the_host_svd");
 }
 
 /// A key-mapping mismatch is refused by **`load_variant` itself**, not by the first `generate`.

@@ -103,7 +103,8 @@ fn mean_std(px: &[u8]) -> (f32, f32) {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + the LCM/Lightning/Hyper LoRAs in the HF cache"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + the LCM/Lightning/Hyper LoRAs in the HF cache"]
 fn few_step_renders_are_coherent() {
     let prompt = "a red fox in a forest, highly detailed".to_string();
     let (w, h, seed) = (1024u32, 1024u32, 42u64);
@@ -127,12 +128,15 @@ fn few_step_renders_are_coherent() {
             ..Default::default()
         };
         let mut last = 0u32;
-        let out = model
-            .generate(&req, &mut |p| {
+        let out = (
+            crate::common::record_model_inference_device(),
+            model.generate(&req, &mut |p| {
                 if let mlx_gen::Progress::Step { current, .. } = p {
                     last = last.max(current);
                 }
-            })
+            }),
+        )
+            .1
             .unwrap_or_else(|e| panic!("{sampler} generate: {e}"));
         assert_eq!(last, steps, "{sampler}: expected {steps} step events");
         let img = match out {
@@ -156,6 +160,8 @@ fn few_step_renders_are_coherent() {
             "{sampler}: render mean {mean:.1} out of sane range (NaN/constant?)"
         );
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED accel_real_weights::few_step_renders_are_coherent");
 }
 
 // ---- deterministic torch parity diagnostic -------------------------------------------------
@@ -177,7 +183,8 @@ fn nchw_to_nhwc(a: &Array) -> Array {
 /// Teacher-force the torch initial latent through the MLX deterministic samplers and report px>8 vs
 /// the torch render. Needs `dump_sdxl_accel_golden.py render`. Prints the ancestral baseline gap too.
 #[test]
-#[ignore = "needs the SDXL snapshot + accel LoRAs + sdxl_accel_render_* goldens (dump … render)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the SDXL snapshot + accel LoRAs + sdxl_accel_render_* goldens (dump … render)"]
 fn lightning_hyper_match_torch_teacher_forced() {
     use mlx_gen::sampler::{AlphaSchedule, DiffusionSampler, LightningSampler, TcdSampler};
     use mlx_gen_sdxl::config::DiffusionConfig;
@@ -204,18 +211,27 @@ fn lightning_hyper_match_torch_teacher_forced() {
         let pp = g.require("pooled").unwrap().as_dtype(dt).unwrap();
         let tids = text_time_ids(pp.shape()[0]);
         let d = Denoiser::new(&unet, &sampler);
-        let lat = denoise(
-            &d,
-            init,
-            &pe,
-            &pp,
-            &tids,
-            1.0,
-            &Default::default(),
-            &mut |_| {},
+        let lat = (
+            crate::common::record_model_inference_device(),
+            denoise(
+                &d,
+                init,
+                &pe,
+                &pp,
+                &tids,
+                1.0,
+                &Default::default(),
+                &mut |_| {},
+            ),
         )
-        .unwrap();
-        let img = decode_image(&mlx_gen_sdxl::load_vae(&snap).unwrap(), &lat, None).unwrap();
+            .1
+            .unwrap();
+        let img = (
+            crate::common::record_model_inference_device(),
+            decode_image(&mlx_gen_sdxl::load_vae(&snap).unwrap(), &lat, None),
+        )
+            .1
+            .unwrap();
         let gpix: Vec<u8> = g.require("image_u8").unwrap().as_slice::<u8>().to_vec();
         save_png("sdxl_accel_base_tf.png", &img);
         let b8 = px_frac(&img.pixels, &gpix, 8) * 100.0;
@@ -272,7 +288,12 @@ fn lightning_hyper_match_torch_teacher_forced() {
 
         // CFG off (guidance 1) for both → single (positive) conditioning row.
         let tokens = tok.tokenize_batch(&prompt, None).unwrap();
-        let (mlx_cond, mlx_pooled) = encode_conditioning(&te1, &te2, &tokens).unwrap();
+        let (mlx_cond, mlx_pooled) = (
+            crate::common::record_model_inference_device(),
+            encode_conditioning(&te1, &te2, &tokens),
+        )
+            .1
+            .unwrap();
 
         // Inject the torch initial latent (NCHW f32 → NHWC), so the trajectory is deterministic.
         let init = nchw_to_nhwc(g.require("init_latent").unwrap());
@@ -301,18 +322,27 @@ fn lightning_hyper_match_torch_teacher_forced() {
         let render = |cond: &Array, pooled: &Array| -> Image {
             let tids = text_time_ids(pooled.shape()[0]);
             let d = Denoiser::new(&unet, sampler.as_ref());
-            let lat = denoise(
-                &d,
-                init.clone(),
-                cond,
-                pooled,
-                &tids,
-                1.0,
-                &Default::default(),
-                &mut |_| {},
+            let lat = (
+                crate::common::record_model_inference_device(),
+                denoise(
+                    &d,
+                    init.clone(),
+                    cond,
+                    pooled,
+                    &tids,
+                    1.0,
+                    &Default::default(),
+                    &mut |_| {},
+                ),
             )
-            .unwrap();
-            decode_image(&vae, &lat, None).unwrap()
+                .1
+                .unwrap();
+            (
+                crate::common::record_model_inference_device(),
+                decode_image(&vae, &lat, None),
+            )
+                .1
+                .unwrap()
         };
 
         // (1) MLX CLIP conditioning — the full MLX path (CLIP + U-Net both MLX).
@@ -366,18 +396,27 @@ fn lightning_hyper_match_torch_teacher_forced() {
                 let pp = gl.require("pooled").unwrap().as_dtype(dt).unwrap();
                 let tids = text_time_ids(pp.shape()[0]);
                 let d = Denoiser::new(&unet, sampler.as_ref());
-                let lat = denoise(
-                    &d,
-                    init_l,
-                    &pe,
-                    &pp,
-                    &tids,
-                    1.0,
-                    &Default::default(),
-                    &mut |_| {},
+                let lat = (
+                    crate::common::record_model_inference_device(),
+                    denoise(
+                        &d,
+                        init_l,
+                        &pe,
+                        &pp,
+                        &tids,
+                        1.0,
+                        &Default::default(),
+                        &mut |_| {},
+                    ),
                 )
-                .unwrap();
-                let img = decode_image(&vae, &lat, None).unwrap();
+                    .1
+                    .unwrap();
+                let img = (
+                    crate::common::record_model_inference_device(),
+                    decode_image(&vae, &lat, None),
+                )
+                    .1
+                    .unwrap();
                 let gpix_l: Vec<u8> = gl.require("image_u8").unwrap().as_slice::<u8>().to_vec();
                 let l8 = px_frac(&img.pixels, &gpix_l, 8) * 100.0;
                 println!("• lightning: MLX-full vs torch-CONV-STRIPPED px>8 {l8:.1}% — large gap ⇒ conv merge is live (sc-2919)");
@@ -396,4 +435,6 @@ fn lightning_hyper_match_torch_teacher_forced() {
          single digits (≈ the few-step-amplified backend floor); the conv merge itself is byte-exact \
          (lora_complete_real_weights). The remaining MLX-CLIP column is the text-encoder backend gap.)"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED accel_real_weights::lightning_hyper_match_torch_teacher_forced");
 }

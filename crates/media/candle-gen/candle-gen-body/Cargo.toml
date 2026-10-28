@@ -11,6 +11,7 @@ repository = "https://github.com/michaeltrefry/candle-gen"
 candle-gen = { path = "../candle-gen" }
 
 [features]
+model-inference-proof = ["candle-gen/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]

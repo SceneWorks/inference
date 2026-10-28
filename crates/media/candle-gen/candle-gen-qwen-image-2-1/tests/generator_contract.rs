@@ -48,16 +48,27 @@ fn request() -> GenerationRequest {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gen_core_conformance_resident() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Resident), &profile());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::gen_core_conformance_resident");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gen_core_conformance_sequential() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Sequential), &profile());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::gen_core_conformance_sequential"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
     let g = load(OffloadPolicy::Resident);
     let mut events = Vec::new();
@@ -85,9 +96,13 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
         }
         other => panic!("expected images, got {other:?}"),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn sequential_policy_reports_loading_phases_and_matches_resident_pixels() {
     let resident = load(OffloadPolicy::Resident);
     let sequential = load(OffloadPolicy::Sequential);
@@ -111,9 +126,13 @@ fn sequential_policy_reports_loading_phases_and_matches_resident_pixels() {
         a[0].pixels, b[0].pixels,
         "residency policy never changes the render"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::sequential_policy_reports_loading_phases_and_matches_resident_pixels");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn count_and_seed_reach_the_runtime() {
     let g = load(OffloadPolicy::Resident);
     let mut req = request();
@@ -135,9 +154,15 @@ fn count_and_seed_reach_the_runtime() {
         images[1].pixels, seeded[0].pixels,
         "seed + 1 == second image of the batch"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::count_and_seed_reach_the_runtime"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn guidance_with_a_negative_prompt_changes_the_render() {
     let g = load(OffloadPolicy::Resident);
     let base = g.generate(&request(), &mut |_| {}).unwrap();
@@ -155,6 +180,9 @@ fn guidance_with_a_negative_prompt_changes_the_render() {
         panic!("images expected");
     };
     assert_eq!(a[0].pixels, off[0].pixels);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::guidance_with_a_negative_prompt_changes_the_render");
 }
 
 #[test]
@@ -178,6 +206,7 @@ fn invalid_requests_fail_with_actionable_errors_before_any_work() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_pre_tripped_cancel_is_typed_and_a_mid_run_cancel_stops_within_a_step() {
     let g = load(OffloadPolicy::Resident);
     let cancel = CancelFlag::new();
@@ -205,6 +234,9 @@ fn a_pre_tripped_cancel_is_typed_and_a_mid_run_cancel_stops_within_a_step() {
         seen <= 2,
         "stopped within a step of the trip, saw {seen} steps"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::a_pre_tripped_cancel_is_typed_and_a_mid_run_cancel_stops_within_a_step");
 }
 
 /// The one deliberate difference from the MLX twin's contract suite: candle has no
@@ -228,7 +260,11 @@ fn load_time_quantization_is_refused_with_a_typed_error() {
 /// `GenerationOutput::Images`. The candle twin of the MLX gate, so the capability is proven on
 /// both backends rather than assumed to transfer.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn alpha_output_honesty() {
     let g = load(OffloadPolicy::Resident);
     gen_core_testkit::check_alpha_output_honesty(g.as_ref(), &profile()).unwrap();
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::alpha_output_honesty");
 }

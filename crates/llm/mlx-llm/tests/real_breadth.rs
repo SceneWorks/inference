@@ -25,6 +25,9 @@ use mlx_llm::provider::{LlamaProvider, PROVIDER_ID};
 fn assert_streams_coherent(env: &str, family: &str) {
     let Some(dir) = std::env::var(env).ok().filter(|v| !v.is_empty()) else {
         eprintln!("skip: set {env}");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in assert_streams_coherent; see preceding skip diagnostic",
+        );
         return;
     };
     let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(&dir)).expect("load provider");
@@ -126,6 +129,9 @@ const GEMMA4_ENV: &str = "MLX_LLM_GEMMA4_MODEL";
 fn gemma4_provider(quantize: Option<Quantize>) -> Option<LlamaProvider> {
     let Some(dir) = std::env::var(GEMMA4_ENV).ok().filter(|v| !v.is_empty()) else {
         eprintln!("skip: set {GEMMA4_ENV} to a google/gemma-4-12B-it snapshot");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in gemma4_provider; see preceding skip diagnostic",
+        );
         return None;
     };
     let spec = LoadSpec {
@@ -214,6 +220,8 @@ fn gemma4_answers_at_a_quantized_tier() {
         out.to_lowercase().contains("paris"),
         "a coherent Q4 Gemma 4 should name Paris; got {out:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_breadth::gemma4_answers_at_a_quantized_tier");
 }
 
 /// **Image conditioning, demonstrated on MLX.** The model must answer a question whose only possible
@@ -266,6 +274,8 @@ fn gemma4_answers_about_an_image() {
         bl.contains("blue") && !bl.contains("red"),
         "a blue left half must be answered 'blue'; got {blue_left:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_breadth::gemma4_answers_about_an_image");
 }
 
 /// **Audio conditioning, demonstrated on MLX.** A clip measurably reaches the decoder: generation
@@ -317,4 +327,6 @@ fn gemma4_accepts_audio_conditioning() {
         "a tone and silence must not produce identical continuations — identical output means the \
          audio never reached the decoder"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_breadth::gemma4_accepts_audio_conditioning");
 }

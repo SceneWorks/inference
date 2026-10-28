@@ -206,8 +206,8 @@ impl Attention {
         // Per-head RMSNorm (Qwen3).
         let q_flat = q.flatten(0, 2)?;
         let k_flat = k.flatten(0, 2)?;
-        let q_flat = self.q_norm.forward(&q_flat)?;
-        let k_flat = self.k_norm.forward(&k_flat)?;
+        let q_flat = __model_proof_output!(self.q_norm.forward(&q_flat))?;
+        let k_flat = __model_proof_output!(self.k_norm.forward(&k_flat))?;
         let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
         let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
 
@@ -260,10 +260,10 @@ impl DecoderLayer {
     }
 
     fn forward(&self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
-        let h = self.ln1.forward(x)?;
+        let h = __model_proof_output!(self.ln1.forward(x))?;
         let h = self.self_attn.forward(&h, mask, offset)?;
         let x = (x + h)?;
-        let h2 = self.ln2.forward(&x)?;
+        let h2 = __model_proof_output!(self.ln2.forward(&x))?;
         let h2 = self.mlp.forward(&h2)?;
         x + h2
     }
@@ -367,6 +367,7 @@ mod parity_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_dense_te_matches_stock_forward() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -378,8 +379,8 @@ mod parity_tests {
         let stock = StockTe::new(&cfg, vb).unwrap();
 
         let ids = Tensor::from_vec(vec![1u32, 5, 12, 0, 3, 7], (1, 6), &dev).unwrap();
-        let y_v = vendored.forward(&ids).unwrap();
-        let y_s = stock.forward(&ids).unwrap();
+        let y_v = __model_proof_output!(vendored.forward(&ids)).unwrap();
+        let y_s = __model_proof_output!(stock.forward(&ids)).unwrap();
         assert_eq!(y_v.dims(), y_s.dims());
         let diff = (y_v - y_s)
             .unwrap()
@@ -393,5 +394,8 @@ mod parity_tests {
             diff < 1e-5,
             "vendored dense TE diverged from stock by {diff}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_te::parity_tests::vendored_dense_te_matches_stock_forward");
     }
 }

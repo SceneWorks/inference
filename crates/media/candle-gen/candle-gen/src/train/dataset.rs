@@ -45,9 +45,15 @@ pub type SquareImage = image::RgbImage;
 /// Decode `path` and center-crop it to its largest centered square — the per-item half of
 /// [`load_image_tensor`], done once per item however many bucket edges it is trained at.
 pub fn decode_square(path: &Path) -> Result<SquareImage> {
-    let img = image::open(path)
-        .map_err(|e| CandleError::Msg(format!("open image {}: {e}", path.display())))?
-        .to_rgb8();
+    let img = gen_core::__model_input_reader!(
+        image::open(path),
+        "crates/media/candle-gen/candle-gen/src/train/dataset.rs::decode_square::image::open@2345",
+        Reference,
+        path,
+        |__model_input_path| image::open(__model_input_path)
+    )
+    .map_err(|e| CandleError::Msg(format!("open image {}: {e}", path.display())))?
+    .to_rgb8();
     let (w, h) = img.dimensions();
     let side = w.min(h);
     let (x0, y0) = ((w - side) / 2, (h - side) / 2);

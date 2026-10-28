@@ -271,7 +271,7 @@ impl PatchEmbed {
         // patchify conv + the learned-pos-embed add run in one consistent dtype (sc-7881, C6).
         let latent = latent.to_dtype(self.proj.weight().dtype())?;
         // conv2d patchify -> [B, inner, h, w]
-        let x = self.proj.forward(&latent)?;
+        let x = __model_proof_output!(self.proj.forward(&latent))?;
         let (b, _c, h, w) = x.dims4()?;
         // -> [B, h*w, inner]
         let x = x.flatten_from(2)?.transpose(1, 2)?.contiguous()?;
@@ -1150,6 +1150,7 @@ mod tests {
 
     /// AdaLN-Zero produces exactly `n_chunks` modulation slices of width `inner`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn adaln_zero_chunk_count_and_width() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -1162,6 +1163,11 @@ mod tests {
         for c in &chunks {
             assert_eq!(c.dims(), &[1, 1, inner]);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::adaln_zero_chunk_count_and_width"
+        );
     }
 
     /// `AdaLayerNormContinuous` splits the linear output as `scale, shift = chunk(2)` (scale FIRST,
@@ -1169,6 +1175,7 @@ mod tests {
     /// hand-built linear so the chunk order is observable: a constant LN(x)=0 input isolates the
     /// shift. Getting this backwards is the sc-7881 real-weight bug (it produced spatial-noise renders).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn adaln_continuous_chunk_order_is_scale_then_shift() {
         let dev = Device::Cpu;
         let inner = 4usize;
@@ -1191,6 +1198,9 @@ mod tests {
                 "shift must be the SECOND chunk (got {v}, expected 2)"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::adaln_continuous_chunk_order_is_scale_then_shift");
     }
 
     /// The joint block's context AdaLN chunk order depends on the block kind (sc-8981):
@@ -1203,6 +1213,7 @@ mod tests {
     /// Before the sc-8981 fix the pre-only branch applied `(1+shift)·LN + scale`, which this test
     /// catches (it would return the scale constant instead of the shift constant).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn context_adaln_chunk_order_per_block_kind() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1253,6 +1264,9 @@ mod tests {
                  got {v}, expected 3"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::context_adaln_chunk_order_per_block_kind");
     }
 
     /// timestep_embedding: cos first, sin second; t=0 -> [1...1, 0...0].
@@ -1274,6 +1288,7 @@ mod tests {
     /// patchify -> unpatchify round-trips the spatial geometry: a `[B,C,H,W]` latent yields the
     /// patch grid `(H/p, W/p)`, and unpatchify of a `[B, h*w, patch_dim]` returns `[B,C,H,W]`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn patchify_unpatchify_round_trip_shape() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1291,12 +1306,16 @@ mod tests {
         let patched = Tensor::randn(0f32, 1f32, (1, h * w, cfg.patch_dim()), &dev).unwrap();
         let out = t.unpatchify(&patched, h, w).unwrap();
         assert_eq!(out.dims(), &[1, 16, 8, 8]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::patchify_unpatchify_round_trip_shape");
     }
 
     /// The FULL tiny MMDiT forward runs on CPU and produces a velocity with the input latent's shape.
     /// Base weights are randomized (the VarMap is filled with random init by `candle_nn::linear`),
     /// so the patch conv is NOT zero-init — the output is a non-trivial function of the input.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiny_mmdit_forward_produces_latent_shape() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1326,11 +1345,15 @@ mod tests {
             max > 0.0,
             "velocity is vacuously zero — base weights not randomized?"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::tiny_mmdit_forward_produces_latent_shape");
     }
 
     /// The final block is `context_pre_only`: its attention has no `to_add_out` and the block has no
     /// `ff_context`, so it must still forward (returning the text stream unchanged).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn final_block_context_pre_only_forwards() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1359,6 +1382,9 @@ mod tests {
             same < 1e-6,
             "context_pre_only block must leave text unchanged"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::final_block_context_pre_only_forwards");
     }
 
     // ---- MMDiT-X dual-attention (sc-7878) -------------------------------------------------------
@@ -1367,6 +1393,7 @@ mod tests {
     /// (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) PLUS shift_msa2, scale_msa2,
     /// gate_msa2 for the `attn2` path. A standard block's `norm1` is 6 chunks.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dual_block_norm1_emits_nine_chunks() {
         let dev = Device::Cpu;
         let cfg = tiny_dual_cfg();
@@ -1388,6 +1415,9 @@ mod tests {
         for c in &chunks {
             assert_eq!(c.dims(), &[1, 1, cfg.inner_dim]);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::dual_block_norm1_emits_nine_chunks");
     }
 
     /// **The dual `attn2` path is NOT a no-op.** Build one dual block, run its forward (which adds the
@@ -1397,6 +1427,7 @@ mod tests {
     /// attn2 would leave the output unchanged). The norm1 9-chunk linear is identical across both
     /// runs (the extra `shift/scale/gate_msa2` chunks are only consumed when `attn2` is present).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dual_attention_path_changes_output() {
         let dev = Device::Cpu;
         let cfg = tiny_dual_cfg();
@@ -1431,11 +1462,15 @@ mod tests {
             diff > 1e-5,
             "dual attn2 path must change the image stream (diff={diff}); it is a no-op?"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::dual_attention_path_changes_output");
     }
 
     /// A small MMDiT-X (Medium-shaped) transformer with dual blocks runs end-to-end and produces a
     /// velocity with the latent's shape and non-vacuous magnitude.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiny_mmdit_x_forward_produces_latent_shape() {
         let dev = Device::Cpu;
         // 3 blocks, the first two dual (MMDiT-X), the last standard — exercises both code paths and
@@ -1469,6 +1504,9 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(max > 0.0, "MMDiT-X velocity is vacuously zero?");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::tiny_mmdit_x_forward_produces_latent_shape");
     }
 
     // ---- Q4/Q8 quantization (sc-7879) -----------------------------------------------------------
@@ -1517,6 +1555,7 @@ mod tests {
     /// on a dense-base fixture (the base-agnostic additive path is byte-equal on a packed base; the
     /// stays-packed property is proven at the `AdaptLinear` unit level).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn install_additive_lora_on_mmdit_applies_and_shifts() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         use std::collections::HashMap as Map;
@@ -1578,6 +1617,9 @@ mod tests {
             shift > 1e-5,
             "additive LoRA did not shift the DiT forward ({shift})"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::install_additive_lora_on_mmdit_applies_and_shifts");
     }
 
     /// **Q8 forward is near-lossless; Q4 forward stays coherent** vs the dense MMDiT (CPU, random
@@ -1623,13 +1665,23 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q8_mmdit_forward_is_near_lossless() {
         quant_forward_parity(Quant::Q8, 0.99);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::q8_mmdit_forward_is_near_lossless");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q4_mmdit_forward_stays_coherent() {
         quant_forward_parity(Quant::Q4, 0.85);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::q4_mmdit_forward_stays_coherent"
+        );
     }
 
     // ---- CPU-stage → quantize_onto (sc-8504) ----------------------------------------------------
@@ -1672,29 +1724,42 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cpu_stage_q4_bit_exact_vs_in_place() {
         cpu_stage_matches_in_place(Quant::Q4, &quant_cfg());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::cpu_stage_q4_bit_exact_vs_in_place");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cpu_stage_q8_bit_exact_vs_in_place() {
         cpu_stage_matches_in_place(Quant::Q8, &quant_cfg());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::cpu_stage_q8_bit_exact_vs_in_place");
     }
 
     /// The CPU-stage path also covers the MMDiT-X (dual-attention) config bit-exactly — its `attn2`
     /// projections + the 9-chunk AdaLN leaf migrate identically.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cpu_stage_dual_bit_exact_vs_in_place() {
         let cfg = Sd3Config {
             dual_attention_layers: vec![0, 1],
             ..quant_cfg()
         };
         cpu_stage_matches_in_place(Quant::Q4, &cfg);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::cpu_stage_dual_bit_exact_vs_in_place");
     }
 
     /// `quantize_onto` is idempotent (a re-run is a no-op per `QLinear`) and the staged model still
     /// forwards finite output.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cpu_stage_is_idempotent_and_forwards() {
         let cfg = quant_cfg();
         let (vm, latent, context, pooled, t) = quant_harness(&cfg);
@@ -1707,6 +1772,9 @@ mod tests {
         for x in v.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
             assert!(x.is_finite());
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::cpu_stage_is_idempotent_and_forwards");
     }
 
     /// **CUDA CPU-stage smoke (sc-8504).** Build the dense MMDiT on a **CPU** VarBuilder, then
@@ -1717,6 +1785,7 @@ mod tests {
     /// `cuda_quant_forward_smoke`; it proves the dense projection never had to land on the GPU.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cuda_cpu_stage_quant_smoke() {
         use candle_gen::candle_core::quantized::GgmlDType;
 
@@ -1745,7 +1814,9 @@ mod tests {
                         Quant::Q8 => GgmlDType::Q8_0,
                         // The loop above only exercises Q4/Q8; NVFP4 is not a GGUF fold target (it is
                         // served by Nvfp4Linear, sc-11042) so this arm is never reached here.
-                        Quant::Nvfp4 => unreachable!("SD3.5 GGUF fold does not exercise NVFP4"),
+                        Quant::Nvfp4 | Quant::Fp8Rowwise => {
+                            unreachable!("SD3.5 GGUF fold does not exercise NVFP4")
+                        }
                     };
                     assert_eq!(qt.dtype(), expected, "wrong GGUF block dtype");
                 }
@@ -1785,11 +1856,15 @@ mod tests {
                 "{quant:?} all-zero (dequant no-op?)"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::cuda_cpu_stage_quant_smoke");
     }
 
     /// `quantize` transitions the model's projections to the `Quantized` arm (idempotently): a second
     /// pass is a no-op, and the forward still runs finite afterward.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quantize_is_idempotent_and_still_forwards() {
         let cfg = quant_cfg();
         let (vm, latent, context, pooled, t) = quant_harness(&cfg);
@@ -1804,5 +1879,8 @@ mod tests {
         for x in v.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
             assert!(x.is_finite());
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::quantize_is_idempotent_and_still_forwards");
     }
 }

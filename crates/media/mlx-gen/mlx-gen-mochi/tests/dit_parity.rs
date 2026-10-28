@@ -81,4 +81,6 @@ fn transformer_forward_matches_golden() {
     // dominated by the tail of a deep bf16 stack; mean_rel is the aggregate signal (the LTX precedent).
     assert!(pr < 1.0e-1, "noise_pred peak_rel {pr:.3e} too high");
     assert!(mr < 3.0e-2, "noise_pred mean_rel {mr:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::transformer_forward_matches_golden");
 }

@@ -2254,10 +2254,13 @@ mod cuda_tests {
     /// be captured: in a `flash-attn` build (always the legacy stream) as `flash_attn_stream`,
     /// otherwise not at all at the capability check (the own stream).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_flash_attn_build_is_refused_by_name() {
         let _guard = cuda_graphs_policy_guard(Some(true));
         let Ok(device @ Device::Cuda(_)) = crate::device::select_device() else {
             eprintln!("skipping: no CUDA device");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:2261 (a_flash_attn_build_is_refused_by_name): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let model = Synthetic::new(&device, None);
@@ -2285,13 +2288,19 @@ mod cuda_tests {
             assert_eq!(record.cuda_graphs.fallback_reason, None);
             assert_eq!(runner.captured_graphs(), 1);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::a_flash_attn_build_is_refused_by_name");
     }
 
     // ---- POC experiments ----
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn poc_allocator_is_stream_ordered_and_the_stream_is_capturable() {
         let Some((_guard, _, dev)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:2295 (poc_allocator_is_stream_ordered_and_the_stream_is_capturable): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let stream = dev.cuda_stream();
@@ -2314,6 +2323,8 @@ mod cuda_tests {
         // The legacy NULL stream (`Device::new_cuda`) refuses capture: the reason the device
         // selector builds the model on its own stream.
         let Ok(Device::Cuda(legacy)) = crate::device::new_cuda_for_test() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:2317 (poc_allocator_is_stream_ordered_and_the_stream_is_capturable): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         match capture(&legacy, || Ok(())) {
@@ -2339,6 +2350,9 @@ mod cuda_tests {
             record.cuda_graphs.fallback_reason,
             Some(REASON_LEGACY_STREAM)
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::poc_allocator_is_stream_ordered_and_the_stream_is_capturable");
     }
 
     /// The core experiment: contiguous candle ops (a cuBLAS matmul, a softmax, an affine, a
@@ -2758,7 +2772,7 @@ mod cuda_tests {
             let mut prev = cache.state.clone();
             let mut rows = Vec::with_capacity(m);
             for i in 0..m {
-                let token_row = ids_col.narrow(0, i, 1)?.matmul(&self.w_id)?; // [1, n]
+                let token_row = __model_proof_output!(ids_col.narrow(0, i, 1)?.matmul(&self.w_id))?; // [1, n]
                 let row = ((token_row + mix)? + &prev)?.tanh()?;
                 rows.push(row.clone());
                 prev = row;
@@ -2796,8 +2810,10 @@ mod cuda_tests {
             cache.state.slice_set(&last, 0, 0)?;
             cache.len += m as i32;
             let logits = match request.scope {
-                LogitsScope::Last => last.matmul(&self.w_out)?, // [1, vocab]
-                LogitsScope::All => h.matmul(&self.w_out)?.reshape((1, m, self.vocab))?,
+                LogitsScope::Last => __model_proof_output!(last.matmul(&self.w_out))?, // [1, vocab]
+                LogitsScope::All => {
+                    __model_proof_output!(h.matmul(&self.w_out))?.reshape((1, m, self.vocab))?
+                }
             };
             let hidden = request
                 .want_hidden
@@ -2856,8 +2872,11 @@ mod cuda_tests {
     /// Speculation off: the runner captures the 1-token decode step, verifies it twice and
     /// replays it for the rest of the request, token-identical to the bare model.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn synthetic_decode_through_the_runner_is_token_identical_and_replays() {
         let Some((_guard, device, _)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:2861 (synthetic_decode_through_the_runner_is_token_identical_and_replays): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let model = Synthetic::new(&device, None);
@@ -2922,14 +2941,20 @@ mod cuda_tests {
             4 + model.vocab * 4,
             "ids [1,1] u32 + logits [1, vocab] f32"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::synthetic_decode_through_the_runner_is_token_identical_and_replays");
     }
 
     /// MTP-style speculation with K = 3: the engine's 4-token verify steps (all-position logits,
     /// device ids) and its rollbacks run through captured graphs, token-identical to the bare
     /// model through the same engine.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn synthetic_speculative_k3_through_the_runner_is_token_identical_and_replays() {
         let Some((_guard, device, _)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:2933 (synthetic_speculative_k3_through_the_runner_is_token_identical_and_replays): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let model = Synthetic::new(&device, None);
@@ -3014,6 +3039,9 @@ mod cuda_tests {
         )
         .unwrap();
         assert_eq!(plain.output.tokens, wrapped.output.tokens);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::synthetic_speculative_k3_through_the_runner_is_token_identical_and_replays");
     }
 
     /// Every fallback is named and never fails the request: a cache that declares itself
@@ -3022,8 +3050,11 @@ mod cuda_tests {
     /// replay's self-check). Each request finishes token-identical to the same model run bare,
     /// on the same device, with no graph kept.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn synthetic_misbehaviour_falls_back_with_a_named_reason() {
         let Some((_guard, _, _)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:3027 (synthetic_misbehaviour_falls_back_with_a_named_reason): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let config = greedy(24);
@@ -3085,13 +3116,19 @@ mod cuda_tests {
                 assert!(runner.last_census().unwrap().escaped_allocs >= 1);
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::synthetic_misbehaviour_falls_back_with_a_named_reason");
     }
 
     /// A step longer than the runner captures (a prefill) runs eager with the named reason
     /// `shape`; it is a per-step fallback, not a refusal, so later decode steps still capture.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn oversized_steps_are_named_shape_fallbacks() {
         let Some((_guard, device, _)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:3095 (oversized_steps_are_named_shape_fallbacks): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let model = Synthetic::new(&device, None);
@@ -3120,14 +3157,20 @@ mod cuda_tests {
                 .unwrap();
         }
         assert_eq!(runner.captured_graphs(), 1, "decode steps still capture");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::oversized_steps_are_named_shape_fallbacks");
     }
 
     /// A graph launch that fails mid-request: the replay's bookkeeping is rolled back, the step
     /// runs eager with the named reason `launch_failed`, the runner drops its graph, and every
     /// step's logits and the cache length stay identical to the bare model's.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_failed_launch_rolls_back_and_falls_back_eager() {
         let Some((_guard, device, _)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:3131 (a_failed_launch_rolls_back_and_falls_back_eager): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let model = Synthetic::new(&device, None);
@@ -3170,13 +3213,19 @@ mod cuda_tests {
         );
         assert_eq!(runner.refusal(), Some(REASON_LAUNCH_FAILED));
         assert_eq!(runner.captured_graphs(), 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::a_failed_launch_rolls_back_and_falls_back_eager");
     }
 
     /// A runner-wide refusal drops every graph the runner holds, not only the refused shape's:
     /// a verified 1-token graph is released (with its staging) when the 2-token shape is refused.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_refusal_drops_every_captured_shape() {
         let Some((_guard, device, _)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:3180 (a_refusal_drops_every_captured_shape): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let model = Synthetic::new(&device, None);
@@ -3203,6 +3252,9 @@ mod cuda_tests {
             "the 1-token graph is dropped too"
         );
         assert_eq!(runner.workspace(), GraphWorkspace::default());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::a_refusal_drops_every_captured_shape");
     }
 
     /// A step that panics inside a capture still ends it: the stream leaves capture mode, the
@@ -3236,8 +3288,11 @@ mod cuda_tests {
     /// Graph memory (E6): the runner reports the reservation its capture added to a trimmed
     /// pool, and gives it back — the pool is trimmed — when it drops its graphs.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn graph_memory_is_reported_and_trimmed_when_the_graphs_go() {
         let Some((_guard, device, dev)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:3241 (graph_memory_is_reported_and_trimmed_when_the_graphs_go): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         // Earlier tests' graphs are gone (each trims as it goes); start from an empty pool.
@@ -3268,6 +3323,9 @@ mod cuda_tests {
         runner.reset();
         assert_eq!(runner.workspace(), GraphWorkspace::default());
         assert_eq!(reserved(&dev), 0, "dropping the graphs trims the pool");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::graph_memory_is_reported_and_trimmed_when_the_graphs_go");
     }
 
     /// The production step models the runner wraps (sc-24441): a dense Qwen3 `CausalLm`, the
@@ -3411,8 +3469,11 @@ mod cuda_tests {
     /// driver and through `K = 3` verify steps. Graphs off, the device-positions path emits the
     /// same greedy tokens as the pre-change host-position path.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn production_decoders_capture_and_replay_token_identical() {
         let Some((_guard, device, _)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:3416 (production_decoders_capture_and_replay_token_identical): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let hosts = production_models(&device);
@@ -3431,6 +3492,9 @@ mod cuda_tests {
                 _ => unreachable!(),
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::production_decoders_capture_and_replay_token_identical");
     }
 
     /// A request decoded through the runner on a thread that then exits leaves nothing recorded
@@ -3442,8 +3506,11 @@ mod cuda_tests {
     /// what this test caught on the CUDA lane). The model keeps decoding on another thread
     /// afterwards.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_runner_thread_exit_leaves_the_models_context_clean() {
         let Some((_guard, device, dev)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:3447 (a_runner_thread_exit_leaves_the_models_context_clean): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let (w, cfg) = crate::models::llama::tests::tiny_qwen3(64, false, &device);
@@ -3484,6 +3551,9 @@ mod cuda_tests {
         )
         .unwrap();
         assert_eq!(eager.tokens, graphs);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::a_runner_thread_exit_leaves_the_models_context_clean");
     }
 
     /// The census of warmed production steps recorded as the runner records them (under the
@@ -3491,9 +3561,12 @@ mod cuda_tests {
     /// cache hold no host copy and no escaping allocation — the ring and the static KV are
     /// written in place at device-held indices.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn warmed_production_steps_record_no_host_copies() {
         use crate::models::qwen35::tests::text_model_on;
         let Some((_guard, device, _)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:3497 (warmed_production_steps_record_no_host_copies): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let prompt = [1i32, 7, 3, 42, 9];
@@ -3535,6 +3608,9 @@ mod cuda_tests {
             assert!(census.kernels > 0);
             assert_eq!(census.refusal(), None, "{name}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::warmed_production_steps_record_no_host_copies");
     }
 
     /// The vendored candle-core's parameter cache (sc-24441, #3564 + #3598): every layout-bearing
@@ -3646,6 +3722,8 @@ mod cuda_tests {
     #[ignore = "timing evidence; needs a quiet GPU"]
     fn synthetic_replay_timing() {
         let Some((_guard, device, _)) = device() else {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/graph.rs:3649 (synthetic_replay_timing): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let model = Synthetic::new(&device, None);
@@ -3671,6 +3749,11 @@ mod cuda_tests {
             eager_time.as_secs_f64() * 1e6 / 2048.0,
             graph_time.as_secs_f64() * 1e6 / 2048.0,
             tally.describe()
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED decode::graph::cuda_tests::synthetic_replay_timing"
         );
     }
 }

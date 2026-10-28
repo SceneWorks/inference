@@ -617,6 +617,9 @@ fn base_preview_frames_evolve_toward_the_final_image() {
         4.0,
         &BASE,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::base_preview_frames_evolve_toward_the_final_image");
 }
 
 /// `sensenova_u1_8b_fast` — the second registered id, on its own snapshot, at its own CFG-1.0
@@ -634,6 +637,9 @@ fn fast_preview_frames_evolve_toward_the_final_image() {
         1.0,
         &FAST,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::fast_preview_frames_evolve_toward_the_final_image");
 }
 
 /// **The committed fit reproduces the model's own decode**, at token resolution — weights-free, and

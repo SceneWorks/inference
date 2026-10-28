@@ -819,7 +819,7 @@ fn admit_lane(
         req_index: ri,
         selection,
         rng: SplitMix64::new(r.seed.unwrap_or_else(default_seed)),
-        params: r.sampling,
+        params: r.sampling.for_prompt(r.prompt_ids.len()),
         history: r.prompt_ids.clone(),
         next_token: 0,
     };
@@ -1024,6 +1024,7 @@ mod tests {
     /// `UnsupportedRequest` (a product serves a lone request on the contiguous path); only the
     /// test arm runs it compressed.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn concurrent_qualified_requests_decode_dense_as_batched_unless_test_armed() {
         let model = model();
         let requests = vec![request(tokens(10_240, 0), 4), request(tokens(10_301, 1), 5)];
@@ -1092,6 +1093,8 @@ mod tests {
         for out in &armed {
             assert_compressed(out);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::concurrent_qualified_requests_decode_dense_as_batched_unless_test_armed");
     }
 
     /// AC1: a continuous batch of jagged qualified requests (and more requests than slots) runs
@@ -1100,6 +1103,7 @@ mod tests {
     /// compressed requests stay wholly compressed (no padding mask, no dense gather). With the
     /// policy off the run is exactly `generate_continuous`.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn continuous_batching_runs_jagged_qualified_requests_compressed_and_the_rest_dense() {
         let model = model();
         let requests = vec![
@@ -1173,6 +1177,8 @@ mod tests {
                 KvCacheReport::dense(KvCacheFallbackReason::PolicyDisabled, None)
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::continuous_batching_runs_jagged_qualified_requests_compressed_and_the_rest_dense");
     }
 
     enum Layout {
@@ -1190,6 +1196,7 @@ mod tests {
     /// by one; the dense sequence's logits are exactly those of an all-dense batch; the
     /// compressed rows stay within 8-bit rounding of the dense run.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn throughput_batches_compressed_sequences_in_one_dispatch_beside_a_dense_one() {
         let model = model();
         let reader = reader();
@@ -1277,6 +1284,8 @@ mod tests {
             }
         }
         assert!(worst < 0.02, "compressed vs dense paged: {worst}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::throughput_batches_compressed_sequences_in_one_dispatch_beside_a_dense_one");
     }
 
     /// AC2: requests sharing a 10 272-token prefix (not page-aligned, so the shared last page is
@@ -1286,6 +1295,7 @@ mod tests {
     /// — and when the run ends the pool holds exactly the store's pages; clearing the store frees
     /// every page.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn in_batch_prefix_sharing_equals_sequential_sharing_and_returns_every_page() {
         let model = model();
         let prefix = tokens(10_272, 9);
@@ -1349,11 +1359,14 @@ mod tests {
             store.clear().unwrap();
             assert_eq!(pool.borrow().live_pages(), 0);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::in_batch_prefix_sharing_equals_sequential_sharing_and_returns_every_page");
     }
 
     /// AC2 refcounts: a run cancelled mid-decode, and a run whose fused reader faults mid-decode
     /// (an error, not a fallback), both leave the pool holding exactly the prefix store's pages.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cancellation_and_failure_return_the_pool_to_the_store_baseline() {
         let model = model();
         let prefix = tokens(10_240, 4);
@@ -1415,6 +1428,8 @@ mod tests {
         assert_eq!(pool.borrow().live_pages(), failed_store.held_pages());
         failed_store.clear().unwrap();
         assert_eq!(pool.borrow().live_pages(), 0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::cancellation_and_failure_return_the_pool_to_the_store_baseline");
     }
 
     /// AC2 identity: a store keyed by another model identity, or built for another page geometry,
@@ -1422,6 +1437,7 @@ mod tests {
     /// its pool is untouched — while the requests still run (compressed, on the run's own pool)
     /// exactly as they do with no store.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_store_of_another_identity_is_refused_and_never_reused() {
         let model = model();
         let prefix = tokens(10_240, 6);
@@ -1482,12 +1498,15 @@ mod tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::a_store_of_another_identity_is_refused_and_never_reused");
     }
 
     /// AC2 restore: a store saved as bytes and restored into a new pool (a process restart) serves
     /// a new request exactly as the original store does; a snapshot whose KV format version was
     /// changed is refused and counted, and nothing is stored.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_saved_prefix_store_restores_and_a_version_mismatch_is_refused() {
         let model = model();
         let prefix = tokens(10_240, 8);
@@ -1597,6 +1616,8 @@ mod tests {
         assert!(!fresh.insert(&identity, &prompt, &foreign).unwrap());
         assert_eq!(fresh.stats().refused, 3);
         assert!(fresh.is_empty());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::a_saved_prefix_store_restores_and_a_version_mismatch_is_refused");
     }
 
     /// AC1 pool sizing: four jagged qualified requests (page_tokens 32) admitted together hold no
@@ -1614,6 +1635,7 @@ mod tests {
     /// that is never trimmed or never compacted hold more (0.85 of dense measured before
     /// sc-20681's fix).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn continuous_runs_reserve_their_prefill_and_trim_the_pool_on_retirement() {
         let model = model();
         let pool = PackedPagePool::new(2, 2, 64, 32, PackedCodeBits::Eight).unwrap();
@@ -1741,12 +1763,15 @@ mod tests {
             "{} pages kept after every request retired",
             pool.capacity_pages()
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::continuous_runs_reserve_their_prefill_and_trim_the_pool_on_retirement");
     }
 
     /// Per-request cancellation in a batch: a request cancelled while it decodes leaves with its
     /// partial output (`Cancelled`), one cancelled while it waits is never prefilled, and the
     /// others decode to their budgets, each with exactly one terminal event.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_request_cancelled_on_its_own_leaves_the_batch_and_the_rest_finish() {
         let model = model();
         let requests = (0..3)
@@ -1785,12 +1810,15 @@ mod tests {
         assert_eq!(dones[0], vec![(FinishReason::MaxTokens, 8)]);
         assert_eq!(dones[1], vec![(FinishReason::Cancelled, 3)]);
         assert_eq!(dones[2], vec![(FinishReason::Cancelled, 0)]);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::a_request_cancelled_on_its_own_leaves_the_batch_and_the_rest_finish");
     }
 
     /// AC2 identity: a store keyed by one decoder is refused by another decoder of the same
     /// geometry and name but another configuration (here its RoPE base), naming the fingerprint;
     /// and a run with no model identity never consults a store.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_store_of_another_decoder_or_an_unnamed_run_is_refused() {
         let model = model();
         let other = crate::provider::tests::synthetic_causal_model_with_rope(128, 2, 4, 2, 64, 5e5);
@@ -1840,6 +1868,8 @@ mod tests {
             other => panic!("an unnamed store served a lookup: {other:?}"),
         }
         assert_eq!(unnamed.stats().refused, 1);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::a_store_of_another_decoder_or_an_unnamed_run_is_refused");
     }
 
     /// AC3 measurement (not a gate): `Throughput` continuous batching of `B` qualified sequences
@@ -2006,5 +2036,7 @@ mod tests {
                 "B={batch}: held compressed / held dense {held:.3}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::continuous::tests::continuous_batching_memory_and_decode_throughput_vs_dense_paged");
     }
 }

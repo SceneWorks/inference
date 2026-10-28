@@ -32,6 +32,16 @@
 //! checkpoint. The `chatterbox_ve` weights resolve via the hub or `CHATTERBOX_VE_SNAPSHOT`.
 //! Optionally dump the raw frames with `MOSS_TTSD_FRAMES_OUT` and a demo WAV with `MOSS_TTSD_WAV_OUT`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -182,6 +192,9 @@ fn moss_ttsd_emits_valid_delay_pattern_rvq_frames() {
         std::fs::write(&out, text).expect("write frames");
         eprintln!("wrote {} frames to {out}", frames.len());
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_ttsd_emits_valid_delay_pattern_rvq_frames");
 }
 
 /// Multi-speaker gate (token level): the 2-speaker script produces valid, deterministic frames whose
@@ -214,6 +227,11 @@ fn moss_ttsd_two_speaker_script_shapes_the_token_stream() {
     assert_ne!(
         ms.frames, control.frames,
         "a 2-speaker script must produce a different token stream than a single-voice control"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED moss_ttsd_two_speaker_script_shapes_the_token_stream"
     );
 }
 
@@ -342,6 +360,9 @@ fn moss_ttsd_renders_multi_speaker_audio() {
             .expect("write demo WAV");
         eprintln!("wrote demo WAV to {out}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_ttsd_renders_multi_speaker_audio");
 }
 
 /// Task 12906 (non-English): MOSS-TTSD reads text in-band (no external G2P), advertising ~20
@@ -398,6 +419,9 @@ fn moss_ttsd_renders_non_english() {
             .expect("write zh demo WAV");
         eprintln!("wrote zh demo WAV to {out}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_ttsd_renders_non_english");
 }
 
 /// Codec-parity harness: decode a fixed set of 8-codebook frames (`MOSS_TTSD_CODES_IN`, one frame
@@ -410,7 +434,15 @@ fn moss_ttsd_renders_non_english() {
 fn codec_decode_frames_from_file() {
     let codes_path = std::env::var("MOSS_TTSD_CODES_IN").expect("set MOSS_TTSD_CODES_IN");
     let out_path = std::env::var("MOSS_TTSD_PARITY_OUT").expect("set MOSS_TTSD_PARITY_OUT");
-    let text = std::fs::read_to_string(&codes_path).expect("read codes file");
+    let text = candle_audio::gen_core::__model_input_reader!(
+std::fs::read_to_string(&codes_path),
+"crates/audio/candle-audio-moss-tts/tests/conformance.rs::codec_decode_frames_from_file::std::fs::read_to_string@19134",
+TensorInput,
+&codes_path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = candle_audio::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).expect("read codes file");
     let frames: Vec<Vec<u32>> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -437,4 +469,7 @@ fn codec_decode_frames_from_file() {
         "candle codec: {} samples, peak={peak:.4}, rms={rms:.5} -> {out_path}",
         wav.len()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED codec_decode_frames_from_file");
 }

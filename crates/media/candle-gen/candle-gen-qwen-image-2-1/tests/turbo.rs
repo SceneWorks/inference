@@ -175,6 +175,7 @@ fn render_reported(
 /// (`self.cache = Some(cache)` removed in `BranchRun::evaluate`) — every evaluation then
 /// re-extracts; the generator ignoring a `Cached` selection (its report says `prefill`).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_turbo_schedule_extracts_once_and_decodes_from_the_cache_at_every_later_step() {
     let turbo = turbo_snapshot();
     let root = turbo.path();
@@ -220,6 +221,9 @@ fn the_turbo_schedule_extracts_once_and_decodes_from_the_cache_at_every_later_st
         .expect("the path is reported on every render");
     assert_eq!(ran.path, PrefixKvCacheMode::Cached);
     assert_eq!(ran.cache_bytes, report.kv_cache_bytes as u64);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo::the_turbo_schedule_extracts_once_and_decodes_from_the_cache_at_every_later_step");
 }
 
 /// The fixture is what it says it is — otherwise every claim below is about a base snapshot.
@@ -328,15 +332,20 @@ fn profile() -> gen_core_testkit::Profile {
 /// The whole gen-core generator contract — validate honesty, progress, typed cancellation, seeded
 /// determinism — on the Turbo fixture, both residency policies, through the catalog load path.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gen_core_conformance_on_the_turbo_fixture_resident() {
     let turbo = turbo_snapshot();
     gen_core_testkit::conformance(
         || load(TURBO, turbo.path(), OffloadPolicy::Resident),
         &profile(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo::gen_core_conformance_on_the_turbo_fixture_resident");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gen_core_conformance_on_the_turbo_fixture_sequential() {
     let turbo = turbo_snapshot();
     gen_core_testkit::conformance(
@@ -345,6 +354,9 @@ fn gen_core_conformance_on_the_turbo_fixture_sequential() {
     );
     let generator = load(TURBO, turbo.path(), OffloadPolicy::Sequential);
     gen_core_testkit::check_alpha_output_honesty(generator.as_ref(), &profile()).unwrap();
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo::gen_core_conformance_on_the_turbo_fixture_sequential");
 }
 
 /// A request that omits `steps` runs one step per sigma **the snapshot saves** — eight for the
@@ -353,6 +365,7 @@ fn gen_core_conformance_on_the_turbo_fixture_sequential() {
 /// *Mutation that reds this:* defaulting the Turbo step count to a constant (8, or the base 40)
 /// instead of the saved list's length.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_unset_step_count_is_the_length_of_the_snapshots_saved_list() {
     for (sigmas, want) in [
         (TURBO_SAMPLE_SIGMAS.to_vec(), 8u32),
@@ -389,6 +402,9 @@ fn an_unset_step_count_is_the_length_of_the_snapshots_saved_list() {
         assert_eq!((images[0].width, images[0].height), (SIZE, SIZE));
         assert_eq!(images[0].pixels.len(), (SIZE * SIZE * 3) as usize);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo::an_unset_step_count_is_the_length_of_the_snapshots_saved_list");
 }
 
 /// **Eight steps denoise over exactly the snapshot's `sample_sigmas` plus 0.** The generator's
@@ -401,6 +417,7 @@ fn an_unset_step_count_is_the_length_of_the_snapshots_saved_list() {
 /// applying a `mu` shift or the terminal stretch to the saved list; reading a hardcoded list
 /// instead of the snapshot's (the second fixture below saves a different one).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn eight_steps_denoise_over_exactly_the_saved_sigmas_then_zero() {
     let turbo = turbo_snapshot();
     let root = turbo.path();
@@ -440,6 +457,9 @@ fn eight_steps_denoise_over_exactly_the_saved_sigmas_then_zero() {
         load_saved_sigma_schedule(root).unwrap().sample_sigmas,
         TURBO_SAMPLE_SIGMAS
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo::eight_steps_denoise_over_exactly_the_saved_sigmas_then_zero");
 }
 
 /// **Twelve steps denoise over the 12-point resample**, pinned to thirteen literals. The same
@@ -449,6 +469,7 @@ fn eight_steps_denoise_over_exactly_the_saved_sigmas_then_zero() {
 /// eight saved sigmas without the trailing-0 knot (`u_j = j/7`); falling back to the saved list
 /// for an off-count request.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn twelve_steps_denoise_over_the_pinned_resample() {
     assert_eq!(
         scheduler::resample_saved_sigmas(&TURBO_SAMPLE_SIGMAS, 12).unwrap(),
@@ -479,6 +500,11 @@ fn twelve_steps_denoise_over_the_pinned_resample() {
         pixels(generator.as_ref(), &request(Some(1))),
         render_over(root, &[1.0, 0.0])
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED turbo::twelve_steps_denoise_over_the_pinned_resample"
+    );
 }
 
 /// The curated `scheduler` axis on Turbo, at the render: a curated name replaces the saved list
@@ -490,6 +516,7 @@ fn twelve_steps_denoise_over_the_pinned_resample() {
 /// *Mutation that reds this:* passing the base `mu` for the request's resolution to
 /// `resolve_flow_schedule` on the Turbo id.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_curated_scheduler_name_replaces_the_saved_list_with_its_unshifted_ramp() {
     let turbo = turbo_snapshot();
     let root = turbo.path();
@@ -512,10 +539,14 @@ fn a_curated_scheduler_name_replaces_the_saved_list_with_its_unshifted_ramp() {
     sampler.sampler = Some("heun".to_owned());
     generator.validate(&sampler).unwrap();
     assert_ne!(pixels(generator.as_ref(), &sampler), literal);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo::a_curated_scheduler_name_replaces_the_saved_list_with_its_unshifted_ramp");
 }
 
 /// True CFG is off by default and still engages with a negative prompt and a scale above 1.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn true_cfg_is_off_by_default_and_still_accepted_on_turbo() {
     let turbo = turbo_snapshot();
     let generator = load(TURBO, turbo.path(), OffloadPolicy::Resident);
@@ -529,6 +560,9 @@ fn true_cfg_is_off_by_default_and_still_accepted_on_turbo() {
     );
     req.true_cfg = Some(2.5);
     assert_ne!(pixels(generator.as_ref(), &req), plain);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo::true_cfg_is_off_by_default_and_still_accepted_on_turbo");
 }
 
 /// Each snapshot under the other id is a typed refusal that names the mismatch — through `load`
@@ -741,6 +775,7 @@ fn memory_errors_name_the_requested_id() {
 /// (`DType::BF16` on the CPU lane fails the dtype assertion, and candle's CPU backend then has no
 /// bf16 conv to decode with).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_bf16_vae_loads_at_the_lane_compute_dtype_and_decodes() {
     let turbo = turbo_snapshot();
     let device = candle_gen::default_device().unwrap();
@@ -779,6 +814,9 @@ fn the_bf16_vae_loads_at_the_lane_compute_dtype_and_decodes() {
         .iter()
         .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
     assert!(hi - lo > 1e-2, "the decode is a picture, not a constant");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo::the_bf16_vae_loads_at_the_lane_compute_dtype_and_decodes");
 }
 
 /// E3 (sc-25909): a refusal raised by the family's shared code names the engine id it was reached

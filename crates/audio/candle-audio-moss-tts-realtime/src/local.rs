@@ -97,7 +97,7 @@ impl LocalTransformer {
         for layer in &self.layers {
             h = layer.forward(&h, &cos, &sin, mask.as_ref())?;
         }
-        let h = self.norm.forward(&h)?;
+        let h = __model_proof_output!(self.norm.forward(&h))?;
         h.i((.., depth - 1..depth, ..))?.reshape((1, h.dim(2)?))
     }
 

@@ -677,8 +677,8 @@ pub fn read_pth_tensor_info<P: AsRef<std::path::Path>>(
     let mut zip = zip::ZipArchive::new(zip_reader)?;
     let zip_file_names = zip
         .file_names()
-        .map(|f| f.map(|f| f.to_string()))
-        .collect::<std::result::Result<Vec<String>, _>>()?;
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut tensor_infos = vec![];
     for file_name in zip_file_names.iter() {
@@ -796,18 +796,24 @@ impl PthTensors {
             &mut reader,
         )?;
 
-        if rank > 1 && is_fortran_contiguous {
-            // Reverse the shape, e.g. Shape(2, 3, 4) -> Shape(4, 3, 2)
-            let shape_reversed: Vec<_> = tensor_info.layout.dims().iter().rev().cloned().collect();
-            let tensor = tensor.reshape(shape_reversed)?;
+        crate::__model_input_result!(
+            if rank > 1 && is_fortran_contiguous {
+                // Reverse the shape, e.g. Shape(2, 3, 4) -> Shape(4, 3, 2)
+                let shape_reversed: Vec<_> =
+                    tensor_info.layout.dims().iter().rev().cloned().collect();
+                let tensor = tensor.reshape(shape_reversed)?;
 
-            // Permute (transpose) the dimensions, e.g. Shape(4, 3, 2) -> Shape(2, 3, 4)
-            let dim_indices_reversed: Vec<_> = (0..rank).rev().collect();
-            let tensor = tensor.permute(dim_indices_reversed)?;
-            Ok(Some(tensor))
-        } else {
-            Ok(Some(tensor))
-        }
+                // Permute (transpose) the dimensions, e.g. Shape(4, 3, 2) -> Shape(2, 3, 4)
+                let dim_indices_reversed: Vec<_> = (0..rank).rev().collect();
+                let tensor = tensor.permute(dim_indices_reversed)?;
+                Ok(Some(tensor))
+            } else {
+                Ok(Some(tensor))
+            },
+            "candle-core::PthTensors::get",
+            TensorInput,
+            &[&self.path]
+        )
     }
 }
 
@@ -829,7 +835,12 @@ pub fn read_all_with_key<P: AsRef<std::path::Path>>(
             tensors.push((name.to_string(), tensor))
         }
     }
-    Ok(tensors)
+    crate::__model_input_result!(
+        Ok(tensors),
+        "candle-core::pickle::read_all_with_key",
+        TensorInput,
+        &[&pth.path]
+    )
 }
 
 /// Read all the tensors from a PyTorch pth file.

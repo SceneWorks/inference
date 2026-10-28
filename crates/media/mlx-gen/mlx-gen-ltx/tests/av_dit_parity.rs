@@ -159,10 +159,16 @@ fn run(bf16: bool, golden: &str) {
 #[ignore = "needs ltx_2_3_base_q8 transformer.safetensors (~20 GB)"]
 fn av_dit_velocity_matches_reference() {
     run(false, GOLDEN);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED av_dit_parity::av_dit_velocity_matches_reference");
 }
 
 #[test]
 #[ignore = "needs ltx_2_3_base_q8 transformer.safetensors (~20 GB)"]
 fn av_dit_velocity_matches_reference_bf16() {
     run(true, GOLDEN_BF16);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED av_dit_parity::av_dit_velocity_matches_reference_bf16"
+    );
 }

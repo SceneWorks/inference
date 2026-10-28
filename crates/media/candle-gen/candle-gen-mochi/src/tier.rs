@@ -113,12 +113,17 @@ impl MochiTierPaths {
             .map_err(|e| CandleError::Msg(format!("mochi tier: read {}: {e}", p.display())))?;
         let json: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| CandleError::Msg(format!("mochi tier: parse {}: {e}", p.display())))?;
-        Ok(Some(PackedConfig::from_config(&json).ok_or_else(|| {
-            CandleError::Msg(format!(
-                "mochi tier: {} has no `quantization.bits` — not a packed tier config",
-                p.display()
-            ))
-        })?))
+        candle_gen::gen_core::__model_input_result!(
+            Ok(Some(PackedConfig::from_config(&json).ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "mochi tier: {} has no `quantization.bits` — not a packed tier config",
+                    p.display()
+                ))
+            })?)),
+            "candle-gen-mochi::tier::MochiTierPaths::packed_config/configuration",
+            Configuration,
+            &[&p]
+        )
     }
 
     /// The tier's declared quantization bit-width (`Some(4)` q4 / `Some(8)` q8; `None` for the dense

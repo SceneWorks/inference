@@ -55,8 +55,17 @@ def validate_generic_ci_context(event_name, payload, environment, expected_repos
                         "workflow-dispatch checkout ref must be a full branch or tag ref")
         feature_epic_policy.validate_event(
             event_name, payload, repository=expected_repository, active_sha=checkout)
-        current.require(payload.get("ref") == ref.removeprefix("refs/heads/").removeprefix(
-            "refs/tags/"), "workflow-dispatch event ref differs from checkout ref")
+        # The real workflow_dispatch payload carries the FULL dispatch ref
+        # (`refs/heads/<branch>`), which is also what GITHUB_REF holds. Older fixtures in this
+        # file use the short form (`main`), so normalize that form to a full ref before the
+        # equality check instead of comparing against the stripped GITHUB_REF.
+        payload_ref = payload.get("ref", "")
+        if payload_ref and not payload_ref.startswith(("refs/heads/", "refs/tags/")):
+            payload_ref = (
+                "refs/tags/" if ref.startswith("refs/tags/") else "refs/heads/"
+            ) + payload_ref
+        current.require(payload_ref == ref,
+                        "workflow-dispatch event ref differs from checkout ref")
     else:
         raise ValueError(f"unsupported source-closure test event {event_name!r}")
 
@@ -283,6 +292,10 @@ class CurrentFailedAdapterTests(unittest.TestCase):
              {"GITHUB_REPOSITORY": repository, "GITHUB_SHA": sha,
               "GITHUB_REF": "refs/heads/main"}),
         ]
+        for full_ref in ("refs/heads/story/sc-26588-moss-recovery", "refs/tags/runtime-1.2.3"):
+            for payload_ref in (full_ref, full_ref.removeprefix("refs/heads/").removeprefix("refs/tags/")):
+                cases.append(("workflow_dispatch", {"repository": {"full_name": repository}, "ref": payload_ref},
+                              {"GITHUB_REPOSITORY": repository, "GITHUB_SHA": sha, "GITHUB_REF": full_ref}))
         for event_name, payload, environment in cases:
             validate_generic_ci_context(event_name, payload, environment, repository, sha)
             for key, value in (("GITHUB_REPOSITORY", "foreign/inference"),
@@ -297,6 +310,10 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             mutant = dict(environment); mutant["GITHUB_REF"] = bad_ref
             with self.assertRaises(ValueError):
                 validate_generic_ci_context(event_name, payload, mutant, repository, sha)
+        for bad_ref in (None, "", "other", "refs/heads/other", "refs/tags/main", "refs/heads/main/extra"):
+            payload = {"repository": {"full_name": repository}, "ref": bad_ref}
+            with self.subTest(payload_ref=bad_ref), self.assertRaisesRegex(ValueError, "event ref"):
+                validate_generic_ci_context("workflow_dispatch", payload, cases[3][2], repository, sha)
         with self.assertRaises(ValueError):
             validate_generic_ci_context("schedule", {}, cases[0][2], repository, sha)
 

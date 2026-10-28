@@ -65,6 +65,8 @@ fn vocoder_waveform_matches_reference() {
     // deterministic; small f32 round-off only.
     assert!(pr < 1e-3, "vocoder waveform peak_rel {pr:.3e} too high");
     assert!(mr < 1e-3, "vocoder waveform mean_rel {mr:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vocoder_parity::vocoder_waveform_matches_reference");
 }
 
 #[test]
@@ -113,4 +115,6 @@ fn vocoder_stage_bisection() {
             got.shape()
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vocoder_parity::vocoder_stage_bisection");
 }

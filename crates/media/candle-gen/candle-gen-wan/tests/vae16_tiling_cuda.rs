@@ -96,6 +96,8 @@ fn psnr_and_maxdiff(a: &Tensor, b: &Tensor) -> (f64, f32) {
 fn wan_z16_bf16_vs_f32_decode_parity() {
     let Some((vae_f32, dev)) = load_vae_dtype(DType::F32) else {
         eprintln!("WAN_VAE16_SNAPSHOT unset — skipping");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-wan/tests/vae16_tiling_cuda.rs:99 (wan_z16_bf16_vs_f32_decode_parity): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let (vae_bf16, _) = load_vae_dtype(DType::BF16).unwrap();
@@ -128,6 +130,11 @@ fn wan_z16_bf16_vs_f32_decode_parity() {
         "bf16 VAE decode degrades vs f32 below the seam-free tolerance: PSNR={psnr:.2} dB (need >35) \
          — bf16 VAE would not be viable and a different VRAM lever would be required"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED vae16_tiling_cuda::wan_z16_bf16_vs_f32_decode_parity"
+    );
 }
 
 #[test]
@@ -135,6 +142,8 @@ fn wan_z16_bf16_vs_f32_decode_parity() {
 fn wan_z16_spatial_tiling_decode() {
     let Some((vae, dev)) = load_vae() else {
         eprintln!("WAN_VAE16_SNAPSHOT unset — skipping");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-wan/tests/vae16_tiling_cuda.rs:138 (wan_z16_spatial_tiling_decode): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
 
@@ -198,6 +207,9 @@ fn wan_z16_spatial_tiling_decode() {
         psnr_small > 30.0,
         "tiny-budget tiled decode must stay seam-free: PSNR={psnr_small:.2} dB"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae16_tiling_cuda::wan_z16_spatial_tiling_decode");
 }
 
 /// Production-scale seam-free check (sc-12758 AC): decode the **real A14B T2V render geometry**
@@ -223,6 +235,8 @@ fn wan_z16_spatial_tiling_decode() {
 fn wan_z16_render_scale_seamfree_parity() {
     let Some((vae, dev)) = load_vae() else {
         eprintln!("WAN_VAE16_SNAPSHOT unset — skipping");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-wan/tests/vae16_tiling_cuda.rs:226 (wan_z16_render_scale_seamfree_parity): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     // 1280×720 / 81 output frames ⇒ latent [1,16,21,90,160] (×8 spatial, ×4 causal temporal).
@@ -274,5 +288,10 @@ fn wan_z16_render_scale_seamfree_parity() {
         psnr_u_ref > 48.0,
         "untiled hi-res decode must be uncorrupted (sc-12773): vs trusted ref256 PSNR={psnr_u_ref:.2} dB \
          (corrupt was ~15.6 dB) — the VAE conv2d im2col chunking regressed"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED vae16_tiling_cuda::wan_z16_render_scale_seamfree_parity"
     );
 }

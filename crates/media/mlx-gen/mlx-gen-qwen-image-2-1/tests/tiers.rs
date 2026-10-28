@@ -667,6 +667,7 @@ fn packed_codes_equal_the_canonical_quantize() {
 /// A converted tier loads through the production catalog path with its matching `quantize` selector
 /// and renders. The quantization error against the dense render is reported and bounded, and the Q4
 /// tier is never *closer* to bf16 than the Q8 tier is.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn packed_tiers_reload_and_render_within_the_declared_bars() {
     let tmp = tempfile::tempdir().unwrap();
@@ -704,6 +705,8 @@ fn packed_tiers_reload_and_render_within_the_declared_bars() {
         mean_by_tier[1],
         mean_by_tier[0]
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiers::packed_tiers_reload_and_render_within_the_declared_bars");
 }
 
 /// The descriptor tells the truth about what is installable, and a request that disagrees with the
@@ -857,6 +860,7 @@ fn derived_parameter_counts_match_the_frozen_snapshot() {
 /// Staged residency is an execution decision, not a numeric one: dropping the tower between
 /// conditioning and denoise must reproduce the resident render **exactly**, on a packed tier as
 /// well as a dense one.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn staged_residency_preserves_the_resident_output_at_every_tier() {
     let tmp = tempfile::tempdir().unwrap();
@@ -880,6 +884,8 @@ fn staged_residency_preserves_the_resident_output_at_every_tier() {
             "{label}: staged residency must be byte-identical to the resident render"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiers::staged_residency_preserves_the_resident_output_at_every_tier");
 }
 
 // ── the shared seam on the LOADED generator ─────────────────────────────────────────────────────
@@ -956,6 +962,7 @@ fn loads_renderer(events: &[mlx_gen::gen_core::Progress]) -> bool {
 /// removing the `begin_memory_strategy_request` override (the default refuses to open a scope for
 /// an implemented optimized rung); reverting `generate_impl` from `run_request_scoped(stage, …)`
 /// to `run(…)` (the staged request then renders warm and emits no `Loading` event).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_staged_selection_through_the_generator_trait_stages_and_preserves_the_resident_output() {
     use mlx_gen::gen_core::{
@@ -1047,6 +1054,8 @@ fn a_staged_selection_through_the_generator_trait_stages_and_preserves_the_resid
         assert_eq!(again.pixels, resident.pixels, "{label}");
         assert!(!loads_renderer(&again_events), "{label}: {again_events:?}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiers::a_staged_selection_through_the_generator_trait_stages_and_preserves_the_resident_output");
 }
 
 /// **Bounded decode through the trait** (sc-24114): a `BoundedDecode` selection inside the
@@ -1059,6 +1068,7 @@ fn a_staged_selection_through_the_generator_trait_stages_and_preserves_the_resid
 ///
 /// *Mutation that reds this:* removing the `begin_memory_strategy_request` override, or the
 /// scope no longer writing `GenerationMemory::tile_vae_decode` (the tiling assertions fail).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_bounded_decode_selection_through_the_generator_trait_tiles_the_decode() {
     use mlx_gen::gen_core::{MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy};
@@ -1115,6 +1125,8 @@ fn a_bounded_decode_selection_through_the_generator_trait_tiles_the_decode() {
         24.0,
         2.0,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiers::a_bounded_decode_selection_through_the_generator_trait_tiles_the_decode");
 }
 
 /// A selection **outside** the published decode domain is refused at the trait's safety check —
@@ -1146,6 +1158,7 @@ fn an_unpublished_decode_geometry_is_refused_through_the_generator_trait() {
 
 /// Bounded (tiled) decode is a memory lever, not a quality one: the head-once/tail-tiled decode
 /// must reproduce the untiled decode to within seam-blend noise, at every tier.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn bounded_decode_preserves_the_untiled_output_at_every_tier() {
     use mlx_gen::gen_core::GenerationMemory;
@@ -1181,4 +1194,6 @@ fn bounded_decode_preserves_the_untiled_output_at_every_tier() {
             2.0,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiers::bounded_decode_preserves_the_untiled_output_at_every_tier");
 }

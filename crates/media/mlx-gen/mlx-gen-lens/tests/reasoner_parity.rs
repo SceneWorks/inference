@@ -131,6 +131,8 @@ fn lens_reasoner_matches_reference() {
         got_new.len()
     );
     eprintln!("ALL PASS");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED reasoner_parity::lens_reasoner_matches_reference");
 }
 
 /// Sampled decode (sc-9561 / F-105) is **seed-reproducible**: two `generate_sampled` runs with the
@@ -165,4 +167,6 @@ fn sampled_decode_is_seed_reproducible() {
         .expect("sampled c");
     assert_ne!(a, c, "a different seed should (overwhelmingly) diverge");
     eprintln!("sampled decode seed-reproducible ✓ ({} tokens)", a.len());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED reasoner_parity::sampled_decode_is_seed_reproducible");
 }

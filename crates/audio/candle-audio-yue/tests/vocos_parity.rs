@@ -19,6 +19,16 @@
 //!   cargo test --locked -p candle-audio-yue --test vocos_parity -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -173,4 +183,7 @@ fn vocos_decoders_and_the_post_processed_mix_match_the_reference() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vocos_decoders_and_the_post_processed_mix_match_the_reference");
 }

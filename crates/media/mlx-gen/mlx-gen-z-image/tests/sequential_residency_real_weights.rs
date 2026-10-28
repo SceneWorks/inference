@@ -523,7 +523,7 @@ fn persist_evidence_outputs(
 }
 
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot (ZIMAGE_SNAPSHOT or the HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot (ZIMAGE_SNAPSHOT or the HF cache)"]
 fn sequential_bounds_peak_within_declared_decode_drift() {
     let req = probe_request();
     let (pixels_resident, peak_resident, mut resident_record) =
@@ -604,6 +604,9 @@ fn sequential_bounds_peak_within_declared_decode_drift() {
         staged_path.display(),
         isolator_path.display()
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::sequential_bounds_peak_within_declared_decode_drift");
 }
 
 /// The multi-seed resample behind [`DECODE_TILING_MEAN_ABS_U8`] (sc-18149): per seed, render the
@@ -612,7 +615,7 @@ fn sequential_bounds_peak_within_declared_decode_drift() {
 /// the declared mean ceiling and its p99 companion. Statistics print per seed so the ceiling can
 /// be re-derived from a run log; PPMs (legs + 8x diff) land in `ZIMAGE_AB_RENDER_OUT` when set.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot (ZIMAGE_SNAPSHOT or the HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot (ZIMAGE_SNAPSHOT or the HF cache)"]
 fn staged_drift_is_attributed_to_the_tiled_decode_across_seeds() {
     const SEEDS: [u64; 3] = [1234, 7, 8_675_309];
     for seed in SEEDS {
@@ -692,6 +695,9 @@ fn staged_drift_is_attributed_to_the_tiled_decode_across_seeds() {
              {DECODE_TILING_P99_ABS_U8}",
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::staged_drift_is_attributed_to_the_tiled_decode_across_seeds");
 }
 
 /// A weights-free record over `pixels` for the parity-helper mutation checks below. Everything the
@@ -897,7 +903,7 @@ fn staging_exactness_check_reddens_when_an_output_is_truncated() {
 }
 
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot (ZIMAGE_SNAPSHOT or the HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot (ZIMAGE_SNAPSHOT or the HF cache)"]
 fn sequential_repeat_job_stays_bounded() {
     let req = probe_request();
     let (_p1, peak1, _e1) = render_measured(OffloadPolicy::Sequential, &req);
@@ -914,10 +920,13 @@ fn sequential_repeat_job_stays_bounded() {
         peak2 as f64 / GIB,
         peak1 as f64 / GIB,
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::sequential_repeat_job_stays_bounded");
 }
 
 #[test]
-#[ignore = "needs a real base Z-Image snapshot (set ZIMAGE_BASE_SNAPSHOT)"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real base Z-Image snapshot (set ZIMAGE_BASE_SNAPSHOT)"]
 fn base_z_image_sequential_bounds_peak_within_declared_decode_drift() {
     // F-172 (sc-11124): the base `z_image` sibling now honors `offload_policy` via the SAME shared
     // `mlx_gen::Residency` seam as the Turbo flagship — before the fix it ignored the policy and always
@@ -990,4 +999,7 @@ fn base_z_image_sequential_bounds_peak_within_declared_decode_drift() {
         staged_path.display(),
         isolator_path.display()
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::base_z_image_sequential_bounds_peak_within_declared_decode_drift");
 }

@@ -158,24 +158,29 @@ impl MochiVaeConfig {
                 .unwrap_or_else(|| dflt.to_vec())
         };
 
-        Ok(Self {
-            latent_channels: usize_at("latent_channels", d.latent_channels),
-            out_channels: usize_at("out_channels", d.out_channels),
-            decoder_block_out_channels: usize_vec(
-                "decoder_block_out_channels",
-                &d.decoder_block_out_channels,
-            ),
-            layers_per_block: usize_vec("layers_per_block", &d.layers_per_block),
-            temporal_expansions: usize_vec("temporal_expansions", &d.temporal_expansions),
-            spatial_expansions: usize_vec("spatial_expansions", &d.spatial_expansions),
-            latents_mean: f32_vec("latents_mean", &d.latents_mean),
-            latents_std: f32_vec("latents_std", &d.latents_std),
-            scaling_factor: json
-                .get("scaling_factor")
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
-                .unwrap_or(d.scaling_factor),
-        })
+        candle_gen::gen_core::__model_input_result!(
+            Ok(Self {
+                latent_channels: usize_at("latent_channels", d.latent_channels),
+                out_channels: usize_at("out_channels", d.out_channels),
+                decoder_block_out_channels: usize_vec(
+                    "decoder_block_out_channels",
+                    &d.decoder_block_out_channels,
+                ),
+                layers_per_block: usize_vec("layers_per_block", &d.layers_per_block),
+                temporal_expansions: usize_vec("temporal_expansions", &d.temporal_expansions),
+                spatial_expansions: usize_vec("spatial_expansions", &d.spatial_expansions),
+                latents_mean: f32_vec("latents_mean", &d.latents_mean),
+                latents_std: f32_vec("latents_std", &d.latents_std),
+                scaling_factor: json
+                    .get("scaling_factor")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+                    .unwrap_or(d.scaling_factor),
+            }),
+            "candle-gen-mochi::config::MochiVaeConfig::from_model_dir/configuration",
+            Configuration,
+            &[&path]
+        )
     }
 
     /// `∏ temporal_expansions` — the temporal compression ratio (6). Also the count of leading

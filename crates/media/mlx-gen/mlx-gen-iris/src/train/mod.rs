@@ -2319,8 +2319,14 @@ fn save_params(path: &Path, params: &Params) -> Result<()> {
 }
 
 fn load_tensors(path: &Path) -> Result<HashMap<String, Array>> {
-    Array::load_safetensors(path)
-        .map_err(|e| Error::Msg(format!("iris checkpoint: read {}: {e}", path.display())))
+    mlx_gen::gen_core::__model_input_reader!(
+Array::load_safetensors(path),
+"crates/media/mlx-gen/mlx-gen-iris/src/train/mod.rs::load_tensors::Array::load_safetensors@92816",
+TensorInput,
+path,
+|__model_input_path| Array::load_safetensors(__model_input_path)
+)
+    .map_err(|e| Error::Msg(format!("iris checkpoint: read {}: {e}", path.display())))
 }
 
 /// One preview image: the release sampler (FlowDPM-Solver++ order 2, the run's resolved shift,

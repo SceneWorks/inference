@@ -947,6 +947,7 @@ mod engine_tests {
     /// attention — bit for bit what the same model with device positions off computes from the
     /// same restored state — never the decode step's length-aware attention. Both families.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_restored_suffix_prefill_attends_as_a_cold_prefill() {
         fn restored_logits<M>(model: &M, pc: &mut PrefixCache, prompt: &[i32]) -> Vec<f32>
         where
@@ -1002,11 +1003,15 @@ mod engine_tests {
             restored_logits(&off, &mut pc, &p),
             "hybrid"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_restored_suffix_prefill_attends_as_a_cold_prefill");
     }
 
     /// sc-24441 × sc-24437 on the CPU: a prefix hit with device positions on (decode steps
     /// through the reference decode attention) matches a cold run, both families.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn restored_prefills_on_device_positions_match_a_cold_run() {
         let mut causal = tiny_llama();
         causal.set_device_positions(true);
@@ -1014,6 +1019,9 @@ mod engine_tests {
         let (_, mut hybrid) = text_model();
         hybrid.set_device_positions(true);
         hybrid_hit_matches_cold(&hybrid, Some(1e-4), "hybrid f32 cpu");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::restored_prefills_on_device_positions_match_a_cold_run");
     }
 
     /// sc-24441 × sc-24437 on CUDA (the `windows-cuda` lane): with the CUDA default (device
@@ -1021,10 +1029,13 @@ mod engine_tests {
     /// and the production bf16.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn restored_prefills_match_a_cold_run_on_cuda() {
         let device = crate::device::select_device().unwrap();
         if !device.is_cuda() {
             eprintln!("skipping: no CUDA device");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/decode/prefix.rs:1026 (restored_prefills_match_a_cold_run_on_cuda): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         }
         // Prefill logits within 1e-3 in f32 (a different but equally rounded order); in bf16 the
@@ -1038,12 +1049,16 @@ mod engine_tests {
             let (_, hybrid) = crate::models::qwen35::tests::text_model_dtype_on(&device, dtype);
             hybrid_hit_matches_cold(&hybrid, tol, &format!("hybrid {dtype:?} cuda"));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::restored_prefills_match_a_cold_run_on_cuda");
     }
 
     /// AC1 on the softmax family (the static step cache): turn 2 extends turn 1's
     /// `prompt + reply`; it restores the whole shared run, prefills only the rest, and matches a
     /// cold run token for token.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_causal_second_turn_prefills_only_the_new_tokens() {
         let model = tiny_llama();
         let counted = Counted::new(&model);
@@ -1075,6 +1090,9 @@ mod engine_tests {
         let (gen2, reused2, _) = turn(&model, &mut NoProposer, &mut pc, &p2, None, 8);
         assert_eq!(reused2, expected);
         assert_eq!(gen2, cold(&model, &mut NoProposer, &p2, 8).0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_causal_second_turn_prefills_only_the_new_tokens");
     }
 
     /// sc-24446 (epic E1): on both decoder families, a prefix-cache hit on the boundary entry a
@@ -1083,6 +1101,7 @@ mod engine_tests {
     /// it, each continued by two different turns (ids below each fixture's vocabulary `v`). Sensitive to the boundary: a recurrent state
     /// captured one position off changes the hybrid's greedy stream here.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_hit_after_a_single_forward_miss_decodes_the_plain_run() {
         fn check<M>(model: &M, family: &str, v: i32)
         where
@@ -1118,12 +1137,16 @@ mod engine_tests {
         }
         check(&tiny_llama(), "causal", 24);
         check(&text_model().1, "hybrid", 50);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_hit_after_a_single_forward_miss_decodes_the_plain_run");
     }
 
     /// AC2: the hybrid restores the recurrent state snapshotted at the boundary (through the
     /// checkpoint ring), prefills only past it, and matches a cold run; a third turn restores the
     /// same entry after the second decoded past it (the entry is an immutable copy).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_qwen35_second_turn_restores_the_recurrent_state_at_the_boundary() {
         let (_, model) = text_model();
         let counted = Counted::new(&model);
@@ -1170,11 +1193,15 @@ mod engine_tests {
             .unwrap()
             .is_none());
         assert_eq!(cache.offset(), 0, "a miss leaves the cache untouched");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_qwen35_second_turn_restores_the_recurrent_state_at_the_boundary");
     }
 
     /// A softmax entry holds exactly the positions it is charged for: a copy of the static step
     /// cache's first `len` positions, not the whole preallocated buffer behind them.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_softmax_entry_pins_only_the_positions_it_is_charged_for() {
         use crate::primitives::decode_cache::pinned_f32_elems;
         let model = tiny_llama();
@@ -1197,6 +1224,9 @@ mod engine_tests {
         }
         assert!(charged > 0);
         assert_eq!(entry.bytes(), charged as u64);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_softmax_entry_pins_only_the_positions_it_is_charged_for");
     }
 
     /// The boundary snapshot is a copy, not a view: the live cache it was taken from goes on to
@@ -1204,6 +1234,7 @@ mod engine_tests {
     /// whose slots are written in place), and a restore of the snapshot answers exactly as it
     /// did before that decode.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_boundary_snapshot_is_not_written_by_the_decode_that_continues_past_it() {
         use candle_core::DType;
         let (_, model) = text_model();
@@ -1255,11 +1286,15 @@ mod engine_tests {
         )
         .unwrap();
         assert_eq!(probe(&boundary.entry), before);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_boundary_snapshot_is_not_written_by_the_decode_that_continues_past_it");
     }
 
     /// Speculative decoding on top of a hit: the MTP head resumes its warm-up from the state
     /// stored at the boundary; its drafts and the greedy tokens equal a cold MTP run's.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn mtp_resumes_its_warm_up_from_the_stored_boundary() {
         let (_, model, head) = text_model_with_mtp();
         let mut pc = PrefixCache::with_budget(1 << 30);
@@ -1325,11 +1360,15 @@ mod engine_tests {
             (stats2.proposed, stats2.accepted),
             (cold_stats.proposed, cold_stats.accepted)
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::mtp_resumes_its_warm_up_from_the_stored_boundary");
     }
 
     /// The head's state resumed at a boundary is the cold warm-up's: its cache after a resumed
     /// warm-up equals the one a whole-prompt warm-up builds.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_resumed_mtp_warm_up_matches_the_cold_warm_up() {
         let (_, model, head) = text_model_with_mtp();
         let prompt = [3, 9, 4, 11, 3, 9, 4, 11, 20, 21];
@@ -1363,11 +1402,15 @@ mod engine_tests {
         assert_eq!(a.len(), b.len());
         assert!(diff(&a, &b) < 1e-4, "resumed head diverged");
         assert!(diff(&c, &b) < 1e-4, "split warm-up diverged");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_resumed_mtp_warm_up_matches_the_cold_warm_up");
     }
 
     /// A cancel landing mid-prefill stops before the next forward, returns the typed cancel and
     /// snapshots nothing; the next request prefills cold and decodes correctly.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_cancel_mid_prefill_stores_nothing() {
         let (_, model) = text_model();
         let cancel = CancelFlag::new();
@@ -1390,11 +1433,15 @@ mod engine_tests {
         assert_eq!(reused, 0);
         assert_eq!(tokens, cold(&model, &mut NoProposer, &prompt, 4).0);
         assert_eq!(pc.len(), 1);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_cancel_mid_prefill_stores_nothing");
     }
 
     /// sc-24446: a prefill whose forward fails part-way drops the boundary capture its linear
     /// layers never consumed, so a later prefill on the same cache captures nothing there.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_failed_prefill_leaves_no_stale_boundary_capture() {
         let (_, model) = text_model();
         let prompt: Vec<i32> = (0..12).map(|i| (i * 7 % 49) + 1).collect();
@@ -1411,11 +1458,15 @@ mod engine_tests {
             cache.prefix_snapshot_at(8).is_err(),
             "a stale boundary was captured by a later prefill"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_failed_prefill_leaves_no_stale_boundary_capture");
     }
 
     /// sc-24446: a boundary the forward does not capture costs the prefix-cache entry, never the
     /// request: the prefill returns its output with no boundary snapshot.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn an_uncaptured_boundary_skips_the_snapshot_not_the_request() {
         let (_, model) = text_model();
         let prompt: Vec<i32> = (0..12).map(|i| (i * 7 % 49) + 1).collect();
@@ -1435,6 +1486,9 @@ mod engine_tests {
         assert!(pre.boundary.is_none());
         assert_eq!(pre.fed_tokens, prompt.len());
         assert_eq!(cache.positions(), prompt.len());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::an_uncaptured_boundary_skips_the_snapshot_not_the_request");
     }
 
     /// sc-24446 (defect B): a miss with a boundary inside the prompt prefills in **one** forward
@@ -1443,6 +1497,7 @@ mod engine_tests {
     /// restoring it decodes the same greedy tokens as a hit on the split prefill's snapshot.
     /// A conversation shorter than one Gated DeltaNet chunk and one long enough to run chunkwise.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_boundary_miss_prefills_in_one_forward_and_stores_the_split_prefills_state() {
         let (_, model) = text_model();
         for conv_len in [8usize, 100] {
@@ -1541,11 +1596,15 @@ mod engine_tests {
             }
             assert_eq!(runs[0], runs[1], "{conv_len}: decode after the hit");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_boundary_miss_prefills_in_one_forward_and_stores_the_split_prefills_state");
     }
 
     /// AC3 on real entries: past the budget the least-recently-used entry is evicted, and resident
     /// bytes never exceed the budget.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn real_entries_are_evicted_least_recently_used_within_the_budget() {
         let model = tiny_llama();
         let prompts = [vec![3, 9, 4, 11], vec![5, 6, 7, 8], vec![12, 13, 14, 15]];
@@ -1568,5 +1627,8 @@ mod engine_tests {
             keys.iter().all(|k| !k.starts_with(&prompts[1])),
             "the least-recently-used entry went: {keys:?}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::real_entries_are_evicted_least_recently_used_within_the_budget");
     }
 }

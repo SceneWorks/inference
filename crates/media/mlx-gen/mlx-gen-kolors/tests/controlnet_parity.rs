@@ -98,6 +98,8 @@ fn kolors_controlnet_forward_matches_diffusers() {
         "ControlNet residual peak_rel {worst:.3e} exceeds 1.2e-2 (wiring/projection bug)"
     );
     println!("✓ Kolors ControlNet forward matches diffusers (9 down + mid residuals, scale 1.0)");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED controlnet_parity::kolors_controlnet_forward_matches_diffusers");
 }
 
 #[test]
@@ -212,4 +214,6 @@ fn kolors_controlnet_scale0_is_base() {
         "degenerate ControlNet render"
     );
     println!("✓ Kolors ControlNet (scale>0) perturbs the output and renders coherently");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED controlnet_parity::kolors_controlnet_scale0_is_base");
 }

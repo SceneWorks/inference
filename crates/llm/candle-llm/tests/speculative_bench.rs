@@ -19,6 +19,15 @@
 //!   speculative_bench_writes_the_baseline_document --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use core_llm::{LoadSpec, TextLlm};
 
 #[path = "../../../contracts/core-llm/core-llm-testkit/baseline/speculative_bench_baseline.rs"]
@@ -50,11 +59,15 @@ fn speculative_bench_writes_the_baseline_document() {
         core_llm_testkit::run_speculative_bench_from_env("candle", &load, &switches)
             .unwrap_or_else(|e| panic!("{e}"));
     println!("wrote {} ({} rows)", output.display(), doc.rows.len());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED speculative_bench_writes_the_baseline_document");
 }
 
 /// The harness end to end on the shared fixture: every schema field over two repeats with the
 /// prefix cache off by default, and a warm-up that never lends the measured prompt to its row.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_bench_runs_on_the_fixture_with_isolated_warmups() {
     let root = tempfile::tempdir().unwrap();
     core_llm_testkit::check_speculative_bench_on_fixture(
@@ -64,6 +77,11 @@ fn the_bench_runs_on_the_fixture_with_isolated_warmups() {
         &switches,
     )
     .unwrap_or_else(|e| panic!("{e}"));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED the_bench_runs_on_the_fixture_with_isolated_warmups"
+    );
 }
 
 /// The entry point records every Candle switch — the CUDA stream only in a `cuda` build, where it

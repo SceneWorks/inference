@@ -20,7 +20,7 @@ use mlx_rs::{Array, Dtype};
 
 #[cfg(feature = "training")]
 use mlx_gen::adapters::Adapter;
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, LinearFacts};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, LinearFacts};
 use mlx_gen::nn::{gelu_exact, modulate, silu, timestep_sincos};
 use mlx_gen::qkv::{
     self, AttnPrepSpec, FusedQkvProjection, QkNormSpec, QkvPart, QkvSource, RopeSpec, RopeStyle,
@@ -203,11 +203,20 @@ pub(crate) enum Qkv {
     /// Self-attention — all three read one activation, so they are packed.
     SelfFused(FusedQkvProjection),
     /// Cross-attention — `q` reads the query stream, `k`/`v` the encoder stream. Never packed.
-    Cross {
-        q: AdaptableLinear,
-        k: AdaptableLinear,
-        v: AdaptableLinear,
-    },
+    ///
+    /// Boxed: three [`AdaptableLinear`]s inline make this variant 360 bytes against the packed
+    /// arm's 152, and the enum is stored once per attention block (a `Qkv` is a construction-time
+    /// fact, never a per-call one), so the extra indirection costs one allocation at load and keeps
+    /// every `Qkv` move small.
+    Cross(Box<CrossQkv>),
+}
+
+/// The three independent projections of a cross-attention (the payload of [`Qkv::Cross`]).
+#[derive(Clone)]
+pub(crate) struct CrossQkv {
+    pub(crate) q: AdaptableLinear,
+    pub(crate) k: AdaptableLinear,
+    pub(crate) v: AdaptableLinear,
 }
 
 /// The projected q/k/v, owned so [`Projected::source`] can hand out a borrowing
@@ -232,7 +241,7 @@ impl Qkv {
     }
 
     pub(crate) fn cross_attn(q: AdaptableLinear, k: AdaptableLinear, v: AdaptableLinear) -> Self {
-        Qkv::Cross { q, k, v }
+        Qkv::Cross(Box::new(CrossQkv { q, k, v }))
     }
 
     /// `true` for a self-attention, i.e. the representation that assumes ONE input stream. The
@@ -246,10 +255,10 @@ impl Qkv {
     pub(crate) fn project(&self, q_src: &Array, kv_src: &Array) -> Result<Projected> {
         match self {
             Qkv::SelfFused(p) => Ok(Projected::Packed(p.forward_packed(q_src)?)),
-            Qkv::Cross { q, k, v } => Ok(Projected::Separate(
-                q.forward(q_src)?,
-                k.forward(kv_src)?,
-                v.forward(kv_src)?,
+            Qkv::Cross(c) => Ok(Projected::Separate(
+                c.q.forward(q_src)?,
+                c.k.forward(kv_src)?,
+                c.v.forward(kv_src)?,
             )),
         }
     }
@@ -258,10 +267,10 @@ impl Qkv {
     pub(crate) fn part_mut(&mut self, part: QkvPart) -> Option<&mut AdaptableLinear> {
         match self {
             Qkv::SelfFused(p) => p.part_mut(part).ok(),
-            Qkv::Cross { q, k, v } => Some(match part {
-                QkvPart::Q => q,
-                QkvPart::K => k,
-                QkvPart::V => v,
+            Qkv::Cross(c) => Some(match part {
+                QkvPart::Q => &mut c.q,
+                QkvPart::K => &mut c.k,
+                QkvPart::V => &mut c.v,
             }),
         }
     }
@@ -270,10 +279,10 @@ impl Qkv {
     pub(crate) fn part_facts(&self, part: QkvPart) -> LinearFacts {
         match self {
             Qkv::SelfFused(p) => p.part_facts(part),
-            Qkv::Cross { q, k, v } => LinearFacts::of(match part {
-                QkvPart::Q => q,
-                QkvPart::K => k,
-                QkvPart::V => v,
+            Qkv::Cross(c) => LinearFacts::of(match part {
+                QkvPart::Q => &c.q,
+                QkvPart::K => &c.k,
+                QkvPart::V => &c.v,
             }),
         }
     }
@@ -716,8 +725,8 @@ impl CosmosDiT {
         &self.cfg
     }
 
-    /// The resident blocks (the CPU proofs run one block's quantum body directly).
-    #[cfg(test)]
+    /// The resident blocks (the CPU proofs run one block's quantum body directly; the iOS pricing
+    /// prices each block's quantum).
     pub(crate) fn blocks(&self) -> &[Block] {
         &self.blocks
     }
@@ -1015,7 +1024,7 @@ impl CosmosDiT {
         plan: mlx_gen::attention::AttentionPlan<'_>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let (hidden, (pe_t, pe_h, pe_w), embedded, temb) =
             self.run_blocks(latents, sigma, encoder, dtype, None, plan, window)?;
         // 6. output norm + projection + unpatchify, priced at its own counted body.
@@ -1084,10 +1093,16 @@ impl CosmosDiT {
     /// sampler-step allowance for the previous step's lazy CFG combine + sampler update over the
     /// incoming latent, which materializes here.
     pub(crate) fn embed_quantum_scratch(&self, latents: &Array, dtype: Dtype) -> u64 {
-        self.embed_body_bytes(latents.shape(), dtype_bytes(dtype))
-            .saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(
-                latents.size() as u64
-            ))
+        self.embed_quantum_scratch_for(latents.shape(), dtype)
+    }
+
+    /// [`Self::embed_quantum_scratch`] over a `latent_shape` latent.
+    pub(crate) fn embed_quantum_scratch_for(&self, latent_shape: &[i32], dtype: Dtype) -> u64 {
+        let elements = latent_shape
+            .iter()
+            .fold(1u64, |a, &d| a.saturating_mul(d.max(0) as u64));
+        self.embed_body_bytes(latent_shape, dtype_bytes(dtype))
+            .saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(elements))
     }
 
     /// The DiT output quantum ([`Self::output`]) over `[B, tokens, hidden]` at `element_bytes`:
@@ -1351,7 +1366,7 @@ impl CosmosDiT {
         dtype: Dtype,
         num_blocks: Option<usize>,
     ) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         Ok(self
             .run_blocks(
                 latents,
@@ -1454,6 +1469,62 @@ impl AdaptableHost for AdaLayerNorm {
     }
 }
 
+/// Pure names used by BOTH the real block host and configured-overlay header normalization.
+pub(crate) fn adapter_block_paths() -> Vec<String> {
+    let mut out = Vec::new();
+    for attention in ["self_attn", "cross_attn"] {
+        for projection in ["q_proj", "k_proj", "v_proj", "output_proj"] {
+            out.push(format!("{attention}.{projection}"));
+        }
+    }
+    for projection in ["layer1", "layer2"] {
+        out.push(format!("mlp.{projection}"));
+    }
+    for norm in ["self_attn", "cross_attn", "mlp"] {
+        for projection in [1, 2] {
+            out.push(format!("adaln_modulation_{norm}.{projection}"));
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+enum GlobalAdapterTarget {
+    Patch,
+    Time1,
+    Time2,
+    Norm1,
+    Norm2,
+    Output,
+}
+const GLOBAL_ADAPTER_TARGETS: [(&str, GlobalAdapterTarget); 6] = [
+    ("x_embedder.proj.1", GlobalAdapterTarget::Patch),
+    ("t_embedder.1.linear_1", GlobalAdapterTarget::Time1),
+    ("t_embedder.1.linear_2", GlobalAdapterTarget::Time2),
+    ("final_layer.adaln_modulation.1", GlobalAdapterTarget::Norm1),
+    ("final_layer.adaln_modulation.2", GlobalAdapterTarget::Norm2),
+    ("final_layer.linear", GlobalAdapterTarget::Output),
+];
+
+pub(crate) fn adapter_target_paths(blocks: usize, include_globals: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for index in 0..blocks {
+        out.extend(
+            adapter_block_paths()
+                .into_iter()
+                .map(|path| format!("blocks.{index}.{path}")),
+        );
+    }
+    if include_globals {
+        out.extend(
+            GLOBAL_ADAPTER_TARGETS
+                .iter()
+                .map(|(path, _)| (*path).to_owned()),
+        );
+    }
+    out
+}
+
 impl AdaptableHost for Block {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
@@ -1468,14 +1539,7 @@ impl AdaptableHost for Block {
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        out.extend(prefixed_paths("self_attn", &self.attn1));
-        out.extend(prefixed_paths("cross_attn", &self.attn2));
-        out.extend(prefixed_paths("mlp", &self.ff));
-        out.extend(prefixed_paths("adaln_modulation_self_attn", &self.norm1));
-        out.extend(prefixed_paths("adaln_modulation_cross_attn", &self.norm2));
-        out.extend(prefixed_paths("adaln_modulation_mlp", &self.norm3));
-        out
+        adapter_block_paths()
     }
 }
 
@@ -1486,26 +1550,29 @@ impl AdaptableHost for Block {
 /// reachable via the dotted diffusers/peft form, which is all the real files use).
 impl AdaptableHost for CosmosDiT {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
-        match path {
-            ["blocks", n, rest @ ..] => self
+        if let ["blocks", n, rest @ ..] = path {
+            return self
                 .blocks
                 .get_mut(n.parse::<usize>().ok()?)?
-                .adaptable_mut(rest),
-            ["x_embedder", "proj", "1"] => Some(&mut self.patch_embed),
-            ["t_embedder", "1", "linear_1"] => Some(&mut self.time_embed.linear_1),
-            ["t_embedder", "1", "linear_2"] => Some(&mut self.time_embed.linear_2),
-            ["final_layer", "adaln_modulation", rest @ ..] => self.norm_out.adaptable_mut(rest),
-            ["final_layer", "linear"] => Some(&mut self.proj_out),
-            _ => None,
+                .adaptable_mut(rest);
         }
+        let name = path.join(".");
+        let target = GLOBAL_ADAPTER_TARGETS
+            .iter()
+            .find(|(path, _)| *path == name)?
+            .1;
+        Some(match target {
+            GlobalAdapterTarget::Patch => &mut self.patch_embed,
+            GlobalAdapterTarget::Time1 => &mut self.time_embed.linear_1,
+            GlobalAdapterTarget::Time2 => &mut self.time_embed.linear_2,
+            GlobalAdapterTarget::Norm1 => &mut self.norm_out.linear_1,
+            GlobalAdapterTarget::Norm2 => &mut self.norm_out.linear_2,
+            GlobalAdapterTarget::Output => &mut self.proj_out,
+        })
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for (i, b) in self.blocks.iter().enumerate() {
-            out.extend(prefixed_paths(&format!("blocks.{i}"), b));
-        }
-        out
+        adapter_target_paths(self.blocks.len(), false)
     }
 }
 
@@ -1817,6 +1884,7 @@ mod bounded_attention_tests {
 
     /// The plan reaches BOTH DiT attentions, and it really chunks at each of them.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_attention_plan_reaches_both_dit_attentions_and_chunks() {
         let cfg = cfg();
         let model = CosmosDiT::synthetic(cfg, 11);
@@ -1865,12 +1933,16 @@ mod bounded_attention_tests {
                 "{label}: a tripped cancel must not affect the unbounded (default) forward"
             );
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::bounded_attention_tests::the_attention_plan_reaches_both_dit_attentions_and_chunks");
     }
 
     /// Bounded attention is a memory-shape choice, not a numeric one: a plan that chunks BOTH
     /// attentions must reproduce the unbounded velocity, and the default `forward` must be
     /// **exactly** the explicitly-unbounded one.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_chunked_forward_matches_the_unbounded_forward() {
         let cfg = cfg();
         let model = CosmosDiT::synthetic(cfg, 11);
@@ -1908,5 +1980,8 @@ mod bounded_attention_tests {
             )
             .unwrap();
         assert_eq!(peak_relative_delta(&unbounded, &explicit), 0.0);
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::bounded_attention_tests::the_chunked_forward_matches_the_unbounded_forward");
     }
 }

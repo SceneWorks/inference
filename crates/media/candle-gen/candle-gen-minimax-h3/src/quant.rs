@@ -67,6 +67,11 @@
 //! assuming this group size, so a second declaration that drifted would derive an illegal width
 //! from a perfectly good artifact instead of failing cleanly. That second declaration is also
 //! exactly what `scripts/check-workspace.py`'s cross-backend geometry gate exists to catch.
+//!
+//! Native W4A8 (`asym_w4a8_int8`) routes before ConvRot/affine detection. Its byte count is the
+//! original packed I8 + FP8 relative scales + F32 channel scales/codebook, never a dense shadow.
+//! The projection exposes its bounded per-forward device decode scratch separately through
+//! `W4A8Linear::weight_scratch_bytes`; that scratch is transient, not a frozen base allocation.
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::{DType, Tensor};
@@ -89,6 +94,17 @@ pub struct TieredLinear {
     /// Device bytes the frozen base holds (quantized weight + any dense bias, or the dense weight +
     /// bias).
     pub base_bytes: usize,
+}
+
+impl TieredLinear {
+    /// Additional peak device weight bytes for this projection while it is executing. W4A8
+    /// retains only packed operands; admission reserves one decode tile, not a full INT8 shadow.
+    /// CUDA decodes the bounded tile on device; there is no matching host scratch allocation.
+    pub fn transient_weight_bytes(&self) -> usize {
+        self.linear
+            .base_w4a8()
+            .map_or(0, candle_gen::quant::W4A8Linear::weight_scratch_bytes)
+    }
 }
 
 /// Bytes a dense tensor occupies on its device.
@@ -122,6 +138,20 @@ pub const TEXT_ENCODER: &str = "te";
 /// refused under a message that says `dit` — and that recites the DiT's dense-by-policy set — sends
 /// the reader to the wrong converter list.
 pub fn guard_dense(w: &Weights, component: &str, base: &str) -> Result<()> {
+    for suffix in [
+        "comfy_quant",
+        "weight_codebook",
+        "weight_s_rel",
+        "weight_s_channel",
+        "weight_scale",
+    ] {
+        let key = format!("{base}.{suffix}");
+        if w.contains(&key) {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 {component} {base}: `{key}` marks a native quantized weight at a dense-only loader; packed bytes must not be interpreted as floats"
+            )));
+        }
+    }
     let scales = format!("{base}.scales");
     if w.contains(&scales) {
         let policy = if component == TEXT_ENCODER {
@@ -165,6 +195,34 @@ pub fn lin(
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
     let bias_key = format!("{base}.bias");
+
+    if let Some(native) = candle_gen::quant::W4A8Linear::from_weights(w, base, bias)? {
+        let base_bytes = native.resident_bytes()
+            + if bias {
+                dense_bytes(&w.require(&bias_key)?)
+            } else {
+                0
+            };
+        return Ok(TieredLinear {
+            base_bytes,
+            linear: AdaptLinear::from_w4a8(native),
+        });
+    }
+
+    if let Some(native) =
+        candle_gen::quant::convrot_int8::ConvRotLinear::from_weights(w, base, bias)?
+    {
+        let base_bytes = native.descriptor().resident_bytes()
+            + if bias {
+                dense_bytes(&w.require(&bias_key)?)
+            } else {
+                0
+            };
+        return Ok(TieredLinear {
+            base_bytes,
+            linear: AdaptLinear::from_convrot(native),
+        });
+    }
 
     if w.contains(&scales_key) {
         let wq = w.require(&weight_key)?;
@@ -427,6 +485,7 @@ mod tests {
     /// The packed forward reproduces a dense projection built from the **same dequantized grid** —
     /// gated on relative max-abs, never cosine.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_packed_forward_matches_its_dense_grid() {
         let (out, in_) = (32usize, 128usize);
         let mut map = HashMap::new();
@@ -456,6 +515,9 @@ mod tests {
             drift < 5e-3,
             "the Q4_1 repack is lossless up to the f16 scale/bias cast; got {drift:.3e}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::the_packed_forward_matches_its_dense_grid");
     }
 
     /// A packed tensor at a **dense-only** loader is refused loudly, naming the key and the reason —
@@ -502,5 +564,39 @@ mod tests {
         let err = lin(&Weights::from_map(map), DIT, "p", false, DType::F32)
             .expect_err("a float weight under a packed marker must be refused");
         assert!(err.to_string().contains("rather than U32"), "{err}");
+    }
+
+    #[test]
+    fn native_w4a8_markers_never_reach_dense_loaders() {
+        for suffix in [
+            "comfy_quant",
+            "weight_codebook",
+            "weight_s_rel",
+            "weight_s_channel",
+        ] {
+            let mut map = HashMap::new();
+            map.insert(
+                format!("p.{suffix}"),
+                Tensor::zeros(1, DType::U8, &Device::Cpu).unwrap(),
+            );
+            let err = guard_dense(&Weights::from_map(map), DIT, "p").unwrap_err();
+            assert!(err.to_string().contains(&format!("p.{suffix}")));
+            assert!(err.to_string().contains("dense-only loader"));
+        }
+    }
+
+    #[test]
+    fn orphaned_w4a8_companions_cannot_fall_through_to_dense() {
+        let mut map = HashMap::new();
+        map.insert(
+            "p.weight".into(),
+            Tensor::zeros((16, 128), DType::U8, &Device::Cpu).unwrap(),
+        );
+        map.insert(
+            "p.weight_codebook".into(),
+            Tensor::zeros(16, DType::F32, &Device::Cpu).unwrap(),
+        );
+        let err = lin(&Weights::from_map(map), DIT, "p", false, DType::BF16).unwrap_err();
+        assert!(err.to_string().contains("authoritative .comfy_quant"));
     }
 }

@@ -649,6 +649,7 @@ mod tests {
     /// Build a zero-filled checkpoint with every memory-encoder + memory-attention key, then run
     /// both forward passes and assert the output shapes — exercises the whole graph, no download.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_passes_emit_expected_shapes() {
         let mut t: Vec<(String, Array)> = Vec::new();
         let me = "memory_encoder";
@@ -743,5 +744,9 @@ mod tests {
         assert_eq!(conditioned.shape(), &[16, 1, 256]);
 
         let _ = std::fs::remove_file(&path);
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED memory::tests::forward_passes_emit_expected_shapes"
+        );
     }
 }

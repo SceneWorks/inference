@@ -62,10 +62,14 @@ pub(crate) const CONTROL_CONTEXT: &str = "Z-Image control context";
 pub(crate) const VAE_DECODE_IN: &str = "Z-Image VAE decode conv_in";
 /// VAE encoder `conv_in`.
 pub(crate) const VAE_ENCODE_IN: &str = "Z-Image VAE encode conv_in";
-/// One VAE resnet.
-pub(crate) const VAE_RESNET: &str = "Z-Image VAE resnet";
-/// The VAE mid-block single-head attention.
-pub(crate) const VAE_ATTENTION: &str = "Z-Image VAE attention";
+/// One VAE decoder resnet (mid block or up path).
+pub(crate) const VAE_DECODE_RESNET: &str = "Z-Image VAE decode resnet";
+/// One VAE encoder resnet (down path or mid block).
+pub(crate) const VAE_ENCODE_RESNET: &str = "Z-Image VAE encode resnet";
+/// The VAE decoder mid-block single-head attention.
+pub(crate) const VAE_DECODE_ATTENTION: &str = "Z-Image VAE decode attention";
+/// The VAE encoder mid-block single-head attention.
+pub(crate) const VAE_ENCODE_ATTENTION: &str = "Z-Image VAE encode attention";
 /// A VAE nearest-2x upsample plus its convolution.
 pub(crate) const VAE_UPSAMPLE: &str = "Z-Image VAE upsample";
 /// A VAE bottom/right-pad stride-2 downsample convolution.
@@ -74,10 +78,43 @@ pub(crate) const VAE_DOWNSAMPLE: &str = "Z-Image VAE downsample";
 pub(crate) const VAE_DECODE_OUT: &str = "Z-Image VAE decode conv_out";
 /// VAE encoder output GroupNorm + SiLU + `conv_out` + the latent mean's affine.
 pub(crate) const VAE_ENCODE_OUT: &str = "Z-Image VAE encode conv_out";
-/// One halo-expanded tile of a layer-wise tiled VAE convolution, checked before its graph exists.
-pub(crate) const VAE_TILE: &str = "Z-Image VAE tile";
-/// The assembled output of one tiled VAE layer (resnet / upsample / output convolution).
-pub(crate) const VAE_TILED_STAGE: &str = "Z-Image VAE tiled stage";
+/// One halo-expanded tile of a layer-wise tiled VAE decode convolution, checked before its graph
+/// exists.
+pub(crate) const VAE_DECODE_TILE: &str = "Z-Image VAE decode tile";
+/// One halo-expanded tile of the bounded encode's tiled convolutions (and its downsample crops).
+pub(crate) const VAE_ENCODE_TILE: &str = "Z-Image VAE encode tile";
+/// The assembled output of one tiled VAE decode layer (resnet / upsample / output convolution).
+pub(crate) const VAE_DECODE_TILED_STAGE: &str = "Z-Image VAE decode tiled stage";
+/// The assembled output of one tiled layer of the bounded encode (`conv_in` / resnet / downsample).
+pub(crate) const VAE_ENCODE_TILED_STAGE: &str = "Z-Image VAE encode tiled stage";
+
+/// The quantum labels of the VAE modules shared by the encoder and the decoder (resnets, the
+/// mid-block attention, the layer-wise tiled stages and their tiles). A module built for one side
+/// carries that side's labels, so every label names exactly one phase (`crate::ios_pricing::
+/// ios_quantum_phase`: encode vs decode).
+#[derive(Debug)]
+pub(crate) struct VaeLabels {
+    pub(crate) resnet: &'static str,
+    pub(crate) attention: &'static str,
+    pub(crate) tile: &'static str,
+    pub(crate) stage: &'static str,
+}
+
+/// The decoder's labels (also every VAE module's default).
+pub(crate) const DECODE_LABELS: VaeLabels = VaeLabels {
+    resnet: VAE_DECODE_RESNET,
+    attention: VAE_DECODE_ATTENTION,
+    tile: VAE_DECODE_TILE,
+    stage: VAE_DECODE_TILED_STAGE,
+};
+
+/// The encoder's labels.
+pub(crate) const ENCODE_LABELS: VaeLabels = VaeLabels {
+    resnet: VAE_ENCODE_RESNET,
+    attention: VAE_ENCODE_ATTENTION,
+    tile: VAE_ENCODE_TILE,
+    stage: VAE_ENCODE_TILED_STAGE,
+};
 /// The decoded image's f32 cast and pixel conversion.
 pub(crate) const DECODED_TO_IMAGE: &str = "Z-Image decoded to image";
 /// The caption features: the valid-token gather of the encoder output and its compute-dtype cast.
@@ -200,41 +237,64 @@ pub(crate) fn promoted_weight_bytes(lins: &[&AdaptableLinear], element_bytes: u6
 /// Residuals are counted at f32, the widest they run. One projection's chain is consumed by its
 /// accumulation before the next projection runs (measured).
 pub(crate) fn adapter_bytes(lins: &[&AdaptableLinear], rows: u64, act_bytes: u64) -> u64 {
-    use mlx_gen::adapters::Adapter;
-    let cast = |w: &Array| {
-        if w.item_size() as u64 == act_bytes {
+    lins.iter()
+        .flat_map(|lin| lin.adapters())
+        .map(|adapter| {
+            adapter_facts_bytes(
+                &mlx_gen::adapters::facts::AdapterFacts::of(adapter),
+                rows,
+                act_bytes,
+            )
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The SAME production guard formula over typed retained residual facts. This is a logical
+/// diagnostic price, not independent proof of the donation/backing assumptions above.
+pub(crate) fn adapter_facts_bytes(
+    adapter: &mlx_gen::adapters::facts::AdapterFacts,
+    rows: u64,
+    act_bytes: u64,
+) -> u64 {
+    use mlx_gen::adapters::facts::{dtype_width, AdapterFacts, TensorFacts};
+    if adapter.disabled() {
+        return 0;
+    }
+    let cast = |tensor: &TensorFacts| {
+        if dtype_width(tensor.dtype) == act_bytes {
             0
         } else {
             ab(
                 act_bytes,
-                &w.shape().iter().map(|&d| u(d)).collect::<Vec<_>>(),
+                &tensor.shape.iter().map(|&dim| u(dim)).collect::<Vec<_>>(),
             )
         }
     };
-    lins.iter()
-        .flat_map(|lin| {
-            let out = lin.base_shape().first().map_or(0, |&d| u(d));
-            lin.adapters()
-                .iter()
-                .filter(|a| !a.is_disabled())
-                .map(move |a| {
-                    // The output-wide residual and the scale scalar it is multiplied by.
-                    let scaled = ab(4, &[rows, out]).saturating_add(ab(4, &[1]));
-                    match a {
-                        Adapter::Lora { a, .. } => {
-                            let rank = a.shape().last().map_or(0, |&d| u(d));
-                            ab(4, &[rows, rank]).saturating_add(scaled)
-                        }
-                        Adapter::Lokr { delta, .. } => cast(delta).saturating_add(scaled),
-                        Adapter::LokrStructured { factors: f } => cast(&f.w1)
-                            .saturating_add(cast(&f.w2))
-                            .saturating_add(ab(4, &[rows, u(f.a), u(f.d)]))
-                            .saturating_add(ab(4, &[rows, out])),
-                    }
-                })
-        })
-        .max()
-        .unwrap_or(0)
+    match adapter {
+        AdapterFacts::Lora { a, b, .. } => {
+            let rank = a.shape.last().map_or(0, |&dim| u(dim));
+            let out = b.shape.last().map_or(0, |&dim| u(dim));
+            ab(4, &[rows, rank])
+                .saturating_add(ab(4, &[rows, out]))
+                .saturating_add(ab(4, &[1]))
+        }
+        AdapterFacts::Materialized { delta, .. } => {
+            let out = delta.shape.first().map_or(0, |&dim| u(dim));
+            cast(delta)
+                .saturating_add(ab(4, &[rows, out]))
+                .saturating_add(ab(4, &[1]))
+        }
+        AdapterFacts::Structured { w1, w2, .. } => {
+            let a = w1.shape.first().map_or(0, |&dim| u(dim));
+            let b = w2.shape.first().map_or(0, |&dim| u(dim));
+            let d = w2.shape.get(1).map_or(0, |&dim| u(dim));
+            cast(w1)
+                .saturating_add(cast(w2))
+                .saturating_add(ab(4, &[rows, a, d]))
+                .saturating_add(ab(4, &[rows, a.saturating_mul(b)]))
+        }
+    }
 }
 
 /// The packed Q4/Q8 bytes `AdaptableLinear::quantize` produces from a dense `[out, in]` projection
@@ -244,28 +304,73 @@ pub(crate) fn quantize_bytes(lin: &AdaptableLinear, bits: i32) -> u64 {
     let Some((weight, bias)) = lin.dense_weight() else {
         return 0;
     };
-    let shape = lin.base_shape();
+    let cast = |array: &Array| {
+        linear_quantization_cast_bytes(&mlx_gen::adapters::facts::TensorFacts::of(array))
+    };
+    packed_bytes(lin, bits)
+        .saturating_add(cast(weight))
+        .saturating_add(bias.map_or(0, cast))
+}
+
+/// `AdaptableLinear::quantize` casts to BF16 by DTYPE, not by byte width. An F16 source
+/// therefore owns a distinct BF16 cast even though both have two-byte elements.
+pub(crate) fn linear_quantization_cast_bytes(
+    tensor: &mlx_gen::adapters::facts::TensorFacts,
+) -> u64 {
+    if tensor.dtype == mlx_rs::Dtype::Bfloat16 {
+        0
+    } else {
+        ab(
+            2,
+            &tensor.shape.iter().map(|&dim| u(dim)).collect::<Vec<_>>(),
+        )
+    }
+}
+
+/// Source parents a lazy load-time quantization can retain until its first consumer evaluates it.
+/// This does NOT include the packed outputs (counted separately), does not force evaluation, and
+/// certifies neither physical disjointness nor that these owners survive a later materialization.
+/// The token embedding's actual Z path packs AS-IS; only Linear casts to BF16.
+pub(crate) fn lazy_quantization_parent_bytes(
+    weight: &mlx_gen::adapters::facts::TensorFacts,
+    bias: Option<&mlx_gen::adapters::facts::TensorFacts>,
+    embedding: bool,
+) -> u64 {
+    let mut bytes = mlx_gen::ios_quantum::allocated_bytes(weight.bytes());
+    if !embedding {
+        bytes = bytes.saturating_add(linear_quantization_cast_bytes(weight));
+        if let Some(bias) = bias.filter(|bias| bias.dtype != mlx_rs::Dtype::Bfloat16) {
+            // The new BF16 bias is the effective module's bias owner. Only its original source
+            // is additional here; counting the converted bias again would duplicate that owner.
+            bytes = bytes.saturating_add(mlx_gen::ios_quantum::allocated_bytes(bias.bytes()));
+        }
+    }
+    bytes
+}
+
+/// The packed Q4/Q8 weight, scales and biases (group 64, each page-rounded as allocated) that
+/// `AdaptableLinear::quantize` leaves resident in place of a dense `[out, in]` projection's weight
+/// (its dense bias stays). `0` for an already packed projection.
+pub(crate) fn packed_bytes(lin: &AdaptableLinear, bits: i32) -> u64 {
+    if lin.dense_weight().is_none() {
+        return 0;
+    }
+    packed_shape_bytes(&lin.base_shape(), bits)
+}
+
+/// The actual ControlNet packing guard's retained-output formula, shared by header profiles.
+pub(crate) fn packed_shape_bytes(shape: &[i32], bits: i32) -> u64 {
     let (out, inp) = (
         shape.first().map_or(0, |&d| d.max(0) as u64),
         shape.get(1).map_or(0, |&d| d.max(0) as u64),
     );
     let groups = inp.div_ceil(crate::quant::GROUP_SIZE as u64);
-    let packed = mlx_gen::ios_quantum::allocated_bytes(
+    mlx_gen::ios_quantum::allocated_bytes(
         out.saturating_mul(inp)
             .saturating_mul(bits.max(0) as u64)
             .div_ceil(8),
     )
-    .saturating_add(2 * ab(2, &[out, groups]));
-    let cast = |a: &Array| {
-        if a.item_size() > 2 {
-            mlx_gen::ios_quantum::bytes(a) / a.item_size() as u64 * 2
-        } else {
-            0
-        }
-    };
-    packed
-        .saturating_add(cast(weight))
-        .saturating_add(bias.map_or(0, cast))
+    .saturating_add(2 * ab(2, &[out, groups]))
 }
 
 /// One DiT attention block's shape, as its quantum is priced.
@@ -383,18 +488,25 @@ pub(crate) fn nhwc(x_nchw: &Array) -> [i32; 4] {
 }
 
 /// Check one halo-expanded tile of a layer-wise tiled VAE convolution BEFORE its norm/activation/
-/// conv graph is constructed, priced at the tile's extent and `weight`'s channel counts
+/// conv graph is constructed, priced at the tile's extent, its `source` (the activation's width,
+/// whether the crop is normalized) and `weight`'s channel counts
 /// ([`mlx_gen::ios_quantum::tile_bytes`]). Called from the per-tile preprocess hook of
 /// `mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc`, which evaluates each output core before the next
 /// tile is built.
-pub(crate) fn before_tile(tile: &Array, weight: &Array) -> mlx_gen::Result<()> {
+pub(crate) fn before_tile(
+    label: &str,
+    tile: &Array,
+    source: mlx_gen::ios_quantum::TileSource,
+    weight: &Array,
+) -> mlx_gen::Result<()> {
     if !mlx_gen::ios_quantum::enabled() {
         return Ok(());
     }
     mlx_gen::ios_quantum::before(
-        VAE_TILE,
+        label,
         mlx_gen::ios_quantum::tile_bytes(
             tile.shape(),
+            source,
             tile.item_size() as u64,
             weight,
             false,
@@ -406,6 +518,7 @@ pub(crate) fn before_tile(tile: &Array, weight: &Array) -> mlx_gen::Result<()> {
 /// One layer-wise tiled VAE stage's check over `x_nhwc` producing `cout` channels
 /// ([`mlx_gen::ios_quantum::tiled_stage_bytes`]); a no-op off device.
 pub(crate) fn before_tiled_stage(
+    label: &str,
     x_nhwc: &[i32],
     act: u64,
     weight: &Array,
@@ -416,7 +529,7 @@ pub(crate) fn before_tiled_stage(
     }
     let (cin, cout) = mlx_gen::ios_quantum::conv_channels(weight);
     mlx_gen::ios_quantum::before(
-        VAE_TILED_STAGE,
+        label,
         mlx_gen::ios_quantum::tiled_stage_bytes(x_nhwc, cin, cout, act, resnet),
     )
 }
@@ -444,6 +557,14 @@ pub(crate) fn source_files(
     if !mlx_gen::ios_quantum::enabled() {
         return Ok(Vec::new());
     }
+    component_files(source)
+}
+
+/// The `.safetensors` files a component source loads (a directory's non-hidden shards, sorted, or
+/// the one file) — what [`source_files`] lists on device, and what the iOS pricing reads headers of.
+pub(crate) fn component_files(
+    source: &mlx_gen::WeightsSource,
+) -> mlx_gen::Result<Vec<std::path::PathBuf>> {
     Ok(match source {
         mlx_gen::WeightsSource::File(path) => vec![path.clone()],
         mlx_gen::WeightsSource::Dir(dir) => {
@@ -496,4 +617,106 @@ thread_local! {
     /// phase from its own start (`crate::quantum_proofs`). Test builds only.
     pub(crate) static BARRIER_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod overlay_header_tests {
+    use super::*;
+    use mlx_gen::adapters::facts::{AdapterFacts, TensorFacts};
+    use mlx_rs::Dtype;
+    #[test]
+    fn residual_header_prices_keep_disabled_payloads_separate_from_forward_work() {
+        let facts = AdapterFacts::Lora {
+            a: TensorFacts::materialized_matrix(4, 2, Dtype::Bfloat16),
+            b: TensorFacts::materialized_matrix(2, 8, Dtype::Float32),
+            disabled: false,
+        };
+        assert_eq!(
+            adapter_facts_bytes(&facts, 3, 4),
+            ab(4, &[3, 2]) + ab(4, &[3, 8]) + ab(4, &[1])
+        );
+        let disabled = AdapterFacts::Lora {
+            a: TensorFacts::materialized_matrix(4, 2, Dtype::Bfloat16),
+            b: TensorFacts::materialized_matrix(2, 8, Dtype::Float32),
+            disabled: true,
+        };
+        assert_eq!(adapter_facts_bytes(&disabled, 3, 4), 0);
+        assert!(
+            disabled
+                .tensors()
+                .iter()
+                .map(|tensor| tensor.bytes())
+                .sum::<u64>()
+                > 0
+        );
+    }
+    #[test]
+    fn structured_header_price_uses_small_factors_and_packing_uses_requested_bits() {
+        let facts = AdapterFacts::Structured {
+            w1: TensorFacts::materialized_matrix(2, 3, Dtype::Bfloat16),
+            w2: TensorFacts::materialized_matrix(5, 7, Dtype::Bfloat16),
+            disabled: false,
+        };
+        assert_eq!(
+            adapter_facts_bytes(&facts, 11, 4),
+            ab(4, &[2, 3]) + ab(4, &[5, 7]) + ab(4, &[11, 2, 7]) + ab(4, &[11, 10])
+        );
+        assert!(packed_shape_bytes(&[1024, 1024], 8) > packed_shape_bytes(&[1024, 1024], 4));
+    }
+    #[test]
+    fn quantization_parents_distinguish_f16_bf16_and_embedding_first_use() {
+        let tensor = |dtype| TensorFacts::materialized_matrix(4, 64, dtype);
+        let bf16 = tensor(Dtype::Bfloat16);
+        let f16 = tensor(Dtype::Float16);
+        let f32 = tensor(Dtype::Float32);
+        assert_eq!(linear_quantization_cast_bytes(&bf16), 0);
+        assert_eq!(linear_quantization_cast_bytes(&f16), ab(2, &[4, 64]));
+        assert_eq!(linear_quantization_cast_bytes(&f32), ab(2, &[4, 64]));
+        assert_eq!(
+            lazy_quantization_parent_bytes(&f16, None, false),
+            mlx_gen::ios_quantum::allocated_bytes(f16.bytes()) + ab(2, &[4, 64])
+        );
+        assert_eq!(
+            lazy_quantization_parent_bytes(&f32, None, true),
+            mlx_gen::ios_quantum::allocated_bytes(f32.bytes())
+        );
+        let bias = TensorFacts::materialized_matrix(1, 4, Dtype::Float32);
+        assert_eq!(
+            lazy_quantization_parent_bytes(&f32, Some(&bias), false),
+            mlx_gen::ios_quantum::allocated_bytes(f32.bytes())
+                + ab(2, &[4, 64])
+                + mlx_gen::ios_quantum::allocated_bytes(bias.bytes())
+        );
+    }
+    #[test]
+    fn transformer_header_aliases_follow_actual_loader_for_dense_and_packed_suffixes() {
+        use mlx_gen::gen_core::weightsmeta::{Dtype as H, SafetensorsTensorHeader};
+        let mut headers = std::collections::BTreeMap::new();
+        for (name, shape, bytes) in [
+            ("t_embedder.mlp.0.weight", vec![2, 2], 16),
+            (
+                "all_final_layer.2-1.adaLN_modulation.1.scales",
+                vec![2, 1],
+                8,
+            ),
+        ] {
+            headers.insert(
+                name.into(),
+                SafetensorsTensorHeader {
+                    name: name.into(),
+                    dtype: H::F32,
+                    shape,
+                    data_bytes: bytes,
+                },
+            );
+        }
+        crate::loader::remap_transformer_header_keys(&mut headers);
+        assert_eq!(headers.len(), 4);
+        assert_eq!(headers["t_embedder.linear1.weight"].shape, [2, 2]);
+        assert_eq!(
+            headers["all_final_layer.2-1.adaLN_modulation.0.scales"].data_bytes,
+            8
+        );
+        assert!(headers.contains_key("t_embedder.mlp.0.weight"));
+    }
 }

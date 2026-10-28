@@ -1,5 +1,15 @@
 //! Frozen-upstream and real-weight gates for SAME outer chunking (`sc-14540`).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -249,6 +259,8 @@ fn chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics() {
             .as_deref()
             .is_some_and(|selected| selected != label)
         {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/audio/candle-audio-stable-audio-3/tests/chunked_oracle.rs:252 (chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             continue;
         }
         let layout = SnapshotLayout::from_dir(&snapshot(env)).unwrap();
@@ -453,6 +465,9 @@ fn chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics() {
             )
             .is_err());
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics");
 }
 
 #[test]
@@ -589,4 +604,7 @@ fn chunked_same_resource_probe() {
             latent_len
         },
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED chunked_same_resource_probe");
 }

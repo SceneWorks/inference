@@ -74,7 +74,14 @@ impl VisionConfig {
     /// Read the `vision_config` sub-object of a `qwen2_5_vl_config.json` (the sc-5144 snapshot copy of
     /// `mllm/config.json`).
     pub fn from_config_json(path: &std::path::Path) -> Result<Self> {
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
+        let v: serde_json::Value =
+            serde_json::from_slice(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(path),
+"crates/media/mlx-gen/mlx-gen-bernini/src/vision.rs::from_config_json::std::fs::read@3534",
+ArtifactInput,
+path,
+|__model_input_path| std::fs::read(__model_input_path)
+)?)
             .map_err(|e| Error::Msg(format!("parse {}: {e}", path.display())))?;
         let vc = v.get("vision_config").unwrap_or(&v);
         let d = Self::default();

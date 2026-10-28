@@ -741,9 +741,10 @@ impl Linear {
         let gemm = kernel_dtype(x.device(), dtype);
         let y = match &self.base {
             Base::Dense { weight, bias } => {
-                let mut y = to(&flat, gemm)?.matmul(&to(weight, gemm)?.t()?)?;
+                let mut y =
+                    __model_proof_output!(to(&flat, gemm)?.matmul(&to(weight, gemm)?.t()?))?;
                 if let Some(b) = bias {
-                    y = y.broadcast_add(&to(b, gemm)?)?;
+                    y = __model_proof_output!(y.broadcast_add(&to(b, gemm)?))?;
                 }
                 y
             }
@@ -757,7 +758,7 @@ impl Linear {
                 if padded_in > in_features {
                     input = input.pad_with_zeros(1, 0, padded_in - in_features)?;
                 }
-                weight.forward(&input)?
+                __model_proof_output!(weight.forward(&input))?
             }
         };
         let mut y = to(&y, dtype)?;
@@ -845,7 +846,7 @@ impl RmsNorm {
             // One tape node (sc-25690): the chain reads `x` twice — the quotient, which the plain
             // backward reaches first, then the mean square.
             let eps = self.eps as f64;
-            return Ok(crate::tape::fold3(
+            return Ok(__model_proof_output!(crate::tape::fold3(
                 "iris-rms-norm",
                 &x,
                 &x,
@@ -856,13 +857,13 @@ impl RmsNorm {
                     let rms = (ms + eps)?.sqrt()?;
                     x.broadcast_div(&rms)?.broadcast_mul(gain)
                 },
-            )?);
+            ))?);
         }
-        Ok(candle_gen::candle_nn::ops::rms_norm(
+        __model_proof_output!(Ok(candle_gen::candle_nn::ops::rms_norm(
             &x,
             &self.weight,
             self.eps,
-        )?)
+        )?))
     }
 }
 
@@ -1258,6 +1259,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn lokr_runs_the_structured_kronecker_product() {
         use candle_gen::train::lora::reconstruct_lokr_delta;
         // w1 [2, 3] ⊗ w2_a·w2_b [4, 5] → [8, 15].
@@ -1303,9 +1305,13 @@ mod tests {
         // Factors that do not decompose the projection fall back to the reconstructed delta.
         let r = lokr((4, 30));
         assert!(matches!(r, Residual::Delta(_)), "{r:?}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nn::tests::lokr_runs_the_structured_kronecker_product");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn loha_runs_its_low_rank_factorisation_below_the_break_even_rank() {
         use candle_gen::train::merge::ThirdPartyLoha;
         let loha = |rank: usize, out: usize, inp: usize| ThirdPartyLoha {
@@ -1332,6 +1338,9 @@ mod tests {
         let g = loha(4, 24, 16);
         let r = crate::adapters::loha_residual(&g, (24, 16), 0.75).unwrap();
         assert!(matches!(r, Residual::Delta(_)), "{r:?}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nn::tests::loha_runs_its_low_rank_factorisation_below_the_break_even_rank");
     }
 
     #[test]

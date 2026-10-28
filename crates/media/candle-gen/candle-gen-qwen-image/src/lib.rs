@@ -22,6 +22,15 @@
 // Qwen-Image-Edit inference adapter merge (sc-6220, epic 5480): fold a LoRA/LoKr `.safetensors` delta
 // into the dense MMDiT weights at load — the Qwen-Image-Edit-2511-Lightning few-step distill, plus
 // general Qwen-family LoRA/LoKr. Consumed by `edit::QwenEdit::load`.
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapters;
 pub mod config;
 // Shared scaffolding for the control lane (`control_fun`): the component loader, prompt encoder,
@@ -877,7 +886,13 @@ fn decode_final_latents(
 /// packed tier with only `bits` still loads packed — never a silent dense read of u32 codes). The
 /// group size is inert on the dense path, so a dense snapshot is byte-identical regardless.
 pub(crate) fn transformer_group_size(dit_dir: &Path) -> usize {
-    std::fs::read_to_string(dit_dir.join("config.json"))
+    candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dit_dir.join("config.json")),
+"crates/media/candle-gen/candle-gen-qwen-image/src/lib.rs::transformer_group_size::std::fs::read_to_string@41053",
+ArtifactInput,
+dit_dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
@@ -886,7 +901,13 @@ pub(crate) fn transformer_group_size(dit_dir: &Path) -> usize {
 }
 
 pub(crate) fn transformer_packed_config(dit_dir: &Path) -> Option<candle_gen::quant::PackedConfig> {
-    std::fs::read_to_string(dit_dir.join("config.json"))
+    candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dit_dir.join("config.json")),
+"crates/media/candle-gen/candle-gen-qwen-image/src/lib.rs::transformer_packed_config::std::fs::read_to_string@41470",
+ArtifactInput,
+dit_dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
@@ -900,7 +921,13 @@ pub(crate) fn transformer_packed_config(dit_dir: &Path) -> Option<candle_gen::qu
 /// correct on a dense base too (it just isn't bit-identical to the fold there), and per-projection
 /// packed-detect (`.scales`) still governs the actual weight load.
 pub(crate) fn transformer_is_packed(dit_dir: &Path) -> bool {
-    std::fs::read_to_string(dit_dir.join("config.json"))
+    candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dit_dir.join("config.json")),
+"crates/media/candle-gen/candle-gen-qwen-image/src/lib.rs::transformer_is_packed::std::fs::read_to_string@42439",
+ArtifactInput,
+dit_dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
@@ -1861,6 +1888,11 @@ mod tests {
             img.pixels.len(),
             img.width,
             img.height
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED tests::qwen_image_probed_generate_for_offload_ab"
         );
     }
 

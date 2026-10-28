@@ -217,6 +217,8 @@ fn conditioning_stage_peak_is_the_staged_tier() {
             gb(peak)
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_tier_real_weights::conditioning_stage_peak_is_the_staged_tier");
 }
 
 /// **AC 4.** The packed context against the **real dense text encoder's** context, not against a
@@ -311,4 +313,6 @@ fn the_packed_context_tracks_the_dense_one() {
         relative < ceiling,
         "q{bits} relative max-abs-diff {relative} exceeds the {ceiling} ceiling"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_tier_real_weights::the_packed_context_tracks_the_dense_one");
 }

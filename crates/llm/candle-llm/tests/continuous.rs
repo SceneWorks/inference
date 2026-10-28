@@ -17,6 +17,15 @@
 //! `Exact` equality on a GPU snapshot and reports `Exact` vs `Throughput` decode throughput by
 //! occupancy.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
@@ -155,6 +164,7 @@ fn run(
 
 /// `Exact` mode, all slots live at once: each differing-length request equals its batch-1 run.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn exact_matches_batch1_cpu() {
     let model = build_tiny_llama();
     let reqs = vec![
@@ -177,11 +187,15 @@ fn exact_matches_batch1_cpu() {
         );
         assert!(!outs[i].tokens.is_empty());
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED exact_matches_batch1_cpu");
 }
 
 /// `Throughput` mode (batched projections + per-sequence attention): on CPU the f32 matmul reduces in
 /// a batch-invariant order, so this is *also* bit-exact to batch-1 — pinning down `forward_per_seq`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn throughput_matches_batch1_cpu() {
     let model = build_tiny_llama();
     let reqs = vec![
@@ -202,6 +216,9 @@ fn throughput_matches_batch1_cpu() {
             "request {i}: Throughput per-seq attention must match batch-1 on CPU"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED throughput_matches_batch1_cpu");
 }
 
 /// `Throughput` **batched prefill** (story 7485): a startup wave with ≥2 requests sharing a prompt
@@ -210,6 +227,7 @@ fn throughput_matches_batch1_cpu() {
 /// bit-exact to batch-1 — pinning the grouped-prefill path (the three length-3 requests batch together;
 /// the length-5 one is a singleton).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn throughput_batched_prefill_matches_batch1_cpu() {
     let model = build_tiny_llama();
     let reqs = vec![
@@ -231,12 +249,16 @@ fn throughput_batched_prefill_matches_batch1_cpu() {
             "request {i}: Throughput batched prefill must match batch-1 on CPU"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED throughput_batched_prefill_matches_batch1_cpu");
 }
 
 /// `Throughput` admit-on-retire with batched prefill: `max_batch = 2` over 6 same-length requests with
 /// paired budgets, so each retirement frees two slots refilled by a batched same-length wave — every
 /// late-admitted lane still equals its batch-1 run on CPU.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn throughput_admit_on_retire_batched_cpu() {
     let model = build_tiny_llama();
     let reqs = vec![
@@ -261,11 +283,15 @@ fn throughput_admit_on_retire_batched_cpu() {
             "request {i}: a batched late-admitted lane must equal its batch-1 run"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED throughput_admit_on_retire_batched_cpu");
 }
 
 /// Admit-on-retire: with only `max_batch = 2` slots over 5 differing-budget requests, sequences
 /// retire and free slots that later requests are admitted into — each still equals its batch-1 run.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn admit_on_retire_matches_batch1_cpu() {
     let model = build_tiny_llama();
     let reqs = vec![
@@ -289,11 +315,15 @@ fn admit_on_retire_matches_batch1_cpu() {
             "request {i}: a late-admitted lane must still equal its batch-1 run"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED admit_on_retire_matches_batch1_cpu");
 }
 
 /// Every request emits exactly one terminal `Done` even when a cancel lands mid-stream with requests
 /// still decoding and still queued (`max_batch` smaller than the queue).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cancel_signals_every_request_once_cpu() {
     let model = build_tiny_llama();
     let reqs: Vec<BatchRequest> = (0..6i32).map(|i| req(vec![1 + i, 2, 3], 64)).collect();
@@ -321,11 +351,15 @@ fn cancel_signals_every_request_once_cpu() {
         dones.iter().all(|&d| d == 1),
         "every request must emit exactly one Done, got {dones:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cancel_signals_every_request_once_cpu");
 }
 
 /// A zero-budget request (`max_new_tokens == 0`) retires at admission with empty output and one Done,
 /// without disturbing its neighbours.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn zero_budget_request_completes_empty_cpu() {
     let model = build_tiny_llama();
     let reqs = vec![req(vec![1, 2, 3], 0), req(vec![4, 5], 8)];
@@ -353,6 +387,9 @@ fn zero_budget_request_completes_empty_cpu() {
         batch1(&model, &reqs[1]),
         "neighbour unaffected"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED zero_budget_request_completes_empty_cpu");
 }
 
 // ---- Real-weights variant (#[ignore]) ------------------------------------------------------------
@@ -388,6 +425,8 @@ mod real {
         for env in ["CANDLE_LLM_TEST_MODEL", "CANDLE_LLM_QWEN3_MODEL"] {
             let Some((model, tok)) = load(env) else {
                 eprintln!("skip: set {env}");
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/continuous.rs:391 (continuous_matches_batch1_and_scales): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
                 continue;
             };
             let prompts = [
@@ -439,6 +478,9 @@ mod real {
                 assert!(outs.iter().all(|o| !o.tokens.is_empty()));
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED real::continuous_matches_batch1_and_scales");
     }
 
     /// The measurement harness behind the sc-7258 split into sc-7351 (varlen) + sc-7258 (custom
@@ -460,6 +502,8 @@ mod real {
         for env in ["CANDLE_LLM_TEST_MODEL", "CANDLE_LLM_QWEN3_MODEL"] {
             let Some((model, tok)) = load(env) else {
                 eprintln!("skip: set {env}");
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/continuous.rs:463 (attention_bottleneck_bound): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
                 continue;
             };
             let prompt = encode(&tok, PROMPT);
@@ -496,6 +540,9 @@ mod real {
                 assert!(outs.iter().all(|o| !o.tokens.is_empty()));
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED real::attention_bottleneck_bound");
     }
 
     /// **sc-7477 ragged + admit-on-retire serving bench.** `attention_bottleneck_bound` uses
@@ -524,6 +571,8 @@ mod real {
         for env in ["CANDLE_LLM_TEST_MODEL", "CANDLE_LLM_QWEN3_MODEL"] {
             let Some((model, tok)) = load(env) else {
                 eprintln!("skip: set {env}");
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/continuous.rs:527 (ragged_churn_serving_bench): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
                 continue;
             };
             // A long real-token pool to slice ragged prompt lengths from (repeat to clear 128 tokens).
@@ -602,6 +651,9 @@ mod real {
                 t.elapsed().as_secs_f64()
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED real::ragged_churn_serving_bench");
     }
 
     /// Mean wall-seconds of `f` over `iters` (warmup excluded), GPU-sync-bracketed: a sync before the
@@ -712,6 +764,8 @@ mod real {
         for env in ["CANDLE_LLM_TEST_MODEL", "CANDLE_LLM_QWEN3_MODEL"] {
             let Some((model, tok)) = load(env) else {
                 eprintln!("skip: set {env}");
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/continuous.rs:715 (prefill_admission_cost): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
                 continue;
             };
             let device = model.device().clone();
@@ -842,5 +896,8 @@ mod real {
                 }
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED real::prefill_admission_cost");
     }
 }

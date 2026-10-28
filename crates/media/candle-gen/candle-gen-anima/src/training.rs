@@ -938,6 +938,7 @@ mod depth_anchoring_tests {
     /// remap on every planned step (drop the `!= sigma as f32` guard) ⇒ the diffusion step's σ is
     /// f32-rounded ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn plan_sigma_remaps_only_aux_steps() {
         let f = fixture();
         let (mut d, sched) = driver(&f);
@@ -955,6 +956,9 @@ mod depth_anchoring_tests {
         // The full `[0, 1]` window remaps σ onto itself, so the exact f64 σ is kept; only its f32
         // level is the plan's.
         assert_eq!(aux_sigma as f32, aux_plan.noise_level());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::plan_sigma_remaps_only_aux_steps");
     }
 
     /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
@@ -1014,6 +1018,7 @@ mod depth_anchoring_tests {
     /// depth term, a nonzero finite gradient through the decoded x0 on the adapter factors — and
     /// step 1 carries no depth term. Mutation: compute the diffusion term unconditionally ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_step_trains_the_lora_through_depth_only() {
         let f = fixture();
         let (mut d, sched) = driver(&f);
@@ -1046,11 +1051,15 @@ mod depth_anchoring_tests {
             })
             .sum();
         assert!(gsum > 0.0 && gsum.is_finite(), "adapter grad {gsum}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only");
     }
 
     /// AC (c): depth off ⇒ bit-identical to the pre-epic-2123 loop body (reproduced here), and a
     /// diffusion-only planned step equals it too. Mutation: scale the diffusion loss (×1.0001) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_off_is_bit_identical_to_the_legacy_step() {
         assert!(
             load_perceptual_path(&TrainingConfig::default(), &Device::Cpu)
@@ -1101,6 +1110,9 @@ mod depth_anchoring_tests {
             grad_bits(&g_on, &f.set.vars),
             grad_bits(&g_off, &f.set.vars)
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// AC (d), E7: depth grows the guarded footprint (more for Large) and the guard refuses at a

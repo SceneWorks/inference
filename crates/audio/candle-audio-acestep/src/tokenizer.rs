@@ -80,8 +80,13 @@ impl TokenizerConfig {
     pub fn from_json(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| AudioError::Msg(format!("read {}: {e}", path.display())))?;
-        serde_json::from_str(&text)
-            .map_err(|e| AudioError::Msg(format!("parse {}: {e}", path.display())))
+        candle_audio::gen_core::__model_input_result!(
+            serde_json::from_str(&text)
+                .map_err(|e| AudioError::Msg(format!("parse {}: {e}", path.display()))),
+            "candle-audio-acestep::tokenizer::TokenizerConfig::from_json",
+            Configuration,
+            &[path]
+        )
     }
 
     fn validate(&self) -> Result<()> {
@@ -208,18 +213,22 @@ impl EncoderLayer {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let device = x.device();
         let len = x.dim(1)?;
-        let h = self.input_layernorm.forward(x)?;
-        let q = self.norm_q.forward(&to_heads(
-            &self.to_q.forward(&h)?,
+        let h = __model_proof_output!(self.input_layernorm.forward(x))?;
+        let q = __model_proof_output!(self.norm_q.forward(&to_heads(
+            &__model_proof_output!(self.to_q.forward(&h))?,
             self.num_heads,
             self.head_dim,
-        )?)?;
-        let k = self.norm_k.forward(&to_heads(
-            &self.to_k.forward(&h)?,
+        )?))?;
+        let k = __model_proof_output!(self.norm_k.forward(&to_heads(
+            &__model_proof_output!(self.to_k.forward(&h))?,
             self.num_kv_heads,
             self.head_dim,
-        )?)?;
-        let v = to_heads(&self.to_v.forward(&h)?, self.num_kv_heads, self.head_dim)?;
+        )?))?;
+        let v = to_heads(
+            &__model_proof_output!(self.to_v.forward(&h))?,
+            self.num_kv_heads,
+            self.head_dim,
+        )?;
         let (cos, sin) = rope_tables(self.head_dim, len, self.theta, device)?;
         let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
@@ -228,14 +237,15 @@ impl EncoderLayer {
         let v = repeat_kv(&v, groups)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let att = candle_nn::ops::softmax_last_dim(&(q.matmul(&k.transpose(2, 3)?)? * scale)?)?;
-        let attn = self
+        let attn = __model_proof_output!(self
             .to_out
-            .forward(&from_heads(&att.matmul(&v.contiguous()?)?)?)?;
+            .forward(&from_heads(&att.matmul(&v.contiguous()?)?)?))?;
         let x = (x + attn)?;
-        let h = self.post_attention_layernorm.forward(&x)?;
-        let ff = self
-            .down_proj
-            .forward(&(self.gate_proj.forward(&h)?.silu()? * self.up_proj.forward(&h)?)?)?;
+        let h = __model_proof_output!(self.post_attention_layernorm.forward(&x))?;
+        let ff = __model_proof_output!(self.down_proj.forward(
+            &(__model_proof_output!(self.gate_proj.forward(&h))?.silu()?
+                * __model_proof_output!(self.up_proj.forward(&h))?)?
+        ))?;
         x + ff
     }
 }
@@ -273,7 +283,7 @@ impl AttentionPooler {
     /// `[num_patches, window, hidden]` (the windows as a batch) → `[num_patches, hidden]`.
     fn forward(&self, windows: &Tensor) -> CandleResult<Tensor> {
         let (num_patches, _window, _h) = windows.dims3()?;
-        let embedded = self.embed_tokens.forward(windows)?;
+        let embedded = __model_proof_output!(self.embed_tokens.forward(windows))?;
         let special = self
             .special_token
             .broadcast_as((num_patches, 1, self.hidden))?
@@ -282,7 +292,7 @@ impl AttentionPooler {
         for l in &self.layers {
             x = l.forward(&x)?;
         }
-        let x = self.norm.forward(&x)?;
+        let x = __model_proof_output!(self.norm.forward(&x))?;
         // `.contiguous()`: `narrow`+`squeeze` yields a strided view (row stride = full window+1 span),
         // which candle's CUDA `matmul` rejects as a non-contiguous lhs in the FSQ `project_in`
         // (sc-13888). No-op on already-contiguous tensors; bit-identical across CPU/Metal/CUDA.
@@ -326,8 +336,8 @@ impl ResidualFsq {
     /// `x [.., fsq_dim]` → quantized `[.., fsq_dim]`. Mirrors the reference `forward` with
     /// `num_quantizers = 1` (`scales = [1.0]`), returning `project_out(quantize(soft_clamp(...)))`.
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let h = self.project_in.forward(x)?; // [.., codebook_dim]
-                                             // soft_clamp = 1 + 1/(levels - 1); h = tanh(h/soft_clamp) * soft_clamp.
+        let h = __model_proof_output!(self.project_in.forward(x))?; // [.., codebook_dim]
+                                                                    // soft_clamp = 1 + 1/(levels - 1); h = tanh(h/soft_clamp) * soft_clamp.
         let ones = Tensor::ones_like(&self.levels)?;
         let levels_minus_one = (&self.levels - &ones)?;
         let soft_clamp = (&ones + ones.broadcast_div(&levels_minus_one)?)?; // [codebook_dim]
@@ -345,7 +355,7 @@ impl ResidualFsq {
             .broadcast_mul(&levels_minus_one)?
             .affine(1.0, 0.5)?;
         let quantized = bracket.floor()?.broadcast_mul(&step)?.affine(1.0, -1.0)?; // step*floor - 1
-        self.project_out.forward(&quantized)
+        __model_proof_output!(self.project_out.forward(&quantized))
     }
 }
 
@@ -416,7 +426,7 @@ impl AudioTokenizer {
         let windows = padded
             .reshape((num_patches, self.pool_window_size, c))?
             .contiguous()?;
-        let windows = self.audio_acoustic_proj.forward(&windows)?; // [num_patches, pool_window, hidden]
+        let windows = __model_proof_output!(self.audio_acoustic_proj.forward(&windows))?; // [num_patches, pool_window, hidden]
         let pooled = self.pooler.forward(&windows)?; // [num_patches, hidden]
         let quantized = self.fsq.forward(&pooled)?; // [num_patches, hidden]
         Ok(quantized.reshape((1, num_patches, self.hidden))?)
@@ -480,8 +490,8 @@ impl AudioTokenDetokenizer {
                 self.hidden
             )));
         }
-        let embedded = self.embed_tokens.forward(quantized)?; // [1, N, hidden]
-                                                              // Expand each token to pool_window frames, add the learned per-position offset.
+        let embedded = __model_proof_output!(self.embed_tokens.forward(quantized))?; // [1, N, hidden]
+                                                                                     // Expand each token to pool_window frames, add the learned per-position offset.
         let expanded = embedded
             .reshape((num_tokens, 1, self.hidden))?
             .broadcast_as((num_tokens, self.pool_window_size, self.hidden))?
@@ -493,8 +503,8 @@ impl AudioTokenDetokenizer {
         for l in &self.layers {
             x = l.forward(&x)?;
         }
-        let x = self.norm.forward(&x)?;
-        let x = self.proj_out.forward(&x)?; // [N, pool_window, acoustic]
+        let x = __model_proof_output!(self.norm.forward(&x))?;
+        let x = __model_proof_output!(self.proj_out.forward(&x))?; // [N, pool_window, acoustic]
         Ok(x.reshape((1, num_tokens * self.pool_window_size, self.acoustic_dim))?)
     }
 }
@@ -598,6 +608,7 @@ mod tests {
     /// default CPU test lane — it goes RED if the trailing `.contiguous()` in `forward` is removed.
     /// Weight VALUES are irrelevant to a layout assertion, so a zero-initialized `VarMap` suffices.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn pooler_query_token_is_contiguous_for_fsq_matmul() {
         use candle_nn::VarMap;
         let dev = Device::Cpu;
@@ -618,5 +629,8 @@ mod tests {
             q.is_contiguous(),
             "sc-13888: the pooler query token must be contiguous (it is the FSQ project_in matmul lhs)"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tokenizer::tests::pooler_query_token_is_contiguous_for_fsq_matmul");
     }
 }

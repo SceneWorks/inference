@@ -255,3 +255,6 @@ mod explicit_registry_tests {
         gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

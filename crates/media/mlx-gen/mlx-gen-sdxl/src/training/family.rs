@@ -693,8 +693,13 @@ pub(crate) fn run_train_step<H: SdxlFamilyHooks>(
 
 /// Decode a dataset image file (PNG/JPEG) into the core RGB8 [`Image`](mlx_gen::media::Image).
 fn decode_image(path: &Path) -> Result<mlx_gen::media::Image> {
-    let dynimg = image::open(path)
-        .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_result!(
+        image::open(path),
+        "crates/media/mlx-gen/mlx-gen-sdxl/src/training/family.rs::decode_image/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Ok(mlx_gen::media::Image {

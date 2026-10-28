@@ -64,6 +64,8 @@ fn decode_matches_reference() {
     let pr = peak_rel(&got, want);
     eprintln!("decode peak_rel = {pr:.3e} shape={:?}", got.shape());
     assert!(pr < 5e-3, "decode peak_rel {pr:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::decode_matches_reference");
 }
 
 #[test]
@@ -77,6 +79,8 @@ fn encode_matches_reference() {
     let pr = peak_rel(&got, want);
     eprintln!("encode peak_rel = {pr:.3e} shape={:?}", got.shape());
     assert!(pr < 5e-3, "encode peak_rel {pr:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::encode_matches_reference");
 }
 
 #[test]
@@ -125,6 +129,8 @@ fn lazy_encoder_matches_eager() {
         "a later conditioned request reconstructs the exact encoder"
     );
     assert!(lazy.release_encoder());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::lazy_encoder_matches_eager");
 }
 
 #[test]
@@ -171,4 +177,6 @@ fn decode_tiled_matches_reference() {
         tp_got.shape()
     );
     assert!(tp_pr < 5e-3, "temporal tiled peak_rel {tp_pr:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::decode_tiled_matches_reference");
 }

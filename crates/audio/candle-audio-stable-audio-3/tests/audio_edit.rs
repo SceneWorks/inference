@@ -53,6 +53,16 @@
 //! alias byte-equality, seam continuity), and what the weight-free cases assert is that the mask and
 //! local conditioning are the ones this crate's own configs and the landed DiT declare.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device, Tensor};
@@ -1565,6 +1575,9 @@ fn real_inpaint_preserves_the_outside_exactly_and_changes_the_inside() {
              barely conditioned on the clip being edited"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_inpaint_preserves_the_outside_exactly_and_changes_the_inside");
 }
 
 /// `Repaint` is an alias of `Inpaint` on this family, so the same request and seed must be
@@ -1620,6 +1633,9 @@ fn real_repaint_is_byte_identical_to_inpaint() {
             "{id}: the render must not be silent"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_repaint_is_byte_identical_to_inpaint");
 }
 
 /// The story's pinned extend: a 10 s source becomes 18 s, keeps its first 10 s exactly, and does not
@@ -1738,6 +1754,11 @@ fn real_extend_keeps_the_source_prefix_and_bridges_the_seam() {
              transition"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_extend_keeps_the_source_prefix_and_bridges_the_seam"
+    );
 }
 
 /// The draw order, on the edit path: the sampler's initial noise is the request stream's **first**
@@ -1822,6 +1843,9 @@ fn real_edit_initial_sampler_noise_precedes_the_source_encode() {
         "no checkpoint's encode consumed a draw, so the ordering assertion discriminated nothing \
          on any of them — the SAME-L encoder's eval-time noise is what makes this a gate"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_edit_initial_sampler_noise_precedes_the_source_encode");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2732,6 +2756,9 @@ fn real_multi_region_inpaint_regenerates_every_span_in_one_pass() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_multi_region_inpaint_regenerates_every_span_in_one_pass");
 }
 
 /// Floor for each window's source divergence, as a fraction of that window's own source energy.

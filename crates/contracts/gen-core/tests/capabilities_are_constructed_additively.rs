@@ -263,10 +263,17 @@ fn workspace_root() -> PathBuf {
     }
 }
 
-/// Every `.rs` file under `crates/`, skipping build output and the vendored candle kernels.
+/// Every `.rs` file under `crates/` and workspace members outside it, skipping build output
+/// and vendored kernels.
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let mut stack = vec![root.join("crates")];
+    let crates = root.join("crates");
+    let mut stack = vec![crates.clone()];
+    stack.extend(
+        member_dirs(root)
+            .into_iter()
+            .filter(|member| !member.starts_with(&crates)),
+    );
     while let Some(dir) = stack.pop() {
         let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}"));
         for entry in entries.flatten() {

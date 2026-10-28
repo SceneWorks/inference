@@ -162,12 +162,17 @@ impl TierPaths {
             .map_err(|e| CandleError::Msg(format!("ltx tier: read {}: {e}", p.display())))?;
         let json: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| CandleError::Msg(format!("ltx tier: parse {}: {e}", p.display())))?;
-        candle_gen::quant::PackedConfig::from_config(&json).ok_or_else(|| {
-            CandleError::Msg(format!(
-                "ltx tier: {} has no `quantization.bits` — not a packed tier config",
-                p.display()
-            ))
-        })
+        candle_gen::gen_core::__model_input_result!(
+            candle_gen::quant::PackedConfig::from_config(&json).ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "ltx tier: {} has no `quantization.bits` — not a packed tier config",
+                    p.display()
+                ))
+            }),
+            "candle-gen-ltx::tier::TierPaths::packed_config/configuration",
+            Configuration,
+            &[&p]
+        )
     }
 
     /// Read + **validate** the tier's `group_size` against the [`crate::quant::GROUP_SIZE`] the packed
@@ -1735,7 +1740,13 @@ fn remap_diff_vae_stat_key(key: &str) -> String {
 /// Read and JSON-parse a tier manifest. Errors only on "cannot read" / "not JSON" — every schema
 /// question is the caller's, so [`Ltx25Tier::detect`] can ask the version question first.
 fn read_manifest_json(path: &Path) -> CResult<serde_json::Value> {
-    let text = std::fs::read_to_string(path)
+    let text = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(path),
+"crates/media/candle-gen/candle-gen-ltx/src/tier.rs::read_manifest_json::std::fs::read_to_string@74840",
+ArtifactInput,
+path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
         .map_err(|e| CandleError::Msg(format!("ltx 2.5 tier: read {}: {e}", path.display())))?;
     serde_json::from_str(&text)
         .map_err(|e| CandleError::Msg(format!("ltx 2.5 tier: parse {}: {e}", path.display())))

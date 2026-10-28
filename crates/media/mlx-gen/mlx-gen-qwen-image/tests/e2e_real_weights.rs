@@ -146,6 +146,10 @@ fn transformer_pipeline_vae_matches_fork() {
         "too many divergent pixels: {:.3}%",
         frac * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::transformer_pipeline_vae_matches_fork"
+    );
 }
 
 /// Transformer-isolation **diagnostic** (NOT the headline parity gate): Q-quantize the Rust
@@ -231,6 +235,10 @@ fn q_pipeline_matches_fork(golden_path: &str, bits: i32, max_latent_mean: f32, m
 fn transformer_q8_pipeline_matches_fork() {
     // Measured (512², fox, seed 42): latent mean-rel 5.0e-3, px>8 0.007%.
     q_pipeline_matches_fork(Q8_GOLDEN, 8, 3e-2, 0.02);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::transformer_q8_pipeline_matches_fork"
+    );
 }
 
 #[test]
@@ -238,6 +246,10 @@ fn transformer_q8_pipeline_matches_fork() {
 fn transformer_q4_pipeline_matches_fork() {
     // Measured (512², fox, seed 42): latent mean-rel 8.3e-3, px>8 0.006%.
     q_pipeline_matches_fork(Q4_GOLDEN, 4, 3e-2, 0.02);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::transformer_q4_pipeline_matches_fork"
+    );
 }
 
 /// sc-2565: the **headline** parity gate — the full public product path
@@ -309,6 +321,8 @@ fn q_full_generate_renders(golden_path: &str, quant: Quant, bits: i32, max_px_fr
 fn q8_full_generate_renders() {
     // Measured (512², fox, seed 42): 0.023% px>8 vs fork-Q8.
     q_full_generate_renders(Q8_GOLDEN, Quant::Q8, 8, 0.02);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::q8_full_generate_renders");
 }
 
 #[test]
@@ -317,6 +331,8 @@ fn q4_full_generate_renders() {
     // Measured (512², fox, seed 42): 0.072% px>8 vs fork-Q4 — NOT the ~18% Z-Image showed
     // transformer-only, because Qwen's fork runs the text encoder dense too (sc-2565).
     q_full_generate_renders(Q4_GOLDEN, Quant::Q4, 4, 0.02);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::q4_full_generate_renders");
 }
 
 #[test]
@@ -344,4 +360,6 @@ fn text_encoder_path_matches_fork() {
     // gate (`text_encoder_real_weights.rs`). This check just confirms the slice-4 loader yields a
     // working encoder.
     assert!(mean < 2e-2, "prompt_embeds mean-rel regressed: {mean:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::text_encoder_path_matches_fork");
 }

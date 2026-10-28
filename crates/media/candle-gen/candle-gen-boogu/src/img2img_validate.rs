@@ -191,6 +191,9 @@ fn run_img2img_gate(id: &str, guidance: Option<f32>, steps: u32, tag: &str) {
 fn real_weight_base_img2img() {
     // Base: true-CFG (guidance 4.0), a few steps past the default so the reduced tail has room.
     run_img2img_gate(crate::BOOGU_IMAGE_ID, Some(4.0), 24, "base");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_validate::real_weight_base_img2img");
 }
 
 #[test]
@@ -199,4 +202,7 @@ fn real_weight_turbo_img2img() {
     // Turbo: CFG-free distilled few-step (NO guidance — the descriptor rejects it); 8 steps so the
     // reduced img2img tail still denoises.
     run_img2img_gate(crate::BOOGU_IMAGE_TURBO_ID, None, 8, "turbo");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_validate::real_weight_turbo_img2img");
 }

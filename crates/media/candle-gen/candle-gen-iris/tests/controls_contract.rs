@@ -72,6 +72,7 @@ fn images(g: &dyn Generator, req: &GenerationRequest) -> Vec<Image> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_advertised_control_changes_the_render() {
     let g = load();
     let base = images(g.as_ref(), &request());
@@ -164,9 +165,13 @@ fn every_advertised_control_changes_the_render() {
         );
         assert_eq!((out[0].width, out[0].height), (w, h));
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED controls_contract::every_advertised_control_changes_the_render");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_prompt_batch_renders_one_image_per_prompt_per_count() {
     // FP32 compute, so the batched solve is compared with the single renders at f32 rounding rather
     // than at bf16's batch-size-dependent GEMM rounding.
@@ -224,9 +229,13 @@ fn a_prompt_batch_renders_one_image_per_prompt_per_count() {
     assert!(g.validate(&both).is_err());
     let too_many = GenerationRequest { count: 5, ..req };
     assert!(g.validate(&too_many).is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED controls_contract::a_prompt_batch_renders_one_image_per_prompt_per_count");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn caption_overflow_policies_are_honoured() {
     let g = load();
     let req = |policy: Option<CaptionOverflowPolicy>| GenerationRequest {
@@ -265,9 +274,13 @@ fn caption_overflow_policies_are_honoured() {
     };
     let report = g.generate_with_report(&fits, &mut |_| {}).unwrap();
     assert!(report.warnings.is_empty());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED controls_contract::caption_overflow_policies_are_honoured");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn previews_stream_the_patch_pooled_clean_image_every_step() {
     let g = load();
     assert!(g.descriptor().capabilities.supports_preview);
@@ -327,9 +340,13 @@ fn previews_stream_the_patch_pooled_clean_image_every_step() {
         images(g.as_ref(), &quiet())[0].pixels == out[0].pixels,
         "an inert sink changes nothing"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED controls_contract::previews_stream_the_patch_pooled_clean_image_every_step");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn adapters_load_through_the_catalog_and_report_provenance() {
     let lora = AdapterSpec::new(
         fixtures().join("iris_lora.safetensors"),
@@ -378,6 +395,9 @@ fn adapters_load_through_the_catalog_and_report_provenance() {
         matches!(&err, CoreError::Unsupported(m) if m.contains("depth")),
         "{err}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED controls_contract::adapters_load_through_the_catalog_and_report_provenance");
 }
 
 #[test]

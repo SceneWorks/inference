@@ -128,6 +128,8 @@ fn video_propagation_matches_mlx_reference_large() {
     // Temporal-consistency GO gate: every frame's mask must closely match the reference track.
     assert!(worst_cos > 0.99, "worst-frame cosine {worst_cos:.6}");
     assert!(worst_iou > 0.97, "worst-frame IoU {worst_iou:.6}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_parity::video_propagation_matches_mlx_reference_large");
 }
 
 /// sc-4750 — SAM2 **reverse** video propagation parity vs the MLX-native reference predictor
@@ -183,6 +185,8 @@ fn video_reverse_propagation_matches_mlx_reference_large() {
     // Temporal-consistency GO gate: every reverse-tracked frame must match the reference track.
     assert!(worst_cos > 0.99, "worst-frame cosine {worst_cos:.6}");
     assert!(worst_iou > 0.97, "worst-frame IoU {worst_iou:.6}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_parity::video_reverse_propagation_matches_mlx_reference_large");
 }
 
 /// F-166 regression: correcting a prompted frame *before* `propagate` — the documented
@@ -214,5 +218,9 @@ fn correction_before_propagate_does_not_panic() {
         refined.shape(),
         &[1, 1, 256, 256],
         "refined low-res mask logits"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED video_parity::correction_before_propagate_does_not_panic"
     );
 }

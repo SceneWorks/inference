@@ -231,6 +231,7 @@ fn run_naive(cfg: &MiniMaxH3DitConfig, schedule: &TimestepSchedule) -> Array {
 /// golden directly, at the fixture's own two timesteps, so the cache is anchored to the reference
 /// and not only to this crate's naive path.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_cache_reproduces_the_reference_modulation_table() {
     let cfg = dit_fixture_config();
     let f = fixture();
@@ -277,6 +278,8 @@ fn the_cache_reproduces_the_reference_modulation_table() {
             name,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::the_cache_reproduces_the_reference_modulation_table");
 }
 
 /// **The acceptance criterion.** A whole run through the precomputed table equals the same run
@@ -287,6 +290,7 @@ fn the_cache_reproduces_the_reference_modulation_table() {
 /// rows; the cached one runs **one** projection of `[num_distinct, time_embed_dim]` and indexes a
 /// global table through the schedule's remap, with the projection weights already released.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_precomputed_path_reproduces_the_naive_per_step_run() {
     let cfg = dit_fixture_config();
     for steps in [2usize, 5, 9] {
@@ -306,11 +310,14 @@ fn the_precomputed_path_reproduces_the_naive_per_step_run() {
             "{steps} steps: the precomputed path diverges from the naive one by {peak:.3e}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::the_precomputed_path_reproduces_the_naive_per_step_run");
 }
 
 /// The residual the mutations below have to clear. Printed on every run and asserted to stay well
 /// under `MUTATION_FLOOR`, so a suite whose mutations sat in its own jitter would fail here first.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn precompute_residual_bounds_the_mutation_floor() {
     let cfg = dit_fixture_config();
     let schedule = joint_schedule(5);
@@ -322,6 +329,10 @@ fn precompute_residual_bounds_the_mutation_floor() {
         peak * 10.0 < MUTATION_FLOOR,
         "the residual {peak:.3e} is within 10x of the mutation floor {MUTATION_FLOOR:.1e}; the \
          mutation tests would be reporting jitter"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED adaln_cache::precompute_residual_bounds_the_mutation_floor"
     );
 }
 
@@ -335,6 +346,7 @@ fn precompute_residual_bounds_the_mutation_floor() {
 /// Both schedules have the same step count and the same table shape, so nothing structural
 /// separates them. This is the failure a held-across-requests cache would have.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_cache_from_another_schedule_is_stale_and_observably_wrong() {
     let cfg = dit_fixture_config();
     // Two schedules built to be structurally INDISTINGUISHABLE: same steps, same row classes,
@@ -399,11 +411,14 @@ fn a_cache_from_another_schedule_is_stale_and_observably_wrong() {
         peak > MUTATION_FLOOR,
         "a stale cache moved the output only {peak:.3e} — the parity test could not see it"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::a_cache_from_another_schedule_is_stale_and_observably_wrong");
 }
 
 /// Using step `i-1`'s remap at step `i` — the classic off-by-one in a cached loop. Every index
 /// stays in range, so nothing fails structurally.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_step_off_by_one_in_the_remap_is_observable() {
     let cfg = dit_fixture_config();
     let schedule = joint_schedule(5);
@@ -443,12 +458,17 @@ fn a_step_off_by_one_in_the_remap_is_observable() {
         peak > MUTATION_FLOOR,
         "a one-step-stale remap moved the output only {peak:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED adaln_cache::a_step_off_by_one_in_the_remap_is_observable"
+    );
 }
 
 /// Addressing the **global** table with a step's **local** timestep index — i.e. forgetting the
 /// remap entirely. In range for every step (the table has more rows than a step has timesteps),
 /// and wrong at every step but the first.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn skipping_the_local_to_global_remap_is_observable() {
     let cfg = dit_fixture_config();
     let schedule = joint_schedule(5);
@@ -489,6 +509,8 @@ fn skipping_the_local_to_global_remap_is_observable() {
         peak > MUTATION_FLOOR,
         "skipping the remap moved the output only {peak:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::skipping_the_local_to_global_remap_is_observable");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -498,6 +520,7 @@ fn skipping_the_local_to_global_remap_is_observable() {
 /// The cache is keyed on the schedule, not fixed at a step count. Every pair of the five lengths
 /// tested must key differently and must reject each other's caches.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_cache_is_keyed_by_the_whole_schedule() {
     let cfg = dit_fixture_config();
     let schedules: Vec<TimestepSchedule> = [2usize, 4, 5, 8, 20]
@@ -532,11 +555,16 @@ fn the_cache_is_keyed_by_the_whole_schedule() {
             a.key()
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED adaln_cache::the_cache_is_keyed_by_the_whole_schedule"
+    );
 }
 
 /// The cache does not grow with resolution or duration — only with the schedule. Same schedule,
 /// two very different packed-sequence lengths, identical cache bytes.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_cache_size_tracks_the_schedule_and_nothing_else() {
     let cfg = dit_fixture_config();
     let mut blocks = stack(&cfg);
@@ -566,6 +594,8 @@ fn the_cache_size_tracks_the_schedule_and_nothing_else() {
         small.bytes(),
         big.bytes()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::the_cache_size_tracks_the_schedule_and_nothing_else");
 }
 
 /// Two of the four row classes are the SAME timestep at every step, so the global union is far
@@ -595,6 +625,7 @@ fn the_constant_row_classes_collapse_across_the_schedule() {
 /// After the evict the block still runs — `forward` never touched the projection — while every
 /// path that needs the projection is a typed error naming the way out.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn an_evicted_block_still_runs_but_cannot_project() {
     let cfg = dit_fixture_config();
     let mut blocks = stack(&cfg);
@@ -659,6 +690,8 @@ fn an_evicted_block_still_runs_but_cannot_project() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("already been evicted"), "{e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::an_evicted_block_still_runs_but_cannot_project");
 }
 
 /// **The recorded decision.** A sampler whose evaluation timesteps are not enumerable up front is
@@ -666,6 +699,7 @@ fn an_evicted_block_still_runs_but_cannot_project() {
 /// projections are gone would mean re-reading 26 GB mid-denoise. `AdaLnResidency::Resident` is
 /// therefore a rejection here, and the error names the per-step path that replaces it.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn resident_residency_refuses_to_precompute_and_evict() {
     let cfg = dit_fixture_config();
     let mut blocks = stack(&cfg);
@@ -688,6 +722,8 @@ fn resident_residency_refuses_to_precompute_and_evict() {
     blocks[0]
         .modulation(f.require("in.temb").unwrap())
         .expect("Resident keeps the projection");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cache::resident_residency_refuses_to_precompute_and_evict");
 }
 
 /// The other half of the exclusion: a timestep the schedule was not built with is a typed error,
@@ -741,6 +777,7 @@ fn an_off_grid_midpoint_timestep_is_rejected_rather_than_rounded() {
 /// caller that embedded per step rather than per distinct timestep would otherwise build a table of
 /// the wrong height and index it out of range.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_mis_shaped_timestep_embedding_is_rejected_before_eviction() {
     let cfg = dit_fixture_config();
     let mut blocks = stack(&cfg);

@@ -350,6 +350,7 @@ fn paths(report: &DenoiseReport, branch: PromptBranch) -> Vec<EvaluationPath> {
 /// `prefill` and zero bytes); hard-coding the reported path or bytes; reporting only the positive
 /// branch's bytes under true CFG; deriving the bytes at bf16 on the f32 CPU lane.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cached_selection_renders_from_the_cache_and_reports_its_derived_bytes() {
     let turbo = turbo_snapshot();
     let tmp = tempfile::tempdir().unwrap();
@@ -413,6 +414,9 @@ fn a_cached_selection_renders_from_the_cache_and_reports_its_derived_bytes() {
             assert_within_price(&tag, &fixture, &req, &got);
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_admission::a_cached_selection_renders_from_the_cache_and_reports_its_derived_bytes");
 }
 
 /// **A shed selection is exactly the prefill path, and so is a request that selects nothing** —
@@ -423,6 +427,7 @@ fn a_cached_selection_renders_from_the_cache_and_reports_its_derived_bytes() {
 /// *Mutations that red this:* ignoring a `Prefill` selection (it reports `cached`); defaulting an
 /// unset request to the cache.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_shed_selection_and_an_unset_request_are_the_prefill_path() {
     let turbo = turbo_snapshot();
     for fixture in dense(&turbo) {
@@ -457,6 +462,9 @@ fn a_shed_selection_and_an_unset_request_are_the_prefill_path() {
             }
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_admission::a_shed_selection_and_an_unset_request_are_the_prefill_path");
 }
 
 /// **Several images hold one image's caches at a time.** A `count: 2` cached request renders two
@@ -465,6 +473,7 @@ fn a_shed_selection_and_an_unset_request_are_the_prefill_path() {
 ///
 /// *Mutation that reds this:* accumulating the reported bytes across images.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_two_image_cached_request_reports_one_images_cache_bytes() {
     let turbo = turbo_snapshot();
     for fixture in dense(&turbo) {
@@ -482,6 +491,9 @@ fn a_two_image_cached_request_reports_one_images_cache_bytes() {
         assert_eq!(two.ran, one.ran, "{tag}: one image's caches, not two");
         assert_within_price(&tag, &fixture, &double, &two);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_admission::a_two_image_cached_request_reports_one_images_cache_bytes");
 }
 
 /// A prompt whose positive branch has exactly `rows` text rows on `fixture`'s tokenizer, found
@@ -530,6 +542,7 @@ fn prompt_with_text_rows(fixture: &Fixture, rows: u64) -> String {
 /// comparing with `>=` (the at-bound prompt sheds); failing the render instead of shedding;
 /// reporting the shed as prefill-by-selection.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_prompt_past_the_priced_text_bound_runs_prefill_and_reports_the_overflow() {
     let tmp = tempfile::tempdir().unwrap();
     for fixture in [
@@ -599,6 +612,9 @@ fn a_prompt_past_the_priced_text_bound_runs_prefill_and_reports_the_overflow() {
         assert_eq!(unset.ran, PREFILL_BY_SELECTION, "{tag}");
         assert!(unset.warnings.is_empty(), "{tag}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_admission::a_prompt_past_the_priced_text_bound_runs_prefill_and_reports_the_overflow");
 }
 
 /// The worker's admitted `Resident` context for `req`, with an unlimited budget.
@@ -696,6 +712,7 @@ fn admit_and_render(
 /// ignoring a `Cached` selection (the roomy request reports `prefill`); admitting the
 /// fits-neither request.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_request_between_the_two_budgets_is_admitted_and_runs_prefill() {
     // The caller's own cache-shed demand for these requests — any number; this crate publishes
     // no activation table, so it is not derived here.
@@ -798,6 +815,9 @@ fn a_request_between_the_two_budgets_is_admitted_and_runs_prefill() {
             }
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_admission::a_request_between_the_two_budgets_is_admitted_and_runs_prefill");
 }
 
 /// **The ordering trap, pinned.** The request scope's `configure_request` *replaces*
@@ -811,6 +831,7 @@ fn a_request_between_the_two_budgets_is_admitted_and_runs_prefill() {
 /// selection would survive) — at which point the documented ordering rule is stale and must be
 /// rewritten with it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_selection_written_before_the_scope_configures_the_request_is_lost() {
     let turbo = turbo_snapshot();
     for fixture in dense(&turbo) {
@@ -843,6 +864,9 @@ fn a_selection_written_before_the_scope_configures_the_request_is_lost() {
         scope.finish(MemoryRunOutcome::Complete).unwrap();
         assert_eq!(kept.ran.path, PrefixKvCacheMode::Cached, "{tag}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_admission::a_selection_written_before_the_scope_configures_the_request_is_lost");
 }
 
 /// **A selection the checkpoint cannot honour is refused, never run as the other mode.** The
@@ -855,6 +879,7 @@ fn a_selection_written_before_the_scope_configures_the_request_is_lost() {
 /// back to prefill, as upstream's `use_kv_cache and causal_condition` does, and the render
 /// succeeds).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cached_selection_on_a_checkpoint_with_no_causal_prefix_is_refused_by_name() {
     let snapshot = crate::common::copy_of_tiny_snapshot();
     let root = snapshot.path();
@@ -884,4 +909,7 @@ fn a_cached_selection_on_a_checkpoint_with_no_causal_prefix_is_refused_by_name()
     );
     let unset = render(generator.as_ref(), &request(false));
     assert_eq!(unset.ran, PREFILL_BY_SELECTION);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kv_admission::a_cached_selection_on_a_checkpoint_with_no_causal_prefix_is_refused_by_name");
 }

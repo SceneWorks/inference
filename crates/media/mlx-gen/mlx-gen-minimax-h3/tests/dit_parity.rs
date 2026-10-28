@@ -371,6 +371,7 @@ fn the_keyframe_anchor_rows_match_the_reference() {
 /// chunked the `[T, 18·hidden]` projection directly produces six tensors of the same total size
 /// with different contents.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn adaln_modulation_matches_the_reference() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -400,11 +401,14 @@ fn adaln_modulation_matches_the_reference() {
             name,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::adaln_modulation_matches_the_reference");
 }
 
 /// One `MiniMaxH3TransformerBlock`: pre-norm + AdaLN modulation, qk-normed MM-RoPE attention,
 /// gated residual, SwiGLU feed-forward, gated residual.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn transformer_block_matches_the_reference() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -430,11 +434,14 @@ fn transformer_block_matches_the_reference() {
         TOL,
         "dit block",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::transformer_block_matches_the_reference");
 }
 
 /// Bare attention, so a qk-norm or rotary error localizes instead of only appearing folded into
 /// the block's two gated residuals. Both configurations are covered: with the rotary (the block's)
 /// and without it (the refiner's).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn attention_matches_the_reference_with_and_without_the_rotary() {
     let f = fixture();
@@ -473,6 +480,8 @@ fn attention_matches_the_reference_with_and_without_the_rotary() {
         peak > MUTATION_FLOOR,
         "applying the rotary changed nothing ({peak:.3e}); it is not reaching attention"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::attention_matches_the_reference_with_and_without_the_rotary");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -480,6 +489,7 @@ fn attention_matches_the_reference_with_and_without_the_rotary() {
 // ---------------------------------------------------------------------------------------------
 
 /// Both refiner blocks and the `final_norm`, against the reference.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn token_refiner_matches_the_reference() {
     let f = fixture();
@@ -526,11 +536,14 @@ fn token_refiner_matches_the_reference() {
         vs_block0 > MUTATION_FLOOR,
         "block 1 and final_norm contribute nothing ({vs_block0:.3e}); a 1-layer refiner would pass"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::token_refiner_matches_the_reference");
 }
 
 /// Every refiner tensor must be load-bearing. The refiner is 21 of the 638 published tensors and
 /// the easiest thing in this port to leave half-wired; the lightx2v turbo LoRAs (sc-18724) target
 /// 24 tensors here, and a partially-wired refiner would silently drop them.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn every_refiner_weight_is_load_bearing() {
     let f = fixture();
@@ -563,6 +576,8 @@ fn every_refiner_weight_is_load_bearing() {
             "perturbing {key} moved the refiner by only {peak:.3e}; it is not wired in"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::every_refiner_weight_is_load_bearing");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -579,6 +594,7 @@ fn every_refiner_weight_is_load_bearing() {
 ///
 /// The two orders are genuinely distinguishable only because the norm weight is non-constant: the
 /// rotary mixes channels, so a per-channel scale does not commute with it.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn qk_norm_runs_per_head_before_the_rotary() {
     let f = fixture();
@@ -679,6 +695,8 @@ fn qk_norm_runs_per_head_before_the_rotary() {
              pin the qk-norm"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::qk_norm_runs_per_head_before_the_rotary");
 }
 
 /// **All three epsilons must reach their norms** — `qk_norm_eps`, `norm_eps` and `final_norm_eps`.
@@ -692,6 +710,7 @@ fn qk_norm_runs_per_head_before_the_rotary() {
 /// knobs (`refiner.rs` deliberately reads `final_norm_eps` for `final_norm` and `norm_eps` for the
 /// block norms), so a variant checkpoint that diverged would otherwise run silently wrong.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn every_norm_epsilon_is_wired_through() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -753,6 +772,8 @@ fn every_norm_epsilon_is_wired_through() {
             "changing {name} moved its module by only {peak:.3e}; the config field is inert"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::every_norm_epsilon_is_wired_through");
 }
 
 /// A qk-norm sized to the 7168-wide projection instead of to a 128-wide head is the plausible wrong
@@ -835,6 +856,7 @@ fn published_ffn_projection_is_value_then_gate() {
 /// and the printed norms and cosine show why a magnitude, std or checksum assertion of any
 /// tolerance would not.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn reading_the_ffn_halves_gate_first_breaks_parity() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -879,6 +901,8 @@ fn reading_the_ffn_halves_gate_first_breaks_parity() {
         vs_ref > TOL,
         "the source-layout block still matches the reference within {TOL:.0e} ({vs_ref:.3e})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::reading_the_ffn_halves_gate_first_breaks_parity");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -976,6 +1000,7 @@ fn published_qkv_is_contiguous_thirds_of_the_reordered_fused_projection() {
 
 /// Feeding the attention a QKV set produced by the *wrong* transform must break parity — the
 /// numeric consequence of the contract above, measured rather than assumed.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_wrong_qkv_transform_breaks_parity() {
     let f = fixture();
@@ -1022,6 +1047,8 @@ fn the_wrong_qkv_transform_breaks_parity() {
         peak > MUTATION_FLOOR,
         "the wrong QKV partition moved attention by only {peak:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::the_wrong_qkv_transform_breaks_parity");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1031,6 +1058,7 @@ fn the_wrong_qkv_transform_breaks_parity() {
 /// **`adaln_indices = timestep_index · MODALITY_NUM + tag`.** The modality term must be present:
 /// dropping it (addressing by timestep alone) is a legal index vector that selects the wrong rows.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn the_modality_term_of_the_adaln_index_is_load_bearing() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1089,6 +1117,8 @@ fn the_modality_term_of_the_adaln_index_is_load_bearing() {
             "addressing the AdaLN table by `{label}` reproduced the golden ({peak:.3e})"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing");
 }
 
 /// **The `view(-1, 6·hidden)`-before-`chunk(6)` row layout.** Chunking the `[T, 18·hidden]`
@@ -1096,6 +1126,7 @@ fn the_modality_term_of_the_adaln_index_is_load_bearing() {
 /// different contents; this reconstructs that wrong reading from the fixture's own weights and
 /// shows the six tables differ.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn the_adaln_table_is_reshaped_before_it_is_chunked() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1131,6 +1162,8 @@ fn the_adaln_table_is_reshaped_before_it_is_chunked() {
         "chunking before the reshape produced the same shift_msa ({peak:.3e}); the row layout is \
          not pinned"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1140,6 +1173,7 @@ fn the_adaln_table_is_reshaped_before_it_is_chunked() {
 /// Every one of a block's 12 tensors must move the output. A tensor that can be changed without
 /// changing the result is not wired into the graph and the parity test is not covering it.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn every_block_weight_is_load_bearing() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1180,6 +1214,8 @@ fn every_block_weight_is_load_bearing() {
              graph or no longer observable here"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::every_block_weight_is_load_bearing");
 }
 
 /// Measure and print the parity residual of every stage, and require the whole ladder to sit well
@@ -1191,6 +1227,7 @@ fn every_block_weight_is_load_bearing() {
 /// matmul ever drifts up to meet the floor, this fails here instead of quietly turning every
 /// mutation test into a coin flip.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn parity_residuals_bound_the_mutation_floor() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -1263,6 +1300,10 @@ fn parity_residuals_bound_the_mutation_floor() {
         MUTATION_FLOOR > 2.0 * worst,
         "the mutation floor {MUTATION_FLOOR:.1e} is not clear of the {worst:.3e} numeric residual; \
          every mutation gate in this file would be measuring jitter"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED dit_parity::parity_residuals_bound_the_mutation_floor"
     );
 }
 
@@ -1348,6 +1389,7 @@ fn fixture_is_not_degenerate() {
 /// The declared tensor names must be exactly the fixture's block + refiner tensor set, and every
 /// one must be consumed. A silently unmapped tensor still produces plausible output.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn weight_mapping_is_exhaustive_over_the_block_stack() {
     let cfg = dit_fixture_config();
 

@@ -892,9 +892,14 @@ fn packed_component(root: &std::path::Path, component: &str) -> Result<bool> {
         }
     };
     if !bytes.is_empty() {
-        let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-            CandleError::Msg(format!("{LABEL}: parse {}: {error}", config_path.display()))
-        })?;
+        let config: serde_json::Value = candle_gen::gen_core::__model_input_result!(
+            serde_json::from_slice(&bytes).map_err(|error| {
+                CandleError::Msg(format!("{LABEL}: parse {}: {error}", config_path.display()))
+            }),
+            "candle-gen-wan::training::packed_component/configuration",
+            Configuration,
+            &[&config_path]
+        )?;
         if candle_gen::quant::PackedConfig::from_config(&config).is_some() {
             return Ok(true);
         }
@@ -1709,6 +1714,7 @@ mod tests {
     /// ISOLATION: does `build_lora_targets` + `set.vars[i].set(..)` propagate to the installed
     /// LoraLinear's forward, with NO Wan dit involved? (Pins the harness mechanism in this crate.)
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn harness_factor_set_propagates_to_forward() {
         use candle_gen::candle_nn::{Linear, Module};
         use candle_gen::train::lora::{LoraHost, LoraLinear};
@@ -1753,6 +1759,9 @@ mod tests {
             y0, y1,
             "setting set.vars must change the installed LoraLinear forward"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::harness_factor_set_propagates_to_forward");
     }
 
     #[test]
@@ -1854,6 +1863,7 @@ mod tests {
     /// The keystone training gate: a real flow-match forward+backward over the tiny DiT with nonzero
     /// LoRA factors yields a finite loss and a gradient on **every** adapter `Var`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn backward_reaches_lora_factors() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1906,9 +1916,13 @@ mod tests {
         );
         // 4 projections × 2 attentions (attn1 self + attn2 cross) × num_layers, ×2 factors.
         assert_eq!(set.vars.len(), 4 * 2 * cfg.num_layers * 2);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::backward_reaches_lora_factors");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn i2v_channel_padding_reaches_lora_factors() {
         let dev = Device::Cpu;
         let cfg = tiny_i2v_cfg();
@@ -1944,6 +1958,9 @@ mod tests {
         .unwrap();
         assert!(loss.is_finite());
         assert!(set.vars.iter().any(|v| grads.get(v.as_tensor()).is_some()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::i2v_channel_padding_reaches_lora_factors");
     }
 
     /// The correctness gate for the gradient-checkpointed backward (the path real training always uses):
@@ -1951,6 +1968,7 @@ mod tests {
     /// All Wan adapters live in the checkpointed block stack (no retained pre-main adapters), so this
     /// spans every adapter target.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dense_and_checkpoint_grads_match() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -2029,12 +2047,18 @@ mod tests {
             }
         }
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED training::tests::dense_and_checkpoint_grads_match"
+        );
     }
 
     /// sc-24828: subject-masked loss on both backward paths (the checkpointed one is what every
     /// real expert step runs). An all-ones map is the unweighted loss; an all-zero map zeroes the loss
     /// AND every adapter gradient (dense and checkpointed); a half map matches across paths.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -2105,11 +2129,15 @@ mod tests {
         ] {
             assert!(d.techniques.subject_mask_loss, "{}", d.id);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 
     /// A few optimizer steps on a fixed batch lower the loss — the step descends the flow-match
     /// objective end to end through the harness.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn one_optimizer_step_descends() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -2182,6 +2210,9 @@ mod tests {
             loss1 < loss0,
             "5 steps on a fixed batch should lower the loss: {loss0} -> {loss1}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::one_optimizer_step_descends");
     }
 
     /// The trainer resolves through the explicit family registry as the candle Wan
@@ -2465,6 +2496,7 @@ mod depth_anchoring_tests {
     /// gradient; a diffusion step (key 1) carries no depth term. Mutation: compute the diffusion
     /// term unconditionally in `step_loss` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let f = fixture();
         let p = prepared(&f, schedule(0.0, 1.0));
@@ -2512,11 +2544,15 @@ mod depth_anchoring_tests {
                 .sum();
             assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B grad {gb}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths");
     }
 
     /// AC (c): depth off ⇒ bit-identical to the legacy step (its body reproduced here), and a
     /// diffusion-only planned step equals it too. Mutation: scale the diffusion loss (×1.0001) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_off_is_bit_identical_to_the_legacy_step() {
         assert!(load_perceptual_path(
             &TrainingConfig::default(),
@@ -2558,6 +2594,9 @@ mod depth_anchoring_tests {
             grad_bits(&g_on, &f.set.vars),
             grad_bits(&g_off, &f.set.vars)
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// Each expert trains its aux steps only inside its band: with the depth window `[0.2, 0.6]`
@@ -2567,6 +2606,7 @@ mod depth_anchoring_tests {
     /// consecutive updates never both train aux-only (sc-2124). Mutations: drop the band
     /// confinement ⇒ red; build the alternation with `accum` alone ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn aux_steps_stay_inside_each_experts_band_and_update_window() {
         let f = fixture();
         let p = prepared(&f, schedule(0.2, 0.6));
@@ -2629,6 +2669,9 @@ mod depth_anchoring_tests {
                 "expert {ei}: two aux-only updates in a row {updates:?}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::aux_steps_stay_inside_each_experts_band_and_update_window");
     }
 
     /// AC (d), E7: depth grows the guarded footprint by TAEHV + DA2 (more for Large), the guard
@@ -2749,6 +2792,7 @@ mod subject_mask_reference_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_video_reference_path_hands_each_entry_its_items_mask() {
         let dir = tempfile::tempdir().unwrap();
         let img = write_png(dir.path(), "img.png", |_, _| 128);
@@ -2812,5 +2856,8 @@ mod subject_mask_reference_tests {
             );
         }
         assert_ne!(seen[0], seen[1], "each entry carries its own item's mask");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::subject_mask_reference_tests::the_video_reference_path_hands_each_entry_its_items_mask");
     }
 }

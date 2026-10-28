@@ -21,6 +21,15 @@
 //! decode is deterministic, identical rows produce identical outputs, and retirement/compaction is
 //! structurally exact. Bit-exact differing-length batching is what paged attention (story 7257) buys.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::time::Instant;
 
 use candle_llm::config::ModelConfig;
@@ -103,6 +112,8 @@ fn common_prefix(a: &[i32], b: &[i32]) -> usize {
 fn batch_of_one_matches_single() {
     let Some(fx) = load() else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/batch.rs:106 (batch_of_one_matches_single): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     for text in [
@@ -128,6 +139,9 @@ fn batch_of_one_matches_single() {
         );
         assert_eq!(batched[0].finish_reason, single_fin);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED batch_of_one_matches_single");
 }
 
 /// Identical input rows in one batch produce identical outputs — adding rows does not corrupt a row,
@@ -137,6 +151,8 @@ fn batch_of_one_matches_single() {
 fn identical_rows_are_identical() {
     let Some(fx) = load() else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/batch.rs:140 (identical_rows_are_identical): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let p = encode(&fx.tok, "The capital of France is");
@@ -166,6 +182,9 @@ fn identical_rows_are_identical() {
             "row {i} streamed ids must reconstruct the output"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED identical_rows_are_identical");
 }
 
 /// The whole batched run is deterministic: the same batch produces the same outputs every time.
@@ -174,6 +193,8 @@ fn identical_rows_are_identical() {
 fn batched_decode_is_reproducible() {
     let Some(fx) = load() else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/batch.rs:177 (batched_decode_is_reproducible): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let reqs = vec![
@@ -192,6 +213,9 @@ fn batched_decode_is_reproducible() {
     let b = run_batch(&fx, &reqs);
     assert_eq!(a, b, "batched decode must be reproducible");
     assert!(a.iter().all(|r| !r.is_empty()));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED batched_decode_is_reproducible");
 }
 
 /// N differing-length requests complete coherently under one device context, and each row tracks its
@@ -202,6 +226,8 @@ fn batched_decode_is_reproducible() {
 fn differing_lengths_complete_and_track_batch1() {
     let Some(fx) = load() else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/batch.rs:205 (differing_lengths_complete_and_track_batch1): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let prompts = [
@@ -243,6 +269,9 @@ fn differing_lengths_complete_and_track_batch1() {
             "row {i} must agree with batch-1 on at least the prefill argmax"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED differing_lengths_complete_and_track_batch1");
 }
 
 /// Differing `max_new_tokens` retire sequences at different steps, exercising mid-batch retirement and
@@ -253,6 +282,8 @@ fn differing_lengths_complete_and_track_batch1() {
 fn retirement_and_compaction_respects_budgets() {
     let Some(fx) = load() else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/batch.rs:256 (retirement_and_compaction_respects_budgets): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let prompts = [
@@ -291,6 +322,9 @@ fn retirement_and_compaction_respects_budgets() {
         );
         assert!(cp >= 1, "row {i} must track its batch-1 run");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED retirement_and_compaction_respects_budgets");
 }
 
 /// A mid-stream cancel stops the whole batch promptly; rows still running finish `Cancelled` with
@@ -300,6 +334,8 @@ fn retirement_and_compaction_respects_budgets() {
 fn mid_stream_cancel_stops_the_batch() {
     let Some(fx) = load() else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/batch.rs:303 (mid_stream_cancel_stops_the_batch): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let prompts = [
@@ -331,6 +367,9 @@ fn mid_stream_cancel_stops_the_batch() {
             "cancel should stop well before the budget"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mid_stream_cancel_stops_the_batch");
 }
 
 /// The story's throughput acceptance: a multi-request batch streams in less wall-clock than running
@@ -342,6 +381,8 @@ fn mid_stream_cancel_stops_the_batch() {
 fn batched_throughput_beats_sequential() {
     let Some(fx) = load() else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/batch.rs:345 (batched_throughput_beats_sequential): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let n = 8usize;
@@ -441,4 +482,7 @@ fn batched_throughput_beats_sequential() {
              exactly once; a per-row loop wearing a batch signature drains one row at a time"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED batched_throughput_beats_sequential");
 }

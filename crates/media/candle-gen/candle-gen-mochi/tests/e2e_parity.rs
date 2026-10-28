@@ -231,4 +231,7 @@ fn e2e_final_latents_match_golden() {
         "E2E final mean_rel {mr:.3e} exceeds 2× the schedule's precision-sensitivity band \
          {chaos_band:.3e} — beyond chaos, pointing to a structural regression"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_parity::e2e_final_latents_match_golden");
 }

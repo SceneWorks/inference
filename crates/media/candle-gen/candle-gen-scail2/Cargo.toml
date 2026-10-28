@@ -27,6 +27,7 @@ safetensors = "0.7"
 sha2 = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen-wan/model-inference-proof", "candle-gen/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-wan/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-wan/cuda"]

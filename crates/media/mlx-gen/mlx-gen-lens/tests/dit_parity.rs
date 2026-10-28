@@ -158,4 +158,6 @@ fn lens_dit_matches_reference() {
         "full forward cosine {out_cos:.7} ≤ 0.9999"
     );
     eprintln!("ALL PASS");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::lens_dit_matches_reference");
 }

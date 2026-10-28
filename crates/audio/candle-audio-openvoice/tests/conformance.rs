@@ -41,6 +41,16 @@
 //! Whisper's own error on the converted clip is higher; the bound still fails hard on scrambled
 //! (garbled) content. A control CER against the transcript of the SOURCE clip is also reported.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_chatterbox_ve as ve;
@@ -294,6 +304,9 @@ fn openvoice_v2_converts_toward_the_target_voice() {
     candle_audio::wav::write_wav_pcm16(std::path::Path::new(&out_path), converted)
         .expect("write converted wav");
     eprintln!("wrote converted clip: {out_path} ({conv_secs:.2}s, peak {peak:.3})");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED openvoice_v2_converts_toward_the_target_voice");
 }
 
 /// Determinism: same request + seed ⇒ byte-identical converted samples.
@@ -318,4 +331,7 @@ fn openvoice_v2_is_deterministic() {
         a[0].samples, b[0].samples,
         "same request + seed ⇒ identical samples"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED openvoice_v2_is_deterministic");
 }

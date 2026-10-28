@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -16,6 +16,10 @@ use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(target_vendor = "apple")]
+#[path = "runtime_clone.rs"]
+mod bounded_clone_laws;
+
 #[cfg(test)]
 #[derive(Debug)]
 struct SealHashWork(AtomicUsize);
@@ -23,6 +27,7 @@ struct SealHashWork(AtomicUsize);
 #[cfg(test)]
 thread_local! {
     static THREAD_FULL_HASH_WORK: Cell<usize> = const { Cell::new(0) };
+    static THREAD_HASH_BYTES_READ: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -295,6 +300,153 @@ fn path_component_fingerprints(path: &Path) -> std::io::Result<Vec<PathComponent
         .collect()
 }
 
+// These helpers are private to the Apple guarded seal path. The native cross-platform
+// algorithms above remain unchanged, including their metadata/error ordering.
+#[cfg(target_vendor = "apple")]
+fn bounded_stat_fingerprint(
+    path: &Path,
+    follow: bool,
+    next: &mut dyn FnMut(u64) -> crate::Result<()>,
+) -> crate::Result<FileStatFingerprint> {
+    use crate::source_inventory::bounded_fs as fs;
+    let stat = fs::stat(path, follow, next)?;
+    let is_symlink = !follow && fs::is_link(&stat);
+    let seconds = stat.st_mtime;
+    let modified = if seconds >= 0 {
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds as u64))
+    } else {
+        std::time::UNIX_EPOCH.checked_sub(std::time::Duration::from_secs(seconds.unsigned_abs()))
+    }
+    .and_then(|time| time.checked_add(std::time::Duration::from_nanos(stat.st_mtime_nsec as u64)));
+    Ok(FileStatFingerprint {
+        size: stat.st_size as u64,
+        modified,
+        is_symlink,
+        symlink_target: if is_symlink {
+            Some(fs::read_link(path, next)?)
+        } else {
+            None
+        },
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+        changed_seconds: stat.st_ctime,
+        changed_nanoseconds: stat.st_ctime_nsec,
+    })
+}
+#[cfg(target_vendor = "apple")]
+fn bounded_clone_stat(
+    source: &FileStatFingerprint,
+    next: &mut dyn FnMut(u64) -> crate::Result<()>,
+) -> crate::Result<FileStatFingerprint> {
+    use crate::source_inventory::bounded_fs as fs;
+    Ok(FileStatFingerprint {
+        size: source.size,
+        modified: source.modified,
+        is_symlink: source.is_symlink,
+        symlink_target: source
+            .symlink_target
+            .as_deref()
+            .map(|p| fs::copy_path(p, next))
+            .transpose()?,
+        device: source.device,
+        inode: source.inode,
+        changed_seconds: source.changed_seconds,
+        changed_nanoseconds: source.changed_nanoseconds,
+    })
+}
+#[cfg(target_vendor = "apple")]
+fn bounded_path_components(
+    path: &Path,
+    next: &mut dyn FnMut(u64) -> crate::Result<()>,
+) -> crate::Result<Vec<PathComponentFingerprint>> {
+    use crate::source_inventory::bounded_fs as fs;
+    let count = path
+        .ancestors()
+        .skip(1)
+        .filter(|p| !p.as_os_str().is_empty())
+        .count();
+    let mut result = fs::vec(count, next)?;
+    for parent in path
+        .ancestors()
+        .skip(1)
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        let metadata = fs::stat(parent, false, next)?;
+        let is_symlink = fs::is_link(&metadata);
+        result.push(PathComponentFingerprint {
+            path: fs::copy_path(parent, next)?,
+            is_symlink,
+            symlink_target: if is_symlink {
+                Some(fs::read_link(parent, next)?)
+            } else {
+                None
+            },
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino,
+        });
+    }
+    result.reverse();
+    Ok(result)
+}
+
+/// ArcInner is repr(C) { strong: AtomicUsize, weak: AtomicUsize, data: T }
+/// (alloc/src/sync.rs). This is its actual payload layout, NOT Layout<Arc<T>>.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn bounded_arc_layout<T>() -> crate::Result<u64> {
+    std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+        .extend(std::alloc::Layout::new::<T>())
+        .map(|(layout, _)| layout.pad_to_align().size() as u64)
+        .map_err(|_| crate::source_inventory::bounded_fs::overflow())
+}
+
+/// What work an artifact-seal observation actually represents. Metadata is not a content read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactSealAcquisition {
+    Metadata,
+    ColdContentRead,
+    MemoryMemo,
+    PersistedMemo,
+    DriftAudit,
+}
+
+/// Completing a read does not authorize a seal; only Acquired follows identity validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactSealProgressState {
+    Reading,
+    ReadComplete,
+    Acquired,
+    Canceled,
+    Failed,
+}
+
+/// Observational source work, never an authorization token or an estimated fraction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactSealProgress {
+    pub loader_path: PathBuf,
+    pub acquisition: ArtifactSealAcquisition,
+    pub state: ArtifactSealProgressState,
+    /// Actual bytes fed to SHA-256 in this read; memo acquisition always reports zero.
+    pub hashed_bytes: u64,
+    /// Declared file size at capture/open, not a cap on actual reads. Unknown before metadata.
+    pub source_bytes: Option<u64>,
+}
+
+fn seal_progress(
+    path: &Path,
+    acquisition: ArtifactSealAcquisition,
+    state: ArtifactSealProgressState,
+    hashed_bytes: u64,
+    source_bytes: Option<u64>,
+) -> ArtifactSealProgress {
+    ArtifactSealProgress {
+        loader_path: path.to_path_buf(),
+        acquisition,
+        state,
+        hashed_bytes,
+        source_bytes,
+    }
+}
+
 /// A re-openable single-file weights source pinned without canonicalizing its loader path.
 ///
 /// The retained path is absolute but otherwise lexical: an extension-bearing snapshot symlink stays
@@ -336,7 +488,9 @@ pub type PinnedWeightsFile = ArtifactSeal;
 pub struct PreparedFilePins {
     prepared: bool,
     finalized: bool,
-    pins: BTreeMap<PathBuf, PinnedWeightsFile>,
+    // Sorted unique lexical keys. A Vec makes the requested payload layout public
+    // and finite for guarded binding; no private std BTree node ABI is assumed.
+    pins: Vec<(PathBuf, PinnedWeightsFile)>,
 }
 
 impl PreparedFilePins {
@@ -359,15 +513,18 @@ impl PreparedFilePins {
     }
 
     pub fn get(&self, path: &Path) -> Option<&PinnedWeightsFile> {
-        self.pins.get(path)
+        self.pins
+            .binary_search_by(|(key, _)| key.as_path().cmp(path))
+            .ok()
+            .map(|index| &self.pins[index].1)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&PathBuf, &PinnedWeightsFile)> {
-        self.pins.iter()
+        self.pins.iter().map(|(path, pin)| (path, pin))
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &PathBuf> {
-        self.pins.keys()
+        self.pins.iter().map(|(path, _)| path)
     }
 }
 
@@ -378,7 +535,7 @@ impl PreparedFilePins {
 /// subset. Two pins agreeing on all of it are, by the seal's own definition, pins of the same
 /// unmutated object, which is what makes reusing a digest between them sound rather than merely
 /// convenient.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SealIdentity {
     loader_path: PathBuf,
     canonical_target_path: PathBuf,
@@ -435,9 +592,249 @@ fn remember_proven_digest(identity: SealIdentity, sha256: [u8; 32]) {
     digests.insert(identity, sha256);
 }
 
+/// Consumer-chosen directory that carries [`PROVEN_DIGESTS`] across process restarts.
+///
+/// The in-process memo dies with the worker, and a consumer restarts its worker routinely. On a
+/// USB model drive (sc-26610) one MOSS-Image job then spent 6.5 minutes re-hashing 25 GB of
+/// weights that the previous process had already proven, before a 10-second load.
+///
+/// A persisted entry is keyed on a digest of the WHOLE [`SealIdentity`], the same predicate the
+/// in-process memo trusts, so it never authorizes anything the in-memory memo would not: any
+/// change to the path, parent chain, entry, resolution, or target (including `ctime`/inode on
+/// Unix) yields a different key and a full re-read. Unset by default; gen-core never picks a
+/// location on its own.
+///
+/// The key also binds the identity of the VOLUME holding the content (see [`volume_identity`]).
+/// Device numbers are assigned per mount, and some filesystems (exFAT/FAT, some SMB) synthesize
+/// inodes and `ctime`, so a different drive mounted at the same path could otherwise present a
+/// same-looking file. With no volume identity available nothing is persisted.
+static PROVEN_DIGEST_STORE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Version prefix for the persisted key. Bump it if [`SealIdentity`]'s fields change meaning;
+/// older entries then simply miss.
+const PROVEN_DIGEST_STORE_KEY_VERSION: &str = "artifact-seal-identity-v2";
+
+fn proven_digest_store_entry(store: &Path, identity: &SealIdentity, volume: &[u8]) -> PathBuf {
+    // `Debug` renders every identity field, escaping paths, so equal renderings mean equal
+    // identities. A future std rendering change can only turn hits into misses.
+    let key = Sha256::digest(format!(
+        "{PROVEN_DIGEST_STORE_KEY_VERSION}\n{}\n{identity:?}",
+        hex_lower(volume)
+    ));
+    store.join(hex_lower(&key))
+}
+
+fn stored_proven_digest(entry: &Path) -> Option<[u8; 32]> {
+    let text = std::fs::read_to_string(entry).ok()?;
+    parse_hex_digest(text.trim())
+}
+
+fn store_proven_digest(entry: &Path, sha256: &[u8; 32]) {
+    if entry
+        .parent()
+        .is_none_or(|store| std::fs::create_dir_all(store).is_err())
+    {
+        return;
+    }
+    // Write-then-rename so a concurrent reader in another worker never sees a torn entry.
+    let staging = entry.with_extension(format!("tmp-{}", std::process::id()));
+    if std::fs::write(&staging, hex_lower(sha256)).is_err()
+        || std::fs::rename(&staging, entry).is_err()
+    {
+        let _ = std::fs::remove_file(&staging);
+    }
+}
+
+/// Stable identity of the volume holding `path`, or `None` when the platform cannot supply one.
+///
+/// macOS: the volume UUID of the mount containing `path`. Other Unix: the filesystem id from
+/// `statvfs`, which ext4/btrfs/xfs derive from the superblock UUID; a zero id (tmpfs and other
+/// synthetic filesystems) counts as unavailable. Windows: the volume serial number is already part
+/// of every [`FileStatFingerprint`], so the identity itself carries the volume.
+#[cfg(target_os = "macos")]
+fn volume_identity(path: &Path) -> Option<Vec<u8>> {
+    use std::ffi::{CStr, CString};
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut fs = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `fs` is an output buffer of the exact libc type.
+    if unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: a successful `statfs` initialized the whole structure.
+    let fs = unsafe { fs.assume_init() };
+    // SAFETY: `f_mntonname` is a NUL-terminated C string inside `fs`.
+    let mount = unsafe { CStr::from_ptr(fs.f_mntonname.as_ptr()) };
+
+    // Volume attributes are only reported for the mount point itself.
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    #[repr(C, packed(4))]
+    struct VolumeUuidReply {
+        length: u32,
+        uuid: [u8; 16],
+    }
+    let mut reply = VolumeUuidReply {
+        length: 0,
+        uuid: [0; 16],
+    };
+    // SAFETY: valid C path, request, and a reply buffer whose size is passed alongside it.
+    let status = unsafe {
+        libc::getattrlist(
+            mount.as_ptr(),
+            (&mut request as *mut libc::attrlist).cast(),
+            (&mut reply as *mut VolumeUuidReply).cast(),
+            size_of::<VolumeUuidReply>(),
+            0,
+        )
+    };
+    let uuid = reply.uuid;
+    (status == 0 && uuid != [0; 16]).then(|| uuid.to_vec())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn volume_identity(path: &Path) -> Option<Vec<u8>> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut fs = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `fs` is an output buffer of the exact libc type.
+    if unsafe { libc::statvfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: a successful `statvfs` initialized the whole structure.
+    let fsid = unsafe { fs.assume_init() }.f_fsid;
+    // `f_fsid` is `c_ulong`: `u64` on 64-bit targets, narrower elsewhere.
+    #[allow(clippy::useless_conversion)]
+    let fsid = u64::from(fsid);
+    (fsid != 0).then(|| fsid.to_le_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn volume_identity(_path: &Path) -> Option<Vec<u8>> {
+    Some(Vec::new())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn volume_identity(_path: &Path) -> Option<Vec<u8>> {
+    None
+}
+
+/// Drop this process's in-memory digests for `path`, as a worker restart would.
+#[cfg(test)]
+fn forget_proven_digests_for(path: &Path) {
+    proven_digests()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|identity, _| identity.loader_path != path);
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_hex_digest(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 || !text.is_ascii() {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(digest)
+}
+
 impl ArtifactSeal {
+    /// Persist proven seal digests under `dir` for the rest of this process (first call wins).
+    ///
+    /// Store failures are never errors: an unreadable or unwritable store only costs the full read
+    /// that pinning performs without one.
+    pub fn persist_proven_digests_in(dir: impl Into<PathBuf>) {
+        let _ = PROVEN_DIGEST_STORE.set(dir.into());
+    }
+
     pub fn pin(path: impl AsRef<Path>) -> crate::Result<Self> {
-        let loader_path = std::path::absolute(path.as_ref())?;
+        Self::pin_with_check(path, || Ok(()))
+    }
+
+    /// Pin the same immutable source identity with cooperative cancellation/progress checks.
+    /// Checks bracket bounded hash reads and metadata/memo paths; errors never authorize a pin.
+    /// Digest reuse and once-at-acquisition hashing are identical to [`Self::pin`].
+    pub fn pin_with_check(
+        path: impl AsRef<Path>,
+        mut check: impl FnMut() -> crate::Result<()>,
+    ) -> crate::Result<Self> {
+        Self::pin_with_progress(path, &mut check, |_| {})
+    }
+
+    /// Acquire the same seal with typed, truthful work observations. The observer cannot authorize
+    /// a source or suppress cancellation. To cancel on progress, latch a token read by `check`.
+    /// Reads report their first chunk, at most 256 MiB between updates, EOF and exact abort bytes.
+    /// Memo acquisitions report zero hashed bytes; metadata checks never fake content progress.
+    pub fn pin_with_progress(
+        path: impl AsRef<Path>,
+        mut check: impl FnMut() -> crate::Result<()>,
+        mut observe: impl FnMut(&ArtifactSealProgress),
+    ) -> crate::Result<Self> {
+        let path = path.as_ref();
+        let loader_path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut last = seal_progress(
+            &loader_path,
+            ArtifactSealAcquisition::Metadata,
+            ArtifactSealProgressState::Reading,
+            0,
+            None,
+        );
+        let result = {
+            let mut record = |progress: &ArtifactSealProgress| {
+                last = progress.clone();
+                observe(progress);
+            };
+            Self::pin_with_store_and_check(
+                path,
+                PROVEN_DIGEST_STORE.get().map(PathBuf::as_path),
+                &mut check,
+                &mut record,
+            )
+        };
+        if let Err(error) = &result {
+            let state = if matches!(error, crate::Error::Canceled) {
+                ArtifactSealProgressState::Canceled
+            } else {
+                ArtifactSealProgressState::Failed
+            };
+            if last.state != state {
+                last.state = state;
+                observe(&last);
+            }
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn pin_with_store(path: &Path, store: Option<&Path>) -> crate::Result<Self> {
+        Self::pin_with_store_and_check(path, store, &mut || Ok(()), &mut |_| {})
+    }
+
+    fn pin_with_store_and_check(
+        path: &Path,
+        store: Option<&Path>,
+        check: &mut impl FnMut() -> crate::Result<()>,
+        observe: &mut impl FnMut(&ArtifactSealProgress),
+    ) -> crate::Result<Self> {
+        check()?;
+        let loader_path = std::path::absolute(path)?;
         let canonical_target_path = std::fs::canonicalize(&loader_path)?;
         let path_component_fingerprints = path_component_fingerprints(&loader_path)?;
         let entry_fingerprint = stat_fingerprint(&loader_path, false)?;
@@ -461,6 +858,7 @@ impl ArtifactSeal {
         // Prove the entry, parent chain, resolution, and target still agree after the multi-stat
         // capture. This closes persistent changes during pin construction itself.
         pinned.ensure_unchanged()?;
+        check()?;
         // Only AFTER that proof is the identity worth trusting as a memo key: the lookup below is
         // allowed to stand in for the content read precisely because everything it compares has just
         // been re-verified against the filesystem.
@@ -472,6 +870,31 @@ impl ArtifactSeal {
             target_fingerprint: pinned.target_fingerprint.clone(),
         };
         if let Some(sha256) = proven_digest(&identity) {
+            check()?;
+            observe(&seal_progress(
+                &pinned.loader_path,
+                ArtifactSealAcquisition::MemoryMemo,
+                ArtifactSealProgressState::Acquired,
+                0,
+                Some(pinned.target_fingerprint.size),
+            ));
+            return Ok(Self { sha256, ..pinned });
+        }
+        let persisted = store.and_then(|store| {
+            let volume = volume_identity(&pinned.canonical_target_path)?;
+            Some(proven_digest_store_entry(store, &identity, &volume))
+        });
+        check()?;
+        if let Some(sha256) = persisted.as_deref().and_then(stored_proven_digest) {
+            check()?;
+            remember_proven_digest(identity, sha256);
+            observe(&seal_progress(
+                &pinned.loader_path,
+                ArtifactSealAcquisition::PersistedMemo,
+                ArtifactSealProgressState::Acquired,
+                0,
+                Some(pinned.target_fingerprint.size),
+            ));
             return Ok(Self { sha256, ..pinned });
         }
         #[cfg(test)]
@@ -479,8 +902,27 @@ impl ArtifactSeal {
             pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
             record_full_hash_work();
         }
-        let sha256 = pinned.read_unchanged(hash_file_sha256)?;
+        let (sha256, hashed_bytes) =
+            pinned.read_unchanged_with_check(check, observe, |path, check, observe| {
+                hash_file_sha256_with_progress(
+                    path,
+                    check,
+                    ArtifactSealAcquisition::ColdContentRead,
+                    observe,
+                )
+            })?;
+        check()?;
+        if let Some(entry) = &persisted {
+            store_proven_digest(entry, &sha256);
+        }
         remember_proven_digest(identity, sha256);
+        observe(&seal_progress(
+            &pinned.loader_path,
+            ArtifactSealAcquisition::ColdContentRead,
+            ArtifactSealProgressState::Acquired,
+            hashed_bytes,
+            Some(pinned.target_fingerprint.size),
+        ));
         Ok(Self { sha256, ..pinned })
     }
 
@@ -516,12 +958,22 @@ impl ArtifactSeal {
     }
 
     fn hash_content(&self, path: &Path) -> crate::Result<[u8; 32]> {
+        self.hash_content_with_check(path, &mut || Ok(()), &mut |_| {})
+    }
+
+    fn hash_content_with_check(
+        &self,
+        path: &Path,
+        check: &mut impl FnMut() -> crate::Result<()>,
+        observe: &mut impl FnMut(&ArtifactSealProgress),
+    ) -> crate::Result<[u8; 32]> {
         #[cfg(test)]
         {
             self.hash_work.0.fetch_add(1, Ordering::Relaxed);
             record_full_hash_work();
         }
-        hash_file_sha256(path)
+        hash_file_sha256_with_progress(path, check, ArtifactSealAcquisition::DriftAudit, observe)
+            .map(|(digest, _)| digest)
     }
 
     pub fn ensure_unchanged(&self) -> crate::Result<()> {
@@ -556,24 +1008,189 @@ impl ArtifactSeal {
         Ok(())
     }
 
-    /// Confirm this seal without re-reading stable artifact content.
-    ///
-    /// Metadata and no-follow identity pins are cheap to check on each reopen. If either pin
-    /// changes, this deliberately performs one full-content audit before rejecting the source;
-    /// callers therefore never continue after a same-size replacement, including one that preserves
-    /// an ordinary mtime. The error grammar is shared by Candle and MLX consumers.
+    /// Verify the complete replacement-sensitive identity through caller-owned Darwin
+    /// metadata buffers. This never hashes the payload on a deferred read, including a
+    /// mismatch (which is unconditionally rejected). Native compatibility APIs retain
+    /// their historical audit behavior. See source_inventory::bounded_fs for authority.
+    pub fn verify_unchanged_with_capacity(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use crate::source_inventory::bounded_fs as fs;
+            if bounded_path_components(&self.loader_path, next)? != self.path_component_fingerprints
+                || bounded_stat_fingerprint(&self.loader_path, false, next)?
+                    != self.entry_fingerprint
+                || fs::canonical(&self.loader_path, next)? != self.canonical_target_path
+                || bounded_stat_fingerprint(&self.loader_path, true, next)?
+                    != self.target_fingerprint
+            {
+                return crate::SourceInventory::metadata_gap(
+                    next,
+                    "artifact seal mismatch after load",
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        crate::SourceInventory::metadata_gap(next, crate::SourceInventory::PIN_VERIFY_METADATA_GAP)
+    }
+
+    /// Fresh acquisition with the same lexical binding, component/entry/target identity
+    /// and full-content SHA-256 as pin(). The bounded path intentionally does not insert
+    /// into the process-global digest memo: that would allocate private HashMap buckets.
+    /// Already prepared tokens are reused by SourceInventory instead of reacquired.
+    pub fn pin_with_capacity(
+        path: &Path,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<Self> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use crate::source_inventory::bounded_fs as fs;
+            let loader_path = fs::absolute(path, next)?;
+            let canonical_target_path = fs::canonical(&loader_path, next)?;
+            let path_component_fingerprints = bounded_path_components(&loader_path, next)?;
+            let entry_fingerprint = bounded_stat_fingerprint(&loader_path, false, next)?;
+            let target_fingerprint = bounded_stat_fingerprint(&loader_path, true, next)?;
+            if !fs::is_file(&fs::stat(&loader_path, true, next)?) {
+                return crate::SourceInventory::metadata_gap(
+                    next,
+                    "weights source is not a regular file",
+                );
+            }
+            #[cfg(test)]
+            next(bounded_arc_layout::<SealHashWork>()?)?;
+            let mut pinned = Self {
+                loader_path,
+                canonical_target_path,
+                path_component_fingerprints,
+                entry_fingerprint,
+                target_fingerprint,
+                sha256: [0; 32],
+                #[cfg(test)]
+                hash_work: Arc::new(SealHashWork(AtomicUsize::new(0))),
+            };
+            pinned.verify_unchanged_with_capacity(next)?;
+            #[cfg(test)]
+            {
+                pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
+                record_full_hash_work();
+            }
+            pinned.sha256 = fs::hash(&pinned.loader_path, next)?;
+            pinned.verify_unchanged_with_capacity(next)?;
+            Ok(pinned)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = path;
+            crate::SourceInventory::metadata_gap(
+                next,
+                crate::SourceInventory::PIN_CAPTURE_METADATA_GAP,
+            )
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn clone_with_capacity(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<Self> {
+        use crate::source_inventory::bounded_fs as fs;
+        let mut components = fs::vec(self.path_component_fingerprints.len(), next)?;
+        for component in &self.path_component_fingerprints {
+            components.push(PathComponentFingerprint {
+                path: fs::copy_path(&component.path, next)?,
+                is_symlink: component.is_symlink,
+                symlink_target: component
+                    .symlink_target
+                    .as_deref()
+                    .map(|p| fs::copy_path(p, next))
+                    .transpose()?,
+                device: component.device,
+                inode: component.inode,
+            });
+        }
+        Ok(Self {
+            loader_path: fs::copy_path(&self.loader_path, next)?,
+            canonical_target_path: fs::copy_path(&self.canonical_target_path, next)?,
+            path_component_fingerprints: components,
+            entry_fingerprint: bounded_clone_stat(&self.entry_fingerprint, next)?,
+            target_fingerprint: bounded_clone_stat(&self.target_fingerprint, next)?,
+            sha256: self.sha256,
+            #[cfg(test)]
+            hash_work: self.hash_work.clone(),
+        })
+    }
+
+    /// Same explicit check before and after a pinned read, including failed reads. The existing
+    /// native read_unchanged/verify_unchanged APIs remain unchanged for compatibility.
+    pub fn read_unchanged_with_capacity<T, E: From<crate::Error>>(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+        read: impl FnOnce(&Path, &mut dyn FnMut(u64) -> crate::Result<()>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        self.verify_unchanged_with_capacity(next).map_err(E::from)?;
+        let result = read(&self.loader_path, next);
+        self.verify_unchanged_with_capacity(next).map_err(E::from)?;
+        result
+    }
+
     pub fn verify_unchanged(&self) -> crate::Result<()> {
-        if self.ensure_unchanged().is_ok() {
+        self.verify_unchanged_with_check(&mut || Ok(()), &mut |_| {})
+    }
+
+    fn verify_unchanged_with_check(
+        &self,
+        check: &mut impl FnMut() -> crate::Result<()>,
+        observe: &mut impl FnMut(&ArtifactSealProgress),
+    ) -> crate::Result<()> {
+        check()?;
+        let unchanged = self.ensure_unchanged().is_ok();
+        check()?;
+        if unchanged {
             return Ok(());
         }
 
-        // A mismatch must force a complete verification attempt before it is rejected. The result
-        // cannot re-authorize the path: an identity change alone is fail-closed.
-        let _ = self.hash_content(&self.loader_path);
+        // Identity drift can never re-authorize this seal, even if a full audit agrees.
+        // Preserve the unchecked API's mismatch authority for I/O errors, but do not swallow
+        // cooperative callback errors or silently turn its audit into an unchecked full read.
+        let mut interrupted = false;
+        let audit = self.hash_content_with_check(
+            &self.loader_path,
+            &mut || check().inspect_err(|_| interrupted = true),
+            observe,
+        );
+        if interrupted {
+            return audit.map(|_| ());
+        }
+        check()?;
         Err(crate::Error::Unsupported(format!(
             "artifact seal mismatch after load: {}",
             self.loader_path.display()
         )))
+    }
+
+    fn read_unchanged_with_check<T, C, O>(
+        &self,
+        check: &mut C,
+        observe: &mut O,
+        read: impl FnOnce(&Path, &mut C, &mut O) -> crate::Result<T>,
+    ) -> crate::Result<T>
+    where
+        C: FnMut() -> crate::Result<()>,
+        O: FnMut(&ArtifactSealProgress),
+    {
+        self.verify_unchanged_with_check(check, observe)?;
+        let result = read(&self.loader_path, check, observe);
+        // A canceled acquisition delivers no source bytes or seal. Do not start a post-read
+        // drift audit (or invoke a one-shot callback again) after that terminal cancellation.
+        // The public unchecked read_unchanged retains its stronger post-read mutation priority.
+        if matches!(result, Err(crate::Error::Canceled)) {
+            return result;
+        }
+        self.verify_unchanged_with_check(check, observe)?;
+        result
     }
 
     /// Explicit, operator-requested full-content audit of an otherwise stable seal.
@@ -613,18 +1230,163 @@ impl ArtifactSeal {
     }
 }
 
+#[cfg(feature = "model-inference-proof")]
+pub(crate) fn record_sealed_input_read<'a>(
+    reader: &str,
+    pins: impl IntoIterator<Item = &'a ArtifactSeal>,
+) {
+    record_sealed_input_read_with_role(
+        reader,
+        crate::model_input_proof::InputRole::ArtifactInput,
+        pins,
+    );
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub(crate) fn record_sealed_input_read_with_role<'a>(
+    reader: &str,
+    role: crate::model_input_proof::InputRole,
+    pins: impl IntoIterator<Item = &'a ArtifactSeal>,
+) {
+    if std::env::var_os("MODEL_INFERENCE_CASE_FQN").is_none() {
+        return;
+    }
+    let identities: Vec<_> = pins
+        .into_iter()
+        .map(|pin| {
+            crate::model_input_proof::InputIdentity::validated(
+                pin.loader_path(),
+                *pin.content_sha256(),
+                "gen-core::ArtifactSeal",
+                "existing retained seal, actual read and pre/post path checks; not an opened-handle or ABA guarantee",
+            )
+        })
+        .collect();
+    crate::model_input_proof::record_inputs(reader, role, &identities);
+}
+
+/// Read size for full-content hashing. 64 KiB reads held a USB model drive to ~63 MB/s against
+/// ~216 MB/s for 4 MiB reads of the same disk (sc-26610); the sequential hash is I/O-bound there.
+const HASH_READ_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
 fn hash_file_sha256(path: &Path) -> crate::Result<[u8; 32]> {
-    let mut reader = BufReader::new(File::open(path)?);
+    hash_file_sha256_with_check(path, &mut || Ok(()))
+}
+
+#[cfg(test)]
+fn hash_file_sha256_with_check(
+    path: &Path,
+    check: &mut impl FnMut() -> crate::Result<()>,
+) -> crate::Result<[u8; 32]> {
+    hash_file_sha256_with_progress(
+        path,
+        check,
+        ArtifactSealAcquisition::ColdContentRead,
+        &mut |_| {},
+    )
+    .map(|(digest, _)| digest)
+}
+
+fn hash_file_sha256_with_progress(
+    path: &Path,
+    check: &mut impl FnMut() -> crate::Result<()>,
+    acquisition: ArtifactSealAcquisition,
+    observe: &mut impl FnMut(&ArtifactSealProgress),
+) -> crate::Result<([u8; 32], u64)> {
+    let mut checked = |hashed_bytes, source_bytes| {
+        check().inspect_err(|error| {
+            let state = if matches!(error, crate::Error::Canceled) {
+                ArtifactSealProgressState::Canceled
+            } else {
+                ArtifactSealProgressState::Failed
+            };
+            observe(&seal_progress(
+                path,
+                acquisition,
+                state,
+                hashed_bytes,
+                source_bytes,
+            ));
+        })
+    };
+    checked(0, None)?;
+    let mut reader = File::open(path)?;
+    let source_bytes = Some(reader.metadata()?.len());
+    checked(0, source_bytes)?;
+    // Release the callback borrow so progress is reported BEFORE the post-read cancellation check.
     let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; HASH_READ_BYTES];
+    let mut hashed_bytes = 0u64;
+    let mut reported = 0u64;
     loop {
-        let read = reader.read(&mut buffer)?;
+        if let Err(error) = check() {
+            let state = if matches!(error, crate::Error::Canceled) {
+                ArtifactSealProgressState::Canceled
+            } else {
+                ArtifactSealProgressState::Failed
+            };
+            observe(&seal_progress(
+                path,
+                acquisition,
+                state,
+                hashed_bytes,
+                source_bytes,
+            ));
+            return Err(error);
+        }
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                observe(&seal_progress(
+                    path,
+                    acquisition,
+                    ArtifactSealProgressState::Failed,
+                    hashed_bytes,
+                    source_bytes,
+                ));
+                return Err(error.into());
+            }
+        };
+        hash.update(&buffer[..read]);
+        hashed_bytes += read as u64;
+        #[cfg(test)]
+        THREAD_HASH_BYTES_READ.with(|bytes| bytes.set(bytes.get() + read));
+        if read == 0 || reported == 0 || hashed_bytes - reported >= 256 * 1024 * 1024 {
+            let state = if read == 0 {
+                ArtifactSealProgressState::ReadComplete
+            } else {
+                ArtifactSealProgressState::Reading
+            };
+            observe(&seal_progress(
+                path,
+                acquisition,
+                state,
+                hashed_bytes,
+                source_bytes,
+            ));
+            reported = hashed_bytes;
+        }
+        if let Err(error) = check() {
+            let state = if matches!(error, crate::Error::Canceled) {
+                ArtifactSealProgressState::Canceled
+            } else {
+                ArtifactSealProgressState::Failed
+            };
+            observe(&seal_progress(
+                path,
+                acquisition,
+                state,
+                hashed_bytes,
+                source_bytes,
+            ));
+            return Err(error);
+        }
         if read == 0 {
             break;
         }
-        hash.update(&buffer[..read]);
     }
-    Ok(hash.finalize().into())
+    Ok((hash.finalize().into(), hashed_bytes))
 }
 
 /// Quantization tier a load may request. [`Q4`](Self::Q4)/[`Q8`](Self::Q8) are the group-wise
@@ -651,6 +1413,11 @@ pub enum Quant {
     /// candle-gen catalog only under the `cuda` feature — the MLX/macOS runtime (no FP4 hardware) and
     /// the CPU candle bundle (no FP4 compute) do not offer it.
     Nvfp4,
+    /// FLUX3 source rowwise E4M3 W8A8: per-output weight scales, per-token
+    /// activation scales and one final BF16 rounding. NOT affine integer Q8.
+    /// Providers must explicitly implement/advertise this format; element width
+    /// is not permission to dispatch an existing eight-bit affine quantizer.
+    Fp8Rowwise,
 }
 
 /// YuE2's AR execution mode, separate from the loaded weight tier. Experimental FP8 replaces
@@ -685,11 +1452,48 @@ impl Quant {
     /// **not** an MLX-quantizer tier — it carries FP8 block scales + an FP32 per-tensor scale
     /// (~4.5 *effective* bits/weight) and is served by candle-gen's NVFP4 packed path, not the MLX
     /// affine quantizer; do not route `Nvfp4` through an MLX `quantize(bits)` call on this width alone.
+    /// The same rule applies to `Fp8Rowwise` (8-bit E4M3, not Q8). Affine loaders
+    /// must use [`Self::affine_bits`] rather than dispatching on this metadata.
     pub fn bits(self) -> i32 {
         match self {
             Quant::Q4 => 4,
-            Quant::Q8 => 8,
+            Quant::Q8 | Quant::Fp8Rowwise => 8,
             Quant::Nvfp4 => 4,
+        }
+    }
+
+    /// Exact wire/cache tier identity. Equal element widths never alias formats.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Q4 => "q4",
+            Self::Q8 => "q8",
+            Self::Nvfp4 => "nvfp4",
+            Self::Fp8Rowwise => "fp8r",
+        }
+    }
+
+    pub fn from_key(key: &str) -> crate::Result<Self> {
+        match key {
+            "q4" => Ok(Self::Q4),
+            "q8" => Ok(Self::Q8),
+            "nvfp4" => Ok(Self::Nvfp4),
+            "fp8r" => Ok(Self::Fp8Rowwise),
+            _ => Err(crate::Error::Unsupported(format!(
+                "unknown quantization format {key:?}; expected q4, q8, nvfp4 or fp8r"
+            ))),
+        }
+    }
+
+    /// Width accepted by an AFFINE integer quantizer. Packed floating-point
+    /// formats must not reach that quantizer just because their width is 4/8.
+    pub fn affine_bits(self) -> crate::Result<i32> {
+        match self {
+            Self::Q4 => Ok(4),
+            Self::Q8 => Ok(8),
+            _ => Err(crate::Error::Unsupported(format!(
+                "{} is not an affine integer quantization format",
+                self.key()
+            ))),
         }
     }
 }
@@ -988,6 +1792,26 @@ pub struct IdentityWeights {
 }
 
 impl LoadSpec {
+    /// Full borrowed-spec ownership, guarded BEFORE the existing Clone executes.
+    /// The exhaustive owned-field/container law covers every field, including
+    /// nested quality policies, prepared receipts and split/deep component maps.
+    /// SourceInventory Arcs remain shared; no image payload carrier is cloned.
+    /// This owning law is Apple-qualified; other targets retain the explicit
+    /// source-gap refusal, never an unbounded owning-Clone fallback.
+    pub fn clone_with_capacity(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<Self> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use crate::source_inventory::bounded_clone::CloneLaw;
+            next(self.clone_bytes()?)?;
+            Ok(self.clone())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        crate::SourceInventory::metadata_gap(next, crate::SourceInventory::PIN_CAPTURE_METADATA_GAP)
+    }
+
     /// Dense bf16 load from the given source.
     pub fn new(weights: WeightsSource) -> Self {
         Self {
@@ -1205,7 +2029,7 @@ impl LoadSpec {
         let candidate = PreparedFilePins {
             prepared: true,
             finalized: true,
-            pins,
+            pins: pins.into_iter().collect(),
         };
         if !self.prepared_receipt_paths.is_empty() || self.prepared_encoder_receipt.is_some() {
             return Err(crate::Error::Unsupported(
@@ -1248,7 +2072,7 @@ impl LoadSpec {
         let candidate = PreparedFilePins {
             prepared: true,
             finalized: true,
-            pins,
+            pins: pins.into_iter().collect(),
         };
         let previous_receipt_paths =
             std::mem::replace(&mut self.prepared_receipt_paths, receipt_paths);
@@ -1271,6 +2095,46 @@ impl LoadSpec {
         }
         self.prepared_file_pins = candidate;
         Ok(())
+    }
+
+    pub(crate) fn visit_source_paths<'a>(&'a self, mut visit: impl FnMut(&'a Path, bool)) {
+        fn source<'a>(value: &'a WeightsSource, visit: &mut impl FnMut(&'a Path, bool)) {
+            match value {
+                WeightsSource::File(path) => visit(path, false),
+                WeightsSource::Dir(path) => visit(path, true),
+            }
+        }
+        source(&self.weights, &mut visit);
+        if let Some(value) = &self.control {
+            source(value, &mut visit);
+        }
+        for value in &self.extra_controls {
+            source(value, &mut visit);
+        }
+        if let Some(value) = &self.ip_adapter {
+            source(value, &mut visit);
+        }
+        for adapter in &self.adapters {
+            visit(&adapter.path, false);
+        }
+        if let Some(pid) = &self.pid {
+            source(&pid.checkpoint, &mut visit);
+            source(&pid.gemma, &mut visit);
+        }
+        if let Some(identity) = &self.identity {
+            for value in [&identity.encoder, &identity.eva, &identity.face_dir]
+                .into_iter()
+                .flatten()
+            {
+                source(value, &mut visit);
+            }
+        }
+        if let Some(value) = &self.text_encoder {
+            source(value, &mut visit);
+        }
+        for value in self.components.values() {
+            source(value, &mut visit);
+        }
     }
 
     /// Every File path configured anywhere on this load spec, in deterministic field order.
@@ -1409,7 +2273,14 @@ impl LoadSpec {
             )));
         }
         self.prepared_file_pins.prepared = true;
-        self.prepared_file_pins.pins.insert(expected, prepared);
+        let index = self
+            .prepared_file_pins
+            .pins
+            .binary_search_by(|(path, _)| path.cmp(&expected))
+            .unwrap_or_else(|index| index);
+        self.prepared_file_pins
+            .pins
+            .insert(index, (expected, prepared));
         Ok(())
     }
 
@@ -1643,7 +2514,12 @@ impl LoadSpec {
         E: From<crate::Error>,
     {
         match self.prepared_file_pin_for(path.as_ref()).map_err(E::from)? {
-            Some(prepared) => prepared.read_unchanged(read),
+            Some(prepared) => __observe_input_success!(prepared.read_unchanged(read), |_| {
+                record_sealed_input_read(
+                    "gen-core::LoadSpec::read_file_unchanged_if_prepared",
+                    std::iter::once(prepared),
+                );
+            }),
             None => read(path.as_ref()),
         }
     }
@@ -1682,6 +2558,10 @@ impl LoadSpec {
         for pin in &pins {
             pin.verify_unchanged().map_err(E::from)?;
         }
+        #[cfg(feature = "model-inference-proof")]
+        if result.is_ok() {
+            record_sealed_input_read("gen-core::LoadSpec::read_files_unchanged", pins.iter());
+        }
         result
     }
 
@@ -1694,6 +2574,138 @@ impl LoadSpec {
     /// during the callback fails closed.
     /// As with [`PinnedWeightsFile::read_unchanged`], a fully restored original pathname object is
     /// outside this path-token guarantee.
+    /// Explicit guarded counterpart for metadata readers. Do not enter the legacy directory
+    /// verification/canonicalization path after a one-time retained-count check.
+    pub fn read_prepared_files_unchanged_with_capacity<T, E: From<crate::Error>>(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+        read: impl FnOnce(&mut dyn FnMut(u64) -> crate::Result<()>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let Some(inventory) = self.source_inventory() else {
+            return crate::SourceInventory::metadata_gap(
+                next,
+                crate::SourceInventory::MISSING_INVENTORY_METADATA_GAP,
+            )
+            .map_err(E::from);
+        };
+        inventory
+            .verify_for_with_capacity(self, next)
+            .map_err(E::from)?;
+        let result = inventory.read_unchanged_with_capacity(next, read);
+        #[cfg(target_vendor = "apple")]
+        self.validate_prepared_file_pins_with_capacity(next)
+            .map_err(E::from)?;
+        result
+    }
+
+    /// Validate the existing prepared set and encoder/tokenizer receipt using only
+    /// bounded metadata operations. Every original missing/orphan/identity predicate
+    /// is retained; no current-directory cardinality authorizes an allocation.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn validate_prepared_file_pins_with_capacity(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        use crate::source_inventory::bounded_fs as fs;
+        if let Some(receipt) = &self.prepared_encoder_receipt {
+            receipt.ensure_unchanged_for_with_capacity(self.text_encoder.as_ref(), next)?;
+        }
+        if !self.prepared_file_pins.is_prepared() {
+            return Ok(());
+        }
+        if !self.prepared_file_pins.is_finalized() {
+            return crate::SourceInventory::metadata_gap(
+                next,
+                "LoadSpec File identity preparation has not been finalized",
+            );
+        }
+        let mut configured = Vec::new();
+        let mut result: crate::Result<()> = Ok(());
+        self.visit_source_paths(|path, directory| {
+            if result.is_ok() {
+                result = (|| {
+                    let path = fs::absolute(path, next)?;
+                    fs::push(&mut configured, (path, directory), next)
+                })();
+            }
+        });
+        result?;
+        for (path, directory) in &configured {
+            if !directory && self.prepared_file_pins.get(path).is_none() {
+                return crate::SourceInventory::metadata_gap(
+                    next,
+                    "prepared file-token set is missing configured source",
+                );
+            }
+        }
+        for path in &self.prepared_receipt_paths {
+            if self.prepared_file_pins.get(path).is_none() {
+                return crate::SourceInventory::metadata_gap(
+                    next,
+                    "prepared file-token set is missing receipt source",
+                );
+            }
+        }
+        for (path, pin) in self.prepared_file_pins.iter() {
+            let configured = configured.iter().any(|(root, directory)| {
+                if *directory {
+                    path != root && path.starts_with(root)
+                } else {
+                    path == root
+                }
+            });
+            if pin.loader_path() != path
+                || (!configured && !self.prepared_receipt_paths.contains(path))
+            {
+                return crate::SourceInventory::metadata_gap(
+                    next,
+                    "prepared file-token set does not match the LoadSpec sources",
+                );
+            }
+            pin.verify_unchanged_with_capacity(next)?;
+        }
+        Ok(())
+    }
+
+    /// Bind a source closure with exact Vec ownership and actual ArcInner payload
+    /// layouts checked BEFORE allocating. Native APIs keep their existing behavior.
+    pub fn bind_source_inventory_with_capacity(
+        &mut self,
+        inventory: crate::SourceInventory,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            inventory.verify_for_with_capacity(self, next)?;
+            self.validate_prepared_file_pins_with_capacity(next)?;
+            let prepared = if self.prepared_file_pins.is_prepared() {
+                None
+            } else {
+                Some(PreparedFilePins {
+                    prepared: true,
+                    finalized: true,
+                    pins: inventory.configured_file_pins_with_capacity(self, next)?,
+                })
+            };
+            next(bounded_arc_layout::<crate::SourceInventory>()?)?;
+            let inventory = Arc::new(inventory);
+            // Only commit after every fallible check/allocation preflight succeeds.
+            if let Some(prepared) = prepared {
+                self.prepared_file_pins = prepared;
+            }
+            self.source_inventory = Some(inventory);
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = inventory;
+            crate::SourceInventory::metadata_gap(
+                next,
+                crate::SourceInventory::PIN_CAPTURE_METADATA_GAP,
+            )
+        }
+    }
+
     pub fn read_prepared_files_unchanged<T, E>(
         &self,
         read: impl FnOnce() -> std::result::Result<T, E>,
@@ -1725,6 +2737,13 @@ impl LoadSpec {
         }
         if let Some(guard) = &self.source_inventory {
             guard.verify_unchanged().map_err(E::from)?;
+        }
+        #[cfg(feature = "model-inference-proof")]
+        if result.is_ok() {
+            record_sealed_input_read(
+                "gen-core::LoadSpec::read_prepared_files_unchanged",
+                pins.iter().copied(),
+            );
         }
         result
     }
@@ -2153,11 +3172,12 @@ impl std::fmt::Debug for HdrFrameSink {
 /// The request-local outcome of optional prompt enhancement.
 ///
 /// This is deliberately a small, tensor-free fact rather than a log convention. Consumers use it
-/// to distinguish a prompt that was actually rewritten from a safe fallback and from the identity
-/// path where enhancement was not requested.
+/// to distinguish an enhancer that ran and produced an accepted caption from a safe fallback
+/// and from the identity path where enhancement was not requested. A valid accepted answer can
+/// match an already-rich original prompt; `Enhanced` is not a claim that its bytes must differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptEnhancementOutcome {
-    /// The provider produced and consumed a non-empty rewritten prompt.
+    /// The enhancer ran and the provider consumed its non-empty accepted answer (possibly unchanged).
     Enhanced,
     /// Enhancement was requested, but the provider safely consumed the original prompt instead.
     Fallback,
@@ -2175,6 +3195,15 @@ pub struct PromptEnhancementReport {
     pub effective_prompt: String,
     /// Stable, non-sensitive reason code for a fallback. `None` for enhanced/absent outcomes.
     pub fallback_reason: Option<String>,
+    /// The enhancer's mode, for an enhancer that has several (sc-26238: the FLUX 3 upsampler's
+    /// system-prompt key — `t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`). `None` for single-mode
+    /// enhancers and for the bypass/absent paths.
+    pub mode: Option<String>,
+    /// The locked box annotations the effective prompt was required to preserve, as the exact
+    /// canvas-row JSON text the enhancer was given (sc-26238: `bbox.to_canvas` rows). `None`
+    /// when the request locked nothing. Present on the bypass path too, where the rows are
+    /// appended to the prompt as typed.
+    pub locked_annotations: Option<String>,
 }
 
 impl PromptEnhancementReport {
@@ -2185,6 +3214,8 @@ impl PromptEnhancementReport {
             original_prompt: prompt.clone(),
             effective_prompt: prompt,
             fallback_reason: None,
+            mode: None,
+            locked_annotations: None,
         }
     }
 
@@ -2197,6 +3228,8 @@ impl PromptEnhancementReport {
             original_prompt: original_prompt.into(),
             effective_prompt: effective_prompt.into(),
             fallback_reason: None,
+            mode: None,
+            locked_annotations: None,
         }
     }
 
@@ -2207,7 +3240,21 @@ impl PromptEnhancementReport {
             original_prompt: prompt.clone(),
             effective_prompt: prompt,
             fallback_reason: Some(reason.into()),
+            mode: None,
+            locked_annotations: None,
         }
+    }
+
+    /// Record the enhancer's mode (see [`mode`](Self::mode)).
+    pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = Some(mode.into());
+        self
+    }
+
+    /// Record the locked annotations (see [`locked_annotations`](Self::locked_annotations)).
+    pub fn with_locked_annotations(mut self, rows: impl Into<String>) -> Self {
+        self.locked_annotations = Some(rows.into());
+        self
     }
 }
 
@@ -2245,6 +3292,19 @@ impl std::fmt::Debug for PromptEnhancementSink {
 /// A progress event streamed to the caller during a long `generate` / `apply`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {
+    /// Optional exact prompt-upsampling decision boundary, before text/reference encoding.
+    /// Emitted once only when enhancement was requested: the final caption is materialized,
+    /// PUP device work synchronized, and any staged owner released/allocator drain completed.
+    /// A completed fallback also emits this event; inspect the prompt-enhancement report for
+    /// its outcome/cause rather than interpreting this as positive inference evidence.
+    /// Resident owners may remain cached. This Rust callback event is not a wire message,
+    /// denoising step, or terminal generation result; consumers not pricing phases may ignore it.
+    PromptUpsamplingComplete,
+    /// Optional exact phase boundary: all text and reference conditioning has been materialized
+    /// and its device work successfully synchronized, before the first denoiser forward. Emitted
+    /// once per request by adopting providers, on resident and staged paths. This is not a step,
+    /// loading event or terminal result; consumers that do not price phases may ignore it.
+    ConditioningComplete,
     /// Denoising step `current` of `total` (1-based).
     Step { current: u32, total: u32 },
     /// VAE decode underway (post-denoise).
@@ -2255,6 +3315,12 @@ pub enum Progress {
     /// without this the UI would freeze silently while a component streams from disk (F-179). The
     /// [`Resident`](OffloadPolicy::Resident) path loads everything before `generate` and never emits it.
     Loading(LoadPhase),
+    /// The optional prompt-upsampling stage is decoding (sc-26238): `tokens` content tokens of
+    /// at most `max_tokens` generated so far, emitted once at `0` when the stage starts and once
+    /// per streamed token. Fires before any `Step` (it rewrites the prompt the encoder will
+    /// read) and never on a request that did not ask for enhancement, so a consumer that does
+    /// not know it can ignore it without losing the step contract.
+    Upsampling { tokens: u32, max_tokens: u32 },
 }
 
 /// Which component the residency seam is loading when it emits [`Progress::Loading`] (sc-11126). The
@@ -2295,6 +3361,410 @@ mod tests {
     use std::collections::HashSet;
     use std::io::Read;
     use std::sync::{Barrier, Mutex};
+
+    #[test]
+    fn artifact_seal_progress_reports_actual_cold_memo_and_partial_cancel_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = (HASH_READ_BYTES * 3 + 17) as u64;
+        let path = dir.path().join("observed-cold.synthetic");
+        File::create(&path).unwrap().set_len(size).unwrap();
+        let mut cold = Vec::new();
+        let seal =
+            ArtifactSeal::pin_with_progress(&path, || Ok(()), |e| cold.push(e.clone())).unwrap();
+        assert_eq!(
+            cold[0].acquisition,
+            ArtifactSealAcquisition::ColdContentRead
+        );
+        assert_eq!(cold[0].state, ArtifactSealProgressState::Reading);
+        assert_eq!(cold[0].hashed_bytes, HASH_READ_BYTES as u64);
+        assert!(cold
+            .iter()
+            .all(|e| e.loader_path == path && e.source_bytes == Some(size)));
+        assert_eq!(
+            cold.last().unwrap().state,
+            ArtifactSealProgressState::Acquired
+        );
+        assert_eq!(cold.last().unwrap().hashed_bytes, size);
+        assert!(cold
+            .iter()
+            .any(|e| e.state == ArtifactSealProgressState::ReadComplete && e.hashed_bytes == size));
+        assert!(cold
+            .windows(2)
+            .all(|w| w[0].hashed_bytes <= w[1].hashed_bytes));
+        let work = test_full_hash_work_count();
+        let mut memo = Vec::new();
+        let again =
+            ArtifactSeal::pin_with_progress(&path, || Ok(()), |e| memo.push(e.clone())).unwrap();
+        assert_eq!(again.content_sha256(), seal.content_sha256());
+        assert_eq!(test_full_hash_work_count(), work);
+        assert_eq!(
+            memo,
+            vec![seal_progress(
+                &path,
+                ArtifactSealAcquisition::MemoryMemo,
+                ArtifactSealProgressState::Acquired,
+                0,
+                Some(size)
+            )]
+        );
+        for chunks in [1, 2] {
+            let path = dir
+                .path()
+                .join(format!("observed-cancel-{chunks}.synthetic"));
+            File::create(&path).unwrap().set_len(size).unwrap();
+            let start_bytes = THREAD_HASH_BYTES_READ.with(Cell::get);
+            let cancel = Cell::new(false);
+            let mut events = Vec::new();
+            let result = ArtifactSeal::pin_with_progress(
+                &path,
+                || {
+                    if cancel.get()
+                        || (chunks == 2
+                            && THREAD_HASH_BYTES_READ.with(Cell::get) - start_bytes
+                                >= 2 * HASH_READ_BYTES)
+                    {
+                        Err(crate::Error::Canceled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |e| {
+                    if chunks == 1
+                        && e.state == ArtifactSealProgressState::Reading
+                        && e.hashed_bytes > 0
+                    {
+                        cancel.set(true); // A consumer can cancel on actual progress, not callback counts.
+                    }
+                    events.push(e.clone());
+                },
+            );
+            assert!(matches!(result, Err(crate::Error::Canceled)));
+            assert_eq!(
+                THREAD_HASH_BYTES_READ.with(Cell::get) - start_bytes,
+                chunks * HASH_READ_BYTES
+            );
+            let last = events.last().unwrap();
+            assert_eq!(last.state, ArtifactSealProgressState::Canceled);
+            assert_eq!(last.acquisition, ArtifactSealAcquisition::ColdContentRead);
+            assert_eq!(
+                last.hashed_bytes,
+                (chunks * HASH_READ_BYTES) as u64,
+                "cancel bytes must include unreported chunks, not repeat last periodic progress"
+            );
+            assert_eq!(last.source_bytes, Some(size));
+            assert!(!events
+                .iter()
+                .any(|e| e.state == ArtifactSealProgressState::Acquired));
+        }
+    }
+
+    #[test]
+    fn artifact_seal_progress_names_real_persisted_hit_or_actual_cold_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("digests");
+        let path = dir.path().join("persisted.synthetic");
+        std::fs::write(&path, b"synthetic source bytes").unwrap();
+        let first = ArtifactSeal::pin_with_store(&path, Some(&store)).unwrap();
+        forget_proven_digests_for(first.loader_path());
+        let before = test_full_hash_work_count();
+        let mut events = Vec::new();
+        let second =
+            ArtifactSeal::pin_with_store_and_check(&path, Some(&store), &mut || Ok(()), &mut |e| {
+                events.push(e.clone())
+            })
+            .unwrap();
+        assert_eq!(first.content_sha256(), second.content_sha256());
+        let persisted = persists_on_this_volume(dir.path());
+        let last = events.last().unwrap();
+        assert_eq!(last.state, ArtifactSealProgressState::Acquired);
+        assert_eq!(
+            last.acquisition,
+            if persisted {
+                ArtifactSealAcquisition::PersistedMemo
+            } else {
+                ArtifactSealAcquisition::ColdContentRead
+            }
+        );
+        assert_eq!(last.hashed_bytes, if persisted { 0 } else { 22 });
+        if persisted {
+            assert_eq!(events.len(), 1);
+            assert_eq!(test_full_hash_work_count(), before);
+        } else {
+            assert!(test_full_hash_work_count() > before);
+            assert!(events
+                .iter()
+                .any(|e| e.state == ArtifactSealProgressState::ReadComplete));
+        }
+    }
+
+    #[test]
+    fn artifact_seal_progress_read_completion_and_drift_audit_never_authorize_changed_source() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed-drift.synthetic");
+        let size = (HASH_READ_BYTES * 3 + 17) as u64;
+        File::create(&path).unwrap().set_len(size).unwrap();
+        let mut events = Vec::new();
+        let mut changed = false;
+        let result = ArtifactSeal::pin_with_progress(
+            &path,
+            || Ok(()),
+            |e| {
+                if !changed
+                    && e.acquisition == ArtifactSealAcquisition::ColdContentRead
+                    && e.state == ArtifactSealProgressState::Reading
+                {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(&[0xa5])
+                        .unwrap();
+                    changed = true;
+                }
+                events.push(e.clone());
+            },
+        );
+        assert!(matches!(result, Err(crate::Error::Unsupported(_))));
+        assert!(
+            events.iter().any(
+                |e| e.acquisition == ArtifactSealAcquisition::ColdContentRead
+                    && e.state == ArtifactSealProgressState::ReadComplete
+                    && e.hashed_bytes == size + 1
+                    && e.source_bytes == Some(size)
+            ),
+            "actual hashed bytes must not be replaced by the declared source size"
+        );
+        assert!(events
+            .iter()
+            .any(|e| e.acquisition == ArtifactSealAcquisition::DriftAudit && e.hashed_bytes > 0));
+        assert_eq!(
+            events.last().unwrap().state,
+            ArtifactSealProgressState::Failed
+        );
+        assert!(!events
+            .iter()
+            .any(|e| e.state == ArtifactSealProgressState::Acquired));
+    }
+
+    #[test]
+    fn artifact_seal_progress_metadata_cancel_does_not_claim_a_cold_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-opened.synthetic");
+        let before = test_full_hash_work_count();
+        let bytes = THREAD_HASH_BYTES_READ.with(Cell::get);
+        let mut events = Vec::new();
+        let result = ArtifactSeal::pin_with_progress(
+            &path,
+            || Err(crate::Error::Canceled),
+            |e| events.push(e.clone()),
+        );
+        assert!(matches!(result, Err(crate::Error::Canceled)));
+        assert_eq!(
+            events,
+            vec![seal_progress(
+                &path,
+                ArtifactSealAcquisition::Metadata,
+                ArtifactSealProgressState::Canceled,
+                0,
+                None
+            )]
+        );
+        assert_eq!(test_full_hash_work_count(), before);
+        assert_eq!(THREAD_HASH_BYTES_READ.with(Cell::get), bytes);
+    }
+
+    #[test]
+    fn checked_artifact_pin_canceled_chunk_with_drift_never_runs_second_audit() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel-drift.synthetic");
+        File::create(&path)
+            .unwrap()
+            .set_len((HASH_READ_BYTES * 3 + 17) as u64)
+            .unwrap();
+        let original_identity = SealIdentity {
+            loader_path: std::path::absolute(&path).unwrap(),
+            canonical_target_path: std::fs::canonicalize(&path).unwrap(),
+            path_component_fingerprints: path_component_fingerprints(&path).unwrap(),
+            entry_fingerprint: stat_fingerprint(&path, false).unwrap(),
+            target_fingerprint: stat_fingerprint(&path, true).unwrap(),
+        };
+        let start_bytes = THREAD_HASH_BYTES_READ.with(Cell::get);
+        let start_reads = test_full_hash_work_count();
+        let mut canceled = false;
+        let result = ArtifactSeal::pin_with_check(&path, || {
+            if !canceled && THREAD_HASH_BYTES_READ.with(Cell::get) > start_bytes {
+                assert_eq!(
+                    THREAD_HASH_BYTES_READ.with(Cell::get) - start_bytes,
+                    HASH_READ_BYTES
+                );
+                // Change content AND a fingerprint field after the first real checked read.
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(&[0xa5])
+                    .unwrap();
+                canceled = true;
+                return Err(crate::Error::Canceled);
+            }
+            // Deliberately one-shot: a later callback must not mask an ignored cancellation.
+            Ok(())
+        });
+        assert!(canceled);
+        assert!(matches!(result, Err(crate::Error::Canceled)));
+        assert_eq!(
+            test_full_hash_work_count() - start_reads,
+            1,
+            "a canceled read must never start a second drift audit"
+        );
+        assert_eq!(
+            THREAD_HASH_BYTES_READ.with(Cell::get) - start_bytes,
+            HASH_READ_BYTES,
+            "neither the rest of the acquisition nor an unchecked audit may read after cancel"
+        );
+        assert!(
+            proven_digest(&original_identity).is_none(),
+            "no partial/canceled seal may reach the memo"
+        );
+    }
+
+    #[test]
+    fn checked_seal_pre_and_post_drift_audits_check_chunks_and_never_authorize() {
+        use std::io::Write;
+        for pre_drift in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("audit-drift.synthetic");
+            File::create(&path)
+                .unwrap()
+                .set_len((HASH_READ_BYTES * 3 + 17) as u64)
+                .unwrap();
+            let seal = ArtifactSeal::pin(&path).unwrap();
+            let drift = || {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(&[0xa5])
+                    .unwrap()
+            };
+            if pre_drift {
+                drift();
+            }
+            let start_bytes = THREAD_HASH_BYTES_READ.with(Cell::get);
+            let start_audits = seal.full_hash_work_count();
+            let read_called = Cell::new(false);
+            let mut canceled = false;
+            let result = seal.read_unchanged_with_check(
+                &mut || {
+                    if !canceled && THREAD_HASH_BYTES_READ.with(Cell::get) > start_bytes {
+                        canceled = true;
+                        return Err(crate::Error::Canceled);
+                    }
+                    Ok(())
+                },
+                &mut |_| {},
+                |_, _, _| {
+                    read_called.set(true);
+                    drift();
+                    Ok(42)
+                },
+            );
+            assert!(
+                matches!(result, Err(crate::Error::Canceled)),
+                "drift audit must propagate cancellation, not authorize source bytes"
+            );
+            assert_eq!(
+                read_called.get(),
+                !pre_drift,
+                "pre-verification drift cannot open the requested source read"
+            );
+            assert!(canceled);
+            assert_eq!(seal.full_hash_work_count() - start_audits, 1);
+            assert_eq!(
+                THREAD_HASH_BYTES_READ.with(Cell::get) - start_bytes,
+                HASH_READ_BYTES,
+                "the actual pre/post drift audit must stop at its first checked chunk"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_artifact_pin_cancels_inside_bounded_hash_and_preserves_digest_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.synthetic");
+        let file = File::create(&path).unwrap();
+        file.set_len((HASH_READ_BYTES * 2 + 17) as u64).unwrap();
+        let mut checks = 0;
+        let aborted = hash_file_sha256_with_check(&path, &mut || {
+            checks += 1;
+            if checks == 4 {
+                Err(crate::Error::Canceled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            matches!(aborted, Err(crate::Error::Canceled)),
+            "cancel after first bounded chunk, not after whole file"
+        );
+        assert_eq!(checks, 4);
+        let mut interrupted_checks = 0;
+        let interrupted = ArtifactSeal::pin_with_check(&path, || {
+            interrupted_checks += 1;
+            if interrupted_checks == 7 {
+                Err(crate::Error::Canceled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(interrupted, Err(crate::Error::Canceled)));
+        let after_interrupted = test_full_hash_work_count();
+        let mut checks = 0;
+        let first = ArtifactSeal::pin_with_check(&path, || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            test_full_hash_work_count() > after_interrupted,
+            "an interrupted pin must not publish a partial digest to the memo"
+        );
+        assert!(
+            checks >= 11,
+            "metadata and every bounded read must check cancellation"
+        );
+        assert_eq!(first.content_sha256(), &hash_file_sha256(&path).unwrap());
+        let before = test_full_hash_work_count();
+        let mut warm_checks = 0;
+        let warm = ArtifactSeal::pin_with_check(&path, || {
+            warm_checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(warm.content_sha256(), first.content_sha256());
+        assert_eq!(
+            test_full_hash_work_count(),
+            before,
+            "checked warm pin must retain once-at-acquisition digest reuse"
+        );
+        assert!(warm_checks >= 3, "warm memo still checks cancellation");
+        assert!(matches!(
+            ArtifactSeal::pin_with_check(&path, || Err(crate::Error::Canceled)),
+            Err(crate::Error::Canceled)
+        ));
+        let mut warm_checks = 0;
+        let canceled_warm = ArtifactSeal::pin_with_check(&path, || {
+            warm_checks += 1;
+            if warm_checks == 3 {
+                Err(crate::Error::Canceled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(canceled_warm, Err(crate::Error::Canceled)));
+    }
 
     #[test]
     fn load_shape_declaration_result_defaults_clones_hashes_and_validates() {
@@ -2437,6 +3907,115 @@ mod tests {
             second.content_sha256(),
             "the re-read must report the digest of the bytes that are there now"
         );
+    }
+
+    /// Persistence needs a volume identity. Developer and CI hosts must supply one for their temp
+    /// volume; only a synthetic filesystem with no id (e.g. a zero-fsid tmpfs) may decline.
+    fn persists_on_this_volume(dir: &Path) -> bool {
+        let supplied = volume_identity(dir).is_some();
+        if cfg!(any(target_os = "macos", windows)) {
+            assert!(supplied, "no volume identity for {}", dir.display());
+        } else if !supplied {
+            eprintln!("skipping: {} has no filesystem id", dir.display());
+        }
+        supplied
+    }
+
+    /// The same file identity on a different volume is a different persisted entry.
+    #[test]
+    fn a_persisted_entry_is_bound_to_its_volume() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("transformer.safetensors");
+        std::fs::write(&file, b"transformer weights").expect("write fixture");
+        let pinned = ArtifactSeal::pin(&file).expect("pin regular file");
+        let identity = SealIdentity {
+            loader_path: pinned.loader_path.clone(),
+            canonical_target_path: pinned.canonical_target_path.clone(),
+            path_component_fingerprints: pinned.path_component_fingerprints.clone(),
+            entry_fingerprint: pinned.entry_fingerprint.clone(),
+            target_fingerprint: pinned.target_fingerprint.clone(),
+        };
+        let store = dir.path().join("seal-digests");
+        assert_ne!(
+            proven_digest_store_entry(&store, &identity, &[1; 16]),
+            proven_digest_store_entry(&store, &identity, &[2; 16]),
+            "a drive swapped in at the same path must not reach the first drive's entry"
+        );
+    }
+
+    /// A restarted worker reuses the digest the previous process proved (sc-26610).
+    ///
+    /// Forgetting this process's in-memory entries stands in for the restart; only the store can
+    /// then supply the digest.
+    #[test]
+    fn a_persisted_digest_survives_a_restart_without_a_re_read() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        if !persists_on_this_volume(dir.path()) {
+            return;
+        }
+        let store = dir.path().join("seal-digests");
+        let file = dir.path().join("transformer.safetensors");
+        std::fs::write(&file, b"transformer weights").expect("write fixture");
+
+        let first = ArtifactSeal::pin_with_store(&file, Some(&store)).expect("pin regular file");
+        forget_proven_digests_for(first.loader_path());
+        let before = test_full_hash_work_count();
+        let second =
+            ArtifactSeal::pin_with_store(&file, Some(&store)).expect("re-pin after restart");
+        assert_eq!(
+            test_full_hash_work_count(),
+            before,
+            "an unchanged file proven by an earlier process must not be re-read"
+        );
+        assert_eq!(first.content_sha256(), second.content_sha256());
+    }
+
+    /// The persisted key is the whole seal identity, so a rewritten file misses the store.
+    #[test]
+    fn a_persisted_digest_never_authorizes_a_mutated_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        if !persists_on_this_volume(dir.path()) {
+            return;
+        }
+        let store = dir.path().join("seal-digests");
+        let file = dir.path().join("transformer.safetensors");
+        std::fs::write(&file, b"transformer weights").expect("write fixture");
+        let first = ArtifactSeal::pin_with_store(&file, Some(&store)).expect("pin regular file");
+
+        // A different length, so the identity changes even within one coarse filesystem clock tick.
+        std::fs::write(&file, b"transformer weights, rewritten").expect("mutate fixture");
+        forget_proven_digests_for(first.loader_path());
+        let before = test_full_hash_work_count();
+        let second =
+            ArtifactSeal::pin_with_store(&file, Some(&store)).expect("re-pin the mutated file");
+        assert!(
+            test_full_hash_work_count() > before,
+            "changed bytes must send the pin back through the full read"
+        );
+        assert_ne!(first.content_sha256(), second.content_sha256());
+    }
+
+    /// A garbage store entry is a miss, never a digest.
+    #[test]
+    fn a_corrupt_persisted_entry_is_ignored() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        if !persists_on_this_volume(dir.path()) {
+            return;
+        }
+        let store = dir.path().join("seal-digests");
+        let file = dir.path().join("transformer.safetensors");
+        std::fs::write(&file, b"transformer weights").expect("write fixture");
+        let first = ArtifactSeal::pin_with_store(&file, Some(&store)).expect("pin regular file");
+        for entry in std::fs::read_dir(&store).expect("store exists") {
+            std::fs::write(entry.expect("entry").path(), "not a digest").expect("corrupt");
+        }
+
+        forget_proven_digests_for(first.loader_path());
+        let before = test_full_hash_work_count();
+        let second =
+            ArtifactSeal::pin_with_store(&file, Some(&store)).expect("re-pin with corrupt store");
+        assert!(test_full_hash_work_count() > before);
+        assert_eq!(first.content_sha256(), second.content_sha256());
     }
 
     #[test]

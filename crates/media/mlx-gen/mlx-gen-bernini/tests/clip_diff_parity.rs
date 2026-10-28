@@ -37,6 +37,7 @@ fn check(name: &str, got: &Array, want: &Array, tol: f32) {
     assert!(rel < tol, "{name} peak-rel {rel:.3e} exceeds {tol:.1e}");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn clip_diff_matches_reference_f32() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
@@ -83,4 +84,6 @@ fn clip_diff_matches_reference_f32() {
         .sample(&z, txt_cfg, steps, Some(img_cfg), &noise)
         .expect("sample");
     check("sample", &sample, w.require("out.sample").unwrap(), 5e-3);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED clip_diff_parity::clip_diff_matches_reference_f32");
 }

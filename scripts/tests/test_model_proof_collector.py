@@ -1,0 +1,518 @@
+"""Mock collector integration: no Cargo, model, weights, GPU or real resource probes."""
+import contextlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from scripts import media_campaign_supervisor as safety
+from scripts.ci import model_proof_resources as resources
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+proof = load('collector_test_proof', ROOT / 'scripts/ci/model_inference_proofs.py')
+policy = load('collector_test_policy', ROOT / 'scripts/check_model_inference_policy.py')
+
+
+def request(backend='darwin-mlx'):
+    return {'selection': 'mlx-gen-test', 'policy': {
+        'schemaVersion': 1, 'backend': backend, 'deadlineSeconds': 10,
+        'pollMillis': 10, 'termGraceMillis': 50,
+        'hostFreeReserveBytes': 100, 'childFootprintCapBytes': 1000000,
+        'stdoutCapBytes': 1000000, 'stderrCapBytes': 1000000, 'eventCapBytes': 1000000}}
+
+
+def case():
+    return {'package': 'mlx-gen-test', 'target': 'mlx_gen_test', 'target_kind': 'lib',
+            'fqn': 'tests::mock', 'source': 'case.rs', 'execution_role': 'direct',
+            'backend': 'cpu', 'fixture_identity': 'protocol mock; NO NN',
+            'configuration_source': 'case.rs::mock', 'output_contract': 'mock logs only',
+            'input_contract': {'fixture_kind': 'source-defined', 'source_identity': 'case.rs::mock', 'requirements': []}}
+
+
+def external_case(grade='reader-binding'):
+    row = case()
+    row['input_contract'] = {'fixture_kind': 'external', 'source_identity': 'case.rs::mock/actual-read',
+        'requirements': [{'slot': 'model-weights', 'role': 'model-weights', 'readers': ['mlx-gen::Weights::from_file'],
+                          'minimum_collections': 1, 'minimum_items': 1, 'required_grade': grade, 'scope': 'case'}]}
+    path = {'display': '/MOCK-ONLY/actual-input', 'os_encoded_hex': b'/MOCK-ONLY/actual-input'.hex()}
+    item = {'literal_path': path, 'absolute_lexical_path': path, 'os_encoding': 'rust-osstr-encoded',
+            'provenance': {'kind': 'successful-reader-binding', 'content_integrity': 'not_attested'}}
+    packet = {'schema_version': 1, 'reader': 'mlx-gen::Weights::from_file', 'role': 'model-weights',
+              'complete': True, 'items': [item]}
+    return row, 'MODEL_INFERENCE_INPUT_USED ' + row['fqn'] + ' ' + json.dumps(packet) + '\n'
+
+
+class Collector(unittest.TestCase):
+    def test_global_cuda_card_bound_is_labeled_without_attributed_peak(self):
+        # CI_IMPACT: pure result-label check; adds no model, Cargo, GPU or process work.
+        bounded = safety.RunResult(1, 0, 0, None, 0, 0, 0.1,
+                                   ({'phase': 'cuda-global-used-upper-bound-sample',
+                                     'globalUsedUpperBoundBytes': 1024},), {})
+        self.assertEqual(proof.gpu_peak_observation(bounded),
+                         'global-used-upper-bound-sampled/not-child-attributed')
+        self.assertEqual(proof.gpu_peak_observation(safety.RunResult(1, 0, 0, 1024, 0, 0, 0.1, (), {})),
+                         'sampled')
+        multi = safety.MultiCudaRunResult(1, 0, 0, None, 0, 0, 0.1, (), {},
+                                         ({'globalUsedUpperBoundSampleCount': 1},))
+        self.assertEqual(proof.gpu_peak_observation(multi),
+                         'global-used-upper-bound-sampled/not-child-attributed')
+
+    def test_toolchain_uses_declaration_and_verified_proxies_for_actual_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "repository-channel"\n', encoding='utf-8')
+            bin_dir = root / 'cargo-home/bin'
+            bin_dir.mkdir(parents=True)
+            suffix = '.exe' if os.name == 'nt' else ''
+            for tool in ('cargo', 'rustc', 'rustup'):
+                path = bin_dir / (tool + suffix)
+                path.write_text('MOCK; never executed', encoding='utf-8')
+                path.chmod(0o755)
+            env = {'CARGO_HOME': str(bin_dir.parent), 'PATH': '/shadow', 'RUSTUP_TOOLCHAIN': 'repository-channel'}
+            commands = []
+            def inspect(argv, **kwargs):
+                commands.append(argv)
+                self.assertEqual(kwargs['env']['RUSTUP_TOOLCHAIN'], 'repository-channel')
+                self.assertEqual(kwargs['cwd'], root)
+                self.assertTrue(kwargs['check'])
+                if 'which' in argv:
+                    self.assertEqual(argv[1:4], ['which', '--toolchain', 'repository-channel'])
+                    output = str(root / 'installed/bin' / argv[-1])
+                else:
+                    self.assertEqual(kwargs['env']['RUSTC'], str(bin_dir / ('rustc' + suffix)))
+                    output = 'MOCK compiler version; not actually run'
+                return subprocess.CompletedProcess(argv, 0, stdout=output + '\n')
+            with patch.object(proof.subprocess, 'run', side_effect=inspect), \
+                    patch.object(proof, 'configure_native_darwin_build',
+                                 return_value={'mechanism': 'MOCK linker; not executed'}) as native:
+                value = proof.verified_toolchain(env, root=root)
+            native.assert_called_once_with(env, [str(bin_dir / ('rustc' + suffix))],
+                                           root=root, system=proof.platform.system())
+            self.assertEqual(value['native_linker']['mechanism'], 'MOCK linker; not executed')
+            self.assertEqual(value['channel'], 'repository-channel')
+            self.assertEqual(value['inherited_rustup_toolchain'], 'repository-channel')
+            self.assertEqual(env['PATH'].split(os.pathsep)[0], str(bin_dir))
+            self.assertEqual(len(commands), 4)
+            self.assertEqual(commands[-2][0], str(bin_dir / ('cargo' + suffix)))
+            self.assertEqual(commands[-1][0], str(bin_dir / ('rustc' + suffix)))
+            self.assertEqual(value['rustc_version'], 'MOCK compiler version; not actually run')
+            env['RUSTC'] = '/unapproved/compiler'
+            with patch.object(proof.subprocess, 'run', side_effect=inspect):
+                with self.assertRaisesRegex(ValueError, 'RUSTC differs'):
+                    proof.verified_toolchain(env, root=root)
+
+    def test_toolchain_rejects_unexpected_override_before_any_compiler_or_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "repository-channel"\n', encoding='utf-8')
+            with patch.object(proof.subprocess, 'run') as command:
+                with self.assertRaisesRegex(ValueError, 'RUSTUP_TOOLCHAIN differs'):
+                    proof.verified_toolchain({'RUSTUP_TOOLCHAIN': 'host-override'}, root=root)
+                command.assert_not_called()
+
+    def test_windows_toolchain_uses_real_pinned_binaries_without_listener_cache_proxies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            rustup_home = root / 'rustup'
+            bin_dir = rustup_home / 'toolchains/repository-channel-x86_64-pc-windows-msvc/bin'
+            bin_dir.mkdir(parents=True)
+            for tool in ('cargo', 'rustc'):
+                binary = bin_dir / f'{tool}.exe'
+                binary.write_text('MOCK; never executed', encoding='utf-8')
+                binary.chmod(0o755)
+            env = {'USERPROFILE': str(root), 'RUSTUP_HOME': str(rustup_home),
+                   'CARGO_HOME': str(root / 'listener-cache-without-bin'),
+                   'MODEL_PROOF_RUST_BIN': str(bin_dir), 'PATH': '/shadow'}
+            declaration = b'[toolchain]\nchannel = "repository-channel"\n'
+
+            def inspect(argv, **kwargs):
+                self.assertEqual(kwargs['env']['PATH'].split(os.pathsep)[0], str(bin_dir))
+                self.assertEqual(kwargs['env']['RUSTC'], str(bin_dir / 'rustc.exe'))
+                output = ('cargo repository-channel (mock)\n' if argv[0].endswith('cargo.exe')
+                          else 'rustc repository-channel (mock)\nrelease: repository-channel\n')
+                return subprocess.CompletedProcess(argv, 0, stdout=output)
+
+            with patch.object(proof.shutil, 'which', side_effect=lambda name, path: str(bin_dir / f'{name}.exe')), \
+                 patch.object(proof.subprocess, 'run', side_effect=inspect):
+                value = proof.verified_windows_toolchain(env, root, declaration, 'repository-channel', None)
+                self.assertEqual(value['binaries']['cargo'], str(bin_dir / 'cargo.exe'))
+                self.assertEqual(value['channel'], 'repository-channel')
+                self.assertEqual(env['CARGO_HOME'], str(root / 'listener-cache-without-bin'))
+                env['MODEL_PROOF_RUST_BIN'] = str(root / 'wrong-toolchain/bin')
+                with self.assertRaisesRegex(ValueError, 'differs from the pinned'):
+                    proof.verified_windows_toolchain(env, root, declaration, 'repository-channel', None)
+                env['MODEL_PROOF_RUST_BIN'] = str(bin_dir)
+                (bin_dir / 'rustc.exe').unlink()
+                with self.assertRaisesRegex(ValueError, 'binaries are missing'):
+                    proof.verified_windows_toolchain(env, root, declaration, 'repository-channel', None)
+
+    def test_windows_toolchain_rejects_reported_version_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            rustup_home = root / 'rustup'
+            bin_dir = rustup_home / 'toolchains/1.96.0-x86_64-pc-windows-msvc/bin'
+            bin_dir.mkdir(parents=True)
+            for tool in ('cargo', 'rustc'):
+                binary = bin_dir / f'{tool}.exe'
+                binary.write_text('MOCK; never executed', encoding='utf-8')
+                binary.chmod(0o755)
+            env = {'USERPROFILE': str(root), 'RUSTUP_HOME': str(rustup_home),
+                   'CARGO_HOME': str(root / 'listener-cache'), 'MODEL_PROOF_RUST_BIN': str(bin_dir),
+                   'PATH': '/shadow'}
+            def inspect(argv, **kwargs):
+                output = ('cargo 1.97.0 (mock)\n' if argv[0].endswith('cargo.exe')
+                          else 'rustc 1.96.0 (mock)\nrelease: 1.96.0\n')
+                return subprocess.CompletedProcess(argv, 0, stdout=output)
+            with patch.object(proof.shutil, 'which', side_effect=lambda name, path: str(bin_dir / f'{name}.exe')), \
+                 patch.object(proof.subprocess, 'run', side_effect=inspect):
+                with self.assertRaisesRegex(ValueError, 'version differs'):
+                    proof.verified_windows_toolchain(env, root, b'pin', '1.96.0', None)
+
+    def test_bridge_accepts_only_fixed_backend_and_request_envelope(self):
+        raw = json.dumps({'backend': 'mlx', 'request': request()})
+        self.assertEqual(proof.binding(raw), ('mlx', request()))
+        for invalid in ('', '{}', 'null', '{"backend":"anything","request":{}}',
+                        json.dumps({'backend': 'mlx', 'request': request(), 'command': 'false'})):
+            with self.assertRaises((ValueError, TypeError)):
+                proof.binding(invalid)
+
+    def test_rustdoc_model_seams_are_not_ordinary_even_in_should_panic(self):
+        for tag in ('rust', 'rust,should_panic', ''):
+            source = '/// ```' + tag + '\n/// model.forward(&x)?;\n/// ```\npub struct X;'
+            self.assertTrue(policy.model_doc_errors(source, 'case.rs'))
+        for tag in ('rust,no_run', 'no_run', 'rust,ignore', 'compile_fail', 'text', 'sh'):
+            source = '/// ```' + tag + '\n/// model.forward(&x)?;\n/// ```\npub struct X;'
+            self.assertEqual(policy.model_doc_errors(source, 'case.rs'), [])
+        self.assertEqual(policy.model_doc_errors('/// ```rust\n/// a.matmul(&b)?;\n/// ```', 'raw.rs'), [])
+        self.assertEqual(policy.model_doc_errors('///  1. Explanation\n///     `loss.backward()` is a description.', 'prose.rs'), [])
+
+    def test_existing_ignore_reason_is_preserved_but_marker_requires_registry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            path = root / 'crates/case.rs'
+            path.parent.mkdir()
+            path.write_text('#[test]\n#[ignore = "original prerequisite reason"]\nfn mock() { println!("MODEL_INFERENCE_BODY_COMPLETED tests::mock"); }', encoding="utf-8")
+            row = case(); row['source'] = 'crates/case.rs'
+            self.assertEqual(policy.registry_errors(root, [row]), [])
+            self.assertTrue(policy.registry_errors(root, []))
+
+    def test_destination_ancestor_and_hardlink_cannot_overwrite_other_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / 'source.png'; source.write_bytes(b'output')
+            outside = root / 'outside'; outside.mkdir()
+            destination = root / 'dest'; destination.mkdir()
+            (destination / 'link').symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                proof.publish_file(source, destination / 'link/out.png', root, 100)
+            victim = outside / 'private.png'; victim.write_bytes(b'private')
+            os.link(victim, destination / 'hard.png')
+            with self.assertRaises(ValueError):
+                proof.publish_file(source, destination / 'hard.png', root, 100)
+            self.assertEqual(victim.read_bytes(), b'private')
+
+    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body='', observer_events=True):
+        row = case() if row_override is None else row_override
+        if missing:
+            row['required_environment'] = ['MODEL_PROOF_TEST_PREREQUISITE_ABSENT']
+        (root / 'case.rs').write_text('// test fixture; no actual Rust execution', encoding="utf-8")
+        def toolchain(env, **_kwargs):
+            self.assertEqual(env['MACOSX_DEPLOYMENT_TARGET'], row.get('deployment_target', '15.0'))
+            env['CARGO_ENCODED_RUSTFLAGS'] = 'MOCK_NATIVE_LINKER_FLAGS'
+            return {'toolchain': 'MOCK; no compiler invoked'}
+        def preparation(_row, env):
+            self.assertEqual(env['MACOSX_DEPLOYMENT_TARGET'], row.get('deployment_target', '15.0'))
+            self.assertEqual(env['CARGO_ENCODED_RUSTFLAGS'], 'MOCK_NATIVE_LINKER_FLAGS')
+            return {'prebuilt': 'MOCK; not executed'}
+        def guarded(argv, **kwargs):
+            self.assertEqual(kwargs['env']['CARGO_ENCODED_RUSTFLAGS'], 'MOCK_NATIVE_LINKER_FLAGS')
+            discovery = '--list' in argv
+            text = (row['fqn'] + ': test\n\n1 test, 0 benchmarks\n') if discovery else (
+                'test result: ok. 1 passed; 0 failed; 0 ignored;\n'
+                'MODEL_INFERENCE_BODY_COMPLETED ' + row['fqn'] + '\n'
+                'MODEL_INFERENCE_DEVICE ' + row['fqn'] + ' mlx-cpu\n' + input_body)
+            kwargs['stdout_path'].write_text(text, encoding="utf-8")
+            kwargs['stderr_path'].write_text('', encoding="utf-8")
+            if observer_events == 'broken-symlink':
+                kwargs['event_path'].symlink_to(root / 'missing-observer-events')
+            elif observer_events:
+                kwargs['event_path'].write_text('{"mock":true}\n', encoding="utf-8")
+            return safety.RunResult(42, 1 if fail and not discovery else 0, 1024, None,
+                                    1000000000, None, 0.01, (), {'mode': 'mock'})
+        @contextlib.contextmanager
+        def incomplete_controller(*_args, **_kwargs):
+            if preseal == 'claim':
+                raise resources.CudaClaimRejected({'requested_uuid': 'GPU-12345678-1234-1234-1234-123456789abc',
+                                                   'predicates': {'unique_uuid': True, 'selected_process_types_allowed': False}})
+            yield {'mechanism': 'MOCK controller', 'post_execution_verified': False}
+            if preseal == 'cancel':
+                raise KeyboardInterrupt('MOCK cancellation before physical seal')
+            if preseal == 'release':
+                raise resources.CudaReleaseRejected('MOCK release refusal',
+                                                    {'status': 'retained-existing-samples', 'sample_count': 1})
+            raise ValueError('MOCK controller post-idle failure')
+        claim_patch = patch.object(resources, 'execution_claim', side_effect=incomplete_controller) if preseal else contextlib.nullcontext()
+        expected = '1' * 40
+        env = {'RUNNER_TEMP': str(root), 'RUNNER_OS': 'macOS', 'RUNNER_NAME': 'mock-hosted',
+               'GITHUB_EVENT_NAME': 'workflow_dispatch', 'MODEL_PROOF_RUNNER_ENVIRONMENT': 'github-hosted'}
+        with patch.dict(os.environ, env), patch.object(proof, 'ROOT', root), \
+                patch.object(proof, 'repository_identity', return_value={'revision': expected, 'tree': '2' * 40}), \
+                patch.object(proof, 'verified_toolchain', side_effect=toolchain), \
+                patch.object(proof, 'prepare_build', side_effect=preparation), \
+                patch.object(safety, 'run_guarded', side_effect=guarded) as guard, claim_patch:
+            output = root / 'evidence'
+            try:
+                status = proof.run((row,), 'mlx', request(), expected, output)
+            except KeyboardInterrupt:
+                status = 130
+            verified = proof.verify_artifacts(output, root, request(), expected, (row,))
+            receipt = json.loads((output / 'receipt.json').read_text(encoding="utf-8"))
+            return status, receipt, verified, guard.call_count, output
+
+    def test_full_mock_collector_records_body_device_events_and_safe_upload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            status, receipt, verified, calls, output = self._mock_run(root)
+            self.assertEqual(status, 0)
+            self.assertEqual(calls, 2)
+            self.assertEqual(receipt['completed'], 1)
+            self.assertTrue(receipt['accepted'])
+            self.assertEqual(receipt['cases'][0]['actual_devices'], ['mlx-cpu'])
+            self.assertNotIn('cuda_claim_diagnostic', receipt['cases'][0])
+            self.assertTrue(verified['accepted_model_run'])  # MOCK ONLY, temp tree removed.
+            self.assertTrue((output / '00000/body.events.jsonl').is_file())
+            self.assertFalse(any(path.suffix == '.safetensors' for path in output.rglob('*')))
+
+    def test_success_without_optional_observer_events_keeps_actual_supervision(self):
+        # CI_IMPACT: pure mocked controller regression for the Windows no-event
+        # discovery/body path; no Cargo, model, weight, GPU, or process execution.
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, output = self._mock_run(
+                Path(temporary).resolve(), observer_events=False)
+            self.assertEqual(status, 0)
+            self.assertEqual(calls, 2)
+            self.assertTrue(verified['accepted_model_run'])  # MOCK ONLY.
+            case_result = receipt['cases'][0]
+            self.assertTrue(case_result['accepted'])
+            self.assertEqual(len(case_result['commands']), 2)
+            self.assertEqual(case_result['actual_devices'], ['mlx-cpu'])
+            self.assertFalse(any(item['path'].endswith('.events.jsonl') for item in case_result['outputs']))
+            self.assertFalse(list(output.rglob('*.events.jsonl')))
+
+    def test_broken_observer_event_link_cannot_pass_as_absent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, _ = self._mock_run(
+                Path(temporary).resolve(), observer_events='broken-symlink')
+            self.assertEqual(status, 1)
+            self.assertEqual(calls, 1)
+            self.assertFalse(receipt['cases'][0]['accepted'])
+            self.assertFalse(verified['accepted_model_run'])
+
+    def test_registered_mlx_deployment_precedes_toolchain_sdk_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            row = case()
+            row['deployment_target'] = '26.2'
+            status, _receipt, _verified, calls, _output = self._mock_run(
+                Path(temporary).resolve(), row_override=row)
+            self.assertEqual(status, 0)
+            self.assertEqual(calls, 2)
+
+    def test_failed_child_keeps_failure_receipt_and_known_logs_not_acceptance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, output = self._mock_run(Path(temporary).resolve(), fail=True)
+            self.assertEqual(status, 1)
+            self.assertFalse(receipt['accepted'])
+            self.assertEqual(receipt['completed'], 0)
+            self.assertFalse(verified['accepted_model_run'])
+            paths = [item['path'] for item in receipt['cases'][0]['outputs']]
+            self.assertEqual(len(paths), len(set(paths)))
+            self.assertTrue((output / '00000/body.stderr.log').is_file())
+
+    def test_missing_prerequisite_never_launches_or_reports_a_completed_body(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, _ = self._mock_run(Path(temporary).resolve(), missing=True)
+            self.assertEqual(status, 1)
+            self.assertEqual(calls, 0)
+            self.assertEqual(receipt['completed'], 0)
+            self.assertFalse(verified['accepted_model_run'])
+
+    def test_controller_failure_after_body_never_publishes_preliminary_acceptance(self):
+        for failure in ('controller', 'cancel'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                status, receipt, verified, calls, _ = self._mock_run(Path(temporary).resolve(), preseal=failure)
+                self.assertNotEqual(status, 0)
+                self.assertEqual(calls, 2)
+                self.assertFalse(receipt['accepted'])
+                self.assertEqual(receipt['completed'], 0)
+                case = receipt['cases'][0]
+                self.assertTrue(case['body_proof_accepted'])
+                self.assertTrue(case['resource_verification_pending'])
+                self.assertFalse(case['accepted'])
+                self.assertFalse(verified['accepted_model_run'])
+                self.assertEqual(len(case['commands']), 2)
+
+    def test_prebody_claim_diagnostic_survives_existing_failed_artifact_without_acceptance(self):
+        # CI_IMPACT: collector mock only; no model, CUDA, Cargo, or process execution.
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, output = self._mock_run(Path(temporary).resolve(), preseal='claim')
+            self.assertEqual(status, 1)
+            self.assertEqual(calls, 1)  # discovery only; body never starts
+            self.assertFalse(receipt['accepted'])
+            self.assertEqual(receipt['completed'], 0)
+            case = receipt['cases'][0]
+            self.assertFalse(case['accepted'])
+            self.assertFalse(case['body_proof_accepted'])
+            self.assertTrue(case['resource_verification_pending'])
+            self.assertEqual(case['cuda_claim_diagnostic']['predicates']['selected_process_types_allowed'], False)
+            self.assertEqual(json.loads((output / '00000/result.json').read_text(encoding='utf-8')), case)
+            self.assertFalse(verified['accepted_model_run'])
+            self.assertFalse((output / '00000/body.stdout.log').exists())
+
+    def test_postbody_release_diagnostic_retains_failure_without_resource_seal(self):
+        # CI_IMPACT: mocked resource controller only; no model, CUDA, Cargo or process execution.
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, output = self._mock_run(Path(temporary).resolve(), preseal='release')
+            self.assertEqual(status, 1)
+            self.assertEqual(calls, 2)
+            self.assertFalse(receipt['accepted'])
+            self.assertEqual(receipt['completed'], 0)
+            case = receipt['cases'][0]
+            self.assertTrue(case['body_proof_accepted'])
+            self.assertTrue(case['resource_verification_pending'])
+            self.assertFalse(case['accepted'])
+            self.assertFalse(case['physical_execution']['post_execution_verified'])
+            self.assertEqual(case['cuda_release_diagnostic']['status'], 'retained-existing-samples')
+            self.assertEqual(json.loads((output / '00000/result.json').read_text(encoding='utf-8')), case)
+            self.assertFalse(verified['accepted_model_run'])
+
+    def test_final_upload_rejects_unknown_files_changed_results_and_wrong_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _, _, _, _, output = self._mock_run(root)
+            unknown = output / 'checkpoint.safetensors'; unknown.write_bytes(b'forbidden')
+            with self.assertRaises(ValueError):
+                proof.verify_artifacts(output, root, request(), '1' * 40, (case(),))
+            unknown.unlink()  # own temporary test scratch only
+            result = output / '00000/result.json'; result.write_text('{}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                proof.verify_artifacts(output, root, request(), '1' * 40, (case(),))
+            with self.assertRaises(ValueError):
+                proof.verify_artifacts(output, root, request(), '3' * 40, (case(),))
+
+    def test_weak_actual_reader_grade_survives_physical_seal_artifact_validation_and_summary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            row, text = external_case()
+            status, receipt, verified, calls, output = self._mock_run(Path(temporary).resolve(), row_override=row, input_body=text)
+            self.assertEqual(status, 0)
+            self.assertEqual(calls, 2)
+            for record in (receipt, receipt['cases'][0], verified):
+                self.assertEqual(record['acceptance_scope'], 'source-bound-case-execution')
+                self.assertEqual(record['input_grade'], 'successful-reader-binding')
+                self.assertFalse(record['checkpoint_byte_integrity_attested'])
+                self.assertFalse(record['verified_named_revision'])
+                self.assertFalse(record['terminal_model_evidence'])
+            self.assertTrue(receipt['cases'][0]['physical_execution']['post_execution_verified'])
+            summary = (output / 'summary.md').read_text(encoding="utf-8")
+            self.assertIn('successful-reader-binding', summary)
+            self.assertIn('Checkpoint-byte integrity attested: False', summary)
+
+    def test_resource_seal_cannot_upgrade_weak_case_json_or_aggregate_input_grade(self):
+        for mutate_case in (False, True):
+            with self.subTest(case=mutate_case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                row, text = external_case()
+                _, receipt, _, _, output = self._mock_run(root, row_override=row, input_body=text)
+                target = receipt['cases'][0] if mutate_case else receipt
+                target.update(acceptance_scope='content-bound-case-execution', input_grade='validated-content',
+                              checkpoint_byte_integrity_attested=True, terminal_model_evidence=True)
+                (output / 'receipt.json').write_text(json.dumps(receipt), encoding="utf-8")
+                if mutate_case:
+                    (output / '00000/result.json').write_text(json.dumps(target), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, 'input.*(grade|scope)|aggregate physical'):
+                    proof.verify_artifacts(output, root, request(), '1' * 40, (row,))
+
+    def test_missing_input_contract_refuses_before_any_command_and_weak_cannot_satisfy_strong_case(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            row = case(); row.pop('input_contract')
+            status, receipt, _, calls, _ = self._mock_run(Path(temporary).resolve(), row_override=row)
+            self.assertNotEqual(status, 0)
+            self.assertEqual(calls, 0)
+            self.assertFalse(receipt['accepted'])
+        with tempfile.TemporaryDirectory() as temporary:
+            row, text = external_case('content')
+            status, receipt, verified, calls, _ = self._mock_run(Path(temporary).resolve(), row_override=row, input_body=text)
+            self.assertNotEqual(status, 0)
+            self.assertEqual(calls, 2)
+            self.assertFalse(receipt['accepted'])
+            self.assertFalse(verified['checkpoint_byte_integrity_attested'])
+            self.assertFalse(receipt['cases'][0]['body_proof_accepted'])
+
+    def test_indexed_children_require_every_exact_body_and_actual_child_device(self):
+        row = case()
+        row.update(execution_role='indexed_children', expected_child_ids=['first', 'second'])
+        text = 'test result: ok. 1 passed; 0 failed; 0 ignored;\n' * 3
+        for child in row['expected_child_ids']:
+            text += f"MODEL_INFERENCE_BODY_COMPLETED {row['fqn']}#child={child}\n"
+            text += f"MODEL_INFERENCE_DEVICE {row['fqn']}#child={child} mlx-cpu\n"
+        text += 'MODEL_INFERENCE_PARENT_COMPLETED ' + row['fqn'] + '\n'
+        result = proof.verify_execution(row, text)
+        self.assertEqual(result['body_completed'], 2)
+        for invalid in (text.replace('#child=second', '#child=first'),
+                        text.replace('MODEL_INFERENCE_DEVICE ' + row['fqn'] + '#child=second mlx-cpu', ''),
+                        text + 'MODEL_INFERENCE_BODY_COMPLETED ' + row['fqn'] + '\n',
+                        text.replace('MODEL_INFERENCE_PARENT_COMPLETED', 'MISSING_PARENT')):
+            with self.assertRaises(ValueError):
+                proof.verify_execution(row, invalid)
+
+    def test_explicit_missing_required_work_rejects_even_successful_body_and_device(self):
+        row = case()
+        text = ('test result: ok. 1 passed; 0 failed; 0 ignored;\n'
+                'MODEL_INFERENCE_BODY_COMPLETED ' + row['fqn'] + '\n'
+                'MODEL_INFERENCE_DEVICE ' + row['fqn'] + ' mlx-cpu\n')
+        with self.assertRaises(ValueError):
+            proof.verify_execution(row, text + 'MODEL_INFERENCE_PREREQUISITE_MISSING ' + row['fqn'] + ' missing fixture tier\n')
+
+    def test_manual_discovery_records_actual_compiler_target_not_a_package_name_guess(self):
+        row = case()
+        row['cargo_target_metadata'] = {'name': row['target'], 'kind': ['staticlib', 'rlib'],
+                                        'crate_types': ['staticlib', 'rlib']}
+        artifact = {'reason': 'compiler-artifact', 'profile': {'test': True}, 'executable': 'MOCK-only',
+                    'package_id': 'mock-id', 'target': dict(row['cargo_target_metadata']), 'features': []}
+        listing = row['fqn'] + ': test\n\n1 test, 0 benchmarks\n'
+        report = proof.verify_discovery(row, json.dumps(artifact) + '\n' + listing)
+        self.assertEqual(report['target']['kind'], ['staticlib', 'rlib'])
+        self.assertEqual(report['model_bodies_executed'], 0)
+        with self.assertRaises(ValueError):
+            proof.verify_discovery(row, listing)
+        artifact['target']['name'] = row['package']
+        with self.assertRaises(ValueError):
+            proof.verify_discovery(row, json.dumps(artifact) + '\n' + listing)
+
+    def test_cpu_metadata_policy_strips_cuda_only_fields(self):
+        value = request('windows-cuda')['policy']
+        value.update(cudaDeviceUuid='GPU-00000000-0000-0000-0000-000000000000',
+                     gpuFreeReserveBytes=1, childGpuCapBytes=1)
+        metadata = resources.metadata_policy_payload(value)
+        self.assertEqual(metadata['backend'], 'windows-cpu')
+        self.assertNotIn('cudaDeviceUuid', metadata)
+        self.assertNotIn('childGpuCapBytes', metadata)
+        self.assertEqual(value['backend'], 'windows-cuda')
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -51,6 +51,7 @@ fn it2i_realweight_matches_reference() {
         eprintln!(
             "skipping: snapshot or golden missing — see tools/dump_sensenova_it2i_realweight.py"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in it2i_realweight_matches_reference; see preceding skip diagnostic");
         return;
     }
 
@@ -194,4 +195,6 @@ fn it2i_realweight_matches_reference() {
         peak_rel(&out.image, &want_image)
     );
     assert!(edit_cos > 0.85, "edit e2e cosine {edit_cos:.5} below 0.85");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED it2i_realweight::it2i_realweight_matches_reference");
 }

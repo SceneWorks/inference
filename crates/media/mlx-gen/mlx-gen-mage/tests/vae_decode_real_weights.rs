@@ -331,6 +331,7 @@ fn decode_matches_the_torch_golden_at_every_geometry() {
         let bundles = load_goldens(size);
         if bundles.is_empty() {
             println!("{size}: no golden, skipped");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in decode_matches_the_torch_golden_at_every_geometry; see preceding skip diagnostic");
             continue;
         }
         println!("{size}:");
@@ -347,6 +348,8 @@ fn decode_matches_the_torch_golden_at_every_geometry() {
          dump them with the command in this file's module docs",
         GEOMETRIES.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_real_weights::decode_matches_the_torch_golden_at_every_geometry");
 }
 
 /// **sc-8228 regression class: no silent corruption at a large decode.**
@@ -396,6 +399,8 @@ fn no_large_decode_corruption() {
     let report = corruption_report(&got, want);
     report.print(size);
     report.assert_clean(size);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_real_weights::no_large_decode_corruption");
 }
 
 /// The per-region error statistics [`no_large_decode_corruption`] gates on.
@@ -727,6 +732,8 @@ fn corruption_probes_reject_a_seeded_defect() {
         .verdict()
         .expect_err("a constant decode was not detected");
     assert!(why.contains("constant"), "wrong probe fired for (f): {why}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_real_weights::corruption_probes_reject_a_seeded_defect");
 }
 
 /// Constant-folded decode must remain numerically equivalent on the **real** weights. This covers
@@ -752,6 +759,8 @@ fn decode_folding_matches_unfolded_real_weights() {
     println!("folded vs unfolded max_abs {mx} mean_abs {mn}");
     assert!(mx < 3e-4, "decode folding changed max_abs by {mx}");
     assert!(mn < 2e-5, "decode folding changed mean_abs by {mn}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_real_weights::decode_folding_matches_unfolded_real_weights");
 }
 
 /// Same-process real-model allocator A/B for the exact 2048² x-embedder activation sc-14372
@@ -807,6 +816,8 @@ fn decode_fold_reduces_2048_activation_peak() {
         "DCT/zero-RGB fold saved only {:.3} GB of 2048 decode activation peak",
         saved as f64 / 1e9
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_real_weights::decode_fold_reduces_2048_activation_peak");
 }
 
 /// Decoding is deterministic and batch-invariant: the same latent decodes identically whether it
@@ -832,6 +843,8 @@ fn decode_is_deterministic_and_batch_invariant() {
     let err = max_abs(&first.reshape(once.shape()).unwrap(), &once);
     println!("batch-of-2 vs batch-of-1 max_abs {err}");
     assert!(err < 1e-5, "batching changed the decode by {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_real_weights::decode_is_deterministic_and_batch_invariant");
 }
 
 /// The state-dict layout constants are claims about the published checkpoint, so check them
@@ -882,4 +895,6 @@ fn checkpoint_layout_matches_the_declared_prefixes() {
     // And the model still builds without them, which is the point of the skip.
     let v = vae(true);
     assert!(v.is_adaln_folded());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_real_weights::checkpoint_layout_matches_the_declared_prefixes");
 }

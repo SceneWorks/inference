@@ -117,4 +117,6 @@ fn dump_runb_latents() {
             vae_decoded.shape()
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dump_runb_latents::dump_runb_latents");
 }

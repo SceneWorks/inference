@@ -13,6 +13,16 @@
 //! `kokoro_wav_conformance` also writes the synthesized WAV next to the test output
 //! (`KOKORO_WAV_OUT` overrides the path) so a human can listen to the evidence.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_kokoro::gen_core::{
@@ -59,6 +69,9 @@ fn kokoro_conformance() {
         },
         &profile,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kokoro_conformance");
 }
 
 /// The real-WAV DoD: fixed script + seed + voice → non-empty, 24 kHz, mono, finite,
@@ -89,7 +102,10 @@ fn kokoro_wav_conformance() {
         .generate(&req, &mut |p| match p {
             Progress::Step { .. } => steps += 1,
             Progress::Decoding => decoding += 1,
-            Progress::Loading(_) => {}
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .expect("generate");
     assert_eq!(steps, pipeline::STAGES);
@@ -231,4 +247,7 @@ fn kokoro_wav_conformance() {
         track.samples, track2.samples,
         "seeded synthesis must be deterministic"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED kokoro_wav_conformance");
 }

@@ -1,7 +1,9 @@
 # iOS device runbook
 
-Updated 2026-10-17 against inference feature base `481b04d6f` plus the sc-26270
-campaign harness. These are implemented harness commands, not a claim the epic
+Reconciled 2026-10-26 against the sc-26270
+ANCHOR campaign (two endpoint configurations per family, with two optimized
+repeats). Source repairs and terminal device evidence remain in progress. These
+are implemented harness commands, not a claim the epic
 is on main or that all models render on the phone. See [strategy](architecture/ios-strategy.md),
 [specification](architecture/ios-project-spec.md), and [remaining work](ios-epics.md).
 
@@ -10,13 +12,21 @@ is on main or that all models render on the phone. See [strategy](architecture/i
 Target: **iPhone 16 Pro Max, 8 GB, iOS 26.6.2**. No successful target-device image
 has been recorded. Registration is not admission or demonstrated fit.
 
+Michael clarified this delivery's Iris scope on 2026-10-26: generation
+(`iris_3b`), including bf16/q8/q4 on MLX and Candle. Existing depth/restoration
+registrations remain, but new task tiers, desktop task-tier plumbing and task
+device certification are outside this closeout. Their unresolved catalog rows
+are not measured fits. Other generation architectures and their conditioning,
+reference and control modes remain in scope; the separate Supra2 exception is
+unchanged. See epic 16774 and sc-26266/sc-26270 for the recorded decision.
+
 | Model set | Feature status at this snapshot | Target-phone status |
 |---|---|---|
 | SANA base/sprint | Registered; source-bound admission and packed Gemma embeddings merged in #1272 (`23c7e3953`) | Admitted loader refuses without applicable capture; 1024/tile192 attempt terminated, cause unconfirmed |
 | Anima Turbo | Registered without training; Base/Aesthetic excluded | No demonstrated phone fit |
 | Iris 3B | q8/q4 engine fixes merged #1275 (`2f3265c71`); iOS registration #1277 merged | No demonstrated phone fit; depth access is explicitly diagnostic |
 | SDXL, Illustrious-XL v1/v2, RealVisXL, RealVisXL Lightning | Low-memory engine fixes merged #1274 (`a54ad6c3a`); iOS registration #1278 merged | No demonstrated phone fit |
-| Supra2-IMG | sc-26269 requires epic 24212 on inference main; not started | No implementation/fit claim here |
+| Supra2-IMG | Provider delivered separately; iOS registration sc-26269 is explicitly user-deferred and non-blocking for this general delivery | No iOS registration/fit claim here |
 | Z-Image Turbo (`z_image_turbo` text / img2img / LoRA+LoKr; `z_image_turbo_control` pose/canny/depth) | Registered without training at its stored q4/q8/bf16 tiers (sc-26433); every quantum bounded; host-derived reachable sizes below | No demonstrated phone fit. Michael's 8 GB **Mac** q4 run is Mac evidence, not device evidence |
 
 The legacy S3 image check drives SANA. The sc-26270 campaign protocol below now
@@ -27,15 +37,270 @@ bounded capture of a Z-Image campaign case (`IOS_SMOKE_ZIMAGE_CASE`, default
 `z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit`) through the same capture permit — there is
 no unadmitted Z-Image loader.
 
+## Model execution policy: ordinary CI versus explicit proofs
+
+The canonical rule lives in `AGENTS.md`: normal PR and `main` CI compiles/lints
+all applicable test targets but **never executes learned model/module/layer
+forward or backward, generation or training**, even on tiny synthetic weights.
+Raw matmul/conv/SDPA/norm/allocator kernels, metadata/schema/math/tokenizers,
+mocks and cheap constructor/load-only checks remain ordinary. Model source may
+land on `main`; ignored model tests retain their complete bodies/assertions and
+are registered in `scripts/ci/model-inference-proofs.json`.
+
+`model-inference-proofs.yml` is a **separate, workflow-dispatch-only** execution
+path. Nothing automatically runs a model because a PR merges, a pin changes, or
+an epic reaches its end. The workflow takes only `backend` and `request` inputs;
+request JSON contains a registered selection and an explicit existing-supervisor
+resource policy. There are no hidden RAM defaults, free Cargo arguments, or
+unfiltered parameter/measurement grids. Obtain execution authorization and use
+approved caps/reserves/deadlines before dispatch; no dispatch is recorded here.
+
+Synthetic H3 and MOSS validation also lives in the separate explicit
+`real-weights.yml` workflow. The former ordinary-CI dispatch inputs map as follows:
+
+| Former `ci.yml` input | `real-weights.yml` profile | Preserved execution route |
+|---|---|---|
+| `synthetic_w4a8=mlx` | `synthetic-w4a8-mlx` | Hosted macOS 15 precise projection plus self-hosted `rw-llm` Metal suite |
+| `synthetic_w4a8=cuda` | `synthetic-w4a8-cuda` | Self-hosted Windows CUDA H3 suite, physical GPU0 UUID binding |
+| `synthetic_w4a8=both` | `synthetic-w4a8-both` | All three H3 routes above |
+| `lanes=moss-edit-cuda` | `moss-edit-cuda` | Exact four synthetic cases on the pinned physical GPU1 UUID/PCI identity |
+| `lanes=moss-edit-metal` | `moss-edit-metal` | Exact prepared NAX Metal oracle with immutable source/runtime/binary receipts |
+
+Dispatch against the intended source ref, for example:
+
+```sh
+gh workflow run real-weights.yml --repo SceneWorks/inference --ref <source-ref> -f profile=synthetic-w4a8-both
+```
+
+These profiles never run through `all`, schedule, PR, push, merge group or an
+ordinary CI dependency. Every run/attempt keeps its own queue entry with
+cancellation disabled. Existing exact test counts, named assertions, fixture and
+source controls, backend markers, device restrictions and MOSS evidence artifacts
+are preserved. Tests remain compiled and ignored in ordinary CI; the dedicated
+MOSS CUDA runner verifies ignored membership before explicitly selecting those
+same cases. `ci.yml` retains its ordinary build/lint/non-model manual lanes and
+the read-only GPU1 diagnostic. An empty or obsolete model selector cannot schedule
+model execution from that workflow.
+
+For source-conditional SD35 cases, optional request `configuration` selects only a
+name declared in that case's fixed `configurations` map; omission selects its explicit
+`default_configuration`. One canonical case identity is retained. Each recipe binds
+its source identity, exact set/UNSET values for the source-read SD35 controls,
+per-recipe Cargo features, backend/device set, scope, and required source work.
+Inherited recipe flags are not authority: declared null values explicitly remove
+them. Asset paths and optional tolerance controls remain separate source controls;
+recipes cannot set credentials, child selectors, device-authority flags, or arbitrary
+environment/argv. Unknown names and incompatible execution lanes fail before work.
+
+The three ordinary SD35 component-parity variants default to full F32/CPU encoder
+and DiT work. The `sd35_bigg_pad_token_ab` source default instead covers only CPU
+encoder-conditioning A/B; its CUDA recipe additionally requires both DiT forwards.
+Do not interpret that encoder-only result as full parity. CPU recipes do not inherit
+a CUDA build merely because another recipe supports CUDA. The plan, effective flag
+record, case declaration, and summary identify the exact selected scope and work;
+missing required work still rejects acceptance under the existing completion protocol.
+
+Source-bound `configuration_kind: "feature-only"` recipes use empty controls and
+`environment: {}`; they select only declared Cargo feature graphs, never request
+provided environment or argv. If the ordinary source-default graph compiles the
+case out or returns before learned work, `default_configuration: null`,
+`backend: null`, and `expected_devices: []` explicitly mean **no runnable NN default**.
+A named supported recipe is required. Exact, package, and `all` selectors refuse
+that unresolved case rather than silently omitting it or claiming partial coverage.
+The packed CPU reference-pair case retains its genuine CPU source-default recipe.
+
+A recipe may separately declare `execution_lane` for its required compile/resource
+host. For example, the Qwen2.1 miniature block-0 comparison retains its original
+CUDA-or-Metal file gate but actually evaluates learned models on CPU. Its declared
+CUDA/Metal build recipes therefore require the corresponding host while keeping
+`backend` and the observed/expected NN device set **CPU only**. A GPU-compatible
+build host or conservative physical lease is not a GPU-model PASS. Impossible
+lane/feature/device combinations and undeclared lane overrides reject; absent
+`execution_lane` preserves legacy routing.
+
+`configuration_kind: "source-controls"` adds only source-declared fixed control
+names and literal values/UNSET from each canonical recipe. Requests still select a
+registered name; they cannot supply environment, Cargo arguments, or lane overrides.
+The declared names must match every recipe's settings exactly. Source presence
+semantics are preserved: an empty string or `"0"` is still SET, not a boolean false.
+Source-default recipes explicitly UNSET inherited controls; optional stream, device,
+precision, rung, and fixture branches run only as declared, not as an automatic grid.
+
+Process/toolchain variables, credentials, child selectors, permits, physical CUDA
+visibility/order, lease descriptors, and external asset-path/required-asset bindings
+are not injectable recipe controls. A source logical-device selector such as
+`CANDLE_LLM_DEVICE` cannot replace controller-approved visibility or observed NN
+device evidence. Required external assets/gates remain separate; a fixed recipe
+neither invents mandatory environment names nor retargets source cache fallbacks.
+
+```sh
+# Inspect fixed source-defined bindings; this does not run models.
+python3.12 -I -c 'import json; print(json.dumps(json.load(open("scripts/ci/model-inference-proofs.json", encoding="utf-8")), indent=2))'
+# Prepare request JSON with selection + the existing supervisor's complete policy schema.
+# MODEL_PROOF_POLICY points to the independently approved resource policy, not a checkpoint.
+jq --arg selection 'mlx-gen-sdxl/quantum_tests::pricing::additivity::optimized_bf16_img2img_preserves_full_request_rgb' \
+  --slurpfile policy "$MODEL_PROOF_POLICY" '{selection:$selection,policy:$policy[0]}' \
+  > /tmp/model-proof-request.json
+# Exact completed source revision; this command is an example, not approval to execute.
+gh workflow run model-inference-proofs.yml --repo SceneWorks/inference \
+  --ref "$COMPLETED_SOURCE_REF" -f backend=mlx -f request="$(cat /tmp/model-proof-request.json)"
+```
+
+Before the new workflow exists on the default branch, dispatch through the **existing**
+`real-weights.yml` workflow identity at the exact feature ref. GitHub does not make a
+brand-new workflow dispatchable merely because its file is in a feature branch. The
+bridge uses the same canonical runner, retains the existing 25-input schema, and does
+not alter the frozen `ios-pricing-compile-only` profile or its JSON default:
+
+```sh
+jq --arg backend mlx --slurpfile request /tmp/model-proof-request.json \
+  '{backend:$backend,request:$request[0]}' > /tmp/model-proof-binding.json
+gh workflow run real-weights.yml --repo SceneWorks/inference \
+  --ref "$COMPLETED_SOURCE_REF" -f profile=model-inference-proofs \
+  -f ios_pricing_compile_binding="$(cat /tmp/model-proof-binding.json)"
+```
+
+Host platform/runner and actual test compute-device SET are recorded separately.
+A CPU child on a Mac is **not** Metal model evidence. Each executed work scope
+reports its actual selected device before context restoration; default/global
+context is not unioned into used devices. Mixed-device comparisons must report
+all actual scopes without creating a GPU stream or rerendering for telemetry.
+The proof runner requires exact nonzero discovery, full-body completion, all
+source-declared root/CPU-child/rank successful-summary cardinalities, preserved
+expected-fault assertions, and actual in-scope device observations.
+Missing assets/dependencies, skipped/ignored bodies and partial workers fail
+proof acceptance; compile/source/discovery success is never a runtime PASS.
+
+Evidence contains exact source/fixture-model identity, backend/configuration,
+pass/body counts, existing computed outputs/metrics, bounded redacted logs and
+duration, plus a workflow summary. Only regular, bounded, explicitly known files
+from the owned workflow output tree can be uploaded. Checkpoints, HF caches,
+credentials and user-reference files are never collected; no model is rerun to
+create evidence. Fast tests that end between GPU sampling ticks record an
+unknown GPU-memory peak, not a zero measurement or a capacity/admission proof.
+
+Actual external inputs require successful, scope-bound `MODEL_INFERENCE_INPUT_USED`
+receipts covering every source-declared required slot, API reader/role, and complete
+selected collection. A source descriptor or empty environment summary is not actual
+external input identity. Synthetic/source-defined fixtures retain their source binding;
+unknown external slot coverage refuses before NN execution, rather than inventing paths
+or mandatory environment. Optional external overrides bind the **actually consumed**
+source branch; a committed/generated/in-memory default creates no external obligation.
+A relative, checkout, or cache default path is not thereby source-defined.
+
+A source-declared `requirement_bundles` list expresses alternatives of complete AND
+requirements, in addition to common `requirements`. Each bundle has a source identity;
+its optional `additional_observed_readers` lists exact reader/role pairs for original
+optional or attempted reads, never a wildcard or a substitute for required work. Every
+observation retains its scope and provenance grade. Positive mode-specific observations
+must be explained by the same complete bundle: an ordinary-directory subset cannot hide
+Hadamard inputs from an incomplete Prism bundle. A single GGUF collection may represent
+its original embedded model/config/tokenizer bundle without inventing three receipts.
+`input_requirement_bundles` reports observation compatibility, not a selected model type,
+source predicate, or successful template parse. No request can select or override these
+source-fixed bundles, reader roles, or branch predicates.
+
+Conditional defaults use an explicit positive source-defined branch contract plus the
+separately verified completed immutable body. `source_origin_basis` distinguishes that
+derivation (`source-defined-branch-contract`) from an observed `actual-reader-tag`;
+no default read event is fabricated. External cases may use such optional-slot defaults,
+but every complete bundle must retain unconditional external input requirements; this
+never makes the whole external case a source-defined/no-input default.
+Logical source obligations that share one observable reader/role collection are retained
+losslessly in source facts rather than converted into guessed distinct-file, shard, or
+invocation counts. Such lower bounds do not independently attest every named component.
+
+Input provenance remains graded: `validated-content` reuses an existing retained
+consumption receipt; `same-read-buffer` digests only bytes the original reader already
+naturally consumed; `successful-reader-binding` records the actual resolved input set
+with `content_integrity: not_attested`. The last grade proves only labelled source-bound
+case execution, never checkpoint-byte integrity, a verified named revision, or terminal
+model evidence. Existing stronger checksum/pin requirements remain stronger. No eager
+mapped-page scans, extra Tensor evaluation, duplicate payload reads, or path/mtime hashes
+are introduced. Physical completion, artifact validation, and workflow summaries preserve
+`acceptance_scope`, `input_grade`, and claim limits; `accepted: true` alone is not a stronger
+input or checkpoint claim.
+
+The source sharding case that actually uses CUDA ordinals 0 and 1 additionally requires
+an explicit ordered request `cuda_device_uuids: [role0UUID, role1UUID]` and one full
+`additional_cuda_policies` entry for role 1. The existing primary policy binds role 0.
+Both UUIDs must be distinct and explicitly approved, with identical host/tree/log/deadline
+settings and independently declared GPU caps/reserves. CVD follows **source role order**;
+UUID sorting is lock order only. Both leases, admission baselines, fresh ordinal-to-UUID
+recheck, bounded per-UUID live/owned-descendant monitoring, and every post-idle check must
+complete before sealing. Failure on either device rejects the whole case; missing peak
+samples remain unknown, never fabricated zeros. Other handles or streams are not extra
+GPUs, and no idle-device discovery, physical-index guess, or source retarget is authorized.
+
+Dispatches queue without cancelling running inference or replacing older pending
+proofs. Per-run execution remains serialized on compatible physical resources.
+Provisioned Mac launches additionally hold the shared cooperative POSIX lease
+`/Users/Shared/SceneWorks/gpu-locks/apple-metal.lock` through the owned child tree;
+CUDA uses the existing `%PUBLIC%/SceneWorks/gpu-locks/<physical-UUID>.lock` byte-lock
+protocol for the explicitly approved UUID, never a different idle GPU. The Iris
+sharing/refusal case preserves its original child's `CUDA_VISIBLE_DEVICES=0` reset.
+That value names a CUDA ordinal under the effective `CUDA_DEVICE_ORDER`, **not an
+NVML physical index**. While holding the approved UUID lease, the controller runs
+the verified context-free driver metadata primitive in a fresh process with that
+exact child-effective visibility/order and requires ordinal 0's UUID to match the
+leased UUID. Missing, ambiguous, mismatched, or unverified mappings reject before
+model launch; neither source controls nor the approved device are retargeted. This
+metadata is resource-binding evidence, never learned-model device/runtime proof.
+Runner labels and unique Actions concurrency keys are not device mutexes. Cooperating launchers in
+both repositories/direct-local wrappers use the same namespace. Unwrapped user apps
+or other local processes still require the existing physical census/operator
+coordination; the lease does not claim universal exclusion. No GPU kill behavior is
+added by this coordination.
+
+Normal PR CI retains its separate superseded-run cancellation rule because it
+contains no model execution. This policy does not waive epic/device acceptance
+requirements or renew/retire runtime measurements when a pin changes.
+
+## Explicit CPU fixture captures (not phone anchors)
+
+The `real-weights.yml` **`ios-selected-captures` profile** runs only registered
+ignored fixture proofs on `nax-macos-2`; it never joins a scheduled or `all`
+profile. This is not the phone campaign below. Obtain the host-time authorization
+before dispatching. These are examples, not a record of captures executed.
+
+GitHub permits at most 25 dispatch inputs, so the existing JSON input is
+profile-specific: **only this capture profile** reads its `selection` key. An
+omitted/blank binding or absent selection key selects `iris`; a provided selection
+must name `all`, a fixed family, or an exact `package/FQN` from
+`scripts/ci/ios-selected-captures.json`. Empty, null and unknown provided selections
+fail rather than selecting another family. Binding JSON travels through an
+environment variable and quoted argv, then the existing runner decodes/validates
+it before any capture—not a GitHub `fromJSON('')` startup expression or shell
+code. Discovery, parent/CPU-child completion and exact selected counts remain
+mandatory.
+
+```sh
+# Default iris selection; choose the approved source ref explicitly.
+gh workflow run real-weights.yml --repo SceneWorks/inference --ref "$SOURCE_REF" \
+  -f profile=ios-selected-captures
+# One family (use {"selection":"all"} for every registered capture).
+gh workflow run real-weights.yml --repo SceneWorks/inference --ref "$SOURCE_REF" \
+  -f profile=ios-selected-captures -f ios_pricing_compile_binding='{"selection":"sdxl"}'
+# One exact registered proof.
+gh workflow run real-weights.yml --repo SceneWorks/inference --ref "$SOURCE_REF" \
+  -f profile=ios-selected-captures \
+  -f ios_pricing_compile_binding='{"selection":"mlx-gen-sdxl/quantum_tests::pricing::final_norm_guards_cover_norm_pool_and_projection"}'
+```
+
+The **`ios-pricing-compile-only` profile is unchanged**: its original default JSON,
+required `source_sha`/`manifest_sha256`/`host` fields, phase handling and strict
+unknown-key validation still apply. Do **not** add `selection` to a compile
+binding. The former standalone `ios_capture_selection` input is replaced only for
+the capture profile by the JSON selection above.
+
 ## Campaign protocol and command matrix (sc-26270)
 
-**Mechanism only; no new device measurements are recorded here.** No full-model
-diagnostic is cleared to execute. Independently bounded primitive characterization
-must precede any such experiment; a diagnostic flag, launch headroom, tensor byte
-sum, engineering reserve, MLX allocator limit or a cap increase is not a permit.
-The current empty artifact-bound evidence remains fail-closed. Anima/Iris have no
-admitted iPhone footprint facade; their cases explicitly refuse before loading,
-not via a raw registry bypass. Unsupported strategy/tier/task combinations remain
+**Mechanism only; no new device measurements are recorded here.** Diagnostic
+endpoint captures use the source-owned capture permit and per-quantum guards;
+they do not establish admitted execution. A primitive result, launch headroom,
+tensor byte sum or soft MLX allocator limit does not establish model fit or a
+validated physical-memory cap. The current empty artifact-bound evidence remains
+fail-closed for admitted execution. Unsupported strategy/tier/task combinations remain
 visible instead of being silently omitted. Malformed/missing snapshots are
 `diagnostic_failure`, **not** next-up admission-refusal evidence.
 
@@ -59,9 +324,9 @@ python3 scripts/ios/campaign.py list --catalog /tmp/ios-campaign-catalog.json \
 | Provider | Catalog generators SANA base/sprint, Anima Turbo, SDXL, Iris, Z-Image Turbo and its control route; registered restoration and composed depth tasks |
 | SDXL route | `sdxl`, `illustrious_xl_v1`, `illustrious_xl_v2`, `realvisxl`, `realvisxl_lightning` (provider constant) |
 | Tier | `q4`, `q8`, `bf16`; unsupported task/tier combinations stay explicit refusals |
-| Geometry | 512², 768², 1024²; future registered Supra2: 256² |
+| Geometry | Anchors at the 1024² reference geometry (future Supra2: 256²); 512²/768² are derived, never captured (one 512² validation case) |
 | Mode | Descriptor conditioning kinds plus text, advertised prompt batch, SDXL `ip_adapter`, registered restoration/depth; no edit-to-text downgrade. A route whose control input is required (`z_image_turbo_control`) has no text mode: its `control` and `reference` cells both carry the control image (pose) |
-| Strategy | `--rung 0..4`, translated through the provider's shared contract, not a copied cumulative ladder |
+| Strategy | Two anchors per family: rung 0 (resident) and the deepest implemented rung at its cheapest selection (optimized); every rung in between is derived |
 
 Provision complete caller-owned snapshots into a distinct slot for every
 route/tier. The slot name is not proof of stored precision. Iris generation needs
@@ -71,6 +336,39 @@ confined relative directories within that slot, e.g.
 `{"text_encoder":"qwen3_vl","vae":"fp16_fix_vae"}`. Nothing downloads or
 silently resolves a sibling artifact. Existing source inventories, deferred-read
 checks and admitted request binding are preserved.
+
+The dedicated host conversion route is `real-weights.yml` profile `ios-prequant`.
+Dispatch one route at a time from a published frozen branch or tag whose HEAD equals
+`source_sha`; it runs only on the primary `nax-macos` real-weights Mac. The typed
+`route` values are `anima-turbo` (one export containing bf16/q8/q4),
+`sana-1600m-q4/q8`, `sana-sprint-q4/q8`,
+`iris-generation-q4/q8`, `iris-restoration-q4/q8`, `iris-depth-q4/q8`, and
+`iris-text-encoder-q4/q8`. The latter uses the shared pinned Qwen3-VL language
+tower. Every dispatch selects one named route; `anima-turbo` alone emits its
+app-compatible two packed tiers together. For example:
+
+```sh
+gh workflow run real-weights.yml --ref FROZEN_REF -f profile=ios-prequant \
+  -f ios_pricing_compile_binding='{"source_sha":"FROZEN_40_HEX_SHA","route":"iris-generation-q4"}'
+```
+
+The runner needs the pinned snapshots in `~/.cache/huggingface/hub`, SDK 26.5,
+Rust 1.96, and free space on the cache volume. The workflow fetches the native
+MLX artifact for the exact pinned source/build cell and builds it from source
+when that release is unavailable; the controller verifies the linked artifact.
+Before conversion, it authenticates selected source bytes against the public
+Hub's immutable-revision LFS or Git-blob inventory. It refuses a mismatched or
+unavailable readback. The controller admits work from source headers and live
+available memory with a host reserve, and monitors owned process RSS, host
+headroom, log size, disk space and wall time. It compiles with four jobs, zero
+debug information, offline Cargo dependencies and the pinned native linker; it checks the compiled CLI's
+argument refusal before invoking conversion. Each dispatch writes a new
+`sceneworks-ios-prequant/RUN_ID-ATTEMPT/ROUTE` directory beside the resolved
+Hugging Face cache on the same volume. A source-keyed Cargo target on that volume
+reuses compilation across serial dispatches. The Actions artifact contains only
+`ios-prequant-receipt.json` with source/output identity, hashes, headers, CPU
+and guard evidence. A failed or missing receipt is not a packed tier. Review
+the on-host output and component mapping before copying it to a phone slot.
 
 ```sh
 # After the host app has been installed (no campaign is started by pushing):
@@ -111,23 +409,219 @@ host load. Low-end accuracy is therefore calibrated here, on the device: the
 fully optimized anchor captures and the validation case of this campaign
 calibrate the formulas. There are no per-proof allowances.
 
-Campaign case keys are `provider/route/tier/edge/mode/rung/selection`. The
+Campaign case keys are `provider/route/tier/edge/mode/rung/selection/steps`. The
 selection token is the cell's memory selection from the provider's OWN declared
 space (`MemoryProviderContract::selection_space`, read from its weights-free
 contract surface at the campaign's load shape): `s` (optional phase eviction),
 `t<edge>`/`o<overlap>` (decode tile), `c<elements>` (attention chunk), `w<n>`
 (transformer window) and the window scope `dit`/`te`/`both`, `_`-joined; `base`
-when the rung declares no parameter. Every selection is its own cell, executed
-exactly as selected (a token outside the artifact's declared space is a typed
-`strategy` refusal) and recorded in the evidence key's execution levers. The
-listing enumerates them quality first (unstaged before staged; the largest tile,
-chunk and window first; scope `dit` → `te` → `both`); 18,450 cells today.
-Control-required routes (`CONTROL_REQUIRED_ROUTES`: `z_image_turbo_control`) have
-one cell per accepted control kind (`control_pose`, `control_canny`,
-`control_depth`, `reference_pose`, ...) and no plain text mode.
+when the rung declares no parameter. `steps` is the denoise step count the case
+runs (`0` = the provider's own default). A case is executed exactly as selected (a
+token outside the artifact's declared space is a typed `strategy` refusal) and
+recorded in the evidence key's execution levers. The listing (schema 3) names each
+case's `purpose` (`resident`, `optimized`, `validation_steps`,
+`validation_geometry`) and `repeats`, plus every route/tier the provider does not
+serve (`unserved`, never silently dropped). `recipe_coverage` maps every accepted
+registered recipe to its measured representative. Control-required routes
+(`CONTROL_REQUIRED_ROUTES`: `z_image_turbo_control`) retain every accepted control
+kind (`control_pose`, `control_canny`, `control_depth`, `reference_pose`, ...),
+with no plain text mode. Aliases share captures only when their source-resolved
+mode and configured role graph are identical.
 
-Z-Image Turbo host-derived reachable sizes (sc-26433) — **predictions, not device
-evidence**. Per mode, tier and edge: the peak of every phase (its resident bytes
+### Anchors and derivation: the recorded memory-anchor rule (epic 16774)
+
+**The campaign measures two extremes per family and derives everything in between.** This is
+the rule SceneWorks already records for its desktop lanes — `docs/memory-strategy-contract.md`:
+"the anchor + analytic derivation is the complete, self-sufficient admission basis", and "every
+non-anchor rung and geometry is now derived analytically from the anchor … rather than measured"
+(`crates/sceneworks-core/src/memory_anchor.rs`, image derivation law). It replaces the exact-match
+evidence table that needed one measured row per model × route × tier × mode × size × rung ×
+selection (18,450 cells). Michael: "measure the extreme cases, fully resident, and fully
+optimized, and estimate in between."
+
+**Anchor family** = `(device, base ARCHITECTURE digest, tier, variant)` — the recorded rule's
+one anchor per (model, tier, lane, VARIANT/decoder), keyed on what actually shapes memory:
+
+* **Architecture**, not route or checkpoint: `layout::architecture_digest` hashes the base
+  components' safetensors HEADERS — tensor names, shapes, dtypes and so packing — and the memory
+  load settings; never values, file names, config content, paths or the route. Checkpoints of one
+  architecture share anchors; any header difference (a distilled U-Net, another VAE, other dense
+  dtypes) is its own family automatically. The per-checkpoint artifact `layout_sha256` stays in
+  the key: an anchor's own key is exact; any other request of the family is derived.
+* **Variant**: actual source role/mechanism family plus its resolved sampling class and
+  configured overlay identity. Unproved reference/init, control+reference, mask/edit and IP
+  graphs do not borrow text/control-only evidence. Role-identical aliases may share a family;
+  the existing raw `reference_count` remains aggregate image geometry (including Mask/Control).
+  Typed mask/control subcounts partition that aggregate only in the validated source-known
+  carrier set; true Reference roles are counted separately when the actual carrier exists.
+  Exact raw counts remain binding/pricing inputs, not an arbitrary measured-count grid.
+  Only a source-certified correlated additivity domain can permit further sharing. Legacy
+  `derive` fixtures, logical scratch sums, and `IOS_NON_ADDITIVE_MODES` are not that proof;
+  `Uncertified` is not capability completion. SDXL validates its actual sampler first, then
+  applies the runtime's IP predicate to configured IP + Reference with no mask/control/acceleration.
+  Its current earlier accel+Reference refusal remains a refusal, not an invented accepted INIT
+  family. Reference strength overrides global strength; Control uses each conditioning scale,
+  not the ignored top-level `control_scale`. <!-- NONADDITIVE -->
+
+Per family at most two anchors (`evidence/ios_device_evidence.json`, schema 3):
+
+| Anchor | Configuration | Captured | Evidence |
+|---|---|---|---|
+| `resident` | rung 0, its first selection | once | completed captures, **or** its typed pre-allocation `capture_refused` quantum (allowed on the 8 GB phone) |
+| `optimized` | the deepest rung the provider implements, its **last (cheapest)** selection — every saving engaged | **2 repeats** | must complete; a refusal is a defect to fix, never evidence |
+
+Both anchors sit at the **reference geometry 1024²** (Supra2: 256²) and run **2 denoise steps**:
+
+* 1024² is the largest ladder size. The fully optimized configuration must fit at every ladder size
+  (see the fit table below), so it completes here by requirement, and this is the tightest cell —
+  where an accurate low end matters — so it is measured, not derived.
+* Desktop activation measurements do not prove an iPhone process-footprint transfer law.
+  Intermediate geometry and optimization claims require the actual source certificate,
+  applicable process model and matching endpoint evidence described below.
+* Two steps, not N: one denoise step's working set is released before the next, so a short run's
+  peak is a long run's; two steps also cross a step-to-step release. The `validation_steps` case
+  checks this on one model.
+
+**Derivation (`mlx-gen/src/ios_anchor_law.rs` and catalog `ios_admission.rs`).**
+The former fitted scratch-ratio/resident-subtraction law is disabled. Do not
+subtract a native upper bound from a process measurement, borrow an unmeasured
+phase's overhead, or transfer a receipt between different family keys.
+
+Provider certificates bind the actual source inventory, request and execution
+facts. A native-allocation certificate remains a native-allocation result; it is
+not a process-footprint result. Mapping it to process growth additionally needs
+the declared physical/process and HOST/layout premises with their actual scope.
+Missing source terms remain unproved; the default policy cannot manufacture
+them. Michael approved the scoped engineering model on 2026-10-26; its
+integration and target-device evidence remain pending at this snapshot.
+
+For that explicitly estimated route, let `P` be the provider's actual per-phase
+resident-plus-largest-quantum pressure and let
+`R = max(1, max_phase(P_request / P_optimized))`. Charge
+`ceil(measured_optimized_growth * R)` plus the optimized repeat spread, floored
+at 32 MiB, and check live headroom. Smaller geometry receives no memory credit.
+A missing phase basis cannot be invented. A completed resident endpoint must
+not be underpredicted; a refused resident supplies no numeric peak. Source
+preparation uses its separately recorded pre-preparation baseline and estimated
+envelope, never the later BeforeModelLoad baseline.
+
+This is a phone/OS/checkpoint/behavior-source-scoped engineering response model,
+not a mathematical physical-charge guarantee. Record the conditional HOST/driver
+and source-preparation assumptions explicitly. Phone-fit certification covers
+the real file-backed catalog/model paths; arbitrary public Array inputs retain
+their behavior without receiving that certification. Keep the original measured
+source revision and a verified behavior/compile-closure mapping when only
+reviewed evidence or policy data is committed later; do not relabel a measurement
+or rerun it solely because the commit hash changed.
+
+Exact measured keys and intermediate derivations are distinct evidence routes.
+A typed resident refusal is permitted by epic acceptance and supplies no measured
+resident peak. The terminal repair must support that contract without inventing
+a resident observation. No completed phone endpoint or complete intermediate
+admission claim exists yet.
+
+**Self-check.** Applicable completed endpoint observations must satisfy the
+certified consistency checks. Any underprediction fails; the retired desktop
+recapture percentage is not an allowed underprediction tolerance. A refusal or
+unexecuted body cannot serve as a numeric consistency pass.
+
+**Low end: admission is the measurement.** At the optimized anchor's own key admission charges the
+largest of its 2 repeats' growth (kernel lifetime `phys_footprint` peak − the capture's starting
+footprint) **plus the margin = the repeats' measured spread (max − min), floored at 32 MiB** (an
+engineering floor so identical repeats never claim a zero margin; ~0.5% of the historical 6142 MiB
+launch headroom). No counted-formula scratch and no 512 MiB formula reserve is stacked on a
+measured anchor: `demand + margin` must fit live headroom (`runtime-ios`'s incremental recheck,
+unchanged: only growth realized since admission is credited). The admitted load and every render
+then run inside that **measured envelope** (`ios_quantum::open_admitted_envelope`): while the
+process stays within it, a quantum guard needs only the envelope's remaining bytes when that is
+less than its formula price; past the envelope every guard is back on its formula (the runtime
+safety net). Captures run on the formula guards alone.
+
+**Per-formula DEVICE observations.** Captures record each quantum's priced scratch
+and observed kernel-footprint growth, with exact versus masked attribution.
+`campaign.py evidence` reports these diagnostics. A ratio between a measured
+interval and a formula is not by itself a source proof or a general permission
+to discount future allocations. Preserve the source/phase/window identities and
+the admission envelope's actual policy when interpreting these rows.
+
+**Per-phase capture.** Every quantum check and synchronization reads the kernel lifetime peak
+(`task_vm_info` REV3); growth inside an opened quantum belongs to that quantum's phase (the
+provider's `ios_quantum_phase(label)`), glue after a synchronization to the next quantum's. A
+phase is `exact` when the lifetime peak rose inside it, else an upper bound (masked by an earlier
+phase). An unattributed phase is priced at the whole-run peak.
+
+**Campaign size.** `campaign.py list --snapshots <dir of the route/tier slots that will be pushed>`
+uses the runner's actual catalog, never a hand-filtered case list. It selects one
+accepted recipe per provider, route, architecture, tier and source-resolved
+mode/configured role graph, then plans one resident and two optimized captures
+per representative. The schema-3 `recipe_coverage` records every discovered
+accepted recipe and allocation class beside its representative. Unresolved
+settings and unserved routes remain explicit. The controller validates the schema
+and recipe-to-representative references. `--max-cases` is an optional execution cap, not
+permission to claim completion from partial coverage.
+
+Exact native evidence identities still retain sampling-allocation classes. The
+approved engineering path derives other registered settings and optimization
+rungs by repricing their actual phase pressure, with no downward credit and the
+measured margin. It does not require a sampler/settings Cartesian capture grid.
+Retain SANA/Sprint, SDXL-family routes, Anima, Iris generation,
+Z-Image and distinct reference/control/init graphs. Header similarity alone
+does not permit foreign-route, artifact or graph reuse; only the source-owned
+representative mapping and compatible engineering evidence authorize derivation.
+Depth/restoration registrations remain available; their endpoint certification
+is excluded by the generation-only Iris scope above.
+
+**Validation cases (part of the campaign, not optional).** For the first optimized family in
+catalog order: `validation_steps` — the optimized anchor at the provider's full step count,
+captured beside the anchor (`evidence` prints full/short growth, whole run and per phase); and
+`validation_geometry` — the optimized configuration at 512², derived DOWN from the 1024² anchor.
+For the first q4 family deriving a `control` member: `validation_mode` — an SDXL ControlNet
+request at 1024² (the optimized selection), derived from the family's TEXT anchor by the additive-
+mode law. Both admitted cases run with `campaign.py validate` once the anchors are committed: each
+row records the anchor law's derived demand (`admitted.demand_bytes`, basis `Derived`) beside the
+measured growth, and `validate` prints the error.
+
+#### The fully optimized configuration fits every served cell (host-derived prediction)
+
+Michael: "for the phone, we want to make sure the fully optimized will fit". Per provider route ×
+tier × mode × size the fully optimized configuration (the optimized anchor's selection) is priced
+by the providers' counted iOS pricing over the real snapshot headers — every phase's resident
+bytes plus its largest counted quantum, plus the 512 MiB formula reserve — against the 6142 MiB
+entitled launch headroom. **Predictions, not device evidence**; regenerate with each crate's
+`reachable_sizes` / `reachable_sizes_prediction` ignored test, and the catalog's own request shape
+with `IOS_PRICING_SNAPSHOTS=<dir of route/tier snapshot dirs> cargo test -p mlx-gen-ios-catalog
+--lib host_integration -- --ignored --nocapture` (54 cells: SANA, Z-Image, SDXL routes).
+
+| Provider / mode | Tier | Before (worst of 512/768/1024, MiB) | After (512 / 768 / 1024) | What made it fit |
+|---|---|---:|---|---|
+| SANA base / Sprint, text + reference | q4 / q8 / bf16 | 3808 / 3946 / 5566 | ≤ 3808 / ≤ 3927 / 5566 | already fit (rung 3; SANA withholds rung 4) |
+| Anima Turbo, text | all | 2903 | 2052 / 2070 / 2903 | already fit (rung 4 is implemented on the iOS load; the "planned" label was wrong) |
+| Z-Image Turbo, text + reference | q4 / q8 / bf16 | fit at the cheapest selection | ≤ 4659 / ≤ 4660 / ≤ 4885 | already fit |
+| Z-Image control (+ reference), each kind | q4 | fit | 2758 / 3435 / 4659 | — |
+| Z-Image control (+ reference), each kind | **q8** | **6383 / 7061 / 8009 ✗** | 3392 / 4070 / 5018 | the deferred (rung-4) control load packs only its 2 resident refiner blocks; each streamed window packs its own block (was: all 15 packed and kept resident) |
+| Z-Image control (+ reference), each kind | bf16 | — | 4208 / 4886 / 5834 | same |
+| Iris 3B text / prompt batch 2 | **bf16** | **load 11979–12014 ✗** | 1696–1997 / 1890–2757 / 2450–3873 | (a) Qwen3-VL text-tower layer streaming (rung 4, scope `te`/`both`); (b) rung-4 backbone block streaming on a deferred load |
+| Iris 3B prompt batch 2, 1024 | **q8 / q4** | **7576 / 6152 ✗** | 3868 / 3751 | (b) rung-4 backbone streaming ((c) the per-row pixel stage alone leaves the trunk block binding) |
+| Iris restore / depth | **bf16** | **11944 / 11946 ✗** | 2018 / 1400–1955 | (b) streamed blocks + deferred skeletons |
+| SDXL family, text | all | fit | ≤ 2210 (bf16) / ≤ 2341 / ≤ 2317 | rung 4 priced as the iOS load actually runs it (the U-Net resident only as its non-block remainder) |
+| SDXL family, reference / mask | **bf16** | **6270 / 6718 ✗ (768 / 1024)** | 2076 / 2076 / 2428 | (b) rung 4 priced correctly on the iOS load |
+| SDXL family, control | **bf16** | **8127–8469 ✗** | 4085 / 4360 / 4770 | (b) |
+| SDXL family, ip_adapter | **bf16** | **7590–8097 ✗** | 3425 | (b) + (d) a staged IP request releases the CLIP-ViT-H encoder and Resampler once its tokens exist |
+| SDXL / RealVisXL, ip_adapter 1024 | **q8** | **6261 ✗** | 3375 | (b) + (d) |
+| Illustrious v1/v2 (cached q8 revision: no packed marker, rung 2 deepest), control / ip_adapter | q8 | 5987 / 6261 ✗ | 5972 / 5599 | load floors follow `Weights::materialize` batching with cast sources held (fixes a 44% cast-load under-count); (d) |
+
+No cell is physically impossible. The largest indivisible tensor anywhere is Iris's bf16 Qwen3-VL
+token-embedding table, 151936 × 2560 × 2 B = 742 MiB: with the 70 MiB that stays resident and the
+512 MiB reserve, 1324 MiB. The tightest fully optimized cell is Illustrious q8 ControlNet on the
+cached (marker-less) q8 revision, 5972 MiB (170 MiB margin); on a packed-marker q8 revision it
+streams at rung 4 like RealVisXL (3748 MiB). Every rung-0 RESIDENT configuration above 512² (and
+most at 512²) is predicted over the headroom: those anchors are expected to be typed pre-allocation
+refusals, which is their evidence.
+
+Z-Image Turbo host-derived reachable sizes (sc-26433), kept as the pre-anchor
+record of the quality-first selection walk the campaign NO LONGER performs (it
+captures the cheapest selection as the optimized anchor and derives the rest) —
+**predictions, not device evidence**. Per mode, tier and edge: the peak of every phase (its resident bytes
 plus its largest counted quantum's live input and scratch, `Backend::Metal`, plus
 the 512 MiB reserve) against the 6142 MiB entitled launch headroom, under each
 rung-4 selection in the capture ladder's quality-first order. Unstaged cells keep
@@ -193,6 +687,33 @@ size. At q4 / 1024 / text the walk refuses the 7 `dit` and 7 `te` selections and
 the staged `s_t512_o64_c67108864_w1_dit` (Michael's Mac configuration, tile 512)
 predicts 5963 MiB.
 
+For SANA resident captures, the catalog checks the mandatory header-derived union of
+Gemma, the transformer and the complete VAE before the observation planner constructs
+its tokenizer. An over-headroom union produces a typed `capture_refused` with the real
+source/key and structured refused quantum; it does not deliberately load the first
+component of an already known nonfit resident configuration. The request-aware preflight
+also checks the largest mandatory decoder upsample formula from the actual resolved
+plan, using the existing source-pricing traversal. It checks the maximum of that future
+scratch and the weight floor, without adding the resident weights again. For an untiled
+1024² SANA request, the existing 1024², 256→128-channel upsample formula is
+13,962,842,112 bytes before the unchanged 512 MiB reserve: its eventual refusal can
+therefore be returned before any weights load. These are conservative guard bytes,
+not measured physical demand or proof of a termination cause. Tiled and smaller plans
+use their actual extents; sequential optimized capture keeps its existing path. The
+later per-quantum headroom check remains in place. This floor/lookahead and reserve
+are not a physical-memory upper bound for optimized execution.
+
+The harness atomically overwrites one bounded `Documents/campaign-progress.txt` record
+at preparation, observation, load, batch materialization and coherence transitions. Its
+nonce, compiled build and case identify the attempt; it is diagnostic only, never an
+anchor or a substitute for a typed refusal. A last transition can narrow an interrupted
+run's stage without proving its termination cause. Per-batch telemetry adds no new
+capacity charge, and compiles to a no-op on desktop and simulator builds.
+
+CI_IMPACT: the bootstrap guard and resident lookahead add only focused
+plan/header/key/refusal/sidecar tests and native compilation/lint checks. These construct no model and execute no learned layer;
+normal CI gains no inference campaign or model-compute requirement.
+
 The following are **future session recipes, not instructions to run now**. Phone
 availability alone does not authorize a full-model diagnostic. Use a fresh evidence
 directory and save the checkout SHA, OS, entitlement, conversion/source receipts
@@ -213,45 +734,38 @@ has a separate bounded grace window. Launch exit codes are retained.
 `--memory-entitlement on|off` applies to the once-installed build. Every case
 requires a fresh matching `launch-memory.txt`; missing copies are failures.
 Each case/probe has its own host artifact directory alongside the JSONL file.
-`--max-cases` counts both renders and next-up probes; exhausted cells are explicit
-skips. Direct `run_smoke.sh --campaign-case` flags delegate to this same driver,
+`--max-cases` (optional; the anchor listing is finite by construction) counts renders,
+repeats and next-up probes; exhausted cases are explicit skips. Direct `run_smoke.sh --campaign-case` flags delegate to this same driver,
 never to the legacy reinstall/terminate-existing path.
 
 ```sh
-# One exact cold case (JSONL output must not already exist):
-python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --case sana_1600m/sana_1600m/q4/512/text/2/t512_o48 --device "$DEVICE" \
-  --output "$EVIDENCE/sana-512.jsonl"
-# One selected model/tier ladder, including all its registered modes and rungs:
-python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --provider iris_3b --tier q8 --device "$DEVICE" --output "$EVIDENCE/iris-q8.jsonl"
-# Full catalog-driven campaign; no hand-maintained model list:
-python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --all-cases --device "$DEVICE" --output "$EVIDENCE/all.jsonl"
-# Explicit next-up REFUSAL-ONLY probe after an admitted completion. This NEVER
-# loads weights at the larger geometry, even if its metadata preflight admits it.
-python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --case sdxl/sdxl/q4/1024/text/2/t896_o64 --next-edge 1280 --device "$DEVICE" \
-  --output "$EVIDENCE/sdxl-next-up.jsonl"
-# Bounded DEVICE CAPTURE (labelled diagnostic, never production): no evidence row is
-# needed, because every quantum of every registered model checks live OS headroom
-# BEFORE constructing its graph. Each model/route/tier/mode/rung ladder is walked
-# 512 -> 768 -> 1024; at each size its selections run quality first, stepping to the
-# next cheaper selection only after a capture refusal (a completed selection carries
-# up to the next size). The ladder stops at the first size where even the cheapest
-# selection refuses, or at any failure; a `capture_refused` row names the refused
-# quantum (the refused-before-jetsam evidence). No cell runs twice; the cap is never
-# raised.
+# The anchor campaign. List the families over the slots that will be pushed (header reads only):
+python3 scripts/ios/campaign.py list --snapshots "$SLOTS" > /tmp/ios-campaign-catalog.json
+# Step 1 — capture every resident, optimized (x2) and validation_steps case
+# as a labelled bounded DEVICE CAPTURE (no evidence needed: every quantum of every registered model
+# checks live OS headroom BEFORE constructing its graph). A resident `capture_refused` row is that
+# anchor's evidence; an optimized anchor that does not complete is a DEFECT (exit 2). No size or
+# selection ladder is walked and nothing runs that is not in the listing.
 python3 scripts/ios/campaign.py capture --catalog /tmp/ios-campaign-catalog.json \
-  --provider sana_1600m --route sana_1600m --tier q4 --mode text --rung 2 \
-  --device "$DEVICE" --output "$EVIDENCE/sana-q4-text-r2-capture.jsonl"
-# Candidate rows for the single reviewed table. PRINTED for review; a human commits
-# them to crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json
-# (schema 2: each row carries the capture's starting `baseline_footprint_bytes`; admission
-# charges only peak - baseline, credits only growth realized since admission, and keeps the
-# 512 MiB reserve, so a product's unrelated residents are never counted as free headroom).
-python3 scripts/ios/campaign.py evidence --input "$EVIDENCE/sana-q4-text-r2-capture.jsonl"
-python3 scripts/ios/campaign.py table --input "$EVIDENCE/all.jsonl"
+  --all-cases --device "$DEVICE" --output "$EVIDENCE/anchors.jsonl"
+# One family only (e.g. to re-capture after a fix):
+python3 scripts/ios/campaign.py capture --catalog /tmp/ios-campaign-catalog.json \
+  --provider sana_1600m --tier q4 --mode text --device "$DEVICE" --output "$EVIDENCE/sana-q4.jsonl"
+# Step 2 — candidate schema-3 ANCHOR rows for the single reviewed table, PRINTED for review (plus
+# the full-steps / short-steps validation and any problem: < 3 completed optimized repeats, a
+# refused optimized anchor). A human commits them to
+# crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json.
+python3 scripts/ios/campaign.py evidence --input "$EVIDENCE/anchors.jsonl"
+# Step 3 — after the anchors are committed and the app rebuilt: the validation_geometry case runs
+# ADMITTED, so its row records the anchor law's derived demand next to the measured growth.
+python3 scripts/ios/campaign.py validate --catalog /tmp/ios-campaign-catalog.json \
+  --all-cases --device "$DEVICE" --output "$EVIDENCE/validate.jsonl"
+# Any configuration of the catalog's domain, ADMITTED (an anchor key admits at its measurement,
+# anything else at its anchor-law derivation):
+python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
+  --case sana_1600m/sana_1600m/q4/768/text/3/s_t192_o48_c1048576/0 --device "$DEVICE" \
+  --output "$EVIDENCE/sana-768.jsonl"
+python3 scripts/ios/campaign.py table --input "$EVIDENCE/anchors.jsonl"
 ```
 
 Each case emits `CAMPAIGN_JSON` and JSONL with elapsed seconds, sampled MLX
@@ -264,7 +778,10 @@ is recorded as an explicit `kernel_lifetime_peak_unavailable` reading, never a s
 layout identity, the full memory-relevant `evidence_key` (hardware, provider,
 route, tier, layout, mode, geometry, references, execution levers, token window;
 never prompt/seed/path), `evidence_class` (`admitted` or `capture`), any typed
-`refused_quantum`, selected strategy parameters, evidence revision,
+`refused_quantum`, selected strategy parameters, the structured `anchor_selection`,
+`steps`, the per-phase `phase_peaks` (`{phase: {peak_bytes, exact}}`, split from the
+kernel lifetime peak through the quantum marks), an admitted case's `admitted`
+price (`demand_bytes`, `margin_bytes`, `basis`: measured anchor or derived), evidence revision,
 entitlement, refusal-only marker, per-launch nonce, compiled build SHA and iOS
 version. The nonce prevents a previous report with the same case/SHA from passing
 freshness checks. Render
@@ -279,17 +796,21 @@ construction), `diagnostic_failure`, or `skipped` (explicit host case budget). M
 reports, timeout, malformed output or a terminated process cannot prove admission
 refusal. Missing physical-footprint/headroom telemetry cannot yield production
 success. Noncompletion returns nonzero; a successful listing is not a render.
-The table includes the largest **admitted** completed edge per route/tier/mode/
-strategy, active/cache/combined columns and probe markers. Refusals have typed
+The table includes each row's purpose, active/cache/combined columns, probe markers,
+any optimized-anchor DEFECT, and per anchor case its completed repeats' demand
+(kernel lifetime peak − capture baseline) or its typed refusal. Refusals have typed
 `refusal_kind`: `capacity`, `no_evidence`, `mode`, `strategy`, or `artifact`,
 taken from runtime-ios's typed refusal, never parsed from a message. Only a
 **capacity** refusal proves the next-up condition (an admitted capacity refusal,
 or a capture's typed quantum refusal); missing footprint evidence, unsupported
 modes/rungs, malformed sources and termination never prove it. Layout-profile
 and request-binding errors are failures before admission, not capacity refusals.
-Commit the actual measured table only after the terminal campaign, not this
-harness change. The 4096 MiB budget remains provisional; 6142/3374 MiB launch
-readings remain unvalidated diagnostics, and no cap/table is invented here.
+Commit the actual measured anchors only after the terminal campaign, not this
+harness change. The runtime ceiling is now the observed **6144 MiB entitled OS process limit**
+for iPhone17,2 / iOS 26.6.2 (23G90), from the 2026-10-26 A/B below. It is not a safe
+render budget: reviewed model demand plus margin, exact device/OS/source applicability,
+live headroom and quantum guards remain necessary. Empty anchor/policy DATA still refuses
+admitted work; no model fit follows from the OS limit.
 
 ### Bounded synthetic primitive characterization (sc-16780)
 
@@ -411,11 +932,15 @@ The control entitlement retains extended virtual addressing and removes only
 increased-memory-limit. Use `--memory-entitlement off`, not an invented
 `SMOKE_ENTITLEMENTS` override.
 
-Observed S3 launch readings: **6142 MiB on**, **3374 MiB off**, three identical
-readings each. These are `os_proc_available_memory()` at launch, not a validated
-safe working-set cap. The runtime's provisional budget constants remain
-unchanged. Do not replace them with 6142 or derive a safe render budget from the
-entitlement delta. MLX allocator limits are not a proven jetsam barrier.
+Historical S3 launch headroom was **6142 MiB on / 3374 MiB off**, three readings each.
+The fresh 2026-10-26 A/B measured available memory **plus current process footprint**:
+all three pairs per launch totaled **6144 MiB entitled / 3376 MiB off**; restored-on
+again totaled 6144 MiB on iPhone17,2, iOS 26.6.2 (23G90). The runtime ceiling now uses
+that observed entitled OS process limit. Preserve the [original e49f5345 receipts](evidence/ios-process-limit-2026-10-26/README.md).
+This source repair requires a final rebuilt SDK/harness before weighted capture, while the
+source-independent OS/entitlement A/B observations remain valid. Neither the limit nor the
+entitlement delta certifies a safe render working set. Existing live guards, margins and
+no-evidence refusals remain unchanged; MLX allocator limits are not a proven jetsam barrier.
 
 ## 3. Provision and inspect the actual SANA snapshot
 
@@ -474,7 +999,7 @@ activations, allocator/cache and driver/process overhead. Compare that bound
 conservatively with the available capacity for this attempt. The header-only
 payload/profile and the harness's automated payload/cap/headroom preflight
 **DO NOT satisfy this prerequisite**: they cannot bound these transients.
-Neither launch headroom nor the provisional constant establishes such a bound.
+Neither launch headroom nor the observed OS process ceiling establishes such a bound.
 **Do not execute capture if this independent bound is missing or unsupported.**
 No numerical safe bound is supplied by this runbook, and none is asserted to
 exist for the target snapshot. Merely creating a receipt file is not evidence.
@@ -612,10 +1137,11 @@ its active+cache values are **not** kernel `phys_footprint`, and it is not the
 
 ## 8. Terminal device campaign — not yet measured
 
-sc-26270 owns the model × tier campaign at 512²/768²/1024² (Supra2: 256²), the
-largest completed size and next-size refusal, feature review, pin and main
-integration. Retain every registered mode; report explicit refusals, not missing
-cells. Add real rows here only after captures, with this schema:
+sc-26270 owns the ANCHOR campaign (per served provider route × tier × mode: the
+resident anchor once and the optimized anchor twice at 1024² with 2 steps, plus the
+validation cases), feature review, pin and main integration. Retain every
+registered mode; report explicit refusals, not missing cells. Add real rows here
+only after captures, with this schema:
 
 | Source SHA / artifact layout and component tiers | Phone / OS / entitlement | Provider / mode / size / strategy | Time | MLX peak | Kernel footprint | Min headroom | Completed / refused / unconfirmed termination | Image / diagnostic receipt |
 |---|---|---|---|---|---|---|---|---|
@@ -623,4 +1149,20 @@ cells. Add real rows here only after captures, with this schema:
 
 A successful diagnostic capture does not populate an admitted-success row.
 Do not invent measurements, infer safe caps from launch headroom, or silently
-mark Supra2 complete while epic 24212 is outstanding.
+mark the explicitly deferred Supra2 iOS registration complete.
+
+## Supported engineering capture build composition
+
+`ios-host/smoke` and `runtime-ios` are explicit members of the same inference root Cargo
+workspace and share its single `Cargo.lock`. The harness no longer creates a nested workspace
+or owns a second lock. Existing `--manifest-path ios-host/smoke/Cargo.toml` commands select that
+package in the root workspace. `run_smoke.sh` explicitly retains `ios-host/smoke/target` for the
+staticlib/metallib paths Xcode already uses; CI can retain its explicit job target directory.
+
+The empirical policy binds the actual compiled dependency units, target/toolchain/features,
+source closure, native artifacts and phone/OS. Reuse is supported between the root-workspace
+SDK and this harness, including an identical relocated checkout and reviewed evidence/policy
+DATA-only changes. A separate nested workspace or Git consumer is a different Cargo composition
+and conservatively receives `no_evidence` for these captures. Public registries, unbound
+file-backed candidates and arbitrary public Array inputs retain their native behavior; this
+boundary grants no phone-fit certification to a different compiled composition.

@@ -278,10 +278,14 @@ fn run_i2v_gate(golden_path: &str, bf16: bool, stat_dt: Dtype) {
 #[ignore = "needs ltx_2_3_base_q8 transformer (~20 GB) + upsampler + vae_decoder + the I2V golden"]
 fn i2v_frames_match_reference() {
     run_i2v_gate(GOLDEN, false, Dtype::Float32);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED i2v_parity::i2v_frames_match_reference");
 }
 
 #[test]
 #[ignore = "needs ltx_2_3_base_q8 transformer (~20 GB) + upsampler + vae_decoder + the bf16 I2V golden"]
 fn i2v_frames_match_reference_bf16() {
     run_i2v_gate(GOLDEN_BF16, true, Dtype::Bfloat16);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED i2v_parity::i2v_frames_match_reference_bf16");
 }

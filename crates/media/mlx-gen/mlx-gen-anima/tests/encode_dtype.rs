@@ -264,6 +264,7 @@ fn rel_l2(got: &[f64], reference: &[f64]) -> f64 {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn qwen3_tower_default_is_bf16_and_fp32_opt_in_is_fp32() {
     let cfg = tiny_qwen3_cfg();
     // Default constructor → bf16 (the shipped path, UNCHANGED by sc-10577).
@@ -335,9 +336,13 @@ fn qwen3_tower_default_is_bf16_and_fp32_opt_in_is_fp32() {
          bf16-weight towers must differ by more than bf16 rounding (rel-L2 {r_weight:.3e}); a value \
          near 0 means the fp32 path collapsed to bf16 weights"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED encode_dtype::qwen3_tower_default_is_bf16_and_fp32_opt_in_is_fp32");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn conditioner_honors_dtype_arg_bf16_and_fp32() {
     let cfg = tiny_cond_cfg();
     let cond_bf16 = AnimaTextConditioner::from_weights(
@@ -404,5 +409,10 @@ fn conditioner_honors_dtype_arg_bf16_and_fp32() {
         r_weight > 5e-4,
         "fp32 conditioner must genuinely use fp32 WEIGHTS: at equal (fp32) compute the fp32-weight \
          and bf16-weight outputs must differ by more than bf16 rounding (rel-L2 {r_weight:.3e})"
+    );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED encode_dtype::conditioner_honors_dtype_arg_bf16_and_fp32"
     );
 }

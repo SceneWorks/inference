@@ -200,8 +200,11 @@ impl MiniMaxH3TeConfig {
     /// always comes from the constant.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let path = root.as_ref().join("text_encoder").join("config.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Msg(format!("minimax-h3 te: read {}: {e}", path.display())))?;
+        let text = mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(&path),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string(&path)
+        )
+        .map_err(|e| Error::Msg(format!("minimax-h3 te: read {}: {e}", path.display())))?;
         Self::from_config_json(&text)
     }
 

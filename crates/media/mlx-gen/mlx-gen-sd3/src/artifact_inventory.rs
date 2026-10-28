@@ -106,7 +106,13 @@ fn turnkey_path_tier(provider_id: &str, root: &Path) -> Option<Option<Quant>> {
 /// tensors do not carry, or packed tensors with no config, is not a tier this can name.
 fn packed_transformer_tier(root: &Path) -> Result<Option<Quant>> {
     let transformer = root.join("transformer");
-    let declared = match std::fs::read_to_string(transformer.join("config.json")) {
+    let declared = match mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(transformer.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-sd3/src/artifact_inventory.rs::packed_transformer_tier::std::fs::read_to_string@4826",
+ArtifactInput,
+transformer.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
             .map_err(|error| {
                 Error::Msg(format!(

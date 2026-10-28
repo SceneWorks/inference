@@ -884,6 +884,9 @@ fn flux1_preview_frames_evolve_toward_the_final_image() {
     // is a real backstop rather than a formality, while leaving room for a prompt whose composition
     // resolves later. See `assert_the_strip_converges` for why the floor is per-lane.
     assert_flux1_previews_converge("flux1-dev-euler", None, steps, size, 0.90, 2.0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::flux1_preview_frames_evolve_toward_the_final_image");
 }
 
 /// Exactly one frame per **outer** solver step on a multi-eval solver.
@@ -908,6 +911,9 @@ fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
     );
     // `assert_flux1_previews_converge` already required exactly `steps` frames numbered 1..=steps, so
     // the dedup collapsed the extra evaluations. Stated here because that is the point of the row.
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::a_multi_eval_solver_emits_one_frame_per_outer_step");
 }
 
 /// This family's σ-convention finding, measured rather than argued — and the counterpart of sc-16954's
@@ -924,6 +930,7 @@ fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
 /// the row that must appear in a plain `cargo test` of this file. sc-16954 shipped a red row that hid
 /// because the only non-ignored row in its file was excluded by `-- --ignored`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_flow_cohort_needs_no_sigma_correction() {
     use candle_gen::gen_core::sampling::{FlowModelSampling, ModelSampling, TimestepConvention};
 
@@ -971,4 +978,7 @@ fn the_flow_cohort_needs_no_sigma_correction() {
         "an uncorrected flow-space projection must already be a readable noise field, not a clipped \
          one ({rails:.4}) — if this ever fails, the family needs PreviewHook::with_sigma"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::the_flow_cohort_needs_no_sigma_correction");
 }

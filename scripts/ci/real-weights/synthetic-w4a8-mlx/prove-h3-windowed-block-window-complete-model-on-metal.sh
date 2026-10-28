@@ -1,0 +1,20 @@
+set -euo pipefail
+log="$RUNNER_TEMP/h3-block-window-mlx.log"
+list_log="$log.list"
+cargo test --locked -p mlx-gen-minimax-h3 --test integration block_window:: -- --ignored --list --color never >"$list_log" 2>&1
+cat "$list_log"
+test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 6
+grep -Fxq "block_window::a_deferred_load_materializes_no_blocks: test" "$list_log"
+grep -Fxq "block_window::windowed_and_resident_stacks_agree: test" "$list_log"
+grep -Fxq "block_window::the_two_residency_modes_are_mutually_exclusive: test" "$list_log"
+grep -Fxq "block_window::the_windowed_adaln_precompute_matches_the_resident_one: test" "$list_log"
+grep -Fxq "block_window::every_window_opens_an_independent_view: test" "$list_log"
+grep -Fxq "block_window::the_windowed_te_matches_the_resident_one_on_the_fixture: test" "$list_log"
+cargo test --locked -p mlx-gen-minimax-h3 --test integration block_window:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+grep -Fq "test result: ok. 6 passed; 0 failed; 0 ignored" "$log"
+grep -Fq "test block_window::a_deferred_load_materializes_no_blocks ..." "$log"
+grep -Fq "test block_window::windowed_and_resident_stacks_agree ..." "$log"
+grep -Fq "test block_window::the_two_residency_modes_are_mutually_exclusive ..." "$log"
+grep -Fq "test block_window::the_windowed_adaln_precompute_matches_the_resident_one ..." "$log"
+grep -Fq "test block_window::every_window_opens_an_independent_view ..." "$log"
+grep -Fq "test block_window::the_windowed_te_matches_the_resident_one_on_the_fixture ..." "$log"

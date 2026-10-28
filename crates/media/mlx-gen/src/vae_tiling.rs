@@ -875,6 +875,7 @@ mod tests {
         }
         let _restore = Restore(mlx_rs::Device::try_default().unwrap());
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
         let x = Array::from_slice(
             &(0..9 * 11 * 4).map(|i| (i % 7) as f32).collect::<Vec<_>>(),
             &[1, 9, 11, 4],
@@ -1194,6 +1195,7 @@ mod tests {
         }
         let _restore = Restore(mlx_rs::Device::try_default().expect("default device"));
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
         // Magnitudes past 256 square beyond f16's 65 504 ceiling: an in-place f16 variance would be
         // inf. Every row-chunk size — one row, a ragged split, the whole activation — must land on
         // the f32 reference statistics, and `apply` must hand the crop back at f16.
@@ -1674,6 +1676,7 @@ mod tests {
             return;
         }
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
         assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal());
         let (denorm, plan, axes) = ragged_video_plan();
         let tiles = plan.t.len() * plan.h.len() * plan.w.len();
@@ -2214,6 +2217,127 @@ mod tests {
             flat[(3 * out_hw as i64 * out_hw as i64 - 1) as usize],
             0.0,
             "last (>2^31) elem"
+        );
+    }
+
+    /// [`crate::ios_quantum::tile_bytes`] against the measured peak of one tile's graph exactly as
+    /// [`tiled_conv2d_3x3_nhwc`] / [`tiled_conv2d_3x3_nhwc_f32_accum`] build it (the halo crop sliced
+    /// from an NHWC transposed view of an NCHW activation, the optional GlobalGroupNorm + SiLU
+    /// preprocess, the optional f32 promotion, the biased convolution, the core crop and its cast
+    /// back): the worst of 5 stalled runs ([`crate::ios_quantum::measured_peak_bytes`]) must be
+    /// covered, within 1.5x. f32 and f16, normalized and raw, crops from 23% to 100% of the row
+    /// width, equal and widening channels.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "macos")]
+    fn tile_formula_tracks_the_measured_tile() {
+        const CHILD: &str = "IOS_CAPTURE_IN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vae_tiling::tests::tile_formula_tracks_the_measured_tile",
+                    "--nocapture",
+                    "--include-ignored",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ios_quantum::{tile_bytes, Backend, TileSource};
+        use mlx_rs::Dtype::{Float16 as H, Float32 as F};
+        let silu = |t: &Array| -> Result<Array> { Ok(multiply(t, mlx_rs::ops::sigmoid(t)?)?) };
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
+        assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal());
+        let rnd = |shape: &[i32], seed: u64, dtype: mlx_rs::Dtype| {
+            let a = mlx_rs::random::normal::<f32>(
+                shape,
+                None,
+                None,
+                Some(&mlx_rs::random::key(seed).unwrap()),
+            )
+            .unwrap()
+            .as_dtype(dtype)
+            .unwrap();
+            a.eval().unwrap();
+            a
+        };
+        // (full edge, crop edge, cin, cout, storage dtype, normalized, f32_accum)
+        for &(full, crop, c, cout, dtype, normalized, f32_accum) in &[
+            (288, 258, 32, 32, F, true, false),
+            (288, 130, 32, 32, F, true, false),
+            (288, 66, 32, 32, F, true, false),
+            (144, 130, 64, 64, F, true, false),
+            (144, 66, 64, 64, F, true, false),
+            (288, 258, 32, 64, F, true, false),
+            (130, 130, 32, 32, F, true, false),
+            (288, 258, 32, 32, F, false, false),
+            (288, 66, 32, 32, F, false, false),
+            (288, 130, 64, 32, F, false, false),
+            (288, 258, 32, 32, H, true, true),
+            (288, 66, 32, 32, H, true, true),
+            (288, 130, 32, 32, H, true, false),
+            (288, 130, 32, 32, H, false, true),
+        ] {
+            let act = if dtype == H { 2 } else { 4 };
+            let x = rnd(&[1, c, full, full], 1, dtype)
+                .transpose_axes(&[0, 2, 3, 1])
+                .unwrap();
+            let w = rnd(&[cout, 3, 3, c], 2, dtype);
+            let b = rnd(&[cout], 3, dtype);
+            let norm =
+                GlobalGroupNorm::new(&x, &rnd(&[c], 4, dtype), &rnd(&[c], 5, dtype), 32, 1e-6)
+                    .unwrap();
+            let (wide_w, wide_b) = (w.as_dtype(F).unwrap(), b.as_dtype(F).unwrap());
+            mlx_rs::transforms::eval([&wide_w, &wide_b]).unwrap();
+            let mut measured = 0;
+            for _ in 0..5 {
+                measured = measured.max(
+                    crate::ios_quantum::measured_peak_bytes(|| {
+                        let tile = slice_axis(&slice_axis(&x, 1, 0, crop)?, 2, 0, crop)?;
+                        let tile = if normalized {
+                            silu(&norm.apply(&tile)?)?
+                        } else {
+                            tile
+                        };
+                        let out = if f32_accum {
+                            crate::nn::conv2d(&tile.as_dtype(F)?, &wide_w, Some(&wide_b), 1, 1)?
+                        } else {
+                            crate::nn::conv2d(&tile, &w, Some(&b), 1, 1)?
+                        };
+                        let core = slice_axis(&slice_axis(&out, 1, 1, crop - 1)?, 2, 1, crop - 1)?;
+                        Ok(vec![if f32_accum {
+                            core.as_dtype(dtype)?
+                        } else {
+                            core
+                        }])
+                    })
+                    .unwrap(),
+                );
+            }
+            let source = TileSource {
+                full_width: full,
+                normalized,
+            };
+            let formula = tile_bytes(
+                &[1, crop, crop, c],
+                source,
+                act,
+                &w,
+                f32_accum,
+                Backend::Cpu,
+            );
+            let label = format!(
+                "tile {crop}² of {full}² {c}->{cout} act {act} normalized {normalized} f32_accum {f32_accum}"
+            );
+            println!("{label}: formula {formula} B, measured {measured} B");
+            crate::ios_quantum::assert_tracks_measured(&label, formula, measured, 1.5);
+        }
+        eprintln!(
+            "IOS_CAPTURE_BODY_COMPLETED vae_tiling::tests::tile_formula_tracks_the_measured_tile"
         );
     }
 }

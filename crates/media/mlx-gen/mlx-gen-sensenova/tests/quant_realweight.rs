@@ -70,6 +70,9 @@ fn quant_vs_bf16_t2i() {
     let snap = snapshot_dir();
     if !snap.exists() {
         eprintln!("skipping: snapshot missing at {}", snap.display());
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in quant_vs_bf16_t2i; see preceding skip diagnostic",
+        );
         return;
     }
     let src = WeightsSource::Dir(snap);
@@ -86,4 +89,6 @@ fn quant_vs_bf16_t2i() {
     // not bit-faithful. (Measured ~0.998 / ~0.84 at cfg=2, 8-step, 256².)
     assert!(c8 > 0.97, "Q8 should be near-lossless vs bf16, got {c8:.5}");
     assert!(c4 > 0.8, "Q4 should stay coherent vs bf16, got {c4:.5}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_realweight::quant_vs_bf16_t2i");
 }

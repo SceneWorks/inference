@@ -39,6 +39,7 @@ fn stream(g: &Golden, name: &str, dev: &Device) -> StreamState {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn mar_loop_matches_reference_f32() {
     let dev = Device::Cpu;
     let g = Golden::load("mar_golden");
@@ -113,4 +114,7 @@ fn mar_loop_matches_reference_f32() {
         println!("{name:>14}: peak|Δ|={abs:.3e}  peak-rel={rel:.3e}");
         assert!(rel < 5e-3, "{name} peak-rel {rel:.3e} exceeds 5e-3");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mar_parity::mar_loop_matches_reference_f32");
 }

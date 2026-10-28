@@ -140,6 +140,10 @@ pub struct CausalLm {
     /// architecture, which is what keeps their stack pass byte-identical.
     full_rope: Option<Rope>,
     cfg: ModelConfig,
+    /// Explicit dense training-teacher precision. Legacy constructors retain BF16.
+    compute_dtype: Dtype,
+    /// HF training's buffer-value rounding, separate from phase arithmetic precision.
+    training_frequency_storage: Option<Dtype>,
     quantized: bool,
     /// The load-time quantization the projections were built with (`None` for none): its bits
     /// and group size shape the K/V as much as the config does.
@@ -239,6 +243,70 @@ impl CausalLm {
         Self::from_weights_with(w, prefix, cfg, None)
     }
 
+    /// Explicit compute precision for the dense Qwen3-VL training teacher. Ordinary
+    /// constructors keep their historical BF16 policy. Quantized or other-family
+    /// inputs are refused before materializing any parameter; this is not a new
+    /// serving/quantization precision matrix.
+    ///
+    /// Cast on the CPU stream and evaluate there BEFORE constructing GPU graphs.
+    /// In MLX's unified memory this is CPU-cast-before-GPU-eval, not a discrete upload.
+    pub fn from_weights_dtype(
+        w: &Weights,
+        prefix: &str,
+        cfg: ModelConfig,
+        dtype: Dtype,
+    ) -> Result<Self> {
+        if !matches!(dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16)
+            || !cfg.architecture.is_qwen3_vl()
+            || cfg.quantization.is_some()
+        {
+            return Err(Error::Unsupported(
+                "explicit teacher precision requires dense Qwen3-VL and F32/F16/BF16 compute"
+                    .into(),
+            ));
+        }
+        let mut keys = w
+            .keys()
+            .filter(|key| key.starts_with("model.language_model.") || key.starts_with("lm_head."))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        keys.sort();
+        // Inspect every selected header/type before allocating casts. Packed weights
+        // must never be reinterpreted as a dense floating checkpoint.
+        for key in &keys {
+            if key.ends_with(".scales") || key.ends_with(".biases") {
+                return Err(Error::Unsupported(
+                    "explicit teacher precision does not support packed/quantized weights".into(),
+                ));
+            }
+            let array = w.require(key)?;
+            if (key.ends_with(".weight") || key.ends_with(".bias"))
+                && !matches!(
+                    array.dtype(),
+                    Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+                )
+            {
+                return Err(Error::Unsupported(format!(
+                    "explicit teacher precision requires floating dense parameter {key}"
+                )));
+            }
+        }
+        let mut typed = std::collections::HashMap::new();
+        for key in keys {
+            let array = w
+                .require(&key)?
+                .as_dtype_device(dtype, mlx_rs::StreamOrDevice::cpu())?;
+            mlx_rs::transforms::eval_pending_loads([&array])?;
+            mlx_rs::transforms::eval([&array])?;
+            typed.insert(key, array);
+        }
+        let typed = Weights::from_map(typed);
+        let model = Self::build_dtype(&typed, prefix, cfg, None, None, dtype)?;
+        typed.verify_accessed_gpu_view()?;
+        crate::primitives::weights::eval_groups(&model.param_groups())?;
+        Ok(model)
+    }
+
     /// Build from a loaded checkpoint, optionally quantizing the attention/MLP projections on load.
     /// Embeddings, the LM head, and norms always stay dense.
     pub fn from_weights_with(
@@ -322,6 +390,17 @@ impl CausalLm {
         quant: Option<QuantSpec>,
         stream_source: Option<std::path::PathBuf>,
     ) -> Result<Self> {
+        Self::build_dtype(w, prefix, cfg, quant, stream_source, COMPUTE_DTYPE)
+    }
+
+    fn build_dtype(
+        w: &Weights,
+        prefix: &str,
+        cfg: ModelConfig,
+        quant: Option<QuantSpec>,
+        stream_source: Option<std::path::PathBuf>,
+        compute_dtype: Dtype,
+    ) -> Result<Self> {
         // Gemma 4's `use_bidirectional_attention: "all"` makes **every** token attend both ways, so
         // its sliding layers want a *symmetric* window rather than the causal one every mask in this
         // crate builds (and the config parse has already halved `sliding_window` to the exclusive
@@ -364,8 +443,8 @@ impl CausalLm {
         } else {
             join(prefix, "lm_head.weight")
         };
-        let req_bf16 =
-            |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
+        let req_compute =
+            |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(compute_dtype)?) };
 
         // **Gemma-2's** norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
         // `rms_norm` applies it. (Llama / Qwen3 / Qwen3-VL / GLM-4 norm weights are standard RMSNorm
@@ -379,7 +458,7 @@ impl CausalLm {
         // (`gelu_pytorch_tanh`) MLP.
         let gemma = cfg.architecture.is_gemma();
         let norm_w = |key: String| -> Result<Array> {
-            let t = req_bf16(key)?;
+            let t = req_compute(key)?;
             if norm_offset {
                 Ok(add(&t, &Array::from_f32(1.0).as_dtype(t.dtype())?)?)
             } else {
@@ -404,10 +483,10 @@ impl CausalLm {
                 w.require(&format!("{embed_base}.biases"))?.clone(),
                 spec.group_size,
                 spec.bits,
-                COMPUTE_DTYPE,
+                compute_dtype,
             )?)
         } else {
-            TokenEmbedding::Dense(req_bf16(embed_key)?)
+            TokenEmbedding::Dense(req_compute(embed_key)?)
         };
         let norm = norm_w(p("norm.weight"))?;
         let lm_head = if cfg.tie_word_embeddings {
@@ -428,17 +507,17 @@ impl CausalLm {
                     w.require(&head_scales_key)?.clone(),
                     w.require(&format!("{head_base}.biases"))?.clone(),
                     spec,
-                    COMPUTE_DTYPE,
+                    compute_dtype,
                 )?
             } else {
                 Projection::Dense {
-                    weight: req_bf16(head_key)?,
+                    weight: req_compute(head_key)?,
                     bias: None,
                 }
             }
         };
 
-        let plan = LayerPlan::new(&cfg, decoder_root.clone());
+        let plan = LayerPlan::new(&cfg, decoder_root.clone(), compute_dtype);
         let stack = match stream_source {
             None => {
                 let mut layers = Vec::with_capacity(cfg.num_layers);
@@ -483,6 +562,8 @@ impl CausalLm {
             weights_identity: String::new(),
             embed_scale: gemma.then(|| (cfg.hidden_size as f32).sqrt()),
             final_softcap: cfg.final_logit_softcap,
+            compute_dtype,
+            training_frequency_storage: None,
             cfg,
         })
     }
@@ -582,9 +663,37 @@ impl CausalLm {
     /// The engine's cached-decode compute dtype (bf16): activations, logits and the K/V cache.
     pub const COMPUTE_DTYPE: Dtype = COMPUTE_DTYPE;
 
-    /// The engine's cached-decode compute dtype (bf16).
+    /// The instance's compute/cache dtype. Legacy constructors default to BF16.
     pub const fn compute_dtype(&self) -> Dtype {
-        Self::COMPUTE_DTYPE
+        self.compute_dtype
+    }
+
+    /// Enable ONLY the pinned HF training teacher's Module.to(dtype) buffer-value
+    /// rounding, on a fresh model before any forward/cache. Generic explicit-dtype
+    /// constructors deliberately retain legacy F32-frequency inference semantics.
+    pub fn with_training_frequency_storage(mut self) -> Result<Self> {
+        if !self.cfg.architecture.is_qwen3_vl() || self.quantized {
+            return Err(Error::Unsupported(
+                "training frequency profile requires a dense Qwen3-VL teacher".into(),
+            ));
+        }
+        if self.training_frequency_storage == Some(self.compute_dtype) {
+            return Ok(self);
+        }
+        self.rope = self
+            .rope
+            .with_training_frequency_storage(self.compute_dtype)?;
+        self.full_rope = self
+            .full_rope
+            .as_ref()
+            .map(|r| r.with_training_frequency_storage(self.compute_dtype))
+            .transpose()?;
+        self.training_frequency_storage = Some(self.compute_dtype);
+        Ok(self)
+    }
+
+    pub fn training_frequency_storage_dtype(&self) -> Option<Dtype> {
+        self.training_frequency_storage
     }
 
     /// Name the weight files this decoder was loaded from (for example each file's name, size
@@ -604,14 +713,16 @@ impl CausalLm {
     /// share pages.
     pub fn cache_fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
-        let described = format!(
+        let mut described = format!(
             "{:?}|kv={:?}|quantized={}|load_quant={:?}|weights={}",
-            self.cfg,
-            Self::COMPUTE_DTYPE,
-            self.quantized,
-            self.load_quant,
-            self.weights_identity
+            self.cfg, self.compute_dtype, self.quantized, self.load_quant, self.weights_identity
         );
+        // Preserve the exact legacy fingerprint when the frequency values are F32.
+        if let Some(storage) = self.training_frequency_storage {
+            if storage != Dtype::Float32 {
+                described.push_str(&format!("|hf_training_frequency={storage:?}"));
+            }
+        }
         format!("{:x}", Sha256::digest(described.as_bytes()))
     }
 
@@ -622,12 +733,18 @@ impl CausalLm {
     /// at a different head dim, which no single pair can carry — see
     /// [`CausalLm::decode_logits_masked_at`], which builds both from the same positions.
     pub fn rope_tables(&self, positions: &[i32], rows: i32, cols: i32) -> Result<(Array, Array)> {
-        Self::grid(&self.rope, positions, rows, cols)
+        Self::grid(&self.rope, positions, rows, cols, self.compute_dtype)
     }
 
     /// One `rope`'s `(cos, sin)` reshaped to a `[rows, cols, rope_dim]` grid.
-    fn grid(rope: &Rope, positions: &[i32], rows: i32, cols: i32) -> Result<(Array, Array)> {
-        let (cos, sin) = rope.cos_sin_at(positions, COMPUTE_DTYPE)?; // [1, rows*cols, rope_dim]
+    fn grid(
+        rope: &Rope,
+        positions: &[i32],
+        rows: i32,
+        cols: i32,
+        dtype: Dtype,
+    ) -> Result<(Array, Array)> {
+        let (cos, sin) = rope.cos_sin_at(positions, dtype)?; // [1, rows*cols, rope_dim]
         let hd = rope.dim();
         Ok((
             cos.reshape(&[rows, cols, hd])?,
@@ -639,9 +756,9 @@ impl CausalLm {
     /// pair per layer type the model has.
     fn stack_rope(&self, s: i32, offset: i32) -> Result<RopeTables> {
         Ok(RopeTables {
-            primary: self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?,
+            primary: self.rope.cos_sin(s, offset, self.compute_dtype)?,
             full: match &self.full_rope {
-                Some(r) => Some(r.cos_sin(s, offset, COMPUTE_DTYPE)?),
+                Some(r) => Some(r.cos_sin(s, offset, self.compute_dtype)?),
                 None => None,
             },
         })
@@ -651,9 +768,9 @@ impl CausalLm {
     /// (per-sequence positions) form of [`CausalLm::stack_rope`].
     fn stack_rope_at(&self, positions: &[i32], rows: i32, cols: i32) -> Result<RopeTables> {
         Ok(RopeTables {
-            primary: Self::grid(&self.rope, positions, rows, cols)?,
+            primary: Self::grid(&self.rope, positions, rows, cols, self.compute_dtype)?,
             full: match &self.full_rope {
-                Some(r) => Some(Self::grid(r, positions, rows, cols)?),
+                Some(r) => Some(Self::grid(r, positions, rows, cols, self.compute_dtype)?),
                 None => None,
             },
         })
@@ -671,7 +788,7 @@ impl CausalLm {
         let e = self
             .embed_tokens
             .forward(input_ids)?
-            .as_dtype(COMPUTE_DTYPE)?;
+            .as_dtype(self.compute_dtype)?;
         match self.embed_scale {
             Some(s) => Ok(multiply(&e, &Array::from_f32(s).as_dtype(e.dtype())?)?),
             None => Ok(e),
@@ -706,7 +823,7 @@ impl CausalLm {
     /// Embed token ids `[1, S]` → `[1, S, hidden]` in the compute dtype — the Qwen3-VL multimodal
     /// splice point (image-token rows are overwritten with the vision tower's merged patch features).
     pub fn embed_input_ids(&self, input_ids: &Array) -> Result<Array> {
-        Ok(self.embed(input_ids)?.as_dtype(COMPUTE_DTYPE)?)
+        Ok(self.embed(input_ids)?.as_dtype(self.compute_dtype)?)
     }
 
     /// Replace the `image_token_id` rows of `embeds` `[1, S, hidden]` with the vision tower's merged
@@ -724,7 +841,7 @@ impl CausalLm {
             image_features,
             image_token_id,
             self.cfg.hidden_size,
-            COMPUTE_DTYPE,
+            self.compute_dtype,
         )
     }
 
@@ -744,7 +861,7 @@ impl CausalLm {
             vision_features,
             placeholder_tokens,
             self.cfg.hidden_size,
-            COMPUTE_DTYPE,
+            self.compute_dtype,
         )
     }
 
@@ -814,10 +931,10 @@ impl CausalLm {
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
-            COMPUTE_DTYPE,
+            self.compute_dtype,
         )?;
         let ropes = RopeTables::uniform(cos, sin);
-        let h0 = embeds.as_dtype(COMPUTE_DTYPE)?;
+        let h0 = embeds.as_dtype(self.compute_dtype)?;
         let s = h0.shape()[1];
         let layers = self.resident_layers()?;
         let mut shared = SharedKv::default();
@@ -989,6 +1106,41 @@ impl CausalLm {
     ) -> Result<Vec<Array>> {
         let embeds = self.embed(input_ids)?;
         self.hidden_states_from_embeds_with_mask(&embeds, cache, offset, mask)
+    }
+
+    /// [`CausalLm::hidden_states_with_mask`] from **explicit absolute positions** rather than the
+    /// contiguous `offset..offset + seq` run — the text-encoder twin of
+    /// [`CausalLm::decode_logits_masked_at`]. `positions` is a row-major `[batch, seq]` grid, so
+    /// a right-padded window whose pads all sit at one position (FLUX 3's
+    /// `positions.masked_fill(mask == 0, 1)`) rotates exactly as upstream's `position_ids`, and
+    /// the additive `mask` keeps the pads out of every query's keys. Every layer type's RoPE
+    /// tables are built from the same grid, so a per-layer-type model (Gemma 4) is served too.
+    ///
+    /// Returns the same `num_layers + 1` HF-ordered stack as [`CausalLm::hidden_states`], with the
+    /// same evaluate-in-order guidance.
+    pub fn hidden_states_with_mask_at(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        positions: &[i32],
+        mask: AttnMask<'_>,
+    ) -> Result<Vec<Array>> {
+        let sh = input_ids.shape();
+        let (b, s) = (sh[0], sh[1]);
+        if positions.len() != (b * s) as usize {
+            return Err(Error::Msg(format!(
+                "hidden_states_with_mask_at: {} positions for a {b}x{s} window",
+                positions.len()
+            )));
+        }
+        let embeds = self.embed(input_ids)?;
+        let ropes = self.stack_rope_at(positions, b, s)?;
+        let mut out = Vec::with_capacity(self.cfg.num_layers + 1);
+        self.run_decoder_stack_collecting(&embeds, cache, &ropes, mask, Some(&mut out))?;
+        if let Some(last) = out.last_mut() {
+            *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps)?;
+        }
+        Ok(out)
     }
 
     /// Like [`CausalLm::hidden_states`] but from pre-computed input embeddings.
@@ -1844,7 +1996,7 @@ impl MlaAttention {
         lp: &dyn Fn(&str) -> String,
         cfg: &ModelConfig,
         load_proj: &dyn Fn(&str, Option<Array>) -> Result<Projection>,
-        req_bf16: &dyn Fn(String) -> Result<Array>,
+        req_compute: &dyn Fn(String) -> Result<Array>,
     ) -> Result<Self> {
         let mla = cfg
             .mla
@@ -1855,7 +2007,7 @@ impl MlaAttention {
                 (
                     None,
                     Some(load_proj(&lp("self_attn.q_a_proj.weight"), None)?),
-                    Some(req_bf16(lp("self_attn.q_a_layernorm.weight"))?),
+                    Some(req_compute(lp("self_attn.q_a_layernorm.weight"))?),
                     Some(load_proj(&lp("self_attn.q_b_proj.weight"), None)?),
                 )
             } else {
@@ -1872,7 +2024,7 @@ impl MlaAttention {
             q_a_layernorm,
             q_b_proj,
             kv_a_proj: load_proj(&lp("self_attn.kv_a_proj_with_mqa.weight"), None)?,
-            kv_a_layernorm: req_bf16(lp("self_attn.kv_a_layernorm.weight"))?,
+            kv_a_layernorm: req_compute(lp("self_attn.kv_a_layernorm.weight"))?,
             kv_b_proj: load_proj(&lp("self_attn.kv_b_proj.weight"), None)?,
             o_proj: load_proj(&lp("self_attn.o_proj.weight"), None)?,
             num_heads: cfg.num_heads,
@@ -2025,6 +2177,7 @@ fn join(prefix: &str, suffix: &str) -> String {
 /// before, and a streamed layer replays the identical `quant`, so the two are byte-identical —
 /// the property `residency`'s parity test pins.
 pub(crate) struct LayerPlan {
+    compute_dtype: Dtype,
     /// `model` / `{prefix}.model` / `model.language_model` — the stem every layer key hangs off.
     decoder_root: String,
     num_heads: i32,
@@ -2040,7 +2193,7 @@ pub(crate) struct LayerPlan {
 }
 
 impl LayerPlan {
-    pub(crate) fn new(cfg: &ModelConfig, decoder_root: String) -> Self {
+    pub(crate) fn new(cfg: &ModelConfig, decoder_root: String, compute_dtype: Dtype) -> Self {
         // `num_kv_shared_layers`: the trailing layers project no K/V of their own and instead reuse
         // the K/V of the **last** earlier layer of their own type. Upstream's
         // `first_kv_shared_layer_idx = num_hidden_layers - num_kv_shared_layers`, with the `> 0`
@@ -2059,6 +2212,7 @@ impl LayerPlan {
             }
         }
         Self {
+            compute_dtype,
             decoder_root,
             num_heads: cfg.num_heads,
             scale: cfg.attn_scale(),
@@ -2094,8 +2248,9 @@ impl LayerPlan {
         let kv_shared_from = self.kv_shared_from;
         let kv_store_at = self.kv_store_at;
         let stored_quant = cfg.quantization;
-        let req_bf16 =
-            |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
+        let compute_dtype = self.compute_dtype;
+        let req_compute =
+            |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(compute_dtype)?) };
 
         // A snapshot may store pre-quantized projections (the GGUF converter's MLX-requant output);
         // those are loaded from `weight`/`scales`/`biases` as-is. Otherwise the dense weight is loaded
@@ -2118,10 +2273,14 @@ impl LayerPlan {
                     spec.group_size,
                     spec.bits,
                     bias,
-                    COMPUTE_DTYPE,
+                    compute_dtype,
                 )?))
             } else {
-                Projection::load_with_bias(w.require(key)?.as_dtype(COMPUTE_DTYPE)?, bias, quant)
+                Projection::load_with_bias(
+                    w.require(key)?.as_dtype(self.compute_dtype)?,
+                    bias,
+                    quant,
+                )
             }
         };
         let proj = |key: String| -> Result<Projection> { load_proj(&key, None) };
@@ -2130,7 +2289,7 @@ impl LayerPlan {
             let base = wkey.strip_suffix(".weight").unwrap_or(&wkey);
             let bkey = format!("{base}.bias");
             let bias = if w.contains(&bkey) {
-                Some(req_bf16(bkey)?)
+                Some(req_compute(bkey)?)
             } else {
                 None
             };
@@ -2148,7 +2307,7 @@ impl LayerPlan {
         // (`gelu_pytorch_tanh`) MLP.
         let gemma = cfg.architecture.is_gemma();
         let norm_w = |key: String| -> Result<Array> {
-            let t = req_bf16(key)?;
+            let t = req_compute(key)?;
             if norm_offset {
                 Ok(add(&t, &Array::from_f32(1.0).as_dtype(t.dtype())?)?)
             } else {
@@ -2180,22 +2339,22 @@ impl LayerPlan {
 
         // Attention: Multi-head Latent Attention (DeepSeek-V2) or grouped-query attention.
         let attn = if cfg.architecture.is_mla() {
-            Attention::Mla(MlaAttention::load(w, &lp, cfg, &load_proj, &req_bf16)?)
+            Attention::Mla(MlaAttention::load(w, &lp, cfg, &load_proj, &req_compute)?)
         } else {
             // A KV-sharing tail layer (Gemma 4's `num_kv_shared_layers`) projects no keys or
             // values of its own — upstream builds no `k_proj` / `v_proj` / `k_norm` / `v_norm`
             // for it at all — and reads the stored K/V of the last earlier layer of its type.
             let q_norm = qk_norm
-                .then(|| req_bf16(lp("self_attn.q_norm.weight")))
+                .then(|| req_compute(lp("self_attn.q_norm.weight")))
                 .transpose()?;
             let k_norm = (qk_norm && !kv_shared)
-                .then(|| req_bf16(lp("self_attn.k_norm.weight")))
+                .then(|| req_compute(lp("self_attn.k_norm.weight")))
                 .transpose()?;
             // A packed `qkv_proj` (Phi-3, no bias) is split into q/k/v along axis 0; otherwise the
             // separate q/k/v projections are loaded (with q/k/v bias for Qwen2 / GLM-4).
             let packed = lp("self_attn.qkv_proj.weight");
             let (q, kv) = if w.contains(&packed) {
-                let qkv = req_bf16(packed)?; // [qd + 2*kvd, hidden]
+                let qkv = req_compute(packed)?; // [qd + 2*kvd, hidden]
                 let parts = split_sections(&qkv, &[qd, qd + kvd], 0)?;
                 (
                     Projection::load(parts[0].clone(), quant)?,
@@ -2261,7 +2420,7 @@ impl LayerPlan {
             };
             let shared_gate_key = lp("mlp.shared_expert_gate.weight");
             Ffn::Moe(SparseMoe::new(
-                req_bf16(lp("mlp.gate.weight"))?, // [num_experts, hidden]
+                req_compute(lp("mlp.gate.weight"))?, // [num_experts, hidden]
                 SwitchLinear::stack(gate)?,
                 SwitchLinear::stack(up)?,
                 SwitchLinear::stack(down)?,
@@ -2271,7 +2430,7 @@ impl LayerPlan {
                     down: proj(lp(&format!("{shared_stem}.down_proj.weight")))?,
                 },
                 if w.contains(&shared_gate_key) {
-                    Some(req_bf16(shared_gate_key)?) // [1, hidden]
+                    Some(req_compute(shared_gate_key)?) // [1, hidden]
                 } else {
                     None
                 },
@@ -2286,7 +2445,7 @@ impl LayerPlan {
             let (gate, up) = {
                 let packed = lp("mlp.gate_up_proj.weight");
                 if w.contains(&packed) {
-                    let gu = req_bf16(packed)?; // [2*inter, hidden]
+                    let gu = req_compute(packed)?; // [2*inter, hidden]
                     let parts = split_sections(&gu, &[inter], 0)?;
                     (
                         Projection::load(parts[0].clone(), quant)?,
@@ -2338,7 +2497,7 @@ impl LayerPlan {
         let scalar_key = lp("layer_scalar");
         let layer_scalar = w
             .contains(&scalar_key)
-            .then(|| req_bf16(scalar_key))
+            .then(|| req_compute(scalar_key))
             .transpose()?;
 
         Ok(LlamaLayer {
@@ -2365,6 +2524,7 @@ mod tests {
     /// class (vector-only 96/256, full-kernel 64/80/128, unserved 8/32/72/512) × MHA / GQA 4 / GQA 8
     /// × prompts inside one vector tile, across tiles, and across many tiles.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn greedy_tokens_match_pre_sc24442_sdpa_routing() {
         use crate::primitives::attention::route_override::{
             assert_greedy_matches_pre_sc24442, GreedyComparison,
@@ -2443,6 +2603,8 @@ mod tests {
             seen.compared_steps > seen.tie_steps,
             "most greedy steps must be decisive enough to compare: {seen:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::llama::tests::greedy_tokens_match_pre_sc24442_sdpa_routing");
     }
 
     /// sc-24446 parity gate for the Gemma decoders' GeGLU in the activation dtype: Gemma 2 on a
@@ -2451,6 +2613,7 @@ mod tests {
     /// to the gate's logit budget and greedy-margin rule against its own `f32` path
     /// ([`crate::primitives::activation::parity`]).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn gemma_geglu_activation_dtype_parity() {
         use crate::primitives::activation::parity::{assert_geglu_parity, random_bf16};
         use serde_json::json;
@@ -2522,6 +2685,8 @@ mod tests {
         let prompt: Vec<i32> = floats(&g["prompt"]).iter().map(|&x| x as i32).collect();
         let report = assert_geglu_parity("gemma4", &gemma4, &prompt, 16);
         eprintln!("gemma4 GeGLU parity: {report:?}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::llama::tests::gemma_geglu_activation_dtype_parity");
     }
 
     #[test]
@@ -2533,3 +2698,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "llama/precision_tests.rs"]
+mod precision_tests;

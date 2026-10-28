@@ -336,6 +336,8 @@ fn qwen_t2i_per_step_compiled_vs_eager() {
         t.forward(&hidden, &encoder, None, sigma, lat, lat, &[])
             .unwrap()
     });
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED perf::qwen_t2i_per_step_compiled_vs_eager");
 }
 
 #[test]
@@ -358,4 +360,6 @@ fn qwen_edit_per_step_compiled_vs_eager() {
         t.forward(&hidden, &encoder, None, sigma, lat, lat, &cond_grids)
             .unwrap()
     });
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED perf::qwen_edit_per_step_compiled_vs_eager");
 }

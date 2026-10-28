@@ -247,10 +247,14 @@ fn fp32_restorer() -> IrisRestorer {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn restoration_matches_upstream_end_to_end_in_fp32() {
     crate::common::cpu_process(
         "restoration_parity::restoration_matches_upstream_end_to_end_in_fp32",
-        restoration_matches_upstream_end_to_end_in_fp32_body,
+        || {
+            restoration_matches_upstream_end_to_end_in_fp32_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_parity::restoration_matches_upstream_end_to_end_in_fp32");
+        },
     );
 }
 
@@ -378,10 +382,14 @@ fn release_geometry_preview_is_backend_free_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn cancel_between_tiles_is_typed_and_yields_no_image() {
     crate::common::cpu_process(
         "restoration_parity::cancel_between_tiles_is_typed_and_yields_no_image",
-        cancel_between_tiles_is_typed_and_yields_no_image_body,
+        || {
+            cancel_between_tiles_is_typed_and_yields_no_image_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_parity::cancel_between_tiles_is_typed_and_yields_no_image");
+        },
     );
 }
 
@@ -418,10 +426,14 @@ fn cancel_between_tiles_is_typed_and_yields_no_image_body() {
 /// colour fix (the longest post-processing) and without either.
 /// MUTATION: drop the post-processing cancel checks in `gen_core::iris::restoration` — RED.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn cancel_after_the_last_tile_is_typed_and_yields_no_image() {
     crate::common::cpu_process(
         "restoration_parity::cancel_after_the_last_tile_is_typed_and_yields_no_image",
-        cancel_after_the_last_tile_is_typed_and_yields_no_image_body,
+        || {
+            cancel_after_the_last_tile_is_typed_and_yields_no_image_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_parity::cancel_after_the_last_tile_is_typed_and_yields_no_image");
+        },
     );
 }
 

@@ -104,6 +104,7 @@ fn render(generator: &dyn Generator, request: &GenerationRequest) -> (Vec<u8>, V
 /// *Mutation that reds this:* `stage_residency_for` ignoring the request
 /// (`spec.offload_policy == Sequential` alone): the staged request then reports no load.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_admitted_staged_request_stages_a_warm_generator() {
     let generator = load(Precision::Bf16);
     let (resident, loads) = render(generator.as_ref(), &request());
@@ -146,6 +147,9 @@ fn an_admitted_staged_request_stages_a_warm_generator() {
     let (again, loads) = render(generator.as_ref(), &request());
     assert!(loads.is_empty(), "{loads:?}");
     assert_eq!(again, resident);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_strategy::an_admitted_staged_request_stages_a_warm_generator");
 }
 
 /// Rung 3: the scope's request carries the admitted attention budget, and the render's attention
@@ -160,6 +164,7 @@ fn an_admitted_staged_request_stages_a_warm_generator() {
 /// *Mutation that reds this:* `attention_budget_for` returning `None` (the render then runs every
 /// attention as a single launch).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_admitted_attention_budget_bounds_the_render() {
     let generator = load(Precision::Fp32);
     chunk_probe::reset();
@@ -238,6 +243,9 @@ fn an_admitted_attention_budget_bounds_the_render() {
     let (after, _) = render(generator.as_ref(), &request());
     assert_eq!(chunk_probe::max_chunk_count(), 1);
     assert_eq!(after, unbounded);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_strategy::an_admitted_attention_budget_bounds_the_render");
 }
 
 /// A memory control this route has no mechanism for is refused, never accepted and ignored.
@@ -296,6 +304,7 @@ const BF16_BOUNDED_MEAN_ABS_LEVELS: f64 = 1.0;
 /// chunking the key axis instead of the query axis (either changes the attention, not its
 /// rounding).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_bf16_render_under_a_binding_attention_budget_stays_inside_the_declared_bound() {
     let generator = load(Precision::Bf16);
     let mut worst_max = 0u8;
@@ -344,4 +353,7 @@ fn a_bf16_render_under_a_binding_attention_budget_stays_inside_the_declared_boun
         worst_mean <= BF16_BOUNDED_MEAN_ABS_LEVELS,
         "mean pixel change {worst_mean:.4} exceeds the declared {BF16_BOUNDED_MEAN_ABS_LEVELS} levels"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_strategy::a_bf16_render_under_a_binding_attention_budget_stays_inside_the_declared_bound");
 }

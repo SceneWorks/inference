@@ -2008,6 +2008,7 @@ mod tests {
     /// decoded — the production `Generator::generate` closure discarded the sink entirely, so the
     /// decode phase was invisible on every shipped Mage-Flow member.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_generation_decode_phase_opens_once_before_any_sample() {
         let vae = tiny_vae();
         let cancel = CancelFlag::default();
@@ -2055,10 +2056,13 @@ mod tests {
             "expected exactly one event, got {events:?}"
         );
         assert!(matches!(events[0], Progress::Decoding));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED pipeline::tests::the_generation_decode_phase_opens_once_before_any_sample");
     }
 
     /// The edit route reaches decode through its own phase function (sc-22738).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_edit_decode_phase_opens_before_the_decode() {
         let vae = tiny_vae();
         let mut events = Vec::new();
@@ -2085,5 +2089,7 @@ mod tests {
             "expected exactly one event, got {events:?}"
         );
         assert!(matches!(events[0], Progress::Decoding));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED pipeline::tests::the_edit_decode_phase_opens_before_the_decode");
     }
 }

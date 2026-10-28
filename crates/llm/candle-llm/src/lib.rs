@@ -25,6 +25,22 @@
 //! Compute runs in `bf16` on the GPU backends (CUDA / Metal) and `f32` on CPU. Candle `Tensor`s are
 //! `Send`/`Sync`, so a loaded model is freely shareable across threads.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
+#[path = "../../../contracts/gen-core/src/model_input_macros.rs"]
+mod model_input_macros;
+
+#[cfg(feature = "model-inference-proof")]
+#[path = "../../../contracts/gen-core/src/model_input_proof.rs"]
+pub mod model_input_proof;
+
 pub mod backend;
 pub mod config;
 pub mod decode;

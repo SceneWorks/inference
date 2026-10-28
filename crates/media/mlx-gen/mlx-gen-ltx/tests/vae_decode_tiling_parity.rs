@@ -358,4 +358,6 @@ fn ltx_tiled_decode_tracks_single_pass() {
             "the LTX planner's temporal overlap is under the blend floor"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_tiling_parity::ltx_tiled_decode_tracks_single_pass");
 }

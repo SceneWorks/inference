@@ -297,4 +297,7 @@ fn measure_z_image_tier() {
         .save(&output_path)
         .expect("write probe image");
     eprintln!("ZIMAGE_OUT {}", output_path.display());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_vram_probe::measure_z_image_tier");
 }

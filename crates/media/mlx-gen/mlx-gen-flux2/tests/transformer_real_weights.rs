@@ -50,4 +50,8 @@ fn transformer_loads_and_forwards() {
         "flux2 transformer real-weights forward OK: shape {:?}, finite",
         out.shape()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED transformer_real_weights::transformer_loads_and_forwards"
+    );
 }

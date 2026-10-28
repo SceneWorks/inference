@@ -205,6 +205,8 @@ fn adapter_keys(path: &Path) -> Vec<String> {
 fn krea_lora_trains_and_is_well_formed() {
     if snapshot().is_none() {
         eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs:206 (krea_lora_trains_and_is_well_formed): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     }
     let tmp = artifact_root().join("krea_trainer_e2e_lora");
@@ -253,6 +255,9 @@ fn krea_lora_trains_and_is_well_formed() {
         std::fs::read(&out2.adapter_path).unwrap(),
     );
     assert_eq!(b1, b2, "same seed must produce a byte-identical adapter");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::krea_lora_trains_and_is_well_formed");
 }
 
 /// LoKr: trains + converges and writes a bare-keyed LoKr adapter with the LoKr metadata.
@@ -261,6 +266,8 @@ fn krea_lora_trains_and_is_well_formed() {
 fn krea_lokr_trains_and_is_well_formed() {
     if snapshot().is_none() {
         eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs:262 (krea_lokr_trains_and_is_well_formed): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     }
     let tmp = artifact_root().join("krea_trainer_e2e_lokr");
@@ -283,6 +290,9 @@ fn krea_lokr_trains_and_is_well_formed() {
         meta.get("baseModel").map(String::as_str),
         Some("krea_2_raw")
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::krea_lokr_trains_and_is_well_formed");
 }
 
 /// Gradient checkpointing: the memory-bounded backward converges + saves end-to-end on real weights.
@@ -291,6 +301,8 @@ fn krea_lokr_trains_and_is_well_formed() {
 fn krea_lora_gradient_checkpointing() {
     if snapshot().is_none() {
         eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs:292 (krea_lora_gradient_checkpointing): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     }
     let tmp = artifact_root().join("krea_trainer_e2e_ckpt");
@@ -309,6 +321,9 @@ fn krea_lora_gradient_checkpointing() {
             .count(),
         112
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::krea_lora_gradient_checkpointing");
 }
 
 /// sc-8650 regression: preview rendering at **production resolution** (1024², gradient-checkpoint, 28
@@ -322,6 +337,8 @@ fn krea_lora_gradient_checkpointing() {
 fn krea_preview_full_resolution_no_oom() {
     if snapshot().is_none() {
         eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs:323 (krea_preview_full_resolution_no_oom): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     }
     let tmp = artifact_root().join("krea_preview_1024");
@@ -368,6 +385,9 @@ fn krea_preview_full_resolution_no_oom() {
         samples, 2,
         "expected 2 full-resolution (1024²) previews without OOM (1 cadence × 2 prompts), got {samples}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::krea_preview_full_resolution_no_oom");
 }
 
 /// sc-8650: with a sample cadence set, the trainer renders preview images from the **in-progress
@@ -378,6 +398,8 @@ fn krea_preview_full_resolution_no_oom() {
 fn krea_trainer_emits_preview_samples() {
     if snapshot().is_none() {
         eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs:379 (krea_trainer_emits_preview_samples): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     }
     let tmp = artifact_root().join("krea_trainer_e2e_samples");
@@ -453,6 +475,9 @@ fn krea_trainer_emits_preview_samples() {
             img.width, img.height
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::krea_trainer_emits_preview_samples");
 }
 
 // ── sc-7837: the real Raw→Turbo round trip (train on Raw → apply at Turbo inference) ──────────────
@@ -585,6 +610,8 @@ fn mean_channel(px: &[u8], off: usize) -> f64 {
 fn krea_lora_roundtrip_raw_to_turbo() {
     let (Some(_raw), Some(turbo)) = (snapshot(), turbo_dir()) else {
         eprintln!("skipping: set KREA_RAW_DIR and KREA_TURBO_DIR");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs:588 (krea_lora_roundtrip_raw_to_turbo): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let tmp = artifact_root().join("krea_rt");
@@ -657,4 +684,7 @@ fn krea_lora_roundtrip_raw_to_turbo() {
         diff > base.pixels.len() / 100,
         "a trained adapter must change the render"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::krea_lora_roundtrip_raw_to_turbo");
 }

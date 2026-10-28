@@ -135,14 +135,19 @@ impl Block {
     /// `residual + γ · mlp(norm(dwconv(x)))` — timm's `ConvNeXtBlock` (`conv_mlp=False`), with the
     /// block input named once per reader.
     fn forward(&self, residual: &Tensor, x: &Tensor, eps: f64, compute: DType) -> Result<Tensor> {
-        let r = depthwise(x, &self.dw_w, 3, compute, false)?
-            .broadcast_add(&self.dw_b.reshape((1, self.dw_b.dim(0)?, 1, 1))?)?;
+        let r = __model_proof_output!(depthwise(x, &self.dw_w, 3, compute, false)?
+            .broadcast_add(&self.dw_b.reshape((1, self.dw_b.dim(0)?, 1, 1))?))?;
         // channels-last MLP (timm `conv_mlp=False`)
         let r = r.permute((0, 2, 3, 1))?;
         let r = layer_norm_c(&r, &self.ln_w, &self.ln_b, eps, 3)?;
-        let r = gelu(&linear(&r, &self.fc1_w, Some(&self.fc1_b), compute)?)?;
-        let r = linear(&r, &self.fc2_w, Some(&self.fc2_b), compute)?;
-        let r = r.broadcast_mul(&self.gamma)?.permute((0, 3, 1, 2))?;
+        let r = gelu(&__model_proof_output!(linear(
+            &r,
+            &self.fc1_w,
+            Some(&self.fc1_b),
+            compute
+        ))?)?;
+        let r = __model_proof_output!(linear(&r, &self.fc2_w, Some(&self.fc2_b), compute))?;
+        let r = __model_proof_output!(r.broadcast_mul(&self.gamma))?.permute((0, 3, 1, 2))?;
         Ok(residual.add(&r)?)
     }
 

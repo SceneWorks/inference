@@ -593,9 +593,9 @@ impl Projection {
     /// cuBLASLt W4A4 GEMM, recording which ran ([`nvfp4_path`](super::nvfp4_path), sc-24136).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Projection::Dense(l) => Ok(l.forward(x)?),
-            Projection::Quantized(q) => q.forward(x),
-            Projection::Prism(weight) => weight.forward(x),
+            Projection::Dense(l) => Ok(__model_proof_output!(l.forward(x))?),
+            Projection::Quantized(q) => __model_proof_output!(q.forward(x)),
+            Projection::Prism(weight) => __model_proof_output!(weight.forward(x)),
             Projection::Nvfp4(weight) => super::nvfp4_path::forward(weight, x),
         }
     }
@@ -844,9 +844,12 @@ mod tests {
     /// quantization error itself on uniform random operands).
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn nvfp4_forward_matches_the_dequantize_then_matmul_reference() {
         let Some((device, format)) = nvfp4_format() else {
             candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/primitives/projection.rs:850 (nvfp4_forward_matches_the_dequantize_then_matmul_reference): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let (n, k) = (96usize, 80usize); // K=80 pads to 96 at quantization
@@ -964,6 +967,9 @@ mod tests {
         let bytes = p.resident_bytes().unwrap();
         assert_eq!(bytes, (wq.packed.len() + wq.scales.len() + n * 2) as u64);
         assert!(bytes < (n * k * 2) as u64);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::projection::tests::nvfp4_forward_matches_the_dequantize_then_matmul_reference");
     }
 
     /// sc-24140: the llama-family loader's shape policy — under NVFP4, an eligible shape becomes

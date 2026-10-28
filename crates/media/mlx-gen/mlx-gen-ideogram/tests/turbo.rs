@@ -151,4 +151,6 @@ fn turbo_generates_single_dit_8step() {
         .save(&out_path)
         .unwrap();
     println!("wrote {}", out_path.display());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo::turbo_generates_single_dit_8step");
 }

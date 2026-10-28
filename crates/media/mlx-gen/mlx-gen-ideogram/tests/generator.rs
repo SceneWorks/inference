@@ -85,7 +85,10 @@ fn generates_via_registry() {
             Progress::Decoding => decoding_seen = true,
             // Sequential-only component-load signal (sc-11126); ideogram runs Resident here, so it
             // never fires — a no-op arm keeps the match exhaustive over the additive `Progress` variant.
-            Progress::Loading(_) => {}
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .expect("generate");
 
@@ -119,4 +122,6 @@ fn generates_via_registry() {
         "wrote {} — {steps} steps (max progress {max_step}), decoding={decoding_seen}",
         out_path.display()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generator::generates_via_registry");
 }

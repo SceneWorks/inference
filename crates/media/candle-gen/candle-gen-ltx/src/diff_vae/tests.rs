@@ -440,6 +440,7 @@ fn rotating_by_position_is_a_plain_rotation_at_the_axis_index() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_pixel_shuffle_places_each_sub_cell_where_the_reference_does() {
     // The upsample projects to `C_out * p1 * p2 * p3` and unshuffles. Upstream's ordering is
     // `(b, t, h, w, c, p1, p2, p3)` -> `(b, t, p1, h, p2, w, p3, c)`, i.e. the *slowest* varying
@@ -511,6 +512,9 @@ fn the_pixel_shuffle_places_each_sub_cell_where_the_reference_does() {
         &host[stride..2 * stride],
         "the origin chunk must drop frame 0, not frame 1"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::the_pixel_shuffle_places_each_sub_cell_where_the_reference_does");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -785,6 +789,7 @@ fn a_config_that_disagrees_with_the_weights_is_refused_at_load() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_decoder_returns_the_geometry_its_latent_asks_for() {
     let cfg = tiny_config();
     let decoder = tiny_decoder(&cfg);
@@ -809,6 +814,9 @@ fn the_decoder_returns_the_geometry_its_latent_asks_for() {
         values.iter().all(|v| v.is_finite()),
         "the decode produced non-finite pixels"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::the_decoder_returns_the_geometry_its_latent_asks_for");
 }
 
 #[test]
@@ -829,6 +837,7 @@ fn a_noise_canvas_of_the_wrong_shape_is_refused() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_single_covering_tile_reproduces_the_untiled_decode() {
     let cfg = tiny_config();
     let decoder = tiny_decoder(&cfg);
@@ -851,9 +860,13 @@ fn a_single_covering_tile_reproduces_the_untiled_decode() {
         err < 1e-5,
         "one covering tile must reproduce the untiled decode, max|delta| = {err:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_single_covering_tile_reproduces_the_untiled_decode");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_heavy_overlap_tiling_is_still_normalised_to_the_right_level() {
     // Ramps that meet multiply, so the blend is not a partition of unity and only the accumulated
     // weight profile makes it one. This is the regime that catches an unnormalised blend; a
@@ -893,6 +906,9 @@ fn a_heavy_overlap_tiling_is_still_normalised_to_the_right_level() {
         "the blend rescaled the picture by {:.4}x: mean|x| {a:.5} tiled vs {b:.5} untiled",
         a / b
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_heavy_overlap_tiling_is_still_normalised_to_the_right_level");
 }
 
 #[test]
@@ -928,6 +944,7 @@ fn a_tile_below_the_window_floor_is_refused() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_split_axis_whose_overlap_swallows_its_tile_is_refused_at_decode() {
     let cfg = tiny_config();
     let decoder = tiny_decoder(&cfg);
@@ -945,6 +962,9 @@ fn a_split_axis_whose_overlap_swallows_its_tile_is_refused_at_decode() {
         .expect_err("a split axis needs overlap < tile")
         .to_string();
     assert!(err.contains("smaller than the tile"), "{err}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_split_axis_whose_overlap_swallows_its_tile_is_refused_at_decode");
 }
 
 #[test]
@@ -1032,6 +1052,7 @@ fn the_euler_update_is_the_literal_arithmetic_of_each_objective() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_x0_schedule_returns_the_prediction_and_v_takes_a_final_euler_step() {
     // At `t_next = 0` the X0 Euler step collapses to `out` itself, so the terminal `match` is only
     // observable through the Velocity arm: `x_T - out * t_last`. With `N = 1` (`t_last = 1`) the
@@ -1080,9 +1101,13 @@ fn the_x0_schedule_returns_the_prediction_and_v_takes_a_final_euler_step() {
         max_abs_diff(&v_pixels, &x0_pixels) > 1e-3,
         "the two objectives decoded to the same picture"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::the_x0_schedule_returns_the_prediction_and_v_takes_a_final_euler_step");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_multi_step_velocity_schedule_takes_every_intermediate_euler_step() {
     // `N = 2` runs the in-loop Euler update once before the terminal one; `N = 1` runs none. A
     // decoder that ignored the loop would return the same picture for both.
@@ -1104,9 +1129,13 @@ fn a_multi_step_velocity_schedule_takes_every_intermediate_euler_step() {
         max_abs_diff(&a, &b) > 1e-3,
         "the second sampling step changed nothing"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_multi_step_velocity_schedule_takes_every_intermediate_euler_step");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_multiaxis_tiled_decode_crosses_real_boundaries_and_is_mutation_sensitive() {
     // This is deliberately an end-to-end CPU test, rather than an assertion on a `DiffVaeTiling`
     // value.  A test which only inspected the selected shape could pass if `decode_tiled` quietly
@@ -1151,9 +1180,13 @@ fn a_multiaxis_tiled_decode_crosses_real_boundaries_and_is_mutation_sensitive() 
         max_abs_diff(&altered_tiled, &tiled) > 1e-6,
         "the boundary-crossing tiled decode ignored a non-degenerate latent mutation"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::a_multiaxis_tiled_decode_crosses_real_boundaries_and_is_mutation_sensitive");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn budgeted_seeded_decode_preserves_the_seeded_canvas_and_reaches_the_selector() {
     // This is the executable counterpart to the provider-route guard: the ordinary provider uses
     // `decode_budgeted_seeded`, so it must draw the same full canvas as `decode_seeded` and then
@@ -1172,6 +1205,9 @@ fn budgeted_seeded_decode_preserves_the_seeded_canvas_and_reaches_the_selector()
         max_abs_diff(&seeded, &explicit) < 1e-5,
         "budgeted seeded decode changed its full noise canvas or bypassed the selector"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED diff_vae::tests::budgeted_seeded_decode_preserves_the_seeded_canvas_and_reaches_the_selector");
 }
 
 // ---------------------------------------------------------------------------------------------

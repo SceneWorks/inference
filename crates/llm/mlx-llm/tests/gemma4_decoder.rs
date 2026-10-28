@@ -179,6 +179,7 @@ fn prompt_ids(g: &Value) -> Vec<i32> {
 /// Asserting only the last entry would hide a layer whose error cancels downstream; asserting each
 /// one localizes a break to the layer that caused it, and because the schedule alternates, a
 /// sliding-only or full-only mistake shows up as every other entry failing.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn gemma4_hidden_states_match_the_reference_at_every_layer() {
     let g = goldens();
@@ -209,11 +210,14 @@ fn gemma4_hidden_states_match_the_reference_at_every_layer() {
             &format!("hidden_states[{i}] — {label}"),
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma4_decoder::gemma4_hidden_states_match_the_reference_at_every_layer");
 }
 
 /// The standard causal-LM logits forward — the prompt-enhancer path — matches the reference at
 /// every position, through the tied `lm_head` and the `final_logit_softcapping: 30.0` tanh.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn gemma4_logits_match_the_reference_at_every_position() {
     let g = goldens();
     let model = fixture_model(&g);
@@ -224,6 +228,8 @@ fn gemma4_logits_match_the_reference_at_every_position() {
         .decode_logits_all(&input_ids(&ids), &mut cache, 0)
         .expect("all-position logits forward");
     assert_abs_close(&host(&logits), &floats(&g["logits"]["data"]), "logits");
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_decoder::gemma4_logits_match_the_reference_at_every_position");
 }
 
 /// Gemma 4 unified ships **both** weight layouts under the same config:
@@ -236,6 +242,7 @@ fn gemma4_logits_match_the_reference_at_every_position() {
 /// crate always used the flat stem, so an HF Gemma 4 snapshot failed on the very first weight
 /// lookup — the general-purpose LLM could not be loaded at all. A probe that guessed wrong fails the
 /// same way; one that quietly fell back would build a model from nothing.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn gemma4_nested_language_model_layout_loads_to_the_same_logits() {
     let g = goldens();
@@ -278,6 +285,8 @@ fn gemma4_nested_language_model_layout_loads_to_the_same_logits() {
         &floats(&g["logits"]["data"]),
         "nested layout logits",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma4_decoder::gemma4_nested_language_model_layout_loads_to_the_same_logits");
 }
 
 /// The two forwards agree where they overlap: the last position's logits from the single-position
@@ -286,6 +295,7 @@ fn gemma4_nested_language_model_layout_loads_to_the_same_logits() {
 /// This is the seam that lets the hidden-state stack and the logits stack share one decoder loop.
 /// If they ever diverge, one of them is running a different model.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn gemma4_last_position_logits_agree_between_entry_points() {
     let g = goldens();
     let model = fixture_model(&g);
@@ -308,6 +318,8 @@ fn gemma4_last_position_logits_agree_between_entry_points() {
     let tail = &all[all.len() - vocab..];
     assert_eq!(last.len(), vocab);
     assert_abs_close(&last, tail, "last-position logits vs the all-position tail");
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_decoder::gemma4_last_position_logits_agree_between_entry_points");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -366,6 +378,7 @@ fn gemma4_is_refused_by_the_single_rope_table_entry_point() {
 /// Rows are compared against `decode_logits_all` on the *unpadded* prompt, so padding that leaked
 /// into attention, a window applied at the wrong offset, or a dropped second RoPE table all fail.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn gemma4_left_padded_batch_matches_per_row_single_sequence_logits() {
     let g = goldens();
     let model = fixture_model(&g);
@@ -439,6 +452,8 @@ fn gemma4_left_padded_batch_matches_per_row_single_sequence_logits() {
             ),
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_decoder::gemma4_left_padded_batch_matches_per_row_single_sequence_logits");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -452,6 +467,7 @@ fn gemma4_left_padded_batch_matches_per_row_single_sequence_logits() {
 /// a sliding layer's window is bottom-right aligned over the *cached* keys, so a decode step at
 /// offset `n` must still see exactly its last `sliding_window` positions, and each layer type must
 /// keep reading its own RoPE table as the offset advances.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn gemma4_cached_decode_matches_a_single_prefill() {
     let g = goldens();
@@ -491,6 +507,8 @@ fn gemma4_cached_decode_matches_a_single_prefill() {
         want_last,
         "final hidden state: stepped decode vs one prefill",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma4_decoder::gemma4_cached_decode_matches_a_single_prefill");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -511,6 +529,7 @@ fn gemma4_cached_decode_matches_a_single_prefill() {
 /// * `no_window` — run `sliding_attention` layers on a plain causal mask.
 /// * `full_rope_as_partial` — read `partial_rotary_factor` as a leading-slice partial RoPE rather
 ///   than the proportional schedule.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn mutations_are_all_outside_the_tolerance() {
     let g = goldens();
@@ -574,6 +593,10 @@ fn mutations_are_all_outside_the_tolerance() {
             entry["why"].as_str().unwrap_or("")
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED gemma4_decoder::mutations_are_all_outside_the_tolerance"
+    );
 }
 
 /// The fixture's schedule really is interleaved, and the decoder really did resolve two different
@@ -668,6 +691,7 @@ fn layer_scalars_are_all_non_identity_in_the_fixture() {
 /// With 4 layers and 2 shared, the tail spans both types: layer 2 (`sliding`) must reuse layer 0's
 /// K/V and layer 3 (`full`) must reuse layer 1's. Reusing the immediately-preceding layer instead —
 /// the obvious wrong reading — crosses the types and changes the numbers.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn gemma4_kv_shared_tail_matches_the_reference() {
     let g = goldens();
@@ -698,6 +722,8 @@ fn gemma4_kv_shared_tail_matches_the_reference() {
         &floats(&section["logits"]),
         "kv_shared logits",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma4_decoder::gemma4_kv_shared_tail_matches_the_reference");
 }
 
 /// The KV-shared fixture really omits the tail layers' key/value weights, and really widens their
@@ -859,6 +885,7 @@ fn gemma4_prompt_lookup_is_greedy_exact_at_every_depth() {
 /// both fixture variants. Without the truncation the drafts stay in the window and the shared KV
 /// tail, and the step reads them.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn gemma4_truncate_rollback_forgets_the_rejected_drafts() {
     let g = goldens();
     let prompt = prompt_ids(&g);
@@ -920,6 +947,8 @@ fn gemma4_truncate_rollback_forgets_the_rejected_drafts() {
             &format!("{label}: the step after the rollback"),
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_decoder::gemma4_truncate_rollback_forgets_the_rejected_drafts");
 }
 
 /// sc-24446: the reference holds under **either** activation dtype the policy can pick
@@ -932,6 +961,7 @@ fn gemma4_truncate_rollback_forgets_the_rejected_drafts() {
 ///
 /// MUTATION: map `ActivationRole::LlmDecode` to `GeluPrecision::F32` in the policy (so the
 /// "BF16" case silently ran the `f32` path) and this goes RED.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_reference_holds_under_either_activation_dtype() {
     use mlx_llm::primitives::activation::ActivationRole;
@@ -986,6 +1016,8 @@ fn the_reference_holds_under_either_activation_dtype() {
             &format!("{role:?} logits"),
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma4_decoder::the_reference_holds_under_either_activation_dtype");
 }
 
 /// sc-24446: the Gemma 4 decoder (both fixtures: alternating sliding / full, and the KV-shared

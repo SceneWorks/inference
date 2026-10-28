@@ -109,6 +109,7 @@ fn umt5_te_quant_parity_and_active_peak() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_TI2V_5B_MODEL_DIR to a converted TI2V-5B tier dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in umt5_te_quant_parity_and_active_peak; see preceding skip diagnostic");
             return;
         }
     };
@@ -170,4 +171,8 @@ fn umt5_te_quant_parity_and_active_peak() {
              the prompt embedding beyond the expected bound",
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED te_quant_parity::umt5_te_quant_parity_and_active_peak"
+    );
 }

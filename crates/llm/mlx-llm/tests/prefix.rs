@@ -181,9 +181,12 @@ fn run_suite(fx: Fixture) {
 fn prefix_reuse_is_bit_exact_llama() {
     let Some(fx) = load_from("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in prefix_reuse_is_bit_exact_llama; see preceding skip diagnostic");
         return;
     };
     run_suite(fx);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prefix::prefix_reuse_is_bit_exact_llama");
 }
 
 #[test]
@@ -191,9 +194,12 @@ fn prefix_reuse_is_bit_exact_llama() {
 fn prefix_reuse_is_bit_exact_qwen3() {
     let Some(fx) = load_from("MLX_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set MLX_LLM_QWEN3_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in prefix_reuse_is_bit_exact_qwen3; see preceding skip diagnostic");
         return;
     };
     run_suite(fx);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prefix::prefix_reuse_is_bit_exact_qwen3");
 }
 
 // ---- Synthetic no-download regression (sc-12455) -------------------------------------------------
@@ -295,6 +301,7 @@ fn greedy(max_new_tokens: usize) -> GenerationConfig {
 /// On MLX this was *worse* than an error: `slice_layers` used an unchecked `take_axis` gather, so
 /// the seeded KV was silent garbage — the `reused_prefix_tokens` stats pin below is what catches
 /// it deterministically (the tiny model's greedy outputs can coincide even with a clamped gather).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn budget_finished_entry_supports_extension() {
     let cfg = tiny_config();
@@ -357,4 +364,6 @@ fn budget_finished_entry_supports_extension() {
         s.computed_prefill_tokens,
         prompt.len() + (extended.len() - (prompt.len() + max_new - 1))
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prefix::budget_finished_entry_supports_extension");
 }

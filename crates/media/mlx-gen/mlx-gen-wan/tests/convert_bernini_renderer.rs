@@ -111,4 +111,8 @@ fn assemble_real_bernini_renderer() {
         pred.as_slice::<f32>().iter().all(|x| x.is_finite()),
         "forward output must be finite"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED convert_bernini_renderer::assemble_real_bernini_renderer"
+    );
 }

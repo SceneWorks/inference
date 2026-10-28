@@ -164,7 +164,7 @@ fn delta(a: &Image, b: &Image) -> (u8, f64) {
 // =================================================================================================
 
 #[test]
-#[ignore = "needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
 fn full_shared_ladder_reduces_peak_and_preserves_output() {
     // The contract this render admits must be the full ladder on a deferred load, and the resident
     // baseline must be the SAME provider — a rung is only meaningful against rung 0.
@@ -321,6 +321,9 @@ fn full_shared_ladder_reduces_peak_and_preserves_output() {
         gib(chunked.denoise),
         gib(full.denoise),
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::full_shared_ladder_reduces_peak_and_preserves_output");
 }
 
 // =================================================================================================
@@ -330,7 +333,7 @@ fn full_shared_ladder_reduces_peak_and_preserves_output() {
 /// One denoise, then every candidate decode of that one latent — so the sweep isolates the decode
 /// instead of comparing two independently sampled renders.
 #[test]
-#[ignore = "needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
 fn decode_tile_sweep_bounds_the_admitted_ladder() {
     use mlx_gen_anima::config::{Variant, VAE_CHANNELS, VAE_COMPRESSION};
 
@@ -495,6 +498,9 @@ fn decode_tile_sweep_bounds_the_admitted_ladder() {
             .map(|(tile, peak)| (*tile, format!("{:.3}", gib(*peak))))
             .collect::<Vec<_>>()
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::decode_tile_sweep_bounds_the_admitted_ladder");
 }
 
 // =================================================================================================
@@ -518,7 +524,7 @@ fn decode_tile_sweep_bounds_the_admitted_ladder() {
 /// phase holds — while the request column comes from the production envelope and exists only for
 /// the cadences a request may actually name.
 #[test]
-#[ignore = "needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
 fn transformer_window_sweep_shows_the_published_domain_is_exact() {
     use mlx_gen_anima::pipeline::{AnimaHeavy, AnimaText};
     use mlx_gen_anima::{config::Variant, DEFAULT_SAMPLER};
@@ -733,6 +739,9 @@ fn transformer_window_sweep_shows_the_published_domain_is_exact() {
             ))
             .collect::<Vec<_>>()
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::transformer_window_sweep_shows_the_published_domain_is_exact");
 }
 
 // =================================================================================================
@@ -848,7 +857,7 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
 /// calibration: the per-tier envelopes and Verified signoff belong to SC-15492 / SC-15493 / SC-15494,
 /// each of which must supply its own evidence. Nothing here promotes a sibling.
 #[test]
-#[ignore = "needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
 fn every_catalog_entry_executes_the_full_ladder_on_its_own_checkpoint() {
     let registry = mlx_gen_anima::provider_registry().expect("anima registry");
     let edge = size();
@@ -936,6 +945,9 @@ fn every_catalog_entry_executes_the_full_ladder_on_its_own_checkpoint() {
              like this rather than error"
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::every_catalog_entry_executes_the_full_ladder_on_its_own_checkpoint");
 }
 
 // =================================================================================================
@@ -947,7 +959,7 @@ fn every_catalog_entry_executes_the_full_ladder_on_its_own_checkpoint() {
 /// change that makes the phase split real, and it is also the one that could silently reorder or
 /// alias a batch. Two images, compared per index against the unbounded warm render.
 #[test]
-#[ignore = "needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
 fn batch_count_survives_the_denoise_decode_phase_split() {
     let render = |shape: LoadShape, memory: GenerationMemory| {
         let generator = mlx_gen_anima::provider_registry()
@@ -1003,6 +1015,9 @@ fn batch_count_survives_the_denoise_decode_phase_split() {
         gib(warm_peak),
         gib(bounded_peak)
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::batch_count_survives_the_denoise_decode_phase_split");
 }
 
 // =================================================================================================
@@ -1028,7 +1043,7 @@ fn batch_count_survives_the_denoise_decode_phase_split() {
 /// flag exactly between the denoise and the first decode. A timer would make the test's own
 /// coverage depend on machine speed.
 #[test]
-#[ignore = "needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs the licensed circlestone-labs/Anima snapshot and Apple/Metal"]
 fn the_decode_phase_is_cancellable_and_the_calibration_fault_hook_is_honored() {
     use mlx_gen::gen_core::MemoryPhase;
 
@@ -1129,4 +1144,7 @@ fn the_decode_phase_is_cancellable_and_the_calibration_fault_hook_is_honored() {
     println!(
         "RESULT status=pass check=terminal provider={PROVIDER} recovery_output_mean={mean:.3}"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::the_decode_phase_is_cancellable_and_the_calibration_fault_hook_is_honored");
 }

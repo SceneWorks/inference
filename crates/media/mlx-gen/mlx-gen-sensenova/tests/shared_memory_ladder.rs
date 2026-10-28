@@ -44,6 +44,7 @@ fn index_rows(w: &Weights) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     (row(0), row(1), row(2))
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cached_attention_and_one_block_gen_windows_match_resident() {
     let weights = Weights::from_file(FIXTURE).unwrap();
@@ -101,8 +102,11 @@ fn cached_attention_and_one_block_gen_windows_match_resident() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f32, f32::max);
     assert!(max < 1e-5, "streamed Gen path drifted by {max}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder::cached_attention_and_one_block_gen_windows_match_resident");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn canceled_windowed_forward_returns_typed_cancellation() {
     let weights = Weights::from_file(FIXTURE).unwrap();
@@ -135,4 +139,6 @@ fn canceled_windowed_forward_returns_typed_cancellation() {
         )
         .unwrap_err();
     assert!(matches!(error, mlx_gen::Error::Canceled));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder::canceled_windowed_forward_returns_typed_cancellation");
 }

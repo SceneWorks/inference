@@ -1057,7 +1057,13 @@ pub fn provider_contract_for(
 }
 
 fn component_quantization(root: &Path, component: &str) -> gen_core::Result<Option<(u8, usize)>> {
-    let bytes = std::fs::read(root.join(component).join("config.json")).map_err(|error| {
+    let bytes = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(root.join(component).join("config.json")),
+"crates/media/candle-gen/candle-gen-kolors/src/memory_strategy.rs::component_quantization::std::fs::read@43178",
+ArtifactInput,
+root.join(component).join("config.json"),
+|__model_input_path| std::fs::read(__model_input_path)
+).map_err(|error| {
         gen_core::Error::Msg(format!("kolors: read physical {component} tier: {error}"))
     })?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
@@ -2301,6 +2307,7 @@ mod tests {
 
     fn context(provider: &str, strategy: MemoryStrategy) -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             selection: MemorySelection {
                 strategy,
                 parameters: Default::default(),

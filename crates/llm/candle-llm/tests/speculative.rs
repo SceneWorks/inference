@@ -17,6 +17,15 @@
 //!   greedy run *tracks* (rather than bit-matches) non-speculative, diverging only where that rounding
 //!   flips a near-tie. The acceptance itself is exact w.r.t. the verify forward (proven in core-llm).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
@@ -215,6 +224,7 @@ fn build_tiny(vocab: usize, tag: &str) -> CausalLm {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn num_draft_zero_is_bit_identical_to_nonspec_cpu() {
     let model = build_tiny_llama();
     let no_draft = Spec {
@@ -246,9 +256,13 @@ fn num_draft_zero_is_bit_identical_to_nonspec_cpu() {
         // single-token verify forward ⇒ exactly `base.len()` target forwards.
         assert_eq!(stats.forwards, base.len());
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED num_draft_zero_is_bit_identical_to_nonspec_cpu");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn drafts_track_and_accept_on_cpu() {
     let model = build_tiny_llama();
     let spec = Spec::default();
@@ -282,9 +296,13 @@ fn drafts_track_and_accept_on_cpu() {
         stats.forwards,
         out.tokens.len()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED drafts_track_and_accept_on_cpu");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn stochastic_is_deterministic_for_fixed_seed_cpu() {
     let model = build_tiny_llama();
     let spec = Spec::default();
@@ -324,11 +342,15 @@ fn stochastic_is_deterministic_for_fixed_seed_cpu() {
         "stochastic speculative must be deterministic for a fixed seed"
     );
     assert!(!a.tokens.is_empty());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stochastic_is_deterministic_for_fixed_seed_cpu");
 }
 
 // ---- Draft-model speculation (synthetic CPU) -----------------------------------------------------
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn draft_num_draft_zero_identical_to_target_cpu() {
     let model = build_tiny_llama();
     let no_draft = Spec {
@@ -355,9 +377,13 @@ fn draft_num_draft_zero_identical_to_target_cpu() {
     assert_eq!(stats.proposed, 0);
     assert_eq!(stats.accepted, 0);
     assert_eq!(stats.forwards, base.len());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED draft_num_draft_zero_identical_to_target_cpu");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn draft_equals_target_accepts_everything_cpu() {
     // Using the target as its own draft: every proposed token is the target's argmax, so on CPU
     // (deterministic, order-stable) every draft is accepted — the maximal speedup, identical output.
@@ -391,6 +417,9 @@ fn draft_equals_target_accepts_everything_cpu() {
         stats.forwards,
         out.tokens.len()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED draft_equals_target_accepts_everything_cpu");
 }
 
 #[test]
@@ -411,6 +440,7 @@ fn draft_spec_rejects_vocab_mismatch_cpu() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn draft_spec_stochastic_deterministic_cpu() {
     let model = build_tiny_llama();
     let spec = Spec::default();
@@ -452,6 +482,9 @@ fn draft_spec_stochastic_deterministic_cpu() {
         "stochastic draft-spec must be deterministic for a fixed seed"
     );
     assert!(!a.tokens.is_empty());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED draft_spec_stochastic_deterministic_cpu");
 }
 
 // ---- Real-weights variants (#[ignore]) -----------------------------------------------------------
@@ -575,9 +608,14 @@ fn run_suite(fx: Fixture) {
 fn prompt_lookup_llama() {
     let Some(fx) = load_from("CANDLE_LLM_TEST_MODEL") else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/speculative.rs:578 (prompt_lookup_llama): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     run_suite(fx);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED prompt_lookup_llama");
 }
 
 #[test]
@@ -585,9 +623,14 @@ fn prompt_lookup_llama() {
 fn prompt_lookup_qwen3() {
     let Some(fx) = load_from("CANDLE_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set CANDLE_LLM_QWEN3_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/speculative.rs:588 (prompt_lookup_qwen3): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     run_suite(fx);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED prompt_lookup_qwen3");
 }
 
 // ---- Draft-model speculation (real weights, #[ignore]) -------------------------------------------
@@ -725,9 +768,14 @@ fn run_draft_suite(target: CausalLm, draft: CausalLm, tok: Tokenizer) {
 fn draft_speculative_llama() {
     let Some((target, draft, tok)) = load_draft_target("CANDLE_LLM_TEST_MODEL") else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/speculative.rs:728 (draft_speculative_llama): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     run_draft_suite(target, draft, tok);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED draft_speculative_llama");
 }
 
 #[test]
@@ -735,9 +783,14 @@ fn draft_speculative_llama() {
 fn draft_speculative_qwen3() {
     let Some((target, draft, tok)) = load_draft_target("CANDLE_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set CANDLE_LLM_QWEN3_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/speculative.rs:738 (draft_speculative_qwen3): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     run_draft_suite(target, draft, tok);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED draft_speculative_qwen3");
 }
 
 /// Two models with different vocabularies (SmolLM2 vs Qwen3) must be rejected as a draft/target pair.

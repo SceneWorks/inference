@@ -73,6 +73,7 @@ fn forward(w: &Weights, cfg: &NeoChatConfig, bits: Option<i32>) -> Array {
         .unwrap()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn quantized_forward_stays_close_to_dense() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
@@ -106,4 +107,6 @@ fn quantized_forward_stays_close_to_dense() {
     // Quantize is deterministic (byte-stable packing) → identical forward across two runs.
     let q8b = forward(&w, &cfg, Some(8));
     assert_eq!(flat(&q8), flat(&q8b), "Q8 quantize is not deterministic");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_smoke::quantized_forward_stays_close_to_dense");
 }

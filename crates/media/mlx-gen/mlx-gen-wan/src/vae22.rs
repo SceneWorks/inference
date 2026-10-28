@@ -1576,6 +1576,7 @@ mod tests {
     /// middle, every tile's tail the same way, and every tile's pool, also value-neutral.
     /// Sized: dec_dim 8, latent [48,2,8,8] → a few MiB.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn single_pass_and_tiled_decodes_release_every_block() {
         let vae = synthetic_decoder(8, Dtype::Float32);
         let latent = mlx_rs::random::normal::<f32>(&[48, 2, 8, 8], None, None, None).unwrap();
@@ -1634,6 +1635,8 @@ mod tests {
         .unwrap();
         eval(&kept).unwrap();
         assert_eq!(tiled.as_slice::<f32>(), kept.as_slice::<f32>());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae22::tests::single_pass_and_tiled_decodes_release_every_block");
     }
 
     const CACHE_CHILD: &str = "WAN22_DECODE_CACHE_CHILD";
@@ -1645,6 +1648,7 @@ mod tests {
     /// Sized: dec_dim 16 f32 weights (< 2 MiB), latent [48,2,8,8], a 16 MiB seeded scratch;
     /// total well under 128 MiB.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn single_pass_decode_leaves_mlx_cache_empty() {
         if std::env::var_os(CACHE_CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1691,6 +1695,8 @@ mod tests {
             released < MIB && released * 16 < kept,
             "a single-pass decode must leave the cache empty: {released} B (kept pool {kept} B)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae22::tests::single_pass_decode_leaves_mlx_cache_empty");
     }
 
     /// Measurement harness (sc-20686), not a gate: the production-width z48 decoder (dec_dim 256,
@@ -1718,6 +1724,8 @@ mod tests {
             live as f64 / voxels,
             footprint as f64 / voxels
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae22::tests::decode_footprint_harness");
     }
 
     fn harness_latent() -> [i32; 3] {
@@ -1764,6 +1772,7 @@ mod tests {
     /// sc-20686: the chunked encode releases at every encoder block boundary (mid-block too) and
     /// per chunk, plus once with the normalized latent. Sized: width 8, clip [1,5,64,64,3].
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn encode_releases_every_block_of_every_chunk() {
         let vae = synthetic_with_encoder();
         let (_, encoder) = vae.encoder.as_ref().unwrap();
@@ -1780,6 +1789,8 @@ mod tests {
         let latent = vae.encode(&clip).unwrap();
         assert_eq!(latent.shape(), &[1, 2, 4, 4, 48]);
         assert_eq!(block_releases() - before, 2 * per_chunk + 1);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae22::tests::encode_releases_every_block_of_every_chunk");
     }
 
     const ENCODE_CACHE_CHILD: &str = "WAN22_ENCODE_CACHE_CHILD";
@@ -1787,6 +1798,7 @@ mod tests {
     /// sc-20686: right after an encode MLX's allocator cache is empty. Isolated child (MLX's
     /// counters are process-wide). Sized: width 8 f32, clip [1,5,64,64,3], 16 MiB seeded scratch.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn encode_leaves_mlx_cache_empty() {
         if std::env::var_os(ENCODE_CACHE_CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1824,5 +1836,7 @@ mod tests {
             left < 64 * 1024,
             "an encode must leave the cache empty: {left} B"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae22::tests::encode_leaves_mlx_cache_empty");
     }
 }

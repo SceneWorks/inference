@@ -14,6 +14,10 @@
 //! of MLX. The FFI entry point returns a report string so the app can display it and an XCTest
 //! can assert on it.
 
+// Keep the complete capture/selection JSON schema; its serde_json expansion exceeds the
+// default macro recursion depth. This is a compile-time macro limit, not a runtime memory cap.
+#![recursion_limit = "256"]
+
 use std::ffi::{c_char, CString};
 use std::path::Path;
 use std::time::Instant;
@@ -26,6 +30,11 @@ use runtime_ios::core_llm::{LoadSpec, Message, Sampling, TextLlmRequest};
 pub mod campaign;
 #[cfg(feature = "media")]
 mod campaign_media;
+
+// Test-only selected-stream evidence; normal app/library builds expose no hook or API.
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../../crates/media/mlx-gen/mlx-gen-iris/tests/common/metal_guard.rs"]
+pub mod model_inference_device;
 
 /// Weights-free, catalog-derived campaign listing for host tooling and the device bridge.
 #[cfg(feature = "media")]
@@ -178,10 +187,9 @@ fn peak_rss_mib() -> f64 {
 
 /// The per-app memory the OS will still let this process allocate, in MiB — or `None` off iOS.
 ///
-/// Every memory conclusion on this branch has been measured against an *assumed* cap: "~6 GB on a
-/// 12 GB device, ~4 GB on 8 GB". Those are folklore. `os_proc_available_memory` is the number iOS
-/// actually enforces, read from the process it applies to, and it is the only way to know whether a
-/// measured peak has headroom or is one allocation from a jetsam kill.
+/// The configured ceiling records the entitled iPhone17,2 / 23G90 process-limit observation.
+/// `os_proc_available_memory` still supplies the live remaining capacity of THIS process; the
+/// recorded ceiling does not replace this check or establish a safe render working set.
 ///
 /// It reports memory *remaining*, not the total limit, so it must be sampled at a known point —
 /// here, at the start of the report, before anything large is resident. Sampling it again after a
@@ -263,6 +271,39 @@ fn bound_mlx_to_the_jetsam_limit() -> String {
             },
             avail = l.os_available_mib,
         ),
+    }
+}
+
+/// The source-derived host upper of THIS lane's progress callback (`on_progress` below): one
+/// formatted stage String per event, at most the longest `Progress` rendering (`Step` with two
+/// `u32::MAX` values; `Decoding`; `Loading(TextEncoder|Renderer)`), replacing the previous stage
+/// (no drop credit taken). Under the labelled toolchain assumption that a `format!` String grown
+/// to `n` bytes allocates at most `4·n + 8` cumulative bytes. No listener; no preview sink.
+#[cfg(feature = "media")]
+fn sampler_progress_callback_host() -> runtime_ios::media::IosCallbackHost {
+    let longest = [
+        format!("Step {}/{}", u32::MAX, u32::MAX).len(),
+        format!("{:?}", runtime_ios::gen_core::Progress::Decoding).len(),
+        format!(
+            "{:?}",
+            runtime_ios::gen_core::Progress::Loading(runtime_ios::gen_core::LoadPhase::TextEncoder)
+        )
+        .len(),
+        format!(
+            "{:?}",
+            runtime_ios::gen_core::Progress::Loading(runtime_ios::gen_core::LoadPhase::Renderer)
+        )
+        .len(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0) as u64;
+    runtime_ios::media::IosCallbackHost::Bounded {
+        fixed_bytes: 0,
+        per_progress_event_bytes: longest * 4 + 8,
+        per_preview_event_bytes: 0,
+        per_quantum_mark_bytes: 0,
+        per_quantum_label_byte_bytes: 0,
     }
 }
 
@@ -418,8 +459,8 @@ fn check_memory_headroom() -> Check {
             detail: format!(
                 "os_proc_available_memory = {mib:.0} MiB available at start of run \
                  ({:.2} GiB), increased-memory-limit entitlement = {entitlement}; runtime-ios \
-                 IOS_APP_MEMORY_CAP_MIB = {cap} (PROVISIONAL, unmeasured) -- the OS number is \
-                 launch headroom only, NOT a validated safe rendering ceiling",
+                 IOS_APP_MEMORY_CAP_MIB = {cap} (observed entitled iPhone17,2 / 23G90 process limit) -- \
+                 the current OS number is remaining headroom, NOT a validated safe render budget",
                 mib / 1024.0
             ),
         },
@@ -429,7 +470,7 @@ fn check_memory_headroom() -> Check {
             detail: format!(
                 "not applicable on this platform (no per-app cap); increased-memory-limit \
                  entitlement = {entitlement}; runtime-ios IOS_APP_MEMORY_CAP_MIB = {cap} \
-                 (PROVISIONAL, unmeasured)"
+                 (observed entitled iPhone17,2 / 23G90 process limit; not a safe render budget)"
             ),
         },
     }
@@ -543,9 +584,32 @@ fn check_generation(model_dir: Option<&Path>) -> Check {
             ..Default::default()
         };
         let bench_started = Instant::now();
-        let bench_out = llm
-            .complete(&bench)
-            .map_err(|e| format!("throughput run failed: {e}"))?;
+        let bench_out = {
+            #[cfg(all(test, target_os = "macos"))]
+            {
+                if std::env::var_os("MODEL_INFERENCE_CASE_FQN").is_some() {
+                    let mut recorded_device = false;
+                    // complete() is generate(request, noop). Observe the SAME request's first
+                    // actual token while generate's execution scope is still active, not the
+                    // restored caller default after complete() returns. No extra inference/eval.
+                    llm.generate(&bench, &mut |event| {
+                        if !recorded_device
+                            && matches!(event, runtime_ios::core_llm::StreamEvent::Token { .. })
+                        {
+                            model_inference_device::record_model_inference_device();
+                            recorded_device = true;
+                        }
+                    })
+                } else {
+                    llm.complete(&bench)
+                }
+            }
+            #[cfg(not(all(test, target_os = "macos")))]
+            {
+                llm.complete(&bench)
+            }
+        }
+        .map_err(|e| format!("throughput run failed: {e}"))?;
         let bench_secs = bench_started.elapsed().as_secs_f64();
         let bench_tokens = bench_out.usage.generated_tokens;
 
@@ -1084,6 +1148,32 @@ fn append_breadcrumb(name: &str, line: &str) {
     }
 }
 
+#[cfg(feature = "media")]
+const SIMULATOR_SANA_TILE_EDGE: u32 = 192;
+
+#[cfg(feature = "media")]
+fn finish_image_generation(
+    name: &'static str,
+    simulator_functional: bool,
+    completed: usize,
+    expected: usize,
+    details: Vec<String>,
+) -> Check {
+    let passed = !simulator_functional || completed == expected;
+    Check {
+        name,
+        passed,
+        detail: if passed {
+            details.join(" | ")
+        } else {
+            format!(
+                "simulator functional image incomplete ({completed}/{expected} completed): {}",
+                details.join(" | ")
+            )
+        },
+    }
+}
+
 /// **E5: SANA image generation on device.** The deciding measurement for S5.2.
 ///
 /// The host harness (`mlx-gen-ios-catalog`'s `image_budget`) puts the sequential peak at 3294-4773
@@ -1099,10 +1189,12 @@ fn append_breadcrumb(name: &str, line: &str) {
 #[cfg(feature = "media")]
 fn check_image_generation(media_dir: Option<&Path>) -> Check {
     const NAME: &str = "SANA image generation (E5)";
+    let simulator_functional = cfg!(all(feature = "simulator-functional", target_abi = "sim"))
+        && std::env::var("IOS_SIMULATOR_SANA").as_deref() == Ok("1");
     let Some(dir) = media_dir else {
         return Check {
             name: NAME,
-            passed: true,
+            passed: !simulator_functional,
             detail: "skipped -- no SANA snapshot in Documents/ (see docs/ios-epics.md E5)"
                 .to_string(),
         };
@@ -1214,14 +1306,23 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         return Check { name: NAME, passed: false,
             detail: "SANA capture requires a real device and explicit IOS_SMOKE_UNADMITTED=1; no weights loaded".into() };
     }
-    let diagnostic = capture || std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some();
+    let diagnostic =
+        capture || simulator_functional || std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some();
     const CAPTURE: &[(&str, u32, Option<u32>, bool)] = &[(
         "256 tile128 UNADMITTED evidence capture",
         256,
         Some(128),
         false,
     )];
-    let configs: &[(&str, u32, Option<u32>, bool)] = if capture {
+    const SIMULATOR: &[(&str, u32, Option<u32>, bool)] = &[(
+        "256 tile192 SIMULATOR FUNCTIONAL ONLY",
+        256,
+        Some(SIMULATOR_SANA_TILE_EDGE),
+        false,
+    )];
+    let configs: &[(&str, u32, Option<u32>, bool)] = if simulator_functional {
+        SIMULATOR
+    } else if capture {
         CAPTURE
     } else if diagnostic {
         DIAGNOSTIC
@@ -1237,6 +1338,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     }
 
     let mut details: Vec<String> = Vec::new();
+    let mut completed = 0;
     for &(label, edge, tile, stage_eval) in configs {
         // The env var is now used for ONE thing: forcing whole-image.
         //
@@ -1263,8 +1365,9 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         }
 
         // E4: admission BEFORE any weight load, against runtime-ios's single cap constant and the
-        // headroom left in this process now. A refused configuration is the designed outcome, not
-        // a failure: it is recorded and the next one runs. The load itself goes through
+        // headroom left in this process now. A refused device configuration is recorded and the
+        // next one runs; the simulator's single functional configuration must complete. The load
+        // itself goes through
         // `runtime_ios::media::load_sana`, which re-admits, so admission is bound to the load
         // rather than only reported beside it. The diagnostic lane (`IOS_SMOKE_IMAGE_ONLY`)
         // deliberately bypasses admission — its whole purpose is to run configurations admission
@@ -1296,7 +1399,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             if payload_mib > u64::from(runtime_ios::IOS_APP_MEMORY_CAP_MIB)
                 || payload_mib as f64 > headroom
             {
-                return Check { name: NAME, passed: false, detail: format!("capture payload exceeds provisional cap/live headroom; refused before load: {}", details.join(" | ")) };
+                return Check { name: NAME, passed: false, detail: format!("capture payload exceeds observed process ceiling/live headroom; refused before load: {}", details.join(" | ")) };
             }
         }
         // One candidate per configuration, built from the provider's own contract: a tiled config is
@@ -1355,23 +1458,30 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 continue;
             }
         };
-        // Admitted lane: the evidence facade. Diagnostic lanes: the labelled bounded capture permit
-        // (every quantum checks live headroom before construction), never an unadmitted load.
+        // Admitted lane: the evidence facade. Device diagnostics use bounded capture quanta;
+        // the simulator-only functional route relies on its external process supervisor.
         let admission = if diagnostic {
+            #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+            if simulator_functional {
+                runtime_ios::media::simulator_functional_permit(&candidate).map(|_| ())
+            } else {
+                runtime_ios::media::capture_permit(&candidate).map(|_| ())
+            }
+            #[cfg(not(all(feature = "simulator-functional", target_abi = "sim")))]
             runtime_ios::media::capture_permit(&candidate).map(|_| ())
         } else {
             runtime_ios::media::load_sana(std::slice::from_ref(&candidate)).map(|_| ())
         };
         if let Err(refusal) = &admission {
-            let line = format!(
-                "{label}: refused before load (cap {} MiB, PROVISIONAL; {}): {refusal}",
-                runtime_ios::IOS_APP_MEMORY_CAP_MIB,
-                if diagnostic {
-                    "bounded capture"
-                } else {
-                    "admitted"
-                }
-            );
+            let line = if simulator_functional {
+                format!("{label}: simulator functional permit refused before load: {refusal}")
+            } else {
+                format!(
+                    "{label}: refused before load (observed entitled process ceiling {} MiB; {}): {refusal}",
+                    runtime_ios::IOS_APP_MEMORY_CAP_MIB,
+                    if diagnostic { "bounded capture" } else { "admitted" }
+                )
+            };
             append_breadcrumb("sana-progress.txt", &line);
             details.push(line);
             continue;
@@ -1394,7 +1504,22 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             debug_assert_eq!(candidate.spec.offload_policy, OffloadPolicy::Sequential);
             // Through the REGISTRY via the bundle's facades, not a direct loader: this is the path a
             // product takes. The returned generator is bound to this exact request.
-            let generator: Box<dyn runtime_ios::gen_core::Generator> = if diagnostic {
+            let generator: Box<dyn runtime_ios::gen_core::Generator> = if simulator_functional {
+                #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+                {
+                    let (registry, permit) = runtime_ios::media::simulator_functional_permit(
+                        &candidate,
+                    )
+                    .map_err(|e| format!("{label}: simulator functional permit refused: {e}"))?;
+                    Box::new(
+                        permit
+                            .load_generator(&registry, |_| Ok(()))
+                            .map_err(|e| format!("{label}: simulator load failed: {e}"))?,
+                    )
+                }
+                #[cfg(not(all(feature = "simulator-functional", target_abi = "sim")))]
+                return Err("simulator functional route is unavailable on this target".into());
+            } else if diagnostic {
                 let (registry, permit) = runtime_ios::media::capture_permit(&candidate)
                     .map_err(|e| format!("{label}: capture refused: {e}"))?;
                 Box::new(
@@ -1404,9 +1529,12 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 )
             } else {
                 Box::new(
-                    runtime_ios::media::load_sana(std::slice::from_ref(&candidate))
-                        .map_err(|e| format!("{label}: load failed: {e}"))?
-                        .1,
+                    runtime_ios::media::load_sana_with(
+                        std::slice::from_ref(&candidate),
+                        sampler_progress_callback_host(),
+                    )
+                    .map_err(|e| format!("{label}: load failed: {e}"))?
+                    .1,
                 )
             };
             // Tiling asked for through the CONTRACT (the candidate wrote the provider's ladder
@@ -1465,18 +1593,26 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 
             // Save it. The checks above prove the decode produced *content* (a wide pixel range);
             // only the image proves it produced the *right* content, and it is the artifact worth
-            // having — a render made on a phone. Written into Documents so `devicectl copy from`
-            // can pull it, named per configuration so neither overwrites the other. Best-effort:
-            // failing to encode a PNG must not fail the generation check.
+            // having — a render made on the selected target. Written into Documents for the
+            // device or simulator collector, named per configuration. The device PNG remains
+            // best-effort; the simulator functional witness requires it.
             if let Some(docs) = dirs_documents() {
                 let name = format!("sana-{}.png", label.replace(' ', "-"));
                 match image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()) {
                     Some(buf) => match buf.save(docs.join(&name)) {
                         Ok(()) => append_breadcrumb(RENDERS_MANIFEST, &name),
+                        Err(e) if simulator_functional => {
+                            return Err(format!("simulator PNG write failed: {e}"))
+                        }
                         Err(e) => eprintln!("could not write {name}: {e}"),
                     },
+                    None if simulator_functional => {
+                        return Err("simulator RGB buffer shape mismatch".into())
+                    }
                     None => eprintln!("{name}: pixel buffer does not match {edge}x{edge}"),
                 }
+            } else if simulator_functional {
+                return Err("simulator Documents directory is unavailable for PNG evidence".into());
             }
 
             let secs = started.elapsed().as_secs_f64();
@@ -1494,7 +1630,13 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             // whether the configuration is comfortable or one step from a kill, and unlike a
             // percentage-of-assumed-cap it comes from the OS.
             let headroom = available_memory_mib()
-                .map(|m| format!(", {m:.0} MiB still available"))
+                .map(|m| {
+                    if simulator_functional {
+                        format!(", simulator-reported {m:.0} MiB available")
+                    } else {
+                        format!(", {m:.0} MiB still available")
+                    }
+                })
                 .unwrap_or_default();
             Ok(format!(
                 "{label}: {secs:.1}s, MLX peak {mlx_peak:.0} MiB, process RSS peak {:.0} MiB{headroom}, \
@@ -1516,6 +1658,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 // configuration after this one" rather than as a mystery.
                 append_breadcrumb("sana-progress.txt", &detail);
                 details.push(detail);
+                completed += 1;
             }
             Err(e) => {
                 std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
@@ -1530,15 +1673,17 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     }
     std::env::remove_var("MLX_GEN_SANA_DECODE_TILE");
 
-    Check {
-        name: NAME,
-        passed: true,
-        detail: details.join(" | "),
-    }
+    finish_image_generation(
+        NAME,
+        simulator_functional,
+        completed,
+        configs.len(),
+        details,
+    )
 }
 
 /// The Z-Image Turbo lane (`--zimage`, sc-26433): one bounded device CAPTURE of a Z-Image campaign
-/// case — `IOS_SMOKE_ZIMAGE_CASE`, default `z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit` — through
+/// case — `IOS_SMOKE_ZIMAGE_CASE`, default `z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit/1` — through
 /// the same capture path every catalog model runs (`campaign_media::report` → `capture_permit`, every
 /// quantum checked against live headroom before its graph is built). A quantum refusal is evidence
 /// (the size does not fit) and passes; only a failure fails. The snapshot is the campaign slot
@@ -1548,7 +1693,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 fn check_zimage_generation() -> Check {
     const NAME: &str = "Z-Image Turbo bounded capture";
     let case = std::env::var("IOS_SMOKE_ZIMAGE_CASE").unwrap_or_else(|_| {
-        "z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit".into()
+        "z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit/1".into()
     });
     // Capture runs only on a real device, against a provisioned slot; anywhere else the lane skips,
     // as every snapshot-backed lane does.
@@ -1587,9 +1732,34 @@ fn check_zimage_generation() -> Check {
 
 /// Run every check and render a human- and test-readable report.
 ///
-/// The first line is `SMOKE: PASS` or `SMOKE: FAIL` so an XCTest can assert on a prefix without
-/// parsing the body.
+/// The first line is `SMOKE: PASS` or `SMOKE: FAIL` for normal runs; the simulator-only
+/// runtime boundary returns `SMOKE: UNSUPPORTED_RUNTIME` with no model execution.
 pub fn run_report() -> String {
+    #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+    if std::env::var("IOS_SIMULATOR_SANA").as_deref() != Ok("1") {
+        return "SMOKE: FAIL\n  [XX] simulator supervisor missing; no model loaded\n".into();
+    }
+    #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+    if std::env::var("IOS_SIMULATOR_SANA").as_deref() == Ok("1") {
+        let nonce = std::env::var("IOS_SIMULATOR_SANA_NONCE").unwrap_or_default();
+        let source = std::env::var("IOS_CAMPAIGN_BUILD_SHA").unwrap_or_default();
+        if nonce.len() != 32
+            || !nonce.bytes().all(|b| b.is_ascii_hexdigit())
+            || source.len() != 40
+            || !source.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return "SMOKE: FAIL\n  [XX] simulator nonce/source identity missing\n".into();
+        }
+        let compiled_source = option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or_default();
+        if compiled_source != source {
+            return "SMOKE: FAIL\n  [XX] simulator compiled source identity mismatch\n".into();
+        }
+        // MLX's Metal backend requires a GPU family the iOS Simulator does not expose. The
+        // pinned backend segfaults while asking MTLSimDevice for its architecture at its first
+        // allocator call. Report that runtime boundary before ANY MLX memory/device/loader call;
+        // a packaged and launched simulator app is not an image or phone-fit witness.
+        return format!("SMOKE: UNSUPPORTED_RUNTIME\nSIMULATOR_NONCE {nonce}\nSOURCE_SHA {compiled_source}\nUNSUPPORTED_RUNTIME mlx-metal-ios-simulator\nMODEL_EXECUTION false\nMODEL_ACCEPTANCE false\nIMAGE_ACCEPTANCE false\nPHONE_FIT_ACCEPTANCE false\n");
+    }
     #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
     if let Some(docs) = dirs_documents() {
         let _ = std::fs::remove_file(docs.join(RENDERS_MANIFEST));
@@ -1745,6 +1915,36 @@ pub unsafe extern "C" fn ios_smoke_free(ptr: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    /// CI_IMPACT: pure completion and provider-edge assertions; no model or Metal execution.
+    #[cfg(feature = "media")]
+    #[test]
+    fn simulator_image_requires_a_completed_served_decode() {
+        assert!(mlx_gen_sana::memory_strategy::DECODE_TILE_EDGES
+            .contains(&super::SIMULATOR_SANA_TILE_EDGE));
+        assert!(
+            mlx_gen_sana::memory_strategy::DECODE_TILE_EDGES_REJECTED.contains(&128),
+            "the failed simulator attempt selected this unserved tile"
+        );
+        let refused = super::finish_image_generation(
+            "SANA image generation (E5)",
+            true,
+            0,
+            1,
+            vec!["no candidate: selection is not executable".into()],
+        );
+        assert!(!refused.passed);
+        assert!(refused.detail.contains("0/1 completed"));
+        assert!(refused.detail.contains("no candidate"));
+        let rendered = super::finish_image_generation(
+            "SANA image generation (E5)",
+            true,
+            1,
+            1,
+            vec!["rendered".into()],
+        );
+        assert!(rendered.passed);
+    }
+
     #[test]
     fn campaign_public_entrypoint_rejects_bad_case_before_legacy_kernels() {
         let old_case = std::env::var_os("IOS_CAMPAIGN_CASE");
@@ -1799,6 +1999,7 @@ mod tests {
     /// The same checks must pass on the host, so a failure on device is attributable to the iOS
     /// build rather than to a bug in the checks themselves.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn smoke_passes_on_the_host() {
         let report = super::run_report();
         // Printed, not just asserted. Most of these checks report measurements (throughput, peak
@@ -1807,5 +2008,11 @@ mod tests {
         // are read against. Visible under `--nocapture`.
         println!("{report}");
         assert!(report.starts_with("SMOKE: PASS"), "{report}");
+        // Only the actual successful model-completion detail contains this throughput field.
+        if report.lines().any(|line| {
+            line.starts_with("  [ok] runtime-ios generation -- ") && line.contains(" tok/s")
+        }) {
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED tests::smoke_passes_on_the_host");
+        }
     }
 }

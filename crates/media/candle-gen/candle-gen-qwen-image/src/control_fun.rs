@@ -619,6 +619,7 @@ mod tests {
     /// the loader uses, asserting the packed path fires (`is_packed()`), that a dense sibling (no
     /// `.scales`) stays dense, and that the packed forward reproduces the affine grid bit-exactly.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_detect_fires_on_2512fun_control_layout() -> Result<()> {
         use crate::quant::QLinear;
         use candle_gen::candle_core::safetensors::MmapedSafetensors;
@@ -755,6 +756,8 @@ mod tests {
             "packed control_img_in vs affine grid cosine {cos:.6}"
         );
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control_fun::tests::packed_detect_fires_on_2512fun_control_layout");
         Ok(())
     }
 

@@ -108,7 +108,13 @@ impl Tier {
 /// dense one is exactly the mislabelling `mlx_gen::quant::write_quantized_config` documents.
 pub fn packed_bits(component_dir: &Path) -> Result<Option<i64>> {
     let config = component_dir.join("config.json");
-    let bytes = match std::fs::read(&config) {
+    let bytes = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&config),
+"crates/media/candle-gen/candle-gen-qwen-image-2-1/src/quant.rs::packed_bits::std::fs::read@4836",
+ArtifactInput,
+&config,
+|__model_input_path| std::fs::read(__model_input_path)
+) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {

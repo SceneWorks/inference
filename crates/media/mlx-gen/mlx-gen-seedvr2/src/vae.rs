@@ -574,10 +574,12 @@ mod stage_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn decoder_stage_localize() {
         let dir = gdir();
         if !dir.join("vae_io_f32.safetensors").exists() {
             eprintln!("SKIP: no goldens");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in decoder_stage_localize; see preceding skip diagnostic");
             return;
         }
         let w = Weights::from_file(dir.join("vae_f32.safetensors")).unwrap();
@@ -610,5 +612,7 @@ mod stage_tests {
         cmp("d_silu", &s, io.require("d_silu").unwrap());
         let o = dec.conv_out.forward(&s).unwrap();
         cmp("d_convout", &o, io.require("d_convout").unwrap());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::stage_tests::decoder_stage_localize");
     }
 }

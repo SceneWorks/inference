@@ -55,7 +55,8 @@ fn max_abs(a: &Array, b: &Array) -> f32 {
 }
 
 #[test]
-#[ignore = "needs the SDXL base snapshot + h94/IP-Adapter weights"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the SDXL base snapshot + h94/IP-Adapter weights"]
 fn ip_decoupled_attn_remap_and_scale_zero() {
     let mut unet = load_unet_dtype(&sdxl_snapshot(), Dtype::Float16).unwrap();
     let pairs = load_ip_kv_pairs(&ip_weights()).unwrap();
@@ -71,14 +72,23 @@ fn ip_decoupled_attn_remap_and_scale_zero() {
     let ip_tokens = randn(&[2, 16, 2048], 4);
     let t = 500.0;
 
-    let eps_plain = unet
-        .forward(&latents, t, &cond, &pooled, &time_ids)
+    let eps_plain = (
+        crate::common::record_model_inference_device(),
+        unet.forward(&latents, t, &cond, &pooled, &time_ids),
+    )
+        .1
         .unwrap();
-    let eps_ip0 = unet
-        .forward_with_ip(&latents, t, &cond, &pooled, &time_ids, (&ip_tokens, 0.0))
+    let eps_ip0 = (
+        crate::common::record_model_inference_device(),
+        unet.forward_with_ip(&latents, t, &cond, &pooled, &time_ids, (&ip_tokens, 0.0)),
+    )
+        .1
         .unwrap();
-    let eps_ip = unet
-        .forward_with_ip(&latents, t, &cond, &pooled, &time_ids, (&ip_tokens, 0.6))
+    let eps_ip = (
+        crate::common::record_model_inference_device(),
+        unet.forward_with_ip(&latents, t, &cond, &pooled, &time_ids, (&ip_tokens, 0.6)),
+    )
+        .1
         .unwrap();
 
     let d0 = max_abs(&eps_plain, &eps_ip0);
@@ -90,6 +100,8 @@ fn ip_decoupled_attn_remap_and_scale_zero() {
         di > 1e-3,
         "scale>0 must change the prediction (IP branch wired)"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_adapter_decoupled::ip_decoupled_attn_remap_and_scale_zero");
 }
 
 fn h94_snapshot() -> PathBuf {
@@ -123,7 +135,8 @@ fn gradient(w: u32, h: u32) -> Image {
 /// txt2img byte-for-byte (the IP branch is zeroed and draws no RNG), while `scale > 0` changes the
 /// image. Proves load → token pipeline → denoise_ip → CFG zeros-uncond → scale knob.
 #[test]
-#[ignore = "needs the SDXL base snapshot + h94/IP-Adapter weights"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the SDXL base snapshot + h94/IP-Adapter weights"]
 fn ip_generate_scale_zero_equals_txt2img() {
     let model = mlx_gen_sdxl::load(
         &LoadSpec::new(WeightsSource::Dir(sdxl_snapshot()))
@@ -150,7 +163,13 @@ fn ip_generate_scale_zero_equals_txt2img() {
             ..Default::default()
         }
     };
-    let run = |r: &GenerationRequest| match model.generate(r, &mut |_| {}).unwrap() {
+    let run = |r: &GenerationRequest| match (
+        crate::common::record_model_inference_device(),
+        model.generate(r, &mut |_| {}),
+    )
+        .1
+        .unwrap()
+    {
         GenerationOutput::Images(mut v) => v.remove(0),
         _ => unreachable!(),
     };
@@ -175,4 +194,6 @@ fn ip_generate_scale_zero_equals_txt2img() {
     println!("[ip-adapter] txt2img vs IP(scale=0.6): {diffi} px bytes differ");
     assert_eq!(diff0, 0, "IP scale=0 must equal plain txt2img");
     assert!(diffi > 0, "IP scale=0.6 must change the image");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_adapter_decoupled::ip_generate_scale_zero_equals_txt2img");
 }

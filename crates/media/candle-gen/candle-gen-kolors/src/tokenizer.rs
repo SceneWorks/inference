@@ -61,8 +61,14 @@ impl KolorsTokenizer {
                 PREFIX.len()
             )));
         }
-        let mut inner = Tokenizer::from_file(tokenizer_json.as_ref())
-            .map_err(|e| CandleError::Msg(format!("kolors: load tokenizer.json: {e}")))?;
+        let mut inner = candle_gen::gen_core::__model_input_reader!(
+Tokenizer::from_file(tokenizer_json.as_ref()),
+"crates/media/candle-gen/candle-gen-kolors/src/tokenizer.rs::from_file::Tokenizer::from_file@2953",
+Tokenizer,
+tokenizer_json.as_ref(),
+|__model_input_path| Tokenizer::from_file(__model_input_path)
+)
+        .map_err(|e| CandleError::Msg(format!("kolors: load tokenizer.json: {e}")))?;
         // This wrapper owns the (left-)padding and truncation; disable the tokenizer's own so `encode`
         // returns the raw SP content ids.
         inner.with_padding(None);

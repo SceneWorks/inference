@@ -470,8 +470,10 @@ fn close(a: f64, b: f64, rel: f64) -> bool {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn host_paths_match_the_base_revision_anchor() {
     if !in_cpu_child("host_paths_match_the_base_revision_anchor") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::host_paths_match_the_base_revision_anchor");
         return;
     }
     let paths = host_paths();
@@ -503,6 +505,9 @@ fn host_paths_match_the_base_revision_anchor() {
             );
         }
     }
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::host_paths_match_the_base_revision_anchor"
+    );
 }
 
 // ---- Guard behaviour -----------------------------------------------------------------------------
@@ -549,14 +554,18 @@ fn assert_checked_before_synchronized(events: &[QuantumEvent]) {
         match e {
             QuantumEvent::Checked { label, .. } => pending.push(label.clone()),
             QuantumEvent::Synchronized { label, .. } => {
-                let want = if label == "tiled conv core" {
-                    crate::quantum::VAE_TILE
-                } else {
-                    label.as_str()
-                };
+                // A tile's core synchronizes as "tiled conv core": it answers its side's tile check.
+                let core = label == "tiled conv core";
                 let at = pending
                     .iter()
-                    .rposition(|l| l == want)
+                    .rposition(|l| {
+                        if core {
+                            l == crate::quantum::VAE_DECODE_TILE
+                                || l == crate::quantum::VAE_ENCODE_TILE
+                        } else {
+                            l == label
+                        }
+                    })
                     .unwrap_or_else(|| panic!("{label} synchronized without a check: {events:?}"));
                 pending.remove(at);
             }
@@ -611,8 +620,10 @@ fn bits(a: &Array) -> Vec<u32> {
 /// fits one chunk, so no path here changes its arithmetic (the chunked iOS attention is held to its
 /// tolerance separately, [`chunked_vae_attention_matches_the_unchunked_attention`]).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn guarded_paths_check_every_quantum_and_stay_byte_identical() {
     if !in_cpu_child("guarded_paths_check_every_quantum_and_stay_byte_identical") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::guarded_paths_check_every_quantum_and_stay_byte_identical");
         return;
     }
     let host = host_paths();
@@ -643,14 +654,16 @@ fn guarded_paths_check_every_quantum_and_stay_byte_identical() {
         crate::quantum::CONTROL_CONTEXT,
         crate::quantum::VAE_DECODE_IN,
         crate::quantum::VAE_ENCODE_IN,
-        crate::quantum::VAE_RESNET,
-        crate::quantum::VAE_ATTENTION,
+        crate::quantum::VAE_DECODE_RESNET,
+        crate::quantum::VAE_ENCODE_RESNET,
+        crate::quantum::VAE_DECODE_ATTENTION,
+        crate::quantum::VAE_ENCODE_ATTENTION,
         crate::quantum::VAE_UPSAMPLE,
         crate::quantum::VAE_DOWNSAMPLE,
         crate::quantum::VAE_DECODE_OUT,
         crate::quantum::VAE_ENCODE_OUT,
-        crate::quantum::VAE_TILE,
-        crate::quantum::VAE_TILED_STAGE,
+        crate::quantum::VAE_DECODE_TILE,
+        crate::quantum::VAE_DECODE_TILED_STAGE,
         crate::quantum::INIT_IMAGE,
         mlx_gen::sampler::SAMPLER_STEP_QUANTUM,
     ] {
@@ -664,6 +677,7 @@ fn guarded_paths_check_every_quantum_and_stay_byte_identical() {
     let count = |label: &str| checks(&events).iter().filter(|(l, _)| l == label).count();
     // The tiny DiT runs 1 noise refiner + 2 main blocks per forward, and 1 context block.
     assert!(count(crate::quantum::DIT_BLOCK) >= 3 * count(crate::quantum::DIT_CONTEXT_BLOCK));
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::guarded_paths_check_every_quantum_and_stay_byte_identical");
 }
 
 /// The iOS VAE attention's query-chunked plan against the unchunked attention: a different graph
@@ -671,8 +685,10 @@ fn guarded_paths_check_every_quantum_and_stay_byte_identical() {
 /// standard — 1e-5 of `max(1, peak)`, SANA's tiled-encode standard — rather than bit for bit. A
 /// chunk that drops or repeats rows, or misses keys, moves the output by O(1e-1).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn chunked_vae_attention_matches_the_unchunked_attention() {
     if !in_cpu_child("chunked_vae_attention_matches_the_unchunked_attention") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::chunked_vae_attention_matches_the_unchunked_attention");
         return;
     }
     let (c, side) = (64, 8);
@@ -714,6 +730,7 @@ fn chunked_vae_attention_matches_the_unchunked_attention() {
         &chunked,
         &whole,
     );
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::chunked_vae_attention_matches_the_unchunked_attention");
 }
 
 /// For every quantum label the host paths check, a run whose FIRST check of that label sees live
@@ -721,8 +738,10 @@ fn chunked_vae_attention_matches_the_unchunked_attention() {
 /// quantum before it is constructed: the run fails, the typed refusal names it and its price, and no
 /// later quantum is checked or synchronized — the checks before it are exactly the ample run's.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn each_quantum_refuses_before_construction_when_headroom_is_short() {
     if !in_cpu_child("each_quantum_refuses_before_construction_when_headroom_is_short") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::each_quantum_refuses_before_construction_when_headroom_is_short");
         return;
     }
     let (_, events) = observed(AMPLE, || Ok(host_paths()));
@@ -751,6 +770,7 @@ fn each_quantum_refuses_before_construction_when_headroom_is_short() {
     }
     eprintln!("refused each of: {seen:?}");
     assert!(seen.len() >= 24, "{seen:?}");
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::each_quantum_refuses_before_construction_when_headroom_is_short");
 }
 
 /// A genuine tiny safetensors file holding `tensors` (`(name, dtype, shape, bytes)`); payload zeros.
@@ -799,8 +819,10 @@ fn assert_refused_at<T>(
 /// are different graphs). Off device `Vae::encode` stays the whole-image encode; a smaller image
 /// takes it on device too. A tile short of headroom refuses before its graph.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
     if !in_cpu_child("bounded_encode_matches_the_whole_image_encode_and_checks_every_tile") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::bounded_encode_matches_the_whole_image_encode_and_checks_every_tile");
         return;
     }
     let vae = vae();
@@ -818,7 +840,7 @@ fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
     let stages: Vec<usize> = all
         .iter()
         .enumerate()
-        .filter(|(_, (l, _))| l == crate::quantum::VAE_TILED_STAGE)
+        .filter(|(_, (l, _))| l == crate::quantum::VAE_ENCODE_TILED_STAGE)
         .map(|(i, _)| i)
         .collect();
     assert_eq!(
@@ -831,7 +853,7 @@ fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
         assert!(
             all[at + 1..end]
                 .iter()
-                .filter(|(l, _)| l == crate::quantum::VAE_TILE)
+                .filter(|(l, _)| l == crate::quantum::VAE_ENCODE_TILE)
                 .count()
                 > 1,
             "stage {n} checks each of its tiles: {all:?}"
@@ -867,7 +889,7 @@ fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
     let (routed, events) = observed(AMPLE, || vae.encode(&big));
     assert!(checks(&events)
         .iter()
-        .any(|(l, _)| l == crate::quantum::VAE_TILED_STAGE));
+        .any(|(l, _)| l == crate::quantum::VAE_ENCODE_TILED_STAGE));
     // A different graph from the unguarded bounded encode: on device the 17,424-token mid
     // attention runs query-chunked.
     assert_cross_graph_parity(
@@ -879,12 +901,15 @@ fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
     let (_, events) = observed(AMPLE, || vae.encode(&image));
     assert!(!checks(&events)
         .iter()
-        .any(|(l, _)| l == crate::quantum::VAE_TILED_STAGE));
+        .any(|(l, _)| l == crate::quantum::VAE_ENCODE_TILED_STAGE));
     // A tile short of headroom refuses before its graph: nothing after it is checked.
-    let events = assert_refused_at(crate::quantum::VAE_TILE, all[stages[0] + 1].1, || {
-        vae.encode_tiled(&image, 16, None)
-    });
+    let events = assert_refused_at(
+        crate::quantum::VAE_ENCODE_TILE,
+        all[stages[0] + 1].1,
+        || vae.encode_tiled(&image, 16, None),
+    );
     assert_eq!(checks(&events), all[..=stages[0]].to_vec());
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::bounded_encode_matches_the_whole_image_encode_and_checks_every_tile");
 }
 
 /// The pre-load floors: each is checked against the header bytes of exactly what its load reads
@@ -1056,9 +1081,79 @@ fn pipeline_quanta_refuse_before_construction() {
 /// Streamed (rung-4) blocks and layers are priced with what they read inside their quantum: a
 /// windowed forward's block checks carry the stored bytes of exactly the tensors each block reads
 /// on top of the resident price.
+fn expected_streamed_read_capacity(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    prefix: &str,
+) -> u64 {
+    headers
+        .iter()
+        .filter(|h| h.name.starts_with(prefix))
+        .map(|h| mlx_gen::ios_quantum::allocated_bytes(h.data_bytes))
+        .sum()
+}
+
+/// Read costs are per-tensor allocator capacities, not aggregate raw bytes. Distinguish dtypes
+/// and a page crossing independently so using either raw data or one rounded sum cannot pass.
 #[test]
+fn streamed_read_capacity_distinguishes_dtype_and_each_page_boundary() {
+    let page = mlx_gen::ios_quantum::PAGE_BYTES;
+    let allocated = mlx_gen::ios_quantum::allocated_bytes;
+    let elements = page / 2 + 1;
+    use mlx_gen::gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader as Header};
+    let headers = [
+        Header {
+            name: "block.bf16".into(),
+            dtype: Stored::BF16,
+            shape: vec![elements as usize],
+            data_bytes: elements * 2,
+        },
+        Header {
+            name: "block.f32".into(),
+            dtype: Stored::F32,
+            shape: vec![elements as usize],
+            data_bytes: elements * 4,
+        },
+        Header {
+            name: "other".into(),
+            dtype: Stored::U8,
+            shape: vec![1],
+            data_bytes: 1,
+        },
+    ];
+    assert_eq!(
+        expected_streamed_read_capacity(&headers, "block.bf16"),
+        page * 2
+    );
+    assert_eq!(
+        expected_streamed_read_capacity(&headers, "block.f32"),
+        page * 3
+    );
+    assert_eq!(
+        expected_streamed_read_capacity(&headers, "block."),
+        page * 5
+    );
+    assert_eq!(allocated(elements * 2), page * 2, "BF16 crosses one page");
+    assert_eq!(allocated(elements * 4), page * 3, "F32 crosses two pages");
+    let requests = [page + 2, page + 4];
+    let individual: u64 = requests.into_iter().map(allocated).sum();
+    assert_eq!(individual, page * 4);
+    assert_ne!(
+        individual,
+        requests.into_iter().sum::<u64>(),
+        "not raw header sum"
+    );
+    assert_ne!(
+        individual,
+        allocated(requests.into_iter().sum()),
+        "not one rounded sum"
+    );
+}
+
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn streamed_quanta_are_priced_with_the_bytes_they_read() {
     if !in_cpu_child("streamed_quanta_are_priced_with_the_bytes_they_read") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::streamed_quanta_are_priced_with_the_bytes_they_read");
         return;
     }
     let model = dit();
@@ -1090,11 +1185,7 @@ fn streamed_quanta_are_priced_with_the_bytes_they_read() {
         mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(fixture("denoise_loop"))
             .unwrap();
     for (i, n) in [(1usize, 0), (2, 1)] {
-        let read: u64 = headers
-            .iter()
-            .filter(|h| h.name.starts_with(&format!("w.layers.{n}.")))
-            .map(|h| h.data_bytes)
-            .sum();
+        let read: u64 = expected_streamed_read_capacity(&headers, &format!("w.layers.{n}."));
         assert!(read > 0);
         assert_eq!(wn[i], r[i] + read, "main block {n}");
     }
@@ -1140,14 +1231,11 @@ fn streamed_quanta_are_priced_with_the_bytes_they_read() {
         .collect();
     assert_eq!(resident_layers.len(), 3);
     for (i, (streamed, resident)) in layers.iter().zip(&resident_layers).enumerate() {
-        let read: u64 = headers
-            .iter()
-            .filter(|h| h.name.starts_with(&format!("model.layers.{i}.")))
-            .map(|h| h.data_bytes)
-            .sum();
+        let read: u64 = expected_streamed_read_capacity(&headers, &format!("model.layers.{i}."));
         assert!(read > 0);
         assert_eq!(*streamed, resident + read, "layer {i}");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::streamed_quanta_are_priced_with_the_bytes_they_read");
 }
 
 /// The ControlNet route's main blocks are priced with the hint they add inside their quantum (the
@@ -1155,8 +1243,10 @@ fn streamed_quanta_are_priced_with_the_bytes_they_read() {
 /// the bytes they read: the control forward's block checks exceed the base forward's by exactly the
 /// hint at every injection place and by nothing elsewhere.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn control_quanta_are_priced_with_their_hints_and_reads() {
     if !in_cpu_child("control_quanta_are_priced_with_their_hints_and_reads") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::control_quanta_are_priced_with_their_hints_and_reads");
         return;
     }
     let (control, w) = control_dit();
@@ -1226,12 +1316,10 @@ fn control_quanta_are_priced_with_their_hints_and_reads() {
     ))
     .unwrap();
     for i in 0..15 {
-        let read: u64 = headers
-            .iter()
-            .filter(|h| h.name.starts_with(&format!("w.control_layers.{i}.")))
-            .map(|h| h.data_bytes)
-            .sum();
+        let read: u64 =
+            expected_streamed_read_capacity(&headers, &format!("w.control_layers.{i}."));
         // The refiner's 2 blocks run first (resident in both); then the 15 main control blocks.
         assert_eq!(s[2 + i], r[2 + i] + read, "control block {i}");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::control_quanta_are_priced_with_their_hints_and_reads");
 }

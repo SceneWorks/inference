@@ -263,7 +263,7 @@ fn checkpoint_split_is_118_adapter_567_dit_all_variants() {
 }
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot"]
 fn conditioner_output_is_b_512_1024() {
     let split = split_files().expect("Anima snapshot");
     let w = Weights::from_file(dit_file(&split, Variant::Base)).unwrap();
@@ -282,10 +282,13 @@ fn conditioner_output_is_b_512_1024() {
         &[1, 512, 1024],
         "conditioner must emit exactly 512 text tokens"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::conditioner_output_is_b_512_1024");
 }
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot"]
 fn dit_forward_17ch_patch_and_5d_latent_roundtrip() {
     let split = split_files().expect("Anima snapshot");
     let w = Weights::from_file(dit_file(&split, Variant::Base)).unwrap();
@@ -302,6 +305,9 @@ fn dit_forward_17ch_patch_and_5d_latent_roundtrip() {
         .unwrap();
     // velocity must have the same 5-D latent shape (proves patchify(17ch) + unpatchify roundtrip).
     assert_eq!(v.shape(), &[1, 16, 1, 64, 64]);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::dit_forward_17ch_patch_and_5d_latent_roundtrip");
 }
 
 #[test]
@@ -323,7 +329,7 @@ fn dit_rejects_out_of_range_size_per_axis() {
 }
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot"]
 fn vae_decode_shape() {
     let split = split_files().expect("Anima snapshot");
     let vae = mlx_gen_anima::load_vae(split.join("vae/qwen_image_vae.safetensors")).unwrap();
@@ -331,6 +337,9 @@ fn vae_decode_shape() {
     let latent = mlx_rs::random::normal::<f32>(&[1, 16, 1, 128, 128], None, None, None).unwrap();
     let img = vae.decode(&latent).unwrap();
     assert_eq!(img.shape(), &[1, 3, 1, 1024, 1024]);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::vae_decode_shape");
 }
 
 // NOTE: the flow-velocity convention (the DiT is a standard flow denoiser, `v ≈ ε − x0`) and the raw-σ
@@ -347,7 +356,7 @@ fn vae_decode_shape() {
 // -------------------------------------------------------------------------------------------------
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (real 2B DiT denoise)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; SLOW (real 2B DiT denoise)"]
 fn generate_all_three_variants_1024() {
     let split = split_files().expect("Anima snapshot");
     let out = out_dir();
@@ -411,6 +420,9 @@ fn generate_all_three_variants_1024() {
 
         mlx_rs::memory::clear_cache();
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::generate_all_three_variants_1024");
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -452,7 +464,7 @@ fn assemble_tier_dir(split: &std::path::Path, variant: Variant, bits: i32) -> Pa
 }
 
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (packs + real 2B DiT denoise)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; SLOW (packs + real 2B DiT denoise)"]
 fn generate_quant_tiers_all_variants_q8_q4() {
     let split = split_files().expect("Anima snapshot");
     let out = out_dir();
@@ -509,6 +521,11 @@ fn generate_quant_tiers_all_variants_q8_q4() {
         let _ = std::fs::remove_dir_all(&tier);
         mlx_rs::memory::clear_cache();
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::generate_quant_tiers_all_variants_q8_q4"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -531,7 +548,7 @@ fn generate_quant_tiers_all_variants_q8_q4() {
 /// assertion FAILS. Uses a fixed random Qwen source (no text encoder needed) so it isolates the
 /// conditioner. `2.0` is a power of two ⇒ the bf16 product is exact, so equality is checked exactly.
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot"]
 fn prompt_weighting_scales_only_weighted_t5_rows() {
     let split = split_files().expect("Anima snapshot");
     let w = Weights::from_file(dit_file(&split, Variant::Base)).unwrap();
@@ -607,6 +624,9 @@ fn prompt_weighting_scales_only_weighted_t5_rows() {
         "unweighted / pad rows must be bit-identical — a nonzero delta means the weight leaked off \
          the T5 output path (wrong place / wrong tower)"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::prompt_weighting_scales_only_weighted_t5_rows");
 }
 
 /// **BOTH DIRECTIONS + IMAGE** through the full pipeline: (1) T5-side `(chibi:2.0)` changes the
@@ -614,7 +634,7 @@ fn prompt_weighting_scales_only_weighted_t5_rows() {
 /// de-weighted prompt, so it contributes 0 — the whole change is the T5 path); and the weighting
 /// visibly changes a generated image. Turbo (CFG-free, 10 steps) keeps it cheap.
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (real 2B DiT denoise)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; SLOW (real 2B DiT denoise)"]
 fn prompt_weighting_both_directions_and_image() {
     let split = split_files().expect("Anima snapshot");
     let out = out_dir();
@@ -747,4 +767,9 @@ fn prompt_weighting_both_directions_and_image() {
     );
 
     mlx_rs::memory::clear_cache();
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::prompt_weighting_both_directions_and_image"
+    );
 }

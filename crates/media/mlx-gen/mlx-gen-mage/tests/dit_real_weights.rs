@@ -169,6 +169,8 @@ fn one_block_matches_the_torch_golden() {
             "block {name} max_abs {abs} exceeds one bf16 ULP ({ulp}) at its {peak} peak"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_real_weights::one_block_matches_the_torch_golden");
 }
 
 /// The pre-block half — `img_in`, `txt_norm → txt_in`, and the timestep conditioning — against the
@@ -213,6 +215,8 @@ fn stack_front_end_matches_the_reference_block_inputs() {
              mean_rel {mean} (gate {FRONT_END_MEAN_REL})"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_real_weights::stack_front_end_matches_the_reference_block_inputs");
 }
 
 /// The full 12-block stack, from raw latents + raw conditioning + sigma, with msrope built by this
@@ -230,6 +234,8 @@ fn full_twelve_block_stack_matches_the_torch_golden() {
         mean < STACK_MEAN_REL,
         "stack mean_rel {mean} exceeds {STACK_MEAN_REL}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_real_weights::full_twelve_block_stack_matches_the_torch_golden");
 }
 
 /// Evidence that the stack residual is **bf16 rounding, not an algorithmic gap**.
@@ -296,6 +302,8 @@ fn the_stack_residual_is_bf16_rounding_not_an_algorithmic_gap() {
         "bf16-vs-f32 self spread ({self_mean}) is far smaller than the golden gap ({bf16_mean}); \
          that would mean the residual is systematic, not rounding"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_real_weights::the_stack_residual_is_bf16_rounding_not_an_algorithmic_gap");
 }
 
 /// The timestep frequency table's **deliberate bf16 rounding** (`mage_layers.py:32-46`) is
@@ -334,6 +342,8 @@ fn an_f32_timestep_frequency_table_moves_further_from_the_reference() {
         "the bf16-rounded frequency table must be the closer one (bf16 {rounded_mean}, \
          f32 {exact_mean}) — the model was trained with the rounding"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_real_weights::an_f32_timestep_frequency_table_moves_further_from_the_reference");
 }
 
 /// **Where this gate's discrimination ends — measured, not assumed.**
@@ -393,6 +403,8 @@ fn the_real_weights_gate_cannot_separate_these_two_mistakes_and_says_so() {
              the module docs, which currently state this gate cannot see it."
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_real_weights::the_real_weights_gate_cannot_separate_these_two_mistakes_and_says_so");
 }
 
 /// **The fused-CFG msrope frame shift, measured properly** — the number that settles whether
@@ -486,6 +498,8 @@ fn the_fused_cfg_frame_shift_is_precision_scale_not_semantic() {
          spread ({spread_guided}) on the guided velocity — it has become semantic, and every doc \
          in this crate saying otherwise needs revisiting"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_real_weights::the_fused_cfg_frame_shift_is_precision_scale_not_semantic");
 }
 
 // ---------------------------------------------------------------------------------------------

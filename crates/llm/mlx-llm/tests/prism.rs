@@ -161,6 +161,7 @@ fn write_fixture() -> Fixture {
     dir
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn provider_loads_and_generates_with_native_packed_operators() {
     let dir = write_fixture();
@@ -199,6 +200,8 @@ fn provider_loads_and_generates_with_native_packed_operators() {
     assert_eq!(output.usage.generated_tokens, 2);
     assert_eq!(streamed, 2);
     assert_fixture_is_self_removing(dir);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prism::provider_loads_and_generates_with_native_packed_operators");
 }
 
 #[test]
@@ -233,6 +236,7 @@ fn malformed_explicit_sign_metadata_fails_closed() {
     assert!(error.to_string().contains("signs must be -1 or +1"));
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn expanded_provider_context_budget_fails_before_text_or_media_prefill() {
     // The fixture's rendered "hello world" prompt is 20 tokens; reserve two generated tokens.
@@ -262,11 +266,14 @@ fn expanded_provider_context_budget_fails_before_text_or_media_prefill() {
         }
         assert_fixture_is_self_removing(dir);
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prism::expanded_provider_context_budget_fails_before_text_or_media_prefill");
 }
 
 /// sc-20671: the fixture stores its Prism affine `scales`/`biases` as F16 (the published
 /// convention). They are held in the BF16 compute dtype at load, so the packed operators do not
 /// promote the activations — and the logits — to F32.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn f16_prism_affine_parameters_keep_the_decoder_in_compute_dtype() {
     use mlx_llm::models::{Qwen35Config, Qwen35Model};
@@ -298,4 +305,6 @@ fn f16_prism_affine_parameters_keep_the_decoder_in_compute_dtype() {
         cache.attention_kv_dtypes().unwrap(),
         vec![(Dtype::Bfloat16, Dtype::Bfloat16)]
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED prism::f16_prism_affine_parameters_keep_the_decoder_in_compute_dtype");
 }

@@ -104,4 +104,6 @@ fn tracker_single_frame_matches_oracle() {
         "object score ours {} vs {want_obj}",
         out.object_score
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tracker_parity::tracker_single_frame_matches_oracle");
 }

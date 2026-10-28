@@ -21,6 +21,15 @@
 //! weights are dequantized to bf16 at load (sc-5108 bring-up). The eventual MXFP4 → GGUF Q4 `QMatMul`
 //! transcode that keeps the ~12 GB footprint is sc-5111.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapters;
 pub mod dit_train;
 pub mod preview;
@@ -216,10 +225,15 @@ impl Pipeline {
     /// future group-32 tier fails at load rather than silently repacking u32 codes to garbage.
     fn packed_config(&self, sub: &str) -> Option<candle_gen::quant::PackedConfig> {
         let path = self.root.join(sub).join("config.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+        candle_gen::gen_core::__model_input_result!(
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v)),
+            "candle-gen-lens::Pipeline::packed_config/configuration",
+            Configuration,
+            &[&path]
+        )
     }
 
     fn packed_group_size(&self, sub: &str) -> Option<i32> {
@@ -2015,7 +2029,13 @@ fn packed_text_encoder_config(spec: &LoadSpec) -> Option<candle_gen::quant::Pack
         return None;
     };
     let component = root.join("text_encoder");
-    let json = std::fs::read_to_string(component.join("config.json")).ok()?;
+    let json = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(component.join("config.json")),
+"crates/media/candle-gen/candle-gen-lens/src/lib.rs::packed_text_encoder_config::std::fs::read_to_string@86323",
+ArtifactInput,
+component.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+).ok()?;
     let config = serde_json::from_str::<serde_json::Value>(&json).ok()?;
     let packed = candle_gen::quant::PackedConfig::from_config(&config)?;
     let files = candle_gen::sorted_safetensors(&component, "lens").ok()?;
@@ -2084,7 +2104,13 @@ fn transformer_numeric_tier_matches(spec: &LoadSpec, expected_bits: usize) -> bo
         return false;
     };
     let component = root.join("transformer");
-    let Ok(json) = std::fs::read_to_string(component.join("config.json")) else {
+    let Ok(json) = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(component.join("config.json")),
+"crates/media/candle-gen/candle-gen-lens/src/lib.rs::transformer_numeric_tier_matches::std::fs::read_to_string@89075",
+ArtifactInput,
+component.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) else {
         return false;
     };
     let Ok(config) = serde_json::from_str::<serde_json::Value>(&json) else {
@@ -2194,7 +2220,13 @@ fn component_marker_bits(spec: &LoadSpec, component: &str) -> Option<i32> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return None;
     };
-    let json = std::fs::read_to_string(root.join(component).join("config.json")).ok()?;
+    let json = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(root.join(component).join("config.json")),
+"crates/media/candle-gen/candle-gen-lens/src/lib.rs::component_marker_bits::std::fs::read_to_string@93300",
+ArtifactInput,
+root.join(component).join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+).ok()?;
     let config = serde_json::from_str::<serde_json::Value>(&json).ok()?;
     candle_gen::quant::PackedConfig::from_config(&config).map(|packed| packed.bits)
 }
@@ -2355,6 +2387,7 @@ fn static_behavior_identity(
         Some(Quant::Q4) => "q4",
         Some(Quant::Q8) => "q8",
         Some(Quant::Nvfp4) => "nvfp4",
+        Some(Quant::Fp8Rowwise) => "fp8r",
     };
     let policy = match spec.offload_policy {
         OffloadPolicy::Resident => "resident",
@@ -2509,7 +2542,8 @@ fn surface_selector_matches_spec(
         }
         gen_core::MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
         gen_core::MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
-        gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+        gen_core::MemoryContractSurfaceTier::Nvfp4
+        | gen_core::MemoryContractSurfaceTier::Fp8Rowwise => false,
     };
     if tier_matches
         && surface.selector.offload_policy == surface.spec.offload_policy
@@ -3709,6 +3743,8 @@ mod integration_tests {
     fn rung4_real_weights_conditioning_window_sweep() -> CResult<()> {
         let Ok(root) = std::env::var("SC15800_LENS_ROOT") else {
             println!("[sc-15800] SKIP: SC15800_LENS_ROOT not set");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/src/lib.rs:3712 (rung4_real_weights_conditioning_window_sweep): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return Ok(());
         };
         let quant_tag = std::env::var("SC15800_LENS_QUANT").unwrap_or_else(|_| "q4".to_owned());
@@ -3827,6 +3863,8 @@ mod integration_tests {
                 "window 1 did not materially reduce conditioning peak for {tokens} tokens: resident {resident_reserved:.3} GiB vs {w1:.3} GiB"
             );
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED integration_tests::rung4_real_weights_conditioning_window_sweep");
         Ok(())
     }
 
@@ -3840,6 +3878,8 @@ mod integration_tests {
     fn rung4_real_weights_request_peak_and_pixels() -> CResult<()> {
         let Ok(root) = std::env::var("SC15800_LENS_ROOT") else {
             println!("[sc-15800] SKIP: SC15800_LENS_ROOT not set");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/src/lib.rs:3843 (rung4_real_weights_request_peak_and_pixels): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return Ok(());
         };
         let quant_tag = std::env::var("SC15800_LENS_QUANT").unwrap_or_else(|_| "q4".to_owned());
@@ -3931,6 +3971,8 @@ mod integration_tests {
             "[sc-15800] request {quant_tag} 512x512/1-step: resident live={resident_live:.3} GiB reserved={resident_reserved:.3} GiB; sequential-window1 live={staged_live:.3} GiB reserved={staged_reserved:.3} GiB; reserved change={:.1}%",
             100.0 * (staged_reserved / resident_reserved - 1.0)
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED integration_tests::rung4_real_weights_request_peak_and_pixels");
         Ok(())
     }
 
@@ -3943,6 +3985,8 @@ mod integration_tests {
     fn sc15819_real_weights_five_rung_sequence() -> CResult<()> {
         let Ok(root) = std::env::var("SC15819_LENS_ROOT") else {
             println!("[sc-15819] SKIP: SC15819_LENS_ROOT not set");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/src/lib.rs:3946 (sc15819_real_weights_five_rung_sequence): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return Ok(());
         };
         let device = Device::new_cuda(0)?;
@@ -4102,6 +4146,8 @@ mod integration_tests {
         assert!(generator.generate(&invalid, &mut |_| {}).is_err());
         drop(generator);
         sc15800_quiesce(&device, pool)?;
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED integration_tests::sc15819_real_weights_five_rung_sequence");
         Ok(())
     }
 
@@ -4363,6 +4409,7 @@ mod integration_tests {
             memory_contract: Some(contract),
         };
         let mut context = gen_core::MemoryRunContext {
+            reference_resources: None,
             optimization_authority: gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: gen_core::MemorySelection {
                 strategy: gen_core::MemoryStrategy::BoundedTransformerResidency,

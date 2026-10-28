@@ -132,7 +132,10 @@ fn first_light_renders_video_and_audio_at_the_smallest_geometry() {
                 observed.push(current);
             }
             Progress::Decoding => decoding = true,
-            Progress::Loading(_) => {}
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .expect("real-weight render");
     let wall = started.elapsed();
@@ -232,6 +235,8 @@ fn first_light_renders_video_and_audio_at_the_smallest_geometry() {
         peak_bytes > 1_000_000_000,
         "peak MLX memory {peak_bytes} B is too small for a real 33 B forward"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED first_light::first_light_renders_video_and_audio_at_the_smallest_geometry");
 }
 
 /// **Off-lattice geometry is refused at the contract boundary, on the real loaded model.**

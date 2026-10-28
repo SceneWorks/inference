@@ -32,9 +32,15 @@ fn photo() -> PathBuf {
 }
 
 fn decode_photo() -> Image {
-    let rgb = image::open(photo())
-        .expect("the repo photo decodes")
-        .to_rgb8();
+    let rgb = mlx_gen::gen_core::__model_input_reader!(
+        image::open(photo()),
+        "crates/media/mlx-gen/mlx-gen-iris/tests/depth_real_weights.rs::decode_photo/image::open",
+        Reference,
+        photo(),
+        |__model_input_path| image::open(__model_input_path)
+    )
+    .expect("the repo photo decodes")
+    .to_rgb8();
     Image {
         width: rgb.width(),
         height: rgb.height(),
@@ -216,6 +222,10 @@ fn real_depth_matches_upstream_full_resolution() {
     assert!(mean <= 1e-2, "mean |Δ| {mean}");
     check_against_reference(&out.map);
     write_evidence(&out.map, "dog-golden-input");
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_real_weights::real_depth_matches_upstream_full_resolution");
 }
 
 /// The off-host form (no golden): the photo decoded by the `image` crate (not PIL — JPEG decoders
@@ -227,4 +237,8 @@ fn real_depth_matches_the_upstream_reference() {
     let out = estimate(model.as_ref(), decode_photo());
     check_against_reference(&out.map);
     write_evidence(&out.map, "dog");
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_real_weights::real_depth_matches_the_upstream_reference");
 }

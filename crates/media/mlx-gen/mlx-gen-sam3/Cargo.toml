@@ -21,3 +21,6 @@ mlx-rs = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+[features]
+model-inference-proof = ["mlx-gen/model-inference-proof"]

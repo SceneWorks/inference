@@ -213,6 +213,7 @@ fn load_reads_config_and_wires_generate() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn bounded_decode_carrier_is_validated_before_stage_one_loads_weights() {
     let tmp = tempfile::tempdir().unwrap();
@@ -243,6 +244,8 @@ fn bounded_decode_carrier_is_validated_before_stage_one_loads_weights() {
         error.to_string().contains("decode tile-edge cap 447"),
         "expected the pre-Stage-1 carrier error, got: {error}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registration::bounded_decode_carrier_is_validated_before_stage_one_loads_weights");
 }
 
 #[test]

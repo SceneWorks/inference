@@ -1217,6 +1217,7 @@ mod tests {
     /// call, `footprint` the active plus freed-buffer bytes after it (what `phys_footprint` sees).
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prefix_reuse_holds_one_entry_and_one_request_cache() {
         use mlx_rs::memory;
         let (layers, heads, head_dim) = (24, 8, 64);
@@ -1271,6 +1272,8 @@ mod tests {
         }
         assert_eq!(store.len(), 1);
         assert_eq!(store.stats().hits, 3);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::tests::prefix_reuse_holds_one_entry_and_one_request_cache");
     }
 
     #[test]
@@ -1436,6 +1439,7 @@ mod engine_tests {
     /// shared run (turn 1's KV minus the never-fed last reply token), prefills only the rest, and
     /// matches a cold run token for token.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_causal_second_turn_prefills_only_the_new_tokens() {
         let model = causal();
         let counted = Counted::new(&model);
@@ -1463,6 +1467,8 @@ mod engine_tests {
         let (run2, reused2) = turn(&model, &mut NoProposer, &mut pc, &p2, None, 8);
         assert_eq!(reused2, expected);
         assert_eq!(run2.output.tokens, cold(&model, &mut NoProposer, &p2, 8));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_causal_second_turn_prefills_only_the_new_tokens");
     }
 
     /// AC2: the hybrid restores the recurrent state snapshotted at the boundary, prefills only
@@ -1473,6 +1479,7 @@ mod engine_tests {
     /// on a stop token (the look-ahead fed the unemitted stop token) or on the caller's stop
     /// predicate (it fed the last emitted token).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_pipelined_run_stores_only_its_committed_length() {
         use crate::decode::engine::Pipelining;
         let model = causal();
@@ -1543,6 +1550,8 @@ mod engine_tests {
             assert_eq!(on.0, off.0, "{end}: stored key");
             assert_eq!(on.1, off.1, "{end}: stored positions");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_pipelined_run_stores_only_its_committed_length");
     }
 
     /// sc-24446 (epic E1): on both decoder families, a prefix-cache hit on the boundary entry a
@@ -1551,6 +1560,7 @@ mod engine_tests {
     /// it, each continued by two different turns (ids below each fixture's vocabulary `v`). Sensitive to the boundary: a recurrent state
     /// captured one position off changes the hybrid's greedy stream here.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_hit_after_a_single_forward_miss_decodes_the_plain_run() {
         fn check<T>(model: &T, family: &str, v: i32)
         where
@@ -1585,9 +1595,12 @@ mod engine_tests {
         }
         check(&causal(), "causal", 24);
         check(&qwen35(false), "hybrid", 50);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_hit_after_a_single_forward_miss_decodes_the_plain_run");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_qwen35_second_turn_restores_the_recurrent_state_at_the_boundary() {
         let model = qwen35(false);
         let counted = Counted::new(&model);
@@ -1618,6 +1631,8 @@ mod engine_tests {
         other.extend_from_slice(&[1, 2]);
         let restored = pc.restore::<Qwen35Cache>(&other, false).unwrap();
         assert!(restored.is_none());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_qwen35_second_turn_restores_the_recurrent_state_at_the_boundary");
     }
 
     /// A hybrid entry is the state at its boundary alone (sc-24435 x sc-24437): a cache stored
@@ -1625,6 +1640,7 @@ mod engine_tests {
     /// is charged exactly what a cache that never recorded holds — and a restore of it carries
     /// none, so the restored cache can return to no earlier position.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_stored_hybrid_entry_carries_no_checkpoint_window() {
         let model = qwen35(false);
         let prompt = [3, 9, 4, 11, 3, 9, 4, 11];
@@ -1684,12 +1700,15 @@ mod engine_tests {
             at..at,
             "no checkpoint window restored"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_stored_hybrid_entry_carries_no_checkpoint_window");
     }
 
     /// The boundary snapshot is independent of the live cache it was taken from (MLX arrays are
     /// copy-on-write): that cache goes on to decode — prompt lookup verifying and rolling back on
     /// top of it — and a restore of the stored entry answers exactly as it did before.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_boundary_snapshot_is_not_written_by_the_decode_that_continues_past_it() {
         let model = qwen35(false);
         let mut prompt = vec![3, 9, 4, 11, 3, 9, 4, 11];
@@ -1737,12 +1756,15 @@ mod engine_tests {
         )
         .unwrap();
         assert_eq!(probe(&entry), before);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_boundary_snapshot_is_not_written_by_the_decode_that_continues_past_it");
     }
 
     /// Speculative decoding on top of a hit: the MTP head resumes from the state stored at the
     /// boundary (its warm-up seeds only past it) and the greedy tokens match a cold MTP run and a
     /// cold plain run.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn mtp_resumes_its_warm_up_from_the_stored_boundary() {
         let model = qwen35(true);
         let mut pc = PrefixCache::with_budget(1 << 30);
@@ -1816,12 +1838,15 @@ mod engine_tests {
             (stats2.proposed, stats2.accepted),
             (cold_mtp.stats.proposed, cold_mtp.stats.accepted)
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::mtp_resumes_its_warm_up_from_the_stored_boundary");
     }
 
     /// The head's state resumed at a boundary is the cold warm-up's: seeding only past the
     /// boundary from the captured state yields the same head outputs, row for row, as warming the
     /// whole prompt.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_resumed_mtp_warm_up_matches_the_cold_warm_up() {
         use crate::decode::engine::seq_rows;
         let model = qwen35(true);
@@ -1868,11 +1893,14 @@ mod engine_tests {
             "the capture split's tail segment"
         );
         assert!(diff(&split, &expect) < 1e-3, "split warm-up diverged");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_resumed_mtp_warm_up_matches_the_cold_warm_up");
     }
 
     /// An entry stored by a request that did not run the MTP head carries no head state, so an
     /// MTP request does not resume from it (it prefills cold) — and still decodes correctly.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn an_mtp_request_skips_an_entry_without_head_state() {
         let model = qwen35(true);
         let mut pc = PrefixCache::with_budget(1 << 30);
@@ -1891,11 +1919,14 @@ mod engine_tests {
         p2.extend_from_slice(&[20, 40]);
         assert!(pc.restore::<Qwen35Cache>(&p2, true).unwrap().is_none());
         assert!(pc.restore::<Qwen35Cache>(&p2, false).unwrap().is_some());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::an_mtp_request_skips_an_entry_without_head_state");
     }
 
     /// A cancel landing mid-prefill stops before the next forward, returns the typed cancel and
     /// stores nothing; the next request prefills from the last good entry and decodes correctly.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_cancel_mid_prefill_stores_nothing() {
         let model: Qwen35Model = qwen35(false);
         let cancel = CancelFlag::new();
@@ -1918,11 +1949,14 @@ mod engine_tests {
         assert_eq!(reused, 0);
         assert_eq!(run.output.tokens, cold(&model, &mut NoProposer, &prompt, 4));
         assert_eq!(pc.len(), 1);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_cancel_mid_prefill_stores_nothing");
     }
 
     /// sc-24446: a forward that fails part-way drops the boundary capture its DeltaNet layers
     /// never consumed, so a later forward on the same cache captures nothing there.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_failed_forward_leaves_no_stale_boundary_capture() {
         let model = qwen35(false);
         let prompt: Vec<i32> = (0..12).map(|i| (i * 7 % 49) + 1).collect();
@@ -1951,12 +1985,15 @@ mod engine_tests {
             cache.at_boundary(8).is_err(),
             "a stale boundary was captured by a later forward"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_failed_forward_leaves_no_stale_boundary_capture");
     }
 
     /// sc-24446: a boundary the forward cannot capture — a DeltaNet layer still recording a
     /// checkpoint window skips it — costs the prefix-cache entry, never the request: the prefill
     /// returns its output with no boundary snapshot.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn an_uncapturable_boundary_skips_the_snapshot_not_the_request() {
         let model = qwen35(false);
         let prompt: Vec<i32> = (0..12).map(|i| (i * 7 % 49) + 1).collect();
@@ -1978,6 +2015,8 @@ mod engine_tests {
         assert!(pre.boundary.is_none());
         assert_eq!(pre.fed_tokens, prompt.len());
         assert_eq!(pre.cache.offset(), prompt.len() as i32);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::an_uncapturable_boundary_skips_the_snapshot_not_the_request");
     }
 
     /// sc-24446 (defect B): a miss with a boundary inside the prompt prefills in **one** forward,
@@ -1987,6 +2026,7 @@ mod engine_tests {
     /// the split prefill's snapshot. A conversation shorter
     /// than one Gated DeltaNet chunk and one past it.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_boundary_miss_prefills_in_one_forward_and_stores_the_split_prefills_state() {
         let model = qwen35(false);
         let fwd = |cache: &mut Qwen35Cache, ids: &[i32], at: usize| {
@@ -2089,11 +2129,14 @@ mod engine_tests {
             }
             assert_eq!(runs[0], runs[1], "{conv_len}: decode after the hit");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::a_boundary_miss_prefills_in_one_forward_and_stores_the_split_prefills_state");
     }
 
     /// AC3 on real entries: past the budget the least-recently-used entry is evicted, and the
     /// resident bytes never exceed the budget.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn real_entries_are_evicted_least_recently_used_within_the_budget() {
         let model = causal();
         let prompts = [vec![3, 9, 4, 11], vec![5, 6, 7, 8], vec![12, 13, 14, 15]];
@@ -2119,5 +2162,7 @@ mod engine_tests {
             "the least-recently-used entry went: {keys:?}"
         );
         assert!(pc.stats().evicted >= 1);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED decode::prefix::engine_tests::real_entries_are_evicted_least_recently_used_within_the_budget");
     }
 }

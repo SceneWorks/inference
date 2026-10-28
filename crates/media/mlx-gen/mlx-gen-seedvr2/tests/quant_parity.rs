@@ -57,6 +57,9 @@ fn run(weights_file: &str, io_file: &str, cfg: DitConfig, label: &str) {
     let dir = golden_dir();
     if !dir.join(weights_file).exists() {
         eprintln!("SKIP: {weights_file} absent (run tools/dump_seedvr2_goldens.py)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in run; see preceding skip diagnostic",
+        );
         return;
     }
     let w = to_bf16(&Weights::from_file(dir.join(weights_file)).expect("dit weights"));
@@ -94,6 +97,7 @@ fn run(weights_file: &str, io_file: &str, cfg: DitConfig, label: &str) {
     assert!(cos4 > 0.70, "{label} Q4 incoherent: {cos4}");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn seedvr2_3b_quant_near_lossless() {
     run(
@@ -102,8 +106,11 @@ fn seedvr2_3b_quant_near_lossless() {
         DitConfig::seedvr2_3b(),
         "3B",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::seedvr2_3b_quant_near_lossless");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn seedvr2_7b_quant_near_lossless() {
     run(
@@ -112,4 +119,6 @@ fn seedvr2_7b_quant_near_lossless() {
         DitConfig::seedvr2_7b(),
         "7B",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::seedvr2_7b_quant_near_lossless");
 }

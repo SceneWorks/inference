@@ -1,7 +1,7 @@
 # iOS strategy — MLX on iPhone
 
 Status: implementation on `feature/sc-16774-ios-runtime`, not an announcement of
-availability on main. Updated 2026-10-16 for [epic 16774](https://app.shortcut.com/trefry/epic/16774).
+availability on main. Reconciled 2026-10-26 for [epic 16774](https://app.shortcut.com/trefry/epic/16774).
 See the [project specification](ios-project-spec.md), [device runbook](../ios-device-runbook.md),
 and [remaining work](../ios-epics.md).
 
@@ -15,7 +15,9 @@ and `DEP_MLX_METALLIB`. There is no additional iOS-specific fork pin or accepted
 "fork of a fork" maintenance cost.
 
 The reviewed workspace pin is `michaeltrefry/mlx-rs` at
-`fe22998bf73e5e785d7659beb2f24d624b785bda`, as declared in `Cargo.toml`.
+`355e2ae4e81c13032233a4244e956bc3547f49e4`, as resolved by the current workspace
+`Cargo.toml` and lockfile. Older `fe22998` strings in legacy package metadata are
+not active dependency declarations.
 The old build-feasibility question has been replaced by cross-build CI and actual
 device evidence. Use the current manifest, not a historical branch's toolchain.
 
@@ -32,7 +34,8 @@ not architectural promises.
 
 The target is **iPhone 16 Pro Max, 8 GB, iOS 26.6.2**. The complete epic media set
 is SANA, Anima Turbo, Iris 3B, SDXL/Illustrious-XL v1/v2/RealVisXL/RealVisXL
-Lightning, and Supra2-IMG. Register all of each model's modes; refuse unsupported
+Lightning, and Z-Image Turbo. Supra2-IMG iOS registration is the explicitly
+user-deferred, non-blocking sc-26269 follow-up. Register all served models' modes; refuse unsupported
 memory requests rather than deleting modes. Registration, cross-compilation,
 Mac rendering and a successful target-phone render are four different claims.
 The runbook lists their current status separately.
@@ -52,6 +55,20 @@ remaining headroom at that instant. Those launch observations are not safe peak
 working-set limits and do not authorize changing the provisional runtime budget.
 `IOS_APP_MEMORY_CAP_MIB` / `IOS_MEMORY_BUDGET_MIB` remain provisional; do not
 interpret the constants as measurements.
+
+On 2026-10-26 Michael approved a practical phone/OS/checkpoint/source-scoped
+engineering admission estimate. Scale the optimized measured demand upward by
+the maximum actual source-priced phase-pressure ratio, never credit smaller
+geometry, add the measured repeat spread with a 32 MiB minimum margin, and check
+live headroom. A completed resident endpoint must not be underpredicted; a typed
+resident refusal supplies no invented peak. HOST/driver and pre-preparation
+response assumptions remain explicitly estimated, not source-certified physical
+bounds. See the runbook for the complete evidence contract.
+
+Phone-fit certification covers the real file-backed catalog/model paths.
+Arbitrary public Array inputs retain their existing behavior without this
+certification. No native allocator/scheduler extension for arbitrary lazy graphs
+is part of the approved certification scope.
 
 Product loading needs both the provider's registered memory-strategy safety check
 and applicable device/artifact evidence. They solve different questions. SANA's
@@ -78,8 +95,8 @@ This epic supplies the Rust bundle, catalog, build lane and measurement harness.
 The smoke host's C entry point is a diagnostic bridge, not the product FFI or a
 Swift package. App-side provisioning, the product app, SenseNova and Anima
 Base/Aesthetic are outside this epic. Supra2 implementation belongs to epic
-24212, but its eventual iOS registration remains required here, not silently
-removed from scope.
+24212 and has been delivered separately. Its iOS registration remains open as
+the explicitly approved non-blocking sc-26269 follow-up, not falsely completed.
 
 Final device campaign, feature-end review, the single SceneWorks pin bump and
 feature-to-main integration remain sc-26270. Until those results exist, neither

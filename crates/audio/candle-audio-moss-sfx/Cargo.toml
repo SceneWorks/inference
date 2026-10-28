@@ -42,6 +42,7 @@ tempfile = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-audio/model-inference-proof", "core-llm/model-inference-proof"]
 default = []
 # Apple Metal GPU backend — forwarded to the shared audio commons. Not in `default` (the audio
 # lane ships CPU-first everywhere; see docs/architecture/audio-backend-strategy.md).

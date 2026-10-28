@@ -25,7 +25,7 @@ use super::timestep_embedder::TimestepEmbedder;
 use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 #[cfg(feature = "training")]
 use mlx_gen::adapters::Adapter;
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::AttentionPlan;
 #[cfg(feature = "training")]
 use mlx_gen::train::lora::LoraParams;
@@ -492,7 +492,7 @@ impl ZImageTransformer {
         // iOS: every stage below is one bounded quantum (checked against live headroom before its
         // graph is built, materialized before the next); off device each guard is a pass-through,
         // so the op sequence is exactly the historical forward.
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let (t_emb, x_emb) = self.embed_quantum(prep, x, timestep)?;
         let mut x_emb = x_emb;
         for layer in &self.noise_refiner {
@@ -1214,8 +1214,129 @@ pub(crate) fn pad_rows(a: &Array, pad: i32) -> Result<Array> {
 /// `feed_forward.w1/w2/w3`, `adaLN_modulation.0`). Trained-file vs internal naming differences are
 /// reconciled here (`all_x_embedder.{p}-{pf}`→`x_embedder`, `cap_embedder.1`→`cap_linear`,
 /// `t_embedder.mlp.{0,2}`→`linear{1,2}`, `all_final_layer.{p}-{pf}.{linear,adaLN_modulation.1}`).
+/// Pure target schema shared with the executable adapter host. Checkpoint aliases (notably final
+/// adaLN adapter index 1 -> stored index 0) come from the same leaf resolver used by mutation.
+pub(crate) fn adapter_header_targets(
+    cfg: &ZImageTransformerConfig,
+    include_globals: bool,
+) -> Vec<(String, String)> {
+    adapter_header_targets_for_counts(
+        cfg,
+        cfg.n_layers,
+        cfg.n_refiner_layers,
+        cfg.n_refiner_layers,
+        include_globals,
+    )
+}
+fn adapter_header_targets_for_counts(
+    cfg: &ZImageTransformerConfig,
+    layers: usize,
+    noise: usize,
+    context: usize,
+    include_globals: bool,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (prefix, count, is_context) in [
+        ("layers", layers, false),
+        ("noise_refiner", noise, false),
+        ("context_refiner", context, true),
+    ] {
+        let paths = if is_context {
+            crate::context_block::adapter_target_paths()
+        } else {
+            crate::transformer_block::adapter_target_paths()
+        };
+        for index in 0..count {
+            for path in &paths {
+                let path = format!("{prefix}.{index}.{path}");
+                out.push((path.clone(), path));
+            }
+        }
+    }
+    if include_globals {
+        let embed = cfg.embed_key();
+        let x = format!("all_x_embedder.{embed}");
+        out.push((x.clone(), x));
+        out.push(("cap_embedder.1".into(), "cap_embedder.1".into()));
+        for path in crate::timestep_embedder::ADAPTER_TARGET_PATHS {
+            let parts = path.split('.').collect::<Vec<_>>();
+            let header = crate::timestep_embedder::adapter_header_path(&parts)
+                .expect("native global schema");
+            out.push((format!("t_embedder.{path}"), format!("t_embedder.{header}")));
+        }
+        for path in crate::final_layer::ADAPTER_TARGET_PATHS {
+            let parts = path.split('.').collect::<Vec<_>>();
+            let header =
+                crate::final_layer::adapter_header_path(&parts).expect("native final schema");
+            out.push((
+                format!("all_final_layer.{embed}.{path}"),
+                format!("all_final_layer.{embed}.{header}"),
+            ));
+        }
+    }
+    out
+}
+
+pub(crate) fn canonical_adapter_path(cfg: &ZImageTransformerConfig, path: &str) -> Option<String> {
+    canonical_adapter_path_for_counts(
+        cfg,
+        cfg.n_layers,
+        cfg.n_refiner_layers,
+        cfg.n_refiner_layers,
+        path,
+    )
+}
+fn canonical_adapter_path_for_counts(
+    cfg: &ZImageTransformerConfig,
+    layers: usize,
+    noise: usize,
+    context: usize,
+    path: &str,
+) -> Option<String> {
+    let parts = path.split('.').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [kind @ ("layers" | "noise_refiner" | "context_refiner"), index, rest @ ..] => {
+            let index = index.parse::<usize>().ok()?;
+            let count = match *kind {
+                "layers" => layers,
+                "noise_refiner" => noise,
+                _ => context,
+            };
+            if index >= count {
+                return None;
+            }
+            let leaf = rest.join(".");
+            let paths = if *kind == "context_refiner" {
+                crate::context_block::adapter_target_paths()
+            } else {
+                crate::transformer_block::adapter_target_paths()
+            };
+            paths
+                .iter()
+                .any(|path| path == &leaf)
+                .then(|| format!("{kind}.{index}.{leaf}"))
+        }
+        ["all_x_embedder", _] => Some(format!("all_x_embedder.{}", cfg.embed_key())),
+        ["cap_embedder", "1"] => Some("cap_embedder.1".into()),
+        ["t_embedder", rest @ ..] => crate::timestep_embedder::adapter_header_path(rest)
+            .map(|_| format!("t_embedder.{}", rest.join("."))),
+        ["all_final_layer", _, rest @ ..] => crate::final_layer::adapter_header_path(rest)
+            .map(|_| format!("all_final_layer.{}.{}", cfg.embed_key(), rest.join("."))),
+        _ => None,
+    }
+}
+
 impl AdaptableHost for ZImageTransformer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        let canonical = canonical_adapter_path_for_counts(
+            &self.cfg,
+            self.layers.len(),
+            self.noise_refiner.len(),
+            self.context_refiner.len(),
+            &path.join("."),
+        )?;
+        let segments = canonical.split('.').collect::<Vec<_>>();
+        let path = segments.as_slice();
         match path {
             ["layers", n, rest @ ..] => self
                 .layers
@@ -1245,19 +1366,16 @@ impl AdaptableHost for ZImageTransformer {
     /// pattern for them (and the patch-size wildcard would make the flattening ambiguous); they stay
     /// reachable via the dotted diffusers/peft form.
     fn adaptable_paths(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        // `layers` + `noise_refiner` are transformer blocks (with `adaLN_modulation.0`);
-        // `context_refiner` blocks have no adaLN — each block enumerates its own leaves.
-        for (i, b) in self.layers.iter().enumerate() {
-            out.extend(prefixed_paths(&format!("layers.{i}"), b));
-        }
-        for (i, b) in self.noise_refiner.iter().enumerate() {
-            out.extend(prefixed_paths(&format!("noise_refiner.{i}"), b));
-        }
-        for (i, b) in self.context_refiner.iter().enumerate() {
-            out.extend(prefixed_paths(&format!("context_refiner.{i}"), b));
-        }
-        out
+        adapter_header_targets_for_counts(
+            &self.cfg,
+            self.layers.len(),
+            self.noise_refiner.len(),
+            self.context_refiner.len(),
+            false,
+        )
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect()
     }
 }
 

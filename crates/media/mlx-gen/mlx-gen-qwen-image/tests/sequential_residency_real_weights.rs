@@ -119,6 +119,8 @@ fn sequential_bounds_peak_and_is_byte_identical() {
         peak_sequential as f64 / GIB,
         peak_resident as f64 / GIB,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::sequential_bounds_peak_and_is_byte_identical");
 }
 
 #[test]
@@ -139,6 +141,8 @@ fn sequential_repeat_job_stays_bounded() {
         peak2 as f64 / GIB,
         peak1 as f64 / GIB,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::sequential_repeat_job_stays_bounded");
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -278,6 +282,8 @@ fn edit_sequential_bounds_peak_and_is_byte_identical() {
         edit_spec,
         &edit_probe_request(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::edit_sequential_bounds_peak_and_is_byte_identical");
 }
 
 // --- Control (`qwen_image_control`) ----------------------------------------------------------------
@@ -342,4 +348,6 @@ fn control_sequential_bounds_peak_and_is_byte_identical() {
         control_spec,
         &control_probe_request(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::control_sequential_bounds_peak_and_is_byte_identical");
 }

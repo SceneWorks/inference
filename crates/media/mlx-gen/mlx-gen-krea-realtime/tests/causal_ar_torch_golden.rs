@@ -217,6 +217,7 @@ fn mask_rule_matches_reference_get_sdpa_mask() {
 /// (2) The ≥2-chunk numeric anchor against the reference `CausalWanModel._forward_inference` run with
 /// a populated KV cache.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn multi_chunk_causal_forward_matches_torch_golden() {
     let golden = Weights::from_file(GOLDEN).expect("load causal AR golden");
     let (causal, cross_kv, cfg) = setup(&golden);
@@ -255,12 +256,15 @@ fn multi_chunk_causal_forward_matches_torch_golden() {
             "chunk{i} peak_rel {p} above the bf16 precision ceiling"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED causal_ar_torch_golden::multi_chunk_causal_forward_matches_torch_golden");
 }
 
 /// (3) NEGATIVE CONTROL — the deliverable that makes the golden worth having. Reproduce the DEEPEST
 /// chunk with the causal-RoPE `start_frame` offset deliberately zeroed (the single most likely
 /// reference-interpretation error: reading `causal_rope_apply` as stock `rope_apply`) and assert the
 /// golden comparison goes RED, by a wide margin over the correct run.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wrong_rope_offset_fails_the_torch_golden() {
     let golden = Weights::from_file(GOLDEN).expect("load causal AR golden");
@@ -328,4 +332,6 @@ fn wrong_rope_offset_fails_the_torch_golden() {
         "wrong-offset divergence ({bad_mean}) is not clearly separated from the correct run \
          ({good_mean})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED causal_ar_torch_golden::wrong_rope_offset_fails_the_torch_golden");
 }

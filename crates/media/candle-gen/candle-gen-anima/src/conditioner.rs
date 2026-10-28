@@ -220,7 +220,7 @@ impl AnimaTextConditioner {
         let st = target_ids.dim(1)?;
 
         // learned query tokens from T5 ids (in_proj is Identity: model_dim == target_dim).
-        let mut hidden = self.embed.forward(target_ids)?.to_dtype(dtype)?; // [B, St, D]
+        let mut hidden = __model_proof_output!(self.embed.forward(target_ids))?.to_dtype(dtype)?; // [B, St, D]
 
         let hd = self.cfg.head_dim();
         let theta = self.cfg.rope_theta as f64;

@@ -37,6 +37,8 @@ pub enum ChatTemplate {
     /// `apply_chat_template(..., enable_thinking=False)`):
     /// `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`.
     QwenInstructNoThink,
+    /// Frozen MOSS Qwen3.5: trimmed single-user content and an open thinking prefix.
+    MossImageQwen35,
     /// Qwen-Image's T2I prompt template (the fork's `LanguageTokenizer` `template=`): a fixed
     /// system instruction + the user prompt + generation prompt. The text encoder later drops the
     /// leading 34 template tokens (`prompt_drop_idx`), keeping the prompt + trailing
@@ -64,6 +66,9 @@ impl ChatTemplate {
             }
             ChatTemplate::QwenInstructNoThink => format!(
                 "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            ),
+            ChatTemplate::MossImageQwen35 => format!(
+                "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n", prompt.trim()
             ),
             ChatTemplate::QwenImage => format!(
                 "<|im_start|>system\nDescribe the image by detailing the color, shape, size, \
@@ -133,7 +138,14 @@ pub struct TextTokenizer {
 impl TextTokenizer {
     /// Load from a `tokenizer.json` (the fast-tokenizer file shipped in every HF repo).
     pub fn from_file(path: impl AsRef<Path>, config: TokenizerConfig) -> Result<Self> {
-        let inner = Tokenizer::from_file(path.as_ref()).map_err(tok_err)?;
+        let inner = crate::__model_input_reader!(
+            Tokenizer::from_file(path.as_ref()),
+            "gen-core::tokenizer::TextTokenizer::from_file",
+            Tokenizer,
+            path.as_ref(),
+            |__input_path| Tokenizer::from_file(__input_path)
+        )
+        .map_err(tok_err)?;
         Ok(Self { inner, config })
     }
 
@@ -185,6 +197,12 @@ impl TextTokenizer {
                 .build()
                 .map_err(|e| Error::Msg(format!("tokenizer: {e}")))?,
         ));
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_input_proof::record_reader_paths(
+            "gen-core::tokenizer::TextTokenizer::from_clip_bpe",
+            crate::model_input_proof::InputRole::Tokenizer,
+            &[vocab, merges],
+        );
         Ok(Self { inner, config })
     }
 
@@ -389,6 +407,30 @@ mod tests {
             "[SYSTEM_PROMPT]You are an AI that reasons about image descriptions. You give \
              structured responses focusing on object relationships, object\nattribution and \
              actions without speculation.[/SYSTEM_PROMPT][INST]a red fox in snow[/INST]"
+        );
+    }
+}
+
+#[cfg(test)]
+mod moss_image_tests {
+    use super::*;
+    #[test]
+    fn frozen_moss_qwen35_keeps_json_and_tags_and_opens_thinking() {
+        for prompt in [
+            "  中文, anime, 1girl  ",
+            "{\"summary\":{\"caption\":\"HELLO\"},\"items\":[]}",
+        ] {
+            assert_eq!(
+                ChatTemplate::MossImageQwen35.render(prompt),
+                format!(
+                    "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                    prompt.trim()
+                )
+            );
+        }
+        assert_ne!(
+            ChatTemplate::MossImageQwen35.render("a cat"),
+            ChatTemplate::QwenInstruct.render("a cat")
         );
     }
 }

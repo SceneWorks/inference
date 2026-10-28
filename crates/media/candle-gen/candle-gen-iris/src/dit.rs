@@ -530,6 +530,12 @@ impl IrisDiT {
         &self.device
     }
 
+    /// Device of a parameter retained by the loaded backbone, for explicit residency proofs.
+    #[cfg(feature = "model-inference-proof")]
+    pub fn resident_device(&self) -> &Device {
+        self.y_pos_embedding.device()
+    }
+
     /// `TimestepEmbedder`: sinusoid bank (period `timestep_max_period`, 256 frequencies, cos‖sin)
     /// → Linear → SiLU → Linear. `t` is model time `[B]` f32 → `[B, 1, D]`.
     fn timestep_embedding(&self, t: &Tensor) -> Result<Tensor> {
@@ -650,7 +656,7 @@ impl IrisDiT {
             .contiguous()?
             .reshape((b, n_patches, c * p * p))?;
         let mut s = self.s_embedder.forward(&patches)?;
-        let t_emb = self.timestep_embedding(t)?;
+        let t_emb = hooks.timestep(self.timestep_embedding(t)?)?;
         let cond = t_emb.silu()?;
 
         let y = self.text_adapter(text)?;
@@ -680,6 +686,7 @@ impl IrisDiT {
             .as_ref()
             .map(|core| core.forward(&cond))
             .transpose()?;
+        let (core_img, core_txt) = hooks.trunk_conditioning(core_img, core_txt)?;
         let ctx = TrunkCtx {
             rope_img,
             rope_txt,
@@ -692,7 +699,7 @@ impl IrisDiT {
 
         // timestep re-fused into every patch token
         let s = add(&t_emb, &s)?.silu()?;
-        let s_cond = s.reshape((b * n_patches, ()))?;
+        let s_cond = hooks.pixel_conditioning(s.reshape((b * n_patches, ()))?)?;
 
         // PixelEmbedder: per-pixel Linear + full-resolution sincos, grouped per patch.
         let tokens = self
@@ -894,9 +901,25 @@ pub struct PixelCtx {
     n_patches: usize,
 }
 
-/// Hooks around every block of [`IrisDiT::forward_hooked`]. The defaults run the backbone's own
-/// block, which is the inference forward.
+/// Hooks around the blocks and shared conditioning of [`IrisDiT::forward_hooked`]. The defaults
+/// move conditioning tensors unchanged and run the backbone's own blocks: the inference forward.
 pub trait ForwardHooks {
+    fn timestep(&mut self, embedding: Tensor) -> Result<Tensor> {
+        Ok(embedding)
+    }
+
+    fn trunk_conditioning(
+        &mut self,
+        image: Tensor,
+        text: Option<Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        Ok((image, text))
+    }
+
+    fn pixel_conditioning(&mut self, conditioning: Tensor) -> Result<Tensor> {
+        Ok(conditioning)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn trunk_block(
         &mut self,

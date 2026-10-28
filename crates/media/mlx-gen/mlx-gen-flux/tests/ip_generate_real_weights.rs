@@ -122,6 +122,8 @@ fn flux_ip_scale_zero_equals_txt2img() {
         "IP scale=0 must equal plain txt2img byte-for-byte"
     );
     assert!(diffi > 0, "IP scale=0.7 must change the image");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ip_generate_real_weights::flux_ip_scale_zero_equals_txt2img");
 }
 
 fn flux_dev_snapshot() -> PathBuf {
@@ -158,7 +160,15 @@ fn flux_ip_render_to_png() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(16);
 
-    let decoded = image::open(&ref_png)
+    let decoded = mlx_gen::gen_core::__model_input_reader!(
+image::open(&ref_png),
+"crates/media/mlx-gen/mlx-gen-flux/tests/ip_generate_real_weights.rs::flux_ip_render_to_png::image::open@6849",
+Reference,
+&ref_png,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .expect("open FLUX_IP_REF_PNG")
         .to_rgb8();
     let reference = Image {
@@ -208,4 +218,6 @@ fn flux_ip_render_to_png() {
         "[mlx-ip] wrote {out_png} (model={}, scale={scale}, true_cfg={true_cfg:?})",
         if dev { "dev" } else { "schnell" }
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ip_generate_real_weights::flux_ip_render_to_png");
 }

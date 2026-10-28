@@ -25,6 +25,721 @@ use crate::config::{ClipActivation, ClipTextConfig};
 /// CLIP's LayerNorm epsilon (HF `layer_norm_eps`, mlx `nn.LayerNorm` default).
 const LN_EPS: f32 = 1e-5;
 
+/// The six actual per-layer Linear names. Constructor routing and header pack projection share
+/// this table; token/position embeddings, norms and ordinary biases are not packing targets.
+const LAYER_LINEAR_NAMES: [&str; 6] = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.out_proj",
+    "mlp.fc1",
+    "mlp.fc2",
+];
+const TEXT_PROJECTION: &str = "text_projection";
+
+/// `(path, has_dense_bias)` of exactly the actual CLIP quantization walk.
+pub(crate) fn quantizable_text_paths(cfg: &ClipTextConfig) -> Vec<(String, bool)> {
+    let mut paths = Vec::new();
+    for layer in 0..cfg.num_layers {
+        for name in LAYER_LINEAR_NAMES {
+            paths.push((format!("text_model.encoder.layers.{layer}.{name}"), true));
+        }
+    }
+    if cfg.projection_dim.is_some() {
+        paths.push((TEXT_PROJECTION.to_owned(), false));
+    }
+    paths
+}
+
+/// One actual projection-pack point. These declared logical owners can overlap native storage;
+/// they are neither an allocation identity nor a subtractable physical lower bound.
+pub(crate) struct TextPackPoint {
+    /// The packed projection's module path, identifying the point across source worlds.
+    pub path: String,
+    pub before_resident: u64,
+    pub scratch: u64,
+}
+
+pub(crate) struct TextPackFacts {
+    pub retained: u64,
+    pub points: Vec<TextPackPoint>,
+    pub failures: Vec<usize>,
+}
+
+/// Header-only post-pack declared owners and EACH coincident raw pack budget. Never combine an
+/// earlier owner set with a future final maximum: page-rounded tiny packs can initially grow.
+/// No native payload/readiness/allocator query or physical lower/freshness proof. The pre-pack
+/// read/cast footprint stays separate at the caller; pending raw/cast parents must not be canceled
+/// merely because declared packed outputs are smaller.
+pub(crate) fn text_pack_facts(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    cfg: &ClipTextConfig,
+    bits: Option<i32>,
+) -> Result<TextPackFacts> {
+    let (facts, failure) = text_pack_prefix(headers, cfg, bits)?;
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(facts),
+    }
+}
+
+/// [`text_pack_facts`] that stops at a native quantize shape failure (rank or group alignment),
+/// returning the pack points admitted before it with that failure. Other errors still abort.
+pub(crate) fn text_pack_prefix(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    cfg: &ClipTextConfig,
+    bits: Option<i32>,
+) -> Result<(TextPackFacts, Option<Error>)> {
+    text_pack_accounting(headers, cfg, bits, true)
+}
+
+/// Algebraic pack terms for witness selection only. After a failed pack the original weight is
+/// left in the additive sum; subsequent terms are not an execution ledger. The selector may use
+/// a point only when every group's chosen assignment reaches it. Only `text_pack_prefix` feeds
+/// the exact world pricer, which never emits those unreachable terms.
+pub(crate) fn text_pack_accounting(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    cfg: &ClipTextConfig,
+    bits: Option<i32>,
+    stop_at_failure: bool,
+) -> Result<(TextPackFacts, Option<Error>)> {
+    use mlx_gen::ios_quantum::allocated_bytes;
+    let overflow = || Error::Msg("sdxl text pack header byte extent overflow".into());
+    let resident = |h: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader| -> Result<u64> {
+        let source = crate::quant::header_dtype(h.dtype)?;
+        let loaded = crate::quant::loaded_header_dtype(headers, h)?;
+        let bytes = if source == loaded {
+            h.data_bytes
+        } else {
+            h.materialized_bytes(crate::quantum::dtype_bytes(loaded))
+                .map_err(|e| Error::Msg(e.to_string()))?
+        };
+        Ok(allocated_bytes(bytes))
+    };
+    let mut retained = 0u64;
+    for header in headers {
+        retained = retained
+            .checked_add(resident(header)?)
+            .ok_or_else(overflow)?;
+    }
+    let Some(bits) = bits else {
+        return Ok((
+            TextPackFacts {
+                retained,
+                points: Vec::new(),
+                failures: Vec::new(),
+            },
+            None,
+        ));
+    };
+    let bit_width = u64::try_from(bits)
+        .ok()
+        .filter(|b| *b != 0)
+        .ok_or_else(|| Error::Msg("sdxl text pack requires positive bits".into()))?;
+    let mut points = Vec::new();
+    let mut first_failure = None;
+    let mut failures = Vec::new();
+    for (path, has_bias) in quantizable_text_paths(cfg) {
+        // The actual CLIP constructor accepts arbitrary-rank dense weights. Do not route
+        // them through HeaderLinear's matrix-only adapter geometry. Stored packs still pass
+        // the SAME ordinary packed validator (2-D) inside clip_header_linear before no-op.
+        let linear = clip_header_linear(headers, &path, has_bias)?;
+        if linear.bits.is_some() {
+            continue;
+        } // Exact existing quantize() no-op.
+        let shape = &linear.base.base_shape;
+        let weight_name = format!("{path}.weight");
+        let weight = headers
+            .iter()
+            .find(|h| h.name == weight_name)
+            .ok_or(Error::MissingTensor(weight_name))?;
+        let bias_bytes = if has_bias {
+            let name = format!("{path}.bias");
+            headers
+                .iter()
+                .find(|h| h.name == name)
+                .ok_or(Error::MissingTensor(name))?
+                .materialized_bytes(2)
+                .map_err(|e| Error::Msg(e.to_string()))?
+        } else {
+            0
+        };
+        // The native guard (quantize_bytes over the actual weight) is admitted BEFORE the
+        // quantize op checks rank and group alignment, so a failing projection's point counts.
+        let elements = shape.iter().try_fold(1u64, |n, &d| {
+            n.checked_mul(u64::try_from(d).map_err(|_| overflow())?)
+                .ok_or_else(overflow)
+        })?;
+        points.push(TextPackPoint {
+            path: path.clone(),
+            before_resident: retained,
+            scratch: crate::quant::quantize_bytes_from_metadata(elements, bias_bytes, bits),
+        });
+        if shape.len() < 2 {
+            let error = Error::Msg("sdxl text pack requires at least two dimensions".into());
+            failures.push(points.len() - 1);
+            if stop_at_failure {
+                return Ok((
+                    TextPackFacts {
+                        retained,
+                        points,
+                        failures,
+                    },
+                    Some(error),
+                ));
+            }
+            first_failure.get_or_insert(error);
+            continue;
+        }
+        let input = u64::try_from(*shape.last().unwrap()).map_err(|_| overflow())?;
+        let output = shape[..shape.len() - 1].iter().try_fold(1u64, |n, &d| {
+            n.checked_mul(u64::try_from(d).map_err(|_| overflow())?)
+                .ok_or_else(overflow)
+        })?;
+        let group = crate::quant::GROUP_SIZE as u64;
+        // Native 096 checks only group divisibility here, not positive row/input extents.
+        // Zero extents remain front-end shape facts, not a claim of successful evaluation.
+        if input % group != 0 {
+            let error = Error::Msg("sdxl text pack input is not group-aligned".into());
+            failures.push(points.len() - 1);
+            if stop_at_failure {
+                return Ok((
+                    TextPackFacts {
+                        retained,
+                        points,
+                        failures,
+                    },
+                    Some(error),
+                ));
+            }
+            first_failure.get_or_insert(error);
+            continue;
+        }
+        // QuantizedLinear's codes plus separate BF16 scales/affine biases, each page-rounded.
+        let code_row = input
+            .checked_mul(bit_width)
+            .ok_or_else(overflow)?
+            .div_ceil(32)
+            .checked_mul(4)
+            .ok_or_else(overflow)?;
+        let codes = output.checked_mul(code_row).ok_or_else(overflow)?;
+        let companion = output
+            .checked_mul(input / group)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(overflow)?;
+        retained = retained
+            .checked_sub(resident(weight)?)
+            .ok_or_else(overflow)?
+            .checked_add(allocated_bytes(codes))
+            .and_then(|n| n.checked_add(allocated_bytes(companion)))
+            .and_then(|n| n.checked_add(allocated_bytes(companion)))
+            .ok_or_else(overflow)?;
+    }
+    Ok((
+        TextPackFacts {
+            retained,
+            points,
+            failures,
+        },
+        first_failure,
+    ))
+}
+
+/// Complete CLIP pricing component, built from file headers without a native weight/model graph.
+/// Facts describe logical operands only: no layout normalization here grants backing/release credit.
+pub(crate) struct ClipPrice {
+    token_embedding: mlx_gen::adapters::facts::TensorFacts,
+    position_embedding: mlx_gen::adapters::facts::TensorFacts,
+    layers: Vec<ClipLayerPrice>,
+    final_ln_w: mlx_gen::adapters::facts::TensorFacts,
+    final_ln_b: mlx_gen::adapters::facts::TensorFacts,
+    text_projection: Option<crate::quantum::LinearWork>,
+}
+
+fn clip_embeddings_scratch(b: i32, n: i32, dim: i32, dtype: Dtype) -> u64 {
+    3 * mlx_gen::ios_quantum::tensor_bytes(
+        crate::quantum::dtype_bytes(dtype),
+        &[b as u64, n as u64, dim as u64],
+    )
+}
+
+struct ClipLayerPrice {
+    ln1_w: mlx_gen::adapters::facts::TensorFacts,
+    /// `layer_norm1.bias`, `layer_norm2.weight`, `layer_norm2.bias`: native layer_norm operands.
+    norms: [mlx_gen::adapters::facts::TensorFacts; 3],
+    // Actual constructor/pack order: q, k, v, out, fc1, fc2.
+    projections: [crate::quantum::LinearWork; 6],
+    num_heads: i32,
+    head_dim: i32,
+}
+
+pub(crate) fn clip_header_tensor(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    name: &str,
+) -> Result<mlx_gen::adapters::facts::TensorFacts> {
+    let header = headers
+        .iter()
+        .find(|h| h.name == name)
+        .ok_or_else(|| Error::MissingTensor(name.to_owned()))?;
+    let shape = header
+        .shape
+        .iter()
+        .map(|&d| {
+            i32::try_from(d)
+                .map_err(|_| Error::Msg("sdxl CLIP header dimension exceeds native i32".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(mlx_gen::adapters::facts::TensorFacts {
+        shape,
+        dtype: crate::quant::loaded_header_dtype(headers, header)?,
+        strides: Vec::new(),
+    })
+}
+
+/// Exact shared quant::lin lookup order: ordinary bias first, scales selector, weight + packed
+/// validator, then affine biases. Dense weights gain no new exact-rank/shape/dtype restriction.
+pub(crate) fn clip_header_linear(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    base: &str,
+    biased: bool,
+) -> Result<crate::quantum::LinearWork> {
+    use mlx_gen::adapters::LinearFacts;
+    let bias = if biased {
+        Some(clip_header_tensor(headers, &format!("{base}.bias"))?)
+    } else {
+        None
+    };
+    let packed = headers.iter().any(|h| h.name == format!("{base}.scales"));
+    let weight = clip_header_tensor(headers, &format!("{base}.weight"))?;
+    let (weights, shape, bits) = if packed {
+        let scales = clip_header_tensor(headers, &format!("{base}.scales"))?;
+        let bits = mlx_gen::quant::packed_bits_from_metadata(
+            &weight.shape,
+            weight.dtype,
+            &scales.shape,
+            scales.dtype,
+            crate::quant::GROUP_SIZE,
+        )?;
+        let offsets = clip_header_tensor(headers, &format!("{base}.biases"))?;
+        // The shared validator already checked the exact 2-D native packed geometry and overflow.
+        let shape = vec![scales.shape[0], scales.shape[1] * crate::quant::GROUP_SIZE];
+        (vec![weight, scales, offsets], shape, Some(bits))
+    } else {
+        let shape = weight.shape.clone();
+        (vec![weight], shape, None)
+    };
+    Ok(crate::quantum::LinearWork {
+        base: LinearFacts {
+            base_shape: shape,
+            is_quantized: bits.is_some(),
+            has_live_adapters: false,
+            adapter_count: 0,
+            bias_shape: bias.as_ref().map(|b| b.shape.clone()),
+        },
+        weights,
+        bias,
+        residuals: Vec::new(),
+        group_size: crate::quant::GROUP_SIZE,
+        bits,
+    })
+}
+
+impl ClipLayerPrice {
+    fn of(layer: &ClipEncoderLayer) -> Self {
+        Self {
+            ln1_w: mlx_gen::adapters::facts::TensorFacts::of(&layer.ln1_w),
+            norms: [&layer.ln1_b, &layer.ln2_w, &layer.ln2_b]
+                .map(mlx_gen::adapters::facts::TensorFacts::of),
+            projections: [
+                &layer.q,
+                &layer.k,
+                &layer.v,
+                &layer.out,
+                &layer.linear1,
+                &layer.linear2,
+            ]
+            .map(crate::quantum::LinearWork::of),
+            num_heads: layer.num_heads,
+            head_dim: layer.head_dim,
+        }
+    }
+
+    /// Native op order, including arbitrary-rank dense `.t()` matmul and residual broadcasts.
+    fn validate(&self, shape: &[i32], mask_tokens: i32) -> Result<Vec<i32>> {
+        let width = *shape
+            .last()
+            .ok_or_else(|| crate::quantum::native_shape_failure("CLIP hidden state is scalar"))?;
+        layer_norm_operands(&self.ln1_w, &self.norms[0], width)?;
+        let (b, n) = (shape[0], shape[1]);
+        let heads = self.num_heads * self.head_dim;
+        for projection in &self.projections[..3] {
+            let projected = projection.output_shape(shape)?;
+            same_elements(&projected, &[b, n, heads])?;
+        }
+        if !crate::quantum::broadcasts(
+            &[b, self.num_heads, n, n],
+            &[1, 1, mask_tokens, mask_tokens],
+        ) {
+            return Err(crate::quantum::native_shape_failure(
+                "CLIP causal mask does not broadcast over attention",
+            ));
+        }
+        let attended = self.projections[3].output_shape(&[b, n, heads])?;
+        let residual = crate::adapters::broadcast_shape(shape, &attended)?;
+        layer_norm_operands(&self.norms[1], &self.norms[2], *residual.last().unwrap())?;
+        let hidden = self.projections[4].output_shape(&residual)?;
+        let mlp = self.projections[5].output_shape(&hidden)?;
+        crate::adapters::broadcast_shape(&residual, &mlp)
+    }
+
+    fn output_dtype(&self, x: Dtype) -> Dtype {
+        [0, 3, 4, 5].iter().fold(x, |d, &index| {
+            Dtype::from_promoting_types(d, self.projections[index].output_dtype(d))
+        })
+    }
+
+    fn quantum_scratch(&self, b: i32, n: i32, x: Dtype) -> u64 {
+        let act = crate::quantum::dtype_bytes(self.output_dtype(x));
+        let casts = if act > crate::quantum::dtype_bytes(x) {
+            mlx_gen::ios_quantum::tensor_bytes(
+                act,
+                &[3, b as u64, n as u64, self.ln1_w.shape[0] as u64],
+            )
+            .saturating_add(crate::quantum::page_slack(3))
+        } else {
+            0
+        };
+        casts.saturating_add(crate::quantum::clip_layer_bytes(
+            b,
+            n,
+            self.ln1_w.shape[0] as u64,
+            self.projections[4].output_width(),
+            self.num_heads,
+            self.head_dim,
+            true,
+            act,
+            crate::quantum::backend(),
+        ))
+    }
+}
+
+/// Native `layer_norm`: weight/bias are 1-D with the input's last-axis size.
+fn layer_norm_operands(
+    weight: &mlx_gen::adapters::facts::TensorFacts,
+    bias: &mlx_gen::adapters::facts::TensorFacts,
+    width: i32,
+) -> Result<()> {
+    for operand in [weight, bias] {
+        if operand.shape.len() != 1 || operand.shape[0] != width {
+            return Err(crate::quantum::native_shape_failure(
+                "layer_norm operand does not match the input's last axis",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The output width of the native matmul/bias broadcast, including dense reverse-axis transpose.
+pub(crate) fn linear_output(linear: &crate::quantum::LinearWork, width: i32) -> Result<i32> {
+    linear
+        .output_shape(&[width])?
+        .last()
+        .copied()
+        .ok_or_else(|| crate::quantum::native_shape_failure("linear output is scalar"))
+}
+
+fn same_elements(from: &[i32], to: &[i32]) -> Result<()> {
+    let elements = |shape: &[i32]| {
+        shape
+            .iter()
+            .fold(1i128, |n, &d| n.saturating_mul(i128::from(d)))
+    };
+    if elements(from) != elements(to) {
+        return Err(crate::quantum::native_shape_failure(
+            "CLIP reshape element counts differ",
+        ));
+    }
+    Ok(())
+}
+
+fn clip_final_scratch(
+    b: i32,
+    n: i32,
+    dim: i32,
+    input: Dtype,
+    weight: &mlx_gen::adapters::facts::TensorFacts,
+    bias: &mlx_gen::adapters::facts::TensorFacts,
+    projection: Option<&crate::quantum::LinearWork>,
+) -> u64 {
+    use crate::quantum as q;
+    let normed =
+        Dtype::from_promoting_types(Dtype::from_promoting_types(input, weight.dtype), bias.dtype);
+    let row = mlx_gen::ios_quantum::tensor_bytes(q::dtype_bytes(normed), &[b as u64, dim as u64]);
+    let projection = projection.map_or(0, |p| {
+        p.operand_bytes(&[b, dim], normed)
+            + mlx_gen::ios_quantum::tensor_bytes(
+                q::dtype_bytes(p.output_dtype(normed)),
+                &[b as u64, p.output_width()],
+            )
+    });
+    let pool = row * n as u64 + row + projection;
+    // Array::from_slice eagerly allocates b i32 EOS indices BEFORE the lazy norm evaluates.
+    // That source buffer overlaps BOTH norm and pooling, so it belongs outside their max.
+    // macOS's shared Metal allocator (also for CPU streams) rounds only above a page;
+    // there is no invented 16-byte CPU alignment law.
+    let gather = mlx_gen::ios_quantum::allocated_bytes(mlx_gen::ios_quantum::tensor_bytes(
+        q::dtype_bytes(Dtype::Int32),
+        &[b as u64],
+    ));
+    gather.saturating_add(
+        q::final_norm_bytes_from_metadata(&[b, n, dim], input, weight, bias).max(pool),
+    )
+}
+
+impl ClipPrice {
+    pub(crate) fn from_headers(
+        headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+        prefix: &str,
+        cfg: &ClipTextConfig,
+    ) -> Result<Self> {
+        // The native safetensors decoder visits all source dtypes before constructor lookups,
+        // even unused keys. This is the same decoder acceptance, not an extra precision policy.
+        for header in headers {
+            crate::quant::header_dtype(header.dtype)?;
+        }
+        let tensor = |suffix: &str| clip_header_tensor(headers, &format!("{prefix}.{suffix}"));
+        let token_embedding = tensor("embeddings.token_embedding.weight")?;
+        let position_embedding = tensor("embeddings.position_embedding.weight")?;
+        let mut layers = Vec::new();
+        for index in 0..cfg.num_layers {
+            let layer = format!("{prefix}.encoder.layers.{index}");
+            let head_dim = cfg.model_dims / cfg.num_heads;
+            let ln1_w = clip_header_tensor(headers, &format!("{layer}.layer_norm1.weight"))?;
+            // Native constructor requirements, and the native-order layer_norm operands.
+            let norms = [
+                clip_header_tensor(headers, &format!("{layer}.layer_norm1.bias"))?,
+                clip_header_tensor(headers, &format!("{layer}.layer_norm2.weight"))?,
+                clip_header_tensor(headers, &format!("{layer}.layer_norm2.bias"))?,
+            ];
+            let linear = |index| {
+                clip_header_linear(
+                    headers,
+                    &format!("{layer}.{}", LAYER_LINEAR_NAMES[index]),
+                    true,
+                )
+            };
+            layers.push(ClipLayerPrice {
+                ln1_w,
+                norms,
+                projections: [
+                    linear(0)?,
+                    linear(1)?,
+                    linear(2)?,
+                    linear(3)?,
+                    linear(4)?,
+                    linear(5)?,
+                ],
+                num_heads: cfg.num_heads,
+                head_dim,
+            });
+        }
+        let final_ln_w = tensor("final_layer_norm.weight")?;
+        let final_ln_b = tensor("final_layer_norm.bias")?;
+        let text_projection = if cfg.projection_dim.is_some() {
+            Some(clip_header_linear(headers, TEXT_PROJECTION, false)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            token_embedding,
+            position_embedding,
+            layers,
+            final_ln_w,
+            final_ln_b,
+            text_projection,
+        })
+    }
+
+    /// Both encoder constructors precede this pair's ordered pack, exactly as the actual loader.
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
+        for layer in &mut self.layers {
+            for projection in &mut layer.projections {
+                projection.pack(bits)?;
+            }
+        }
+        if let Some(projection) = &mut self.text_projection {
+            projection.pack(bits)?;
+        }
+        Ok(())
+    }
+
+    /// Pack each independent projection for symbolic witness scoring. Invalid projections stay
+    /// unchanged; selectors exclude their assignments from every post-pack execution state.
+    pub(crate) fn pack_witness_terms(&mut self, bits: i32) -> Result<()> {
+        let projections = self
+            .layers
+            .iter_mut()
+            .flat_map(|layer| &mut layer.projections)
+            .chain(self.text_projection.iter_mut());
+        for projection in projections {
+            if let Err(error) = projection.pack(bits) {
+                if !crate::quantum::is_native_shape_failure(&error) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pooled_width(&self) -> i32 {
+        match &self.text_projection {
+            Some(projection) => projection.output_width() as i32,
+            None => self.token_embedding.shape[1],
+        }
+    }
+
+    /// Every admitted quantum's scratch is pushed BEFORE that quantum's native op checks run, as
+    /// the native guard precedes its graph: a native shape failure returns `Err` with the admitted
+    /// prefix already in `out`.
+    pub(crate) fn price_forward_with_hidden(
+        &self,
+        b: i32,
+        n: i32,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<(mlx_gen::adapters::facts::TensorFacts, Dtype)> {
+        let (embeddings, entered) = self.embeddings_quantum(b, n);
+        out.push((crate::quantum::CLIP_EMBEDDINGS, embeddings));
+        let (mut x, mut shape) = entered?;
+        let mut hidden_states = Vec::with_capacity(self.layers.len());
+        for index in 0..self.layers.len() {
+            let (scratch, next) = self.layer_quantum(index, b, n, x, &shape);
+            out.push((crate::quantum::CLIP_LAYER, scratch));
+            (x, shape) = next?;
+            hidden_states.push((x, shape.clone()));
+        }
+        let (pooled_scratch, pooled) = self.pooled_quantum(b, n, x, &shape);
+        out.push((crate::quantum::CLIP_POOLED, pooled_scratch));
+        let pooled = pooled?;
+        let (dtype, shape) = hidden_states
+            .len()
+            .checked_sub(2)
+            .map_or((x, shape), |i| hidden_states[i].clone());
+        Ok((
+            mlx_gen::adapters::facts::TensorFacts {
+                shape,
+                dtype,
+                strides: Vec::new(),
+            },
+            pooled,
+        ))
+    }
+
+    /// The embeddings quantum's scratch, then (after its native ops: token gather reshaped to
+    /// `[b, n, dim]`, positions reshaped to `[1, n, dim]`, add) the first layer's input dtype/shape.
+    pub(crate) fn embeddings_quantum(&self, b: i32, n: i32) -> (u64, Result<(Dtype, Vec<i32>)>) {
+        let dim = self.token_embedding.shape[1];
+        let scratch = clip_embeddings_scratch(b, n, dim, self.token_embedding.dtype);
+        if self.position_embedding.shape.len() != 2 || self.position_embedding.shape[1] != dim {
+            return (
+                scratch,
+                Err(crate::quantum::native_shape_failure(
+                    "CLIP position embedding does not reshape to the token width",
+                )),
+            );
+        }
+        (
+            scratch,
+            Ok((
+                Dtype::from_promoting_types(
+                    self.token_embedding.dtype,
+                    self.position_embedding.dtype,
+                ),
+                vec![b, n, dim],
+            )),
+        )
+    }
+
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Layer `index`'s quantum scratch for an `x`-typed, shaped input, then (after its native
+    /// op checks) its output dtype and residual shape.
+    pub(crate) fn layer_quantum(
+        &self,
+        index: usize,
+        b: i32,
+        n: i32,
+        x: Dtype,
+        shape: &[i32],
+    ) -> (u64, Result<(Dtype, Vec<i32>)>) {
+        let layer = &self.layers[index];
+        let scratch = layer.quantum_scratch(b, n, x);
+        (
+            scratch,
+            layer
+                .validate(shape, n)
+                .map(|shape| (layer.output_dtype(x), shape)),
+        )
+    }
+
+    /// The final norm/pool/projection quantum for an `x`-typed, `width`-wide last hidden state,
+    /// then (after the final layer_norm and projection checks) the pooled output's dtype.
+    pub(crate) fn pooled_quantum(
+        &self,
+        b: i32,
+        n: i32,
+        x: Dtype,
+        shape: &[i32],
+    ) -> (u64, Result<Dtype>) {
+        let dim = self.token_embedding.shape[1];
+        let scratch = clip_final_scratch(
+            b,
+            n,
+            dim,
+            x,
+            &self.final_ln_w,
+            &self.final_ln_b,
+            self.text_projection.as_ref(),
+        );
+        let checked =
+            layer_norm_operands(&self.final_ln_w, &self.final_ln_b, *shape.last().unwrap())
+                .and_then(|()| {
+                    same_elements(shape, &[b * n, dim])?;
+                    match &self.text_projection {
+                        Some(projection) => projection.output_shape(&[b, dim]).map(|_| ()),
+                        None => Ok(()),
+                    }
+                });
+        let normed = Dtype::from_promoting_types(
+            Dtype::from_promoting_types(x, self.final_ln_w.dtype),
+            self.final_ln_b.dtype,
+        );
+        let pooled = self
+            .text_projection
+            .as_ref()
+            .map_or(normed, |p| p.output_dtype(normed));
+        (scratch, checked.map(|()| pooled))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_facts(&self) -> Vec<(String, crate::quantum::LinearWork)> {
+        let mut result = Vec::new();
+        for (index, layer) in self.layers.iter().enumerate() {
+            for (name, facts) in LAYER_LINEAR_NAMES.iter().zip(&layer.projections) {
+                result.push((
+                    format!("text_model.encoder.layers.{index}.{name}"),
+                    facts.clone(),
+                ));
+            }
+        }
+        if let Some(projection) = &self.text_projection {
+            result.push((TEXT_PROJECTION.to_owned(), projection.clone()));
+        }
+        result
+    }
+}
+
 /// The outputs the SDXL pipeline reads off a CLIP encoder.
 pub struct ClipOutput {
     /// Final-layer-norm'd output `[B, N, D]`.
@@ -67,12 +782,12 @@ impl ClipEncoderLayer {
             ln1_b: g("layer_norm1.bias")?,
             ln2_w: g("layer_norm2.weight")?,
             ln2_b: g("layer_norm2.bias")?,
-            q: lin("self_attn.q_proj")?,
-            k: lin("self_attn.k_proj")?,
-            v: lin("self_attn.v_proj")?,
-            out: lin("self_attn.out_proj")?,
-            linear1: lin("mlp.fc1")?,
-            linear2: lin("mlp.fc2")?,
+            q: lin(LAYER_LINEAR_NAMES[0])?,
+            k: lin(LAYER_LINEAR_NAMES[1])?,
+            v: lin(LAYER_LINEAR_NAMES[2])?,
+            out: lin(LAYER_LINEAR_NAMES[3])?,
+            linear1: lin(LAYER_LINEAR_NAMES[4])?,
+            linear2: lin(LAYER_LINEAR_NAMES[5])?,
             num_heads: cfg.num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
@@ -81,14 +796,26 @@ impl ClipEncoderLayer {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        for lin in [
+        for (projection, lin) in [
             &mut self.q,
             &mut self.k,
             &mut self.v,
             &mut self.out,
             &mut self.linear1,
             &mut self.linear2,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mlx_gen::ios_quantum::diagnostic_metadata(
+                "sdxl",
+                "clip-pack-projection",
+                &[
+                    ("schema", 1),
+                    ("projection", projection as u64),
+                    ("pooled_projection", 0),
+                ],
+            );
             crate::quant::quantize_linear(lin, bits)?;
         }
         Ok(())
@@ -128,35 +855,7 @@ impl ClipEncoderLayer {
     /// [`crate::quantum::linear_output_dtype`]). The causal mask is an additive array mask, which
     /// MLX's fused Metal SDPA accepts at head dim 64.
     fn quantum_scratch(&self, b: i32, n: i32, x: Dtype) -> u64 {
-        let act = crate::quantum::dtype_bytes(
-            [&self.q, &self.out, &self.linear1, &self.linear2]
-                .iter()
-                .fold(x, |d, linear| {
-                    Dtype::from_promoting_types(d, crate::quantum::linear_output_dtype(linear, d))
-                }),
-        );
-        // A promoting layer entered at a narrower width: each of q/k/v casts the narrow LayerNorm
-        // output up (`quantized_matmul`'s `astype(x, result_type)`) — three hidden-sized copies.
-        let casts = if act > crate::quantum::dtype_bytes(x) {
-            mlx_gen::ios_quantum::tensor_bytes(
-                act,
-                &[3, b as u64, n as u64, self.ln1_w.shape()[0] as u64],
-            )
-            .saturating_add(crate::quantum::page_slack(3))
-        } else {
-            0
-        };
-        casts.saturating_add(crate::quantum::clip_layer_bytes(
-            b,
-            n,
-            self.ln1_w.shape()[0] as u64,
-            crate::quantum::linear_out(&self.linear1),
-            self.num_heads,
-            self.head_dim,
-            true,
-            act,
-            crate::quantum::Backend::current(),
-        ))
+        ClipLayerPrice::of(self).quantum_scratch(b, n, x)
     }
 
     /// `x`: `[B, N, D]`; `mask`: additive causal `[1, 1, N, N]`.
@@ -209,6 +908,54 @@ pub struct ClipTextEncoder {
     text_projection: Option<AdaptableLinear>,
 }
 
+/// The actual pair's post-load packing policy, shared by snapshot/LDM loads and raw pricing.
+/// Only the existing `quantize` walk selects weights: embeddings/norms/bias exceptions are not
+/// replaced by a header-name approximation. Header pricing mirrors this ordered base-only policy
+/// without invoking a native quantizer. Runtime keeps its existing per-projection materialization
+/// and load pack before-checks, not a new evaluation or precision rule.
+pub(crate) fn quantize_pair(
+    te1: &mut ClipTextEncoder,
+    te2: &mut ClipTextEncoder,
+    bits: i32,
+) -> Result<()> {
+    let result = crate::quant::guarded_load_quantize(|| {
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sdxl",
+            "clip-pack-encoder",
+            &[
+                ("schema", 1),
+                ("encoder", 0),
+                ("bits", bits.max(0) as u64),
+                ("active", 1),
+            ],
+        );
+        te1.quantize(bits)?;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sdxl",
+            "clip-pack-encoder",
+            &[
+                ("schema", 1),
+                ("encoder", 1),
+                ("bits", bits.max(0) as u64),
+                ("active", 1),
+            ],
+        );
+        te2.quantize(bits)
+    });
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sdxl",
+        "clip-pack-encoder",
+        &[
+            ("schema", 1),
+            ("encoder", 1),
+            ("bits", bits.max(0) as u64),
+            ("active", 0),
+            ("completed", u64::from(result.is_ok())),
+        ],
+    );
+    result
+}
+
 impl ClipTextEncoder {
     /// Load from a CLIP-text checkpoint. `prefix` is the encoder namespace (`text_model`); the
     /// projection (TE2) is read from the bare top-level `text_projection.weight`.
@@ -233,7 +980,7 @@ impl ClipTextEncoder {
         // TE2's `text_projection` (bias-free) is quantized — packed-detect (sc-8746). The bare
         // top-level key (no `text_model.` prefix) matches the on-disk layout the converter packs.
         let text_projection = match cfg.projection_dim {
-            Some(_) => Some(crate::quant::lin(w, "text_projection", false)?),
+            Some(_) => Some(crate::quant::lin(w, TEXT_PROJECTION, false)?),
             None => None,
         };
         Ok(Self {
@@ -246,13 +993,32 @@ impl ClipTextEncoder {
         })
     }
 
+    /// The pooled output's width: the projection's rows (TE2), else the hidden width.
+    #[cfg(test)]
+    pub(crate) fn pooled_width(&self) -> i32 {
+        match &self.text_projection {
+            Some(p) => crate::quantum::linear_out(p) as i32,
+            None => self.token_embedding.shape()[1],
+        }
+    }
+
     /// Quantize every Linear (the per-layer projections + the text projection) to Q4/Q8. The token /
     /// position embeddings stay dense (gather lookups, not matmuls).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        for l in &mut self.layers {
+        for (layer, l) in self.layers.iter_mut().enumerate() {
+            mlx_gen::ios_quantum::diagnostic_metadata(
+                "sdxl",
+                "clip-pack-layer",
+                &[("schema", 1), ("layer", layer as u64)],
+            );
             l.quantize(bits)?;
         }
         if let Some(p) = &mut self.text_projection {
+            mlx_gen::ios_quantum::diagnostic_metadata(
+                "sdxl",
+                "clip-pack-projection",
+                &[("schema", 1), ("projection", 0), ("pooled_projection", 1)],
+            );
             crate::quant::quantize_linear(p, bits)?;
         }
         Ok(())
@@ -274,6 +1040,76 @@ impl ClipTextEncoder {
         Ok(())
     }
 
+    /// Borrowed native shape/dtype observations for fixture proofs, never a unique-backing or
+    /// physical lower certificate. No Array clone, value read or evaluation is performed.
+    #[cfg(test)]
+    pub(crate) fn payload_layouts_for_test(
+        &self,
+    ) -> (std::collections::BTreeMap<String, (Vec<i32>, Dtype)>, u64) {
+        use std::collections::BTreeMap;
+        type Layouts = BTreeMap<String, (Vec<i32>, Dtype)>;
+        fn record(out: &mut Layouts, bytes: &mut u64, key: String, tensor: &Array) {
+            *bytes += mlx_gen::ios_quantum::allocated_bytes(crate::quantum::bytes(tensor));
+            out.insert(key, (tensor.shape().to_vec(), tensor.dtype()));
+        }
+        fn linear(out: &mut Layouts, bytes: &mut u64, key: &str, value: &AdaptableLinear) {
+            if let Some((weight, bias)) = value.dense_weight() {
+                record(out, bytes, format!("{key}.weight"), weight);
+                if let Some(bias) = bias {
+                    record(out, bytes, format!("{key}.bias"), bias);
+                }
+            } else if let Some((codes, scales, offsets, bias, _, _)) = value.quantized_params() {
+                for (suffix, tensor) in [("weight", codes), ("scales", scales), ("biases", offsets)]
+                {
+                    record(out, bytes, format!("{key}.{suffix}"), tensor);
+                }
+                if let Some(bias) = bias {
+                    record(out, bytes, format!("{key}.bias"), bias);
+                }
+            }
+        }
+        let (mut out, mut bytes) = (BTreeMap::new(), 0);
+        for (key, tensor) in [
+            (
+                "text_model.embeddings.token_embedding.weight",
+                &self.token_embedding,
+            ),
+            (
+                "text_model.embeddings.position_embedding.weight",
+                &self.position_embedding,
+            ),
+            ("text_model.final_layer_norm.weight", &self.final_ln_w),
+            ("text_model.final_layer_norm.bias", &self.final_ln_b),
+        ] {
+            record(&mut out, &mut bytes, key.into(), tensor);
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("text_model.encoder.layers.{index}");
+            for (key, tensor) in [
+                ("layer_norm1.weight", &layer.ln1_w),
+                ("layer_norm1.bias", &layer.ln1_b),
+                ("layer_norm2.weight", &layer.ln2_w),
+                ("layer_norm2.bias", &layer.ln2_b),
+            ] {
+                record(&mut out, &mut bytes, format!("{prefix}.{key}"), tensor);
+            }
+            for (name, value) in LAYER_LINEAR_NAMES.iter().zip([
+                &layer.q,
+                &layer.k,
+                &layer.v,
+                &layer.out,
+                &layer.linear1,
+                &layer.linear2,
+            ]) {
+                linear(&mut out, &mut bytes, &format!("{prefix}.{name}"), value);
+            }
+        }
+        if let Some(projection) = &self.text_projection {
+            linear(&mut out, &mut bytes, TEXT_PROJECTION, projection);
+        }
+        (out, bytes)
+    }
+
     /// One layer's guarded quantum body and price (sc-26270 proof tests): `layer.forward(x, mask)`
     /// and its counted scratch over `x`.
     #[cfg(test)]
@@ -288,6 +1124,42 @@ impl ClipTextEncoder {
         let (n, dtype) = (s[1], x.dtype());
         let x = x.clone();
         (scratch, move || layer.forward(&x, &causal_mask(n, dtype)?))
+    }
+
+    /// Native test witness, projected from the actual constructed/packed model. Production guards
+    /// use the same metadata formulas directly; header construction never calls this method.
+    #[cfg(test)]
+    pub(crate) fn price_facts(&self) -> ClipPrice {
+        use mlx_gen::adapters::facts::TensorFacts;
+        ClipPrice {
+            token_embedding: TensorFacts::of(&self.token_embedding),
+            position_embedding: TensorFacts::of(&self.position_embedding),
+            layers: self.layers.iter().map(ClipLayerPrice::of).collect(),
+            final_ln_w: TensorFacts::of(&self.final_ln_w),
+            final_ln_b: TensorFacts::of(&self.final_ln_b),
+            text_projection: self
+                .text_projection
+                .as_ref()
+                .map(crate::quantum::LinearWork::of),
+        }
+    }
+
+    /// Final norm and EOS pool/projection keep their original competing live sets. Only operand
+    /// metadata crosses into the common formula; actual normalization/projection graphs are intact.
+    fn final_scratch(&self, b: i32, n: i32, input: Dtype) -> u64 {
+        use mlx_gen::adapters::facts::TensorFacts;
+        clip_final_scratch(
+            b,
+            n,
+            self.token_embedding.shape()[1],
+            input,
+            &TensorFacts::of(&self.final_ln_w),
+            &TensorFacts::of(&self.final_ln_b),
+            self.text_projection
+                .as_ref()
+                .map(crate::quantum::LinearWork::of)
+                .as_ref(),
+        )
     }
 
     /// Run the encoder over `input_ids` `[B, N]` (int32). Returns the last hidden state, the
@@ -312,22 +1184,22 @@ impl ClipTextEncoder {
         }
         // sc-26270: embeddings, each layer, and the final norm + pooled token are guarded iOS
         // quanta (pass-throughs off device), each counted from its own ops.
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
-        let act = crate::quantum::element_bytes(&self.token_embedding);
-        let hidden = mlx_gen::ios_quantum::tensor_bytes(act, &[b as u64, n as u64, dim as u64]);
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        let embeddings_scratch = clip_embeddings_scratch(b, n, dim, self.token_embedding.dtype());
 
         // Token + position embeddings. `position_embedding.weight[:N]` broadcast over the batch.
         // Counted: the gathered tokens, the gathered positions and the sum.
-        let mut x = mlx_gen::ios_quantum::run(crate::quantum::CLIP_EMBEDDINGS, 3 * hidden, || {
-            let ids_flat = input_ids.reshape(&[b * n])?;
-            let tok = self
-                .token_embedding
-                .take_axis(&ids_flat, 0)?
-                .reshape(&[b, n, dim])?;
-            let pos_idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
-            let pos = self.position_embedding.take_axis(&pos_idx, 0)?; // [N, D]
-            Ok(add(&tok, &pos.reshape(&[1, n, dim])?)?)
-        })?;
+        let mut x =
+            mlx_gen::ios_quantum::run(crate::quantum::CLIP_EMBEDDINGS, embeddings_scratch, || {
+                let ids_flat = input_ids.reshape(&[b * n])?;
+                let tok = self
+                    .token_embedding
+                    .take_axis(&ids_flat, 0)?
+                    .reshape(&[b, n, dim])?;
+                let pos_idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
+                let pos = self.position_embedding.take_axis(&pos_idx, 0)?; // [N, D]
+                Ok(add(&tok, &pos.reshape(&[1, n, dim])?)?)
+            })?;
 
         let mask = causal_mask(n, x.dtype())?;
         let mut hidden_states = Vec::with_capacity(self.layers.len());
@@ -339,15 +1211,9 @@ impl ClipTextEncoder {
             )?;
             hidden_states.push(x.clone());
         }
-        // Counted: the final LayerNorm output (the pooled gather and its projection are rows), at
-        // the width the layers left the hidden state (f32 after a packed layer's promotion).
-        let wide = crate::quantum::element_bytes(&x).max(act);
-        let final_hidden =
-            mlx_gen::ios_quantum::tensor_bytes(wide, &[b as u64, n as u64, dim as u64]);
-        let pooled_rows = mlx_gen::ios_quantum::tensor_bytes(wide, &[b as u64, 2 * dim as u64]);
         mlx_gen::ios_quantum::before(
             crate::quantum::CLIP_POOLED,
-            final_hidden.saturating_add(pooled_rows),
+            self.final_scratch(b, n, x.dtype()),
         )?;
         let last_hidden_state =
             layer_norm(&x, Some(&self.final_ln_w), Some(&self.final_ln_b), LN_EPS)?;
@@ -423,6 +1289,32 @@ fn first_argmax(ids: &[i32]) -> i32 {
 mod tests {
     use super::*;
 
+    /// No native arrays: independently enumerate the F16 CPU fallback live graph and the
+    /// eager EOS owner. This cheap discriminator remains ordinary when native captures move out.
+    #[test]
+    fn final_pool_prices_live_eos_and_native_fallback_scalar_operands() {
+        let affine = mlx_gen::adapters::facts::TensorFacts {
+            shape: vec![32],
+            dtype: Dtype::Float16,
+            strides: vec![],
+        };
+        crate::quantum::with_backend(crate::quantum::Backend::Cpu, || {
+            for batch in [1, 2, 5] {
+                let elements = batch as u64 * 8 * 32;
+                // Three half-width epilogue outputs plus three F32 fallback operands;
+                // three per-row F32 statistics; two mean normalizers plus epsilon; EOS i32.
+                let expected = elements * (3 * 2 + 3 * 4)
+                    + 3 * (batch as u64 * 8) * 4
+                    + (2 + 1) * 4
+                    + batch as u64 * 4;
+                assert_eq!(
+                    clip_final_scratch(batch, 8, 32, Dtype::Float16, &affine, &affine, None),
+                    expected
+                );
+            }
+        });
+    }
+
     #[test]
     fn first_argmax_picks_first_max_on_ties() {
         // F-063: EOS id appears twice; the *first* index wins (np.argmax), not max_by_key's last.
@@ -446,5 +1338,98 @@ mod tests {
         assert_eq!(s[5], -1e9);
         assert_eq!(s[6], 0.0);
         assert_eq!(s[8], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod text_pack_rank_tests {
+    use super::*;
+    use mlx_gen::gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader as Header};
+
+    fn cfg() -> ClipTextConfig {
+        // Isolate the pack inventory to its one bias-free projection. This is a metadata
+        // pack test, NOT a zero-layer full-forward acceptance fixture.
+        ClipTextConfig {
+            num_layers: 0,
+            model_dims: 64,
+            num_heads: 1,
+            max_length: 8,
+            vocab_size: 4,
+            projection_dim: Some(5),
+            hidden_act: ClipActivation::Gelu,
+        }
+    }
+    fn header(name: &str, shape: &[usize], dtype: Stored) -> Header {
+        Header {
+            name: name.into(),
+            shape: shape.to_vec(),
+            dtype,
+            data_bytes: shape.iter().product::<usize>() as u64 * dtype.size() as u64,
+        }
+    }
+    #[test]
+    fn dense_text_pack_preserves_all_leading_axes_in_q4_q8_header_bytes_host() {
+        // Independent literal counts: rank3 rows15*N64; rank4 rows30*N64. Each packed
+        // companion is one BF16 element per64-weight group. No shared pack helper oracle.
+        for (shape, initial, q4_data, q4_retained, q8_data, q8_retained) in [
+            (vec![3, 5, 64], 1920, 2460, 540, 2940, 1020),
+            (vec![2, 3, 5, 64], 3840, 4920, 1080, 5880, 2040),
+            (vec![1, 64, 64], 8192, 10496, 2304, 12544, 4352),
+        ] {
+            let headers = [header("text_projection.weight", &shape, Stored::F32)];
+            for (bits, data, retained) in [(4, q4_data, q4_retained), (8, q8_data, q8_retained)] {
+                let facts = text_pack_facts(&headers, &cfg(), Some(bits)).unwrap();
+                assert_eq!(facts.points.len(), 1);
+                assert_eq!(facts.points[0].before_resident, initial);
+                assert_eq!(
+                    facts.points[0].scratch,
+                    data + 5 * crate::quantum::PAGE_BYTES
+                );
+                assert_eq!(facts.retained, retained);
+            }
+        }
+    }
+    #[test]
+    fn text_pack_rank_generalization_does_not_relax_stored_pack_validator_host() {
+        let cfg = cfg();
+        let bad_rank = [header("text_projection.weight", &[64], Stored::F32)];
+        assert!(text_pack_facts(&bad_rank, &cfg, Some(4))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("at least two"));
+        let bad_group = [header("text_projection.weight", &[2, 3, 65], Stored::F32)];
+        assert!(text_pack_facts(&bad_group, &cfg, Some(8))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("group-aligned"));
+        let stored = [
+            header("text_projection.weight", &[1, 5, 8], Stored::U32),
+            header("text_projection.scales", &[1, 5, 1], Stored::BF16),
+            header("text_projection.biases", &[1, 5, 1], Stored::BF16),
+        ];
+        assert!(text_pack_facts(&stored, &cfg, Some(4))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("2-D"));
+        let stored = [
+            header("text_projection.weight", &[5, 8], Stored::U32),
+            header("text_projection.scales", &[5, 1], Stored::BF16),
+            header("text_projection.biases", &[5, 1], Stored::BF16),
+        ];
+        let facts = text_pack_facts(&stored, &cfg, Some(8)).unwrap();
+        assert!(
+            facts.points.is_empty(),
+            "already-packed ordinary loads remain no-op even when requested bits differ here"
+        );
+        assert_eq!(facts.retained, 180);
+        // Native quantize front-end permits zero group-aligned extents. Do not invent a
+        // metadata refusal before it; CPU/Metal evaluation viability is NOT asserted here.
+        let empty = [header("text_projection.weight", &[5, 0], Stored::F32)];
+        let facts = text_pack_facts(&empty, &cfg, Some(4)).unwrap();
+        assert_eq!(facts.points[0].scratch, 5 * crate::quantum::PAGE_BYTES);
+        assert_eq!(facts.retained, 0);
     }
 }

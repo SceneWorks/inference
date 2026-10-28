@@ -58,14 +58,13 @@ impl DownSampler {
             &self.b,
             tile,
             cancel,
-            crate::quantum::VAE_TILED_STAGE,
-            crate::quantum::VAE_TILE,
+            crate::quantum::VAE_ENCODE_TILED_STAGE,
+            crate::quantum::VAE_ENCODE_TILE,
         )?;
         Ok(h.transpose_axes(&[0, 3, 1, 2])?)
     }
 
-    /// The `[out, 3, 3, in]` NHWC conv weight (for the iOS convolution accounting proofs).
-    #[cfg(test)]
+    /// The `[out, 3, 3, in]` NHWC conv weight (for the iOS convolution accounting).
     pub(crate) fn weight(&self) -> &Array {
         &self.w
     }

@@ -41,8 +41,11 @@ pub mod block_residency;
 // A/B authority and a truthful opt-out for any path that cannot run one.
 pub mod capability;
 pub mod coherence;
+pub mod convrot_int8;
 pub mod error;
 pub mod img2img;
+pub mod ios_anchor_law;
+pub mod ios_pricing;
 pub mod ios_quantum;
 pub mod logical_weights;
 pub mod memory;
@@ -61,6 +64,9 @@ pub mod sampler;
 pub mod sc20686;
 pub mod scheduler;
 pub mod text_sample;
+// Native packed W4A8 (asym_w4a8_int8) projections (sc-26685): the descriptor-driven consume side of
+// the frozen Comfy Kitchen PR#90 dialect, sharing the S4 ConvRot activation kernels.
+pub mod w4a8_int8;
 pub mod weights;
 
 // Split modules: contract types in gen-core, MLX impls + lifts local (caption→joycaption,
@@ -154,3 +160,10 @@ pub use transform::{
     InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,
     TransformRequest,
 };
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::{IosCompiledDependencyAnchor, IOS_ENGINEERING_FEATURES_SUPPORTED};

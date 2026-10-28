@@ -126,10 +126,16 @@ fn run(id: &str, env: &str) {
 #[ignore = "needs WAN_I2V_14B_TRAIN_SNAPSHOT and explicitly scheduled CUDA"]
 fn wan_i2v_14b_lora_real_cuda() {
     run("wan2_2_i2v_14b", "WAN_I2V_14B_TRAIN_SNAPSHOT");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training_modes_cuda::wan_i2v_14b_lora_real_cuda");
 }
 
 #[test]
 #[ignore = "needs WAN_TI2V_5B_TRAIN_SNAPSHOT and explicitly scheduled CUDA"]
 fn wan_ti2v_5b_lora_real_cuda() {
     run("wan2_2_ti2v_5b", "WAN_TI2V_5B_TRAIN_SNAPSHOT");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training_modes_cuda::wan_ti2v_5b_lora_real_cuda");
 }

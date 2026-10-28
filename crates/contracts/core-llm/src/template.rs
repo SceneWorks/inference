@@ -211,7 +211,13 @@ impl JinjaChatTemplate {
 
     /// Read and parse `tokenizer_config.json` from a path.
     pub fn from_tokenizer_config_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = crate::__model_input_reader!(
+            std::fs::read_to_string(path),
+            "core-llm::template::JinjaChatTemplate::from_tokenizer_config_file/read_to_string",
+            Tokenizer,
+            path,
+            |__path| std::fs::read_to_string(__path)
+        )?;
         let v: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("parse tokenizer_config.json: {e}")))?;
         Self::from_tokenizer_config(&v)

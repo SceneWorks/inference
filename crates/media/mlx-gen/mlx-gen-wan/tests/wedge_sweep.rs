@@ -72,6 +72,7 @@ fn wan_ti2v_5b_wedge_sweep() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_5B_MODEL_DIR to the converted 5B snapshot dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_ti2v_5b_wedge_sweep; see preceding skip diagnostic");
             return;
         }
     };
@@ -288,4 +289,6 @@ fn wan_ti2v_5b_wedge_sweep() {
         gb(get_peak_memory()),
         gb(budget),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED wedge_sweep::wan_ti2v_5b_wedge_sweep");
 }

@@ -1197,8 +1197,13 @@ fn resolve_target_paths(transformer: &ZImageTransformer, cfg: &TrainingConfig) -
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = image::open(path)
-        .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_result!(
+        image::open(path),
+        "crates/media/mlx-gen/mlx-gen-z-image/src/training.rs::decode_image/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Ok(Image {
@@ -1548,7 +1553,7 @@ mod first_step_repro {
     /// force the backward. Run at SAFE resolutions (512/768) so it characterizes the split without
     /// risking the OOM kill, and extrapolate.
     #[test]
-    #[ignore = "needs real Z-Image weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights; run as its own process"]
     fn first_step_memory_attribution() {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         for edge in [512u32, 768] {
@@ -1591,13 +1596,16 @@ mod first_step_repro {
                 gb(full_peak.saturating_sub(fwd_peak)),
             );
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_memory_attribution");
     }
 
     /// Sweep resolution from tiny → production, printing the peak-memory curve. If the process dies
     /// (SIGKILL) at some edge, the prints from the survived edges are already flushed (eprintln +
     /// per-step completion), so the curve shows exactly where it falls over.
     #[test]
-    #[ignore = "needs real Z-Image weights; run as its own process (may SIGKILL)"]
+    #[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights; run as its own process (may SIGKILL)"]
     fn first_step_memory_sweep() {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         eprintln!("[sc-4874] sweeping first-step peak memory by resolution:");
@@ -1620,12 +1628,17 @@ mod first_step_repro {
             }
         }
         eprintln!("[sc-4874] sweep complete (reached the end without SIGKILL)");
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_memory_sweep"
+        );
     }
 
     /// Production resolution (1024) with a low MLX memory ceiling: tests whether forcing MLX to
     /// stay under a limit converts the silent SIGKILL into a catchable Rust error (story step 2).
     #[test]
-    #[ignore = "needs real Z-Image weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights; run as its own process"]
     fn first_step_1024_with_memory_limit() {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         let limit_gb = std::env::var("SC4874_LIMIT_GB")
@@ -1652,13 +1665,16 @@ mod first_step_repro {
             ),
             Err(e) => eprintln!("[sc-4874] edge 1024 returned CATCHABLE error under limit: {e}"),
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_1024_with_memory_limit");
     }
 
     /// The fix: at production resolution 1024, gradient checkpointing must drop the first-step peak
     /// well under the dense path's ~135 GB (which exceeds the 128 GB unified memory). Runs the dense
     /// step first (baseline), then the checkpointed step, and asserts a substantial reduction.
     #[test]
-    #[ignore = "needs real Z-Image weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights; run as its own process"]
     fn first_step_1024_checkpointed_vs_dense() {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         let locals = main_block_local_targets(&trainer);
@@ -1700,12 +1716,15 @@ mod first_step_repro {
             ckpt_peak < 128.0,
             "checkpointed peak must fit unified memory: {ckpt_peak:.2} GB"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_1024_checkpointed_vs_dense");
     }
 
     /// Gradient checkpointing must not change the math: the checkpointed forward+grads must match the
     /// dense path within fp tolerance (it reuses the same install + block forward, recompute-only).
     #[test]
-    #[ignore = "needs real Z-Image weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights; run as its own process"]
     fn checkpointed_grads_match_dense() {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         let locals = main_block_local_targets(&trainer);
@@ -1752,6 +1771,9 @@ mod first_step_repro {
             max_rel < 1e-3,
             "checkpointed grads must match dense within tolerance: max rel {max_rel:.2e}"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::checkpointed_grads_match_dense");
     }
 
     /// Max relative grad diff between two param maps (shared by the sc-4886/4887 parity tests).
@@ -1770,7 +1792,7 @@ mod first_step_repro {
     /// the SDPA checkpoint on must match the retained backward (flag off). Same decomposed
     /// attention, recomputed instead of retained → expect (near-)bit-identical.
     #[test]
-    #[ignore = "needs real Z-Image weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights; run as its own process"]
     fn attn_ckpt_grads_match_retained() {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         let edge = 256u32;
@@ -1810,6 +1832,9 @@ mod first_step_repro {
             max_rel < 1e-5,
             "attention-segment checkpointing must not change grads: max rel {max_rel:.2e}"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::attn_ckpt_grads_match_retained");
     }
 
     /// sc-4886/4887 — first-step peak sweep on the NEW training dense path (attention-segment
@@ -1817,7 +1842,7 @@ mod first_step_repro {
     /// `projected_dense_peak_gb` guard fit — refit the constants if this prints materially
     /// different numbers.
     #[test]
-    #[ignore = "needs real Z-Image weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights; run as its own process"]
     fn first_step_attn_ckpt_sweep() {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         trainer.transformer.set_sdpa_checkpoint(true, true);
@@ -1869,6 +1894,9 @@ mod first_step_repro {
             "blk-ckpt bf16",
         )
         .map_err(|e| eprintln!("  blk-ckpt bf16 CATCHABLE error: {e}"));
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_attn_ckpt_sweep");
     }
 
     /// sc-4887 — bf16 is mixed precision, NOT bit parity: assert the grads point the same way as
@@ -1877,7 +1905,7 @@ mod first_step_repro {
     /// genuinely smaller — a silent f32 re-promotion anywhere in the forward would pass the cosine
     /// check while saving nothing, so the memory ratio IS the dtype assertion.
     #[test]
-    #[ignore = "needs real Z-Image weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights; run as its own process"]
     fn bf16_grads_direction_and_memory_vs_f32() {
         let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
         trainer.transformer.set_sdpa_checkpoint(true, true);
@@ -2012,6 +2040,9 @@ mod first_step_repro {
             "bf16 must materially shrink the working set (silent f32 re-promotion?): \
              f32 {f32_peak:.2} GB vs bf16 {bf16_peak:.2} GB"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::bf16_grads_direction_and_memory_vs_f32");
     }
 }
 
@@ -2609,6 +2640,7 @@ mod depth_anchoring_tests {
     /// `diffusion_on = true` in `compute_loss_grads` ⇒ the depth step reports a diffusion term and
     /// total ≠ aux ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_depth_only() {
         let mut dit = tiny_dit();
         let cfg = cfg();
@@ -2637,6 +2669,9 @@ mod depth_anchoring_tests {
             gb > 0.0 && gb.is_finite(),
             "depth step LoRA-B grad |Σ| = {gb}"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only");
     }
 
     /// Review blocker, through the real step seam: with N = 2 and N = 4 images and `every_n = 2`,
@@ -2645,6 +2680,7 @@ mod depth_anchoring_tests {
     /// period-drifting window key flips each slot within any 3 periods). Mutation: drop the period
     /// drift ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn every_image_gets_diffusion_and_depth_steps() {
         for n in [2u64, 4] {
             let cache = cache_n(n);
@@ -2661,12 +2697,16 @@ mod depth_anchoring_tests {
                 );
             }
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::every_image_gets_diffusion_and_depth_steps");
     }
 
     /// Review major, through the real step seam: with gradient accumulation 2 both micro-steps of
     /// each optimizer window share one step kind (no averaged diffusion+depth update), and depth
     /// updates still happen. Mutation: build the tracker with accumulation 1 in `prepared` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn accumulation_windows_share_one_step_kind() {
         let cache = cache();
         let kinds = run_kinds(&cache, 2, 8);
@@ -2674,6 +2714,9 @@ mod depth_anchoring_tests {
             assert_eq!(w[0].1, w[1].1, "window {w:?} mixes step kinds ({kinds:?})");
         }
         assert!(kinds.iter().any(|(_, d)| *d), "{kinds:?}");
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::accumulation_windows_share_one_step_kind");
     }
 
     /// sc-2127 integration: with two resolution buckets (item-major cache, seeded shuffle) and
@@ -2686,6 +2729,7 @@ mod depth_anchoring_tests {
     /// the reference on the item, or pick the latent round-robin instead of from the schedule ⇒ the
     /// depth term differs from the scheduled entry's ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn two_buckets_interleave_with_per_entry_references() {
         let items = 2usize;
         let buckets = [
@@ -2821,6 +2865,9 @@ mod depth_anchoring_tests {
             );
         }
         assert_eq!(d.path().reference_computations(), cache.len());
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::two_buckets_interleave_with_per_entry_references");
     }
 
     /// AC2: the reference depth is computed once per image per job (per (image, bucket) cache
@@ -2828,6 +2875,7 @@ mod depth_anchoring_tests {
     /// at 3 (only the `AuxDriver` builds references; the step never does). Mutation: build the
     /// references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn reference_depth_is_computed_once_per_image_across_epochs() {
         let mut dit = tiny_dit();
         let cfg = cfg();
@@ -2839,6 +2887,9 @@ mod depth_anchoring_tests {
             step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), n);
         }
         assert_eq!(d.path().reference_computations(), cache.len());
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::reference_depth_is_computed_once_per_image_across_epochs");
     }
 
     /// E1: with depth anchoring off nothing is loaded and the step is bit-identical to the
@@ -2846,6 +2897,7 @@ mod depth_anchoring_tests {
     /// of an enabled path is bit-identical too. Mutation: always add `aux_term` (e.g. a 0-weighted
     /// copy) or reorder the loss reduction ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn everything_off_is_bit_identical_to_the_legacy_step() {
         assert!(load_perceptual_path(&TrainingConfig::default())
             .unwrap()
@@ -2932,6 +2984,9 @@ mod depth_anchoring_tests {
         for (k, v) in &g_none1 {
             assert_eq!(bits(v), bits(&g_on1[k]), "{k}");
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::everything_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// E7: depth anchoring grows the trainer memory estimate by the TAEF1 + DA2 footprint, more for
@@ -3017,6 +3072,7 @@ mod depth_anchoring_tests {
     /// `aux_term` from `combine_step_loss` in `compute_loss_grads` ⇒ the gradients match ⇒ red;
     /// build the references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn latent_perceptual_losses_train_the_lora_through_the_step_seam() {
         use mlx_gen::train::latent_lpips::{
             formula_weights as lpips_w, LatentLpips, LatentLpipsLoss,
@@ -3102,6 +3158,9 @@ mod depth_anchoring_tests {
             (gz - gw).abs() > 1e-6 * gz.max(1e-12),
             "the aux term must move the LoRA gradient: {gz} vs {gw}"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::latent_perceptual_losses_train_the_lora_through_the_step_seam");
     }
 }
 
@@ -3160,6 +3219,7 @@ mod subject_mask_reference_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_reference_path_hands_each_entry_its_items_mask() {
         let dir = tempfile::tempdir().unwrap();
         let img = write_png(dir.path(), "img.png", |_, _| 128);
@@ -3243,6 +3303,9 @@ mod subject_mask_reference_tests {
         )
         .unwrap();
         assert!(none.is_none());
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::subject_mask_reference_tests::the_reference_path_hands_each_entry_its_items_mask");
     }
 }
 
@@ -3443,6 +3506,7 @@ mod training_adapter_tests {
     /// Mutations: push the cancel at +1.0 ⇒ the bare-forward assert fails; skip `pop_cancel` ⇒ the
     /// restored assert fails.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_preview_cancel_renders_the_bare_base_and_pops_cleanly() {
         let tmp = tempfile::tempdir().unwrap();
         let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 2);
@@ -3496,6 +3560,9 @@ mod training_adapter_tests {
                 "{path}: pop did not restore"
             );
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::training_adapter_tests::the_preview_cancel_renders_the_bare_base_and_pops_cleanly");
     }
 
     /// (b) + training: a step on the merged base trains against base + adapter (its loss and
@@ -3504,6 +3571,7 @@ mod training_adapter_tests {
     /// Mutations: drop the `apply_training_adapter` call's merge ⇒ the loss assert fails; save the
     /// training adapter's keys alongside ⇒ the key-set assert fails.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn training_runs_on_the_merged_base_and_saves_only_the_trainable_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 3);
@@ -3534,6 +3602,9 @@ mod training_adapter_tests {
         assert!(keys
             .iter()
             .all(|k| !k.starts_with("diffusion_model.") && !k.contains("feed_forward")));
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::training_adapter_tests::training_runs_on_the_merged_base_and_saves_only_the_trainable_keys");
     }
 
     /// (c) E1: with no training adapter the trainer's base preparation is exactly the pre-sc-25213
@@ -3543,6 +3614,7 @@ mod training_adapter_tests {
     /// Mutations: make `prepare_training_base` skip (or repeat with another dtype) the cast, or touch
     /// the base in the `(None, None)` arm (e.g. a stray f32 round trip that is lossy, or a merge) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn no_training_adapter_prepares_exactly_the_pre_change_base() {
         for (use_bf16, compute) in [(false, Dtype::Float32), (true, Dtype::Bfloat16)] {
             let cfg = TrainingConfig {
@@ -3573,6 +3645,9 @@ mod training_adapter_tests {
                 assert_eq!(bits32(v), bits32(&g1[k]), "{k} (bf16={use_bf16})");
             }
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::training_adapter_tests::no_training_adapter_prepares_exactly_the_pre_change_base");
     }
 
     /// Any-dtype bit view (an f32 copy of a bf16 array is exact, so equal bits ⇔ equal values).
@@ -3696,6 +3771,7 @@ mod training_adapter_tests {
     /// is deleted; every later preview still cancels to the same bits (built residuals reused).
     /// Mutation: re-run the loader on every `push_cancel` ⇒ the second push fails (file gone) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_preview_cancel_is_built_once_and_reused() {
         let tmp = tempfile::tempdir().unwrap();
         let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 8);
@@ -3720,6 +3796,9 @@ mod training_adapter_tests {
             merged.pop_cancel(&mut dit).unwrap();
             assert!(lin(&mut dit, path).adapters().is_empty());
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::training_adapter_tests::the_preview_cancel_is_built_once_and_reused");
     }
 
     /// E7 for the cached cancel: it counts only with an adapter AND previews; a missing file is a

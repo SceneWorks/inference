@@ -24,6 +24,15 @@
 //! SC18769_WRITE_FORWARD_GOLDEN=1 cargo test -p candle-llm --test architecture_forward
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Tensor};
@@ -666,6 +675,7 @@ fn pack_mlx_affine_q8(weight: &Tensor, group_size: usize) -> (Tensor, Tensor, Te
 /// sidecars. Treating the shortened U32 matrix as dense reproduces the terminal LTX-2.5 failure:
 /// an activation with the real hidden width contracts against `hidden / 4` instead.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn mlx_affine_q8_decoder_uses_logical_projection_widths() {
     const GROUP: usize = 32;
     let mut case = llama();
@@ -727,6 +737,11 @@ fn mlx_affine_q8_decoder_uses_logical_projection_widths() {
         .map(|(dense, packed)| (dense - packed).abs())
         .fold(0f32, f32::max);
     assert!(max_abs < 0.05, "packed decoder drifted by {max_abs}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED mlx_affine_q8_decoder_uses_logical_projection_widths"
+    );
 }
 
 #[test]
@@ -781,6 +796,7 @@ fn packed_fused_projection_is_refused_before_dense_cast() {
 /// **The regression gate.** Every architecture's full forward output, exactly as the base branch
 /// produced it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_architecture_forward_is_bit_identical_to_the_base_branch() {
     let cases = cases();
 
@@ -823,6 +839,9 @@ fn every_architecture_forward_is_bit_identical_to_the_base_branch() {
         let got = run_forward(case);
         assert_forward_equal(case.name, &got, &want);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED every_architecture_forward_is_bit_identical_to_the_base_branch");
 }
 
 /// The fixture must cover **every** architecture the generic decoder serves, so a newly-added one
@@ -855,6 +874,7 @@ fn forward_goldens_cover_every_generic_architecture() {
 /// decodes, a 4-token verify and a rollback into it. Mixture-of-Experts stacks run the same path
 /// eagerly (their graph refusal is the router, not the positions).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_architecture_steps_identically_on_device_positions() {
     for case in cases() {
         let build = |on: bool| {
@@ -903,4 +923,9 @@ fn every_architecture_steps_identically_on_device_positions() {
             }
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED every_architecture_steps_identically_on_device_positions"
+    );
 }

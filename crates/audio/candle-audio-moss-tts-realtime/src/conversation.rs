@@ -449,6 +449,7 @@ mod tests {
     /// assistant turn folded in by `replay_turn`. A divergence between the two drive granularities, or
     /// a per-turn seed that leaked prior-turn sampling, turns this RED.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn render_conversation_equals_stepwise_advance_turn() {
         let cfg = tiny_cfg();
         let dec = tiny_decoder(&cfg);
@@ -538,6 +539,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(a.turns, a2.turns, "per-conversation determinism");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conversation::tests::render_conversation_equals_stepwise_advance_turn");
     }
 
     #[test]

@@ -186,6 +186,9 @@ fn bernini_full_pipeline_emits_its_declared_phase_boundaries_in_order() {
         Progress::Loading(LoadPhase::Renderer) => marks.push("renderer".into()),
         Progress::Decoding => marks.push("decode".into()),
         Progress::Step { current, .. } => marks.push(format!("step:{current}")),
+        Progress::PromptUpsamplingComplete
+        | Progress::ConditioningComplete
+        | Progress::Upsampling { .. } => {}
     })
     .expect("generate");
 
@@ -221,4 +224,6 @@ fn bernini_full_pipeline_emits_its_declared_phase_boundaries_in_order() {
         "decode",
         "decode closes the run: {marks:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED conformance::bernini_full_pipeline_emits_its_declared_phase_boundaries_in_order");
 }

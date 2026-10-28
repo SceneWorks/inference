@@ -106,6 +106,8 @@ fn default_sampler_equals_explicit_euler() {
         default.pixels, euler.pixels,
         "the unset-sampler default must be byte-identical to explicit euler (epic 7114 N1)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::default_sampler_equals_explicit_euler");
 }
 
 /// N2: a curated named sampler renders a coherent image that genuinely differs from Euler.
@@ -130,4 +132,6 @@ fn named_sampler_dpmpp_2m_is_coherent_and_distinct() {
         frac > 0.01,
         "dpmpp_2m must differ from euler (a real solver swap, not a silent fallback); differ {frac}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::named_sampler_dpmpp_2m_is_coherent_and_distinct");
 }

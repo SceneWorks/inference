@@ -166,9 +166,17 @@ fn parse_lora(entry: &str) -> (PathBuf, f32) {
 }
 
 fn load_image(path: &str) -> Image {
-    let rgb = image::open(path)
-        .unwrap_or_else(|e| panic!("open image {path}: {e}"))
-        .to_rgb8();
+    let rgb = candle_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/candle-gen/candle-gen-minimax-h3/tests/veda_ab.rs::load_image::image::open@7446",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
+    .unwrap_or_else(|e| panic!("open image {path}: {e}"))
+    .to_rgb8();
     Image {
         width: rgb.width(),
         height: rgb.height(),
@@ -537,7 +545,10 @@ fn veda_ab_render() {
         .generate(&req, &mut |p| match p {
             Progress::Step { .. } => step_ticks.push(gen_started.elapsed()),
             Progress::Decoding => decode_tick = Some(gen_started.elapsed()),
-            Progress::Loading(_) => {}
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .unwrap_or_else(|e| panic!("generate {MODEL_ID} ({tier}, veda {veda_on}): {e}"));
     let gen_total = gen_started.elapsed();
@@ -643,6 +654,9 @@ fn veda_ab_render() {
         if veda_on { "on" } else { "off" },
         degenerate.join("; ")
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED veda_ab::veda_ab_render");
 }
 
 #[test]

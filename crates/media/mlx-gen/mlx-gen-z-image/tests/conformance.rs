@@ -13,7 +13,7 @@ use gen_core_testkit::Profile;
 use mlx_gen::{LoadSpec, WeightsSource};
 
 #[test]
-#[ignore = "needs real Z-Image-Turbo weights (ZIMAGE_SNAPSHOT or HF cache); macos-mlx / dev box only"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image-Turbo weights (ZIMAGE_SNAPSHOT or HF cache); macos-mlx / dev box only"]
 fn z_image_turbo_satisfies_gen_core_contract() {
     let snap = common::snapshot();
     gen_core_testkit::conformance(
@@ -27,5 +27,10 @@ fn z_image_turbo_satisfies_gen_core_contract() {
         },
         // 256² / 2 steps — the minimum valid Z-Image config (min_size 256, multiple-of-16).
         &Profile::cheap(),
+    );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED conformance::z_image_turbo_satisfies_gen_core_contract"
     );
 }

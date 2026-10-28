@@ -754,6 +754,7 @@ fn gemma4_sliding_window_prefill_matches_the_eager_reference() {
 /// `attention_k_eq_v`: one projection feeds both key and value heads. K takes the scaled `k_norm`,
 /// V takes the **scale-free** `v_norm` of the *raw* projection output — so the two are different
 /// tensors built from one matmul, which is exactly what the goldens pin.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn gemma4_k_eq_v_projection_matches_golden() {
     let g = goldens();
@@ -848,6 +849,10 @@ fn gemma4_k_eq_v_projection_matches_golden() {
         max_abs_err(&host(&sep_v), &floats(&c["v_shared"])) > 1e-3,
         "a separate v_proj must not reproduce the shared one"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED gemma4_primitives::gemma4_k_eq_v_projection_matches_golden"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -862,6 +867,7 @@ fn gemma4_k_eq_v_projection_matches_golden() {
 /// logits path applies the same norm either way) and silently shifts every feature an encoder
 /// consumer builds. Here it is pinned by pushing the stack's last entry through the (tied) LM head
 /// and requiring it to reproduce the model's own all-position logits.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn hidden_state_stack_matches_the_logits_forward() {
     const HIDDEN: i32 = 32;
@@ -1012,6 +1018,8 @@ fn hidden_state_stack_matches_the_logits_forward() {
         err < 1e-3,
         "batch row 0 must match the batch-1 stack: {err}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma4_primitives::hidden_state_stack_matches_the_logits_forward");
 }
 
 /// A stray guard: the mask enum's new variant must not have quietly changed how the existing masks

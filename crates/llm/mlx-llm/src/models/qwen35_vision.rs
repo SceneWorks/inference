@@ -758,6 +758,7 @@ mod tests {
     /// qkv split, rotary layout, gelu variant, or merger grouping) diverges by `O(1)` — far above this.
     /// Regenerate the fixture with `/tmp/gen_vision.py` (sc-7633).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn encoder_matches_qwen3_5_vision_reference() {
         let j = oracle();
         let cfg = test_cfg();
@@ -955,6 +956,8 @@ mod tests {
             "vision encoder vs reference: rel err {rel} (max|Δ| {max_abs}, max|exp| {max_mag})\n got {got:?}\n exp {exp:?}"
         );
         assert_eq!(got, mlx_got, "MLX channels-last Conv3d conversion drifted");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35_vision::tests::encoder_matches_qwen3_5_vision_reference");
     }
 
     fn qwen3vl_oracle() -> serde_json::Value {
@@ -1038,6 +1041,12 @@ mod tests {
             "qwen3vl oracle: no `model.visual.*` shards in index {}",
             index_path.display()
         );
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_input_proof::record_reader_paths(
+            "mlx-llm::models::qwen35_vision::tests::qwen3vl_visual_weights/index",
+            crate::model_input_proof::InputRole::Configuration,
+            &[&index_path],
+        );
         let mut tensors = HashMap::new();
         for shard in shards {
             let shard_path = snapshot.join(&shard);
@@ -1085,6 +1094,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn qwen3vl_oracle_matches_hf_reference() {
         let j = qwen3vl_oracle();
         let cfg = qwen3vl_cfg(&j);
@@ -1149,6 +1159,7 @@ mod tests {
 
         let Some(snapshot) = qwen3vl_snapshot_dir() else {
             eprintln!("skipping qwen3vl real-weight oracle: cached HF snapshot unavailable");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in qwen3vl_oracle_matches_hf_reference; see preceding skip diagnostic");
             return;
         };
         let weights = qwen3vl_visual_weights(&snapshot);
@@ -1185,5 +1196,7 @@ mod tests {
                 "qwen3-vl deepstack tap {tap} vs HF: rel err {rel} (max|Δ| {max_abs}, max|exp| {max_mag})"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35_vision::tests::qwen3vl_oracle_matches_hf_reference");
     }
 }

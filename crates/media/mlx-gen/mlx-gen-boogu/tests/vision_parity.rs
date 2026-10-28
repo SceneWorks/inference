@@ -99,6 +99,8 @@ fn vision_tower_matches_reference() {
     for (i, c) in c_ds.iter().enumerate() {
         assert!(*c > 0.999, "deepstack[{i}] parity cosine {c} too low");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vision_parity::vision_tower_matches_reference");
 }
 
 #[test]

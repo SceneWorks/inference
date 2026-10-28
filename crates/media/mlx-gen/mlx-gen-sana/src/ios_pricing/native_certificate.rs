@@ -1,0 +1,865 @@
+//! Source/native certificate assembly. No physical-transfer or retirement premise.
+use super::native_alloc::NativeBackend;
+use super::native_graph::{cumulative_upper, NativeSampling};
+use super::*;
+use mlx_gen::ios_pricing::{
+    IosAnchorObservation, IosBoundRequest, IosCertifiedBounds, IosExecutionFacts,
+    IosMemoryCoordinate, IosMemoryDomain, IosObservedCheck, IosWindowBound,
+};
+
+fn invalid(reason: &str) -> Error {
+    Error::Unsupported(format!("SANA native certificate: {reason}"))
+}
+fn same_profile(expected: &IosPricing, supplied: &IosPricing) -> bool {
+    expected.phases == supplied.phases
+        && expected.windows == supplied.windows
+        && expected.absent_phases == supplied.absent_phases
+}
+fn context<'a>(
+    capture: &'a IosAnchorObservation,
+    check: &IosObservedCheck,
+    provider: &str,
+    kind: &str,
+) -> Result<&'a BTreeMap<String, u64>> {
+    let mut found = None;
+    for &index in &check.context {
+        let mark = capture
+            .metadata
+            .get(index as usize)
+            .ok_or_else(|| invalid("observation context is out of range"))?;
+        if mark.provider == provider && mark.kind == kind && found.replace(&mark.fields).is_some() {
+            return Err(invalid("duplicate actual source context"));
+        }
+    }
+    found.ok_or_else(|| invalid(&format!("missing actual {provider}/{kind} source mark")))
+}
+fn fields_match(fields: &BTreeMap<String, u64>, expected: &[(&str, u64)]) -> bool {
+    expected
+        .iter()
+        .all(|&(key, value)| fields.get(key) == Some(&value))
+}
+/// Check actual source roots at their actual checks. No replay/planned metadata
+/// is generated here. This binds the page law and closed graph to captured
+/// Gemma/trunk/DC-AE execution; stale/changed contexts refuse rather than giving
+/// the raw logical inventory native proof authority.
+fn observed_page(
+    facts: &SanaPricingFacts,
+    plan: &SanaPricingPlan,
+    pricing: &IosPricing,
+) -> Result<u64> {
+    let mut page = None;
+    let mut seen = [false; 4];
+    let embedding = facts
+        .text_encoder
+        .0
+        .get("model.embed_tokens.scales")
+        .or_else(|| facts.text_encoder.0.get("model.embed_tokens.weight"))
+        .ok_or_else(|| invalid("missing actual Gemma embedding dtype"))?;
+    let g = &facts.gemma;
+    let t = &facts.transformer;
+    let d = &facts.dc_ae;
+    let patch = u32::try_from(t.patch_size)
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or_else(|| invalid("invalid source patch dimension"))?;
+    let tokens = u64::from(plan.height / 32 / patch)
+        .checked_mul(u64::from(plan.width / 32 / patch))
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| invalid("source token extent exceeds native axis"))?;
+    let caption_tokens = i32::try_from(facts.caption_tokens)
+        .map_err(|_| invalid("source caption extent exceeds native axis"))?;
+    let latent_elements = u64::from(plan.height / 32)
+        .checked_mul(u64::from(plan.width / 32))
+        .and_then(|n| n.checked_mul(u64::try_from(d.latent_channels).ok()?))
+        .ok_or_else(|| invalid("source unscaled latent extent overflow"))?;
+    for capture in &pricing.observations {
+        if !capture.has_source_witness_coordinate() {
+            return Err(invalid("incompatible observation domain/baseline"));
+        }
+        for check in &capture.checks {
+            let expected = match check.label.as_str() {
+                label if label == GEMMA_LABELS[0] => Some((
+                    0,
+                    "gemma2",
+                    "native-forward",
+                    vec![
+                        ("schema", 1),
+                        ("batch", 1),
+                        ("tokens", facts.gemma_tokens),
+                        ("hidden", g.hidden_size as u64),
+                        ("layers", g.num_layers as u64),
+                        ("heads", g.num_heads as u64),
+                        ("kv_heads", g.num_kv_heads as u64),
+                        ("head_dim", g.head_dim as u64),
+                        ("intermediate", g.intermediate_size as u64),
+                        (
+                            "dtype",
+                            mlx_gen::sampler::sampling_dtype_code(embedding.dtype),
+                        ),
+                        ("pad_mask", 1),
+                    ],
+                )),
+                labels::ENTRY => Some((
+                    1,
+                    "sana",
+                    "native-trunk",
+                    vec![
+                        ("schema", 1),
+                        ("batch", 1),
+                        ("height", u64::from(plan.height / 32)),
+                        ("width", u64::from(plan.width / 32)),
+                        ("channels", t.in_channels as u64),
+                        ("caption_tokens", facts.caption_tokens),
+                        ("caption_width", g.hidden_size as u64),
+                        ("layers", t.num_layers as u64),
+                        ("dim", t.inner_dim() as u64),
+                        ("patch", t.patch_size as u64),
+                        ("qk_norm", u64::from(t.qk_norm)),
+                        ("guidance_embeds", u64::from(t.guidance_embeds)),
+                        (
+                            "dtype",
+                            mlx_gen::sampler::sampling_dtype_code(Dtype::Float32),
+                        ),
+                        ("caption_mask", 1),
+                        ("streamed", 0),
+                        (
+                            "query_rows",
+                            plan.attention.query_block(
+                                1,
+                                t.num_cross_attention_heads,
+                                tokens,
+                                caption_tokens,
+                            ) as u64,
+                        ),
+                    ],
+                )),
+                labels::DECODER_INPUT => Some((
+                    2,
+                    "sana",
+                    "native-decoder",
+                    vec![
+                        ("schema", 1),
+                        ("batch", 1),
+                        ("height", u64::from(plan.height / 32)),
+                        ("width", u64::from(plan.width / 32)),
+                        ("channels", d.latent_channels as u64),
+                        ("stages", d.num_stages() as u64),
+                        (
+                            "tail_stages",
+                            d.block_types
+                                .iter()
+                                .take_while(|t| **t == BlockType::Res)
+                                .count() as u64,
+                        ),
+                        (
+                            "input_width",
+                            *d.block_out_channels
+                                .last()
+                                .ok_or_else(|| invalid("empty DC-AE stages"))?
+                                as u64,
+                        ),
+                        (
+                            "dtype",
+                            mlx_gen::sampler::sampling_dtype_code(Dtype::Float32),
+                        ),
+                    ],
+                )),
+                labels::DECODED_PIXELS => Some((
+                    3,
+                    "sana",
+                    "native-pixels",
+                    vec![
+                        ("schema", 1),
+                        ("batch", 1),
+                        ("channels", 3),
+                        ("height", u64::from(plan.height)),
+                        ("width", u64::from(plan.width)),
+                        (
+                            "dtype",
+                            mlx_gen::sampler::sampling_dtype_code(Dtype::Float32),
+                        ),
+                        ("nchw_view_of_decoder", 1),
+                        ("held_unscaled_elements", latent_elements),
+                    ],
+                )),
+                _ => None,
+            };
+            let Some((slot, provider, kind, expected)) = expected else {
+                continue;
+            };
+            if check.phase != ios_quantum_phase(&check.label) {
+                return Err(invalid("actual source mark phase mismatch"));
+            }
+            if !fields_match(context(capture, check, provider, kind)?, &expected) {
+                return Err(invalid("actual source graph shape/dtype/regime changed"));
+            }
+            // A nested guard's successful restoration is the latest ACTUAL
+            // policy application at outer pixel/selection checks. It is not a
+            // failed setup. U bounds cache reuse under either cache policy; no
+            // cache/alias/physical release is inferred from the restore event.
+            let scope = context(capture, check, "mlx", "allocation-scope")?;
+            if !fields_match(
+                scope,
+                &[
+                    ("schema", 1),
+                    ("setter_succeeded", 1),
+                    ("cache_query_succeeded", 1),
+                ],
+            ) || scope
+                .get("restoring")
+                .is_none_or(|restoring| *restoring > 1)
+            {
+                return Err(invalid(
+                    "native allocation scope was not observed successfully",
+                ));
+            }
+            let current = *scope
+                .get("page_bytes")
+                .filter(|p| p.is_power_of_two())
+                .ok_or_else(|| invalid("missing actual native page basis"))?;
+            if page.replace(current).is_some_and(|old| old != current) {
+                return Err(invalid("inconsistent actual native page basis"));
+            }
+            seen[slot] = true;
+        }
+    }
+    for (slot, label) in [
+        GEMMA_LABELS[0],
+        labels::ENTRY,
+        labels::DECODER_INPUT,
+        labels::DECODED_PIXELS,
+    ]
+    .iter()
+    .enumerate()
+    {
+        if pricing.windows.iter().any(|w| w.label == *label) && !seen[slot] {
+            return Err(invalid(&format!(
+                "no source-correlated actual {label} check"
+            )));
+        }
+    }
+    page.ok_or_else(|| invalid("no actual native allocation basis"))
+}
+
+fn validate_actual_generation(
+    req: &IosPricingRequest<'_>,
+    generation: &mlx_gen::GenerationRequest,
+) -> Result<()> {
+    if req.geometry.width != generation.width
+        || req.geometry.height != generation.height
+        || req.geometry.batch != generation.count
+        || req.geometry.frames != 1
+    {
+        return Err(invalid(
+            "actual generation geometry/count differs from pricing transport",
+        ));
+    }
+    if generation
+        .conditioning
+        .iter()
+        .any(|c| !matches!(c, mlx_gen::Conditioning::Reference { .. }))
+    {
+        return Err(invalid(
+            "conditioning role is not served by Sana generation",
+        ));
+    }
+    let reference = crate::model::resolve_reference(generation, req.provider)?;
+    let has_reference = reference.is_some();
+    let mode_matches = matches!(
+        (req.mode, has_reference),
+        (MemoryMode::TextToImage, false) | (MemoryMode::ImageToImage, true)
+    );
+    if !mode_matches || req.geometry.reference_count != u32::from(has_reference) {
+        return Err(invalid(
+            "actual reference role differs from pricing mode/geometry",
+        ));
+    }
+    if generation
+        .memory
+        .is_some_and(|actual| actual != *req.execution)
+    {
+        return Err(invalid(
+            "actual generation memory levers differ from pricing execution",
+        ));
+    }
+    Ok(())
+}
+
+fn controls(side: &IosBoundRequest<'_>) -> Result<(PricingSampling, u32)> {
+    let req = side.pricing;
+    req.validate_work_context()?;
+    if req.transform.is_some() || req.depth.is_some() {
+        return Err(invalid("Sana certificate requires image-generation work"));
+    }
+    if let Some(generation) = req.generation {
+        validate_actual_generation(req, generation)?;
+    }
+    let has_init = matches!(req.mode, MemoryMode::ImageToImage);
+    match (req.generation, side.replay) {
+        (Some(generation), None) => Ok((
+            match req.provider {
+                crate::MODEL_ID => PricingSampling::Flow(crate::sampling::resolve_base_with_init(
+                    generation, has_init,
+                )?),
+                crate::SPRINT_MODEL_ID => PricingSampling::Scm(
+                    crate::sampling::resolve_sprint_with_init(generation, has_init)?,
+                ),
+                _ => return Err(invalid("unknown provider")),
+            },
+            generation.count,
+        )),
+        (None, Some(replay)) => {
+            if replay.true_reference_count != u32::from(has_init)
+                || replay.mask_count != 0
+                || replay.control_count != 0
+                || replay.source.is_some()
+            {
+                return Err(invalid(
+                    "replay conditioning/source roles do not match Sana's served route",
+                ));
+            }
+            let sampling = match req.provider {
+                crate::MODEL_ID => PricingSampling::Flow(
+                    mlx_gen::sampler::flow_sampling::ResolvedFlowControls::from_recipe(
+                        &mlx_gen::sampler::flow_sampling::FlowSamplingRecipe::from_token(
+                            replay.token,
+                        )?,
+                        crate::sampling::base_defaults(),
+                        mlx_gen::TimestepConvention::Sigma,
+                    )?,
+                ),
+                crate::SPRINT_MODEL_ID => {
+                    PricingSampling::Scm(crate::sampling::ResolvedSprintControls::from_recipe(
+                        &crate::sampling::ScmSamplingRecipe::from_token(replay.token)?,
+                        has_init,
+                    )?)
+                }
+                _ => return Err(invalid("unknown replay provider")),
+            };
+            Ok((sampling, req.geometry.batch))
+        }
+        _ => Err(invalid(
+            "needs exactly one actual generation or recorded controls replay",
+        )),
+    }
+}
+fn materialize(sampling: PricingSampling, has_init: bool, budget: u64) -> Result<NativeSampling> {
+    match sampling {
+        PricingSampling::Flow(controls) => {
+            controls.check_capture_schedule_bytes(budget)?;
+            let steps = controls.steps();
+            let strength = controls.recipe().effective_strength();
+            let native =
+                mlx_gen::FlowMatchEuler::for_static_shift(steps, crate::pipeline::SCHEDULE_SHIFT);
+            let mut resolved = controls
+                .materialize_schedule(&native.sigmas, crate::pipeline::SCHEDULE_SHIFT.ln())?;
+            let start_step = if has_init {
+                let strength = mlx_gen::img2img::resolve_strength(None, strength);
+                let start = mlx_gen::img2img::init_time_step(steps, Some(strength));
+                resolved.window(start, resolved.sigmas().len())?;
+                start
+            } else {
+                0
+            };
+            Ok(NativeSampling::Flow {
+                resolved,
+                start_step,
+            })
+        }
+        PricingSampling::Scm(controls) => {
+            Ok(NativeSampling::Scm(controls.materialize_capture(budget)?))
+        }
+    }
+}
+
+#[path = "native_observations.rs"]
+mod retirement;
+pub use retirement::{validate_retirement_receipts, RetirementCheckView, RetirementMetadataView};
+
+/// Projection choice only. The source/counter/epoch cardinality proof below
+/// remains mandatory before any tighter native bound is returned.
+pub fn observed_pricing_regime(pricing: &IosPricing) -> SanaPricingRegime {
+    retirement::observed_regime(pricing)
+}
+pub(super) struct CertificateProfile<'a> {
+    pub facts: &'a SanaPricingFacts,
+    pub plan: &'a SanaPricingPlan,
+    pub expected: &'a IosPricing,
+    pub observed: &'a IosPricing,
+    pub sampling: Option<&'a NativeSampling>,
+}
+pub(super) fn certify_profiles(
+    anchor: CertificateProfile<'_>,
+    request: CertificateProfile<'_>,
+    regime: SanaPricingRegime,
+    analysis_budget: u64,
+) -> Result<Vec<IosWindowBound>> {
+    if !same_profile(anchor.expected, anchor.observed)
+        || !same_profile(request.expected, request.observed)
+    {
+        return Err(invalid(
+            "pricing undercounts or changes the source-generated owner/window profile",
+        ));
+    }
+    let page = observed_page(anchor.facts, anchor.plan, anchor.observed)?;
+    if !request.observed.observations.is_empty()
+        && observed_page(request.facts, request.plan, request.observed)? != page
+    {
+        return Err(invalid(
+            "actual request and anchor allocator page domains differ",
+        ));
+    }
+    let request_sampling = request
+        .sampling
+        .ok_or_else(|| invalid("request source schedule missing"))?;
+    let upper = match regime {
+        SanaPricingRegime::Ordinary => cumulative_upper(
+            request.facts,
+            request.plan,
+            request_sampling,
+            page,
+            NativeBackend::Cpu,
+        )?
+        .max(cumulative_upper(
+            request.facts,
+            request.plan,
+            request_sampling,
+            page,
+            NativeBackend::Metal,
+        )?),
+        SanaPricingRegime::RetiredLifecycle => {
+            if observed_pricing_regime(anchor.observed) != SanaPricingRegime::RetiredLifecycle {
+                return Err(invalid(
+                    "additional tight credit requires actual complete native anchor receipts",
+                ));
+            }
+            let anchor_sampling = anchor
+                .sampling
+                .ok_or_else(|| invalid("native anchor source schedule missing"))?;
+            let (_, anchor_epochs) = super::native_graph::retired_profile(
+                anchor.facts,
+                anchor.plan,
+                anchor_sampling,
+                page,
+                NativeBackend::Cpu,
+                analysis_budget,
+            )?;
+            retirement::validate(
+                anchor.facts,
+                anchor.plan,
+                anchor.observed,
+                &anchor_epochs,
+                anchor_sampling.guided(),
+            )?;
+            let (cpu, request_epochs) = super::native_graph::retired_profile(
+                request.facts,
+                request.plan,
+                request_sampling,
+                page,
+                NativeBackend::Cpu,
+                analysis_budget,
+            )?;
+            let metal = super::native_graph::retired_upper(
+                request.facts,
+                request.plan,
+                request_sampling,
+                page,
+                NativeBackend::Metal,
+                analysis_budget,
+            )?;
+            if !request.observed.observations.is_empty() {
+                retirement::validate(
+                    request.facts,
+                    request.plan,
+                    request.observed,
+                    &request_epochs,
+                    request_sampling.guided(),
+                )?;
+            }
+            cpu.max(metal)
+        }
+    };
+    let request = request.observed;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut bounds = Vec::new();
+    for window in &request.windows {
+        let class = window
+            .profile_class()
+            .ok_or_else(|| invalid("request has an unclassified source window"))?;
+        if seen.insert(class) {
+            bounds.push(IosWindowBound::RawPhysical {
+                domain: IosMemoryDomain::NativeAllocatorGrowth,
+                coordinate: IosMemoryCoordinate::BeforeModelLoad,
+                request_class: class.into(),
+                growth_upper: upper,
+            });
+        }
+    }
+    if bounds.is_empty() {
+        return Err(invalid("empty native source request"));
+    }
+    Ok(bounds)
+}
+
+/// Complete NATIVE tensor-allocation upper. Ordinary uses cumulative owners;
+/// the configured joined program additionally needs actual complete range
+/// receipts and exact source epoch counts. Every solver uses its actual factory
+/// and actual schedule tail under the caller's analysis-storage allowance.
+///
+/// HOST remains Undeclared: native receipt/state/ackclosure owners, global-stream
+/// snapshots N, temporary owners T, pending buffers P, error/key bytes K and
+/// opaque allocator/driver backing are NOT NativeAllocatorGrowth. This function
+/// grants NO physical/process/phone-fit permission, premise approval or reserve.
+pub fn ios_certified_bounder(
+    anchor_request: &IosBoundRequest<'_>,
+    anchor_pricing: &IosPricing,
+    request: &IosBoundRequest<'_>,
+    request_pricing: &IosPricing,
+    execution: &IosExecutionFacts,
+) -> Result<IosCertifiedBounds> {
+    if !execution.ios_quantum_scope {
+        return Err(invalid("execution is outside the iOS quantum source graph"));
+    }
+    let regime = if execution.native_retirement
+        == mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle
+    {
+        if request
+            .pricing
+            .generation
+            .is_some_and(|generation| generation.memory.is_none())
+        {
+            return Err(invalid(
+                "legacy None cannot select the joined native program",
+            ));
+        }
+        SanaPricingRegime::RetiredLifecycle
+    } else {
+        SanaPricingRegime::Ordinary
+    };
+    let (anchor_controls, anchor_count) = controls(anchor_request)?;
+    let (request_controls, request_count) = controls(request)?;
+    // Caller-owned analysis allowance, before snapshots or N-sized schedules.
+    let schedule_bytes = |controls: &PricingSampling| -> Result<u64> {
+        match controls {
+            PricingSampling::Flow(c) => {
+                c.check_capture_schedule_bytes(execution.analysis_budget_bytes)?;
+                c.host_schedule_bytes()
+            }
+            PricingSampling::Scm(c) => {
+                c.check_capture_budget(execution.analysis_budget_bytes)?;
+                c.host_schedule_bytes()
+            }
+        }
+    };
+    let request_bytes = schedule_bytes(&request_controls)?;
+    let anchor_bytes = if regime == SanaPricingRegime::RetiredLifecycle {
+        schedule_bytes(&anchor_controls)?
+    } else {
+        0
+    };
+    let retained = request_bytes
+        .checked_add(anchor_bytes)
+        .ok_or_else(|| invalid("analysis schedule storage overflow"))?;
+    let node_budget = execution
+        .analysis_budget_bytes
+        .checked_sub(retained)
+        .ok_or_else(|| invalid("combined source schedules exceed caller analysis allowance"))?;
+    let (anchor_facts, anchor_plan) = resolve_source_plan(anchor_request.pricing, anchor_count)?;
+    let (request_facts, request_plan) = resolve_source_plan(request.pricing, request_count)?;
+    let anchor_regime = observed_pricing_regime(anchor_pricing);
+    let expected_anchor = price_request_controls_in_regime(
+        anchor_request.pricing,
+        anchor_count,
+        anchor_controls.clone(),
+        anchor_regime,
+    )?;
+    let expected_request = price_request_controls_in_regime(
+        request.pricing,
+        request_count,
+        request_controls.clone(),
+        regime,
+    )?;
+    let anchor_sampling = if regime == SanaPricingRegime::RetiredLifecycle {
+        Some(materialize(
+            anchor_controls,
+            anchor_plan.img2img,
+            execution.analysis_budget_bytes,
+        )?)
+    } else {
+        None
+    };
+    let sampling = materialize(
+        request_controls,
+        request_plan.img2img,
+        execution.analysis_budget_bytes,
+    )?;
+    certify_profiles(
+        CertificateProfile {
+            facts: &anchor_facts,
+            plan: &anchor_plan,
+            expected: &expected_anchor,
+            observed: anchor_pricing,
+            sampling: anchor_sampling.as_ref(),
+        },
+        CertificateProfile {
+            facts: &request_facts,
+            plan: &request_plan,
+            expected: &expected_request,
+            observed: request_pricing,
+            sampling: Some(&sampling),
+        },
+        regime,
+        node_budget,
+    )
+    .map(IosCertifiedBounds::proven)
+}
+
+/// Source event cardinalities for storage preflight, NEVER bytes/headroom or a
+/// model/counter/physical permit. Uses the SAME closed programme as allocation
+/// interpretation, without tensor-header/workspace evaluation or native calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureObservationPlan {
+    pub checked_quanta: u64,
+    pub quantum_events: u64,
+    pub quantum_label_bytes: u64,
+    pub native_epoch_marks: u64,
+    pub native_joined_marks: u64,
+    pub native_shape_marks: u64,
+    pub native_root_marks: u64,
+    /// Provider-owned ordinary metadata (including allocation-scope enter/restore).
+    /// The recorder owner must add any of its OWN enclosing observed scopes/events.
+    pub ordinary_sampling_marks: u64,
+}
+pub fn capture_observation_plan(
+    req: &IosPricingRequest<'_>,
+    page_bytes: u64,
+    analysis_budget: u64,
+) -> Result<CaptureObservationPlan> {
+    if req.generation.is_none()
+        || req
+            .generation
+            .is_some_and(|generation| generation.memory.is_none())
+    {
+        return Err(invalid(
+            "native capture event query requires original explicit-memory request",
+        ));
+    }
+    let side = IosBoundRequest {
+        pricing: req,
+        replay: None,
+    };
+    let (controls, count) = controls(&side)?;
+    match &controls {
+        PricingSampling::Flow(c) => c.check_capture_schedule_bytes(analysis_budget)?,
+        PricingSampling::Scm(c) => c.check_capture_budget(analysis_budget)?,
+    }
+    let (facts, plan) = resolve_source_plan(req, count)?;
+    let sampling = materialize(controls, plan.img2img, analysis_budget)?;
+    let counts = super::native_graph::source_epoch_counts(
+        &facts,
+        &plan,
+        &sampling,
+        page_bytes,
+        analysis_budget,
+    )?;
+    let mut nonload = 0u64;
+    let mut labels_bytes = 0u64;
+    for label in super::native_graph::native_epoch_labels() {
+        let count = counts.count(label)?;
+        nonload = nonload
+            .checked_add(count)
+            .ok_or_else(|| invalid("capture source checks overflow"))?;
+        let bytes = count
+            .checked_mul(label.len() as u64)
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| invalid("capture source label storage overflow"))?;
+        labels_bytes = labels_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("capture source label sum overflow"))?;
+    }
+    // Real production Resident loads precede invocation; Sequential loads are
+    // inside it. All loads still produce ordinary Checked/listener events.
+    let (loads, load_bytes) = capture_load_events(plan.sequential, plan.img2img);
+    labels_bytes = labels_bytes
+        .checked_add(load_bytes)
+        .ok_or_else(|| invalid("capture load label sum overflow"))?;
+    let checked = nonload
+        .checked_add(loads)
+        .ok_or_else(|| invalid("capture checked sum overflow"))?;
+    let native_epochs = nonload
+        .checked_add(if plan.sequential { loads } else { 0 })
+        .ok_or_else(|| invalid("capture native epoch sum overflow"))?;
+    let selected = counts.count(labels::TEXT_SELECTED)?;
+    let shape = counts
+        .count(labels::ENCODER_GLU)?
+        .checked_add(counts.count(labels::DECODER_GLU)?)
+        .and_then(|count| count.checked_add(selected))
+        .ok_or_else(|| invalid("capture owner-shape count overflow"))?;
+    let ordinary_sampling_marks = ordinary_source_marks(&counts, &plan, &sampling)?;
+    Ok(CaptureObservationPlan {
+        checked_quanta: checked,
+        quantum_events: checked
+            .checked_add(nonload)
+            .ok_or_else(|| invalid("capture event count overflow"))?,
+        quantum_label_bytes: labels_bytes,
+        native_epoch_marks: native_epochs,
+        native_joined_marks: nonload,
+        native_shape_marks: shape,
+        native_root_marks: 2 + u64::from(plan.sequential && plan.img2img),
+        ordinary_sampling_marks,
+    })
+}
+
+/// Physical catalog captures additionally preflight the complete resident union before their
+/// observation planner. Sequential captures do not execute that guard. These are listener
+/// events only, not additional native allocation epochs or graph execution.
+fn capture_load_events(sequential: bool, img2img: bool) -> (u64, u64) {
+    let loads = 2 + u64::from(sequential && img2img) + u64::from(!sequential);
+    let bytes = labels::TEXT_LOAD.len()
+        + labels::HEAVY_LOAD.len()
+        + if sequential && img2img {
+            labels::REFERENCE_ENCODER_LOAD.len()
+        } else {
+            0
+        }
+        + if !sequential {
+            labels::RESIDENT_LOAD.len()
+        } else {
+            0
+        };
+    (loads, bytes as u64)
+}
+
+pub(super) fn ordinary_source_marks(
+    counts: &super::native_graph::NativeEpochCounts,
+    plan: &SanaPricingPlan,
+    sampling: &NativeSampling,
+) -> Result<u64> {
+    let n = u64::from(plan.count);
+    let count = |label| counts.count(label);
+    let add = |a: u64, b: u64| {
+        a.checked_add(b)
+            .ok_or_else(|| invalid("ordinary capture mark count overflow"))
+    };
+    let times = |a: u64, b: u64| {
+        a.checked_mul(b)
+            .ok_or_else(|| invalid("ordinary capture mark product overflow"))
+    };
+    // model::generate request + its allocation scope, Gemma forward metadata
+    // + scope for each actual caption, serial start/end, and solve_complete/output.
+    let mut ordinary = add(3, times(3, count(GEMMA_LABELS[0])?)?)?;
+    ordinary = add(ordinary, times(3, n)?)?;
+    let forwards = count(labels::ENTRY)?;
+    ordinary = add(
+        ordinary,
+        match sampling {
+            NativeSampling::Flow { .. } => {
+                // sampler callback_evaluated/predict_argument/predict_return plus
+                // pipeline forward_argument; each conditioned/unconditioned trunk
+                // adds forward, native-trunk and allocation-scope enter/restore.
+                let callbacks = count(mlx_gen::sampler::SAMPLER_STEP_QUANTUM)?
+                    .checked_sub(n)
+                    .ok_or_else(|| invalid("source sampler final count exceeds callbacks"))?;
+                add(
+                    add(times(4, callbacks)?, times(4, forwards)?)?,
+                    counts.solver_marks,
+                )?
+            }
+            // callback_evaluated, forward_argument/return, update, native-trunk,
+            // and the actual trunk allocation-scope enter/restore per SCM step.
+            NativeSampling::Scm(_) => times(7, forwards)?,
+        },
+    )?;
+    // Decoder head: one native-decoder + scope; each actual tail (including
+    // tiles): its scope. Tiled folding has one enclosing scope per output.
+    ordinary = add(ordinary, times(3, count(labels::DECODER_INPUT)?)?)?;
+    ordinary = add(ordinary, times(2, count(labels::DECODER_OUTPUT)?)?)?;
+    ordinary = add(ordinary, times(2, count(labels::TILE_FINALIZE)?)?)?;
+    // Pixel conversion: native-pixels + allocation scope. Encoder has one
+    // native-encoder per actual prefix tile, with one enclosing encode scope.
+    ordinary = add(ordinary, times(3, count(labels::DECODED_PIXELS)?)?)?;
+    ordinary = add(ordinary, count(labels::ENCODER_INPUT)?)?;
+    add(ordinary, 2 * u64::from(count(labels::ENCODER_INPUT)? > 0))
+}
+
+#[cfg(test)]
+pub(super) fn fixture_sampling(
+    generation: &mlx_gen::GenerationRequest,
+    sprint: bool,
+    has_init: bool,
+    budget: u64,
+) -> Result<NativeSampling> {
+    let controls = if sprint {
+        PricingSampling::Scm(crate::sampling::resolve_sprint_with_init(
+            generation, has_init,
+        )?)
+    } else {
+        PricingSampling::Flow(crate::sampling::resolve_base_with_init(
+            generation, has_init,
+        )?)
+    };
+    materialize(controls, has_init, budget)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::ios_pricing::IosObservedMetadata;
+
+    #[test]
+    fn resident_capture_counts_the_union_guard_and_sequential_does_not() {
+        let base = (labels::TEXT_LOAD.len() + labels::HEAVY_LOAD.len()) as u64;
+        for reference in [false, true] {
+            assert_eq!(
+                capture_load_events(false, reference),
+                (3, base + labels::RESIDENT_LOAD.len() as u64)
+            );
+        }
+        assert_eq!(capture_load_events(true, false), (2, base));
+        assert_eq!(
+            capture_load_events(true, true),
+            (3, base + labels::REFERENCE_ENCODER_LOAD.len() as u64)
+        );
+    }
+
+    // Protocol tests only: these synthetic marks are NEVER passed to the
+    // certificate builder or represented as observed production execution.
+    #[test]
+    fn context_rejects_dangling_duplicate_and_missing_source_marks() {
+        let capture = IosAnchorObservation {
+            metadata: vec![IosObservedMetadata {
+                provider: "sana".into(),
+                kind: "native-trunk".into(),
+                fields: [("schema".into(), 1), ("streamed".into(), 0)].into(),
+            }],
+            ..Default::default()
+        };
+        let mut check = IosObservedCheck {
+            phase: Some(IosPhase::Denoise),
+            label: labels::ENTRY.into(),
+            context: vec![0],
+        };
+        let mark = context(&capture, &check, "sana", "native-trunk").unwrap();
+        assert!(fields_match(mark, &[("schema", 1), ("streamed", 0)]));
+        assert!(!fields_match(mark, &[("streamed", 1)]));
+        assert!(!fields_match(mark, &[("caption_tokens", 300)]));
+        check.context.push(0);
+        assert!(context(&capture, &check, "sana", "native-trunk").is_err());
+        check.context = vec![u32::MAX];
+        assert!(context(&capture, &check, "sana", "native-trunk").is_err());
+        check.context.clear();
+        assert!(context(&capture, &check, "sana", "native-trunk").is_err());
+    }
+    #[test]
+    fn every_count_and_absence_belongs_to_the_source_profile() {
+        let mut expected = IosPricing::default();
+        expected.take(IosPhase::Denoise, 32, 64, labels::BLOCK);
+        expected.phase_not_run(IosPhase::Encode, "no reference");
+        let mut changed = expected.clone();
+        changed.phases[0].resident_bytes -= 1;
+        assert!(!same_profile(&expected, &changed));
+        let mut changed = expected.clone();
+        changed.absent_phases.clear();
+        assert!(!same_profile(&expected, &changed));
+    }
+}

@@ -242,6 +242,7 @@ fn setup() -> (
 
 /// (A) Incremental cached AR forward == single full-sequence forward under the block-causal mask.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn cached_incremental_matches_full_recompute() {
     let (causal, cross_kv, cfg) = setup();
     let c = cfg.wan.in_dim as i32;
@@ -334,10 +335,13 @@ fn cached_incremental_matches_full_recompute() {
         d_wrong > 10.0 * d.max(1e-6),
         "a zero RoPE offset must diverge from the correct offset (control d_wrong={d_wrong} vs d={d})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED causal_forward::cached_incremental_matches_full_recompute");
 }
 
 /// (B) Single chunk, empty cache, no mask == stock non-causal Wan `forward_packed` (the anchor).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn single_chunk_equals_stock_wan_forward() {
     let (causal, cross_kv, cfg) = setup();
     let c = cfg.wan.in_dim as i32;
@@ -372,10 +376,15 @@ fn single_chunk_equals_stock_wan_forward() {
         assert_eq!(k.shape(), &[1, n, s, hd]);
         assert_eq!(v.shape(), &[1, n, s, hd]);
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED causal_forward::single_chunk_equals_stock_wan_forward"
+    );
 }
 
 /// Shape sanity: a chunk forward returns `[out_dim, F_chunk, H, W]` and the cache grows per chunk.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn forward_chunk_shapes_and_cache_growth() {
     let (causal, cross_kv, cfg) = setup();
     let c = cfg.wan.in_dim as i32;
@@ -393,10 +402,15 @@ fn forward_chunk_shapes_and_cache_growth() {
         assert_eq!(cache.stored_tokens(), (step + 1) * s_chunk);
     }
     assert_eq!(cache.num_layers(), cfg.wan.num_layers);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED causal_forward::forward_chunk_shapes_and_cache_growth"
+    );
 }
 
 /// A mis-positioned chunk (cache/start disagreement, or non-frame-aligned start) is rejected.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn forward_chunk_rejects_bad_start() {
     let (causal, cross_kv, cfg) = setup();
     let c = cfg.wan.in_dim as i32;
@@ -408,4 +422,6 @@ fn forward_chunk_rejects_bad_start() {
         .forward_chunk(&chunk, 500.0, &cross_kv, 8, &mut cache)
         .expect_err("start must equal cache stored tokens");
     assert!(err.to_string().contains("stored"), "err: {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED causal_forward::forward_chunk_rejects_bad_start");
 }

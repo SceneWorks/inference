@@ -330,6 +330,7 @@ fn packed_snapshot_quantizes_exactly_the_predicate_linears() {
 /// the packed consume path read the wrong tensor, assumed the wrong group size, or fell back to dense,
 /// this diverges immediately.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn pre_quantized_tier_is_bit_identical_to_load_time_quantization() {
     let cfg = tiny_cfg();
     for bits in [4, 8] {
@@ -341,12 +342,15 @@ fn pre_quantized_tier_is_bit_identical_to_load_time_quantization() {
             "Q{bits}: a pre-quantized snapshot must build the same model as load-time quantization"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::pre_quantized_tier_is_bit_identical_to_load_time_quantization");
 }
 
 /// (3) The tier genuinely changes the numerics: Q4 ≠ bf16, Q8 ≠ bf16, and Q4 ≠ Q8 — with Q8 measurably
 /// closer to bf16 than Q4 is (more bits ⇒ less quantization error). A "packed" path that silently
 /// served the dense weights would pass every shape assertion but fail all three here.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn each_tier_changes_the_forward_and_q8_is_closer_to_bf16_than_q4() {
     let cfg = tiny_cfg();
     let bf16 = forward_once(&dense_transformer(&cfg), &cfg);
@@ -368,6 +372,8 @@ fn each_tier_changes_the_forward_and_q8_is_closer_to_bf16_than_q4() {
         d8 < d4,
         "Q8 must be closer to bf16 than Q4 (Q8 err {d8}, Q4 err {d4})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::each_tier_changes_the_forward_and_q8_is_closer_to_bf16_than_q4");
 }
 
 /// (4) The bf16 cast in the converter must leave the u32 packed codes alone (sc-15203): a packed tier
@@ -496,6 +502,7 @@ const TIERS: [(&str, Option<i32>); 3] = [("bf16", None), ("q8", Some(8)), ("q4",
 /// the packed forward, and the base is **still packed** afterwards — never dequantized, which would
 /// blow the whole point of the tier (a 14B Q4 base dequantized back to bf16 is ~28 GB resident).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lora_installs_additively_over_a_packed_base_without_dequantizing_it() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
@@ -532,6 +539,8 @@ fn lora_installs_additively_over_a_packed_base_without_dequantizing_it() {
             "Q{bits}: the LoRA must measurably change the packed forward"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::lora_installs_additively_over_a_packed_base_without_dequantizing_it");
 }
 
 /// (7) A **scale-0** adapter is a bit-exact no-op on **every** tier — bf16, Q8 and Q4 alike. This is
@@ -548,6 +557,7 @@ fn lora_installs_additively_over_a_packed_base_without_dequantizing_it() {
 /// output dtype before adding it (and skips a `scale == 0` adapter outright), so all six legs are
 /// exactly `0.0`. Keeping both dtypes here is what stops the artifact silently coming back.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn scale_zero_is_a_bit_exact_no_op_on_every_tier() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
@@ -594,11 +604,14 @@ fn scale_zero_is_a_bit_exact_no_op_on_every_tier() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::scale_zero_is_a_bit_exact_no_op_on_every_tier");
 }
 
 /// (8) The same LoRA file resolves on **every** tier — the capability the descriptor advertises
 /// (`supports_lora` alongside `supported_quants = [Q4, Q8]`) has to hold at Q4/Q8, not only bf16.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_same_lora_installs_on_every_tier() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
@@ -619,6 +632,8 @@ fn the_same_lora_installs_on_every_tier() {
             "{name}: the LoRA must move this tier's forward"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::the_same_lora_installs_on_every_tier");
 }
 
 /// (9) The load-time quant request is reconciled against the tier actually on disk. A Q4 request over a

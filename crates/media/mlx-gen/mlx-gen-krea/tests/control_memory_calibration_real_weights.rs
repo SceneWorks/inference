@@ -340,10 +340,16 @@ fn calibrate_tier(label: &str, tier: Option<Quant>) {
 #[ignore = "needs SceneWorks/krea-2-turbo-mlx bf16 + the pose overlay (KREA_CONTROL_DIR / KREA_CONTROL_OVERLAY)"]
 fn calibrate_bf16_base() {
     calibrate_tier("bf16", None);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_memory_calibration_real_weights::calibrate_bf16_base");
 }
 
 #[test]
 #[ignore = "needs SceneWorks/krea-2-turbo-mlx bf16 + the pose overlay; quantizes the base to q4 at load"]
 fn calibrate_q4_base() {
     calibrate_tier("q4", Some(Quant::Q4));
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED control_memory_calibration_real_weights::calibrate_q4_base"
+    );
 }

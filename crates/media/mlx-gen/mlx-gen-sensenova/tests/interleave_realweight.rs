@@ -50,6 +50,7 @@ fn interleave_realweight_matches_reference() {
     let fix = fixture();
     if !snap.exists() || !fix.exists() {
         eprintln!("skipping: snapshot or golden missing — see tools/dump_sensenova_interleave_realweight.py");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in interleave_realweight_matches_reference; see preceding skip diagnostic");
         return;
     }
 
@@ -121,4 +122,6 @@ fn interleave_realweight_matches_reference() {
         common >= 40,
         "deterministic think-text prefix agrees only {common} bytes with the reference"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED interleave_realweight::interleave_realweight_matches_reference");
 }

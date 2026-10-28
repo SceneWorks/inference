@@ -49,14 +49,17 @@ fn cosine(got: &Array, exp: &Array) -> f32 {
     (dot / (na.sqrt() * nb.sqrt()).max(1e-12)) as f32
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn seedvr2_loads_and_runs_from_real_checkpoint() {
     let (Some(raw), gdir) = (raw_dir(), golden_dir()) else {
         eprintln!("SKIP: raw checkpoint absent");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_loads_and_runs_from_real_checkpoint; see preceding skip diagnostic");
         return;
     };
     if !gdir.join("e2e_io_f32.safetensors").exists() {
         eprintln!("SKIP: e2e golden absent");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_loads_and_runs_from_real_checkpoint; see preceding skip diagnostic");
         return;
     }
     // load f32 from the raw checkpoint (native convert + load), then check the model path.
@@ -109,19 +112,26 @@ fn seedvr2_loads_and_runs_from_real_checkpoint() {
         out.height,
         out.pixels.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED registry_e2e::seedvr2_loads_and_runs_from_real_checkpoint"
+    );
 }
 
 /// 7B (sc-5197) real-weight smoke: load the 36-layer pixel-mode-RoPE variant from the raw checkpoint
 /// (bf16, ~17 GB) and run `generate` end-to-end. The numeric pixel-RoPE parity is gated separately in
 /// `dit_parity.rs::seedvr2_dit_7b_matches_reference`; this proves the full 7B pipeline loads + runs.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn seedvr2_7b_loads_and_generates() {
     let Some(snap) = raw_dir() else {
         eprintln!("SKIP: raw checkpoint absent");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_7b_loads_and_generates; see preceding skip diagnostic");
         return;
     };
     if !snap.join("seedvr2_ema_7b_fp16.safetensors").exists() {
         eprintln!("SKIP: 7B checkpoint absent");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_7b_loads_and_generates; see preceding skip diagnostic");
         return;
     }
     let pipe = Seedvr2Pipeline::load(
@@ -143,15 +153,19 @@ fn seedvr2_7b_loads_and_generates() {
     assert_eq!((out.width, out.height), (128, 128));
     assert_eq!(out.pixels.len(), 128 * 128 * 3);
     eprintln!("7B generate ok: {}x{}", out.width, out.height);
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED registry_e2e::seedvr2_7b_loads_and_generates");
 }
 
 /// Q8 (sc-5198) real-weight smoke: load 3B, quantize the DiT Linears to Q8, and run `generate`
 /// end-to-end (exercises the `quantized_matmul` forward path + the load-time quantize wiring). The
 /// numeric near-losslessness is gated separately in `quant_parity.rs`.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn seedvr2_q8_loads_and_generates() {
     let Some(snap) = raw_dir() else {
         eprintln!("SKIP: raw checkpoint absent");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_q8_loads_and_generates; see preceding skip diagnostic");
         return;
     };
     let mut pipe = Seedvr2Pipeline::load(
@@ -174,6 +188,8 @@ fn seedvr2_q8_loads_and_generates() {
     assert_eq!((out.width, out.height), (128, 128));
     assert_eq!(out.pixels.len(), 128 * 128 * 3);
     eprintln!("Q8 generate ok: {}x{}", out.width, out.height);
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED registry_e2e::seedvr2_q8_loads_and_generates");
 }
 
 /// A deterministic sharp RGB image (`size²`): a fine high-frequency pattern so a faithful upscale
@@ -218,9 +234,11 @@ fn mean_var(px: &[u8]) -> (f64, f64) {
 /// post-fix it tiles (cosine ≥ 0.99). The 0.985 gate sits cleanly between. Real-weight, skips without
 /// the checkpoint. (The pure budget/tile-size guard is `video::tests::spatial_tile_never_exceeds_vae_cap`.)
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn seedvr2_generate_tiles_above_vae_cap() {
     let Some(snap) = raw_dir() else {
         eprintln!("SKIP: raw checkpoint absent");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_generate_tiles_above_vae_cap; see preceding skip diagnostic");
         return;
     };
     let pipe = Seedvr2Pipeline::load(
@@ -270,4 +288,6 @@ fn seedvr2_generate_tiles_above_vae_cap() {
         "auto {target}² generate diverged from the tiled reference (cos {cos:.4}) — the VAE \
          correctness cap is not routing the large decode through tiling (sc-8228 regression)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED registry_e2e::seedvr2_generate_tiles_above_vae_cap");
 }

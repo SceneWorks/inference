@@ -64,15 +64,13 @@ impl AlbertLayer {
     fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
         let (b, t, _h) = hidden.dims3()?;
         let shape = (b, t, self.n_heads, self.head_dim);
-        let q = self
-            .query
-            .forward(hidden)?
+        let q = __model_proof_output!(self.query.forward(hidden))?
             .reshape(shape)?
             .transpose(1, 2)?;
-        let k = self.key.forward(hidden)?.reshape(shape)?.transpose(1, 2)?;
-        let v = self
-            .value
-            .forward(hidden)?
+        let k = __model_proof_output!(self.key.forward(hidden))?
+            .reshape(shape)?
+            .transpose(1, 2)?;
+        let v = __model_proof_output!(self.value.forward(hidden))?
             .reshape(shape)?
             .transpose(1, 2)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
@@ -82,12 +80,14 @@ impl AlbertLayer {
             .matmul(&v.contiguous()?)? // [b, heads, t, head_dim]
             .transpose(1, 2)?
             .reshape((b, t, self.n_heads * self.head_dim))?;
-        let attn_out = self
+        let attn_out = __model_proof_output!(self
             .attn_norm
-            .forward(&(self.dense.forward(&ctx)? + hidden)?)?;
-        let ffn = gelu_new(&self.ffn.forward(&attn_out)?)?;
-        let ffn = self.ffn_output.forward(&ffn)?;
-        Ok(self.full_norm.forward(&(ffn + attn_out)?)?)
+            .forward(&(__model_proof_output!(self.dense.forward(&ctx))? + hidden)?))?;
+        let ffn = gelu_new(&__model_proof_output!(self.ffn.forward(&attn_out))?)?;
+        let ffn = __model_proof_output!(self.ffn_output.forward(&ffn))?;
+        Ok(__model_proof_output!(self
+            .full_norm
+            .forward(&(ffn + attn_out)?))?)
     }
 }
 
@@ -139,11 +139,11 @@ impl Plbert {
         let device = input_ids.device();
         let positions = Tensor::arange(0u32, t as u32, device)?.unsqueeze(0)?;
         let token_types = Tensor::zeros((1, t), candle_audio::candle_core::DType::U32, device)?;
-        let emb = (self.word_embeddings.forward(input_ids)?
-            + self.position_embeddings.forward(&positions)?)?;
-        let emb = (emb + self.token_type_embeddings.forward(&token_types)?)?;
-        let emb = self.embed_norm.forward(&emb)?;
-        let mut hidden = self.hidden_mapping.forward(&emb)?;
+        let emb = (__model_proof_output!(self.word_embeddings.forward(input_ids))?
+            + __model_proof_output!(self.position_embeddings.forward(&positions))?)?;
+        let emb = (emb + __model_proof_output!(self.token_type_embeddings.forward(&token_types))?)?;
+        let emb = __model_proof_output!(self.embed_norm.forward(&emb))?;
+        let mut hidden = __model_proof_output!(self.hidden_mapping.forward(&emb))?;
         for _ in 0..self.num_layers {
             hidden = self.shared_layer.forward(&hidden)?;
         }

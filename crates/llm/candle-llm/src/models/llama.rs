@@ -254,6 +254,8 @@ pub struct CausalLm {
     rope_full: Option<Rope>,
     cfg: ModelConfig,
     dtype: DType,
+    /// Explicit HF training buffer rounding; None preserves generation's F32 frequencies.
+    training_frequency_storage: Option<DType>,
     device: Device,
     /// Per-layer compute device — every entry equals `device` for a single-device model, and differs
     /// when the model is **pipeline-sharded** across GPUs (contiguous layer blocks per device). Drives
@@ -771,6 +773,7 @@ impl CausalLm {
             rope,
             rope_full,
             dtype,
+            training_frequency_storage: None,
             device,
             layer_devices,
             quantized: format.is_some(),
@@ -1162,6 +1165,47 @@ impl CausalLm {
         self.dtype
     }
 
+    /// Enable the pinned HF teacher's explicit Module.to(dtype) frequency-buffer
+    /// rounding. Call only on a fresh dense Qwen3-VL teacher BEFORE any forward/cache.
+    /// Ordinary constructors and generation keep their existing schedule unchanged.
+    pub fn with_training_frequency_storage(mut self) -> Result<Self> {
+        if !self.cfg.architecture.is_qwen3_vl() || self.quantized {
+            return Err(Error::Unsupported(
+                "training frequency profile requires a dense Qwen3-VL teacher".into(),
+            ));
+        }
+        if self.training_frequency_storage == Some(self.dtype) {
+            return Ok(self);
+        }
+        self.rope = self.rope.with_training_frequency_storage(self.dtype)?;
+        self.rope_full = self
+            .rope_full
+            .as_ref()
+            .map(|r| r.with_training_frequency_storage(self.dtype))
+            .transpose()?;
+        // The staged-device-position path must use the SAME rounded frequencies.
+        self.device_rope = DeviceRope::new(&self.rope, &self.device)?;
+        self.device_rope_full = self
+            .rope_full
+            .as_ref()
+            .map(|r| DeviceRope::new(r, &self.device))
+            .transpose()?;
+        self.training_frequency_storage = Some(self.dtype);
+        Ok(self)
+    }
+
+    pub fn training_frequency_storage_dtype(&self) -> Option<DType> {
+        self.training_frequency_storage
+    }
+
+    /// Training hidden-state cache identities must bind both compute and frequency policy.
+    pub fn precision_profile_key(&self) -> String {
+        format!(
+            "compute={:?};hf_training_frequency={:?}",
+            self.dtype, self.training_frequency_storage
+        )
+    }
+
     /// Build per-row RoPE tables for a `[rows, cols]` grid of absolute positions (row-major flat
     /// `positions`, length `rows * cols`) — the **per-sequence** position tables the batched decode
     /// (story 7255) feeds [`CausalLm::decode_logits_masked`]. Each `(cos, sin)` is
@@ -1198,7 +1242,7 @@ impl CausalLm {
     /// Embed token ids `[batch, seq]` (u32) → `[batch, seq, hidden]`. Gemma scales the embeddings by
     /// √hidden.
     pub fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let e = embed(&self.embed_tokens, input_ids)?;
+        let e = __model_proof_output!(embed(&self.embed_tokens, input_ids))?;
         match self.embed_scale {
             Some(s) => Ok(e.affine(s, 0.0)?),
             None => Ok(e),
@@ -1272,6 +1316,49 @@ impl CausalLm {
     ) -> Result<Vec<Tensor>> {
         let embeds = self.embed(input_ids)?;
         self.hidden_states_from_embeds_with_mask(&embeds, cache, offset, mask)
+    }
+
+    /// [`CausalLm::hidden_states_with_mask`] from **explicit absolute positions** rather than the
+    /// contiguous `offset..offset + seq` run — the text-encoder twin of
+    /// [`CausalLm::decode_logits_masked`] over [`CausalLm::rope_tables`]. `positions` is a
+    /// row-major `[batch, seq]` grid, so a right-padded window whose pads all sit at one position
+    /// (FLUX 3's `positions.masked_fill(mask == 0, 1)`) rotates exactly as upstream's
+    /// `position_ids`, and the additive `mask` keeps the pads out of every query's keys. Every
+    /// layer type's RoPE tables are built from the same grid, so a per-layer-type model (Gemma 4)
+    /// is served too.
+    ///
+    /// Returns the same `num_layers + 1` HF-ordered stack as [`CausalLm::hidden_states`].
+    pub fn hidden_states_with_mask_at(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut dyn KvCache,
+        positions: &[i32],
+        mask: AttnMask<'_>,
+    ) -> Result<Vec<Tensor>> {
+        let (b, s) = input_ids.dims2()?;
+        if positions.len() != b * s {
+            return Err(Error::Msg(format!(
+                "hidden_states_with_mask_at: {} positions for a {b}x{s} window",
+                positions.len()
+            )));
+        }
+        let embeds = self.embed(input_ids)?;
+        let tables = self.rope_tables(positions, b as i32, s as i32)?;
+        let mut out = Vec::with_capacity(self.layers.len() + 1);
+        self.run_decoder_stack_collecting(
+            &embeds,
+            cache,
+            &tables,
+            mask,
+            Some(&mut out),
+            self.attn_formulation,
+            false,
+            false,
+        )?;
+        if let Some(last) = out.last_mut() {
+            *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps as f64)?;
+        }
+        Ok(out)
     }
 
     /// Like [`CausalLm::hidden_states`] but from pre-computed input embeddings.
@@ -2994,6 +3081,10 @@ fn join(prefix: &str, suffix: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "llama/training_precision_tests.rs"]
+mod training_precision_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
@@ -3001,6 +3092,7 @@ pub(crate) mod tests {
     /// decode attention whenever the model's device positions are active (the static cache that
     /// stages them, and an un-expanded growing cache alike), `gqa` / `expanded` otherwise.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn records_report_the_decode_attention_when_device_positions_run_it() {
         use crate::decode::{generate_step, CancelFlag, GenerationConfig};
         let (weights, cfg) = tiny_qwen3(64, true, &Device::Cpu);
@@ -3034,6 +3126,9 @@ pub(crate) mod tests {
             "expanded",
             "the expanded selector keeps sdpa"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::llama::tests::records_report_the_decode_attention_when_device_positions_run_it");
     }
 
     /// A tiny `Qwen3ForCausalLM` (the Qwen3-8B block shape: explicit head_dim, per-head q/k
@@ -3106,6 +3201,7 @@ pub(crate) mod tests {
     /// order — while a decode step copies no cached K/V: no `cat`, no `repeat_kv`, no transposed-key
     /// copy, with the step's mask a narrowed view of a preallocated one.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn masked_gqa_matches_the_expanded_masked_forward_without_copying_kv() {
         use crate::primitives::kv_cache::{kv_materialize_count, StaticKvCache};
         let (w, cfg) = tiny_qwen3(40, false, &Device::Cpu);
@@ -3190,6 +3286,9 @@ pub(crate) mod tests {
             start += n;
         }
         assert_eq!(fixed.offset(), 9);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::llama::tests::masked_gqa_matches_the_expanded_masked_forward_without_copying_kv");
     }
 
     /// sc-24140: the llama-family load census names every projection's kind — the 7 attention/MLP
@@ -3254,14 +3353,19 @@ pub(crate) mod tests {
     /// the decoder's logits track the dense model's.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4() {
         use crate::primitives::projection::ProjectionKind;
         let Ok(device) = crate::device::new_cuda_for_test() else {
             candle_quant_kernels::skip_without_sm120("no CUDA device");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/models/llama.rs:3261 (nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let Ok(format) = ProjectionFormat::nvfp4(&device) else {
             candle_quant_kernels::skip_without_sm120("CUDA device below the NVFP4 floor");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/models/llama.rs:3265 (nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let (w, cfg) = tiny_qwen3(64, false, &device);
@@ -3365,6 +3469,9 @@ pub(crate) mod tests {
             Err(other) => panic!("expected the typed refusal, got {other}"),
             Ok(_) => panic!("an MLX affine triple loaded under NVFP4"),
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::llama::tests::nvfp4_format_loads_every_eligible_projection_and_the_head_as_nvfp4");
     }
 
     /// A tiny `Phi3ForCausalLM` (fused `qkv_proj` / `gate_up_proj`) 256 wide, so Q4_K can quantize
@@ -3427,6 +3534,7 @@ pub(crate) mod tests {
     /// size-check panic in a debug build, silently wrong weights in a release one). Every part's
     /// Q8_0 and Q4_K projection tracks its dense twin on the same input.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn ggml_quantizes_each_fused_part_from_its_own_rows() {
         let (w, cfg) = tiny_phi3();
         let dense = CausalLm::from_weights_format(&w, "", cfg.clone(), None).unwrap();
@@ -3484,6 +3592,9 @@ pub(crate) mod tests {
                 );
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::llama::tests::ggml_quantizes_each_fused_part_from_its_own_rows");
     }
 
     #[test]
@@ -3562,6 +3673,8 @@ pub(crate) mod tests {
             Ok(d) => d,
             Err(_) => {
                 eprintln!("skip: no CUDA device");
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/models/llama.rs:3565 (decode_step_phase_breakdown_on_cuda): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
                 return;
             }
         };
@@ -3573,10 +3686,14 @@ pub(crate) mod tests {
         for env in ["CANDLE_LLM_TEST_MODEL", "CANDLE_LLM_QWEN3_MODEL"] {
             let Ok(dir) = std::env::var(env) else {
                 eprintln!("skip {env}: unset");
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/models/llama.rs:3576 (decode_step_phase_breakdown_on_cuda): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
                 continue;
             };
             if dir.is_empty() {
                 eprintln!("skip {env}: empty");
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/models/llama.rs:3580 (decode_step_phase_breakdown_on_cuda): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
                 continue;
             }
             let cfg = ModelConfig::from_dir(&dir).unwrap();
@@ -3947,5 +4064,8 @@ pub(crate) mod tests {
                 us(b_attn),
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::llama::tests::decode_step_phase_breakdown_on_cuda");
     }
 }

@@ -33,7 +33,8 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
 }
 
 #[test]
-#[ignore = "needs the instantid_resampler golden (tools/dump_instantid_resampler_golden.py)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the instantid_resampler golden (tools/dump_instantid_resampler_golden.py)"]
 fn instantid_face_resampler_matches_torch() {
     let mut g = Weights::from_file(GOLDEN).unwrap_or_else(|e| panic!("load {GOLDEN:?}: {e}"));
     g.cast_all(Dtype::Float32).unwrap();
@@ -47,7 +48,12 @@ fn instantid_face_resampler_matches_torch() {
     let resampler =
         Resampler::from_weights(&g, "image_proj", &ResamplerConfig::instantid_face()).unwrap();
 
-    let tokens = resampler.forward(embed).unwrap();
+    let tokens = (
+        crate::common::record_model_inference_device(),
+        resampler.forward(embed),
+    )
+        .1
+        .unwrap();
     assert_eq!(tokens.shape(), [1, 16, 2048], "output token shape");
 
     let rel = peak_rel(&tokens, tok_golden);
@@ -58,4 +64,6 @@ fn instantid_face_resampler_matches_torch() {
     // 1e-3 (a wrong port — e.g. a misordered residual or a transposed fused split — diverges orders
     // of magnitude past this).
     assert!(rel < 1e-3, "InstantID Resampler diverged: {rel:.3e}");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED instantid_resampler_real_weights::instantid_face_resampler_matches_torch");
 }

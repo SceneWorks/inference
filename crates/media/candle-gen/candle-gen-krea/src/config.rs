@@ -90,7 +90,13 @@ impl Krea2Config {
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let path = root.join("transformer").join("config.json");
-        let text = std::fs::read_to_string(&path)
+        let text = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/candle-gen/candle-gen-krea/src/config.rs::from_snapshot::std::fs::read_to_string@4430",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
             .map_err(|e| CandleError::Msg(format!("krea: read {}: {e}", path.display())))?;
         let v: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| CandleError::Msg(format!("krea: parse {}: {e}", path.display())))?;
@@ -197,7 +203,13 @@ impl Krea2Config {
 /// damaged/partial download that must surface rather than silently downgrade behavior (sc-9010 /
 /// F-073).
 pub(crate) fn read_optional_json(path: &Path, who: &str) -> Result<Option<serde_json::Value>> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(path),
+"crates/media/candle-gen/candle-gen-krea/src/config.rs::read_optional_json::std::fs::read_to_string@10048",
+ArtifactInput,
+path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(t) => t,
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {

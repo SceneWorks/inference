@@ -13,6 +13,16 @@
 //! `acestep_music_wav_conformance` writes the synthesized WAV (`ACESTEP_WAV_OUT` overrides the
 //! path) so a human can listen to the evidence.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_acestep::candle_audio;
@@ -73,6 +83,9 @@ fn acestep_conformance() {
         },
         &profile,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED acestep_conformance");
 }
 
 /// The real-WAV DoD: fixed prompt + lyrics + seed + duration → non-empty, 48 kHz, stereo, finite,
@@ -120,7 +133,10 @@ fn acestep_music_wav_conformance() {
         .generate(&req, &mut |p| match p {
             Progress::Step { .. } => steps += 1,
             Progress::Decoding => decoding += 1,
-            Progress::Loading(_) => {}
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .expect("generate");
     assert_eq!(steps, STEPS);
@@ -318,6 +334,9 @@ fn acestep_music_wav_conformance() {
         track.samples, track2.samples,
         "seeded synthesis must be deterministic"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED acestep_music_wav_conformance");
 }
 
 // ============================ Prompted audio editing (sc-12847) ============================
@@ -572,6 +591,9 @@ fn acestep_edit_repaint_wav_conformance() {
         edited.samples, edited2.samples,
         "seeded edit must be deterministic"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED acestep_edit_repaint_wav_conformance");
 }
 
 // ================================ Prompted audio COVER (sc-13251) ================================
@@ -1017,6 +1039,9 @@ fn acestep_cover_wav_conformance() {
         cover_a.samples, cover_a2.samples,
         "seeded cover must be deterministic"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED acestep_cover_wav_conformance");
 }
 
 // ==================== Cover chroma-gate hardening (sc-13714) ====================
@@ -1352,6 +1377,9 @@ fn acestep_cover_chroma_seed_stability() {
         "the shipped gate's canonical cover seed 42 weak-leg margin {canonical_margin_b:+.4} does not \
          clear the 0.03 floor — the shipped gate itself would fail"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED acestep_cover_chroma_seed_stability");
 }
 
 // A representative fully-independent pair (sc-13714 (1)) — shares NO anchor with sitar / industrial /
@@ -1500,4 +1528,7 @@ fn acestep_cover_chroma_independent_pair_constraint() {
          would be vacuous",
         legs.src_ab,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED acestep_cover_chroma_independent_pair_constraint");
 }

@@ -63,12 +63,12 @@ impl SpatialAggLayer {
             softmax_last(&sim).map_err(|e| candle_audio::candle_core::Error::Msg(e.to_string()))?;
         let ctx = attn.matmul(&v)?; // (B, h, N, hd)
         let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((b, n, d))?;
-        self.out_proj.forward(&ctx)
+        __model_proof_output!(self.out_proj.forward(&ctx))
     }
 
     fn ff(&self, x: &Tensor) -> CResult<Tensor> {
-        let x = self.linear1.forward(x)?.gelu_erf()?;
-        self.linear2.forward(&x)
+        let x = __model_proof_output!(self.linear1.forward(x))?.gelu_erf()?;
+        __model_proof_output!(self.linear2.forward(&x))
     }
 
     /// `x`: `(B, seq, D)` spatial tokens. Prepends CLS, runs the pre-norm encoder layer, returns the
@@ -78,8 +78,8 @@ impl SpatialAggLayer {
         let cls = self.cls_token.broadcast_as((b, 1, d))?;
         let x = Tensor::cat(&[&cls, x], 1)?; // (B, 1+seq, D)
                                              // norm_first: x = x + sa(norm1(x)); x = x + ff(norm2(x))
-        let x = (&x + self.self_attn(&self.norm1.forward(&x)?)?)?;
-        let x = (&x + self.ff(&self.norm2.forward(&x)?)?)?;
+        let x = (&x + self.self_attn(&__model_proof_output!(self.norm1.forward(&x))?)?)?;
+        let x = (&x + self.ff(&__model_proof_output!(self.norm2.forward(&x))?)?)?;
         // Return the CLS token representation.
         x.narrow(1, 0, 1)?.squeeze(1)
     }

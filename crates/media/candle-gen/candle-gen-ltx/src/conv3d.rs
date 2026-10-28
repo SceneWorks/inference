@@ -102,10 +102,11 @@ impl ZeroPaddedConv3d {
         }
         let y = acc.expect("kt >= 1");
         let (_, o, hp, wp) = y.dims4()?;
-        y.reshape((b, t, o, hp, wp))?
+        __model_proof_output!(y
+            .reshape((b, t, o, hp, wp))?
             .permute((0, 2, 1, 3, 4))?
             .contiguous()?
-            .broadcast_add(&self.bias)
+            .broadcast_add(&self.bias))
     }
 }
 
@@ -256,7 +257,7 @@ impl CausalConv3d {
             .reshape((b, t, o, hp, wp))?
             .permute((0, 2, 1, 3, 4))?
             .contiguous()?;
-        y.broadcast_add(&self.bias)
+        __model_proof_output!(y.broadcast_add(&self.bias))
     }
 }
 
@@ -300,6 +301,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn upsampler_zero_temporal_padding_is_not_vae_edge_replication() -> Result<()> {
         let d = Device::Cpu;
         let weight = Tensor::ones((1, 1, 3, 1, 1), candle_gen::candle_core::DType::F32, &d)?;
@@ -325,6 +327,8 @@ mod tests {
             causal.forward(&x, false)?.flatten_all()?.to_vec1::<f32>()?,
             vec![4., 5.]
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conv3d::tests::upsampler_zero_temporal_padding_is_not_vae_edge_replication");
         Ok(())
     }
 }

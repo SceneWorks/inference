@@ -367,6 +367,7 @@ fn tiny_dcae_weights(cfg: &DcAeConfig) -> Weights {
 /// the SCM loop ran the expected step count, the denoised latent keeps shape and is finite +
 /// non-degenerate, and the decode tail produces a sane RGB image.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn sprint_wires_guidance_trunk_scm_decode() {
     let tcfg = tiny_sprint_config();
     let trunk = SanaTransformer::from_weights(&tiny_sprint_trunk_weights(&tcfg), tcfg.clone())
@@ -440,9 +441,16 @@ fn sprint_wires_guidance_trunk_scm_decode() {
     assert_eq!(img.width, (latent_w * scale) as u32);
     assert_eq!(img.height, (latent_h * scale) as u32);
     assert_eq!(img.pixels.len(), (img.width * img.height * 3) as usize);
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED sprint_contract::sprint_wires_guidance_trunk_scm_decode"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn sprint_preview_numbers_actual_steps_and_is_output_inert() {
     let mut tcfg = tiny_sprint_config();
     tcfg.in_channels = 32;
@@ -505,11 +513,16 @@ fn sprint_preview_numbers_actual_steps_and_is_output_inert() {
     assert!(frames
         .windows(2)
         .any(|pair| pair[0].image.pixels != pair[1].image.pixels));
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sprint_contract::sprint_preview_numbers_actual_steps_and_is_output_inert");
 }
 
 /// Single-step Sprint (num_steps = 1): the SCM loop must take exactly one step and skip the renoise
 /// (diffusers `if len(self.timesteps) > 1`), producing a finite latent.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn sprint_single_step_runs_one_step() {
     let tcfg = tiny_sprint_config();
     let trunk =
@@ -547,12 +560,17 @@ fn sprint_single_step_runs_one_step() {
     let lo = min_op(&out, None).unwrap();
     eval([&lo]).unwrap();
     assert!(lo.item::<f32>().is_finite());
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sprint_contract::sprint_single_step_runs_one_step");
 }
 
 /// Base SANA must remain loadable from the SAME tiny weights MINUS the Sprint-only keys — i.e. the
 /// guidance-embed + qk-norm paths are genuinely config-gated and OFF by default. (A base trunk built
 /// from a config with `guidance_embeds = false` must NOT require `time_embed.guidance_embedder.*`.)
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn base_trunk_does_not_require_sprint_keys() {
     use mlx_gen_sana::SanaTransformerConfig;
     let mut base = SanaTransformerConfig::sana_1600m();
@@ -726,6 +744,12 @@ fn base_trunk_does_not_require_sprint_keys() {
     let ts = Array::from_slice(&[0.3_f32], &[1]);
     let out = trunk.forward(&latent, &cap, &ts).expect("base forward");
     assert_eq!(out.shape(), &[1, base.out_channels, 4, 4]);
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED sprint_contract::base_trunk_does_not_require_sprint_keys"
+    );
 }
 
 /// Real-weight Sprint 1024px e2e. `#[ignore]`d: needs a `Sana_Sprint_1.6B_1024px_diffusers` snapshot.
@@ -773,4 +797,8 @@ fn real_weight_sprint_1024_e2e() {
         "SANA-Sprint real-weight 1024² gen OK: {} px",
         img.pixels.len()
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sprint_contract::real_weight_sprint_1024_e2e");
 }

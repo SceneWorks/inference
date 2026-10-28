@@ -80,6 +80,8 @@ fn nvfp4_device() -> Option<Device> {
         Ok(d @ Device::Cuda(_)) => d,
         _ => {
             eprintln!("[sc-11044] no CUDA device; skipping on-device W4A4 GPU gate");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_w4a4_ondevice_gpu.rs:83 (nvfp4_device): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
             return None;
         }
     };
@@ -97,6 +99,8 @@ fn nvfp4_device() -> Option<Device> {
                 "[sc-11044] device not sm_120 ({:?}); skipping",
                 lt.compute_cap().ok()
             );
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_w4a4_ondevice_gpu.rs:95 (nvfp4_device): Implicit None on ineligible/error capability probe silently bypasses selected learned GPU cases just like explicit no-device return.");
             None
         }
     }
@@ -457,8 +461,13 @@ fn nvfp4_e2m1_element_nibbles_match_cpu_at_exact_ties() {
 /// repeated forwards (a denoise-step stand-in), and stays within NVFP4 tolerance of a bf16-dense
 /// reference. Exercises the `forward_checked` NaN/inf guard.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn nvfp4_w4a4_forward_ondevice_no_nan_vs_bf16() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_w4a4_ondevice_gpu.rs:461 (nvfp4_w4a4_forward_ondevice_no_nan_vs_bf16): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
+        return;
+    };
     let (m, k, n) = (512usize, 512usize, 512usize);
     let x_f32 = pseudo_random(m * k, 7);
     let w_f32 = pseudo_random(n * k, 8);
@@ -496,6 +505,9 @@ fn nvfp4_w4a4_forward_ondevice_no_nan_vs_bf16() {
         rr < 0.2,
         "on-device W4A4 vs bf16 {rr:.5} exceeds NVFP4 tolerance"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_w4a4_ondevice_gpu::nvfp4_w4a4_forward_ondevice_no_nan_vs_bf16");
 }
 
 /// (2b) **sc-12078 fallback policy: no fused quantizer ⇒ W4A16, never W4A4-via-unfused.**
@@ -518,8 +530,13 @@ fn nvfp4_w4a4_forward_ondevice_no_nan_vs_bf16() {
 /// Env-var mutation is safe here: `.cargo/config.toml` forces `RUST_TEST_THREADS=1`, so no concurrent
 /// test can observe the window, and the var is removed before any assertion can unwind past it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn nvfp4_fused_unavailable_forces_w4a16() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_w4a4_ondevice_gpu.rs:522 (nvfp4_fused_unavailable_forces_w4a16): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
+        return;
+    };
     let (n, k) = (256usize, 512usize);
     let w_f32 = pseudo_random(n * k, 0x1_2078);
     let w = Tensor::from_vec(w_f32.clone(), (n, k), &dev)
@@ -589,6 +606,9 @@ fn nvfp4_fused_unavailable_forces_w4a16() {
         None,
         "nothing is staged packed on-device in W4A16"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_w4a4_ondevice_gpu::nvfp4_fused_unavailable_forces_w4a16");
 }
 
 /// (3) Throughput: on-device **W4A4** vs **W4A16** (and a bf16-dense baseline) layer forwards on
@@ -596,8 +616,13 @@ fn nvfp4_fused_unavailable_forces_w4a16() {
 /// hardware-dependent, so it is reported, not asserted (the correctness/no-NaN gates above are the
 /// hard checks).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn nvfp4_w4a4_vs_w4a16_throughput() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_w4a4_ondevice_gpu.rs:600 (nvfp4_w4a4_vs_w4a16_throughput): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
+        return;
+    };
     // (M tokens, K in, N out): Sana-1.6B-ish attn proj (2240²) and FF up-proj (2240→5600).
     let shapes = [(1024usize, 2240usize, 2240usize), (1024, 2240, 5600)];
     let iters = 40usize;
@@ -706,6 +731,11 @@ fn nvfp4_w4a4_vs_w4a16_throughput() {
         );
         assert!(t_w4a4.is_finite() && t_w4a4 > 0.0 && t_fp4g > 0.0);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_w4a4_ondevice_gpu::nvfp4_w4a4_vs_w4a16_throughput"
+    );
 }
 
 /// (3b) **sc-12207 re-measurement — per-projection activation-quantizer cost on the real Krea 2 Turbo
@@ -913,11 +943,17 @@ fn nvfp4_w4a4_outlier_sparsity_capture_confirms_partition() {
 #[test]
 #[ignore = "real-weight test: set SC11044_SANA_DIT_SAFETENSORS to a Sana DiT shard"]
 fn nvfp4_w4a4_real_sana_dit_weight() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_w4a4_ondevice_gpu.rs:916 (nvfp4_w4a4_real_sana_dit_weight): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
+        return;
+    };
     let path = match std::env::var("SC11044_SANA_DIT_SAFETENSORS") {
         Ok(p) => p,
         Err(_) => {
             eprintln!("[sc-11044] SC11044_SANA_DIT_SAFETENSORS unset; skipping real-weight test");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_w4a4_ondevice_gpu.rs:921 (nvfp4_w4a4_real_sana_dit_weight): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
             return;
         }
     };
@@ -972,5 +1008,10 @@ fn nvfp4_w4a4_real_sana_dit_weight() {
     assert!(
         rr < 0.25,
         "real-weight W4A4 vs bf16 {rr:.5} unexpectedly large"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_w4a4_ondevice_gpu::nvfp4_w4a4_real_sana_dit_weight"
     );
 }

@@ -216,6 +216,7 @@ fn one_forward(c: &MiniMaxH3DitConfig, blocks: &[DitBlock], cache: &AdaLnCache) 
 }
 
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_evicted_adaln_weights_leave_device_memory() {
     let c = cfg();
     let per_block = (c.adaln_out_features() as usize * c.time_embed_dim as usize
@@ -475,4 +476,6 @@ fn the_evicted_adaln_weights_leave_device_memory() {
         .unwrap()
         .item::<f32>()
         .is_finite());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_evict_memory::the_evicted_adaln_weights_leave_device_memory");
 }

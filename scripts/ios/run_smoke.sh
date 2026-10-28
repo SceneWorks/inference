@@ -9,9 +9,10 @@
 #             [--device <udid> | --simulator [<udid>|<name>]] [--memory-entitlement on|off]
 #
 # Device:    a paired device with Developer Mode on, xcodegen, and a signing identity.
-# Simulator: xcodegen and an installed iOS simulator runtime; no signing, no device. The simulator
-#            is a BUILD/packaging/correctness check only: it has no jetsam per-app cap (the report
-#            says so) and no ANE, so no memory or performance claim may rest on it.
+# Simulator: xcodegen and an installed iOS simulator runtime; no signing, no device. The
+#            dispatch-only runtime-boundary route builds, installs and launches, then reports
+#            MLX Metal unsupported before any device or model call. It proves no image, kernel,
+#            memory-fit or performance claim.
 #
 # --memory-entitlement (device only; default on) selects whether the app is signed with
 # com.apple.developer.kernel.increased-memory-limit. The app logs os_proc_available_memory at
@@ -21,6 +22,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
+# The harness shares the SDK workspace; keep Xcode's existing explicit artifact location.
+export CARGO_TARGET_DIR="$ROOT/ios-host/smoke/target"
 
 PROFILE=release
 CARGO_PROFILE_FLAG=--release
@@ -29,6 +32,8 @@ SIMULATOR=""
 MEMORY_ENTITLEMENT=on
 CARGO_FEATURES=""
 INSTALL_ONLY=0
+SIMULATOR_FUNCTIONAL=0
+OTHER_MEDIA_MODE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --debug)  PROFILE=debug; CARGO_PROFILE_FLAG=""; shift ;;
@@ -43,26 +48,34 @@ while [ $# -gt 0 ]; do
     # E5: also run the SANA image-generation check. Needs a SANA snapshot pushed to
     # Documents/<any-subdir>/ (scripts/ios/push_model.sh <dir> sana); without one the check
     # reports "skipped" rather than failing.
-    --media)  CARGO_FEATURES="--features media"; shift ;;
+    --media)  OTHER_MEDIA_MODE=1; CARGO_FEATURES="--features media"; shift ;;
     # One bounded CAPTURE of a Z-Image Turbo campaign case (IOS_SMOKE_ZIMAGE_CASE, default
-    # z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit) through the capture
+    # z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit/1) through the capture
     # permit (sc-26433); off-device or without a provisioned slot it skips; needs the
     # campaign slot (scripts/ios/push_model.sh <tier-dir> --campaign-route z_image_turbo --tier q4).
-    --zimage) CARGO_FEATURES="--features media,zimage"; shift ;;
+    --zimage) OTHER_MEDIA_MODE=1; CARGO_FEATURES="--features media,zimage"; shift ;;
     # The measurement lane: LLM loads have no footprint estimate, so iOS admission
     # refuses them by default (the report says "refused before load"). This runs them UNADMITTED to
     # produce that estimate, and the report's "iOS admission lane" line says so.
     --unadmitted) export IOS_SMOKE_UNADMITTED=1; shift ;;
     --campaign-case)
-      [ $# -ge 2 ] || { echo "--campaign-case needs provider/route/tier/edge/mode/rung/selection" >&2; exit 2; }
-      export IOS_CAMPAIGN_CASE="$2"; CARGO_FEATURES="--features media"; shift 2 ;;
+      [ $# -ge 2 ] || { echo "--campaign-case needs provider/route/tier/edge/mode/rung/selection/steps" >&2; exit 2; }
+      OTHER_MEDIA_MODE=1; export IOS_CAMPAIGN_CASE="$2"; CARGO_FEATURES="--features media"; shift 2 ;;
     --install-only) INSTALL_ONLY=1; shift ;;
+    --simulator-runtime-boundary|--simulator-functional) SIMULATOR_FUNCTIONAL=1; shift ;;
     --campaign-timeout) export IOS_CAMPAIGN_TIMEOUT_SECONDS="$2"; shift 2 ;;
-    --campaign-list) export IOS_CAMPAIGN_LIST=1; CARGO_FEATURES="--features media"; shift ;;
+    --campaign-list) OTHER_MEDIA_MODE=1; export IOS_CAMPAIGN_LIST=1; CARGO_FEATURES="--features media"; shift ;;
     --campaign-diagnostic) export IOS_CAMPAIGN_DIAGNOSTIC=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+[ "$SIMULATOR_FUNCTIONAL" -eq 0 ] || { [ -n "$SIMULATOR" ] && [ "$INSTALL_ONLY" -eq 1 ]; } \
+  || { echo "--simulator-runtime-boundary is build/install-only; use the dispatch-only simulator controller to launch" >&2; exit 2; }
+if [ "$SIMULATOR_FUNCTIONAL" -eq 1 ]; then
+  [ "$OTHER_MEDIA_MODE" -eq 0 ] && [ -z "${IOS_SMOKE_IMAGE_ONLY:-}${IOS_SMOKE_SANA_CAPTURE:-}${IOS_SMOKE_UNADMITTED:-}" ] \
+    || { echo "--simulator-runtime-boundary cannot combine with other model modes" >&2; exit 2; }
+  CARGO_FEATURES="--features simulator-functional"
+fi
 
 if [ -n "${IOS_CAMPAIGN_CASE:-}${IOS_CAMPAIGN_LIST:-}" ]; then
   [ -z "${IOS_SMOKE_UNADMITTED:-}${IOS_SMOKE_SANA_CAPTURE:-}" ] || { echo "campaign cannot inherit legacy unadmitted/capture bypass flags" >&2; exit 2; }
@@ -95,6 +108,9 @@ say() { printf '\n=== %s\n' "$1"; }
 SMOKE_BUNDLE_ID=${SMOKE_BUNDLE_ID:-com.idkplay.SceneWorksSmoke}
 export SMOKE_BUNDLE_ID
 
+# Stamp the exact compiled checkout for both device and simulator artifacts.
+export IOS_CAMPAIGN_BUILD_SHA=$(git rev-parse HEAD)
+
 if [ -n "$SIMULATOR" ]; then
   [ -z "$DEVICE" ] || { echo "--device and --simulator are mutually exclusive" >&2; exit 2; }
   ON_SIMULATOR=1
@@ -125,7 +141,7 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   [ "$MEMORY_ENTITLEMENT" = on ] || say "NOTE: --memory-entitlement is ignored on the simulator (unsigned; no jetsam cap)"
 
   SIM_TRIPLE=aarch64-apple-ios-sim
-  SMOKE_TARGET="$ROOT/ios-host/smoke/target"
+  SMOKE_TARGET="$CARGO_TARGET_DIR"
   LIB="$SMOKE_TARGET/$SIM_TRIPLE/$PROFILE/libios_smoke.a"
   say "building ios-smoke for $SIM_TRIPLE ($PROFILE${CARGO_FEATURES:+, $CARGO_FEATURES})"
   # shellcheck disable=SC2086  # both flag vars are deliberately word-split
@@ -151,13 +167,16 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   CONFIG=Release
   [ "$PROFILE" = debug ] && CONFIG=Debug
   DERIVED="$ROOT/target/ios-derived-sim"
+  # A freshly created simulator may not yet appear in xcodebuild destinations. Package the
+  # arm64 simulator app generically; the selected UUID is still required for boot/install.
   xcodebuild \
     -project ios-host/SceneWorksSmoke.xcodeproj \
     -scheme SceneWorksSmoke \
     -configuration "$CONFIG" \
     -sdk iphonesimulator \
-    -destination "id=$SIMULATOR" \
+    -destination 'generic/platform=iOS Simulator' \
     -derivedDataPath "$DERIVED" \
+    ARCHS=arm64 \
     CODE_SIGNING_ALLOWED=NO \
     build 2>&1 | tail -20
   APP=$(find "$DERIVED/Build/Products/$CONFIG-iphonesimulator" -name "SceneWorksSmoke.app" -print -quit)
@@ -172,6 +191,10 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   DATA=$(xcrun simctl get_app_container "$SIMULATOR" "$SMOKE_BUNDLE_ID" data)
   mkdir -p "$DATA/Documents"
   say "data container $DATA (push a SANA snapshot with: scripts/ios/push_model.sh <dir> sana --simulator $SIMULATOR)"
+  if [ "$INSTALL_ONLY" -eq 1 ]; then
+    say "installed only; no simulator app launch or model execution"
+    exit 0
+  fi
 
   # simctl forwards SIMCTL_CHILD_<VAR> from the calling environment as <VAR> in the app.
   for var in IOS_CAMPAIGN_TIMEOUT_SECONDS IOS_CAMPAIGN_BUILD_SHA IOS_CAMPAIGN_CASE IOS_CAMPAIGN_LIST IOS_CAMPAIGN_DIAGNOSTIC IOS_CAMPAIGN_REFUSAL_ONLY IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
@@ -268,16 +291,13 @@ else
 fi
 say "increased-memory-limit entitlement: $MEMORY_ENTITLEMENT (${ENTITLEMENT_OVERRIDES[*]})"
 
-# Stamp the exact compiled checkout, not a caller label on a stale installed app.
-export IOS_CAMPAIGN_BUILD_SHA=$(git rev-parse HEAD)
-
 # --- rust staticlib ---------------------------------------------------------------------------
 # No IPHONEOS_DEPLOYMENT_TARGET here on purpose: .cargo/config.toml floors the iOS triples (per-target
 # rustflags, not [env] -- see the note there), and this script is
 # also a check that a clean invocation needs no environment help.
-# ios-host/smoke is excluded from the workspace, so it has its OWN target directory rather than
-# the root one. The metallib it builds lives there too.
-SMOKE_TARGET="$ROOT/ios-host/smoke/target"
+# SDK and capture share the root workspace/lock. The explicit target directory above keeps
+# Xcode's staticlib and metallib lookup independent of Cargo's workspace target default.
+SMOKE_TARGET="$CARGO_TARGET_DIR"
 LIB="$SMOKE_TARGET/aarch64-apple-ios/$PROFILE/libios_smoke.a"
 
 say "building ios-smoke for aarch64-apple-ios ($PROFILE${CARGO_FEATURES:+, $CARGO_FEATURES})"

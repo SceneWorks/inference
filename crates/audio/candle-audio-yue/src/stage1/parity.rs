@@ -307,21 +307,33 @@ fn check_run(run_key: &str, guided: bool) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn guided_render_matches_the_reference_token_for_token() {
     check_run("guidance", true);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage1::parity::guided_render_matches_the_reference_token_for_token");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn unguided_render_matches_the_reference_token_for_token() {
     check_run("noGuidance", false);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage1::parity::unguided_render_matches_the_reference_token_for_token");
 }
 
 /// Every segment ends at the budget and the context never overflows, so each forced `<EOA>` must
 /// reach the next segment through the incremental KV cache — not a smart-context rebuild from the
 /// full sequence, which would hide a forced `<EOA>` missing from the cache window.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn budget_ended_segments_carry_the_forced_eoa_into_the_cache() {
     check_run("budgetOnly", true);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage1::parity::budget_ended_segments_carry_the_forced_eoa_into_the_cache");
 }
 
 /// Drive the fixture's `run_key` render, asserting per step that no decode step copies cached K/V
@@ -395,6 +407,7 @@ fn assert_bounded_decode(run_key: &str, capacity: usize) -> (usize, usize) {
 /// the guided render's bound (4 × (130 + 1) generated) outgrows the context — that is why it
 /// shortens — so its cache is the context.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn decode_steps_neither_copy_the_kv_cache_nor_build_a_mask() {
     let fx = fixture();
     let context = fx["config"]["max_position_embeddings"].as_u64().unwrap() as usize;
@@ -420,12 +433,16 @@ fn decode_steps_neither_copy_the_kv_cache_nor_build_a_mask() {
         rewinds, 1,
         "the last segment's smart-context rebuild rewinds the cache"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage1::parity::decode_steps_neither_copy_the_kv_cache_nor_build_a_mask");
 }
 
 /// A render bound that does not cover the segments run is refused at the segment that would
 /// outgrow the cache — before any write — rather than failing mid-decode; the next render with an
 /// adequate bound reallocates and decodes normally.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_segment_beyond_the_render_bound_is_refused_before_it_decodes() {
     let fx = fixture();
     let decode = decode_config(&fx["runs"]["budgetOnly"]["decode"], true);
@@ -457,6 +474,9 @@ fn a_segment_beyond_the_render_bound_is_refused_before_it_decodes() {
     // An adequate bound renders all four segments.
     let got = render(&mut lm, &prompts, &decode, 1);
     assert_eq!(got.segments.len(), 4);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage1::parity::a_segment_beyond_the_render_bound_is_refused_before_it_decodes");
 }
 
 /// Sequence length the cache would hold before segment `index`'s shortening check, with no
@@ -540,6 +560,7 @@ fn the_fixture_exercises_both_endings_the_smart_context_and_the_min_new_floor() 
 /// repetition penalty, top-k) changes the stream. Guards against a golden the engine would match
 /// with a knob silently ignored.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn each_decode_knob_moves_the_stream() {
     let fx = fixture();
     let want: Vec<Vec<u32>> = fx["runs"]["guidance"]["segments"]
@@ -575,6 +596,9 @@ fn each_decode_knob_moves_the_stream() {
     // …and the seed is the render's only randomness.
     let again = render(&mut lm, &prompts(&fx), &base, seed(&fx));
     assert_eq!(again.segments, want);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage1::parity::each_decode_knob_moves_the_stream");
 }
 
 #[test]
@@ -625,6 +649,7 @@ fn tiny_weights_match_the_reference_generator() {
 /// Production wiring: `stage1::load` (the `StageSet::production` loader) loads a staged snapshot
 /// through candle-llm's provider — no `Unsupported` refusal — and decodes inside the allow-list.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn production_load_decodes_a_staged_snapshot() {
     let fx = fixture();
     let root = tempfile::tempdir().unwrap();
@@ -654,6 +679,9 @@ fn production_load_decodes_a_staged_snapshot() {
         }
     }
     lm.end_segment().unwrap();
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage1::parity::production_load_decodes_a_staged_snapshot");
 }
 
 /// A prompt builder that returns the fixture's blocks, so the engine drives the reference prompts.
@@ -742,6 +770,7 @@ fn engine_with_tiny_stage1(
 /// AC2: the segment loop over the real stage 1 reports one finished-segment event per segment
 /// (carrying the reference's token counts) and renders through the downstream stages.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn engine_reports_each_segment_once_over_the_real_stage1() {
     let fx = fixture();
     let (engine, req, _) = engine_with_tiny_stage1(None);
@@ -770,10 +799,14 @@ fn engine_reports_each_segment_once_over_the_real_stage1() {
         .filter(|e| matches!(e, YueEvent::SegmentStarted { .. }))
         .count();
     assert_eq!(started, 4);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage1::parity::engine_reports_each_segment_once_over_the_real_stage1");
 }
 
 /// AC2: a cancel raised mid-segment stops the real stage 1 within one decode step.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cancel_stops_the_real_stage1_within_one_step() {
     let cancel = CancelFlag::new();
     let (engine, req, steps) = engine_with_tiny_stage1(Some((150, cancel.clone())));
@@ -784,11 +817,15 @@ fn cancel_stops_the_real_stage1_within_one_step() {
         150,
         "no step after the one that saw the cancel"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage1::parity::cancel_stops_the_real_stage1_within_one_step");
 }
 
 /// A guidance scale of exactly 1 is no guidance: it reproduces the unguided reference stream and
 /// runs batch-of-1 (no unconditional row computed only to be discarded).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn unit_guidance_scale_is_no_guidance_on_one_row() {
     let fx = fixture();
     let decode = DecodeConfig {
@@ -808,6 +845,9 @@ fn unit_guidance_scale_is_no_guidance_on_one_row() {
         .map(ids)
         .collect();
     assert_eq!(got.segments, want);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stage1::parity::unit_guidance_scale_is_no_guidance_on_one_row");
 }
 
 /// The engine's split skips the prompt's ICL reference pair: a segment-0 prompt block carrying a

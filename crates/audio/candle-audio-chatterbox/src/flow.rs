@@ -99,7 +99,9 @@ impl TimeMlp {
         })
     }
     fn forward(&self, t: &Tensor) -> CandleResult<Tensor> {
-        self.linear_2.forward(&self.linear_1.forward(t)?.silu()?)
+        __model_proof_output!(self
+            .linear_2
+            .forward(&__model_proof_output!(self.linear_1.forward(t))?.silu()?))
     }
 }
 
@@ -122,7 +124,7 @@ impl CausalConv1d {
     }
     /// `[B, in, T]` → `[B, out, T]` (length preserved).
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        self.conv.forward(&x.pad_with_zeros(2, self.left_pad, 0)?)
+        __model_proof_output!(self.conv.forward(&x.pad_with_zeros(2, self.left_pad, 0)?))
     }
 }
 
@@ -142,7 +144,7 @@ impl CausalBlock1D {
     /// `[B, in, T]` → `[B, out, T]`.
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let h = self.conv.forward(x)?; // [B, out, T]
-        let h = self.norm.forward(&h.transpose(1, 2)?.contiguous()?)?; // LN over channels
+        let h = __model_proof_output!(self.norm.forward(&h.transpose(1, 2)?.contiguous()?))?; // LN over channels
         let h = h.transpose(1, 2)?.contiguous()?; // [B, out, T]
         candle_nn::ops::mish(&h)
     }
@@ -170,13 +172,11 @@ impl ResnetBlock {
     fn forward(&self, x: &Tensor, t_emb: &Tensor) -> CandleResult<Tensor> {
         let h = self.block1.forward(x)?;
         // mlp = Linear(Mish(t)); add the [B, dim_out, 1] time bias, broadcast over time.
-        let t = self
-            .mlp
-            .forward(&candle_nn::ops::mish(t_emb)?)?
+        let t = __model_proof_output!(self.mlp.forward(&candle_nn::ops::mish(t_emb)?))?
             .unsqueeze(D::Minus1)?;
         let h = h.broadcast_add(&t)?;
         let h = self.block2.forward(&h)?;
-        h + self.res_conv.forward(x)?
+        h + __model_proof_output!(self.res_conv.forward(x))?
     }
 }
 
@@ -209,14 +209,14 @@ impl SelfAttention {
                 .transpose(1, 2)?
                 .contiguous()
         };
-        let q = heads(&self.to_q.forward(x)?)?;
-        let k = heads(&self.to_k.forward(x)?)?;
-        let v = heads(&self.to_v.forward(x)?)?;
+        let q = heads(&__model_proof_output!(self.to_q.forward(x))?)?;
+        let k = heads(&__model_proof_output!(self.to_k.forward(x))?)?;
+        let v = heads(&__model_proof_output!(self.to_v.forward(x))?)?;
         let scale = 1.0 / (TB_HEAD_DIM as f64).sqrt();
         let att = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
         let att = softmax_last_dim(&att)?;
         let ctx = att.matmul(&v)?.transpose(1, 2)?.reshape((b, t, TB_INNER))?;
-        self.to_out.forward(&ctx)
+        __model_proof_output!(self.to_out.forward(&ctx))
     }
 }
 
@@ -234,7 +234,9 @@ impl FeedForwardGelu {
         })
     }
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        self.out.forward(&self.proj.forward(x)?.gelu_erf()?)
+        __model_proof_output!(self
+            .out
+            .forward(&__model_proof_output!(self.proj.forward(x))?.gelu_erf()?))
     }
 }
 
@@ -257,8 +259,12 @@ impl TransformerBlock {
     }
     /// `[B, T, DEC_CH]` → `[B, T, DEC_CH]`.
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let x = (x + self.attn1.forward(&self.norm1.forward(x)?)?)?;
-        let ff = self.ff.forward(&self.norm3.forward(&x)?)?;
+        let x = (x + self
+            .attn1
+            .forward(&__model_proof_output!(self.norm1.forward(x))?)?)?;
+        let ff = self
+            .ff
+            .forward(&__model_proof_output!(self.norm3.forward(&x))?)?;
         x + ff
     }
 }
@@ -380,7 +386,7 @@ impl ConditionalDecoder {
         h = self.up_sample.forward(&h)?;
 
         h = self.final_block.forward(&h)?;
-        self.final_proj.forward(&h)
+        __model_proof_output!(self.final_proj.forward(&h))
     }
 }
 
@@ -595,7 +601,7 @@ impl Flow {
         ids.extend_from_slice(speech_tokens);
         let n_tok = ids.len();
         let ids = Tensor::from_vec(ids, (1, n_tok), &self.device)?;
-        let token_emb = self.input_embedding.forward(&ids)?; // [1, T, 512]
+        let token_emb = __model_proof_output!(self.input_embedding.forward(&ids))?; // [1, T, 512]
 
         // Encoder + projection → mu [1, 80, 2T].
         let h = self.encoder.forward(&token_emb)?; // [1, 2T, 512]
@@ -606,9 +612,7 @@ impl Flow {
             )));
         }
         let mel_len2 = total - mel_len1;
-        let mu = self
-            .encoder_proj
-            .forward(&h)?
+        let mu = __model_proof_output!(self.encoder_proj.forward(&h))?
             .transpose(1, 2)?
             .contiguous()?; // [1, 80, 2T]
 
@@ -688,6 +692,7 @@ mod tests {
 
     /// Estimator block accounting on synthetic weights: 320 → 80 velocity field, length preserved.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn estimator_maps_320_to_80_preserving_length() {
         let dev = Device::Cpu;
         let varmap = VarMap::new();
@@ -713,6 +718,9 @@ mod tests {
             .unwrap()
             .iter()
             .all(|v| v.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED flow::tests::estimator_maps_320_to_80_preserving_length");
     }
 
     // ---- synthetic-weight materializers (shapes exactly match flow.decoder.estimator.*) ----

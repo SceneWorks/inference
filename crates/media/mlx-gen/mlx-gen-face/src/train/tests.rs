@@ -199,6 +199,7 @@ fn noise_px(key: &str, h: usize, w: usize) -> Array {
 /// `round` in `face_crop_box` ⇒ crop box differs ⇒ red; drop the `.max(0.0)` source clamp in
 /// `bilinear_matrix` ⇒ embedding differs ⇒ red; skip the bias centring in `frame_score` ⇒ cos red;
 /// draw the noise set from a different key ⇒ noise mean red.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn identity_path_matches_the_torch_reference() {
     let (f, _cpu) = fixture();
@@ -252,11 +253,16 @@ fn identity_path_matches_the_torch_reference() {
         "loss {} vs {want}",
         scalar(&l)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED train::tests::identity_path_matches_the_torch_reference"
+    );
 }
 
 /// Bias centring takes a non-face toward 0: 112² noise images drawn like the bias set score below
 /// upstream's 0.2 gate against the synthetic reference, matching torch. Mutation: score the raw
 /// (uncentred) cosine ⇒ values drift from the fixture ⇒ red.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn noise_scores_below_the_gate_against_the_reference() {
     let (f, _cpu) = fixture();
@@ -282,6 +288,8 @@ fn noise_scores_below_the_gate_against_the_reference() {
         assert!((cos - want).abs() < 2e-5, "{key}: cos {cos} vs {want}");
         assert!(cos < 0.2, "{key}: noise scored {cos}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED train::tests::noise_scores_below_the_gate_against_the_reference");
 }
 
 /// AC3 (landmarks): the fx-program executor runs the converter's lowered FaceMesh-shaped program
@@ -466,6 +474,7 @@ fn no_face_and_low_cos_samples_contribute_zero() {
 /// clean score `max(cos(own, mean), 0.1)` — `max(0, 1 − cos / clean)` — matching torch; a reference
 /// added afterwards is refused. Mutations: target the per-image embedding ⇒ cos red; drop the
 /// clean-cos normalization ⇒ loss red.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn dataset_average_targets_the_mean_reference() {
     let (f, _cpu) = fixture();
@@ -507,11 +516,16 @@ fn dataset_average_targets_the_mean_reference() {
         loss.reference(&live).is_err(),
         "a late reference must be refused"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED train::tests::dataset_average_targets_the_mean_reference"
+    );
 }
 
 /// The multi-frame mean divides by the number of frames whose gate is OPEN (`max(Σ gate, 1)`):
 /// with one frame gated out the loss equals the passing frame's own. Mutations: divide by the
 /// face-bearing frame count ⇒ the value halves ⇒ red; drop the gate from the numerator ⇒ red.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_gated_frame_leaves_the_multi_frame_mean() {
     let (f, _cpu) = fixture();
@@ -544,11 +558,16 @@ fn a_gated_frame_leaves_the_multi_frame_mean() {
     let r = l.reference(&clip(&reference, &reference)).unwrap().unwrap();
     let v = scalar(&l.loss(&clip(&live, &other), r.as_ref()).unwrap());
     assert!((v - pass).abs() < 2e-5, "{v} vs the passing frame's {pass}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED train::tests::a_gated_frame_leaves_the_multi_frame_mean"
+    );
 }
 
 /// Upstream's detection retry reaches the reference: a detector that only finds the face on the
 /// gray-padded frame yields the same crop (box unpadded) and so the fixture loss. Mutation: skip
 /// the retry in `reference_boxes` ⇒ the reference is unusable ⇒ red.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_face_found_only_on_the_padded_retry_is_used() {
     struct PaddedOnly([f32; 4], (usize, usize));
@@ -583,6 +602,8 @@ fn a_face_found_only_on_the_padded_retry_is_used() {
     let v = scalar(&loss.loss(&live, r.as_ref()).unwrap());
     let want = expect(&f["arcface"]["identity_loss"]);
     assert!((v - want).abs() < 2e-5, "{v} vs {want}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED train::tests::a_face_found_only_on_the_padded_retry_is_used");
 }
 
 /// The landmark loss is differentiable into the LoRA, weighted by the noise level, and skips a
@@ -666,6 +687,7 @@ impl FaceBoxDetector for ScriptedDetector {
 /// frame (divide by 2) ⇒ the value halves ⇒ red; read frame 0 for every frame ⇒ the frame-1 face
 /// is never scored ⇒ red. (A miss is retried on the padded frame, so a no-face frame consumes two
 /// script entries.)
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn multi_frame_decodes_score_each_face_bearing_frame() {
     let (f, _cpu) = fixture();
@@ -703,9 +725,12 @@ fn multi_frame_decodes_score_each_face_bearing_frame() {
         .unwrap()
         .is_none());
     assert!(l.loss(&live, r.as_ref()).is_err());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED train::tests::multi_frame_decodes_score_each_face_bearing_frame");
 }
 
 /// A live decode at another size than its reference is an error, never a silently misplaced crop.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_live_decode_of_another_size_is_refused() {
     let (f, _cpu) = fixture();
@@ -714,6 +739,10 @@ fn a_live_decode_of_another_size_is_refused() {
     let r = loss.reference(&reference).unwrap().unwrap();
     let small = live.index((.., 0..64, .., ..));
     assert!(loss.loss(&small, r.as_ref()).is_err());
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED train::tests::a_live_decode_of_another_size_is_refused"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -739,6 +768,7 @@ fn arcface_depth_is_read_from_the_keys_and_its_size_is_counted() {
 /// real I/O contract (478 landmarks). With the identity loss on, the landmark loss's gate IS the
 /// identity loss's scorer (one ArcFace, one dataset mean); off, it is ungated. Mutation: build a
 /// fresh scorer per loader (skip the `SCORERS` lookup) ⇒ `ptr_eq` red.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn testing_checkpoints_load_through_the_real_loaders() {
     let (f, _cpu) = fixture();
@@ -780,6 +810,8 @@ fn testing_checkpoints_load_through_the_real_loaders() {
         .landmarks(&live, face_crop_box(bbox(&f), 72, 88))
         .unwrap();
     assert_eq!(out.shape(), &[478, 2]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED train::tests::testing_checkpoints_load_through_the_real_loaders");
 }
 
 /// The executor refuses an op the converter never emits, naming it.
@@ -829,4 +861,6 @@ fn real_facemesh_program_matches_torch() {
     let d = max_abs_diff(&got, &want);
     println!("real FaceMesh max abs {d} (scale {scale})");
     assert!(d <= 1e-4 * scale, "real FaceMesh drift {d} (scale {scale})");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED train::tests::real_facemesh_program_matches_torch");
 }

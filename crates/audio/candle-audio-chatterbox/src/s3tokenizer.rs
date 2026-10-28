@@ -405,7 +405,7 @@ impl S3Tokenizer {
 
     /// FSQ-encode the encoder hidden states `[1, T, n_state]` → token ids `[T]`.
     fn fsq_encode(&self, hidden: &Tensor) -> Result<Vec<i64>> {
-        let proj = self.project_down.forward(hidden)?; // [1, T, fsq_dim]
+        let proj = __model_proof_output!(self.project_down.forward(hidden))?; // [1, T, fsq_dim]
         let (_, t, d) = proj.dims3()?;
         let flat: Vec<f32> = proj.reshape((t, d))?.to_vec2::<f32>()?.concat();
         let mut codes = Vec::with_capacity(t);
@@ -453,8 +453,8 @@ impl Encoder {
     /// `[1, n_mels, T_mel]` → `[1, T_tok, n_state]`.
     fn forward(&self, mel: &Tensor) -> CandleResult<Tensor> {
         // Conv stem with exact-erf GELU (both `F.gelu(conv1(·))` and `F.gelu(conv2(·))`).
-        let x = self.conv1.forward(mel)?.gelu_erf()?;
-        let x = self.conv2.forward(&x)?.gelu_erf()?;
+        let x = __model_proof_output!(self.conv1.forward(mel))?.gelu_erf()?;
+        let x = __model_proof_output!(self.conv2.forward(&x))?.gelu_erf()?;
         // [1, n_state, T] → [1, T, n_state].
         let mut x = x.transpose(1, 2)?.contiguous()?;
         let seq = x.dim(1)?;
@@ -508,7 +508,7 @@ impl Block {
 
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> CandleResult<Tensor> {
         let (b, t, n) = x.dims3()?;
-        let h = self.attn_ln.forward(x)?;
+        let h = __model_proof_output!(self.attn_ln.forward(x))?;
 
         // q/k/v projections; q/k reshaped to [b, n_head, t, head_dim] for attention + RoPE.
         let to_heads = |proj: &Tensor| -> CandleResult<Tensor> {
@@ -516,9 +516,9 @@ impl Block {
                 .transpose(1, 2)?
                 .contiguous()
         };
-        let q = to_heads(&self.query.forward(&h)?)?;
-        let k = to_heads(&self.key.forward(&h)?)?;
-        let value = self.value.forward(&h)?; // [b, t, n] — reused raw for the FSMN memory
+        let q = to_heads(&__model_proof_output!(self.query.forward(&h))?)?;
+        let k = to_heads(&__model_proof_output!(self.key.forward(&h))?)?;
+        let value = __model_proof_output!(self.value.forward(&h))?; // [b, t, n] — reused raw for the FSMN memory
         let v = to_heads(&value)?;
 
         let q = candle_nn::rotary_emb::rope(&q, cos, sin)?;
@@ -532,19 +532,20 @@ impl Block {
             .matmul(&v)? // [b, n_head, t, head_dim]
             .transpose(1, 2)?
             .reshape((b, t, n))?;
-        let attn_out = self.out.forward(&ctx)?;
+        let attn_out = __model_proof_output!(self.out.forward(&ctx))?;
 
         // FSMN memory: depthwise conv over the value projection [b, n, t], added back.
-        let fsmn = self
-            .fsmn
-            .forward(&value.transpose(1, 2)?.contiguous()?)?
+        let fsmn = __model_proof_output!(self.fsmn.forward(&value.transpose(1, 2)?.contiguous()?))?
             .transpose(1, 2)?;
         let fsmn = (fsmn + &value)?;
 
         // Block: x + (out(attn) + fsmn), then x + mlp(mlp_ln(x)).
         let x = (x + (attn_out + fsmn)?)?;
-        let m = self.mlp0.forward(&self.mlp_ln.forward(&x)?)?.gelu_erf()?;
-        let m = self.mlp2.forward(&m)?;
+        let m = __model_proof_output!(self
+            .mlp0
+            .forward(&__model_proof_output!(self.mlp_ln.forward(&x))?))?
+        .gelu_erf()?;
+        let m = __model_proof_output!(self.mlp2.forward(&m))?;
         x + m
     }
 }
@@ -674,6 +675,7 @@ mod tests {
     /// confirm the mel tensor shape, token count (≈ clip_len / 640), and range invariants. Real
     /// weights are exercised by the `#[ignore]`d conformance test.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn mel_front_end_shape_and_token_rate_with_synthetic_weights() {
         use candle_audio::candle_core::DType;
         use candle_nn::VarMap;
@@ -740,6 +742,9 @@ mod tests {
             codes.iter().all(|&t| (0..6561).contains(&t)),
             "every token in [0, 6560]"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED s3tokenizer::tests::mel_front_end_shape_and_token_rate_with_synthetic_weights");
     }
 
     // ---------------------------------------------------------------------------------------

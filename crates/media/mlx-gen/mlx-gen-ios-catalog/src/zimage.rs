@@ -105,9 +105,11 @@ fn tier_name(bits: Option<i32>) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::evidence::{EvidenceRow, DEVICE_CAPTURE_CLASS};
-    use crate::ios_admission::{admit, admit_with_rows, build_candidate, evidence_key, IosWork};
-    use crate::sdxl::tests::{budget, write_tensor, DEVICE};
+    use crate::evidence::{AnchorKind, AnchorSelection};
+    use crate::ios_admission::{admit, build_candidate, evidence_key, IosWork};
+    use crate::sdxl::tests::{
+        admit_fixture_rows as admit_with_rows, budget, write_tensor, DEVICE, FIXTURE_BML_BYTES,
+    };
     use crate::RefusalKind;
     use mlx_gen::gen_core::{
         Conditioning, ControlKind, GenerationOutput, GenerationRequest, Generator, Image,
@@ -118,6 +120,48 @@ pub(crate) mod tests {
     /// A header-only Z-Image Turbo snapshot stored at `bits` (None = dense bf16): transformer and
     /// VAE tensors with their packed-tier markers, and the production Qwen3-4B text encoder's
     /// sparse contract fixture (the provider validates its exact geometry) with its tokenizer.
+    /// Complete header-only DiT projection schema inspected by source overlay normalization.
+    /// No native constructor runs: group-aligned tiny matrices exercise dense-to-Q4/Q8 facts.
+    fn transformer_fixture_headers() -> Vec<(String, Vec<usize>)> {
+        let cfg = mlx_gen_z_image::transformer::ZImageTransformerConfig::turbo();
+        let mut paths = Vec::new();
+        for (stack, count, conditioned) in [
+            ("layers", cfg.n_layers, true),
+            ("noise_refiner", cfg.n_refiner_layers, true),
+            ("context_refiner", cfg.n_refiner_layers, false),
+        ] {
+            for index in 0..count {
+                if conditioned {
+                    paths.push(format!("{stack}.{index}.adaLN_modulation.0"));
+                }
+                for leaf in [
+                    "attention.to_q",
+                    "attention.to_k",
+                    "attention.to_v",
+                    "attention.to_out.0",
+                    "feed_forward.w1",
+                    "feed_forward.w2",
+                    "feed_forward.w3",
+                ] {
+                    paths.push(format!("{stack}.{index}.{leaf}"));
+                }
+            }
+        }
+        let embed = format!("{}-{}", cfg.patch_size, cfg.f_patch_size);
+        paths.extend([
+            format!("all_x_embedder.{embed}"),
+            "cap_embedder.1".into(),
+            "t_embedder.mlp.0".into(),
+            "t_embedder.mlp.2".into(),
+            format!("all_final_layer.{embed}.linear"),
+            format!("all_final_layer.{embed}.adaLN_modulation.0"),
+        ]);
+        paths
+            .into_iter()
+            .map(|path| (format!("{path}.weight"), vec![64, 64]))
+            .collect()
+    }
+
     pub(crate) fn snapshot(root: &Path, bits: Option<i32>) {
         let marker = |dir: &Path| {
             let mut config = serde_json::json!({"_class_name": "fixture"});
@@ -131,6 +175,10 @@ pub(crate) mod tests {
             write_tensor(&dir.join("model.safetensors"), "BF16", 64);
             marker(&dir);
         }
+        crate::sdxl::tests::write_header_fixture(
+            &root.join("transformer/model.safetensors"),
+            transformer_fixture_headers(),
+        );
         gen_core_testkit::write_encoder_contract_fixture_with_quant(
             &root.join("text_encoder"),
             mlx_gen_z_image::ENCODER_CONTRACT,
@@ -492,22 +540,25 @@ pub(crate) mod tests {
             work("text", 768),
         )
         .unwrap();
-        let row = EvidenceRow {
-            key: evidence_key(&registry, &candidate, DEVICE).unwrap(),
-            footprint_bytes: 3 << 30,
-            baseline_footprint_bytes: 1 << 28,
-            mlx_peak_bytes: 2 << 30,
-            min_headroom_mib: 900.0,
-            elapsed_seconds: 60.0,
-            evidence_class: DEVICE_CAPTURE_CLASS.into(),
-            run_id: "synthetic".into(),
-            build_sha: "synthetic".into(),
-        };
+        let mut row = crate::evidence::fixture::completed(
+            evidence_key(&registry, &candidate, DEVICE).unwrap(),
+            AnchorKind::Optimized,
+            AnchorSelection::from_parts(
+                candidate.context.selection.strategy,
+                &candidate.context.selection.parameters,
+            ),
+            0,
+        );
+        if let crate::evidence::AnchorOutcome::Completed { captures } = &mut row.outcome {
+            for c in captures.iter_mut() {
+                crate::evidence::fixture::set_kernel_footprints(c, 1 << 28, 3 << 30);
+            }
+        }
         let admitted = admit_with_rows(
             &registry,
             std::slice::from_ref(&candidate),
             DEVICE,
-            crate::capacity_budget(8 << 30, 0, None),
+            crate::capacity_budget(8 << 30, FIXTURE_BML_BYTES, None),
             &[row],
         )
         .unwrap();

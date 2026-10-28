@@ -161,12 +161,12 @@ impl Sam3MaskHead {
         prompt_key_mask: &Tensor,
     ) -> Result<MaskOutput> {
         // prompt cross-attention: encoder features attend to the text prompt
-        let normed = layer_norm(
+        let normed = __model_proof_output!(layer_norm(
             encoder_hidden,
             &self.prompt_norm_w,
             &self.prompt_norm_b,
             LN_EPS,
-        )?;
+        ))?;
         let attn = self
             .prompt_attn
             .forward(&normed, prompt, prompt, Some(prompt_key_mask))?;

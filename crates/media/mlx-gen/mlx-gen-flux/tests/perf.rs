@@ -86,6 +86,7 @@ fn flux1_per_step_compiled_vs_eager() {
         Some(p) => p,
         None => {
             eprintln!("skip: set MLX_GEN_FLUX_SNAPSHOT or populate the HF cache for {var:?}");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in flux1_per_step_compiled_vs_eager; see preceding skip diagnostic");
             return;
         }
     };
@@ -163,4 +164,6 @@ fn flux1_per_step_compiled_vs_eager() {
         max_diff, 0.0,
         "FLUX.1 compiled glue diverged from eager on real weights"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED perf::flux1_per_step_compiled_vs_eager");
 }

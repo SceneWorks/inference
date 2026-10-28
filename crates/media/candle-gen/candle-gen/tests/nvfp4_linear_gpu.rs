@@ -66,6 +66,8 @@ fn nvfp4_device() -> Option<Device> {
         Ok(d @ Device::Cuda(_)) => d,
         _ => {
             eprintln!("[sc-11041] no CUDA device; skipping Nvfp4Linear GPU gate");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_linear_gpu.rs:69 (nvfp4_device): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
             return None;
         }
     };
@@ -83,6 +85,8 @@ fn nvfp4_device() -> Option<Device> {
                 "[sc-11041] device cap {:?} < 12.0 (not sm_120); skipping Nvfp4Linear GPU gate",
                 lt.compute_cap().ok()
             );
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_linear_gpu.rs:81 (nvfp4_device): Implicit None on ineligible/error capability probe silently bypasses selected learned GPU cases just like explicit no-device return.");
             None
         }
     }
@@ -91,8 +95,13 @@ fn nvfp4_device() -> Option<Device> {
 /// (1) W4A4 `Nvfp4Linear` output matches a bf16 reference linear within NVFP4 tolerance, and tightly
 /// matches the CPU dequant reference (the exact value the FP4 cores approximate).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn nvfp4_linear_w4a4_matches_bf16_reference() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_linear_gpu.rs:95 (nvfp4_linear_w4a4_matches_bf16_reference): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
+        return;
+    };
     let (m, k, n) = (256usize, 256usize, 256usize);
 
     let x_f32 = pseudo_random(m * k, 11);
@@ -153,6 +162,9 @@ fn nvfp4_linear_w4a4_matches_bf16_reference() {
         rr_bf16 < 0.2,
         "Nvfp4Linear vs bf16 dense {rr_bf16:.5} exceeds NVFP4 tolerance"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_linear_gpu::nvfp4_linear_w4a4_matches_bf16_reference");
 }
 
 /// (2) **SC#6 packed-forward.** The resident W4A4 weight occupies the NVFP4 footprint on-device
@@ -216,8 +228,13 @@ fn nvfp4_linear_resident_vram_is_nvfp4_footprint() {
 /// (the layer pads M to `NVFP4_M_ALIGN` and slices the padding back off), and the real rows match the
 /// dequant reference.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn nvfp4_linear_handles_non_aligned_m() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_linear_gpu.rs:220 (nvfp4_linear_handles_non_aligned_m): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
+        return;
+    };
     let (k, n) = (256usize, 128usize); // K_pad % 32 == 0, N % 16 == 0
     let w_bf16 = Tensor::from_vec(pseudo_random(n * k, 22), (n, k), &dev)
         .unwrap()
@@ -262,13 +279,23 @@ fn nvfp4_linear_handles_non_aligned_m() {
             "M={m} real rows do not match the dequant reference (rel-RMS {rr:.5})"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_linear_gpu::nvfp4_linear_handles_non_aligned_m"
+    );
 }
 
 /// (4) An explicit **W4A16** override on `sm_120` still takes the dequant→bf16 regime (the outlier-class
 /// fallback), proving the mixed-precision policy flag is honored even where W4A4 is available.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn nvfp4_linear_w4a16_override_forces_dequant_on_sm120() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_linear_gpu.rs:271 (nvfp4_linear_w4a16_override_forces_dequant_on_sm120): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
+        return;
+    };
     let (out_dim, in_dim) = (128usize, 256usize);
     let w_bf16 = Tensor::from_vec(pseudo_random(out_dim * in_dim, 9), (out_dim, in_dim), &dev)
         .unwrap()
@@ -303,6 +330,9 @@ fn nvfp4_linear_w4a16_override_forces_dequant_on_sm120() {
         .unwrap()
         .iter()
         .all(|v| v.is_finite()));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_linear_gpu::nvfp4_linear_w4a16_override_forces_dequant_on_sm120");
 }
 
 // ==============================================================================================
@@ -335,10 +365,15 @@ fn nvfp4_linear_w4a16_override_forces_dequant_on_sm120() {
 /// constructor still costs (by design — it is for one-off layers and tests), leg 3 pins that the
 /// constructor a trunk loader uses does not.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn nvfp4_linear_shares_one_cublaslt_workspace_across_layers() {
     use candle_gen::candle_core::cuda_backend::cudarc::driver::result as cuda;
     use candle_gen::quant::cublaslt::CublasLt;
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/tests/nvfp4_linear_gpu.rs:341 (nvfp4_linear_shares_one_cublaslt_workspace_across_layers): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
+        return;
+    };
 
     /// `CublasLt::WORKSPACE` — private to the handle, restated here as the *predicted* per-handle cost
     /// this test exists to confirm or refute against the driver.
@@ -576,4 +611,7 @@ fn nvfp4_linear_shares_one_cublaslt_workspace_across_layers() {
         reference.len()
     );
     drop(shared);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_linear_gpu::nvfp4_linear_shares_one_cublaslt_workspace_across_layers");
 }

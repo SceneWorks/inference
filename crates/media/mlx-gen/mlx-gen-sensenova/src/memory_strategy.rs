@@ -595,7 +595,13 @@ fn safetensors_inventory(root: &Path) -> Option<Vec<String>> {
 /// a shard path that is not a single plain file name (`..`, nested, absolute): the pin must never
 /// follow an index outside the snapshot.
 fn indexed_shard_names(index: &Path) -> Option<Vec<String>> {
-    let body = std::fs::read_to_string(index).ok()?;
+    let body = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(index),
+"crates/media/mlx-gen/mlx-gen-sensenova/src/memory_strategy.rs::indexed_shard_names::std::fs::read_to_string@27556",
+ArtifactInput,
+index,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+).ok()?;
     let index: serde_json::Value = serde_json::from_str(&body).ok()?;
     let weight_map = index.get("weight_map")?.as_object()?;
     if weight_map.is_empty() {
@@ -628,19 +634,84 @@ fn indexed_shard_names(index: &Path) -> Option<Vec<String>> {
 /// * Without an index the checkpoint is one [`SINGLE_FILE`], and it must be the only
 ///   `*.safetensors` present.
 fn checkpoint_files(root: &Path) -> Option<Vec<PathBuf>> {
-    let inventory = safetensors_inventory(root)?;
-    let index = root.join(SHARD_INDEX);
-    if index.is_file() {
-        let shards = indexed_shard_names(&index)?;
-        if shards != inventory {
-            return None;
+    checkpoint_files_with_companion(root, None)
+}
+
+/// Select the original base inventory, excluding only the already-resolved companion entry.
+/// Indexed snapshots still require the complete exact shard set; every other extra stays an error.
+fn selected_base_names(
+    mut inventory: Vec<String>,
+    mut indexed: Option<Vec<String>>,
+    companion: Option<&str>,
+) -> Option<Vec<String>> {
+    if let Some(companion) = companion {
+        inventory.retain(|name| name != companion);
+        if let Some(indexed) = indexed.as_mut() {
+            indexed.retain(|name| name != companion);
         }
-        return Some(shards.iter().map(|name| root.join(name)).collect());
     }
-    if inventory.as_slice() != [SINGLE_FILE] {
+    if inventory.is_empty() {
         return None;
     }
-    Some(vec![root.join(SINGLE_FILE)])
+    if let Some(indexed) = indexed {
+        if indexed != inventory {
+            return None;
+        }
+    }
+    Some(inventory)
+}
+
+/// Match only the already-selected existing companion identity to a direct inventory entry.
+/// Canonical paths resolve symlink/parent aliases; metadata also recognizes hard links.
+/// Caller/loader paths and extensions are unchanged; unknown entries remain fail-closed.
+fn companion_inventory_name(
+    root: &Path,
+    companion: Option<&Path>,
+    inventory: &[String],
+) -> Option<String> {
+    let companion = std::fs::canonicalize(companion?).ok()?;
+    let selected = std::fs::metadata(&companion).ok()?;
+    let mut matched = None;
+    // Reuse only the already-collected direct inventory: no new directory traversal.
+    for name in inventory {
+        let Ok(candidate) = std::fs::canonicalize(root.join(name)) else {
+            continue;
+        };
+        let Ok(identity) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if identity.dev() == selected.dev() && identity.ino() == selected.ino() {
+            // Do not exempt a second unknown alias just because it shares the selected inode.
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(name.clone());
+        }
+    }
+    matched
+}
+
+/// The explicit base-only shard set used by the selected fast load and converter.
+/// Unindexed layouts retain their eager shard inventory; pinning remains stricter below.
+pub(crate) fn selected_base_files(root: &Path, companion: Option<&Path>) -> Option<Vec<PathBuf>> {
+    let inventory = safetensors_inventory(root)?;
+    let index = root.join(SHARD_INDEX);
+    let indexed = if index.is_file() {
+        Some(indexed_shard_names(&index)?)
+    } else {
+        None
+    };
+    let companion = companion_inventory_name(root, companion, &inventory);
+    let names = selected_base_names(inventory, indexed, companion.as_deref())?;
+    Some(names.into_iter().map(|name| root.join(name)).collect())
+}
+
+fn checkpoint_files_with_companion(root: &Path, companion: Option<&Path>) -> Option<Vec<PathBuf>> {
+    let files = selected_base_files(root, companion)?;
+    if !root.join(SHARD_INDEX).is_file() && files.as_slice() != [root.join(SINGLE_FILE)] {
+        return None;
+    }
+    Some(files)
 }
 
 /// SHA-256 identity of the exact checkpoint bytes, cached per file by a mutation-sensitive
@@ -654,10 +725,18 @@ fn checkpoint_files(root: &Path) -> Option<Vec<PathBuf>> {
 /// Pins both shipped layouts — see [`PinnedArtifact`] and [`checkpoint_files`] — and returns
 /// `None` for any inventory that is neither.
 pub(crate) fn verified_artifact(spec: &LoadSpec) -> Option<PinnedArtifact> {
+    verified_artifact_with_companion(spec, None)
+}
+
+/// Pin only the explicit selected base files; a distill component is never a base shard.
+pub(crate) fn verified_artifact_with_companion(
+    spec: &LoadSpec,
+    companion: Option<&Path>,
+) -> Option<PinnedArtifact> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return None;
     };
-    let files = checkpoint_files(root)?;
+    let files = checkpoint_files_with_companion(root, companion)?;
     if let [only] = files.as_slice() {
         return pinned_file(only).map(PinnedArtifact::single);
     }
@@ -1030,7 +1109,17 @@ pub fn memory_strategy_contract(
 ) -> CoreResult<MemoryProviderContract> {
     validate_load_contract(provider_id, spec)?;
     validate_resolved_artifact_binding(spec)?;
-    let artifact = verified_artifact(spec);
+    let companion = match &spec.weights {
+        WeightsSource::Dir(root)
+            if provider_id == crate::MODEL_ID_FAST
+                && !root.join(crate::DISTILL_MERGED_MARKER).exists() =>
+        {
+            crate::distill::resolve_distill_lora(spec.components.get(DISTILL_LORA_COMPONENT), root)
+                .ok()
+        }
+        _ => None,
+    };
+    let artifact = verified_artifact_with_companion(spec, companion.as_deref());
     memory_strategy_contract_with_artifact(provider_id, spec, artifact.as_ref())
 }
 
@@ -4014,5 +4103,235 @@ mod tests {
             Some(TRANSFORMER_WINDOW_SIZE)
         );
         std::fs::remove_dir_all(root).ok();
+    }
+}
+
+#[cfg(test)]
+mod selected_base_asset_tests {
+    use super::*;
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn selected_companion_is_not_base_but_other_extras_still_fail() {
+        let inventory = names(&["distill.safetensors", "model.safetensors"]);
+        assert_eq!(
+            selected_base_names(inventory.clone(), None, Some("distill.safetensors")),
+            Some(names(&["model.safetensors"]))
+        );
+        assert_eq!(
+            selected_base_names(
+                inventory,
+                Some(names(&["model.safetensors"])),
+                Some("distill.safetensors")
+            ),
+            Some(names(&["model.safetensors"]))
+        );
+        assert!(selected_base_names(
+            names(&[
+                "distill.safetensors",
+                "model.safetensors",
+                "stray.safetensors"
+            ]),
+            Some(names(&["model.safetensors"])),
+            Some("distill.safetensors")
+        )
+        .is_none());
+        assert!(selected_base_names(
+            names(&["distill.safetensors"]),
+            Some(names(&["model.safetensors"])),
+            Some("distill.safetensors")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn no_selection_never_grants_companion_or_suffix_tolerance() {
+        assert!(selected_base_names(
+            names(&["distill.safetensors", "model.safetensors"]),
+            Some(names(&["model.safetensors"])),
+            None
+        )
+        .is_none());
+        assert!(selected_base_names(
+            names(&["another_lora.safetensors", "model.safetensors"]),
+            Some(names(&["model.safetensors"])),
+            Some("distill.safetensors")
+        )
+        .is_none());
+        // Legacy unindexed eager shards remain possible; pinning still requires one model file.
+        assert_eq!(
+            selected_base_names(names(&["a.safetensors", "b.safetensors"]), None, None),
+            Some(names(&["a.safetensors", "b.safetensors"]))
+        );
+    }
+
+    #[test]
+    fn selection_never_excludes_nonexistent_or_external_names_only() {
+        let root = Path::new("nonexistent-selected-root");
+        let inventory = names(&["distill.safetensors", "model.safetensors"]);
+        assert_eq!(
+            companion_inventory_name(root, Some(&root.join("distill.safetensors")), &inventory),
+            None
+        );
+        assert_eq!(
+            companion_inventory_name(
+                root,
+                Some(Path::new("elsewhere/distill.safetensors")),
+                &inventory
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn indexed_companion_is_excluded_without_dropping_any_base_shard() {
+        let inventory = names(&["a.safetensors", "b.safetensors", "distill.safetensors"]);
+        assert_eq!(
+            selected_base_names(
+                inventory.clone(),
+                Some(inventory),
+                Some("distill.safetensors")
+            ),
+            Some(names(&["a.safetensors", "b.safetensors"]))
+        );
+    }
+}
+
+#[cfg(test)]
+mod selected_companion_alias_tests {
+    use super::*;
+
+    struct Assets(tempfile::TempDir);
+    impl Assets {
+        fn new() -> Self {
+            let guard = tempfile::tempdir().unwrap();
+            let path = guard.path();
+            std::fs::create_dir(path.join("root")).unwrap();
+            for name in ["model.safetensors", "distill.safetensors"] {
+                // Empty asset identity fixtures only: never model bytes or a model loader.
+                std::fs::write(path.join("root").join(name), []).unwrap();
+            }
+            Self(guard)
+        }
+        fn root(&self) -> PathBuf {
+            self.0.path().join("root")
+        }
+        fn inventory(&self) -> Vec<String> {
+            vec!["distill.safetensors".into(), "model.safetensors".into()]
+        }
+    }
+
+    #[test]
+    fn direct_absolute_and_parent_component_preserve_original_paths() {
+        let assets = Assets::new();
+        let root = assets.root();
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        for selected in [
+            root.join("distill.safetensors"),
+            root.join("subdir/../distill.safetensors"),
+        ] {
+            let original = selected.clone();
+            assert_eq!(
+                companion_inventory_name(&root, Some(&selected), &assets.inventory()),
+                Some("distill.safetensors".into())
+            );
+            assert_eq!(selected, original);
+            assert_eq!(selected.extension().unwrap(), "safetensors");
+        }
+    }
+
+    #[test]
+    fn relative_root_and_selected_path_match_existing_asset_identity() {
+        fn relative(path: &Path) -> PathBuf {
+            let cwd = std::env::current_dir().unwrap();
+            let from: Vec<_> = cwd.components().collect();
+            let to: Vec<_> = path.components().collect();
+            let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+            let mut result = PathBuf::new();
+            for _ in common..from.len() {
+                result.push("..");
+            }
+            for component in &to[common..] {
+                result.push(component.as_os_str());
+            }
+            result
+        }
+        let assets = Assets::new();
+        let root = relative(&assets.root());
+        let selected = relative(&assets.root().join("distill.safetensors"));
+        assert!(!root.is_absolute() && !selected.is_absolute());
+        assert_eq!(
+            companion_inventory_name(&root, Some(&selected), &assets.inventory()),
+            Some("distill.safetensors".into())
+        );
+    }
+
+    #[test]
+    fn differently_named_file_symlink_selects_only_companion_entry() {
+        let assets = Assets::new();
+        let selected = assets.0.path().join("selected-alias.safetensors");
+        std::os::unix::fs::symlink(assets.root().join("distill.safetensors"), &selected).unwrap();
+        assert_eq!(
+            companion_inventory_name(&assets.root(), Some(&selected), &assets.inventory()),
+            Some("distill.safetensors".into())
+        );
+        assert!(selected.is_symlink());
+    }
+
+    #[test]
+    fn directory_symlink_form_keeps_the_actual_inventory_paths() {
+        let assets = Assets::new();
+        let root_alias = assets.0.path().join("root-alias");
+        std::os::unix::fs::symlink(assets.root(), &root_alias).unwrap();
+        let selected = root_alias.join("distill.safetensors");
+        assert_eq!(
+            companion_inventory_name(&assets.root(), Some(&selected), &assets.inventory()),
+            Some("distill.safetensors".into())
+        );
+    }
+
+    #[test]
+    fn selected_hard_link_identity_is_not_a_filename_guess() {
+        let assets = Assets::new();
+        let selected = assets.0.path().join("selected-hardlink.safetensors");
+        std::fs::hard_link(assets.root().join("distill.safetensors"), &selected).unwrap();
+        assert_eq!(
+            companion_inventory_name(&assets.root(), Some(&selected), &assets.inventory()),
+            Some("distill.safetensors".into())
+        );
+    }
+
+    #[test]
+    fn same_external_basename_different_identity_does_not_exempt_base() {
+        let assets = Assets::new();
+        let selected = assets.0.path().join("distill.safetensors");
+        std::fs::write(&selected, []).unwrap();
+        assert_eq!(
+            companion_inventory_name(&assets.root(), Some(&selected), &assets.inventory()),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_duplicate_alias_is_not_blanket_exempted() {
+        let assets = Assets::new();
+        let root = assets.root();
+        std::fs::hard_link(
+            root.join("distill.safetensors"),
+            root.join("unknown.safetensors"),
+        )
+        .unwrap();
+        let mut inventory = assets.inventory();
+        inventory.push("unknown.safetensors".into());
+        assert_eq!(
+            companion_inventory_name(&root, Some(&root.join("distill.safetensors")), &inventory),
+            None
+        );
+        assert!(
+            selected_base_names(inventory, Some(vec!["model.safetensors".into()]), None).is_none()
+        );
     }
 }

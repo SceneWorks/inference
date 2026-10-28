@@ -372,6 +372,9 @@ fn the_timestep_embedder_and_shared_adaln_match_the_reference() {
         err < BLOCK_TOL * max_abs(&adaln).max(1.0),
         "shared AdaLN max|delta| = {err:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::the_timestep_embedder_and_shared_adaln_match_the_reference");
 }
 
 #[test]
@@ -394,6 +397,9 @@ fn one_deterministic_na_block_matches_the_reference() {
         err < BLOCK_TOL,
         "deterministic NA block max|delta| = {err:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::one_deterministic_na_block_matches_the_reference");
 }
 
 #[test]
@@ -428,6 +434,9 @@ fn one_diffusion_block_matches_the_reference() {
         without > 20.0 * err,
         "zeroing the context barely moved the output ({without:.3e} vs {err:.3e})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::one_diffusion_block_matches_the_reference");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -511,6 +520,9 @@ fn the_full_decode_matches_the_reference() {
         moved > 50.0 * err,
         "negating the latent barely moved the picture ({moved:.3e} vs {err:.3e})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::the_full_decode_matches_the_reference");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -546,6 +558,9 @@ fn the_conv_vae_decode_still_matches_the_v1_2_0_reference() {
         max_abs(want)
     );
     assert!(err < BLOCK_TOL, "conv VAE decode max|delta| = {err:.3e}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::the_conv_vae_decode_still_matches_the_v1_2_0_reference");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -655,6 +670,9 @@ fn tiled_decode_keeps_its_seams_and_its_temporal_continuity() {
         (a - b).abs() < 0.01,
         "the blend changed the picture's mean level"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::tiled_decode_keeps_its_seams_and_its_temporal_continuity");
 }
 
 /// CUDA-only acceptance substrate for sc-18783.  This story deliberately does not run the
@@ -722,4 +740,7 @@ fn budgeted_diffvae_estimate_never_under_predicts_the_measured_peak() {
         "bounded decode drifted from exact untiled decode by mean {drift:.3e} after {:.1}s",
         t.elapsed().as_secs_f64()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::budgeted_diffvae_estimate_never_under_predicts_the_measured_peak");
 }

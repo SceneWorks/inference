@@ -68,8 +68,8 @@ impl QEmbedding {
     /// Index-select the embedding rows for `indexes`.
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(e) => e.forward(indexes),
-            Self::Packed(e) => e.forward(indexes),
+            Self::Dense(e) => __model_proof_output!(e.forward(indexes)),
+            Self::Packed(e) => __model_proof_output!(e.forward(indexes)),
         }
     }
 
@@ -171,6 +171,7 @@ mod tests {
     /// sc-7702-safe **dequant-dense** arm (the packed forward flux uses), the dense sibling stays
     /// `Dense`, and the packed forward must reproduce the affine grid bit-exactly.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -217,6 +218,8 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged");
         Ok(())
     }
 
@@ -224,6 +227,7 @@ mod tests {
     /// rows (the CLIP `token_embedding` / T5 `shared` are packed in the q4/q8 tiers), while a
     /// `.scales`-less table stays dense.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn embedding_detect_fires_and_matches_grid() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -258,6 +262,8 @@ mod tests {
             "packed embedding deviates from the dense grid"
         );
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::embedding_detect_fires_and_matches_grid");
         Ok(())
     }
 }

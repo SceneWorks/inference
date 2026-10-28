@@ -24,12 +24,13 @@ on:
   # runners. `lanes: windows-cuda` scopes a dispatch to the Windows CUDA lanes (`windows-cuda-check`
   # and the manual `windows-cuda`), so CUDA tests can be run against a branch without scheduling
   # anything on a self-hosted Mac (sc-24164). The unconditional hosted checks still run.
+  # windows-gpu-diagnostic runs only bounded GPU1 metadata collection; all CI siblings skip.
   workflow_dispatch:
     inputs:
       lanes:
-        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes"
+        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; windows-gpu-diagnostic = read-only GPU1 metadata only"
         type: choice
-        options: [all, windows-cuda]
+        options: [all, windows-cuda, windows-gpu-diagnostic]
         default: all
 
 permissions:
@@ -64,6 +65,7 @@ concurrency:
 
 jobs:
   changes:
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
     name: select affected lanes
     runs-on: ubuntu-latest
     outputs:
@@ -78,12 +80,16 @@ jobs:
       # Informational only: ordinary CI has no job that consumes this output because privileged
       # real-weight runners remain dispatch/schedule-only in real-weights.yml.
       real_weights: ${{ steps.select.outputs.real_weights }}
+      # `all`, or the space-separated packages this change can affect. Only pull_request and
+      # merge_group runs are narrowed; see `scripts/ci/test_scope.py`.
+      test_scope: ${{ steps.scope.outputs.test_scope }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
       # Feature-epic refs form a protected branch train. Keep this in `changes`, which is
-      # unconditional for every CI event and is itself required by the aggregate `CI gate`.
+      # unconditional for every verification event and is required by the aggregate `CI gate`.
+      # Only the explicit metadata-only diagnostic dispatch skips both jobs.
       # A path-gated lane would let a docs-only topology violation merge without a verdict.
       - name: Enforce feature-epic pull-request topology
         id: topology
@@ -116,6 +122,25 @@ jobs:
           else
             python3 scripts/ci/select_lanes.py --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
           fi
+      # Narrows the three package test steps to the crates a PR can affect: the changed crates,
+      # crates that read the changed files, crates whose Cargo.lock resolution changed, and their
+      # dependents. A model crate (`mlx-gen-*`, `candle-gen-*`, `candle-audio-*`, not `*-catalog`)
+      # is NOT reached through a shared crate: a `gen-core` / `mlx-gen` / `candle-gen` / engine
+      # edit tests the shared crates, catalogs and bundles here, and leaves the ~80 models behind
+      # them to the post-merge `push: main` run, which is never narrowed. Those models still
+      # COMPILE on the PR (the all-target Clippy steps are not narrowed), so a contract break
+      # still fails the PR; what moves to post-merge is a behavioural regression in an untouched
+      # model. Before this, path-based lane selection ran every `mlx-gen-*` / `candle-gen*` crate
+      # for a one-model change, which put both test jobs past an hour.
+      - name: Scope package tests to affected crates
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ steps.topology.outputs.effective_base_sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: >-
+          python3 scripts/ci/test_scope.py scope --event "$EVENT_NAME"
+          --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
       - name: Report privileged real-weight impact
         run: |
           {
@@ -133,6 +158,7 @@ jobs:
   # --all` all failed hard on main until it was found by hand. `--no-deps` keeps this to a
   # fast manifest parse (no dependency resolution, no compile).
   resolve:
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
     name: workspace manifest resolution
     runs-on: ubuntu-latest
     steps:
@@ -152,6 +178,7 @@ jobs:
   # formatting can drift in any .rs file. `cargo fmt --all` also invokes `cargo metadata`, so
   # this doubles as a second resolution tripwire — no compile, so it stays fast.
   format:
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
     name: workspace formatting
     runs-on: ubuntu-latest
     steps:
@@ -164,9 +191,11 @@ jobs:
         run: cargo fmt --all --check
 
   workspace:
+    timeout-minutes: 20
     name: workspace graph invariants
     needs: changes
-    if: needs.changes.outputs.workspace == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.workspace == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -216,16 +245,20 @@ jobs:
       # which needs numpy. Leaving this after the discover step would turn that gate into an import
       # error rather than a check (sc-17285).
       - name: Install pinned tooling test dependencies
-        run: python3 -m pip install --disable-pip-version-check numpy==2.4.3 safetensors==0.8.0
+        run: python3 -m pip install --disable-pip-version-check numpy==2.4.3 safetensors==0.8.0 PyYAML==6.0.3
+      - name: Enforce model-free ordinary CI and registered explicit proofs
+        run: python3 -I scripts/check_model_inference_policy.py
       - name: Test repository tooling
         run: python3 -m unittest discover -s scripts/tests -v
       - name: Test Mage oracle provisioning failures
         run: python3 scripts/release/provision_mage_oracles.py --self-test
 
   contracts:
+    timeout-minutes: 30
     name: contracts + conformance testkits (Linux)
     needs: changes
-    if: needs.changes.outputs.contracts == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.contracts == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -249,7 +282,7 @@ jobs:
           --all-targets -- -D warnings
       - name: Test contracts
         run: >-
-          cargo test --locked
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
 
@@ -268,9 +301,11 @@ jobs:
   # Keep it that way: moving this to a self-hosted label would cost a whole lane on the scarcest
   # resource in this repo to run a test that needs nothing but a filesystem.
   contracts-windows:
+    timeout-minutes: 30
     name: contracts testkit (Windows)
     needs: changes
-    if: needs.changes.outputs.contracts == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.contracts == 'true')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -284,7 +319,7 @@ jobs:
       # Just the testkit: the Linux `contracts` job above owns clippy and the whole contracts
       # package set. This lane is here only for the assertions that need a real NTFS volume.
       - name: Test contracts testkit on NTFS
-        run: cargo test --locked -p sceneworks-gen-core-testkit
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked -p sceneworks-gen-core-testkit
 
   # THE LINUX CPU LANE, SPLIT ACROSS FOUR RUNNERS. This was one `candle-cpu` job running every step
   # in sequence at a ~40-minute median. Nothing was dropped: the four jobs below carry the same
@@ -292,8 +327,8 @@ jobs:
   # `changes.outputs.candle_cpu` and listed in the `gate` job's `needs:`.
   #
   # (sc-19447 later split `candle-cpu-test`'s single invocation in two and gave the `candle-gen*`
-  # half `--tests`, so that job now carries two steps rather than one. Nothing was dropped there
-  # either; see the notes on those steps.)
+  # half `--tests`. sc-27011 runs those unchanged groups in separate matrix members;
+  # nothing was dropped in either split. See the notes on those steps.)
   #
   # Why split rather than trim: the serial ordering was never a correctness requirement. Measured
   # over nine successful PR runs on 2026-08-15, the steps were independent and the job was bounded
@@ -311,15 +346,17 @@ jobs:
   # second policy test caps that step's comment block at four lines — so the note explaining the
   # move lives here rather than on the step.
   #
-  # Cache note: rust-cache derives its key from the job, so these four save four separate baselines
-  # instead of one. That is affordable only because `save-if` below restricts saving to `main` —
-  # without it, four jobs would write four PR-scoped caches per open PR. See the `save-if` note on
-  # the `workspace` job's cache step.
+  # Cache note: rust-cache derives its key from the job, plus the explicit matrix group for
+  # package tests, so these lanes save five separate baselines instead of one. This is affordable
+  # because `save-if` below restricts saving to `main`; PRs only restore these baselines.
+  # See the `save-if` note on the `workspace` job's cache step.
 
   candle-cpu-lint:
+    timeout-minutes: 60
     name: Candle CPU lint + docs (Linux)
     needs: changes
-    if: needs.changes.outputs.candle_cpu == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -340,6 +377,14 @@ jobs:
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
           --features candle-audio/testkit
           --all-targets -- -D warnings
+      - name: Compile and lint Candle CPU model-proof hooks (no model execution)
+        run: >-
+          python3 -I scripts/ci/compile_model_proof_targets.py --lane cpu -- cargo clippy --locked
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          --features candle-audio/testkit
+          --all-targets -- -D warnings
+      - name: Compile and lint opt-in MOSS model tests without execution
+        run: cargo clippy --locked --all-targets -j 1 -p candle-gen-moss-image --features test-support -- -D warnings
       - name: Reclaim Clippy artifacts before linking tests
         # RETAINED, and still between Clippy and rustdoc where it has always sat. The package tests
         # that used to follow now run on their own runners, so this no longer protects them — but
@@ -372,10 +417,20 @@ jobs:
         run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh candle-gen
 
   candle-cpu-test:
-    name: Candle CPU package tests (Linux)
+    timeout-minutes: 90
+    name: Candle CPU package tests (Linux, ${{ matrix.group }})
     needs: changes
-    if: needs.changes.outputs.candle_cpu == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [base, gen]
+    env:
+      # Cold gen took ~55m29s in run 40329999413. Allow a 75m invocation
+      # budget plus setup/cache time; see docs/ci-test-suites.md.
+      TEST_SUITE_DEADLINE_SECONDS: 4500
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install pinned Rust toolchain
@@ -383,8 +438,12 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          # rust-cache includes this in both save and restore prefixes: a fast base
+          # member cannot occupy gen's immutable main cache key with fewer dependencies.
+          key: ${{ matrix.group }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test Candle packages
+        if: matrix.group == 'base'
         # All-target Clippy in `candle-cpu-lint` checks every integration and real-weight target.
         # Execute the package unit/catalog suites one linker at a time: concurrently linking several
         # provider test binaries exceeds the hosted runner's memory-backed linker capacity and
@@ -400,9 +459,20 @@ jobs:
         #   * runtime-cpu has no `tests/` directory at all.
         # `candle-gen*` moved to its own invocation below because it was the group that had no
         # `--tests` runner anywhere.
-        run: >-
-          cargo test --locked --lib -j 1
-          -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu
+        # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
+        # tests"); push: main, tags and dispatches run the whole set.
+        env:
+          TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
+        run: |
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu)
+          read -r -a packages <<< "$args"
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "No package in this step's set is affected by the change; nothing to test."
+            exit 0
+          fi
+          echo "Testing: $args"
+          python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --lib -j 1 "${packages[@]}"
+          python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" routine -- cargo test --locked --lib -j 1 "${packages[@]}"
       # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
       # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
       # under all-target Clippy without running them, `windows-cuda-check` compiles them
@@ -482,14 +552,28 @@ jobs:
       #     That is the real price, it is paid per push, and it is the first thing to re-measure
       #     (or to split across runners) if the candle lane's cost is ever questioned.
       - name: Test Candle gen packages and integration targets
-        run: >-
-          cargo test --locked --lib --tests -j 1
-          -p 'candle-gen*'
+        if: matrix.group == 'gen'
+        # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
+        # tests"); push: main, tags and dispatches run the whole set.
+        env:
+          TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
+        run: |
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p 'candle-gen*')
+          read -r -a packages <<< "$args"
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "No package in this step's set is affected by the change; nothing to test."
+            exit 0
+          fi
+          echo "Testing: $args"
+          python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --lib --tests -j 1 "${packages[@]}"
+          python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" routine -- cargo test --locked --lib --tests -j 1 "${packages[@]}"
 
   candle-cpu-conformance:
+    timeout-minutes: 45
     name: Candle CPU conformance + SA3 gates (Linux)
     needs: changes
-    if: needs.changes.outputs.candle_cpu == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -500,14 +584,14 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test Candle LLM conformance
-        run: cargo test --locked -j 1 -p candle-llm --test conformance
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked -j 1 -p candle-llm --test conformance
       - name: Test Stable Audio 3 weight-free quality gates
         # Every integration target with a non-ignored case must be named in this command.
         # scripts/tests/test_sa3_ci_target_coverage.py enforces that executable invariant.
         # Rationale, real-weight exclusions, and historical mutation evidence live in the
         # SC_14545 through SC_14550 migration records and SC_16605_REAL_WEIGHT_WORKFLOW_CLEANUP.md.
         run: >-
-          cargo test --locked -j 1
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked -j 1
           -p candle-audio-stable-audio-3
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
@@ -516,9 +600,11 @@ jobs:
           -- --nocapture
 
   candle-cpu-bundles:
+    timeout-minutes: 45
     name: Candle CPU bundle profiles (Linux)
     needs: changes
-    if: needs.changes.outputs.candle_cpu == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -533,20 +619,22 @@ jobs:
       # is why they cost ~7m combined even when they ran straight after it. Grouping them keeps that
       # feature thrash on one runner instead of spreading it.
       - name: Test LLM-only CPU bundle
-        run: cargo test --locked --no-default-features --lib -p runtime-cpu
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --lib -p runtime-cpu
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
       # LLM+audio composition (ChatWorks TTS without the media graph) is a supported profile.
       - name: Test LLM+audio CPU bundle
-        run: cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
       # The fourth documented profile (audio-backend-strategy.md feature matrix): media without
       # the audio lane must keep composing — one lane covers it, on the cheapest platform.
       - name: Test media-only CPU bundle
-        run: cargo test --locked --no-default-features --features media --lib -p runtime-cpu
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --features media --lib -p runtime-cpu
 
   macos-metal:
+    timeout-minutes: 75
     name: MLX + Candle Metal packages (macOS)
     needs: changes
-    if: needs.changes.outputs.macos_metal == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.macos_metal == 'true')
     runs-on: macos-15
     env:
       # Hosted SDK 15 cannot compile the shipping macOS 26.2 NAX path. The root
@@ -577,7 +665,9 @@ jobs:
       CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        id: mlx_checkout
       - name: Toolchain versions
+        id: mlx_versions
         run: |
           sw_vers
           xcodebuild -version
@@ -639,16 +729,19 @@ jobs:
           echo "reclaim running in background (pid $!); log: $RUNNER_TEMP/reclaim-runner-disk.log"
           exit 0
       - name: Ensure Metal compiler
+        id: mlx_metal
         run: |
           if ! xcrun --find metal >/dev/null 2>&1; then
             sudo xcodebuild -downloadComponent MetalToolchain
           fi
           xcrun metal --version || true
       - name: Install pinned Rust toolchain
+        id: mlx_rust
         run: |
           rustup show
           rustup component add clippy
       - name: Fetch prebuilt MLX (sc-21382)
+        id: mlx_prebuilt
         # pmetal-mlx-sys's cmake build of libmlx is ≈6 min on this runner on every cache miss
         # (plus a network fetch of MLX). The SceneWorks/mlx-rs fork publishes that build per
         # commit (`prebuilt-<sha12>` releases, cell = target × deployment target × Debug/Release);
@@ -672,25 +765,50 @@ jobs:
             exit "$rc"
           fi
       - name: Cache Cargo and MLX native build
+        id: mlx_setup
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           # Save only on `main` — see the note on the `workspace` job's cache step. This lane's
           # baseline is the 2 GB one that survived the 2026-08-15 eviction; the point of this input
           # is that the others get to survive alongside it.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Clippy MLX packages
+      - name: Test dependency-owned CLIP certificate and source hasher
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          cargo clippy --locked
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios
+          python3 scripts/ci/run_ci_collection.py -- python3 scripts/ci/run_clip_regex_certificate_tests.py
+          --output-dir "${{ runner.temp }}/clip-regex-certificate-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Clippy MLX packages
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
+          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core
           --all-targets -- -D warnings
+      - name: Compile and lint opt-in MOSS model tests without execution
+        run: cargo clippy --locked --all-targets -j 1 -p mlx-gen-moss-image --features test-support -- -D warnings
       - name: Rustdoc macOS MLX packages
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         # This is the complete macOS/MLX package set the lane already builds. Keep its public
         # intra-doc graph under the same warnings-as-errors policy as the Linux and CUDA package
         # sets; NAX-specific docs remain on the separate macos-nax feature/platform lane.
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: >-
-          cargo doc --locked --no-deps
+          python3 scripts/ci/run_ci_collection.py -- cargo doc --locked --keep-going --no-deps
           -p mlx-llm -p mlx-llm-server
           -p mlx-gen -p 'mlx-gen-*'
           -p runtime-macos -p runtime-ios
@@ -725,10 +843,31 @@ jobs:
       # NB the `macos-nax` lane below IS self-hosted, so it does share `$TMPDIR` between jobs; it
       # is safe only because no hardcoded fixture path remains in the crates it runs (mlx-llm,
       # runtime-macos). Keep it that way if that lane's package set ever grows.
+      # Keep the original combined feature graph; compile errors block dependent test binaries.
+      # --no-fail-fast collects later test failures once that combined graph compiles.
       - name: Test MLX packages
-        run: >-
-          cargo test --locked --lib --tests
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
+        # tests"); push: main, tags and dispatches run the whole set.
+        env:
+          # The native full graph took 41m07s in job 121596995674; retain headroom.
+          TEST_SUITE_DEADLINE_SECONDS: 3600
+          TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
+        run: |
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core)
+          read -r -a packages <<< "$args"
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "No package in this step's set is affected by the change; nothing to test."
+            exit 0
+          fi
+          echo "Testing: $args"
+          python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --no-fail-fast --lib --tests "${packages[@]}"
+          python3 scripts/ci/run_ci_collection.py -- python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" routine -- cargo test --locked --no-fail-fast --lib --tests "${packages[@]}"
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -742,20 +881,67 @@ jobs:
       # builds below reuse the dependency and `pmetal-mlx-sys` artifacts of the test step instead of
       # rebuilding them from zero — that clean alone cost a third libmlx cmake build.
       - name: Test LLM-only macOS bundle
-        run: cargo test --locked --no-default-features --lib -p runtime-macos -p runtime-ios
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --no-default-features --lib -p runtime-macos -p runtime-ios
       # The non-default `device-capture` surface (`media::capture_permit`), which only the device
       # harness enables: its own tests (incl. the CPU capture-path depth run) and lints.
       - name: Test runtime-ios device-capture surface
-        run: |
-          cargo clippy --locked -p runtime-ios --features device-capture --all-targets -- -D warnings
-          cargo test --locked --lib -p runtime-ios --features device-capture
-          cargo test --locked --lib -p mlx-gen-ios-catalog --features device-capture
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
+          -p runtime-ios --features device-capture --all-targets -- -D warnings
+      - name: Test runtime-ios device-capture unit tests
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
+          --lib -p runtime-ios --features device-capture
+      - name: Test iOS catalog device-capture unit tests
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
+          --lib -p mlx-gen-ios-catalog --features device-capture
       # The compile_fail doctests that keep `capture_permit` out of a product build (and the
       # inverse doctests that prove the feature exposes it): `--lib` above never runs doctests.
       - name: Doctest runtime-ios capture gating
-        run: |
-          cargo test --locked --doc -p runtime-ios
-          cargo test --locked --doc -p runtime-ios --features device-capture
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
+          --doc -p runtime-ios
+      - name: Doctest runtime-ios enabled capture gating
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
+          --doc -p runtime-ios --features device-capture
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after LLM-only bundle
         if: always()
@@ -769,7 +955,13 @@ jobs:
       # LLM+audio composition (mlx LLM + candle audio lane, no mlx media graph) is a supported
       # profile — and this is the one platform where that combination is cross-backend.
       - name: Test LLM+audio macOS bundle
-        run: cargo test --locked --no-default-features --features audio --lib -p runtime-macos
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --no-default-features --features audio --lib -p runtime-macos
       # sc-19556: this is the step that ran the runner out of disk on all three 2026-08-19 attempts,
       # so the probe runs even when it fails — that is the reading we did not have. Diagnostics
       # only; never fails the job.
@@ -792,8 +984,25 @@ jobs:
       # test targets no lane had ever compiled. Keep this package set aligned with the CPU and cuda
       # Clippy lanes.
       - name: Clippy Candle Metal packages
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          cargo clippy --locked
+          python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
+          --all-targets --features metal -- -D warnings
+      - name: Compile and lint Candle Metal model-proof hooks (no model execution)
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- python3.12 -I scripts/ci/compile_model_proof_targets.py --lane metal -- cargo clippy --locked --keep-going
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
       # The only Candle tests any lane RUNS on a Metal device. The vendored candle-metal-kernels
@@ -805,32 +1014,47 @@ jobs:
       # The filters are pinned to existing integration modules by test_ci_workflow_policy, so a
       # renamed module cannot turn this into a step that runs zero tests.
       - name: Test Candle Metal reduce pins
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          cargo test --locked -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
           --test integration -- metal_strided_reduce:: metal_reference_latents::
-      # Epic 16774 E3: the iOS device harness `ios-host/smoke` on the host. It is NOT a workspace
-      # member (own `[workspace]` and Cargo.lock, hence `--manifest-path`), so nothing above compiles
-      # it. Two settings make it reuse this job's `target/` instead of building a second one:
-      # `CARGO_TARGET_DIR` points it at the workspace target, and the root manifest's
-      # `[profile.dev.package."*"] opt-level = 3` (which the harness manifest lacks) is supplied by
-      # `--config`, so its registry/git units, pmetal-mlx-sys included, hash identically.
+      # Epic 16774 E3: the explicit device-harness package now shares the root SDK workspace
+      # and Cargo.lock, preserving compiled dependency identity across SDK/capture and relocation.
+      # Keep these named package lanes and target directory; --config matches the root profile.
       # Only weights-free, CPU-only tests run here. MLX has no environment switch to a CPU default
       # device, so the one test that drives the GPU, `smoke_passes_on_the_host` (the whole device
       # smoke: GEMMs, softmax, metallib load), is skipped by name; it is the device harness's own
       # host baseline and runs from `scripts/ios/run_smoke.sh`, never on this shared runner.
       - name: Clippy iOS device harness (host)
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: >-
-          cargo --config 'profile.dev.package."*".opt-level=3'
-          clippy --locked --manifest-path ios-host/smoke/Cargo.toml
+          python3 scripts/ci/run_ci_collection.py -- cargo --config 'profile.dev.package."*".opt-level=3'
+          clippy --locked --keep-going --manifest-path ios-host/smoke/Cargo.toml
           --features media --all-targets -- -D warnings
       - name: Test iOS device harness (host, weights-free)
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: >-
-          cargo --config 'profile.dev.package."*".opt-level=3'
-          test --locked --manifest-path ios-host/smoke/Cargo.toml
+          python3 scripts/ci/run_ci_collection.py -- cargo --config 'profile.dev.package."*".opt-level=3'
+          test --locked --no-fail-fast --manifest-path ios-host/smoke/Cargo.toml
           --features media --lib -- --skip smoke_passes_on_the_host
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after iOS device harness
@@ -857,7 +1081,7 @@ jobs:
   ios-build:
     name: runtime-ios cross-build (${{ matrix.target }})
     needs: changes
-    if: needs.changes.outputs.ios_build == 'true'
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.ios_build == 'true')
     runs-on: macos-15
     timeout-minutes: 120
     env:
@@ -866,6 +1090,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "0"
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         include:
@@ -916,11 +1141,9 @@ jobs:
           cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --all-targets -- -D warnings
           cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --no-default-features --all-targets -- -D warnings
           cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --features device-capture --all-targets -- -D warnings
-      # The device harness `ios-host/smoke` (own `[workspace]` and Cargo.lock) is what
-      # `scripts/ios/run_smoke.sh` links into the app: the default (LLM smoke) and `media` profiles.
-      # It shares this job's `target/` (`CARGO_TARGET_DIR`), and `--config` supplies the root
-      # manifest's `[profile.dev.package."*"] opt-level = 3`, so its registry/git units hash like
-      # the workspace's and the iOS libmlx built above is reused rather than rebuilt by cmake.
+      # The root-workspace device harness `ios-host/smoke` is what run_smoke.sh links into
+      # the app. Its default/media profiles share the SDK lock and compiled dependency units;
+      # these explicit package lanes retain the job's target and native build artifacts.
       - name: Build iOS device harness (media) for ${{ matrix.target }}
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -946,9 +1169,14 @@ jobs:
           cargo --config 'profile.dev.package."*".opt-level=3' clippy --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml --features zimage --all-targets -- -D warnings
 
   macos-nax:
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
     name: runtime-macos NAX (macOS 26.2, manual)
     needs: changes
-    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true')
     runs-on: [self-hosted, macOS, ARM64, nax]
     env:
       MACOSX_DEPLOYMENT_TARGET: "26.2"
@@ -991,7 +1219,9 @@ jobs:
           # until something reinstalls rustup. Harmless on ephemeral runners; not here.
           cache-bin: "false"
       - name: Exercise MLX engine and complete runtime catalog on NAX
-        run: cargo test --locked --lib -p mlx-llm -p runtime-macos
+        run: |
+          python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --lib -p mlx-llm -p runtime-macos
+          python3 scripts/ci/test_suites.py routine -- cargo test --locked --lib -p mlx-llm -p runtime-macos
       # SC-18318 acceptance is correctness-only: exercise the focused synthetic
       # request-scoped exact-epilogue equality/receipt suite on a live Metal
       # device. The p3_ filter is intentionally narrow and invokes no timing,
@@ -1000,9 +1230,9 @@ jobs:
         env:
           MLX_ENABLE_TF32: "1"
           SCENEWORKS_REQUIRE_NAX: "1"
-        run: cargo test --locked --lib -p mlx-gen p3_ -- --test-threads=1
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --lib -p mlx-gen p3_ -- --test-threads=1
       - name: Exercise LLM-only runtime catalog on NAX
-        run: cargo test --locked --no-default-features --lib -p runtime-macos
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --lib -p runtime-macos
 
   # Non-executing gate for the CUDA feature (compile, lint, docs) — runs on every PR/push that touches
   # the lane.
@@ -1021,6 +1251,7 @@ jobs:
   # below because it needs the CUDA-gated registration graph but never touches a device; executing the
   # rest of the CUDA tests stays in the manual `windows-cuda` lane.
   windows-cuda-check:
+    timeout-minutes: 90
     name: Candle CUDA compile check (Windows)
     needs: changes
     # This persistent runner may execute repository build scripts, so a public-fork PR must never
@@ -1031,9 +1262,7 @@ jobs:
     # keyed on `!= 'pull_request'` rather than an allowlist of trusted events, so a new trusted
     # event does not silently lose CUDA coverage.
     if: >-
-      needs.changes.outputs.windows_cuda == 'true' &&
-      (github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository)
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.windows_cuda == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: [self-hosted, windows, cuda]
     env:
       # Two listeners share this 48-thread host. Leaving Cargo at its per-process default lets
@@ -1075,6 +1304,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in the repo's
+      # CI config); its daemon resets mid-build on heavy Candle/CUDA graphs ("An existing connection
+      # was forcibly closed by the remote host (os error 10054)" with zero rustc diagnostics). Clear
+      # the wrapper for THIS job only; sibling jobs keep sccache and the registry/git/target caches
+      # stay intact. Same step as windows-candle.yml's heavy Candle lane.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Verify H3 compiled-test list parser without GPU execution
+        shell: powershell
+        run: ./scripts/ci/h3-native-test-list.ps1 -SelfTest
+      - name: Verify native MOSS transport guards without GPU execution
+        timeout-minutes: 5
+        shell: powershell
+        run: ./scripts/ci/moss-native-terminal.ps1 -SelfTest -SelfTestPositiveTimeoutSeconds 60
       - name: Install pinned uv for Windows supervisor smoke
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
@@ -1111,12 +1357,12 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
       - name: Execute weights-free CUDA catalog conformance (no GPU required)
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-catalog --features cuda tests::every_registered_memory_strategy_rejects_cross_route_decode_geometry -- --exact
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked -p candle-gen-catalog --features cuda tests::every_registered_memory_strategy_rejects_cross_route_decode_geometry -- --exact
       # The lint twin of the compile check above. The `candle-cpu` lane already Clippies this same
       # package set with --all-targets, but it has no CUDA toolkit and so cannot pass --features cuda:
       # every `#[cfg(feature = "cuda")]` target is invisible to it and reaches main unlinted. That is
@@ -1131,6 +1377,11 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda -- -D warnings
+      - name: Compile and lint Candle CUDA model-proof hooks (no model execution)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          "%REVIEWED_PYTHON%" -I scripts/ci/compile_model_proof_targets.py --lane cuda -- cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda -- -D warnings
       # The doc twin of the compile check above. The hosted rustdoc gate cannot pass --features cuda
       # (no CUDA toolkit), so `#[cfg(feature = "cuda")]` docs need this lane. Keep this doc package
       # set aligned with the compile check above; together with the hosted gate, the CPU and CUDA
@@ -1147,9 +1398,11 @@ jobs:
           cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
 
   windows-cuda:
+    timeout-minutes: 180
     name: Candle CUDA packages (Windows, manual)
     needs: changes
-    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true')
     runs-on: [self-hosted, windows, cuda]
     env:
       # Keep manual runs inside the same per-listener budget as the automatic compile check.
@@ -1159,6 +1412,15 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Isolate persistent-runner HF caches
+        shell: cmd
+        run: |
+          set "HF_OUTER=%RUNNER_TEMP%\inference-ci-h3-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%"
+          if not exist "%HF_OUTER%" mkdir "%HF_OUTER%"
+          if errorlevel 1 exit /b 1
+          echo HF_HOME=%HF_OUTER%\hf-home>>"%GITHUB_ENV%"
+          echo HF_HUB_CACHE=%HF_OUTER%\hub>>"%GITHUB_ENV%"
+          echo HUGGINGFACE_HUB_CACHE=%HF_OUTER%\hub>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -1182,34 +1444,68 @@ jobs:
           # proxies dangling. This is the real cause of the breakage that
           # scripts/win/use-real-rust-toolchain.cmd works around in the app repo.
           cache-bin: "false"
+      # sc-26754: Actions schedules this lane; preserve the required physical GPU1 boundary.
+      - name: Bind physical GPU1 and isolate synthetic test caches
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identity = @(& nvidia-smi -i 1 --query-gpu=index,uuid,name,pci.bus_id,driver_version,memory.total,memory.used --format=csv,noheader,nounits)
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to query physical GPU1 identity' }
+          $identity = @($identity | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          if ($identity.Count -ne 1) { throw 'Physical GPU1 identity is missing or ambiguous' }
+          $fields = @($identity[0].Split(',') | ForEach-Object { $_.Trim() })
+          if ($fields.Count -ne 7 -or $fields[0] -ne '1' -or $fields[1] -notmatch '^GPU-[0-9a-fA-F-]+$') {
+            throw "Invalid physical GPU1 identity: $($identity[0])"
+          }
+          $gpuUuid = $fields[1]
+          Write-Host "Physical GPU1 identity (index, UUID, name, PCI bus, driver, total MiB, used MiB): $($identity[0])"
+          "CUDA_VISIBLE_DEVICES=$gpuUuid" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          'CUDA_DEVICE_ORDER=PCI_BUS_ID' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          'SCENEWORKS_GPU_ID=1' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "CUDA logical device 0 maps only to physical GPU1 UUID $gpuUuid; telemetry index is 1"
+          $cacheRoot = Join-Path $env:RUNNER_TEMP ("moss-edit-synthetic-" + [guid]::NewGuid().ToString('N'))
+          $hubRoot = Join-Path $cacheRoot 'hub'
+          New-Item -ItemType Directory -Path $hubRoot | Out-Null
+          "HF_HOME=$cacheRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HF_HUB_CACHE=$hubRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HUGGINGFACE_HUB_CACHE=$hubRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          'HF_HUB_OFFLINE=1' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Synthetic offline cache root: $cacheRoot"
       - name: Build Candle CUDA packages
         shell: cmd
         run: |
           call "%VCVARS%"
           cargo build --locked -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
+      # Learned bodies stay compiled and ignored here; explicit model validation lives in real-weights.yml.
       - name: Test Candle CUDA packages
         shell: cmd
         # The runner is sm_120: an sm_120 test (NVFP4, the indexed NVFP4 MoE kernel) must run
         # here, so `skip_without_sm120` fails instead of skipping silently (sc-24440 review).
         env:
           REQUIRE_SM120: "1"
+          # Iris' multi-process fixtures explicitly opt into sharing this lane's one visible card.
+          # Without it rank 1 asks for cuda:1, exits InvalidMesh, and peers time out in rendezvous.
+          IRIS_DIST_SHARE_DEVICE: "1"
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
+          python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
+          if errorlevel 1 exit /b 1
+          python scripts/ci/test_suites.py routine -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
       - name: Test LLM-only CUDA bundle
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --no-default-features --lib -p runtime-cuda
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --lib -p runtime-cuda
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
       # LLM+audio composition (ChatWorks TTS without the media graph) is a supported profile.
       - name: Test LLM+audio CUDA bundle
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
 
   supply-chain:
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
     name: dependency policy + advisories
     runs-on: ubuntu-latest
     steps:
@@ -1233,9 +1529,11 @@ jobs:
         run: cargo deny --locked check advisories bans licenses sources
 
   docs:
+    timeout-minutes: 30
     name: repository documentation
     needs: changes
-    if: needs.changes.outputs.docs == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.docs == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -1243,9 +1541,11 @@ jobs:
         run: python3 scripts/check_docs.py
 
   release-metadata:
+    timeout-minutes: 20
     name: runtime manifest + SPDX SBOM
     needs: changes
-    if: needs.changes.outputs.release == 'true'
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.release == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -1262,9 +1562,11 @@ jobs:
         run: python3 scripts/release/verify_release.py dist/release --skip-smoke
 
   release-artifacts:
+    timeout-minutes: 30
     name: tagged source archive + external smoke
     needs: [changes, release-metadata]
-    if: startsWith(github.ref, 'refs/tags/runtime-')
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (startsWith(github.ref, 'refs/tags/runtime-'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -1303,6 +1605,7 @@ jobs:
   # dispatch- and tag-only lanes are included deliberately, since `skipped` is tolerated and that
   # keeps them covered on the events where they do run. Add new jobs here, or they go ungated.
   gate:
+    timeout-minutes: 10
     name: CI gate
     needs:
       - changes
@@ -1320,11 +1623,13 @@ jobs:
       - macos-nax
       - windows-cuda-check
       - windows-cuda
+      - windows-gpu-diagnostic
       - supply-chain
       - docs
       - release-metadata
       - release-artifacts
-    if: always()
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (always())
     runs-on: ubuntu-latest
     steps:
       - name: Require every lane to have succeeded or been skipped
@@ -1341,3 +1646,31 @@ jobs:
                 ;;
             esac
           done
+
+  # Diagnostic completion is evidence capture, never GPU ownership or allocation admission.
+  windows-gpu-diagnostic:
+    name: Physical GPU1 read-only diagnostic (Windows, manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'windows-gpu-diagnostic'
+    runs-on: [self-hosted, windows, cuda]
+    timeout-minutes: 5
+    env:
+      CUDA_VISIBLE_DEVICES: "-1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Capture bounded GPU1 metadata without device admission
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "gpu1-diagnostic-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          & .\scripts\ci\windows-gpu1-diagnostic.ps1 -OutputDirectory $out
+      - name: Upload diagnostic evidence including incomplete results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: gpu1-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gpu1-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/evidence.json
+          if-no-files-found: error
+          retention-days: 3
+
+
+
+  # Manual synthetic gate: Actions schedules preparation and direct execution.

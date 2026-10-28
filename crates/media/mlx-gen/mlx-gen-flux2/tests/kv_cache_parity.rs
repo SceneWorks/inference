@@ -149,6 +149,7 @@ impl Fixture {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn extract_pass_equals_plain_forward() {
     let f = Fixture::load();
@@ -164,8 +165,11 @@ fn extract_pass_equals_plain_forward() {
         cache.is_populated(),
         "extract must populate every layer slot"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache_parity::extract_pass_equals_plain_forward");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cached_pass_reconstructs_extract_target_slice() {
     let f = Fixture::load();
@@ -187,12 +191,15 @@ fn cached_pass_reconstructs_extract_target_slice() {
         exact_eq(&cached, &extract_target),
         "cached forward must reproduce the target-token slice of the extract forward exactly"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache_parity::cached_pass_reconstructs_extract_target_slice");
 }
 
 /// LoRA ⊥ cache: applying adapters to the transformer must not perturb the cache invariants. The
 /// cache only depends on the (post-RoPE) K/V the linears produce, so `cached(X) == extract(X)[target]`
 /// must still hold *exactly* with a LoRA installed on the attention projections — proving the
 /// `-kv` variant's inherited LoRA path composes cleanly with the cache (sc-2646 + sc-2347).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cache_invariants_hold_with_lora_installed() {
     use mlx_gen::adapters::{install_adapter, Adapter};
@@ -234,8 +241,13 @@ fn cache_invariants_hold_with_lora_installed() {
         exact_eq(&cached, &extract_target),
         "with LoRA: cached forward must still reproduce the extract target slice exactly"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED kv_cache_parity::cache_invariants_hold_with_lora_installed"
+    );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cached_without_populated_cache_errors() {
     let f = Fixture::load();
@@ -257,6 +269,10 @@ fn cached_without_populated_cache_errors() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("slot is empty"), "got: {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED kv_cache_parity::cached_without_populated_cache_errors"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -320,6 +336,7 @@ fn cfg_oracle(f: &Fixture, negative: &Array) -> Array {
     .unwrap()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cfg_kv_edit_matches_the_non_kv_forward_on_every_cached_step() {
     let f = Fixture::load();
@@ -365,8 +382,11 @@ fn cfg_kv_edit_matches_the_non_kv_forward_on_every_cached_step() {
         error > 0.0,
         "the fixture must discriminate the shared-cache defect"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache_parity::cfg_kv_edit_matches_the_non_kv_forward_on_every_cached_step");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn extract_materializes_every_slot_with_the_step_output() {
     let f = Fixture::load();
@@ -395,6 +415,8 @@ fn extract_materializes_every_slot_with_the_step_output() {
             assert_eq!(slot.nbytes(), expected_slot_bytes);
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache_parity::extract_materializes_every_slot_with_the_step_output");
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -481,6 +503,7 @@ mod sc20686 {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn kv_cache_lifecycle_is_observed_without_changing_the_forward() {
         let f = Fixture::load();
         let negative = negative_text(&f);
@@ -563,9 +586,12 @@ mod sc20686 {
         assert_eq!(metrics["current_persistent_bytes"], 4 * slice_bytes);
         assert_eq!(metrics["minimum_cache_reads"], 1);
         assert_eq!(metrics["reference_runtime_attribution_available"], false);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache_parity::sc20686::kv_cache_lifecycle_is_observed_without_changing_the_forward");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cached_read_window_contains_the_reference_splice() {
         // A long reference makes the spliced K/V dominate the attention output, so the window
         // placement is visible above allocator rounding: [1, 2, ~2k, 8] f32 K and V ≈ 260 KiB
@@ -603,9 +629,12 @@ mod sc20686 {
                 read["transient_bytes"]
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache_parity::sc20686::cached_read_window_contains_the_reference_splice");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn edit_reference_slice_is_recomputed_on_double_stream_forwards_only() {
         let f = Fixture::load();
         let off = f.forward_full(None);
@@ -658,5 +687,7 @@ mod sc20686 {
         let metrics = of(&events, "metrics").pop().unwrap();
         assert_eq!(metrics["current_persistent_bytes"], 0);
         assert_eq!(metrics["reused_requests"], 1);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache_parity::sc20686::edit_reference_slice_is_recomputed_on_double_stream_forwards_only");
     }
 }

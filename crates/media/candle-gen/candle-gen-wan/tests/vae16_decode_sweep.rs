@@ -81,6 +81,8 @@ fn wan_z16_vae_decode_sweep() {
     let gpu = env_usize("WAN_GPU", 0);
     let Some((vae, dev)) = load_vae(gpu) else {
         eprintln!("skip: set WAN_VAE16_SNAPSHOT to a Wan2.2-T2V-A14B snapshot dir");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-wan/tests/vae16_decode_sweep.rs:84 (wan_z16_vae_decode_sweep): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let w_out = env_usize("WAN_W", 1280) as i32;
@@ -204,4 +206,7 @@ fn wan_z16_vae_decode_sweep() {
         peak_bytes / out_vox as f64,
         peak_bytes / frame_px as f64,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae16_decode_sweep::wan_z16_vae_decode_sweep");
 }

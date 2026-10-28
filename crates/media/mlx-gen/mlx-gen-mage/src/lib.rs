@@ -393,3 +393,6 @@ mod explicit_registry_tests {
         assert!(!error.contains("checkpoint fingerprint"), "{error}");
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

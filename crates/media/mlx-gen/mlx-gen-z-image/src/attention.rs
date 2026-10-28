@@ -94,10 +94,26 @@ impl ZImageAttention {
             // Packed-detect (sc-8670): each QKV/out projection loads packed from a pre-quantized
             // snapshot (`{base}.scales` present) or dense otherwise. No bias on the Z-Image DiT
             // attention projections.
-            to_q: crate::quant::lin(w, &format!("{prefix}.to_q"), false)?,
-            to_k: crate::quant::lin(w, &format!("{prefix}.to_k"), false)?,
-            to_v: crate::quant::lin(w, &format!("{prefix}.to_v"), false)?,
-            to_out: crate::quant::lin(w, &format!("{prefix}.to_out.0"), false)?,
+            to_q: crate::quant::lin(
+                w,
+                &format!("{prefix}.to_q"),
+                crate::quant::DIT_ATTENTION_HAS_BIAS,
+            )?,
+            to_k: crate::quant::lin(
+                w,
+                &format!("{prefix}.to_k"),
+                crate::quant::DIT_ATTENTION_HAS_BIAS,
+            )?,
+            to_v: crate::quant::lin(
+                w,
+                &format!("{prefix}.to_v"),
+                crate::quant::DIT_ATTENTION_HAS_BIAS,
+            )?,
+            to_out: crate::quant::lin(
+                w,
+                &format!("{prefix}.to_out.0"),
+                crate::quant::DIT_ATTENTION_HAS_BIAS,
+            )?,
             norm_q: w.get(&format!("{prefix}.norm_q.weight")).cloned(),
             norm_k: w.get(&format!("{prefix}.norm_k.weight")).cloned(),
             n_heads,
@@ -276,6 +292,8 @@ fn rope_rotate(xr: &Array, xi: &Array, cos: &Array, sin: &Array) -> Result<(Arra
     Ok((out_r, out_i))
 }
 
+pub(crate) const ADAPTER_TARGET_PATHS: &[&str] = &["to_q", "to_k", "to_v", "to_out.0"];
+
 impl AdaptableHost for ZImageAttention {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
@@ -288,9 +306,9 @@ impl AdaptableHost for ZImageAttention {
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        ["to_q", "to_k", "to_v", "to_out.0"]
-            .into_iter()
-            .map(String::from)
+        ADAPTER_TARGET_PATHS
+            .iter()
+            .map(|path| (*path).to_owned())
             .collect()
     }
 }

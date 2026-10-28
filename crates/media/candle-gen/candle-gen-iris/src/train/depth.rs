@@ -187,7 +187,12 @@ fn resolve_resources(spec: &LoadSpec) -> Result<(PathBuf, DepthInit, IrisConfig,
             )))
         }
     };
-    Ok((dir, DepthInit::Parent, config, prompt))
+    candle_gen::gen_core::__model_input_result!(
+        Ok((dir, DepthInit::Parent, config, prompt)),
+        "candle-gen-iris::train::depth::resolve_resources/generation-configuration",
+        Configuration,
+        &[&config_path]
+    )
 }
 
 candle_gen::register_trainer! {

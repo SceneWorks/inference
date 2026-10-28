@@ -19,6 +19,16 @@
 //! (`rectified_flow` against `rf_denoiser`). So for medium the `repo_id` check discriminates
 //! nothing, and the objective check plus the SHA-256 pin are the whole gate.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::{Path, PathBuf};
 
 use candle_audio_stable_audio_3::gen_core::{
@@ -386,6 +396,9 @@ fn swapping_the_root_after_load_is_rejected_before_any_tensor_is_read() {
         }
         other => panic!("expected audio, got {other:?}"),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED swapping_the_root_after_load_is_rejected_before_any_tensor_is_read");
 }
 
 #[test]
@@ -648,6 +661,8 @@ fn medium_and_the_smalls_reject_each_others_snapshots() {
 fn the_medium_base_sibling_is_rejected_under_the_post_trained_medium_id() {
     let Some(base) = medium_base() else {
         eprintln!("SA3_MEDIUM_BASE_SNAPSHOT unset; skipping the sharpest medium mutation");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/audio/candle-audio-stable-audio-3/tests/variant_binding.rs:651 (the_medium_base_sibling_is_rejected_under_the_post_trained_medium_id): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     // Control: the post-trained snapshot loads.
@@ -685,6 +700,8 @@ fn the_medium_base_sibling_is_rejected_under_the_post_trained_medium_id() {
 fn the_standalone_same_l_autoencoder_is_rejected_under_every_registration() {
     let Some(same_l) = standalone_same_l() else {
         eprintln!("SA3_SAME_L_SNAPSHOT unset; skipping the standalone-autoencoder mutation");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/audio/candle-audio-stable-audio-3/tests/variant_binding.rs:688 (the_standalone_same_l_autoencoder_is_rejected_under_every_registration): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     for variant in [Variant::Medium, Variant::SmallMusic, Variant::SmallSfx] {
@@ -704,6 +721,8 @@ fn the_standalone_same_l_autoencoder_is_rejected_under_every_registration() {
 fn swapping_the_medium_root_after_load_is_rejected_before_any_tensor_is_read() {
     let Some(base) = medium_base() else {
         eprintln!("SA3_MEDIUM_BASE_SNAPSHOT unset; skipping the medium post-load swap");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/audio/candle-audio-stable-audio-3/tests/variant_binding.rs:707 (swapping_the_medium_root_after_load_is_rejected_before_any_tensor_is_read): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let assembled = Assembled::new("medium-post-load-swap", &medium(), &[]);
@@ -738,4 +757,7 @@ fn swapping_the_medium_root_after_load_is_rejected_before_any_tensor_is_read() {
         }
         other => panic!("expected audio, got {other:?}"),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED swapping_the_medium_root_after_load_is_rejected_before_any_tensor_is_read");
 }

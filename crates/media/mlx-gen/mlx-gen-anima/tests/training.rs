@@ -165,9 +165,15 @@ fn run_training(req: &TrainingRequest) -> (PathBuf, f32, f32, f32) {
 /// thing that varies between a base pipeline and an adapter-applied pipeline is the trained delta. A
 /// lower value on the training image after training = the adapter learned to reconstruct it (overfit).
 fn velocity_mse(pipeline: &AnimaPipeline, caption: &str, edge: u32, sigma: f32) -> f32 {
-    let img = image::open(out_dir().join("dataset/magenta_0.png"))
-        .unwrap()
-        .to_rgb8();
+    let img = mlx_gen::gen_core::__model_input_reader!(
+        image::open(out_dir().join("dataset/magenta_0.png")),
+        "crates/media/mlx-gen/mlx-gen-anima/tests/training.rs::velocity_mse/image::open",
+        Reference,
+        out_dir().join("dataset/magenta_0.png"),
+        |__model_input_path| image::open(__model_input_path)
+    )
+    .unwrap()
+    .to_rgb8();
     let core = mlx_gen::media::Image {
         width: img.width(),
         height: img.height(),
@@ -323,7 +329,7 @@ fn adapter_max_abs_diff(a: &PathBuf, b: &PathBuf) -> (f32, usize) {
 /// adapter reduces the fixed-batch velocity-MSE on the training image → reload through the inference
 /// path (508 applied) → generate → the output visibly changes and tilts toward the overfit magenta.
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train + gen)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train + gen)"]
 fn train_lora_end_to_end() {
     if split_files().is_none() {
         eprintln!("skip: no Anima snapshot");
@@ -405,6 +411,9 @@ fn train_lora_end_to_end() {
         ml > mb,
         "LoRA did not push output toward the overfit magenta style ({mb:.1} → {ml:.1})"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::train_lora_end_to_end");
 }
 
 /// sc-10642 mid-run RESUME validation. Train `steps` with `save_every = K` (K < steps) so the run drops
@@ -414,7 +423,7 @@ fn train_lora_end_to_end() {
 /// reproduce the uninterrupted run's adapter to fp tolerance, and the resumed run must start at step K+1
 /// (proving it restored the step count, not restarted at 0) with the full 508-target surface asserted.
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train ×2)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train ×2)"]
 fn train_resume_matches_uninterrupted() {
     if split_files().is_none() {
         eprintln!("skip: no Anima snapshot");
@@ -502,13 +511,16 @@ fn train_resume_matches_uninterrupted() {
         max_d <= 1e-6,
         "resumed adapter must reproduce the uninterrupted run to tolerance (max |Δ| {max_d:e})"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::train_resume_matches_uninterrupted");
 }
 
 /// Full LoKr end-to-end: same as the LoRA test but `NetworkType::Lokr` with a `decompose_factor`; the
 /// bare-key `lokr_*` file reloads through the sc-10521 LoKr path (508 applied), reduces the fixed-batch
 /// MSE, and changes output.
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train + gen)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train + gen)"]
 fn train_lokr_end_to_end() {
     if split_files().is_none() {
         eprintln!("skip: no Anima snapshot");
@@ -580,6 +592,9 @@ fn train_lokr_end_to_end() {
         diff > 3.0,
         "LoKr had no visible effect (mean|Δpixel| {diff:.2} ≤ 3)"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::train_lokr_end_to_end");
 }
 
 /// Target-enumeration anchor (the mutation-check made permanent): the full trainable surface is
@@ -626,7 +641,7 @@ fn trainable_surface_is_508_dit_plus_conditioner() {
 ///       preview samples the LIVE in-training adapter (the DiT AND the conditioner adapters, sc-10522);
 ///       a preview that reused a cached/base conditioner output could not track the overfit.
 #[test]
-#[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train + periodic preview gens)"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; SLOW (2B DiT train + periodic preview gens)"]
 fn train_emits_in_training_previews() {
     if split_files().is_none() {
         eprintln!("skip: no Anima snapshot");
@@ -755,6 +770,9 @@ fn train_emits_in_training_previews() {
         "the final preview must reflect the trained adapter (more magenta than the base model: \
          base {mb:.1} vs final preview {ml:.1})"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::train_emits_in_training_previews");
 }
 
 /// Preview denoise-step count used by the base-model comparison generation in the preview test.

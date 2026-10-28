@@ -48,6 +48,7 @@ fn max_abs(got: &Array, exp: &Array) -> f32 {
     mlx_rs::ops::max(&d, None).unwrap().item::<f32>()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn compiled_glue_matches_eager_within_f32_contract() {
     let w = Weights::from_file(FIXTURE).unwrap();
@@ -81,4 +82,6 @@ fn compiled_glue_matches_eager_within_f32_contract() {
         "FLUX.2 compiled glue rel|Δ|={rel:e} exceeds the f32 whole-forward bound {:e}",
         COMPILED_GLUE_F32_WHOLE_FWD_ULP_TOL
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED compile_parity::compiled_glue_matches_eager_within_f32_contract");
 }

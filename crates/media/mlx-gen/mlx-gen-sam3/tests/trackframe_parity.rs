@@ -76,4 +76,8 @@ fn tracked_frame_decode_matches_oracle() {
         (out.object_score - score_want).abs() < 0.05,
         "object_score |Δ| too large"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED trackframe_parity::tracked_frame_decode_matches_oracle"
+    );
 }

@@ -22,6 +22,7 @@ fn small_cfg() -> VaeDecoderConfig {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn decoder_assembly_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let decoder = Decoder::from_weights(&w, "", &small_cfg()).unwrap();
@@ -37,9 +38,13 @@ fn decoder_assembly_matches_fork() {
             .item::<bool>(),
         "VAE decoder assembly diverged from the fork"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_decoder::decoder_assembly_matches_fork");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn vae_decode_applies_scale_shift_and_frame_axis() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
@@ -75,12 +80,16 @@ fn vae_decode_applies_scale_shift_and_frame_axis() {
             .item::<bool>(),
         "Vae::decode scale/shift/frame-axis wrapper is wrong"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_decoder::vae_decode_applies_scale_shift_and_frame_axis");
 }
 
 /// SC-18309 N1: the real tiny VAE fixture's trait default is bit-for-bit the historical inherent
 /// decode, including scale/shift de-normalization and the singleton output frame. This is an exact
 /// comparison (not the tolerance used for cross-framework parity above).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn native_trait_decode_is_byte_exact_to_inherent_decode() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
@@ -93,6 +102,9 @@ fn native_trait_decode_is_byte_exact_to_inherent_decode() {
         seam.reshape(&[-1]).unwrap().as_slice::<f32>(),
         legacy.reshape(&[-1]).unwrap().as_slice::<f32>()
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_decoder::native_trait_decode_is_byte_exact_to_inherent_decode");
 }
 
 /// A pre-tripped cancel wins before rank validation, tiling selection, de-normalization, or the
@@ -124,6 +136,7 @@ fn native_tiled_decode_rejects_pre_cancel_before_all_tensor_work() {
 /// primitive. The fixture's position-dependent latent makes the old whole-tail/per-crop GroupNorm
 /// implementation diverge, while layer-wise global normalization tracks the dense decode.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn vae_tiled_decode_tracks_dense_with_global_group_norm() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
@@ -149,6 +162,9 @@ fn vae_tiled_decode_tracks_dense_with_global_group_norm() {
         max_delta < 2e-3,
         "layer-wise tiled VAE diverged from dense decode: max|delta|={max_delta:.3e}"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_decoder::vae_tiled_decode_tracks_dense_with_global_group_norm");
 }
 
 #[test]

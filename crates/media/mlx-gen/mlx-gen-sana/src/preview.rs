@@ -123,6 +123,9 @@ fn emit_preview(
     if !sink.is_active() {
         return;
     }
+    // The projection remains the same borrowed/native operation recipe, but a
+    // user preview callback cannot inherit this model's retirement selector.
+    let _ordinary_callback = mlx_gen::ios_quantum::OrdinaryNativeRetirementScope::enter();
     mlx_gen::preview::emit_preview(sink, counter, schedule, position, || {
         let shape = latents.shape();
         if shape.len() != 4 || shape[0] != 1 || shape[1] != 32 {
@@ -189,6 +192,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn native_layout_projects_at_actual_latent_resolution() {
         let schedule = [1.0, 0.5, 0.0];
         let counter = mlx_gen::preview::PreviewCounter::new(&schedule);
@@ -203,9 +207,14 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].current, frames[0].total), (1, 2));
         assert_eq!((frames[0].image.width, frames[0].image.height), (5, 3));
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::native_layout_projects_at_actual_latent_resolution");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn shipped_resolution_examples_are_self_describing() {
         for (image_edge, latent_edge) in [(256_u32, 8_i32), (1024, 32)] {
             let schedule = [1.0, 0.0];
@@ -224,9 +233,14 @@ mod tests {
                 (image_edge / 32, image_edge / 32)
             );
         }
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::shipped_resolution_examples_are_self_describing");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn malformed_layout_is_decorative_and_consumes_position() {
         let schedule = [1.0, 0.5, 0.0];
         let counter = mlx_gen::preview::PreviewCounter::new(&schedule);
@@ -243,6 +257,10 @@ mod tests {
         let frames = frames.lock().unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].current, frames[0].total), (2, 2));
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED preview::tests::malformed_layout_is_decorative_and_consumes_position");
     }
 
     #[test]

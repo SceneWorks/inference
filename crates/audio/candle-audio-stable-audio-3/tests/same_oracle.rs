@@ -1,5 +1,15 @@
 //! SAME-S whole-stage and structural parity gates.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -343,6 +353,8 @@ fn same_l_short_standalone_and_embedded_match_every_band_layer() {
             (selected == "standalone" && env != "SA3_SAME_L_SNAPSHOT")
                 || (selected == "embedded" && env != "SA3_MEDIUM_SNAPSHOT")
         }) {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/audio/candle-audio-stable-audio-3/tests/same_oracle.rs:342 (same_l_short_standalone_and_embedded_match_every_band_layer): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             continue;
         }
         let layout = SnapshotLayout::from_dir(&snapshot(env)).unwrap();
@@ -461,6 +473,9 @@ fn same_l_short_standalone_and_embedded_match_every_band_layer() {
             0.001,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED same_l_short_standalone_and_embedded_match_every_band_layer");
 }
 
 #[test]
@@ -490,6 +505,8 @@ fn same_l_long_durations_match_compact_band_boundaries() {
             (selected == "standalone" && env != "SA3_SAME_L_SNAPSHOT")
                 || (selected == "embedded" && env != "SA3_MEDIUM_SNAPSHOT")
         }) {
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/audio/candle-audio-stable-audio-3/tests/same_oracle.rs:489 (same_l_long_durations_match_compact_band_boundaries): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             continue;
         }
         let layout = SnapshotLayout::from_dir(&snapshot(env)).unwrap();
@@ -503,6 +520,8 @@ fn same_l_long_durations_match_compact_band_boundaries() {
                 .as_deref()
                 .is_some_and(|selected| selected != duration)
             {
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/audio/candle-audio-stable-audio-3/tests/same_oracle.rs:506 (same_l_long_durations_match_compact_band_boundaries): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
                 continue;
             }
             let label = format!("{snapshot_label}.{duration}");
@@ -651,6 +670,11 @@ fn same_l_long_durations_match_compact_band_boundaries() {
             }
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED same_l_long_durations_match_compact_band_boundaries"
+    );
 }
 
 #[test]
@@ -760,6 +784,9 @@ fn same_l_variable_stride_padding_gather_and_noise_order_match_upstream() {
     assert_eq!(captures[1].scale, 0.001);
     assert_eq!(captures[2].kind, SameNoiseKind::DecoderTokens { stage: 0 });
     assert_eq!(captures[2].scale, 0.1);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED same_l_variable_stride_padding_gather_and_noise_order_match_upstream");
 }
 
 fn max_abs_tensor(left: &Tensor, right: &Tensor) -> f32 {
@@ -846,6 +873,9 @@ fn same_l_long_duration_roundtrip_resource_probe() {
          peak_rss_bytes={peak_rss_bytes:?} checksum={checksum:.9} pcm_sha256={pcm_sha256}",
         latent_len * 17,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED same_l_long_duration_roundtrip_resource_probe");
 }
 
 #[test]
@@ -868,6 +898,9 @@ fn existing_whole_stage_reference_matches_encoder() {
         &oracle.get((1, 256, 4), "latents").unwrap(),
         2e-4,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED existing_whole_stage_reference_matches_encoder");
 }
 
 #[test]
@@ -1009,6 +1042,9 @@ fn structural_oracle_locks_all_blocks_midpoint_selection_and_noise() {
         max_abs(&decoded, &no_mask) > 1e-5,
         "dropping decoder mask noise must be observable"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED structural_oracle_locks_all_blocks_midpoint_selection_and_noise");
 }
 
 #[test]
@@ -1280,6 +1316,11 @@ fn frozen_stride_eight_oracle_locks_every_resampling_seam() {
         (0.0, 0.30),
         (10.5, f64::INFINITY),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED frozen_stride_eight_oracle_locks_every_resampling_seam"
+    );
 }
 
 fn max_abs(left: &Tensor, right: &Tensor) -> f32 {
@@ -1446,6 +1487,9 @@ fn production_rng_is_seeded_captured_ordered_scaled_and_mutation_sensitive() {
         0.0,
         "disabling both configured noises must equal explicit zero noise"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED production_rng_is_seeded_captured_ordered_scaled_and_mutation_sensitive");
 }
 
 #[test]
@@ -1537,6 +1581,9 @@ fn standalone_and_embedded_namespaces_match_and_extent_rules_hold() {
     assert!(standalone
         .encode_with_strides(&audio, Some(&[8, 16]))
         .is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED standalone_and_embedded_namespaces_match_and_extent_rules_hold");
 }
 
 #[test]
@@ -1559,6 +1606,7 @@ fn runtime_consumes_all_and_only_244_same_s_tensors_in_both_namespaces() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn frozen_upstream_two_stage_model_locks_override_list_execution_order() {
     let device = Device::Cpu;
     let root =
@@ -1655,6 +1703,9 @@ fn frozen_upstream_two_stage_model_locks_override_list_execution_order() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED frozen_upstream_two_stage_model_locks_override_list_execution_order");
 }
 
 fn roundtrip_metrics(reference: &[Vec<Vec<f32>>], decoded: &[Vec<Vec<f32>>]) -> (f64, f64) {
@@ -1741,4 +1792,7 @@ fn ten_second_music_roundtrip_matches_torch_and_measured_quality_bounds() {
     eprintln!("music roundtrip: snr_db={snr:.6}, mrstft={mrstft:.6}");
     assert!(snr >= 7.6, "SNR {snr} dB fell below measured bound");
     assert!(mrstft <= 3.055, "MR-STFT {mrstft} exceeded measured bound");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ten_second_music_roundtrip_matches_torch_and_measured_quality_bounds");
 }

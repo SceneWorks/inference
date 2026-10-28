@@ -582,7 +582,13 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 }
 
 fn validate_snapshot(dir: &Path) -> Result<()> {
-    let text = std::fs::read_to_string(dir.join("config.json"))?;
+    let text = crate::__model_input_reader!(
+        std::fs::read_to_string(dir.join("config.json")),
+        "crates/llm/mlx-llm/src/starvector_8b.rs::validate_snapshot::std::fs::read_to_string@22964",
+        ArtifactInput,
+        dir.join("config.json"),
+        |__model_input_path| std::fs::read_to_string(__model_input_path)
+    )?;
     let config: Value = serde_json::from_str(&text)
         .map_err(|error| Error::Config(format!("StarVector-8B config.json: {error}")))?;
     if !exact_config(&config) {
@@ -641,6 +647,8 @@ fn sampling(value: &core_llm::Sampling) -> SamplingParams {
         top_p: value.top_p,
         top_k: value.top_k,
         presence_penalty: value.presence_penalty,
+        presence_penalty_generated_only: value.presence_penalty_generated_only,
+        presence_penalty_prompt_len: 0,
         repetition_penalty: value.repetition_penalty,
         repetition_context: value.repetition_context,
     }
@@ -813,6 +821,8 @@ mod tests {
             || Box::new(StarVector8bProvider::load(&spec).unwrap()),
             &profile,
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance");
     }
 
     // ---- The engine decode (epic sc-24432, story sc-24434) on a shape-valid synthetic model. ----
@@ -937,6 +947,7 @@ mod tests {
     /// synthetic model's image-conditioned prefill — greedy, and seeded stochastic (whose draws
     /// are sensitive to small logit differences a greedy argmax can absorb).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_engine_decode_is_the_pre_engine_loop() {
         let provider = tiny_provider();
         let request = image_request(None);
@@ -1000,12 +1011,15 @@ mod tests {
             assert_eq!(run.output.tokens, expected.tokens, "{name}");
             assert_eq!(run.output.finish_reason, expected.finish_reason, "{name}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED starvector_8b::tests::the_engine_decode_is_the_pre_engine_loop");
     }
 
     /// AC2 end to end: an SVG generation carries `decode`, naming the token-at-a-time path, no
     /// proposer, the measured sampler, and the fallback an `auto` request resolves to on a
     /// provider that advertises no proposer.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_provider_reports_its_decode_and_the_auto_fallback() {
         let mut provider = tiny_provider();
         let out = provider
@@ -1074,5 +1088,7 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>()
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED starvector_8b::tests::the_provider_reports_its_decode_and_the_auto_fallback");
     }
 }

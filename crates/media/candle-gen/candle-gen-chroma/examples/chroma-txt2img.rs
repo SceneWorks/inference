@@ -117,6 +117,9 @@ fn main() -> Result<()> {
             }
             Progress::Decoding => println!("\n[smoke] call {}/{repeat} decoding", call + 1),
             Progress::Loading(phase) => println!("\n[smoke] loading {phase:?}"),
+            Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         };
         let t_call = std::time::Instant::now();
         let output = gen.generate(&req, &mut on_progress)?;

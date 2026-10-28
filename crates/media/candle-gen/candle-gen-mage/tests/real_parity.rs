@@ -107,6 +107,9 @@ fn final_normalized_qwen_conditioning_matches_torch() {
     let (max_abs, _, mean_rel) = stats(&got, require(&golden, "gen_txt"));
     assert!(max_abs <= 3.0, "TE max_abs {max_abs} exceeds 3.0");
     assert!(mean_rel <= 3.5e-2, "TE mean_rel {mean_rel} exceeds 3.5e-2");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_parity::final_normalized_qwen_conditioning_matches_torch");
 }
 
 #[test]
@@ -116,7 +119,15 @@ fn twelve_block_nr_mmdit_matches_torch() {
     let device = test_device();
     let dir = component_dir(&root, "transformer");
     let cfg = MageConfig::from_json(
-        &std::fs::read_to_string(dir.join("config.json")).expect("transformer/config.json"),
+        &candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/candle-gen/candle-gen-mage/tests/real_parity.rs::twelve_block_nr_mmdit_matches_torch::std::fs::read_to_string@3923",
+Configuration,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).expect("transformer/config.json"),
     )
     .expect("Mage config");
     let model = MageTransformer::load(&dir, &cfg, &device).expect("load NR-MMDiT");
@@ -182,6 +193,9 @@ fn twelve_block_nr_mmdit_matches_torch() {
         max_abs / peak
     );
     assert!(mean_rel <= 4.0e-2, "DiT mean_rel {mean_rel} exceeds 4.0e-2");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_parity::twelve_block_nr_mmdit_matches_torch");
 }
 
 #[test]
@@ -215,6 +229,9 @@ fn mage_vae_1024_decode_matches_torch() {
         "VAE decode parity failures:\n{}",
         failures.join("\n")
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_parity::mage_vae_1024_decode_matches_torch");
 }
 
 #[test]
@@ -240,4 +257,9 @@ fn mage_vae_1024_encoder_moments_match_torch() {
         assert!(max_abs <= 4.0e-2, "{label} max_abs {max_abs}");
         assert!(mean_rel <= 2.0e-3, "{label} mean_rel {mean_rel}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_parity::mage_vae_1024_encoder_moments_match_torch"
+    );
 }

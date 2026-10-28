@@ -197,4 +197,6 @@ fn mochi_bf16_vs_f32_perf() {
         bf16_step <= f32_step * 1.05,
         "bf16 per-step {bf16_step:.3}s must not be slower than f32 {f32_step:.3}s"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED bf16_perf_smoke::mochi_bf16_vs_f32_perf");
 }

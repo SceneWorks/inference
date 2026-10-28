@@ -1,0 +1,61 @@
+{
+  "status": "PASS_CPU_FROZEN_PILLOW_PREPROCESS",
+  "fixture_sha256": "8ad94e2fbbbc2330e785c5f941b0a1468d1ceede8577c5f0ec7e17fac979ed98",
+  "script_sha256": "51d0b2a333a7739715929cdbbeab40734585d5319eeefa8b9d1115c51666f712",
+  "pillow_version": "12.3.0",
+  "source_sha256": {
+    "ComfyUI-Moss-Image-Edit/moss_runtime/processing.py": "43e5fd31a40500cb720b573b547e39e9b0a298837b2ac3bd21f7a7d8bd8c521f",
+    "ComfyUI-Moss-Image-Edit/nodes.py": "79984ac3928e125ccc2045424badcf938f90a0ec76e47d0829575ae6b2c60d42"
+  },
+  "cases": [
+    {
+      "width": 19,
+      "height": 37,
+      "max_edge": 32,
+      "output_width": 16,
+      "output_height": 32,
+      "output_sha256": "09b3dbb576419475ba89a91e09f170a8f68123c13d0d61002aeda241117e105c"
+    },
+    {
+      "width": 65,
+      "height": 29,
+      "max_edge": 32,
+      "output_width": 32,
+      "output_height": 16,
+      "output_sha256": "86d31d0a73ab90a40fa7efea513f9fa1289be1de77bd8e3cb6a0e8f8c3552138"
+    },
+    {
+      "width": 8,
+      "height": 40,
+      "max_edge": 48,
+      "output_width": 16,
+      "output_height": 48,
+      "output_sha256": "7a0a169e5a40176e1e92e8362580056ef2199c91777535cf48828d3bd3add885"
+    },
+    {
+      "width": 23,
+      "height": 17,
+      "max_edge": 48,
+      "output_width": 16,
+      "output_height": 16,
+      "output_sha256": "9f1f610290c658bb1c549ffa19bfeb867bb3898ff838bf89294297a6be333854"
+    },
+    {
+      "width": 19,
+      "height": 37,
+      "max_edge": 47,
+      "output_width": 16,
+      "output_height": 32,
+      "output_sha256": "09b3dbb576419475ba89a91e09f170a8f68123c13d0d61002aeda241117e105c"
+    },
+    {
+      "width": 48,
+      "height": 16,
+      "max_edge": 48,
+      "output_width": 48,
+      "output_height": 16,
+      "output_sha256": "078857bb01cab600936d5e58fbf959075fbff07659012a95061b36489e50fc65"
+    }
+  ],
+  "bytes": 287921
+}

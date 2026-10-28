@@ -137,12 +137,17 @@ impl RawGguf {
         }
         let pos = file.stream_position()?;
         let data_offset = pos.div_ceil(alignment) * alignment;
-        Ok(Self {
-            metadata,
-            tensors,
-            data_offset,
-            file,
-        })
+        crate::__model_input_result!(
+            Ok(Self {
+                metadata,
+                tensors,
+                data_offset,
+                file,
+            }),
+            "candle-llm::prism_gguf::RawGguf::open",
+            ModelWeights,
+            &[path]
+        )
     }
 
     pub fn read_tensor(&mut self, name: &str) -> Result<Vec<u8>> {

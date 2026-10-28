@@ -110,8 +110,8 @@ use mlx_gen::weights::{to_f32, Weights};
 use mlx_gen::{Error, Result};
 
 use crate::dit::config::MiniMaxH3DitConfig;
+use crate::dit::MiniMaxH3Dit;
 use crate::tensor::slice_axis;
-
 /// The alpha upstream's `inference_minimax_h3.py` assumes when a LoRA declares none —
 /// `DEFAULT_LORA_ALPHA = 8`.
 ///
@@ -176,6 +176,149 @@ pub const BLOCK_TARGETS: [&str; 6] = [
     "ff.net.0.proj",
     "ff.net.2",
 ];
+
+/// The AdaLN modulation topology of the checkpoint an adapter install lands on.
+///
+/// The strict install classifies every target it could not resolve against this axis, because the
+/// two topologies make an unmatched AdaLN stem mean different things. On the full path the module
+/// exists but is deliberately not adapter-addressable. On the pruned coordinate-table path
+/// (sc-26684) the full-width module does not exist at all, the reduced projections are owned by
+/// the curve runtime and are bound into the pruning identity, and **no validated full→pruned
+/// transformation exists for an adapter delta** — the table stores `U·S` and the projections
+/// `W·Vh.T` of the *centered, post-SiLU* embedding curve, so a full-trained delta cannot be mapped
+/// onto them without the basis the checkpoint never ships. Folding such a delta onto the curve,
+/// rederiving a basis from the table, or dropping the target silently would each be a substitution
+/// the story refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdaLnSurface {
+    /// Full timestep-MLP path: `time_embedder`, full-width per-block `adaln_proj.linear`, and
+    /// full-width `norm_out.linear` exist as weights.
+    FullTimestepMlp,
+    /// Curve topology: the timestep MLP is absent and the reduced projections live in the curve
+    /// runtime. Body leaves (attention/FFN) are unchanged.
+    PrunedCurve,
+}
+
+/// The AdaLN stems a full-topology adapter may name that are never adapter-addressable, paired
+/// with the human wording the refusal uses. `time_embedder` matches as a path segment; the two
+/// projections match as dotted suffixes on the normalized module stem.
+const ADALN_SURFACE_TARGETS: [(&str, &str); 3] = [
+    (
+        "time_embedder",
+        "the full timestep-MLP embedding (`time_embedder`)",
+    ),
+    (
+        "adaln_proj.linear",
+        "a block's AdaLN projection (`adaln_proj.linear`)",
+    ),
+    (
+        "norm_out.linear",
+        "the final AdaLN projection (`norm_out.linear`)",
+    ),
+];
+
+/// Real modules on **both** topologies that no LoRA/LoKr can attach to — the bias-Linear I/O
+/// heads and the RMS norms the DiT owns directly. An unmatched stem landing here gets the
+/// "exists but is excluded from the adapter surface" refusal rather than the generic miss.
+const NON_ADAPTER_MODULE_STEMS: [&str; 8] = [
+    "proj_in",
+    "audio_proj_in",
+    "proj_out",
+    "audio_proj_out",
+    "context_embedder",
+    "norm_out.norm",
+    "norm1",
+    "norm2",
+];
+
+/// Whether a matched-nothing module stem names the topology-dependent AdaLN modulation surface.
+fn is_adaln_surface_target(path: &str) -> bool {
+    ADALN_SURFACE_TARGETS.iter().any(|(stem, _)| match *stem {
+        s if s.contains('.') => path.ends_with(s),
+        s => path.split('.').any(|seg| seg == s),
+    })
+}
+
+/// Whether a matched-nothing module stem names a real module no H3 adapter can ever attach to.
+fn is_known_non_adapter_module(path: &str) -> bool {
+    NON_ADAPTER_MODULE_STEMS
+        .iter()
+        .any(|stem| path == *stem || path.ends_with(stem))
+}
+
+/// What a matched-nothing adapter target means on a given [`AdaLnSurface`] — the typed half of
+/// the strict install's refusal contract (sc-26688). `unmatched_targets_error` renders these
+/// classes; tests assert the classification directly instead of pinning message wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnmatchedTargetClass {
+    /// A full-topology AdaLN target against a pruned coordinate-table checkpoint: refused as a
+    /// topology mismatch, with no validated full→pruned transformation to apply.
+    PrunedCurveTopologyMismatch,
+    /// A real module on this checkpoint that no H3 adapter can ever attach to.
+    DeliberatelyExcluded,
+    /// No such module on this checkpoint — the generic strict-install miss.
+    NoSuchModule,
+}
+
+/// Classify one normalized, matched-nothing module stem against the checkpoint's surface.
+pub fn classify_unmatched_target(path: &str, surface: AdaLnSurface) -> UnmatchedTargetClass {
+    if is_adaln_surface_target(path) {
+        return match surface {
+            AdaLnSurface::PrunedCurve => UnmatchedTargetClass::PrunedCurveTopologyMismatch,
+            AdaLnSurface::FullTimestepMlp => UnmatchedTargetClass::DeliberatelyExcluded,
+        };
+    }
+    if is_known_non_adapter_module(path) {
+        return UnmatchedTargetClass::DeliberatelyExcluded;
+    }
+    UnmatchedTargetClass::NoSuchModule
+}
+
+/// The strict-install refusal for unmatched targets, classified by the checkpoint's AdaLN
+/// topology (sc-26688).
+///
+/// Everything here is an **error** — the classification only names the cause, exactly as the
+/// strict install demands: an unmatched target is surfaced, never dropped, and the install never
+/// returns `Ok` with targets unresolved. The per-path classification is
+/// [`classify_unmatched_target`] — the typed contract the tests assert; this render names the
+/// cause and lists every offending stem so a user can act on it.
+fn unmatched_targets_error(paths: &[String], surface: AdaLnSurface) -> Error {
+    let worst = paths
+        .iter()
+        .map(|p| classify_unmatched_target(p, surface))
+        .max_by_key(|class| match class {
+            UnmatchedTargetClass::PrunedCurveTopologyMismatch => 2,
+            UnmatchedTargetClass::DeliberatelyExcluded => 1,
+            UnmatchedTargetClass::NoSuchModule => 0,
+        })
+        .expect("at least one unmatched path");
+    match worst {
+        UnmatchedTargetClass::PrunedCurveTopologyMismatch => Error::Msg(format!(
+            "minimax_h3 adapters: {} adapter target(s) address the full timestep-MLP AdaLN surface, \
+             which this pruned coordinate-table checkpoint does not carry in adapter-addressable \
+             form: the reduced projections are owned by the curve runtime and bound into its \
+             pruning identity, and no validated full→pruned transformation exists for an adapter \
+             delta. Refusing rather than dropping the targets, folding them onto the table, or \
+             rederiving a basis. All unmatched targets: {:?}",
+            paths.len(),
+            paths
+        )),
+        UnmatchedTargetClass::DeliberatelyExcluded => Error::Msg(format!(
+            "minimax_h3 adapters: {} adapter target(s) name real modules that no MiniMax-H3 adapter \
+             can attach to — the adapter surface is exactly the attention/FFN leaves \
+             (`attn.to_q/to_k/to_v/to_out.0`, `ff.net.0.proj/2`) of every transformer and \
+             token-refiner block. Refusing rather than dropping. All unmatched targets: {:?}",
+            paths.len(),
+            paths
+        )),
+        UnmatchedTargetClass::NoSuchModule => Error::Msg(format!(
+            "minimax_h3 adapters: {} adapter target(s) matched no module (surfaced, not silently \
+             dropped): {:?}",
+            paths.len(),
+            paths
+        )),
+    }
+}
 
 /// Outcome of applying the MiniMax-H3 adapter specs.
 #[derive(Debug, Default, PartialEq)]
@@ -847,7 +990,6 @@ fn apply_one_lora(
     }
     Ok(())
 }
-
 /// Install every adapter in `specs` onto a MiniMax-H3 DiT, stacking in order.
 ///
 /// **Strict, like every other family's install:** an unmatched target path, or **any single file**
@@ -859,6 +1001,20 @@ fn apply_one_lora(
 /// all** (a merged LoRA, a base checkpoint, a textual inversion) contributes neither an `applied`
 /// nor an `unmatched_path`, so only a per-spec check can see it. Downstream, the aggregate form
 /// reaches a user as "my second LoRA did nothing, and there was no error".
+///
+/// A zero-match file that DID collect unmatched targets is refused with the **classified**
+/// topology error (`unmatched_targets_error`) over THAT file's targets, before the generic
+/// zero-match error fires: the generic error is reserved for files carrying no recognized targets
+/// at all, and a full-topology AdaLN file against a pruned curve must be named as a topology
+/// mismatch, not swallowed by "no target modules matched".
+///
+/// The host is the **whole DiT**, not a sub-host, and that is load-bearing since sc-26688: the
+/// checkpoint's [`AdaLnSurface`] decides what an unmatched target **means**. A body stem that
+/// misses is a generic error; an AdaLN stem that misses is either a topology mismatch (full-trained
+/// delta against a pruned curve — refused with the absent-transformation wording, never folded onto
+/// the table) or a module the surface deliberately excludes — and only the DiT knows which
+/// topology it loaded. Body leaves resolve identically on both topologies, so a compatible adapter
+/// needs nothing else.
 ///
 /// Routing is by the **file**, not by `spec.kind`. An exact H3 trainer claim is classified before
 /// the generic LoKr predicate so trainer keys cannot be ignored by adding one valid `lokr_*`
@@ -873,13 +1029,20 @@ fn apply_one_lora(
 /// `verify_adapter_file` the moment it is read, before classification or folding, and the count
 /// lands in [`MiniMaxH3LoraReport::verified_source_tensors`].
 pub fn apply_minimax_h3_adapters(
-    host: &mut impl AdaptableHost,
+    host: &mut MiniMaxH3Dit,
     specs: &[AdapterSpec],
 ) -> Result<MiniMaxH3LoraReport> {
     let mut report = MiniMaxH3LoraReport::default();
     for spec in specs {
         let before = report.applied;
-        let w = Weights::from_file(&spec.path)?;
+        let before_unmatched = report.unmatched_paths.len();
+        let w = mlx_gen::gen_core::__model_input_choose!(
+            Weights::from_file(&spec.path),
+            mlx_gen::gen_core::model_input_proof::with_model_weight_purpose(
+                "minimax-h3/adapter-source",
+                || Weights::from_file(&spec.path),
+            )
+        )?;
         // sc-23402: the load boundary. Force and GPU-verify the whole file here, before anything
         // classifies, converts or folds it — see [`verify_adapter_file`] for why a stale adapter
         // read is the silent one.
@@ -905,6 +1068,10 @@ pub fn apply_minimax_h3_adapters(
             report.applied += applied;
             report.unmatched_paths.extend(unmatched_paths);
             if report.applied == before {
+                let fresh = &report.unmatched_paths[before_unmatched..];
+                if !fresh.is_empty() {
+                    return Err(unmatched_targets_error(fresh, host.adapter_surface()));
+                }
                 return Err(Error::Msg(format!(
                     "minimax_h3 adapter {}: no target modules matched in this file",
                     spec.path.display()
@@ -955,6 +1122,10 @@ pub fn apply_minimax_h3_adapters(
         // Per-spec, NOT aggregate: this file, on its own, must have folded onto something. See the
         // doc comment — an aggregate check passes a junk file riding alongside a good one.
         if report.applied == before {
+            let fresh = &report.unmatched_paths[before_unmatched..];
+            if !fresh.is_empty() {
+                return Err(unmatched_targets_error(fresh, host.adapter_surface()));
+            }
             return Err(Error::Msg(format!(
                 "minimax_h3 adapter {}: no target modules matched in this file — expected the \
                  diffusers key space (`transformer_blocks.{{i}}.…` / `token_refiner.…` with \
@@ -965,12 +1136,10 @@ pub fn apply_minimax_h3_adapters(
         }
     }
     if !report.unmatched_paths.is_empty() {
-        return Err(Error::Msg(format!(
-            "minimax_h3 adapters: {} adapter target(s) matched no module (surfaced, not silently \
-             dropped): {:?}",
-            report.unmatched_paths.len(),
-            report.unmatched_paths
-        )));
+        return Err(unmatched_targets_error(
+            &report.unmatched_paths,
+            host.adapter_surface(),
+        ));
     }
     report.trainer_ranks.sort_unstable();
     report.trainer_ranks.dedup();

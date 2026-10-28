@@ -40,6 +40,15 @@
 //! goldens the MLX port uses. The conv decoder ([`vae`]) is untouched and still the selectable
 //! decode path for a conv-VAE checkpoint.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapters;
 mod advanced_quant;
 pub mod audio_vae;
@@ -424,8 +433,14 @@ impl Pipeline {
         let audio_sample_rate = self.vocoder_cfg.final_sample_rate() as u32;
 
         let tok_path = gemma_dir.join("tokenizer.json");
-        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
-            .map_err(|e| CandleError::Msg(format!("ltx: load gemma tokenizer: {e}")))?;
+        let tokenizer = candle_gen::gen_core::__model_input_reader!(
+            tokenizers::Tokenizer::from_file(&tok_path),
+            "candle-gen-ltx::Pipeline::load_components/tokenizer",
+            Tokenizer,
+            &tok_path,
+            |actual_path| tokenizers::Tokenizer::from_file(actual_path)
+        )
+        .map_err(|e| CandleError::Msg(format!("ltx: load gemma tokenizer: {e}")))?;
 
         Ok(Components {
             te: Arc::new(TextEncoder::Gemma3(Box::new(te))),
@@ -763,8 +778,14 @@ impl Pipeline {
         let upsampler = LatentUpsampler::from_checkpoint(&upsampler_file, VAE_DTYPE, &self.device)?;
 
         let tok_path = paths.tokenizer_path();
-        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
-            .map_err(|e| CandleError::Msg(format!("ltx tier: load gemma tokenizer: {e}")))?;
+        let tokenizer = candle_gen::gen_core::__model_input_reader!(
+            tokenizers::Tokenizer::from_file(&tok_path),
+            "candle-gen-ltx::Pipeline::load_components_tier/tokenizer",
+            Tokenizer,
+            &tok_path,
+            |actual_path| tokenizers::Tokenizer::from_file(actual_path)
+        )
+        .map_err(|e| CandleError::Msg(format!("ltx tier: load gemma tokenizer: {e}")))?;
 
         Ok(Components {
             te: Arc::new(TextEncoder::Gemma3(Box::new(te))),

@@ -147,6 +147,8 @@ fn fixed_instruction_edit_matches_the_torch_reference() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("; "));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::fixed_instruction_edit_matches_the_torch_reference");
 }
 
 #[test]
@@ -186,6 +188,8 @@ fn seeded_mlx_posterior_sampling_is_deterministic_and_stochastic() {
         error(&first, &moved).0 > 0.01,
         "a new seed must move the posterior sample instead of returning the mean"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::seeded_mlx_posterior_sampling_is_deterministic_and_stochastic");
 }
 
 #[test]
@@ -387,4 +391,6 @@ fn multimodal_instruction_conditioning_matches_torch() {
         max_abs <= 20.0 && mean_rel <= 0.10,
         "combined vision+LM conditioning exceeds measured cross-backend spread"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::multimodal_instruction_conditioning_matches_torch");
 }

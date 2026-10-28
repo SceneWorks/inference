@@ -1,0 +1,4100 @@
+{
+  "schema_version": 1,
+  "source_contract_sha256": "ba071f78c7ddbcdab6ab215e4664b19dde52f6ebef0a7680a4dd05937b6b3602",
+  "scope": "Current source-declared API role/grade registry; not runtime evidence; replace only from final frozen source contract",
+  "supporting_not_consumption": [
+    "candle-audio-yue2::snapshot::verify_component"
+  ],
+  "readers": {
+    "candle-audio-acestep::config::read_json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-acestep::model::shard_names_from_index": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-acestep::pipeline::AceStepPipeline::from_snapshot/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-acestep::tokenizer::TokenizerConfig::from_json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-chatterbox::text::EnTokenizer::from_file/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-clap::model::ClapEmbedder::build/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-kokoro::config::KokoroConfig::from_file": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-kokoro::weights::VoicePack::from_file": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-moss-sfx::config::read_json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-moss-sfx::pipeline::MossSfxPipeline::from_snapshot/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-moss-tts-realtime::codec::CodecConfig::from_dir": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-moss-tts-realtime::config::MossTtsRealtimeConfig::from_dir": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-moss-tts-realtime::model::Loaded::from_snapshot/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-moss-tts::config::MossTtsdConfig::from_dir": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-moss-tts::model::Loaded::from_snapshot/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-openvoice::pipeline::validate_config": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-whisper::model::WhisperTranscriber::build/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-whisper::model::WhisperTranscriber::build/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-audio-yue2::tokenizer::Yue2TextTokenizer::from_verified": {
+      "role": "tokenizer",
+      "grades": [
+        "content"
+      ]
+    },
+    "candle-core::NpzTensors::get": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-core::PthTensors::get": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-core::Tensor::read_npy": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-core::Tensor::read_npz": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-core::Tensor::read_npz_by_name": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-core::pickle::read_all_with_key": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-core::safetensors::BufferedSafetensors::new": {
+      "role": "tensor-input",
+      "grades": [
+        "content"
+      ]
+    },
+    "candle-core::safetensors::MmapedSafetensors::multi": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-core::safetensors::MmapedSafetensors::new": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-core::safetensors::load": {
+      "role": "tensor-input",
+      "grades": [
+        "content"
+      ]
+    },
+    "candle-gen-anima::loader::dit_path_quant_tier/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-bernini::config::BerniniKnobs::from_dir/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-boogu::config::BooguConfig::from_snapshot/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-chroma::pipeline::Pipeline::transformer_group_size/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-chroma::text::load_t5/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-flux::flux1_load::text_encoders/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-flux::pipeline::FluxTokenizers::load/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-flux::pipeline::Pipeline::component_packed_config/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-flux::pipeline::Pipeline::dit_block_counts/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-iris::train::depth::resolve_resources/generation-configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-krea::text_encoder::KreaTeConfig::from_snapshot": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-lens::Pipeline::packed_config/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-ltx::Pipeline::load_components/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-ltx::Pipeline::load_components_tier/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-ltx::tier::TierPaths::packed_config/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-ltx::training::LtxTrainer::cache/ltx23-tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-minimax-h3::dit::MiniMaxH3Dit::load_from_dir/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-minimax-h3::model::MiniMaxH3::audio_vae_config/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-minimax-h3::tests::common::Golden::load/reference": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-minimax-h3::text_encoder::MiniMaxH3TeConfig::from_component_dir/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-minimax-h3::text_encoder::MiniMaxH3Tokenizer::from_snapshot/tokenizer-pair": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-minimax-h3::vae::MiniMaxH3VideoVae::load/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-minimax-h3::vae::MiniMaxH3VideoVae::load_decode_only/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-mochi::config::MochiVaeConfig::from_model_dir/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-mochi::tier::MochiTierPaths::packed_config/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-sam3::text::Sam3Tokenizer::from_file/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-sd3::clip_tokenizer::synthesize_clip_tokenizer/tokenizer-pair": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-sd3::pipeline::Pipeline::transformer_packed_config/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-sd3::training::packed_component/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-sdxl::pipeline::SdxlTokenizers::load/tokenizers": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ],
+      "ordered_records": true,
+      "ordered_records_arity": 2
+    },
+    "candle-gen-sdxl::training::DualClip::load/tokenizers": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ],
+      "ordered_records": true,
+      "ordered_records_arity": 2
+    },
+    "candle-gen-wan::training::packed_component/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen::Weights::from_file": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen::Weights::from_file_filtered": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen::Weights::from_files": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen::Weights::from_files_filtered": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen::loader::mmap_var_builder": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen::testkit::read_ppm": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-llm::gguf::GgufCheckpoint::open": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-llm::primitives::Weights::from_dir": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-llm::primitives::Weights::from_dir_sharded": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-llm::primitives::Weights::from_file": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-llm::prism_gguf::RawGguf::open": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-llm::prism_vision_gguf::PrismVisionGguf::open": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "core-llm::template::JinjaChatTemplate::from_tokenizer_config_file/read_to_string": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "core-llm::tokenizer::Tokenizer::from_file": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "core-llm::tokenizer::Tokenizer::from_hf_byte_level_bpe": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-mmaudio/tests/clip_conformance.rs::dfn_clip_matches_open_clip_reference::std::fs::read@13001": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-mmaudio/tests/clip_conformance.rs::read_f32::std::fs::read@5773": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-moss-tts-realtime/tests/conformance.rs::codec_only_decodes_synthetic_frames::std::fs::read_to_string@22810": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-moss-tts-realtime/tests/conformance.rs::read_codes_csv::std::fs::read_to_string@35431": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-moss-tts-realtime/tests/conformance.rs::read_f32le::std::fs::read@34736": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-moss-tts/tests/conformance.rs::codec_decode_frames_from_file::std::fs::read_to_string@19134": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-sheetsage2/src/provider.rs::read_json::std::fs::read@8752": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-sheetsage2/src/review.rs::open::std::fs::read@29936": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-stable-audio-3/src/config.rs::from_path::std::fs::read_to_string@2252": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-stable-audio-3/src/t5gemma.rs::from_path::std::fs::read_to_string@2629": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-stable-audio-3/src/t5gemma.rs::load::Tokenizer::from_file@23831": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-yue/src/tokenizer.rs::from_file::tokenizers::Tokenizer::from_file@5969": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-yue/tests/registered_loader_real_weights.rs::en_icl_renders_one_segment_with_a_single_track_reference::std::fs::read@9830": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-yue2/src/latent.rs::load::fs::read@17261": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-yue2/src/model.rs::open_tier::std::fs::read_to_string@12893": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-yue2/src/model.rs::open_verified::std::fs::read_to_string@11282": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-yue2/src/run.rs::read_json::fs::read@14745": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-yue2/src/tier.rs::verify_tier_from::std::fs::read@11458": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/audio/candle-audio-yue2/src/vae.rs::load_files_with_dtype::fs::read_to_string@39074": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/src/config.rs::from_dir::std::fs::read_to_string@50697": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/src/llava.rs::from_dir_with::std::fs::read_to_string@11509": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/src/prepare.rs::read_json::std::fs::read_to_string@20434": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/src/prism_checkpoint.rs::read_metadata::std::fs::read@12764": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/src/provider.rs::read_json::std::fs::read_to_string@267613": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/src/provider.rs::sidecar_chat_template::std::fs::read_to_string@189409": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/src/starvector.rs::read_config::std::fs::read_to_string@10042": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/src/starvector_8b.rs::validate_snapshot::std::fs::read_to_string@22842": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/tests/common/qwen35.rs::load::std::fs::read_to_string@1090": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/tests/common/qwen35.rs::render_chat_prompt::std::fs::read_to_string@2137": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/tests/decode_bench.rs::is_causal_snapshot::std::fs::read_to_string@51931": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/tests/decode_bench.rs::load::std::fs::read_to_string@48780": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/tests/decode_bench.rs::render_prompt::std::fs::read_to_string@48029": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/tests/fused_primitives.rs::qwen38_27b_greedy_decode_is_token_identical_fused_on_vs_off::std::fs::read_to_string@12806": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/tests/fused_primitives.rs::qwen38_27b_greedy_decode_is_token_identical_fused_on_vs_off::std::fs::read_to_string@13452": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/tests/nvfp4_evidence.rs::load::std::fs::read_to_string@6735": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/tests/nvfp4_evidence.rs::nvfp4_real_weight_evidence::std::fs::read@13528": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/candle-llm/tests/nvfp4_evidence.rs::render_prompt::std::fs::read_to_string@4822": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/config.rs::from_dir::std::fs::read_to_string@49555": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/joycaption.rs::from_dir::std::fs::read_to_string@10743": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/primitives/kv_candidates/compare.rs::load_captured_case::Array::load_safetensors_with_metadata@16563": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/prism.rs::from_dir::std::fs::read_to_string@5963": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/provider.rs::load_admitted::Tokenizer::from_file@87862": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/provider.rs::read_config_value::std::fs::read_to_string@232605": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/provider.rs::read_json::std::fs::read_to_string@234545": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/provider.rs::sidecar_chat_template::std::fs::read_to_string@120781": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/snapshot.rs::read_to_string_if_exists::std::fs::read_to_string@35710": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/snapshot.rs::write_hf_snapshot_inner::std::fs::read_to_string@32724": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/starvector_1b.rs::validate_snapshot::std::fs::read_to_string@20980": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/llm/mlx-llm/src/starvector_8b.rs::validate_snapshot::std::fs::read_to_string@22964": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-boogu/src/loader.rs::read_packed_config::std::fs::read_to_string@8917": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-boogu/tests/preview_real_weights.rs::read_reference::image::open@3576": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-clip/src/lib.rs::from_snapshot::Tokenizer::from_file@9378": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-flux/src/ip_provider.rs::detect_variant::std::fs::read@6286": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-flux/src/memory_strategy.rs::snapshot_quant_tier::std::fs::read_to_string@25464": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-flux/src/memory_strategy.rs::uses_diffusers_layout::std::fs::read_to_string@4995": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-flux2/src/lib.rs::flux2_klein_reference_routes_probed_memory_ladder::image::open@156009": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-flux2/src/lib.rs::measured_output_parity::std::fs::read@142120": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-flux2/src/memory_strategy.rs::packed_quant::std::fs::read_to_string@40791": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-ideogram/src/loader.rs::read_packed_group_size::std::fs::read_to_string@7536": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-kolors/src/memory_strategy.rs::component_quantization::std::fs::read@43178": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-kolors/src/pipeline.rs::detect_packed_group::std::fs::read@45743": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-kolors/src/tokenizer.rs::from_file::Tokenizer::from_file@2953": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-krea/src/config.rs::from_snapshot::std::fs::read_to_string@4430": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-krea/src/config.rs::read_optional_json::std::fs::read_to_string@10048": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-krea/src/control_provider.rs::control_probed_generate_for_offload_ab::image::open@43740": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-krea/src/lib.rs::krea_probed_generate_for_offload_ab::image::open@325143": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-krea/src/loader.rs::read_packed_config::std::fs::read_to_string@77173": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-krea/tests/edit_real_weights.rs::read_ppm::std::fs::read@3529": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-krea/tests/edit_real_weights.rs::read_source::image::open@4924": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-krea/tests/img2img_real_weights.rs::read_ppm::std::fs::read@3856": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-krea/tests/img2img_real_weights.rs::read_source::image::open@4989": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-krea/tests/imported_cuda_smoke.rs::read_image::image::open@503": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-lens/src/lib.rs::component_marker_bits::std::fs::read_to_string@93300": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-lens/src/lib.rs::packed_text_encoder_config::std::fs::read_to_string@86323": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-lens/src/lib.rs::transformer_numeric_tier_matches::std::fs::read_to_string@89075": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-ltx/src/tier.rs::read_manifest_json::std::fs::read_to_string@74840": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-mage/src/memory_strategy.rs::architecture_facts::std::fs::read_to_string@24049": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-mage/src/memory_strategy.rs::packed_group_size::std::fs::read_to_string@11147": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-mage/src/memory_strategy.rs::transformer_has_device_format::std::fs::read_to_string@4618": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-mage/tests/memory_ladder_real_weights.rs::representative_route_exercises_advertised_rung::std::fs::read@11609": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-mage/tests/memory_ladder_real_weights.rs::representative_route_exercises_advertised_rung::std::fs::read@13436": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-mage/tests/real_parity.rs::twelve_block_nr_mmdit_matches_torch::std::fs::read_to_string@3923": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-minimax-h3/src/tier.rs::packed_config::std::fs::read@19553": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-minimax-h3/tests/turbo_lora.rs::manual_cuda_exact_h3_trainer_runtime_receipt::std::fs::read_to_string@103822": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-minimax-h3/tests/veda_ab.rs::load_image::image::open@7446": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/config.rs::read_json::std::fs::read@4341": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/loader.rs::load_vision_config::std::fs::read@6378": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/loader.rs::load_vision_config::std::fs::read@7027": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/loader.rs::read_optional_json::std::fs::read@13725": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/quant.rs::packed_bits::std::fs::read@4836": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs::decode_reference::image::open@66861": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs::decode_target_picture::image::open@65392": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs::compare_with_golden::std::fs::read@18439": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs::references::std::fs::read@46156": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs::transparent_reference::image::open@137967": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image/src/edit.rs::read_zero_cond_t::std::fs::read_to_string@16169": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image/src/lib.rs::transformer_group_size::std::fs::read_to_string@41053": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image/src/lib.rs::transformer_is_packed::std::fs::read_to_string@42439": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image/src/lib.rs::transformer_packed_config::std::fs::read_to_string@41470": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image/src/memory_strategy.rs::snapshot_quant_tier::std::fs::read_to_string@24129": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image/tests/preview_real_weights.rs::control_fun_preview_frames_evolve_toward_the_final_image::image::open@27343": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image/tests/preview_real_weights.rs::edit_preview_frames_evolve_toward_the_final_image::image::open@21988": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-scail2/src/config.rs::from_model_dir::std::fs::read_to_string@4095": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sd3/src/clip_tokenizer.rs::load_clip_tokenizer::Tokenizer::from_file@3310": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sd3/src/conditioning.rs::load::Tokenizer::from_file@15308": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sd3/src/conditioning.rs::load::std::fs::read_to_string@16073": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sd3/src/conditioning.rs::resolve_clip_pad_id::std::fs::read_to_string@8591": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sd3/tests/component_parity.rs::manifest::std::fs::read_to_string@10785": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sdxl/src/conditioning.rs::load::Tokenizer::from_file@7400": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sdxl/src/conditioning.rs::load::Tokenizer::from_file@7631": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sdxl/src/memory_strategy.rs::packed_bits::std::fs::read@10655": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sdxl/src/pipeline.rs::detect_packed_clip::std::fs::read@75223": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sdxl/src/pipeline.rs::detect_packed_unet::std::fs::read@76839": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sensenova/src/config.rs::from_dir::std::fs::read_to_string@9987": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-sensenova/src/text.rs::from_dir::Tokenizer::from_file@8620": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-wan/src/memory_strategy.rs::packed_marker::std::fs::read@11155": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-wan/tests/vram_probe.rs::measure::image::open@11467": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen-z-image/src/pipeline.rs::packed_config_at::std::fs::read_to_string@6340": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen/src/train/dataset.rs::decode_square::image::open@2345": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-anima/tests/velocity_convention.rs::image_to_nchw::image::open@2667": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-bernini/src/config.rs::read_knob_sidecar::std::fs::read@3856": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-bernini/src/convert.rs::planner_knobs::std::fs::read@12350": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-bernini/src/memory_strategy.rs::quant_manifest::std::fs::read@72701": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-bernini/src/qwen2_5_vl.rs::from_config_json::std::fs::read@3425": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-bernini/src/vision.rs::from_config_json::std::fs::read@3534": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-boogu/src/config.rs::from_snapshot::std::fs::read_to_string@2856": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-boogu/src/convert.rs::write_quantized_config::std::fs::read_to_string@16466": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-flux/src/artifact_inventory.rs::quant_marker_at::std::fs::read@16685": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-flux/tests/ip_generate_real_weights.rs::flux_ip_render_to_png::image::open@6849": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-flux/tests/ip_image_encoder_real_weights.rs::ip_image_encoder_runs_on_real_weights::std::fs::read@4392": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-flux/tests/ip_image_encoder_real_weights.rs::read_f32_le::std::fs::read@5388": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-flux2/src/loader.rs::read_component_quant::std::fs::read_to_string@1653": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-flux2/tests/img_guidance_spike.rs::load_ref::image::open@1149": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-instantid/tests/instantid_curated_smoke.rs::load_rgb::image::open@2075": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/src/packed.rs::prequantize_text_encoder::Array::load_safetensors@23531": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/src/packed.rs::prequantize_text_encoder::std::fs::read_to_string@25050": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/src/text_encoder.rs::weight_shards::std::fs::read_to_string@6583": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/src/train/depth.rs::load_tensors::Array::load_safetensors@42911": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/src/train/lpips.rs::load::Array::load_safetensors@4447": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/src/train/mod.rs::load_tensors::Array::load_safetensors@92816": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-kolors/tests/conditioned_curated_smoke.rs::image_from::image::open@3166": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-krea/src/config.rs::from_snapshot::std::fs::read_to_string@4411": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-krea/src/config.rs::from_snapshot::std::fs::read_to_string@4898": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-krea/src/convert.rs::read_te_num_layers::std::fs::read_to_string@15823": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-lens/src/registry.rs::text_encoder_storage::std::fs::read@3688": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@17772": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@29553": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@35239": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@42938": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-ltx/src/config.rs::from_model_dir::std::fs::read_to_string@45676": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-ltx/src/diff_vae.rs::from_model_dir::std::fs::read_to_string@17071": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-mage/src/model.rs::dit_config::std::fs::read_to_string@28598": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-mage/src/text_encoder/load.rs::load_lm_dir_with::std::fs::read_to_string@5702": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-mage/src/training.rs::load_master_weights::std::fs::read_to_string@64128": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-mage/src/transformer.rs::load::std::fs::read_to_string@9377": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-mage/src/transformer.rs::load_streamed::std::fs::read_to_string@10003": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy.rs::resolved_dit_config::std::fs::read_to_string@76461": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy.rs::vae_config::std::fs::read_to_string@78050": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/adaln_evict_real_weights.rs::real_weight_adaln_evict_releases_26_gb::std::fs::read_to_string@5087": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::read::std::fs::read_to_string@44312": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_decode_matches_the_official_diffusers_vae::std::fs::read_to_string@10481": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_decode_produces_a_plausible_video::std::fs::read_to_string@5159": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_dit_block_runs_one_forward::std::fs::read_to_string@79396": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_encode_matches_the_official_diffusers_vae::std::fs::read_to_string@35112": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_multi_chunk_decode_blends_the_seam::std::fs::read_to_string@13854": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_tiled_decode_matches_the_official_diffusers_vae::std::fs::read_to_string@89090": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs::real_weight_tiling_is_inert_below_one_tile::std::fs::read_to_string@95325": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/te_load_integrity.rs::fresh_and_warm_text_and_grounded_contexts_match::image::open@1854": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/te_load_integrity.rs::fresh_and_warm_text_and_grounded_contexts_match::std::fs::read@1669": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/te_load_integrity.rs::fresh_and_warm_text_and_grounded_contexts_match::std::fs::read_to_string@1357": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/turbo_lora.rs::manual_metal_exact_h3_trainer_runtime_receipt::std::fs::read_to_string@111922": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/veda_ab.rs::load_rgb::image::open@7990": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-pulid/tests/shared_memory_ladder_real_weights.rs::ladder_preserves_identity_quality_and_reduces_request_peak::image::open@2511": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/config.rs::read_json::std::fs::read@3295": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::load_saved_sigma_schedule::std::fs::read@13192": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::load_vision_config::std::fs::read@5424": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::load_vision_config::std::fs::read@5935": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::read_model_index::std::fs::read@12258": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/q4_diagnostic.rs::fixed_q4_numeric_diagnostic::image::open@26444": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::decode_image::image::open@51854": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::decode_reference::image::open@52482": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/e2e_real_weights.rs::compare_with_golden::image::open@15349": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/e2e_real_weights.rs::references::image::open@53337": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/e2e_real_weights.rs::transparent_reference::image::open@113529": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs::diagnostic_reused_edit_adapter_semantics::std::fs::read@108368": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs::diagnostic_reused_t2i_style_direction::std::fs::read@98814": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs::imported_adapters_move_t2i_and_two_reference_edit_every_tier::std::fs::read@91036": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image/tests/lightning_render_real_weights.rs::load_ppm::std::fs::read@8916": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-scail2/src/config.rs::from_model_dir::std::fs::read_to_string@2436": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-scail2/tests/dit_chunk_equiv.rs::chunking_matches_unchunked::std::fs::read_to_string@6762": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-scail2/tests/dit_parity.rs::dit_parity_tiny_seeded::std::fs::read_to_string@2901": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-sd3/src/artifact_inventory.rs::packed_transformer_tier::std::fs::read_to_string@4826": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-sd3/src/loader.rs::resolve_clip_pad_id::std::fs::read_to_string@3925": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-sd3/src/loader.rs::resolve_clip_pad_id::std::fs::read_to_string@4607": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-sdxl/src/tokenizer.rs::from_files::std::fs::read_to_string@3322": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-sdxl/src/tokenizer.rs::from_files::std::fs::read_to_string@3509": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-sensenova/src/config.rs::from_dir::std::fs::read_to_string@10788": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-sensenova/src/memory_strategy.rs::indexed_shard_names::std::fs::read_to_string@27556": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-wan/src/config.rs::from_model_dir::std::fs::read_to_string@17510": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-wan/src/config.rs::from_model_dir::std::fs::read_to_string@31041": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-wan/src/config.rs::from_model_dir::std::fs::read_to_string@31397": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/mlx-gen-wan/src/convert.rs::bernini_renderer_knobs::std::fs::read@35049": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/src/quant.rs::packed_quant_bits_at::std::fs::read@3186": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/src/quant.rs::packed_quant_group_size_at::std::fs::read@8611": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/src/quant.rs::write_quantized_config::std::fs::read_to_string@25585": {
+      "role": "artifact-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/src/train/checkpoint.rs::load_resume_inner::Array::load_safetensors_with_metadata@7568": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/src/train/optim.rs::load_state::Array::load_safetensors_with_metadata@22532": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/src/train/optim.rs::load_state::opt.state_mut().load_safetensors@9545": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/src/train/vae_anchor.rs::taps::Array::load_safetensors@20026": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/src/weights.rs::from_file::Array::load_safetensors_with_metadata@1543": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/media/mlx-gen/src/weights.rs::from_paths::Array::load_safetensors_with_metadata@13609": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "gen-core::LoadSpec::read_prepared_files_unchanged": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "gen-core::SourceInventory::read_unchanged": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "gen-core::SourceInventory::read_unchanged_with_capacity": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "gen-core::ValidatedEncoderSource::read_unchanged": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "gen-core::ValidatedTokenizerSource::read_unchanged": {
+      "role": "tokenizer",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "gen-core::iris::IrisConfig::from_dir": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "gen-core::iris::downstream::EmptyPrompt::read": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "gen-core::iris::downstream::TaskExport::from_dir_impl": {
+      "role": "configuration",
+      "grades": [
+        "content"
+      ]
+    },
+    "gen-core::iris::restoration_train::RestoreTrainResources::from_spec/parent-configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "gen-core::iris::train::shapes::preprocess_file_to_shape": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "gen-core::tokenizer::TextTokenizer::from_clip_bpe": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "gen-core::tokenizer::TextTokenizer::from_file": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "gen-core::veda::contract::Bundle::load": {
+      "role": "model-weights",
+      "grades": [
+        "content"
+      ]
+    },
+    "mlx-gen-iris::IrisTextEncoder::load_quantized": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-gen-iris::IrisTextEncoder::load_streamed": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-gen::Weights::from_file": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-gen::Weights::from_file_with_fp8_filter": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-gen::Weights::from_paths": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-gen::logical_weights::load_with_rewritten_header": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-gen::pth::load_pth_f32_filtered": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-llm::gguf::GgufFile::open": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-llm::models::qwen35_vision::tests::qwen3vl_visual_weights/index": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-llm::primitives::Weights::from_dir": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "mlx-llm::primitives::Weights::from_file": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "crates/contracts/gen-core/src/train/subject_mask.rs::SubjectMask::load/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "SubjectMask::load",
+      "source": "crates/contracts/gen-core/src/train/subject_mask.rs",
+      "source_sha256": "f1a47876916cdf55fd9bd47b04135059a142513472f9c717aef99422798f4b47",
+      "function_byte_span": [
+        5607,
+        6285
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "ac789eff5f8e9df2e55833730d112ea6d095b0b6e155d0e88b6e37a36040fd86",
+      "function_lines": [
+        128,
+        147
+      ],
+      "hook_byte_span": [
+        5676,
+        5887
+      ],
+      "hook_sha256": "5f210942ff18fef83c9c7bb176e800e10dede102c4eb94e622965b01fb403c92",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-qwen-image-2-1",
+        "target": "mlx_gen_qwen_image_2_1",
+        "target_kind": "lib",
+        "fqn": "training::tests::subject_mask_weight_is_resampled_per_bucket",
+        "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-z-image/src/training.rs::decode_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_image",
+      "source": "crates/media/mlx-gen/mlx-gen-z-image/src/training.rs",
+      "source_sha256": "adc2a14d837d642f1ffa7d4f09b66ec9035b7d27970977484d7ead69dc455859",
+      "function_byte_span": [
+        57850,
+        58377
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "82da6861849510bdd1cd0ef05479c599f44e52f18aa565d9ca93f69011f1586c",
+      "function_lines": [
+        1199,
+        1214
+      ],
+      "hook_byte_span": [
+        57915,
+        58114
+      ],
+      "hook_sha256": "7a12686b11ab707e667d38afa2ffd4712a1e8c796e6250b515f7e788531172e1",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-z-image",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "trainer_e2e::z_image_trainer_emits_preview_samples",
+        "source": "crates/media/mlx-gen/mlx-gen-z-image/tests/trainer_e2e.rs"
+      },
+      "additional_registered_identities": [
+        {
+          "package": "mlx-gen-z-image",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "trainer_conformance::z_image_turbo_trainer_satisfies_gen_core_contract",
+          "source": "crates/media/mlx-gen/mlx-gen-z-image/tests/trainer_conformance.rs"
+        }
+      ],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-lens/src/training.rs::decode_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_image",
+      "source": "crates/media/mlx-gen/mlx-gen-lens/src/training.rs",
+      "source_sha256": "b2e83f80ab4995f672eb56f88da7935bd6684e0f190e2111cc89f06835abfb85",
+      "function_byte_span": [
+        49098,
+        49613
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "80a22ce0fb0e697a69d61974547eced31bd1e225402addb359b0f5e2662a75f8",
+      "function_lines": [
+        977,
+        992
+      ],
+      "hook_byte_span": [
+        49163,
+        49359
+      ],
+      "hook_sha256": "642d9adc8d75441cdc9a914fcd875424251cbd745b75400316bf8a1800b3473e",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-lens",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "trainer_e2e::lens_trainer_emits_preview_samples",
+        "source": "crates/media/mlx-gen/mlx-gen-lens/tests/trainer_e2e.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-anima/src/training.rs::decode_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_image",
+      "source": "crates/media/mlx-gen/mlx-gen-anima/src/training.rs",
+      "source_sha256": "2c7cfc03450f604f449e155e4c15c995ad84df94ccdbb1b66445c2e5d36f6796",
+      "function_byte_span": [
+        52617,
+        53142
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "b62c43bf61fd2f3764be500755b43fb77990715ca344753fe026085662081d76",
+      "function_lines": [
+        1035,
+        1050
+      ],
+      "hook_byte_span": [
+        52682,
+        52879
+      ],
+      "hook_sha256": "fe2e8de0bb302f20cfa3dcc83844f347defdc5924754df5d3960962303291573",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-anima",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "training::train_emits_in_training_previews",
+        "source": "crates/media/mlx-gen/mlx-gen-anima/tests/training.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::decode_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_image",
+      "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
+      "source_sha256": "68193202ba36aecf6a2b151aa69d901e248b0d04f78a4618c49d6f99ab611303",
+      "function_byte_span": [
+        191711,
+        192234
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "c8dc256c4a78c574f26fe9c5192b6f631310d30c28019b873b37b541532debb2",
+      "function_lines": [
+        4660,
+        4675
+      ],
+      "hook_byte_span": [
+        191776,
+        191971
+      ],
+      "hook_sha256": "92abcb8e48312123d4e278ba01f4773131cc23ee2bba06470d0f94ddc175d71e",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-ltx",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "trainer_e2e::ltx_trainer_emits_preview_samples",
+        "source": "crates/media/mlx-gen/mlx-gen-ltx/tests/trainer_e2e.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-krea/src/training.rs::decode_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_image",
+      "source": "crates/media/mlx-gen/mlx-gen-krea/src/training.rs",
+      "source_sha256": "8a0df37e3339341035cdea5b7cf5c7f0d55b6a5ec08734e513e0210674c4bebd",
+      "function_byte_span": [
+        49377,
+        49892
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "a8df09bb72330a697409f4d89e88ada1f1af73830c221a516503a3f54f00f789",
+      "function_lines": [
+        1040,
+        1055
+      ],
+      "hook_byte_span": [
+        49442,
+        49638
+      ],
+      "hook_sha256": "8d00c8f5ab73e249a9a1365e9fbc0f3f76a14c67f36299a7f3878446f52e9731",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-krea",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "trainer_real_weights::short_train_checkpointed_produces_loadable_adapter",
+        "source": "crates/media/mlx-gen/mlx-gen-krea/tests/trainer_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs::decode_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_image",
+      "source": "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs",
+      "source_sha256": "5e87f2a1a7217720de5b8200b02a4064a62bcae66bece022fdf462358c52c93d",
+      "function_byte_span": [
+        46559,
+        47073
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "676d099221104b8ad24cf652e6d2d66dbc9f6985cc1e731f798727e746cb36e1",
+      "function_lines": [
+        956,
+        971
+      ],
+      "hook_byte_span": [
+        46624,
+        46819
+      ],
+      "hook_sha256": "ba406b8833d492d0428d1c99c2bd302f7b2dc9b7abf1102932d36b6373b26fde",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-sd3",
+        "target": "mlx_gen_sd3",
+        "target_kind": "lib",
+        "fqn": "training::real_weight_repro::medium_training_smoke_round_trip",
+        "source": "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-wan/src/training.rs::decode_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_image",
+      "source": "crates/media/mlx-gen/mlx-gen-wan/src/training.rs",
+      "source_sha256": "343e484621d09ea0665f2a756f546b26228e226dbbd959ac8b99fc9368cab158",
+      "function_byte_span": [
+        75979,
+        76502
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "87a149ad85a835ffa30a718e1ef88b7a4ed6aca8a257b5b8e4cfd94059722529",
+      "function_lines": [
+        1648,
+        1663
+      ],
+      "hook_byte_span": [
+        76044,
+        76239
+      ],
+      "hook_sha256": "544c1cbd1623b02d619db144ace01ca3f983d0bb9af24ef93dde6f38f265e400",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-wan",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "trainer_e2e::wan_i2v_a14b_trainer_gradient_checkpointing",
+        "source": "crates/media/mlx-gen/mlx-gen-wan/tests/trainer_e2e.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-mage/src/training.rs::decode_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_image",
+      "source": "crates/media/mlx-gen/mlx-gen-mage/src/training.rs",
+      "source_sha256": "8797e0e3a147eff8ac116e5a2150bf58bbcbd35a69edafd321ab70f9b128ba97",
+      "function_byte_span": [
+        70621,
+        71145
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "2bd202ce5c41b8feb6fcb11e750dacfa323aceaa2cb5805c906dfaa91d46ba79",
+      "function_lines": [
+        1429,
+        1444
+      ],
+      "hook_byte_span": [
+        70686,
+        70882
+      ],
+      "hook_sha256": "31ca860a050c59ce8e91b64072d5325a765ff92479e111f8f50f4d5b19a479bb",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-mage",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "trainer_e2e::mage_lokr_trains_writes_adapter_and_reloads",
+        "source": "crates/media/mlx-gen/mlx-gen-mage/tests/trainer_e2e.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-sdxl/src/training/family.rs::decode_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_image",
+      "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/training/family.rs",
+      "source_sha256": "038e1749e5d382f4e1f48ebb3d94a6c034a53397f57d4c85d475e955af77d597",
+      "function_byte_span": [
+        30401,
+        30964
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "b3c06d6b980611051c8fba038c78aa72bb41ea5bbe22943a4e9f043cffb28e42",
+      "function_lines": [
+        695,
+        710
+      ],
+      "hook_byte_span": [
+        30482,
+        30685
+      ],
+      "hook_sha256": "3085ac0265f491a3cb6d50e8282055b85f95358d20eb6fe5feebe9ef54481401",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-sdxl",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "trainer_e2e::sdxl_resume_matches_uninterrupted",
+        "source": "crates/media/mlx-gen/mlx-gen-sdxl/tests/trainer_e2e.rs"
+      },
+      "additional_registered_identities": [
+        {
+          "package": "mlx-gen-kolors",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "trainer_e2e::kolors_trainer_trains_and_writes_lora_that_reloads",
+          "source": "crates/media/mlx-gen/mlx-gen-kolors/tests/trainer_e2e.rs"
+        }
+      ],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/contracts/gen-core/src/iris/restoration_train.rs::decode/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode",
+      "source": "crates/contracts/gen-core/src/iris/restoration_train.rs",
+      "source_sha256": "bb59dd6d55d38ff4ed63188889f357a3fb53da844cb6a049a33fd7d393000c86",
+      "function_byte_span": [
+        65777,
+        66294
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "575e0e8739ddafb7fdd3d74b50c514a7284d3e4192b6d8fc8714dd8aaff93939",
+      "function_lines": [
+        1607,
+        1626
+      ],
+      "hook_byte_span": [
+        65831,
+        66015
+      ],
+      "hook_sha256": "cde4c40311f3de0a3da0e1b0cfc11c49942774a3eb4b1a7061b5ae4f597b6c70",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "restoration_train_real_weights::real_restoration_trains_exports_and_restores",
+        "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/contracts/gen-core/src/iris/train/depth.rs::load_depth_sample/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "load_depth_sample",
+      "source": "crates/contracts/gen-core/src/iris/train/depth.rs",
+      "source_sha256": "c279285ba962435731e70342899c35a5a0e96dbf61a041fee723d4deb48dcd3c",
+      "function_byte_span": [
+        47282,
+        49230
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "cf82d5d2478c1a86ccb1c762d718ca30d709bbaf4dc5c0f1b21e1cca720a4ba0",
+      "function_lines": [
+        1150,
+        1207
+      ],
+      "hook_byte_span": [
+        47415,
+        47628
+      ],
+      "hook_sha256": "560dd46c85d9fdb086d802dca77cc7058e06e00f6d6ded52e443348140d2a96a",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "depth_train_lifecycle::overfit_export_and_load_in_the_estimator",
+        "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_lifecycle.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/contracts/gen-core/src/iris/train/shapes.rs::preprocess_file_to_shape/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "preprocess_file_to_shape",
+      "source": "crates/contracts/gen-core/src/iris/train/shapes.rs",
+      "source_sha256": "c4f088d3ca97be9840af858ecf2916b86e664825b465dee4d66060f54907fbd7",
+      "function_byte_span": [
+        12566,
+        13260
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "1fd103014ca1c140a2cc90b45f179c4785216b95524dbd585a782b04f6890d20",
+      "function_lines": [
+        362,
+        381
+      ],
+      "hook_byte_span": [
+        12694,
+        12891
+      ],
+      "hook_sha256": "df735d21732d3184402c01a0b2f32e4b57ef0a459db71a3d336304282aad5078",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "curricula_real_weights::real_stage_presets_resume_256_to_512_with_repa",
+        "source": "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-anima/tests/training.rs::velocity_mse/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "velocity_mse",
+      "source": "crates/media/mlx-gen/mlx-gen-anima/tests/training.rs",
+      "source_sha256": "40586c117c0ca9663f16286ea389e8ecfd80827bb083e7b91a10fe59999731db",
+      "function_byte_span": [
+        6923,
+        8614
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "6e6b3cc6255d17da7a6e6097178aa4ad53c27ed4a5f5629bbb3dcde83ea62e52",
+      "function_lines": [
+        167,
+        211
+      ],
+      "hook_byte_span": [
+        7026,
+        7354
+      ],
+      "hook_sha256": "54fcdd664fafa58492b53f8289404aea7c319fd55c2902a6c075016918fadf26",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-anima",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "training::train_lora_end_to_end",
+        "source": "crates/media/mlx-gen/mlx-gen-anima/tests/training.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs::rgb_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "rgb_image",
+      "source": "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs",
+      "source_sha256": "573b58219d763164b844e7f0bfc091ae6fb3357c1dec55595e0ce7e42d0ef2ca",
+      "function_byte_span": [
+        209860,
+        210301
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "03de79f2c3ac9af149946bfa797df0e70cdf67dbaecb1d6119496fb8b6caff2c",
+      "function_lines": [
+        4667,
+        4679
+      ],
+      "hook_byte_span": [
+        209915,
+        210147
+      ],
+      "hook_sha256": "f043b92c4e2b638bfc31d937fe4e5ab9d329fd92908c4c0d3d4df9f9cde2a8c8",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "candle-gen-qwen-image-2-1",
+        "target": "candle_gen_qwen_image_2_1",
+        "target_kind": "lib",
+        "fqn": "training::tests::edit_training_assembles_the_render_paths_joint_sequence",
+        "source": "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/training.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::edit_training_assembles_the_render_paths_joint_sequence/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "edit_training_assembles_the_render_paths_joint_sequence",
+      "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs",
+      "source_sha256": "43501123bccc67e569bbbb06d99c9a9794aa191f6820ae40c0eb087dee4e8e83",
+      "function_byte_span": [
+        162763,
+        168764
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "534eb143418fa4a33fbc3cc12b49a7b79b8714fcd3401196f9d4051193157115",
+      "function_lines": [
+        3708,
+        3847
+      ],
+      "hook_byte_span": [
+        164319,
+        164608
+      ],
+      "hook_sha256": "5223ed4ae44711da50ba71148acef9781499338d8c0b8c543ef81db719dacf0a",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-qwen-image-2-1",
+        "target": "mlx_gen_qwen_image_2_1",
+        "target_kind": "lib",
+        "fqn": "training::tests::edit_training_assembles_the_render_paths_joint_sequence",
+        "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "Local rgb closure inside the named function"
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_real_weights.rs::example/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "example",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_real_weights.rs",
+      "source_sha256": "fb4ee1660258dd8bc30cb0bd9209fbe72c53c87d7e91aaabd564f0016c6dc0ad",
+      "function_byte_span": [
+        2559,
+        4005
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "a28c2b3b61327c36e6b168d18bd82e3d3cd9c9ec44cbbd833da2059b175d0bb5",
+      "function_lines": [
+        57,
+        96
+      ],
+      "hook_byte_span": [
+        2735,
+        3005
+      ],
+      "hook_sha256": "83129b13df3b2f651db47367274958134e0f1c82023cf3a091df3958df316133",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "depth_train_real_weights::real_depth_full_finetune_trains_exports_and_estimates",
+        "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/tests/depth_real_weights.rs::decode_photo/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_photo",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_real_weights.rs",
+      "source_sha256": "ee0c6bab3492b50e5d393dcc15e5ec201cb67bb1f5413b2da605e3d65643d59e",
+      "function_byte_span": [
+        1506,
+        1986
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "63f0338f39e40b473a83875e5234039680d203a2c52ba6ed1ec691e24e65544e",
+      "function_lines": [
+        34,
+        49
+      ],
+      "hook_byte_span": [
+        1549,
+        1822
+      ],
+      "hook_sha256": "b04bfca2dec8d80cf0b2176a0a56134658819a1ab7fd47094ad94f2ab33170a3",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "depth_real_weights::real_depth_matches_the_upstream_reference",
+        "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_real_weights.rs::dataset/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "dataset",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_real_weights.rs",
+      "source_sha256": "669bbe5c62a87c326e9713c35c5016f962bbe90d636aeed706f2ef7c0bd7db39",
+      "function_byte_span": [
+        2199,
+        3518
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "3d3804010a45fb292342ef0fd237ec5ca45abf4595cf8781cb84c249e7def6dc",
+      "function_lines": [
+        41,
+        75
+      ],
+      "hook_byte_span": [
+        2358,
+        2626
+      ],
+      "hook_sha256": "1c0a247da8d3dbc1c86c0393c1c54189c54aa825e6e5f12794447dd6f8aab258",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "curricula_real_weights::real_stage_presets_resume_256_to_512_with_repa",
+        "source": "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_lifecycle.rs::rgb_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "rgb_image",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_lifecycle.rs",
+      "source_sha256": "ce20c2a90c358818c3ea3376d464065ce6fd5244c5420fd05fb9c37ecb3d570f",
+      "function_byte_span": [
+        17513,
+        18003
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "d1f5b55d111234b1d98f08d181475c2805b9ec4bba42ee860f16af15313d74e6",
+      "function_lines": [
+        459,
+        474
+      ],
+      "hook_byte_span": [
+        17572,
+        17863
+      ],
+      "hook_sha256": "d1bcdb258e0785c9ee12dc6c0667711e661d35639c413b1645def13a0cbfeaa2",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "depth_train_lifecycle::overfit_export_and_load_in_the_estimator",
+        "source": "crates/media/mlx-gen/mlx-gen-iris/tests/depth_train_lifecycle.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_real_weights.rs::dataset/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "dataset",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_real_weights.rs",
+      "source_sha256": "23f8ce9f1752c1bae279b2e2624c04df638ec118dc47431f9b56f00e89749fa6",
+      "function_byte_span": [
+        5409,
+        6486
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "8a0933110a6f6a0b6c4f18f0617f2b3b34d4f4b5ea9dc226ba7c923566e28805",
+      "function_lines": [
+        132,
+        164
+      ],
+      "hook_byte_span": [
+        5588,
+        5864
+      ],
+      "hook_sha256": "ec9e3dceef3272661aaca7ca2d1631ee9aa21c3d94131145fd94e91dd5e74085",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "restoration_train_real_weights::real_restoration_trains_exports_and_restores",
+        "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_real_weights.rs::restore_case/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "restore_case",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_real_weights.rs",
+      "source_sha256": "23f8ce9f1752c1bae279b2e2624c04df638ec118dc47431f9b56f00e89749fa6",
+      "function_byte_span": [
+        6654,
+        7582
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "d263e5c37bcf1cd28a027854dd5bd24b79144cc2b51e6b78916cbede8d5130a5",
+      "function_lines": [
+        168,
+        195
+      ],
+      "hook_byte_span": [
+        6718,
+        7214
+      ],
+      "hook_sha256": "68195e6f5bb588bc761f36c6b6d22bf1f05f33a195a2b71faa28a90ada44b9fb",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "restoration_train_real_weights::real_restoration_trains_exports_and_restores",
+        "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs::example/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "example",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs",
+      "source_sha256": "8f724f94ac5b4a434120ea61a2d87ac879e24754c5fc1c4cc5727e1bdc3ea921",
+      "function_byte_span": [
+        2779,
+        4262
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "edb789b71e55eb5b165df056fe61bd65d99c25f18a187653ab001b0717032d8a",
+      "function_lines": [
+        62,
+        102
+      ],
+      "hook_byte_span": [
+        2975,
+        3254
+      ],
+      "hook_sha256": "234f9aa01af06e2be34f1bb83dc5d8c170328115001e920d4728773ef2e2485e",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "candle-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "depth_train_real_weights::real_depth_full_finetune_trains_exports_and_estimates",
+        "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/candle-gen/candle-gen-iris/tests/depth_real_weights.rs::decode_photo/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_photo",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_real_weights.rs",
+      "source_sha256": "7b6f0695880c3861605a32378923ca4f4543484837a777d589dae19a0fb5113f",
+      "function_byte_span": [
+        1467,
+        2058
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "69a0da55069edb98371ad01d1a66e4e5dca03a9357cf6134121a17de1b8a852c",
+      "function_lines": [
+        30,
+        45
+      ],
+      "hook_byte_span": [
+        1628,
+        1904
+      ],
+      "hook_sha256": "f6f8652192fd79bd694e7cffcb08d084c60c2965621788ea87b127544fc05215",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "candle-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "depth_real_weights::real_depth_matches_the_upstream_reference",
+        "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/candle-gen/candle-gen-iris/tests/curricula_real_weights.rs::dataset/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "dataset",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/curricula_real_weights.rs",
+      "source_sha256": "570fb2384e84971216140ebd39f2df33cecfe9c2a300803f9f15b724e53a3fee",
+      "function_byte_span": [
+        2361,
+        3717
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "6479f41c5e22284133b317d7c3769ad9585b54afae2712d3b9e2e20ab64e0c66",
+      "function_lines": [
+        42,
+        77
+      ],
+      "hook_byte_span": [
+        2540,
+        2817
+      ],
+      "hook_sha256": "7dd368344452d89f700d6618fa9d03e8a0d9a30b3d25deeb6e26497cae124060",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "candle-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "curricula_real_weights::real_stage_presets_resume_256_to_512_with_repa",
+        "source": "crates/media/candle-gen/candle-gen-iris/tests/curricula_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/candle-gen/candle-gen-iris/tests/depth_train_lifecycle.rs::rgb_image/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "rgb_image",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_lifecycle.rs",
+      "source_sha256": "89db169d674244da3427110844a265f1524b2f0c487ee204070bbb163e768fa4",
+      "function_byte_span": [
+        10743,
+        11232
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "c5eb9c84b7b418a62bf7b34e6051e06b97b3f5b163886d73b661d0f4e6803292",
+      "function_lines": [
+        308,
+        321
+      ],
+      "hook_byte_span": [
+        10802,
+        11102
+      ],
+      "hook_sha256": "2a01b595e0e0a8d0ce3dbdf36f8cdb62792ce5e82dd840c8f4d1d8ce26744da3",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "candle-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "depth_train_lifecycle::overfit_export_and_load_in_the_estimator",
+        "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_lifecycle.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs::dataset/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "dataset",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs",
+      "source_sha256": "d7d19fd168224d15eb276ef9541e8c5cb96297e02504ebf84f7653616df08c32",
+      "function_byte_span": [
+        5174,
+        6260
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "08dd0ce157a497cd1ac6182c43b7b0e422bc2c4539edcc64f6cad5670aecbc34",
+      "function_lines": [
+        131,
+        163
+      ],
+      "hook_byte_span": [
+        5353,
+        5638
+      ],
+      "hook_sha256": "887c09a1d250cca1759a52ce4903fcd263028454a1f91f79a88388bb021d5611",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "candle-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "restoration_train_real_weights::real_restoration_trains_exports_and_restores",
+        "source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs::restore_case/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "restore_case",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs",
+      "source_sha256": "d7d19fd168224d15eb276ef9541e8c5cb96297e02504ebf84f7653616df08c32",
+      "function_byte_span": [
+        6428,
+        7365
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "b694554b885e48051d353fc67f05c963d1ec75c38397e1fdfba385e8bca188d1",
+      "function_lines": [
+        167,
+        194
+      ],
+      "hook_byte_span": [
+        6492,
+        6997
+      ],
+      "hook_sha256": "e8949b3019976ce52253b85720db12826d616cf6835f246ba7d7e5ad7afa25f1",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "candle-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "restoration_train_real_weights::real_restoration_trains_exports_and_restores",
+        "source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs::dataset/image::open": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "dataset",
+      "source": "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs",
+      "source_sha256": "6c2531c28e08afbbb95718e68d321c46c2867c62d6a095423bcc1e8b5dc491b5",
+      "function_byte_span": [
+        2484,
+        4466
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "bb6296ae25765da8326bb8e5e36a0149430f1f75eac95fc31f13ffab18c94147",
+      "function_lines": [
+        49,
+        98
+      ],
+      "hook_byte_span": [
+        2991,
+        3312
+      ],
+      "hook_sha256": "893b21fc05c0831916bf1394dacfd8f2f7acbe9be14ab511b76a5b59926d0945",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "candle-gen-iris",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "train_real_weights::real_lora_trains_exports_and_renders",
+        "source": "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs"
+      },
+      "additional_registered_identities": [],
+      "source_scope_note": "The named function performs this physical read"
+    },
+    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::edit_target_size/image::image_dimensions": {
+      "role": "reference",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::image_dimensions",
+      "function": "edit_target_size",
+      "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs",
+      "source_sha256": "43501123bccc67e569bbbb06d99c9a9794aa191f6820ae40c0eb087dee4e8e83",
+      "function_byte_span": [
+        60310,
+        61197
+      ],
+      "function_lines": [
+        1299,
+        1324
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "28ef18db8e3bd70be3bc4c5794712f973c7f9c26bb1d8e5b59589fc4e5271c76",
+      "hook_byte_span": [
+        60472,
+        60730
+      ],
+      "hook_sha256": "0af521ee7b5b883e97ff26c478c49db8badb5a1fdb3784944be9f1ab9e0a9e8a",
+      "registered_identity": {
+        "package": "mlx-gen-qwen-image-2-1",
+        "target": "mlx_gen_qwen_image_2_1",
+        "target_kind": "lib",
+        "fqn": "training::tests::edit_training_assembles_the_render_paths_joint_sequence",
+        "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs"
+      },
+      "claim_limit": "Successful dimensions/header read used for target geometry only; not full image decode, image-byte, checkpoint-byte, named-revision, or weights-integrity proof. Generated/external is DATA origin, never role or a hook inference."
+    },
+    "gen-core::model_input_proof::read_configuration_to_string": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "gen-core::weightsmeta::safetensors_file_metadata": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "function": "safetensors_file_metadata",
+      "source": "crates/contracts/gen-core/src/weightsmeta.rs",
+      "source_sha256": "fa3b9d1fc4d3c6049f1545fec9ead4e6bc6d70b97fa57166a65e399069dfd247",
+      "function_byte_span": [
+        9574,
+        11163
+      ],
+      "function_sha256": "c0a138cb492580ba4f0b316295f34e2fb2b598f3153eecfec8fc19b9595e6ca2",
+      "function_lines": [
+        211,
+        254
+      ],
+      "hook_byte_span": [
+        10972,
+        11161
+      ],
+      "hook_sha256": "b5411736bd4f4bceadb925a4ffb36841028b40078312863350134fdc89260707",
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "physical_read_site": "crates/contracts/gen-core/src/weightsmeta.rs::safetensors_file_metadata",
+      "read_kind": "header __metadata__ map",
+      "selector": null,
+      "claim_limit": "Source-bound case-execution binding only to successfully read+parsed header __metadata__ map. Not tensor payload consumption, full checkpoint/image byte integrity, named revision, or weights integrity; no content hash or new read.",
+      "alias_policy": "One actual file reader; wrappers and Chroma packed-bit consumers have no new alias observations. Master/fp16 index IDs share one physical read site and discriminate the actual source-fixed family argument."
+    },
+    "gen-core::weightsmeta::file_tensor_locations_impl": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "function": "file_tensor_locations_impl",
+      "source": "crates/contracts/gen-core/src/weightsmeta.rs",
+      "source_sha256": "fa3b9d1fc4d3c6049f1545fec9ead4e6bc6d70b97fa57166a65e399069dfd247",
+      "function_byte_span": [
+        26529,
+        33983
+      ],
+      "function_sha256": "e160a7431a3a1a9d97a982b7d9d66854912cb89c03385789e1a1f9d74abf00a6",
+      "function_lines": [
+        625,
+        817
+      ],
+      "hook_byte_span": [
+        33699,
+        33981
+      ],
+      "hook_sha256": "e441d248bd5e9f3cb8bc51045b24629e1e6b40dfcf15f4c85c5060075bb1b5c2",
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "physical_read_site": "crates/contracts/gen-core/src/weightsmeta.rs::file_tensor_locations_impl",
+      "read_kind": "safetensors tensor header locations, dtypes, shapes and offsets only",
+      "selector": null,
+      "claim_limit": "Source-bound case-execution binding only to successfully read+parsed safetensors tensor header locations, dtypes, shapes and offsets only. Not tensor payload consumption, full checkpoint/image byte integrity, named revision, or weights integrity; no content hash or new read.",
+      "alias_policy": "One actual file reader; wrappers and Chroma packed-bit consumers have no new alias observations. Master/fp16 index IDs share one physical read site and discriminate the actual source-fixed family argument."
+    },
+    "gen-core::sd3_encoder_artifacts::indexed_shard_names/master": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "function": "indexed_shard_names",
+      "source": "crates/contracts/gen-core/src/sd3_encoder_artifacts.rs",
+      "source_sha256": "14cd0fbaf174a220e4ee226e6e0a6700783c65c5e0a2c237602bbc2324672577",
+      "function_byte_span": [
+        7160,
+        10418
+      ],
+      "function_sha256": "dd9f59e9f752351897a5f12776e285368ede1668c2107dc1eaa16b3a83e2719b",
+      "function_lines": [
+        219,
+        302
+      ],
+      "hook_byte_span": [
+        9836,
+        10416
+      ],
+      "hook_sha256": "a88e14919347e37ab634c0a817a4f59b30ca7f25888351fcabf0cb79904211fd",
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "physical_read_site": "crates/contracts/gen-core/src/sd3_encoder_artifacts.rs::indexed_shard_names",
+      "read_kind": "T5 shard-index text/JSON plus original shard-family validation",
+      "selector": "master",
+      "claim_limit": "Source-bound case-execution binding only to successfully read+parsed T5 shard-index text/JSON plus original shard-family validation. Not tensor payload consumption, full checkpoint/image byte integrity, named revision, or weights integrity; no content hash or new read.",
+      "alias_policy": "One actual file reader; wrappers and Chroma packed-bit consumers have no new alias observations. Master/fp16 index IDs share one physical read site and discriminate the actual source-fixed family argument."
+    },
+    "gen-core::sd3_encoder_artifacts::indexed_shard_names/fp16": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "function": "indexed_shard_names",
+      "source": "crates/contracts/gen-core/src/sd3_encoder_artifacts.rs",
+      "source_sha256": "14cd0fbaf174a220e4ee226e6e0a6700783c65c5e0a2c237602bbc2324672577",
+      "function_byte_span": [
+        7160,
+        10418
+      ],
+      "function_sha256": "dd9f59e9f752351897a5f12776e285368ede1668c2107dc1eaa16b3a83e2719b",
+      "function_lines": [
+        219,
+        302
+      ],
+      "hook_byte_span": [
+        9836,
+        10416
+      ],
+      "hook_sha256": "a88e14919347e37ab634c0a817a4f59b30ca7f25888351fcabf0cb79904211fd",
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "physical_read_site": "crates/contracts/gen-core/src/sd3_encoder_artifacts.rs::indexed_shard_names",
+      "read_kind": "T5 shard-index text/JSON plus original shard-family validation",
+      "selector": "fp16",
+      "claim_limit": "Source-bound case-execution binding only to successfully read+parsed T5 shard-index text/JSON plus original shard-family validation. Not tensor payload consumption, full checkpoint/image byte integrity, named revision, or weights integrity; no content hash or new read.",
+      "alias_policy": "One actual file reader; wrappers and Chroma packed-bit consumers have no new alias observations. Master/fp16 index IDs share one physical read site and discriminate the actual source-fixed family argument."
+    },
+    "gen-core::LoadSpec::read_files_unchanged": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-flux2::Pipeline::load_klein_planned_dit/verified-weights": {
+      "role": "model-weights",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "gen-core::safetensors_shards::resolve_indexed_safetensors_shards/index-present-used": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "function": "resolve_indexed_safetensors_shards",
+      "selector": "index-present-used",
+      "source": "crates/contracts/gen-core/src/safetensors_shards.rs",
+      "source_sha256": "876e7e9ea3814021e90060eebed1d2067b71eac50afff5f1e23166b1f8beb69e",
+      "function_byte_span": [
+        3671,
+        6408
+      ],
+      "function_sha256": "a793e87a556a069522f931c9bda6d9414a8b290de4244d15a67a51846f32bede",
+      "function_lines": [
+        83,
+        157
+      ],
+      "hook_byte_span": [
+        6203,
+        6406
+      ],
+      "hook_sha256": "9a0aa672a761c03526184bba08ebffad32fcf108e8912f0e1ce9758743ef146d",
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "claim_limit": "Successful index text read, JSON/weight_map parse and original complete selected-path validation; no indexed observation for None/directory fallback. No selected-shard payload, checkpoint-byte, named revision or weights integrity. Records actual index_target read path, not an invented shard content claim."
+    },
+    "mlx-gen-minimax-h3::text_encoder::MiniMaxH3Tokenizer::from_snapshot/configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/text_encoder/tokenizer.rs",
+      "function": "MiniMaxH3Tokenizer::from_snapshot",
+      "selector": "tokenizer_config.json",
+      "source_sha256": "ffea013aa24801bf8d1eff304cf1de3e33b4120759ce78fed3eacbb23cf1d479",
+      "function_byte_span": [
+        8227,
+        9164
+      ],
+      "function_sha256": "2be565c11bf849554a5373da33701ebb434f51d25b20a9538804979977163920",
+      "function_lines": [
+        173,
+        193
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            8349,
+            8671
+          ],
+          "sha256": "2f7fc386fd1c56492f143e32b229d378889940502cb4ebfd7097514b10060cf0"
+        },
+        {
+          "byte_span": [
+            8877,
+            9158
+          ],
+          "sha256": "ab8ba1c74664fc6d827c9d9af9638741d8958cef765d3c52bb9845dfe05d2b1e"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "original config string read plus successful original tokenizer/config construction",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "mlx-gen-minimax-h3::text_encoder::MiniMaxH3Tokenizer::from_files/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/src/text_encoder/tokenizer.rs",
+      "function": "MiniMaxH3Tokenizer::from_files",
+      "selector": "tokenizer.json",
+      "source_sha256": "ffea013aa24801bf8d1eff304cf1de3e33b4120759ce78fed3eacbb23cf1d479",
+      "function_byte_span": [
+        9334,
+        11614
+      ],
+      "function_sha256": "e072c53130ba4702ffc96283a22181169f4448a937a0d67c49809db0f2bb68c4",
+      "function_lines": [
+        197,
+        249
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            9436,
+            9743
+          ],
+          "sha256": "467bd530cef133fa9f8e87efea33a79e48ec3f285e7170038d7a98e6b6c36aaf"
+        },
+        {
+          "byte_span": [
+            11358,
+            11608
+          ],
+          "sha256": "f833c4de14bfc6c60e1e286f6dc5f366dd30cab0aa6b6ba2ecbe1acdddca9736"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "direct tokenizers::Tokenizer::from_file plus original config/special-token construction",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::SafetensorsHeader::read/metadata/gemma_config": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "SafetensorsHeader::read",
+      "selector": "gemma_config",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        15782,
+        21060
+      ],
+      "function_sha256": "3818a87aecb24634fba63f999b7f54eec4a80cb0ffbd0d6618033fa27c2bde95",
+      "function_lines": [
+        372,
+        500
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            18735,
+            20979
+          ],
+          "sha256": "83ee9adc3c6720c1304931bac7eb92ce6a6d02fd27087bad9b483580db411c6f"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "parsed safetensors __metadata__ string; not weight data",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::SafetensorsHeader::read/metadata/tokenizer_config.json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "SafetensorsHeader::read",
+      "selector": "tokenizer_config.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        15782,
+        21060
+      ],
+      "function_sha256": "3818a87aecb24634fba63f999b7f54eec4a80cb0ffbd0d6618033fa27c2bde95",
+      "function_lines": [
+        372,
+        500
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            18735,
+            20979
+          ],
+          "sha256": "83ee9adc3c6720c1304931bac7eb92ce6a6d02fd27087bad9b483580db411c6f"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "parsed metadata fallback sidecar, only when its tensor asset is absent; not weight data",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::SafetensorsHeader::read/metadata/processor_config.json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "SafetensorsHeader::read",
+      "selector": "processor_config.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        15782,
+        21060
+      ],
+      "function_sha256": "3818a87aecb24634fba63f999b7f54eec4a80cb0ffbd0d6618033fa27c2bde95",
+      "function_lines": [
+        372,
+        500
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            18735,
+            20979
+          ],
+          "sha256": "83ee9adc3c6720c1304931bac7eb92ce6a6d02fd27087bad9b483580db411c6f"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "parsed metadata fallback sidecar, only when its tensor asset is absent; not weight data",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::SafetensorsHeader::read/metadata/chat_template.jinja": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "SafetensorsHeader::read",
+      "selector": "chat_template.jinja",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        15782,
+        21060
+      ],
+      "function_sha256": "3818a87aecb24634fba63f999b7f54eec4a80cb0ffbd0d6618033fa27c2bde95",
+      "function_lines": [
+        372,
+        500
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            18735,
+            20979
+          ],
+          "sha256": "83ee9adc3c6720c1304931bac7eb92ce6a6d02fd27087bad9b483580db411c6f"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "parsed metadata fallback sidecar, only when its tensor asset is absent; not weight data",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::SafetensorsHeader::read/metadata/generation_config.json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "SafetensorsHeader::read",
+      "selector": "generation_config.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        15782,
+        21060
+      ],
+      "function_sha256": "3818a87aecb24634fba63f999b7f54eec4a80cb0ffbd0d6618033fa27c2bde95",
+      "function_lines": [
+        372,
+        500
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            18735,
+            20979
+          ],
+          "sha256": "83ee9adc3c6720c1304931bac7eb92ce6a6d02fd27087bad9b483580db411c6f"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "parsed metadata fallback sidecar, only when its tensor asset is absent; not weight data",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::SafetensorsHeader::read_asset/tokenizer_json": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "SafetensorsHeader::read_asset",
+      "selector": "tokenizer_json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        21774,
+        27052
+      ],
+      "function_sha256": "6fc8bb1bb8cf3c14e982c1c1f6a41eda934c80a2c1c736c018672c7d373b1c2f",
+      "function_lines": [
+        514,
+        635
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            24996,
+            26856
+          ],
+          "sha256": "b95a0260e583b637920910beab4ee54d67fc39328e785836562054d3862096f0"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "successful validated seek/read of selected packed asset byte range; no weight payload read",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::SafetensorsHeader::read_asset/hf_asset__tokenizer_config.json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "SafetensorsHeader::read_asset",
+      "selector": "hf_asset__tokenizer_config.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        21774,
+        27052
+      ],
+      "function_sha256": "6fc8bb1bb8cf3c14e982c1c1f6a41eda934c80a2c1c736c018672c7d373b1c2f",
+      "function_lines": [
+        514,
+        635
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            24996,
+            26856
+          ],
+          "sha256": "b95a0260e583b637920910beab4ee54d67fc39328e785836562054d3862096f0"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "successful validated seek/read of selected packed asset byte range; no weight payload read",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::SafetensorsHeader::read_asset/hf_asset__processor_config.json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "SafetensorsHeader::read_asset",
+      "selector": "hf_asset__processor_config.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        21774,
+        27052
+      ],
+      "function_sha256": "6fc8bb1bb8cf3c14e982c1c1f6a41eda934c80a2c1c736c018672c7d373b1c2f",
+      "function_lines": [
+        514,
+        635
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            24996,
+            26856
+          ],
+          "sha256": "b95a0260e583b637920910beab4ee54d67fc39328e785836562054d3862096f0"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "successful validated seek/read of selected packed asset byte range; no weight payload read",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::SafetensorsHeader::read_asset/hf_asset__chat_template.jinja": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "SafetensorsHeader::read_asset",
+      "selector": "hf_asset__chat_template.jinja",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        21774,
+        27052
+      ],
+      "function_sha256": "6fc8bb1bb8cf3c14e982c1c1f6a41eda934c80a2c1c736c018672c7d373b1c2f",
+      "function_lines": [
+        514,
+        635
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            24996,
+            26856
+          ],
+          "sha256": "b95a0260e583b637920910beab4ee54d67fc39328e785836562054d3862096f0"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "successful validated seek/read of selected packed asset byte range; no weight payload read",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::SafetensorsHeader::read_asset/hf_asset__generation_config.json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "SafetensorsHeader::read_asset",
+      "selector": "hf_asset__generation_config.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        21774,
+        27052
+      ],
+      "function_sha256": "6fc8bb1bb8cf3c14e982c1c1f6a41eda934c80a2c1c736c018672c7d373b1c2f",
+      "function_lines": [
+        514,
+        635
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            24996,
+            26856
+          ],
+          "sha256": "b95a0260e583b637920910beab4ee54d67fc39328e785836562054d3862096f0"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "successful validated seek/read of selected packed asset byte range; no weight payload read",
+      "conditional_directory_branch": false,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::GemmaAssets::from_root/config.json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "GemmaAssets::from_root",
+      "selector": "config.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        7344,
+        11577
+      ],
+      "function_sha256": "8dd99b8df95c43982000abdb905d581c18c05edd10a4edb55bc55edefc0f38f0",
+      "function_lines": [
+        158,
+        251
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            8006,
+            8316
+          ],
+          "sha256": "5ca927b5ba8473cce2a4e5cd617684a3db04ea53c386c40130ae963d15347363"
+        },
+        {
+          "byte_span": [
+            8348,
+            8643
+          ],
+          "sha256": "ec4ebad8464419567a85dbe639d05bc2f026b38148f0e08b915ecaba0f13545a"
+        },
+        {
+          "byte_span": [
+            9278,
+            11341
+          ],
+          "sha256": "1a92c373f6820389069d27777d663d771892681b0d076dc0843302329df65cd2"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "legacy directory filesystem read_to_string",
+      "conditional_directory_branch": true,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::GemmaAssets::from_root/tokenizer.json": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "GemmaAssets::from_root",
+      "selector": "tokenizer.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        7344,
+        11577
+      ],
+      "function_sha256": "8dd99b8df95c43982000abdb905d581c18c05edd10a4edb55bc55edefc0f38f0",
+      "function_lines": [
+        158,
+        251
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            8006,
+            8316
+          ],
+          "sha256": "5ca927b5ba8473cce2a4e5cd617684a3db04ea53c386c40130ae963d15347363"
+        },
+        {
+          "byte_span": [
+            8348,
+            8643
+          ],
+          "sha256": "ec4ebad8464419567a85dbe639d05bc2f026b38148f0e08b915ecaba0f13545a"
+        },
+        {
+          "byte_span": [
+            9278,
+            11341
+          ],
+          "sha256": "1a92c373f6820389069d27777d663d771892681b0d076dc0843302329df65cd2"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "legacy directory filesystem read",
+      "conditional_directory_branch": true,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::GemmaAssets::from_root/sidecar/tokenizer_config.json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "GemmaAssets::from_root",
+      "selector": "tokenizer_config.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        7344,
+        11577
+      ],
+      "function_sha256": "8dd99b8df95c43982000abdb905d581c18c05edd10a4edb55bc55edefc0f38f0",
+      "function_lines": [
+        158,
+        251
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            8006,
+            8316
+          ],
+          "sha256": "5ca927b5ba8473cce2a4e5cd617684a3db04ea53c386c40130ae963d15347363"
+        },
+        {
+          "byte_span": [
+            8348,
+            8643
+          ],
+          "sha256": "ec4ebad8464419567a85dbe639d05bc2f026b38148f0e08b915ecaba0f13545a"
+        },
+        {
+          "byte_span": [
+            9278,
+            11341
+          ],
+          "sha256": "1a92c373f6820389069d27777d663d771892681b0d076dc0843302329df65cd2"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "legacy directory sidecar std::fs::read; known consumed key only",
+      "conditional_directory_branch": true,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::GemmaAssets::from_root/sidecar/processor_config.json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "GemmaAssets::from_root",
+      "selector": "processor_config.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        7344,
+        11577
+      ],
+      "function_sha256": "8dd99b8df95c43982000abdb905d581c18c05edd10a4edb55bc55edefc0f38f0",
+      "function_lines": [
+        158,
+        251
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            8006,
+            8316
+          ],
+          "sha256": "5ca927b5ba8473cce2a4e5cd617684a3db04ea53c386c40130ae963d15347363"
+        },
+        {
+          "byte_span": [
+            8348,
+            8643
+          ],
+          "sha256": "ec4ebad8464419567a85dbe639d05bc2f026b38148f0e08b915ecaba0f13545a"
+        },
+        {
+          "byte_span": [
+            9278,
+            11341
+          ],
+          "sha256": "1a92c373f6820389069d27777d663d771892681b0d076dc0843302329df65cd2"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "legacy directory sidecar std::fs::read; known consumed key only",
+      "conditional_directory_branch": true,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::GemmaAssets::from_root/sidecar/chat_template.jinja": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "GemmaAssets::from_root",
+      "selector": "chat_template.jinja",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        7344,
+        11577
+      ],
+      "function_sha256": "8dd99b8df95c43982000abdb905d581c18c05edd10a4edb55bc55edefc0f38f0",
+      "function_lines": [
+        158,
+        251
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            8006,
+            8316
+          ],
+          "sha256": "5ca927b5ba8473cce2a4e5cd617684a3db04ea53c386c40130ae963d15347363"
+        },
+        {
+          "byte_span": [
+            8348,
+            8643
+          ],
+          "sha256": "ec4ebad8464419567a85dbe639d05bc2f026b38148f0e08b915ecaba0f13545a"
+        },
+        {
+          "byte_span": [
+            9278,
+            11341
+          ],
+          "sha256": "1a92c373f6820389069d27777d663d771892681b0d076dc0843302329df65cd2"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "legacy directory sidecar std::fs::read; known consumed key only",
+      "conditional_directory_branch": true,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::gemma_assets::GemmaAssets::from_root/sidecar/generation_config.json": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "grade_ceiling": "reader-binding",
+      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "function": "GemmaAssets::from_root",
+      "selector": "generation_config.json",
+      "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
+      "function_byte_span": [
+        7344,
+        11577
+      ],
+      "function_sha256": "8dd99b8df95c43982000abdb905d581c18c05edd10a4edb55bc55edefc0f38f0",
+      "function_lines": [
+        158,
+        251
+      ],
+      "hook_boundaries": [
+        {
+          "byte_span": [
+            8006,
+            8316
+          ],
+          "sha256": "5ca927b5ba8473cce2a4e5cd617684a3db04ea53c386c40130ae963d15347363"
+        },
+        {
+          "byte_span": [
+            8348,
+            8643
+          ],
+          "sha256": "ec4ebad8464419567a85dbe639d05bc2f026b38148f0e08b915ecaba0f13545a"
+        },
+        {
+          "byte_span": [
+            9278,
+            11341
+          ],
+          "sha256": "1a92c373f6820389069d27777d663d771892681b0d076dc0843302329df65cd2"
+        }
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "read_kind": "legacy directory sidecar std::fs::read; known consumed key only",
+      "conditional_directory_branch": true,
+      "claim_limit": "Successful source-bound tokenizer/config reader binding only. No content/checkpoint byte, named revision or weights-integrity proof. Packed selectors distinguish actual metadata/asset key; no new read/hash/eval. Unknown collected sidecars remain unclaimed."
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#mlx-gen-wan::config::read_boundary_ratio": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "mlx-gen-wan::config::read_boundary_ratio",
+      "condition": "Only read_boundary_ratio caller vace_fun_from_model_dir; not a14b_vace T5-only nonconsumer; raw UTF-8 success only"
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#gen-core::ltx_checkpoint::declared_model_version": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "gen-core::ltx_checkpoint::declared_model_version",
+      "condition": "Only existing split manifest exists branch; absent manifest retains original safetensors/default resolution; raw UTF-8 success only"
+    },
+    "gen-core::model_input_proof::read_configuration_bytes": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "condition": "Raw successful byte read only; no parse-success claim, no UTF-8 conversion; caller-created configuration/index rewrite fixtures"
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#mlx-gen-mochi::config::MochiVaeConfig::from_model_dir": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "mlx-gen-mochi::config::MochiVaeConfig::from_model_dir",
+      "condition": "Required vae/config.json read; qualified by containing function, ONE shared physical UTF-8 producer, exclusive identity not base plus selector"
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#mlx-gen-mochi::config::MochiSplitModel::from_model_dir": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "mlx-gen-mochi::config::MochiSplitModel::from_model_dir",
+      "condition": "Conditional split_model.json read; missing manifest keeps dense default; qualified by containing function, ONE shared physical UTF-8 producer, exclusive identity not base plus selector"
+    },
+    "mlx-gen-qwen-image-2-1::conditioning_velocity_trajectory::read_vector#decode_rgb": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "decode_rgb",
+      "condition": "Source-fixed true only for final_cpu whose array reaches pipeline::decode_rgb; all metric-only reads false. Emit after original SHA, byte-length and finite-F32 validation, no extra hash/eval/read.",
+      "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/conditioning_velocity_trajectory.rs",
+      "source_sha256": "12d62f64a6e4a045fcd8e14429f26d930f56155a85b55be1e8d07282ef6b62ed",
+      "function": "read_vector",
+      "function_byte_span": [
+        1046,
+        2367
+      ],
+      "function_sha256": "b915cb9c6b200d949f0972d8834afa55c7c58242bd10042629b6ae6f407d2d79",
+      "function_lines": [
+        23,
+        58
+      ],
+      "hook_byte_span": [
+        1922,
+        2264
+      ],
+      "hook_sha256": "fbda2e783e8de431403dbaf3b38411e780bc3b9c30374a477151365ae8c7a63a",
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive"
+    },
+    "candle-gen-mage::text_encoder::MageTextEncoder::load_inner/tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ],
+      "condition": "Direct tokenizers::Tokenizer::from_file success after its original load/parse/validation; no delegation to gen-core TextTokenizer, no MLX identity alias."
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::pipeline::MagePipeline::load_components": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "candle-gen-mage::pipeline::MagePipeline::load_components",
+      "condition": "Original required selected transformer configuration read; raw successful UTF-8 reader binding only; caller parse/validation unchanged; distinct containing-function selector avoids required/conditional or branch identity collision"
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::pipeline::MagePipeline::load_heavy": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "candle-gen-mage::pipeline::MagePipeline::load_heavy",
+      "condition": "Original required selected transformer configuration read; raw successful UTF-8 reader binding only; caller parse/validation unchanged; distinct containing-function selector avoids required/conditional or branch identity collision"
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::edit_provider::MageEdit::load_components": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "candle-gen-mage::edit_provider::MageEdit::load_components",
+      "condition": "Original required selected transformer configuration read; raw successful UTF-8 reader binding only; caller parse/validation unchanged; distinct containing-function selector avoids required/conditional or branch identity collision"
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::training::MageTrainer::train_impl": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "candle-gen-mage::training::MageTrainer::train_impl",
+      "condition": "Original required selected transformer configuration read; raw successful UTF-8 reader binding only; caller parse/validation unchanged; distinct containing-function selector avoids required/conditional or branch identity collision"
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::training::packed_component": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "candle-gen-mage::training::packed_component",
+      "condition": "Optional packed-component metadata; NotFound returns false, successful read may return dense false; raw successful UTF-8 reader binding only; caller parse/validation unchanged; distinct containing-function selector avoids required/conditional or branch identity collision"
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#mlx-gen-krea::text_encoder::KreaTeConfig::from_snapshot/architecture": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "mlx-gen-krea::text_encoder::KreaTeConfig::from_snapshot/architecture",
+      "condition": "Required text_encoder/config.json architecture; original root.as_ref once, parser/required fields/errors unchanged. Raw successful UTF-8 reader binding only; no parse-success or content-integrity claim."
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#mlx-gen-krea::text_encoder::KreaTeConfig::from_snapshot/select_layers_manifest": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "mlx-gen-krea::text_encoder::KreaTeConfig::from_snapshot/select_layers_manifest",
+      "condition": "Conditional model_index.json original if-let read/parse/field/nonempty guards; missing/malformed/empty keeps existing layer defaults. This raw read receipt is NOT alternative evidence for required architecture. Raw successful UTF-8 reader binding only; no parse-success or content-integrity claim."
+    },
+    "gen-core::model_input_proof::read_configuration_to_string#mlx-gen-krea-realtime::config::KreaRealtimeConfig::from_model_dir": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "mlx-gen-krea-realtime::config::KreaRealtimeConfig::from_model_dir",
+      "condition": "Locally exists-guarded API default unchanged. Whole-case required in exactly three registered runtime/style cases: memory_strategy PACKED_FILES and BF16_FILES require CONFIG via required_direct_files; no obligation inferred for other callers. Raw successful UTF-8 reader binding only; no parse-success or content-integrity claim."
+    },
+    "mlx-gen::Weights::from_file#sensenova/runtime-base/merge-planned": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "sensenova/runtime-base/merge-planned",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_file#sensenova/runtime-base/no-runtime-merge": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "sensenova/runtime-base/no-runtime-merge",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_file#sensenova/runtime-distill": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "sensenova/runtime-distill",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_file#sensenova/converter-fast/distill": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "sensenova/converter-fast/distill",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_file#krea-realtime/rehost-source/delete-planned": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "krea-realtime/rehost-source/delete-planned",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_file#krea-realtime/rehost-source/retain-planned": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "krea-realtime/rehost-source/retain-planned",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_file#krea-realtime/rehost-shard-readback": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "krea-realtime/rehost-shard-readback",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_paths#sensenova/runtime-base/merge-planned": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "sensenova/runtime-base/merge-planned",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_paths#sensenova/runtime-base/no-runtime-merge": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "sensenova/runtime-base/no-runtime-merge",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_paths#sensenova/converter-ordinary/source": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "sensenova/converter-ordinary/source",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_paths#sensenova/converter-fast/source": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "sensenova/converter-fast/source",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_paths#krea-realtime/rehost-source/delete-planned": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "krea-realtime/rehost-source/delete-planned",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_paths#krea-realtime/rehost-source/retain-planned": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "krea-realtime/rehost-source/retain-planned",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_paths#krea-realtime/rehost-retained-output": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "krea-realtime/rehost-retained-output",
+      "condition": "Source-owned captured plan/purpose on the original successful physical reader. Scope entry emits none; base OR qualified only, not both. Lazy/header reader binding only; no payload-integrity/materialization/NN success claim."
+    },
+    "mlx-gen::Weights::from_file#minimax-h3/adapter-source": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ],
+      "selector": "minimax-h3/adapter-source",
+      "condition": "Actual configured H3 adapter file consumed in apply_minimax_h3_adapters; distinct from TE/vision ModelWeights file reads. Source-owned generic adapter purpose, not a case/FQN/recipe alias. Existing successful physical base OR qualified event only. Lazy/header reader binding; unchanged subsequent GPU verification/classification/folding must still succeed in real execution."
+    }
+  },
+  "ordered_record_source_facts_sha256": "888da778962d6902bcf54ab53b83436e5677abc22668902d3421a23b67506f44"
+}

@@ -201,6 +201,7 @@ fn max_abs_diff(a: &Array, b: &Array) -> f32 {
 /// lane narrowed row 0 out of a stack padded to `S_txt = max(s_pos, s_neg)` — a zero-padded positive
 /// with a zero-padded mask. The gated encode returns the positive un-padded. Both must produce the
 /// same conditional velocity, or the refactor would have changed CFG-off renders.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn padded_and_unpadded_cond_streams_agree() {
     let cfg = tiny_config();
@@ -239,6 +240,8 @@ fn padded_and_unpadded_cond_streams_agree() {
         diff < 1e-5,
         "the masked pad tail must be inert: cond-only vs narrowed-from-padded differ by {diff}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED cfg_gate_equivalence::padded_and_unpadded_cond_streams_agree");
 }
 
 // NOTE (deliberately not a test): the empty-negative case — the `lens_turbo` default at guidance 1.0

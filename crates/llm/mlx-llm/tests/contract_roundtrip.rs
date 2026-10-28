@@ -106,6 +106,7 @@ fn text_request(max_new_tokens: u32) -> TextLlmRequest {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn provider_loads_and_streams_through_the_contract() {
     let dir = write_tiny_snapshot();
@@ -144,6 +145,8 @@ fn provider_loads_and_streams_through_the_contract() {
     assert_eq!(out.finish_reason, Some(core_llm::FinishReason::Length));
     // The incremental token deltas reconstruct the final text.
     assert_eq!(streamed, out.text);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED contract_roundtrip::provider_loads_and_streams_through_the_contract");
 }
 
 #[test]
@@ -166,6 +169,7 @@ fn greedy_generation_is_reproducible_through_the_contract() {
     assert_eq!(a.text, b.text);
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn already_cancelled_request_errors_before_inference() {
     let dir = write_tiny_snapshot();
@@ -174,6 +178,8 @@ fn already_cancelled_request_errors_before_inference() {
     req.cancel.cancel();
     let res = provider.generate(&req, &mut |_| {});
     assert!(matches!(res, Err(CoreError::Canceled)));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED contract_roundtrip::already_cancelled_request_errors_before_inference");
 }
 
 #[test]

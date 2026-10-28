@@ -9,6 +9,8 @@
 //! `cargo test -p <crate> --test integration -- <name>::`.
 
 // --- shared modules (hand-maintained; preserved by regen) ---
+#[path = "common/model_inference_device.rs"]
+pub mod model_inference_device;
 // --- generated modules (do not edit) ---
 
 #[path = "detr_parity.rs"]

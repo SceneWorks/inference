@@ -34,10 +34,10 @@ impl SwiGlu {
     }
 
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let x1 = self.w1.forward(x)?;
-        let x2 = self.w2.forward(x)?;
+        let x1 = __model_proof_output!(self.w1.forward(x))?;
+        let x2 = __model_proof_output!(self.w2.forward(x))?;
         let hidden = (x1.silu()? * x2)?;
-        let hidden = self.ffn_ln.forward(&hidden)?;
-        self.w3.forward(&hidden)
+        let hidden = __model_proof_output!(self.ffn_ln.forward(&hidden))?;
+        __model_proof_output!(self.w3.forward(&hidden))
     }
 }

@@ -167,4 +167,8 @@ fn lens_turbo_pid_decode_vs_vae() {
         pid_img.width,
         pid_dt / vae_dt.max(1e-3)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::lens_turbo_pid_decode_vs_vae"
+    );
 }

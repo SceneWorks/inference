@@ -141,4 +141,6 @@ fn svd_pipeline_matches_diffusers() {
     // and stays tight — confirming the chunked-decode + scaling wiring is exact.
     assert!(l_l2 < 6e-2, "denoise rel-L2 {l_l2} (max|Δ| {l_abs})");
     assert!(f_l2 < 5e-3, "decode rel-L2 {f_l2} (max|Δ| {f_abs})");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline_parity::svd_pipeline_matches_diffusers");
 }

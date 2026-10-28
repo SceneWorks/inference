@@ -281,6 +281,7 @@ dependencies = [
  "candle-nn",
  "cmudict-fast",
  "core-llm",
+ "flate2",
  "misaki-rs",
  "rand",
  "rand_distr",
@@ -453,6 +454,7 @@ dependencies = [
  "candle-metal-kernels",
  "candle-ug",
  "cudarc 0.19.8",
+ "flate2",
  "float8",
  "gemm 0.19.0",
  "half",
@@ -466,6 +468,7 @@ dependencies = [
  "rand_distr",
  "rayon",
  "safetensors 0.7.0",
+ "sha2",
  "thiserror 2.0.18",
  "tokenizers 0.22.2",
  "yoke 0.8.3",
@@ -575,6 +578,7 @@ dependencies = [
  "candle-gen-face",
  "candle-gen-flux",
  "candle-gen-flux2",
+ "candle-gen-flux3",
  "candle-gen-ideogram",
  "candle-gen-instantid",
  "candle-gen-iris",
@@ -586,6 +590,7 @@ dependencies = [
  "candle-gen-mage",
  "candle-gen-minimax-h3",
  "candle-gen-mochi",
+ "candle-gen-moss-image",
  "candle-gen-pid",
  "candle-gen-pulid",
  "candle-gen-qwen-image",
@@ -597,6 +602,7 @@ dependencies = [
  "candle-gen-sdxl",
  "candle-gen-seedvr2",
  "candle-gen-sensenova",
+ "candle-gen-supra2",
  "candle-gen-svd",
  "candle-gen-wan",
  "candle-gen-z-image",
@@ -698,6 +704,22 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-flux3"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-llm",
+ "candle-quant-kernels",
+ "image",
+ "rand",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -885,6 +907,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-moss-image"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-flux2",
+ "candle-llm",
+ "image",
+ "rand",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "candle-gen-perceptual"
 version = "0.0.0"
 dependencies = [
@@ -1068,6 +1106,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-supra2"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-sdxl",
+ "candle-transformers",
+ "image",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1286,6 +1336,12 @@ checksum = "2c9f73004e928ed46c3e7fd7406d2b12c8674153295f08af084b49860276dc02"
 dependencies = [
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 
 [[package]]
 name = "compact_str"
@@ -1694,6 +1750,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "fax"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caf1079563223d5d59d83c85886a56e586cfd5c1a26292e971a0fa266531ac5a"
+
+[[package]]
 name = "fdeflate"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2040,6 +2102,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "color_quant",
+ "weezl",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2105,11 +2177,25 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
+ "image-webp",
  "moxcms",
  "num-traits",
  "png",
+ "tiff",
  "zune-core",
  "zune-jpeg",
+]
+
+[[package]]
+name = "image-webp"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
+dependencies = [
+ "byteorder-lite",
+ "quick-error",
 ]
 
 [[package]]
@@ -2120,6 +2206,23 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "ios-smoke"
+version = "0.0.0"
+dependencies = [
+ "core-llm-testkit",
+ "image",
+ "libc",
+ "mlx-gen",
+ "mlx-gen-sana",
+ "mlx-gen-z-image",
+ "pmetal-mlx-rs",
+ "runtime-ios",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2357,12 +2460,12 @@ dependencies = [
  "pmetal-mlx-sys",
  "safetensors 0.4.5",
  "sceneworks-gen-core",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
- "zip",
 ]
 
 [[package]]
@@ -2433,6 +2536,7 @@ dependencies = [
  "mlx-gen-face",
  "mlx-gen-flux",
  "mlx-gen-flux2",
+ "mlx-gen-flux3",
  "mlx-gen-ideogram",
  "mlx-gen-instantid",
  "mlx-gen-iris",
@@ -2445,6 +2549,7 @@ dependencies = [
  "mlx-gen-mage",
  "mlx-gen-minimax-h3",
  "mlx-gen-mochi",
+ "mlx-gen-moss-image",
  "mlx-gen-pid",
  "mlx-gen-pulid",
  "mlx-gen-qwen-image",
@@ -2457,6 +2562,7 @@ dependencies = [
  "mlx-gen-sdxl",
  "mlx-gen-seedvr2",
  "mlx-gen-sensenova",
+ "mlx-gen-supra2",
  "mlx-gen-svd",
  "mlx-gen-wan",
  "mlx-gen-z-image",
@@ -2542,6 +2648,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-flux3"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "safetensors 0.4.5",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "mlx-gen-ideogram"
 version = "0.0.0"
 dependencies = [
@@ -2581,11 +2702,13 @@ dependencies = [
  "mlx-gen-sdxl",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "toml_edit",
 ]
 
 [[package]]
@@ -2599,6 +2722,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "sceneworks-gen-core-testkit",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -2738,6 +2862,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-moss-image"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-flux2",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "mlx-gen-perceptual"
 version = "0.0.0"
 dependencies = [
@@ -2828,7 +2967,9 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "sceneworks-gen-core-testkit",
+ "serde",
  "sha2",
  "tempfile",
 ]
@@ -2873,8 +3014,10 @@ dependencies = [
  "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "regex",
  "sceneworks-gen-core-testkit",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -2902,6 +3045,19 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-supra2"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-flux",
+ "mlx-gen-sdxl",
+ "pmetal-mlx-rs",
+ "serde_json",
  "tempfile",
 ]
 
@@ -2944,6 +3100,7 @@ dependencies = [
  "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "safetensors 0.4.5",
  "sceneworks-gen-core-testkit",
  "serde_json",
@@ -2954,7 +3111,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=355e2ae4e81c13032233a4244e956bc3547f49e4#355e2ae4e81c13032233a4244e956bc3547f49e4"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2995,7 +3152,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=355e2ae4e81c13032233a4244e956bc3547f49e4#355e2ae4e81c13032233a4244e956bc3547f49e4"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -3303,7 +3460,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=355e2ae4e81c13032233a4244e956bc3547f49e4#355e2ae4e81c13032233a4244e956bc3547f49e4"
 dependencies = [
  "dyn-clone",
  "half",
@@ -3326,7 +3483,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=355e2ae4e81c13032233a4244e956bc3547f49e4#355e2ae4e81c13032233a4244e956bc3547f49e4"
 dependencies = [
  "bindgen",
  "cc",
@@ -3426,6 +3583,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "quick-error"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quote"
@@ -3539,8 +3702,6 @@ dependencies = [
 [[package]]
 name = "regex"
 version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a0e75113e14dc5acb068cd0786884f214f1312650a3d36d269f5c4f3cdee8a2"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -3551,8 +3712,6 @@ dependencies = [
 [[package]]
 name = "regex-automata"
 version = "0.4.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f388202e4b80542a0921078cc23b6333bcf1409c1e3f86404cae4766a6131db"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -3562,8 +3721,6 @@ dependencies = [
 [[package]]
 name = "regex-syntax"
 version = "0.8.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "runtime-catalog"
@@ -3696,20 +3853,25 @@ dependencies = [
  "image",
  "libc",
  "safetensors 0.4.5",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "windows-sys",
+ "zip",
 ]
 
 [[package]]
 name = "sceneworks-gen-core-testkit"
 version = "0.1.0"
 dependencies = [
+ "image",
  "sceneworks-gen-core",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -3951,6 +4113,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tiff"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63feaf3343d35b6ca4d50483f94843803b0f51634937cc2ec519fc32232bc52"
+dependencies = [
+ "fax",
+ "flate2",
+ "half",
+ "quick-error",
+ "weezl",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4223,6 +4399,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "weezl"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
+
+[[package]]
 name = "which"
 version = "7.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4396,6 +4578,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a954114b47a54df49f83d2722814e86b23d4bb1b54a1b90fb7d92b41619ddc22"
 dependencies = [
  "crc32fast",
+ "flate2",
  "indexmap",
  "memchr",
  "nix",

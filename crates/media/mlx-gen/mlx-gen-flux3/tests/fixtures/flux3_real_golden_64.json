@@ -1,0 +1,13 @@
+{
+  "upstream_commit": "45e57c9fb06f9751cdced29a65c5d2171003be05",
+  "package_revision": "8454017f9ebaada30c998fccd9f67a80c7580f68",
+  "prompt": "a red fox sitting in fresh snow at golden hour, soft light, photograph",
+  "size": 64,
+  "steps": 16,
+  "alpha": 6.93,
+  "torch": "2.14.1+cpu",
+  "transformers": "5.20.0",
+  "text_seconds": "4.3",
+  "dit_bf16_distance": "2.516911e-02",
+  "e2e_bf16_distance": "2.474492e-02"
+}

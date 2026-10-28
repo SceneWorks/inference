@@ -1,0 +1,2294 @@
+{
+  "format": "moss-edit-lora",
+  "format_version": 1,
+  "metadata": {
+    "attention_backend": "fa4-varlen-mask_mod",
+    "dit_quantization": "none",
+    "edit_contract": "ref-prefix-only-t0__target-text-original-moss-v1",
+    "model_config": {
+      "dim": 3072,
+      "ffn_dim": 8192,
+      "freq_dim": 256,
+      "latent_channels": 128,
+      "num_heads": 24,
+      "num_layers": 42,
+      "rope_base": 10000.0,
+      "text_dim": 4096
+    },
+    "snapshot_dir": "/data/comfyui/models/huggingface/OpenMOSS-Team/MOSS-Image-SFT",
+    "text_quantization": "quanto_int8"
+  },
+  "modules": {
+    "layers.0.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.0.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.0.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.0.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.0.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.0.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.1.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.1.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.1.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.1.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.1.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.1.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.10.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.10.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.10.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.10.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.10.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.10.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.11.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.11.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.11.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.11.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.11.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.11.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.12.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.12.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.12.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.12.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.12.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.12.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.13.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.13.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.13.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.13.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.13.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.13.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.14.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.14.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.14.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.14.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.14.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.14.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.15.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.15.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.15.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.15.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.15.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.15.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.16.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.16.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.16.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.16.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.16.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.16.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.17.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.17.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.17.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.17.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.17.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.17.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.18.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.18.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.18.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.18.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.18.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.18.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.19.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.19.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.19.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.19.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.19.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.19.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.2.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.2.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.2.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.2.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.2.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.2.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.20.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.20.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.20.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.20.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.20.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.20.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.21.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.21.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.21.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.21.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.21.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.21.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.22.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.22.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.22.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.22.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.22.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.22.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.23.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.23.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.23.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.23.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.23.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.23.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.24.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.24.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.24.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.24.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.24.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.24.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.25.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.25.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.25.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.25.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.25.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.25.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.26.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.26.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.26.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.26.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.26.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.26.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.27.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.27.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.27.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.27.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.27.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.27.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.28.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.28.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.28.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.28.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.28.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.28.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.29.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.29.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.29.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.29.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.29.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.29.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.3.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.3.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.3.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.3.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.3.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.3.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.30.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.30.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.30.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.30.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.30.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.30.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.31.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.31.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.31.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.31.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.31.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.31.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.32.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.32.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.32.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.32.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.32.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.32.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.33.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.33.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.33.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.33.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.33.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.33.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.34.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.34.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.34.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.34.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.34.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.34.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.35.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.35.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.35.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.35.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.35.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.35.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.36.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.36.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.36.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.36.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.36.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.36.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.37.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.37.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.37.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.37.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.37.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.37.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.38.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.38.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.38.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.38.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.38.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.38.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.39.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.39.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.39.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.39.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.39.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.39.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.4.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.4.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.4.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.4.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.4.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.4.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.40.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.40.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.40.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.40.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.40.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.40.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.41.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.41.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.41.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.41.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.41.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.41.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.5.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.5.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.5.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.5.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.5.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.5.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.6.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.6.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.6.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.6.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.6.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.6.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.7.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.7.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.7.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.7.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.7.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.7.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.8.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.8.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.8.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.8.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.8.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.8.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.9.proj.ffn_down": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 8192,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.9.proj.ffn_up_gate": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 16384,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.9.proj.k": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.9.proj.o": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.9.proj.q": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    },
+    "layers.9.proj.v": {
+      "alpha": 64.0,
+      "dropout": 0.0,
+      "in_features": 3072,
+      "out_features": 3072,
+      "param_dtype": "bfloat16",
+      "rank": 64
+    }
+  },
+  "targets": [
+    "layers.0.proj.ffn_down",
+    "layers.0.proj.ffn_up_gate",
+    "layers.0.proj.k",
+    "layers.0.proj.o",
+    "layers.0.proj.q",
+    "layers.0.proj.v",
+    "layers.1.proj.ffn_down",
+    "layers.1.proj.ffn_up_gate",
+    "layers.1.proj.k",
+    "layers.1.proj.o",
+    "layers.1.proj.q",
+    "layers.1.proj.v",
+    "layers.10.proj.ffn_down",
+    "layers.10.proj.ffn_up_gate",
+    "layers.10.proj.k",
+    "layers.10.proj.o",
+    "layers.10.proj.q",
+    "layers.10.proj.v",
+    "layers.11.proj.ffn_down",
+    "layers.11.proj.ffn_up_gate",
+    "layers.11.proj.k",
+    "layers.11.proj.o",
+    "layers.11.proj.q",
+    "layers.11.proj.v",
+    "layers.12.proj.ffn_down",
+    "layers.12.proj.ffn_up_gate",
+    "layers.12.proj.k",
+    "layers.12.proj.o",
+    "layers.12.proj.q",
+    "layers.12.proj.v",
+    "layers.13.proj.ffn_down",
+    "layers.13.proj.ffn_up_gate",
+    "layers.13.proj.k",
+    "layers.13.proj.o",
+    "layers.13.proj.q",
+    "layers.13.proj.v",
+    "layers.14.proj.ffn_down",
+    "layers.14.proj.ffn_up_gate",
+    "layers.14.proj.k",
+    "layers.14.proj.o",
+    "layers.14.proj.q",
+    "layers.14.proj.v",
+    "layers.15.proj.ffn_down",
+    "layers.15.proj.ffn_up_gate",
+    "layers.15.proj.k",
+    "layers.15.proj.o",
+    "layers.15.proj.q",
+    "layers.15.proj.v",
+    "layers.16.proj.ffn_down",
+    "layers.16.proj.ffn_up_gate",
+    "layers.16.proj.k",
+    "layers.16.proj.o",
+    "layers.16.proj.q",
+    "layers.16.proj.v",
+    "layers.17.proj.ffn_down",
+    "layers.17.proj.ffn_up_gate",
+    "layers.17.proj.k",
+    "layers.17.proj.o",
+    "layers.17.proj.q",
+    "layers.17.proj.v",
+    "layers.18.proj.ffn_down",
+    "layers.18.proj.ffn_up_gate",
+    "layers.18.proj.k",
+    "layers.18.proj.o",
+    "layers.18.proj.q",
+    "layers.18.proj.v",
+    "layers.19.proj.ffn_down",
+    "layers.19.proj.ffn_up_gate",
+    "layers.19.proj.k",
+    "layers.19.proj.o",
+    "layers.19.proj.q",
+    "layers.19.proj.v",
+    "layers.2.proj.ffn_down",
+    "layers.2.proj.ffn_up_gate",
+    "layers.2.proj.k",
+    "layers.2.proj.o",
+    "layers.2.proj.q",
+    "layers.2.proj.v",
+    "layers.20.proj.ffn_down",
+    "layers.20.proj.ffn_up_gate",
+    "layers.20.proj.k",
+    "layers.20.proj.o",
+    "layers.20.proj.q",
+    "layers.20.proj.v",
+    "layers.21.proj.ffn_down",
+    "layers.21.proj.ffn_up_gate",
+    "layers.21.proj.k",
+    "layers.21.proj.o",
+    "layers.21.proj.q",
+    "layers.21.proj.v",
+    "layers.22.proj.ffn_down",
+    "layers.22.proj.ffn_up_gate",
+    "layers.22.proj.k",
+    "layers.22.proj.o",
+    "layers.22.proj.q",
+    "layers.22.proj.v",
+    "layers.23.proj.ffn_down",
+    "layers.23.proj.ffn_up_gate",
+    "layers.23.proj.k",
+    "layers.23.proj.o",
+    "layers.23.proj.q",
+    "layers.23.proj.v",
+    "layers.24.proj.ffn_down",
+    "layers.24.proj.ffn_up_gate",
+    "layers.24.proj.k",
+    "layers.24.proj.o",
+    "layers.24.proj.q",
+    "layers.24.proj.v",
+    "layers.25.proj.ffn_down",
+    "layers.25.proj.ffn_up_gate",
+    "layers.25.proj.k",
+    "layers.25.proj.o",
+    "layers.25.proj.q",
+    "layers.25.proj.v",
+    "layers.26.proj.ffn_down",
+    "layers.26.proj.ffn_up_gate",
+    "layers.26.proj.k",
+    "layers.26.proj.o",
+    "layers.26.proj.q",
+    "layers.26.proj.v",
+    "layers.27.proj.ffn_down",
+    "layers.27.proj.ffn_up_gate",
+    "layers.27.proj.k",
+    "layers.27.proj.o",
+    "layers.27.proj.q",
+    "layers.27.proj.v",
+    "layers.28.proj.ffn_down",
+    "layers.28.proj.ffn_up_gate",
+    "layers.28.proj.k",
+    "layers.28.proj.o",
+    "layers.28.proj.q",
+    "layers.28.proj.v",
+    "layers.29.proj.ffn_down",
+    "layers.29.proj.ffn_up_gate",
+    "layers.29.proj.k",
+    "layers.29.proj.o",
+    "layers.29.proj.q",
+    "layers.29.proj.v",
+    "layers.3.proj.ffn_down",
+    "layers.3.proj.ffn_up_gate",
+    "layers.3.proj.k",
+    "layers.3.proj.o",
+    "layers.3.proj.q",
+    "layers.3.proj.v",
+    "layers.30.proj.ffn_down",
+    "layers.30.proj.ffn_up_gate",
+    "layers.30.proj.k",
+    "layers.30.proj.o",
+    "layers.30.proj.q",
+    "layers.30.proj.v",
+    "layers.31.proj.ffn_down",
+    "layers.31.proj.ffn_up_gate",
+    "layers.31.proj.k",
+    "layers.31.proj.o",
+    "layers.31.proj.q",
+    "layers.31.proj.v",
+    "layers.32.proj.ffn_down",
+    "layers.32.proj.ffn_up_gate",
+    "layers.32.proj.k",
+    "layers.32.proj.o",
+    "layers.32.proj.q",
+    "layers.32.proj.v",
+    "layers.33.proj.ffn_down",
+    "layers.33.proj.ffn_up_gate",
+    "layers.33.proj.k",
+    "layers.33.proj.o",
+    "layers.33.proj.q",
+    "layers.33.proj.v",
+    "layers.34.proj.ffn_down",
+    "layers.34.proj.ffn_up_gate",
+    "layers.34.proj.k",
+    "layers.34.proj.o",
+    "layers.34.proj.q",
+    "layers.34.proj.v",
+    "layers.35.proj.ffn_down",
+    "layers.35.proj.ffn_up_gate",
+    "layers.35.proj.k",
+    "layers.35.proj.o",
+    "layers.35.proj.q",
+    "layers.35.proj.v",
+    "layers.36.proj.ffn_down",
+    "layers.36.proj.ffn_up_gate",
+    "layers.36.proj.k",
+    "layers.36.proj.o",
+    "layers.36.proj.q",
+    "layers.36.proj.v",
+    "layers.37.proj.ffn_down",
+    "layers.37.proj.ffn_up_gate",
+    "layers.37.proj.k",
+    "layers.37.proj.o",
+    "layers.37.proj.q",
+    "layers.37.proj.v",
+    "layers.38.proj.ffn_down",
+    "layers.38.proj.ffn_up_gate",
+    "layers.38.proj.k",
+    "layers.38.proj.o",
+    "layers.38.proj.q",
+    "layers.38.proj.v",
+    "layers.39.proj.ffn_down",
+    "layers.39.proj.ffn_up_gate",
+    "layers.39.proj.k",
+    "layers.39.proj.o",
+    "layers.39.proj.q",
+    "layers.39.proj.v",
+    "layers.4.proj.ffn_down",
+    "layers.4.proj.ffn_up_gate",
+    "layers.4.proj.k",
+    "layers.4.proj.o",
+    "layers.4.proj.q",
+    "layers.4.proj.v",
+    "layers.40.proj.ffn_down",
+    "layers.40.proj.ffn_up_gate",
+    "layers.40.proj.k",
+    "layers.40.proj.o",
+    "layers.40.proj.q",
+    "layers.40.proj.v",
+    "layers.41.proj.ffn_down",
+    "layers.41.proj.ffn_up_gate",
+    "layers.41.proj.k",
+    "layers.41.proj.o",
+    "layers.41.proj.q",
+    "layers.41.proj.v",
+    "layers.5.proj.ffn_down",
+    "layers.5.proj.ffn_up_gate",
+    "layers.5.proj.k",
+    "layers.5.proj.o",
+    "layers.5.proj.q",
+    "layers.5.proj.v",
+    "layers.6.proj.ffn_down",
+    "layers.6.proj.ffn_up_gate",
+    "layers.6.proj.k",
+    "layers.6.proj.o",
+    "layers.6.proj.q",
+    "layers.6.proj.v",
+    "layers.7.proj.ffn_down",
+    "layers.7.proj.ffn_up_gate",
+    "layers.7.proj.k",
+    "layers.7.proj.o",
+    "layers.7.proj.q",
+    "layers.7.proj.v",
+    "layers.8.proj.ffn_down",
+    "layers.8.proj.ffn_up_gate",
+    "layers.8.proj.k",
+    "layers.8.proj.o",
+    "layers.8.proj.q",
+    "layers.8.proj.v",
+    "layers.9.proj.ffn_down",
+    "layers.9.proj.ffn_up_gate",
+    "layers.9.proj.k",
+    "layers.9.proj.o",
+    "layers.9.proj.q",
+    "layers.9.proj.v"
+  ],
+  "weights_sha256": "17a48b8c605dcffdedb92a2b887d18cf316505be90802717669fb6556098dcdf"
+}

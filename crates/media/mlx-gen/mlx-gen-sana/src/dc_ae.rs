@@ -34,6 +34,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::{BlockType, DcAeConfig};
+use crate::quantum::labels;
 
 const F32: Dtype = Dtype::Float32;
 
@@ -379,6 +380,59 @@ impl Block {
             Block::Evit { attn, conv_out } => conv_out.forward(&attn.forward(x)?),
         }
     }
+
+    fn run_quantum(&self, x: &Array, cancel: &CancelFlag, encode: bool) -> Result<Array> {
+        if crate::quantum::retired_lifecycle()? {
+            if let Block::Evit { attn, conv_out } = self {
+                let (b, h, w, c) = nhwc(x);
+                let attention_label = if encode {
+                    labels::ENCODER_ATTENTION
+                } else {
+                    labels::DECODER_ATTENTION
+                };
+                let glu_label = if encode {
+                    labels::ENCODER_GLU
+                } else {
+                    labels::DECODER_GLU
+                };
+                let attended = quantum(
+                    cancel,
+                    attention_label,
+                    crate::quantum::dcae_attention_bytes(b, h, w, c, attn.projs.len() as u64),
+                    || attn.forward(x),
+                )?;
+                // The stage still owns its OLD feature until run_quantum returns
+                // and its assignment replaces it. The attended result is a
+                // distinct owner; successful retirement erases neither one.
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    "sana",
+                    "native-dcae-glu",
+                    &[
+                        ("schema", 1),
+                        ("encode", u64::from(encode)),
+                        ("original_elements", x.size() as u64),
+                        ("attended_elements", attended.size() as u64),
+                        ("batch", b),
+                        ("height", h),
+                        ("width", w),
+                        ("channels", c),
+                    ],
+                );
+                return quantum(
+                    cancel,
+                    glu_label,
+                    crate::quantum::dcae_glu_bytes(b, h, w, c),
+                    || conv_out.forward(&attended),
+                );
+            }
+        }
+        let label = if encode {
+            labels::ENCODER_BLOCK
+        } else {
+            labels::DECODER_BLOCK
+        };
+        quantum(cancel, label, self.quantum_bytes(x), || self.forward(x))
+    }
 }
 
 /// `DCUpBlock2d` (interpolate path): `nearest-upsample → conv`, + `repeat_interleave → pixel_shuffle`
@@ -541,12 +595,30 @@ impl DcAeDecoder {
         latent_nchw: &Array,
         cancel: &CancelFlag,
     ) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let latent = latent_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let (b, lh, lw, lc) = nhwc(&latent);
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sana",
+            "native-decoder",
+            &[
+                ("schema", 1),
+                ("batch", b),
+                ("height", lh),
+                ("width", lw),
+                ("channels", lc),
+                ("stages", self.stages.len() as u64),
+                ("tail_stages", self.num_tail_stages() as u64),
+                ("input_width", self.conv_in.w.shape()[0] as u64),
+                (
+                    "dtype",
+                    mlx_gen::sampler::sampling_dtype_code(latent.dtype()),
+                ),
+            ],
+        );
         let mut h = quantum(
             cancel,
-            "DC-AE head input",
+            labels::DECODER_INPUT,
             crate::quantum::dcae_decoder_input_bytes(
                 b,
                 lh,
@@ -574,7 +646,7 @@ impl DcAeDecoder {
 
     /// [`Self::decode_tail`], checking `cancel` before each bounded quantum.
     pub fn decode_tail_cancellable(&self, head_nhwc: &Array, cancel: &CancelFlag) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let mut h = head_nhwc.clone();
         let tail = self.num_tail_stages();
         for stage in self.stages[..tail].iter().rev() {
@@ -583,7 +655,7 @@ impl DcAeDecoder {
         let (b, hh, hw, c) = nhwc(&h);
         quantum(
             cancel,
-            "DC-AE output",
+            labels::DECODER_OUTPUT,
             crate::quantum::dcae_decoder_output_bytes(
                 b,
                 hh,
@@ -614,14 +686,15 @@ impl Stage {
     fn run_decoder(&self, x: &Array, cancel: &CancelFlag) -> Result<Array> {
         let mut h = x.clone();
         if let Some(up) = &self.upsample {
-            h = quantum(cancel, "DC-AE upsample", up.quantum_bytes(&h), || {
-                up.forward(&h)
-            })?;
+            h = quantum(
+                cancel,
+                labels::DECODER_UPSAMPLE,
+                up.quantum_bytes(&h),
+                || up.forward(&h),
+            )?;
         }
         for block in &self.blocks {
-            h = quantum(cancel, "DC-AE block", block.quantum_bytes(&h), || {
-                block.forward(&h)
-            })?;
+            h = block.run_quantum(&h, cancel, false)?;
         }
         Ok(h)
     }
@@ -769,7 +842,7 @@ impl DcAeEncoder {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let x = image_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let h = self.encode_prefix(&x, cancel)?;
         self.encode_rest(&h, cancel)
@@ -817,9 +890,24 @@ impl DcAeEncoder {
     /// each. NHWC f32 in; NHWC prefix features out.
     fn encode_prefix(&self, x: &Array, cancel: &CancelFlag) -> Result<Array> {
         let (b, xh, xw, xc) = nhwc(x);
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sana",
+            "native-encoder",
+            &[
+                ("schema", 1),
+                ("batch", b),
+                ("height", xh),
+                ("width", xw),
+                ("channels", xc),
+                ("stages", self.stages.len() as u64),
+                ("prefix_stages", self.num_prefix_stages() as u64),
+                ("input_width", self.conv_in.w.shape()[0] as u64),
+                ("dtype", mlx_gen::sampler::sampling_dtype_code(x.dtype())),
+            ],
+        );
         let mut h = quantum(
             cancel,
-            "DC-AE encoder input",
+            labels::ENCODER_INPUT,
             crate::quantum::dcae_encoder_input_bytes(
                 b,
                 xh,
@@ -845,7 +933,7 @@ impl DcAeEncoder {
         // out_shortcut: conv_out(h) + mean_group(h → latent_channels).
         quantum(
             cancel,
-            "DC-AE encoder output",
+            labels::ENCODER_OUTPUT,
             crate::quantum::dcae_encoder_output_bytes(
                 b,
                 hh,
@@ -891,7 +979,7 @@ impl DcAeEncoder {
         if self.num_prefix_stages() == 0 || (height <= core && width <= core) {
             return self.encode(image_nchw, cancel);
         }
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let halo = self.prefix_halo();
         let x = image_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let starts = |extent: i32| (0..extent).step_by(core as usize).collect::<Vec<i32>>();
@@ -930,7 +1018,7 @@ impl DcAeEncoder {
         let (b, _, _, c) = nhwc(&rows[0][0]);
         let stitched = quantum(
             cancel,
-            "DC-AE encode tile stitch",
+            labels::ENCODER_STITCH,
             crate::quantum::dcae_encode_stitch_bytes(
                 b,
                 (height / cell) as u64,
@@ -958,14 +1046,15 @@ impl EncStage {
     fn run_encoder(&self, x: &Array, cancel: &CancelFlag) -> Result<Array> {
         let mut h = x.clone();
         for block in &self.blocks {
-            h = quantum(cancel, "DC-AE block", block.quantum_bytes(&h), || {
-                block.forward(&h)
-            })?;
+            h = block.run_quantum(&h, cancel, true)?;
         }
         if let Some(down) = &self.downsample {
-            h = quantum(cancel, "DC-AE downsample", down.quantum_bytes(&h), || {
-                down.forward(&h)
-            })?;
+            h = quantum(
+                cancel,
+                labels::ENCODER_DOWNSAMPLE,
+                down.quantum_bytes(&h),
+                || down.forward(&h),
+            )?;
         }
         Ok(h)
     }
@@ -1107,6 +1196,11 @@ pub(crate) mod quantum_proofs {
     }
 
     pub(crate) fn weights(cfg: &DcAeConfig) -> Weights {
+        Weights::from_map(weight_map(cfg))
+    }
+
+    /// [`weights`]' tensors by name (to write a fixture snapshot).
+    pub(crate) fn weight_map(cfg: &DcAeConfig) -> HashMap<String, Array> {
         let mut w = W(HashMap::new(), 4000);
         let n = cfg.num_stages();
         let ch = &cfg.block_out_channels;
@@ -1149,7 +1243,7 @@ pub(crate) mod quantum_proofs {
         w.affine("decoder.norm_out", ch[0]);
         w.conv("decoder.conv_out", cfg.in_channels, ch[0], 3, true);
         w.conv("encoder.conv_out", cfg.latent_channels, ch[n - 1], 3, true);
-        Weights::from_map(w.0)
+        w.0
     }
 
     fn rand(shape: &[i32], seed: u64) -> Array {
@@ -1175,6 +1269,7 @@ pub(crate) mod quantum_proofs {
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
     fn dcae_quanta_track_their_measured_peaks() {
         const CHILD: &str = "SANA_DCAE_QUANTUM_PROOF_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -1182,9 +1277,12 @@ pub(crate) mod quantum_proofs {
                 .args([
                     "--exact",
                     "dc_ae::quantum_proofs::dcae_quanta_track_their_measured_peaks",
+                    "--include-ignored",
                     "--nocapture",
+                    "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -1270,6 +1368,9 @@ pub(crate) mod quantum_proofs {
         for (label, formula, measured) in proofs {
             assert_tracks_measured(&label, formula, measured, MAX_RATIO);
         }
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED dc_ae::quantum_proofs::dcae_quanta_track_their_measured_peaks");
+        }
     }
 
     fn max_abs(a: &Array, b: &Array) -> f32 {
@@ -1287,12 +1388,13 @@ pub(crate) mod quantum_proofs {
     /// diverges observably. The stitch quantum's counted scratch is proven against its measured
     /// peak.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn tiled_encode_matches_the_whole_image_encode_and_prices_its_stitch() {
         const CHILD: &str = "SANA_TILED_ENCODE_CPU_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "--exact",
+                    "--include-ignored", "--exact",
                     "dc_ae::quantum_proofs::tiled_encode_matches_the_whole_image_encode_and_prices_its_stitch",
                     "--nocapture",
                 ])
@@ -1365,6 +1467,34 @@ pub(crate) mod quantum_proofs {
             "the halo-free control must diverge: {seam}"
         );
 
+        // The stalled stitch allocation measurement is an individually selected capture below.
+
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::quantum_proofs::tiled_encode_matches_the_whole_image_encode_and_prices_its_stitch");
+    }
+
+    #[test]
+    #[ignore = "expensive stalled fixture capture; run through the selected iOS capture workflow"]
+    fn encode_stitch_tracks_its_measured_peak() {
+        const CHILD: &str = "SANA_ENCODE_STITCH_PROOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "dc_ae::quantum_proofs::encode_stitch_tracks_its_measured_peak",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        assert!(crate::test_metal_guard::metal_forbidden());
         // Stitch proof over a 3x3 grid of materialized 48x40x32 crops (the tiles' prefix outputs are
         // materialized by their own quanta before the stitch; shapes large enough that the
         // allocator's 16 KiB page rounding is negligible).
@@ -1382,5 +1512,8 @@ pub(crate) mod quantum_proofs {
             formula as f64 / measured as f64
         );
         assert_tracks_measured("DC-AE encode stitch", formula, measured, MAX_RATIO);
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED dc_ae::quantum_proofs::encode_stitch_tracks_its_measured_peak");
+        }
     }
 }

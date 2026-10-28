@@ -28,6 +28,7 @@ image = { workspace = true, optional = true }
 mlx-gen-perceptual = { path = "../mlx-gen-perceptual", optional = true }
 
 [features]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-perceptual?/model-inference-proof"]
 # The LoRA/LoKr trainers (`training`) and their training-only deps. Default-on, so every existing
 # consumer is unchanged; an inference-only graph (the iOS bundle reaches this crate through
 # `mlx-gen-qwen-image`) depends with `default-features = false` and compiles no trainer (sc-26265).

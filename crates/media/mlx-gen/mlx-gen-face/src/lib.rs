@@ -37,3 +37,6 @@ pub use bisenet::{face_features_image, to_parse_input, BiSeNet};
 pub use face::{detector_blob, Face, FaceAnalysis};
 pub use iresnet::ArcFace;
 pub use scrfd::{Detection, Scrfd};
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

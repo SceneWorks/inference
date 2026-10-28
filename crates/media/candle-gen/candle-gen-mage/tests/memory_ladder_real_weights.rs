@@ -166,6 +166,8 @@ fn representative_route_exercises_advertised_rung() {
         eprintln!(
             "MAGE_MEMORY_UNAVAILABLE strategy={strategy:?} support=Missing reason=dense_runtime_quantized_snapshot_has_no_device_format_block_sidecars"
         );
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-mage/tests/memory_ladder_real_weights.rs:169 (representative_route_exercises_advertised_rung): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     }
     assert_eq!(
@@ -268,7 +270,15 @@ fn representative_route_exercises_advertised_rung() {
     if strategy != MemoryStrategy::Resident {
         let reference_path = std::env::var("MAGE_MEMORY_REFERENCE")
             .expect("set MAGE_MEMORY_REFERENCE for optimized rungs");
-        let reference = std::fs::read(&reference_path)
+        let reference = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&reference_path),
+"crates/media/candle-gen/candle-gen-mage/tests/memory_ladder_real_weights.rs::representative_route_exercises_advertised_rung::std::fs::read@11609",
+TensorInput,
+&reference_path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
             .unwrap_or_else(|error| panic!("read MAGE_MEMORY_REFERENCE={reference_path}: {error}"));
         assert_eq!(reference.len(), pixels.len(), "resident cohort shape");
         for (index, case) in EVIDENCE_CASES.iter().enumerate() {
@@ -300,7 +310,15 @@ fn representative_route_exercises_advertised_rung() {
     if strategy == MemoryStrategy::BoundedTransformerResidency {
         let attention_path = std::env::var("MAGE_MEMORY_ATTENTION_REFERENCE")
             .expect("set MAGE_MEMORY_ATTENTION_REFERENCE for block-streaming isolation");
-        let attention = std::fs::read(&attention_path).unwrap_or_else(|error| {
+        let attention = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&attention_path),
+"crates/media/candle-gen/candle-gen-mage/tests/memory_ladder_real_weights.rs::representative_route_exercises_advertised_rung::std::fs::read@13436",
+TensorInput,
+&attention_path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap_or_else(|error| {
             panic!("read MAGE_MEMORY_ATTENTION_REFERENCE={attention_path}: {error}")
         });
         assert_eq!(attention.len(), pixels.len(), "attention cohort shape");
@@ -327,4 +345,7 @@ fn representative_route_exercises_advertised_rung() {
         contract.engaged_composition(strategy),
         candle_gen::testkit::probe_gpu(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::representative_route_exercises_advertised_rung");
 }

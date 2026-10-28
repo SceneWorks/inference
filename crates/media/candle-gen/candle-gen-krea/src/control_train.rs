@@ -513,6 +513,7 @@ mod tests {
     /// visited at each bucket `repeats` times per epoch), refuses a sample count that is not a whole
     /// number of items, and `step` trains across samples encoded at DIFFERENT latent sizes.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn control_trainer_walks_item_major_buckets() {
         let mut rng = StdRng::seed_from_u64(2127);
         let out = tempfile::tempdir().unwrap();
@@ -550,12 +551,16 @@ mod tests {
                 rep.step
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control_train::tests::control_trainer_walks_item_major_buckets");
     }
 
     /// The trainer's optimizer loop lowers the loss on a fixed held-out probe point — the library twin
     /// of `control::tests::backward_reaches_branch_and_descends`, exercising `ControlTrainer::run`
     /// end-to-end (both optimizer groups, accumulation, clip, checkpoint) on the tiny DiT.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn control_trainer_descends() {
         let dev = Device::Cpu;
         // Draw the ENTIRE fixture — base DiT weights, branch nudge, probe batch, control latent —
@@ -638,5 +643,8 @@ mod tests {
             "run must emit a final checkpoint event whose file exists"
         );
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control_train::tests::control_trainer_descends");
     }
 }

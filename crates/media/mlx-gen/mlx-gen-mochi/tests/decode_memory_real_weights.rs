@@ -186,6 +186,8 @@ fn decode_peak_is_flat_in_clip_length() {
         hi / lo < 1.35,
         "chunked decode peak must be ~flat in clip length (8.6× more frames), got {lo:.2}..{hi:.2} GiB"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED decode_memory_real_weights::decode_peak_is_flat_in_clip_length");
 }
 
 /// The chunk knob's memory/time tradeoff — the evidence behind [`DEFAULT_DECODE_CHUNK_FRAMES`].
@@ -211,6 +213,10 @@ fn decode_peak_vs_chunk_size() {
     println!(
         "max safe chunk @{W}×{H}: {}",
         dec.max_safe_chunk_frames(H / 8, W / 8)
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED decode_memory_real_weights::decode_peak_vs_chunk_size"
     );
 }
 
@@ -255,6 +261,8 @@ fn chunked_matches_untiled_on_real_weights() {
         }
         clear_cache();
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED decode_memory_real_weights::chunked_matches_untiled_on_real_weights");
 }
 
 /// **sc-12748 — THE PAYOFF: the untiled decode is now correct PAST the element ceiling on MLX 0.32.0.**
@@ -319,4 +327,6 @@ fn untiled_matches_chunked_past_the_bound() {
          reference by {d:.3e} — the >i32::MAX path is NOT correct. (bf16 tolerance; the f32 path is \
          bit-exact — see chunked_matches_untiled_on_real_weights.)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED decode_memory_real_weights::untiled_matches_chunked_past_the_bound");
 }

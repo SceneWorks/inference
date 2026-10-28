@@ -134,6 +134,7 @@ fn max_abs(a: &Array, b: &Array) -> f32 {
 }
 
 /// The forward produces the documented shape, and every layer plus the final norm participates.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn forward_segment_returns_the_post_final_norm_state() {
     let cfg = tiny();
@@ -199,10 +200,13 @@ fn forward_segment_returns_the_post_final_norm_state() {
         vs_penultimate > 1e-3,
         "the last decoder layer is a no-op on this fixture ({vs_penultimate:e})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder_forward::forward_segment_returns_the_post_final_norm_state");
 }
 
 /// A packed two-prompt forward reproduces each prompt's independent encode **bit for bit**: the
 /// segments cannot see each other, and position ids restart at 0 per segment.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn packed_segments_are_isolated_from_each_other() {
     let te = encoder(&tiny());
@@ -242,10 +246,13 @@ fn packed_segments_are_isolated_from_each_other() {
         0.0,
         "segment order changed a segment's own encode"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder_forward::packed_segments_are_isolated_from_each_other");
 }
 
 /// Attention is causal: appending tokens must not change the states already computed for the
 /// prefix. A bidirectional mask would fail this, and no shape check would notice.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn attention_is_causal_within_a_segment() {
     let te = encoder(&tiny());
@@ -260,6 +267,10 @@ fn attention_is_causal_within_a_segment() {
         0.0,
         "extending the sequence changed the prefix — attention is not causal"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED text_encoder_forward::attention_is_causal_within_a_segment"
+    );
 }
 
 /// The M-RoPE positions really reach the forward: running the **same embeddings** under two
@@ -272,6 +283,7 @@ fn attention_is_causal_within_a_segment() {
 /// is `Σᵢ wᵢ·v` = `v` regardless of the weights, and the rows are mathematically identical. Such a
 /// test measures float rounding, which is exactly what it did — it passed on one machine and was
 /// bit-identical (and so failed) on another.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn position_affects_the_encoded_state() {
     let cfg = tiny();
@@ -303,6 +315,10 @@ fn position_affects_the_encoded_state() {
         max_abs(&a, &te.forward_embeds(&hidden, &sequential).unwrap()),
         0.0,
         "the forward is not deterministic, so the comparison above proves nothing"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED text_encoder_forward::position_affects_the_encoded_state"
     );
 }
 
@@ -387,6 +403,7 @@ fn micro_run(w: &Weights) -> Array {
 /// **The arithmetic gate.** The whole composition — embedding, GQA + `repeat_kv`, QK-RMSNorm before
 /// RoPE, interleaved M-RoPE, causal SDPA, `o_proj`, SwiGLU, both residuals and the final RMSNorm —
 /// must reproduce `transformers.Qwen3VLTextModel` element-for-element.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn micro_forward_matches_the_torch_oracle() {
     let w = micro_weights();
@@ -402,6 +419,8 @@ fn micro_forward_matches_the_torch_oracle() {
         d < MICRO_TOL,
         "the forward diverges from transformers.Qwen3VLTextModel by rel {d:e} (> {MICRO_TOL:e})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder_forward::micro_forward_matches_the_torch_oracle");
 }
 
 /// …and the gate genuinely discriminates. Both mutations are pure weight permutations between
@@ -412,6 +431,7 @@ fn micro_forward_matches_the_torch_oracle() {
 ///   differ only because `silu` is non-linear, so a port that swapped them would be entirely
 ///   shape-correct and silently wrong.
 /// * `q_norm` ↔ `k_norm` — the per-head QK-RMSNorm assignment.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_micro_oracle_rejects_composition_swaps() {
     let w = micro_weights();
@@ -445,6 +465,8 @@ fn the_micro_oracle_rejects_composition_swaps() {
             "{label} still matches the torch oracle ({moved:e}) — the gate does not discriminate"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder_forward::the_micro_oracle_rejects_composition_swaps");
 }
 
 /// A malformed or empty pack is an error, never a silently shorter conditioning.

@@ -353,7 +353,7 @@ impl PrismPackedWeight {
         let output = if flat.device().is_cuda() {
             #[cfg(feature = "cuda")]
             {
-                self.cuda_matmul(&flat)?
+                __model_proof_output!(self.cuda_matmul(&flat))?
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -362,7 +362,7 @@ impl PrismPackedWeight {
                 ));
             }
         } else if flat.device().is_cpu() {
-            self.cpu_matmul(&flat)?
+            __model_proof_output!(self.cpu_matmul(&flat))?
         } else {
             return Err(Error::Unsupported(
                 "Prism packed weights currently support CPU and CUDA devices".into(),
@@ -391,7 +391,7 @@ impl PrismPackedWeight {
         let decoded = if ids.device().is_cuda() {
             #[cfg(feature = "cuda")]
             {
-                self.cuda_embedding(ids)?
+                __model_proof_output!(self.cuda_embedding(ids))?
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -400,7 +400,7 @@ impl PrismPackedWeight {
                 ));
             }
         } else if ids.device().is_cpu() {
-            self.cpu_embedding(ids)?
+            __model_proof_output!(self.cpu_embedding(ids))?
         } else {
             return Err(Error::Unsupported(
                 "Prism packed embeddings currently support CPU and CUDA devices".into(),
@@ -1256,32 +1256,34 @@ mod cuda {
     pub(super) fn matmul(weight: &PrismPackedWeight, x: &Tensor) -> Result<Tensor> {
         let tokens = x.dim(0)?;
         match &weight.storage {
-            PackedStorage::MlxAffine2 { words, scales, .. } => Ok(x.apply_op3_no_bwd(
-                words
-                    .as_ref()
-                    .ok_or_else(|| Error::Config("missing Prism CUDA codes".into()))?,
-                scales
-                    .as_ref()
-                    .ok_or_else(|| Error::Config("missing Prism CUDA scales".into()))?,
-                &MlxMatmul {
-                    tokens,
-                    rows: weight.rows,
-                    width: weight.input_width,
-                    map: weight.row_map,
-                },
-            )?),
-            PackedStorage::Gguf { kind, bytes, .. } => Ok(x.apply_op2_no_bwd(
-                bytes
-                    .as_ref()
-                    .ok_or_else(|| Error::Config("missing Prism CUDA bytes".into()))?,
-                &GgufMatmul {
-                    kind: *kind,
-                    tokens,
-                    rows: weight.rows,
-                    width: weight.input_width,
-                    map: weight.row_map,
-                },
-            )?),
+            PackedStorage::MlxAffine2 { words, scales, .. } => Ok(__model_proof_output!(x
+                .apply_op3_no_bwd(
+                    words
+                        .as_ref()
+                        .ok_or_else(|| Error::Config("missing Prism CUDA codes".into()))?,
+                    scales
+                        .as_ref()
+                        .ok_or_else(|| Error::Config("missing Prism CUDA scales".into()))?,
+                    &MlxMatmul {
+                        tokens,
+                        rows: weight.rows,
+                        width: weight.input_width,
+                        map: weight.row_map,
+                    },
+                ))?),
+            PackedStorage::Gguf { kind, bytes, .. } => Ok(__model_proof_output!(x
+                .apply_op2_no_bwd(
+                    bytes
+                        .as_ref()
+                        .ok_or_else(|| Error::Config("missing Prism CUDA bytes".into()))?,
+                    &GgufMatmul {
+                        kind: *kind,
+                        tokens,
+                        rows: weight.rows,
+                        width: weight.input_width,
+                        map: weight.row_map,
+                    },
+                ))?),
         }
     }
 
@@ -1289,30 +1291,32 @@ mod cuda {
         let ids = ids.to_dtype(DType::I64)?.contiguous()?;
         let count = ids.elem_count();
         match &weight.storage {
-            PackedStorage::MlxAffine2 { words, scales, .. } => Ok(ids.apply_op3_no_bwd(
-                words
-                    .as_ref()
-                    .ok_or_else(|| Error::Config("missing Prism CUDA codes".into()))?,
-                scales
-                    .as_ref()
-                    .ok_or_else(|| Error::Config("missing Prism CUDA scales".into()))?,
-                &MlxEmbedding {
-                    count,
-                    rows: weight.rows,
-                    width: weight.input_width,
-                },
-            )?),
-            PackedStorage::Gguf { kind, bytes, .. } => Ok(ids.apply_op2_no_bwd(
-                bytes
-                    .as_ref()
-                    .ok_or_else(|| Error::Config("missing Prism CUDA bytes".into()))?,
-                &GgufEmbedding {
-                    kind: *kind,
-                    count,
-                    rows: weight.rows,
-                    width: weight.input_width,
-                },
-            )?),
+            PackedStorage::MlxAffine2 { words, scales, .. } => Ok(__model_proof_output!(ids
+                .apply_op3_no_bwd(
+                    words
+                        .as_ref()
+                        .ok_or_else(|| Error::Config("missing Prism CUDA codes".into()))?,
+                    scales
+                        .as_ref()
+                        .ok_or_else(|| Error::Config("missing Prism CUDA scales".into()))?,
+                    &MlxEmbedding {
+                        count,
+                        rows: weight.rows,
+                        width: weight.input_width,
+                    },
+                ))?),
+            PackedStorage::Gguf { kind, bytes, .. } => Ok(__model_proof_output!(ids
+                .apply_op2_no_bwd(
+                    bytes
+                        .as_ref()
+                        .ok_or_else(|| Error::Config("missing Prism CUDA bytes".into()))?,
+                    &GgufEmbedding {
+                        kind: *kind,
+                        count,
+                        rows: weight.rows,
+                        width: weight.input_width,
+                    },
+                ))?),
         }
     }
 }
@@ -1370,6 +1374,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn mlx_affine2_matches_dense_reference_without_expansion() {
         let codes = (0..128).map(|i| (i % 3) as u8).collect::<Vec<_>>();
         let weight = mlx_weight("plain.weight", &codes, PrismTransformRole::None);
@@ -1385,9 +1390,13 @@ mod tests {
             .to_vec2::<f32>()
             .unwrap()[0][0];
         assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::prism::tests::mlx_affine2_matches_dense_reference_without_expansion");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn pq2_and_ptq1_match_decoded_dense_rows() {
         for kind in [PrismPackedKind::Pq2_0, PrismPackedKind::Ptq1_0] {
             let mut bytes = vec![0u8; kind.block_bytes()];
@@ -1433,9 +1442,13 @@ mod tests {
                 "{kind:?}: {actual} != {expected}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::prism::tests::pq2_and_ptq1_match_decoded_dense_rows");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn optional_ungrouped_gdn_reorder_precedes_sign_and_hadamard() {
         let name = "model.layers.0.linear_attn.ssm_out.weight";
         let codes = (0..128)
@@ -1479,6 +1492,9 @@ mod tests {
             .to_vec2::<f32>()
             .unwrap()[0][0];
         assert!((actual - expected).abs() < 2e-3, "{actual} != {expected}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::prism::tests::optional_ungrouped_gdn_reorder_precedes_sign_and_hadamard");
     }
 
     /// sc-24444: the device-tensor rotation (the CUDA path) multiplies by a sign vector and
@@ -1551,6 +1567,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn published_grouped_ssm_out_does_not_permute_activation() {
         let name = "model.layers.0.linear_attn.ssm_out.weight";
         let codes = (0..128)
@@ -1588,9 +1605,13 @@ mod tests {
             .to_vec2::<f32>()
             .unwrap()[0][0];
         assert!((actual - expected).abs() < 2e-3, "{actual} != {expected}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::prism::tests::published_grouped_ssm_out_does_not_permute_activation");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn inverse_embedding_applies_hadamard_before_signs() {
         let name = "model.embed_tokens.weight";
         let codes = (0..128)
@@ -1618,6 +1639,9 @@ mod tests {
                 "lane {i}: {actual} != {expected}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::prism::tests::inverse_embedding_applies_hadamard_before_signs");
     }
 
     #[test]
@@ -1677,6 +1701,7 @@ mod tests {
     /// fused-primitive tally recording which ran.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_fused_rotation_is_bit_identical_to_the_op_chain() {
         let device = crate::device::new_cuda_for_test()
             .expect("CUDA is required for the fused rotation fixture");
@@ -1808,6 +1833,9 @@ mod tests {
             weight.forward(&x).unwrap()
         };
         assert_eq!(bits(&fused), bits(&chain), "Prism forward, fused vs chain");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::prism::tests::the_fused_rotation_is_bit_identical_to_the_op_chain");
     }
 
     /// sc-24440 review: the fused rotation's affine factor is the one the op chain multiplies by
@@ -1921,6 +1949,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cuda_packed_operator_oracles_compile_and_execute_nvrtc() {
         fn rotate(mut values: Vec<f32>, signs: &[i8], inverse: bool) -> Vec<f32> {
             if !inverse {
@@ -2168,6 +2197,9 @@ mod tests {
             ];
             assert_close(&actual, &expected);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::prism::tests::cuda_packed_operator_oracles_compile_and_execute_nvrtc");
     }
 
     /// sc-24164 parity: the PTQ select chain that replaced the `pow3` table decodes exactly the
@@ -2178,6 +2210,7 @@ mod tests {
     /// reference is the kernel's own formula evaluated on the host.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cuda_gguf_decode_is_bit_exact_for_every_packed_byte() {
         const POW3: [u32; 5] = [1, 3, 9, 27, 81];
         let device = crate::device::new_cuda_for_test().expect("cuda device");
@@ -2254,6 +2287,9 @@ mod tests {
                 "{kind:?} decode differs (row, lane, got bits, want bits): {mismatches:?}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::prism::tests::cuda_gguf_decode_is_bit_exact_for_every_packed_byte");
     }
 
     /// sc-24164 timing evidence (a bench, not a gate): `prism_ptq_matmul_f32` milliseconds per
@@ -2302,5 +2338,10 @@ mod tests {
         }
         let per_token_ms = started.elapsed().as_secs_f64() * 1e3 / (iterations * tokens) as f64;
         eprintln!("[prism-ptq-timing] {rows}x{width}, {tokens} tokens: {per_token_ms:.3} ms/token");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED primitives::prism::tests::cuda_ptq_matmul_timing"
+        );
     }
 }

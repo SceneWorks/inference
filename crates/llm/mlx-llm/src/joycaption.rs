@@ -257,7 +257,13 @@ impl JoyCaptionModel {
     /// `text_config` for the Llama decoder and loads the LLaVA-prefixed weight tree.
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
-        let text = std::fs::read_to_string(dir.join("config.json"))?;
+        let text = crate::__model_input_reader!(
+            std::fs::read_to_string(dir.join("config.json")),
+            "crates/llm/mlx-llm/src/joycaption.rs::from_dir::std::fs::read_to_string@10743",
+            ArtifactInput,
+            dir.join("config.json"),
+            |__model_input_path| std::fs::read_to_string(__model_input_path)
+        )?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Config(format!("joycaption config.json: {e}")))?;
         let tc = v
@@ -592,6 +598,8 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         top_p: s.top_p,
         top_k: s.top_k,
         presence_penalty: s.presence_penalty,
+        presence_penalty_generated_only: s.presence_penalty_generated_only,
+        presence_penalty_prompt_len: 0,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
     }
@@ -789,6 +797,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn projector_activation_metadata_selects_distinct_gelu_functions() {
         let erf = ProjectorActivation::from_config(&json!({
             "projector_hidden_act": "gelu"
@@ -837,6 +846,8 @@ mod tests {
             (erf_out - tanh_out).abs() > 1e-4,
             "projector metadata must select distinct GELU functions"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED joycaption::tests::projector_activation_metadata_selects_distinct_gelu_functions");
     }
 
     #[test]
@@ -961,6 +972,7 @@ mod tests {
     /// The engine port emits the pre-engine loop's tokens — greedy, penalized and seeded
     /// stochastic — and names its decode path.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_engine_decode_is_the_pre_engine_loop() {
         let model = tiny_model();
         let image = gray(8, 8);
@@ -973,6 +985,8 @@ mod tests {
             repetition_penalty: 1.3,
             repetition_context: 16,
             presence_penalty: 0.2,
+            presence_penalty_generated_only: false,
+            presence_penalty_prompt_len: 0,
             ..greedy
         };
         let stochastic = SamplingParams {
@@ -1019,12 +1033,15 @@ mod tests {
             assert_eq!(gen.report.path, "step_model", "{name}");
             assert_eq!(gen.report.sampler, sampler, "{name}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED joycaption::tests::the_engine_decode_is_the_pre_engine_loop");
     }
 
     /// AC2 end to end: a JoyCaption generation carries `decode`, naming the token-at-a-time path,
     /// no proposer, the measured sampler, and the fallback an `auto` request resolves to on a
     /// captioner that advertises no proposer.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_provider_reports_its_decode_and_the_auto_fallback() {
         let mut provider = JoyCaptionProvider {
             descriptor: descriptor(),
@@ -1103,5 +1120,7 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>()
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED joycaption::tests::the_provider_reports_its_decode_and_the_auto_fallback");
     }
 }

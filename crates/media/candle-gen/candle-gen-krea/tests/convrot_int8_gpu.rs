@@ -44,6 +44,8 @@ fn int8_device() -> Option<Device> {
         Ok(d @ Device::Cuda(_)) => d,
         _ => {
             eprintln!("[sc-12301] no CUDA device; skipping the INT8-ConvRot workspace gate");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/convrot_int8_gpu.rs:47 (int8_device): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
             return None;
         }
     };
@@ -61,6 +63,8 @@ fn int8_device() -> Option<Device> {
                 "[sc-12301] device cap {:?} < 8.9; the INT8-ConvRot lane is not offered here, skipping",
                 lt.compute_cap().ok()
             );
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/convrot_int8_gpu.rs:59 (int8_device): Implicit None on ineligible/error capability probe silently bypasses selected learned GPU cases just like explicit no-device return.");
             None
         }
     }
@@ -104,9 +108,14 @@ fn convrot_parts(out_dim: usize, in_dim: usize, seed: u64) -> (Tensor, Vec<f32>)
 /// Legs 2 and 3 together are the regression gate: the private constructor *should* still cost a whole
 /// workspace (it is for one-off projections and tests), and the constructor the loader uses must not.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn convrot_int8_shares_one_cublaslt_workspace_across_projections() {
     use candle_gen::candle_core::cuda_backend::cudarc::driver::result as cuda;
-    let Some(dev) = int8_device() else { return };
+    let Some(dev) = int8_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                         crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/convrot_int8_gpu.rs:109 (convrot_int8_shares_one_cublaslt_workspace_across_projections): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
+        return;
+    };
 
     /// `CublasLt::WORKSPACE` — private to the handle, restated here as the *predicted* per-handle cost
     /// this test exists to confirm or refute against the driver.
@@ -353,6 +362,9 @@ fn convrot_int8_shares_one_cublaslt_workspace_across_projections() {
          reference, bit for bit ({} outputs each)",
         want.len()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED convrot_int8_gpu::convrot_int8_shares_one_cublaslt_workspace_across_projections");
 }
 
 /// **The device-identity guard — a hazard that only exists once handles are shared.**

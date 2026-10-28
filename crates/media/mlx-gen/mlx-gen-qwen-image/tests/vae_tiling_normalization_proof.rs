@@ -228,6 +228,7 @@ fn bounded() -> TilingConfig {
 /// **Executed mutation** (`QwenVae::decode` rewritten to denormalize as `(z + mean)·std` instead of
 /// `z·std + mean`, i.e. `decode` stops agreeing with its own head/tail pair): this test goes RED at
 /// **5.770e-1**; every other test in this file stays green, so the discrimination is this one's.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn head_tail_decomposition_is_the_exact_single_pass_decode() {
     let vae = vae();
@@ -244,6 +245,8 @@ fn head_tail_decomposition_is_the_exact_single_pass_decode() {
         0.0,
         "the head/tail split must reproduce the single-pass decode exactly"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_normalization_proof::head_tail_decomposition_is_the_exact_single_pass_decode");
 }
 
 /// **The upsample tail is spatially LOCAL and the head is GLOBAL — the exact form of the proof.**
@@ -267,6 +270,7 @@ fn head_tail_decomposition_is_the_exact_single_pass_decode() {
 /// **Executed mutation** (`rms_norm_channels`'s `sum_axes(.., &[1], ..)` widened to `&[1, H, W]`, so
 /// the tail's normalization becomes spatially scoped): the tail's crop-locality goes 0.0 → **8.272e-4**
 /// and this test goes RED.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_upsample_tail_is_spatially_local_but_the_head_is_not() {
     let vae = vae();
@@ -311,6 +315,8 @@ fn the_upsample_tail_is_spatially_local_but_the_head_is_not() {
         "the head/tail locality gap collapsed: head {global:.3e} vs tail {local:.3e}"
     );
     println!("tail crop-locality = {local:.3e}; head crop-locality = {global:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_normalization_proof::the_upsample_tail_is_spatially_local_but_the_head_is_not");
 }
 
 /// **`decode_tiled` runs the global head ONCE and tiles only the local tail** — asserted as an
@@ -336,6 +342,7 @@ fn the_upsample_tail_is_spatially_local_but_the_head_is_not() {
 ///    route-A identity goes 0.0 → **4.772e-1**, RED. This is exactly the sc-19753 defect.
 ///  - `rms_norm_channels` widened to a spatial reduction: the route-B control collapses to
 ///    **8.098e-5** (a spatially-scoped tail makes whole-decode tiling look almost free), RED.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiled_decode_runs_the_global_head_once_and_tiles_only_the_local_tail() {
     let vae = vae();
@@ -382,6 +389,8 @@ fn tiled_decode_runs_the_global_head_once_and_tiles_only_the_local_tail() {
     // Informational: the blend's own halo residual against the dense single-pass decode.
     let halo = max_abs_delta(&dense, &shipped);
     println!("route_b vs shipped = {b:.3e}; dense vs shipped (halo residual) = {halo:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_normalization_proof::tiled_decode_runs_the_global_head_once_and_tiles_only_the_local_tail");
 }
 
 /// The tiling must actually fire, otherwise the bound above would be measured against an untiled
@@ -391,6 +400,7 @@ fn tiled_decode_runs_the_global_head_once_and_tiles_only_the_local_tail() {
 ///
 /// **Executed mutation** (the `if !needs_tiling` fallback disabled so every request tiles): this test
 /// goes RED at **7.488e-1**, and it is the only one that does.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_request_too_wide_to_tile_is_the_exact_single_pass_decode() {
     let vae = vae();
@@ -408,6 +418,8 @@ fn a_request_too_wide_to_tile_is_the_exact_single_pass_decode() {
         0.0,
         "a request too wide to tile must be the exact single-pass decode"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_normalization_proof::a_request_too_wide_to_tile_is_the_exact_single_pass_decode");
 }
 
 /// `rms_norm_channels` — the tail's ONLY normalization — reduces the channel axis alone

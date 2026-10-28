@@ -42,6 +42,7 @@ safetensors = "0.7"
 candle-gen-perceptual = { path = "../candle-gen-perceptual" }
 
 [features]
+model-inference-proof = ["candle-gen-boogu/model-inference-proof", "candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen-qwen-image/model-inference-proof", "candle-gen/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-qwen-image/metal", "candle-gen-boogu/metal", "candle-gen-pid/metal", "candle-gen-perceptual/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda", "candle-gen-boogu/cuda", "candle-gen-pid/cuda", "candle-gen-perceptual/cuda"]

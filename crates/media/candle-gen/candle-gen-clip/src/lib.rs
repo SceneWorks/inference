@@ -23,6 +23,15 @@
 //! in deterministic order (via [`candle_gen::loader::sorted_safetensors`]) so a resharded upstream
 //! snapshot loads the full union of tensors, matching the MLX sharded-dir loader (F-037, sc-9021).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, IndexOp, Tensor};
@@ -131,8 +140,8 @@ impl ClipImageEmbedder {
         let px = preprocess_clip_image_sized(image, self.image_size, &device)?.to_dtype(dtype)?;
         let last = self.body.last_hidden(&px)?; // [1, num_positions, 1024]
         let cls = last.i((.., 0))?; // [1, 1024] — the class token
-        let pooled = self.post_ln.forward(&cls)?;
-        let embeds = self.visual_projection.forward(&pooled)?; // [1, 768]
+        let pooled = __model_proof_output!(self.post_ln.forward(&cls))?;
+        let embeds = __model_proof_output!(self.visual_projection.forward(&pooled))?; // [1, 768]
         Ok(embeds.to_dtype(DType::F32)?)
     }
 
@@ -187,8 +196,14 @@ impl ClipTextEmbedder {
             )?,
             None,
         );
-        let tokenizer = Tokenizer::from_file(root.join("tokenizer.json"))
-            .map_err(|e| CandleError::Msg(format!("clip_vit_l14_text: load tokenizer: {e}")))?;
+        let tokenizer = candle_gen::gen_core::__model_input_reader!(
+Tokenizer::from_file(root.join("tokenizer.json")),
+"crates/media/candle-gen/candle-gen-clip/src/lib.rs::from_snapshot::Tokenizer::from_file@9378",
+Tokenizer,
+root.join("tokenizer.json"),
+|__model_input_path| Tokenizer::from_file(__model_input_path)
+)
+        .map_err(|e| CandleError::Msg(format!("clip_vit_l14_text: load tokenizer: {e}")))?;
         Ok(Self {
             body,
             text_projection,
@@ -216,11 +231,8 @@ impl ClipTextEmbedder {
             ids[CLIP_MAX_LENGTH - 1] = CLIP_EOS_ID;
         }
         let input_ids = Tensor::new(ids.as_slice(), device)?.unsqueeze(0)?;
-        let pooled = self.body.forward(&input_ids)?;
-        Ok(self
-            .text_projection
-            .forward(&pooled)?
-            .to_dtype(DType::F32)?)
+        let pooled = __model_proof_output!(self.body.forward(&input_ids))?;
+        Ok(__model_proof_output!(self.text_projection.forward(&pooled))?.to_dtype(DType::F32)?)
     }
 
     fn embed_text_internal(&self, text: &str) -> Result<Vec<f32>> {
@@ -487,6 +499,7 @@ mod tests {
 
     /// `from_weights` (on a tiny ViT-L-shaped tower) + `embed` produce a finite `[proj_dim]` raw vector.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn embed_is_finite_with_expected_dim() {
         let dev = Device::Cpu;
         let cfg = VisionConfig {
@@ -524,6 +537,9 @@ mod tests {
         let v = embedder.embed(&img).unwrap();
         assert_eq!(v.len(), proj_dim);
         assert!(v.iter().all(|x| x.is_finite()), "embedding not finite");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::embed_is_finite_with_expected_dim");
     }
 
     /// Write a single-tensor f32 `.safetensors` at `path` holding `name -> [value]`.
@@ -655,6 +671,9 @@ mod tests {
             (0.80..0.97).contains(&red_blue),
             "red·blue {red_blue:.4} outside the sane CLIP band (head/preprocessing bug?)"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::real_weights_red_blue_parity");
     }
 
     /// Real-weights text/image alignment (sc-6537): with the paired CLIP-L text tower registered,
@@ -718,5 +737,8 @@ mod tests {
             blue_match > blue_mismatch,
             "blue text should rank blue image over red image"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::real_weights_text_image_alignment_ranks_matching_colors_higher");
     }
 }

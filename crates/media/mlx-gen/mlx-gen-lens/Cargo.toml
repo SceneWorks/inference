@@ -52,3 +52,6 @@ sceneworks-gen-core-testkit = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+[features]
+model-inference-proof = ["mlx-gen-perceptual/model-inference-proof", "mlx-gen/model-inference-proof", "mlx-gen-flux2/model-inference-proof", "mlx-gen-pid/model-inference-proof", "mlx-llm/model-inference-proof"]

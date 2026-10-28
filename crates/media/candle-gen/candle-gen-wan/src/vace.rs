@@ -929,6 +929,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q4_and_q8_tiers_dispatch_every_vace_projection_through_packed_qlinear() {
         for bits in [4, 8] {
             let (transformer, cfg) = tiny_packed_transformer(bits);
@@ -944,11 +945,15 @@ mod tests {
                 .unwrap();
             assert_eq!(out.dims(), &[1, 16, 1, 2, 2]);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vace::tests::q4_and_q8_tiers_dispatch_every_vace_projection_through_packed_qlinear");
     }
 
     /// VACE has two cross-attention stacks (control and main). This CPU probe proves each CFG payload
     /// projects K/V once for both stacks, then survives repeated denoise forwards without reprojecting.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_cross_kv_reuses_vace_and_main_stacks_with_pinned_output() {
         use crate::transformer::{
             cross_kv_preparation_pairs, lock_cross_kv_probe, reset_cross_kv_preparation_pairs,
@@ -1021,6 +1026,9 @@ mod tests {
             4,
             "VACE denoise repetition must not reproject text K/V"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vace::tests::prepared_cross_kv_reuses_vace_and_main_stacks_with_pinned_output");
     }
 
     #[test]

@@ -51,6 +51,12 @@
 //!   preparation: turn a downloaded HF-safetensors or GGUF source into a loadable,
 //!   optionally-quantized snapshot, delegating tensor work to a selected backend.
 
+#[path = "../../gen-core/src/model_input_macros.rs"]
+mod model_input_macros;
+#[cfg(feature = "model-inference-proof")]
+#[path = "../../gen-core/src/model_input_proof.rs"]
+pub mod model_input_proof;
+
 pub mod cancel;
 pub mod capabilities;
 pub mod constraint;
@@ -69,6 +75,7 @@ pub mod registry;
 pub mod report;
 pub mod request;
 pub mod resource;
+pub mod rope_config;
 pub mod schedule;
 pub mod speculative;
 pub mod starvector;
@@ -184,3 +191,7 @@ pub use tool::{ToolCall, ToolCallSegmenter, ToolSpec};
 
 /// The crate version, surfaced in conformance / diagnostic messages.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::IOS_ENGINEERING_FEATURES_SUPPORTED;

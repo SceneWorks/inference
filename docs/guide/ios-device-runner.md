@@ -42,6 +42,34 @@ State a bounded loan and obtain approval each session before Mac real-weight
 measurements; use an external RSS/physical-footprint guard, and return the GPU
 at the agreed deadline. This documentation change runs neither devices nor GPUs.
 
+## Separately dispatched SANA simulator runtime boundary
+
+The iOS simulator cannot run MLX Metal inference: its Metal device does not
+provide the GPU family MLX requires. The approved simulator acceptance is a
+verified build, install, launch and explicit `UNSUPPORTED_RUNTIME` response,
+with no model execution. The SANA image remains required on the target phone.
+This manual `real-weights.yml` profile selects an available iPhone simulator
+on the claiming Mac, creates and later deletes only its own device, and never
+touches the template's apps or data. Until the dedicated reusable
+workflow is on the default branch, dispatch through the registered workflow at
+the exact feature ref:
+
+```sh
+gh workflow run real-weights.yml --ref <feature-ref> \
+  -f profile=ios-simulator-sana \
+  -f ios_pricing_compile_binding='{"source_sha":"<40-hex-feature-head>","simulator":"iPhone 17 Pro Max"}'
+```
+
+The route builds a simulator metallib and installs without launching. The
+controller claims the exact app PID and process start before releasing its gate,
+samples physical footprint and host reserve, and accepts only a fresh, exact
+nonce/source-bound `SMOKE: UNSUPPORTED_RUNTIME` report emitted before MLX device
+initialization. The artifact binds the compiled source, bundle, executable and
+metallib hashes, simulator UUID, PID and runtime. Its
+`packaging_runtime_boundary_accepted` field can be true while
+`model_execution`, `model_acceptance`, `image_acceptance` and
+`phone_fit_acceptance` are all false. No SANA weights are fetched or copied.
+
 ## Optional tooling is not campaign evidence
 
 `scripts/ios/soak.sh --secs 300 --device <identifier>` exists for sustained LLM

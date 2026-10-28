@@ -497,6 +497,8 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
         100.0 * spread,
         100.0 * SETTLE_TOLERANCE
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::identical_requests_reproduce_once_the_allocator_has_settled");
 }
 
 /// **Is the request peak a function of the step count?**
@@ -545,6 +547,8 @@ fn the_request_peak_is_step_independent() {
          CHROMA_LADDER_STEPS cannot be used to shorten a peak-bearing row and every peak in this \
          file must be re-taken at the production schedule"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_request_peak_is_step_independent");
 }
 
 // ── Rung 0/1 ─────────────────────────────────────────────────────────────────────────────────────
@@ -596,6 +600,8 @@ fn staged_residency_bounds_the_request_peak_and_preserves_output() {
         staged_row.peak_gib,
         resident.peak_gib
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::staged_residency_bounds_the_request_peak_and_preserves_output");
 }
 
 /// **Which phase bears the request peak** — the measurement the rung-4 component scope turns on.
@@ -749,6 +755,8 @@ fn the_request_peak_bearing_phase_is_measured_not_assumed() {
          GiB); the rung-2 verdict rests on the mechanism working and the QUALITY failing, not on \
          the mechanism failing"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_request_peak_bearing_phase_is_measured_not_assumed");
 }
 
 /// **Which component scope actually moves the request peak** — measured, never inherited.
@@ -842,6 +850,8 @@ fn the_window_component_scopes_are_measured_not_inherited() {
         ms::TRANSFORMER_WINDOW_COMPONENT,
         published.1
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_window_component_scopes_are_measured_not_inherited");
 }
 
 // ── Rung 2 ───────────────────────────────────────────────────────────────────────────────────────
@@ -972,6 +982,8 @@ fn decode_tile_mechanism_sweep_on_the_production_latent() {
         "the tiled decode no longer bounds the decode phase ({best_peak:.4} vs {untiled_peak:.4} \
          GiB) — the mechanism this rung rests on has stopped working"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::decode_tile_mechanism_sweep_on_the_production_latent");
 }
 
 /// A **production** final latent: the denoiser's own output at the production schedule and sampler.
@@ -1107,6 +1119,8 @@ fn layerwise_decode_quality_is_resampled_across_seeds() {
         "layer-wise decode must clear {SIBLING_DRIFT_BAR}/255 on every production latent: \
          {drifts:?} (range {lo}..{hi})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::layerwise_decode_quality_is_resampled_across_seeds");
 }
 
 /// **Rungs 2 and 3 are refused by the PRODUCTION path** wherever they are declared `Missing`, on
@@ -1188,6 +1202,8 @@ fn the_withheld_rungs_are_refused_by_the_production_path() {
     model
         .generate(&request(Some(staged()), 1024, 1), &mut |_| {})
         .expect("the published rung-1 composition must render");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_withheld_rungs_are_refused_by_the_production_path");
 }
 
 // ── Rung 3 ───────────────────────────────────────────────────────────────────────────────────────
@@ -1345,6 +1361,8 @@ fn attention_chunking_is_measured_at_the_dit_seam() {
              on a superseded measurement"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::attention_chunking_is_measured_at_the_dit_seam");
 }
 
 // ── Rung 4 ───────────────────────────────────────────────────────────────────────────────────────
@@ -1464,6 +1482,8 @@ fn transformer_window_sweep_and_streamed_output_identity() {
          narrowed to the cadence that was actually measured"
     );
     let _ = (tightest, widest, tight_ms, wide_ms);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::transformer_window_sweep_and_streamed_output_identity");
 }
 
 /// **The published cadence domain is enforced in BOTH directions on the production path.**
@@ -1552,6 +1572,8 @@ fn the_published_window_domain_is_enforced_and_reachable() {
         };
         assert!(error.contains("component"), "scope {component:?}: {error}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_published_window_domain_is_enforced_and_reachable");
 }
 
 /// **Rung 4's preconditions fail closed on real weights**, with a positive control.
@@ -1624,6 +1646,8 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
             &mut |_| {},
         )
         .expect("the published rung-4 composition must render");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::rung_four_preconditions_fail_closed_on_real_weights");
 }
 
 /// **The rung-4 saving is bounded by the block weight set it actually holds**, cross-checked against
@@ -1681,6 +1705,8 @@ fn the_rung_four_saving_is_inside_the_block_weight_set() {
         saving / GIB,
         block_bytes / GIB
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_rung_four_saving_is_inside_the_block_weight_set");
 }
 
 /// Sum the `transformer/` safetensors payload split into the windowable block stacks and the trunk
@@ -1824,6 +1850,8 @@ fn every_cached_entry_and_tier_publishes_its_own_evidence() {
          and cannot be made from an empty set",
         ENTRIES.iter().map(|(_, var)| *var).collect::<Vec<_>>()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::every_cached_entry_and_tier_publishes_its_own_evidence");
 }
 
 /// **The full ladder renders under a memory cap** that the unwindowed composition does not fit.
@@ -1882,6 +1910,8 @@ fn the_full_ladder_renders_under_a_memory_cap() {
         0,
         "the capped render must be byte-identical to the uncapped windowed one"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_full_ladder_renders_under_a_memory_cap");
 }
 
 /// **The SC-15449 calibration fault fires at each phase boundary, and a fresh request follows.**
@@ -1929,4 +1959,6 @@ fn the_calibration_fault_fires_at_every_phase_and_a_fresh_request_recovers() {
         Err(error) => error.to_string(),
     };
     assert!(error.contains("authorization"), "{error}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_calibration_fault_fires_at_every_phase_and_a_fresh_request_recovers");
 }

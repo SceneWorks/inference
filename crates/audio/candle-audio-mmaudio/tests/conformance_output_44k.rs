@@ -24,6 +24,16 @@
 //! dirs containing them), or leave unset to resolve the pinned checkpoints via the audio lane's F-029
 //! hub path (downloads ~1.7 GB into the HF cache on first run).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use candle_audio_mmaudio as mm;
 use candle_audio_mmaudio::candle_audio::candle_core::{Device, Tensor};
 use candle_audio_mmaudio::gen_core::WeightsSource;
@@ -131,4 +141,7 @@ fn output_44k_latent_to_waveform_finite_deterministic() {
         hop * 2 * LATENT_LEN,
         w_var.sqrt()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED output_44k_latent_to_waveform_finite_deterministic");
 }

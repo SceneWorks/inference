@@ -213,9 +213,9 @@ impl TrainGateMlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.w1.forward(x)?.silu()?;
-        let up = self.w3.forward(x)?;
-        self.w2.forward(&gate.mul(&up)?)
+        let gate = __model_proof_output!(self.w1.forward(x))?.silu()?;
+        let up = __model_proof_output!(self.w3.forward(x))?;
+        __model_proof_output!(self.w2.forward(&gate.mul(&up)?))
     }
 }
 
@@ -274,8 +274,8 @@ impl TrainBlock {
         mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
         let act = temb.silu()?;
-        let img_mod = self.img_mod.forward(&act)?;
-        let txt_mod = self.txt_mod.forward(&act)?;
+        let img_mod = __model_proof_output!(self.img_mod.forward(&act))?;
+        let txt_mod = __model_proof_output!(self.txt_mod.forward(&act))?;
         let n = img_mod.dim(D::Minus1)? / 2;
         let (im0, im1) = (
             img_mod.narrow(D::Minus1, 0, n)?,
@@ -406,16 +406,15 @@ impl LensTransformerTrain {
         let img_len = hidden_states.dim(1)?;
         let txt_len = text_feats[0].dim(1)?;
 
-        let hidden = self.img_in.forward(hidden_states)?;
+        let hidden = __model_proof_output!(self.img_in.forward(hidden_states))?;
 
         let mut normed = Vec::with_capacity(self.cfg.num_text_layers);
         for (i, feat) in text_feats.iter().enumerate() {
             normed.push(self.txt_norm[i].forward_diff(feat)?);
         }
         let normed_refs: Vec<&Tensor> = normed.iter().collect();
-        let encoder = self
-            .txt_in
-            .forward(&Tensor::cat(&normed_refs, D::Minus1)?)?;
+        let encoder =
+            __model_proof_output!(self.txt_in.forward(&Tensor::cat(&normed_refs, D::Minus1)?))?;
 
         let temb = self
             .time_embed
@@ -476,7 +475,7 @@ impl LensTransformerTrain {
     /// image-stream output. No sign flip and no unpatchify (the 2×2 (un)patchify lives in the VAE shim).
     pub fn velocity_out(&self, hidden: &Tensor, ctx: &PreCtx) -> Result<Tensor> {
         let hidden = self.norm_out.forward(hidden, &ctx.temb)?;
-        self.proj_out.forward(&hidden)
+        __model_proof_output!(self.proj_out.forward(&hidden))
     }
 
     /// Dense forward (the parity path): `pre_main` → the per-block stack → `velocity_out`. Mirrors
@@ -559,6 +558,7 @@ mod parity_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_dit_matches_stock_forward() {
         let dev = Device::Cpu;
         let mut rng = StdRng::seed_from_u64(0x1e45_d001);
@@ -600,6 +600,9 @@ mod parity_tests {
             diff < 1e-5,
             "vendored Lens DiT diverged from stock by {diff}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_train::parity_tests::vendored_dit_matches_stock_forward");
     }
 
     /// The [`LoraHost`] walk reaches exactly `4 × num_layers` projections — the four fused/output
@@ -642,6 +645,7 @@ mod parity_tests {
     /// both-streams loss is what exercises every projection's composable backward. Factors are forced
     /// nonzero so the residual is live everywhere.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn backward_reaches_every_adapter_factor() {
         use candle_gen::train::lora::build_lora_targets;
 
@@ -692,5 +696,8 @@ mod parity_tests {
                 .unwrap();
             assert!(mag > 0.0, "adapter factor {i} got an all-zero gradient");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_train::parity_tests::backward_reaches_every_adapter_factor");
     }
 }

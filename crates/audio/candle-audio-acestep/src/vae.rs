@@ -52,10 +52,10 @@ impl Snake {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let alpha = self.alpha.exp()?;
         let beta = self.beta.exp()?;
-        let ax = x.broadcast_mul(&alpha)?;
+        let ax = __model_proof_output!(x.broadcast_mul(&alpha))?;
         let s = ax.sin()?;
         let s2 = (&s * &s)?;
-        x + s2.broadcast_div(&(&beta + 1e-9)?)
+        __model_proof_output!(x + __model_proof_output!(s2.broadcast_div(&(&beta + 1e-9)?)))
     }
 }
 
@@ -68,11 +68,9 @@ struct ResidualUnit {
 
 impl ResidualUnit {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let y = self.conv2.forward(
-            &self
-                .snake2
-                .forward(&self.conv1.forward(&self.snake1.forward(x)?)?)?,
-        )?;
+        let y = __model_proof_output!(self.conv2.forward(&self.snake2.forward(
+            &__model_proof_output!(self.conv1.forward(&self.snake1.forward(x)?))?
+        )?,))?;
         let pad = (x.dim(D::Minus1)? - y.dim(D::Minus1)?) / 2;
         if pad > 0 {
             y.broadcast_add(&x.narrow(D::Minus1, pad, y.dim(D::Minus1)?)?)
@@ -90,7 +88,7 @@ struct DecoderBlock {
 
 impl DecoderBlock {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let mut x = self.up.forward(&self.snake.forward(x)?)?;
+        let mut x = __model_proof_output!(self.up.forward(&self.snake.forward(x)?))?;
         for r in &self.res {
             x = r.forward(&x)?;
         }
@@ -261,7 +259,7 @@ impl OobleckDecoder {
     /// Decode latents `[B, 64, T]` → waveform `[B, audio_channels, T·hop]`. `cancel` is polled
     /// between decoder stages (the upsampling blocks dominate the cost).
     pub fn decode(&self, z: &Tensor, cancel: &dyn Fn() -> bool) -> CandleResult<Option<Tensor>> {
-        let mut x = self.conv1.forward(z)?;
+        let mut x = __model_proof_output!(self.conv1.forward(z))?;
         for block in &self.blocks {
             if cancel() {
                 return Ok(None);
@@ -271,7 +269,7 @@ impl OobleckDecoder {
         if cancel() {
             return Ok(None);
         }
-        let x = self.conv_out.forward(&self.snake_out.forward(&x)?)?;
+        let x = __model_proof_output!(self.conv_out.forward(&self.snake_out.forward(&x)?))?;
         Ok(Some(x))
     }
 }
@@ -346,7 +344,7 @@ impl EncoderBlock {
         for r in &self.res {
             x = r.forward(&x)?;
         }
-        self.down.forward(&self.snake.forward(&x)?)
+        __model_proof_output!(self.down.forward(&self.snake.forward(&x)?))
     }
 }
 
@@ -419,7 +417,7 @@ impl OobleckEncoder {
         waveform: &Tensor,
         cancel: &dyn Fn() -> bool,
     ) -> CandleResult<Option<Tensor>> {
-        let mut x = self.conv1.forward(waveform)?;
+        let mut x = __model_proof_output!(self.conv1.forward(waveform))?;
         for block in &self.blocks {
             if cancel() {
                 return Ok(None);
@@ -429,8 +427,8 @@ impl OobleckEncoder {
         if cancel() {
             return Ok(None);
         }
-        let params = self.conv_out.forward(&self.snake_out.forward(&x)?)?; // [1, 2·latent, T']
-                                                                           // OobleckDiagonalGaussianDistribution: mean = first `latent` channels; deterministic mode.
+        let params = __model_proof_output!(self.conv_out.forward(&self.snake_out.forward(&x)?))?; // [1, 2·latent, T']
+                                                                                                  // OobleckDiagonalGaussianDistribution: mean = first `latent` channels; deterministic mode.
         let mean = params.narrow(1, 0, self.latent_channels)?;
         Ok(Some(mean.transpose(1, 2)?.contiguous()?)) // [1, T', latent]
     }
@@ -484,6 +482,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn snake_identity_at_zero() {
         let dev = Device::Cpu;
         let snake = Snake {
@@ -501,6 +500,9 @@ mod tests {
                 .unwrap(),
             vec![0.0; 8]
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::snake_identity_at_zero");
     }
 
     #[test]

@@ -41,6 +41,26 @@ pub struct ResnetBlock2D {
 }
 
 impl ResnetBlock2D {
+    fn pricing_facts(&self) -> super::pricing::ResnetFacts {
+        let conv = |c: &AdaptableConv2d| crate::quantum::ConvWork {
+            weight: crate::quantum::activation_facts(c.weight()),
+            bias: c.bias().map(crate::quantum::activation_facts),
+        };
+        super::pricing::ResnetFacts {
+            norm1_w: crate::quantum::activation_facts(&self.norm1_w),
+            norm1_b: crate::quantum::activation_facts(&self.norm1_b),
+            norm2_w: crate::quantum::activation_facts(&self.norm2_w),
+            norm2_b: crate::quantum::activation_facts(&self.norm2_b),
+            conv1: conv(&self.conv1),
+            conv2: conv(&self.conv2),
+            time_emb_proj: self
+                .time_emb_proj
+                .as_ref()
+                .map(crate::quantum::LinearWork::of),
+            shortcut: self.shortcut.as_ref().map(crate::quantum::LinearWork::of),
+        }
+    }
+
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let g = |n: &str| w.require(&format!("{prefix}.{n}")).cloned();
         let shortcut = match w.get(&format!("{prefix}.conv_shortcut.weight")) {
@@ -81,8 +101,19 @@ impl ResnetBlock2D {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.quantize_using("", bits, &mut |_, linear, bits| {
+            crate::quant::quantize_linear(linear, bits)
+        })
+    }
+
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
         if let Some(t) = &mut self.time_emb_proj {
-            crate::quant::quantize_linear(t, bits)?;
+            visit(&crate::quant::child_path(prefix, "time_emb_proj"), t, bits)?;
         }
         // `shortcut` is the 1×1 `conv_shortcut` stored as a Linear (for the NHWC channel-matmul
         // forward), not a true Linear — so it stays DENSE like every other conv in the U-Net
@@ -208,22 +239,81 @@ impl ResnetBlock2D {
     /// promotes the second half to (a packed `time_emb_proj` with BF16 scales, or an f32 `temb`,
     /// makes it f32 — [`crate::quantum::linear_output_dtype`]), on the running backend.
     pub(crate) fn quantum_scratch(&self, x: &Array, temb: Option<&Array>) -> u64 {
-        let act_in = crate::quantum::element_bytes(x);
-        let act_out = match (&self.time_emb_proj, temb) {
-            (Some(proj), Some(t)) => {
-                let projected = crate::quantum::linear_output_dtype(proj, t.dtype());
-                crate::quantum::dtype_bytes(Dtype::from_promoting_types(x.dtype(), projected))
-            }
-            _ => act_in,
-        };
-        crate::quantum::resnet_bytes(
-            x.shape(),
-            act_in,
-            act_out,
-            self.conv1.weight(),
-            self.conv2.weight(),
-            crate::quantum::Backend::current(),
+        self.quantum_scratch_with_effects(x, temb, &crate::quantum::EffectScope::native())
+            .expect("native projection facts are infallible")
+    }
+
+    pub(crate) fn quantum_scratch_with_effects(
+        &self,
+        x: &Array,
+        temb: Option<&Array>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<u64> {
+        self.pricing_facts().quantum_scratch_with_effects(
+            &crate::quantum::activation_facts(x),
+            temb.map(crate::quantum::activation_facts).as_ref(),
+            effects,
         )
+    }
+
+    /// Small affine/bias casts and the dense shortcut's addmm operand casts are distinct from
+    /// the two 3x3 convolution kernels. Read their actual dtypes instead of widening every buffer.
+    #[cfg(test)]
+    pub(crate) fn promotion_scratch(&self, x: &Array, temb: Option<&Array>) -> u64 {
+        self.promotion_scratch_with_effects(x, temb, &crate::quantum::EffectScope::native())
+            .expect("native projection facts are infallible")
+    }
+
+    #[cfg(test)]
+    fn promotion_scratch_with_effects(
+        &self,
+        x: &Array,
+        temb: Option<&Array>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<u64> {
+        self.pricing_facts().promotion_scratch_with_effects(
+            &crate::quantum::activation_facts(x),
+            temb.map(crate::quantum::activation_facts).as_ref(),
+            effects,
+        )
+    }
+
+    /// The dtype [`Self::forward_core`] returns for an `input`-typed input (the up path's
+    /// concatenation already applied) and a `temb`-typed time embedding: MLX promotes through
+    /// every weight, bias and norm affine the forward touches and the projected embedding
+    /// ([`crate::quantum::linear_output_dtype`]). Header-only pricing threads it.
+    #[cfg(test)]
+    pub(crate) fn output_dtype(&self, input: Dtype, temb: Option<Dtype>) -> Dtype {
+        self.output_dtype_with_effects(input, temb, &crate::quantum::EffectScope::native())
+            .expect("native projection facts are infallible")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_dtype_with_effects(
+        &self,
+        input: Dtype,
+        temb: Option<Dtype>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<Dtype> {
+        self.pricing_facts()
+            .output_dtype_with_effects(input, temb, effects)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_shape_with_effects(
+        &self,
+        input: &[i32],
+        skip: Option<&[i32]>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<Vec<i32>> {
+        self.pricing_facts()
+            .output_shape_with_effects(input, skip, effects)
+    }
+
+    /// The `[cin, cout]` of `conv1` and `cout` of `conv2` (header-only pricing).
+    #[cfg(test)]
+    pub(crate) fn conv_weights(&self) -> (&Array, &Array) {
+        (self.conv1.weight(), self.conv2.weight())
     }
 
     /// [`forward_planned`](Self::forward_planned) as one guarded iOS quantum (sc-26270). `skip`
@@ -250,11 +340,12 @@ impl ResnetBlock2D {
     ///
     /// The U-Net continues to use [`Self::forward`]. VAE resnets carry no time embedding, allowing
     /// their GroupNorms to use full-image statistics while only the two 3×3 convolutions tile.
-    pub fn forward_tiled_vae(
+    pub(crate) fn forward_tiled_vae(
         &self,
         x: &Array,
         tile_edge: i32,
         cancel: Option<&CancelFlag>,
+        labels: crate::quantum::VaeLabels,
     ) -> Result<Array> {
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(Error::Canceled);
@@ -269,9 +360,13 @@ impl ResnetBlock2D {
         let s = x.shape();
         let (cin, cout) = crate::quantum::conv_channels(self.conv1.weight());
         mlx_gen::ios_quantum::before(
-            crate::quantum::VAE_TILED_STAGE,
+            labels.tiled_stage,
             crate::quantum::tiled_stage_bytes(s, cin, cout, crate::quantum::element_bytes(x), true),
         )?;
+        let source = crate::quantum::TileSource {
+            full_width: x.shape()[2],
+            normalized: true,
+        };
         let norm1 = GlobalGroupNorm::new(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
         let y = tiled_conv2d_3x3_nhwc(
             x,
@@ -281,7 +376,7 @@ impl ResnetBlock2D {
             cancel,
             |tile| {
                 // sc-26270: each tile is checked before its norm/conv graph is constructed.
-                crate::quantum::before_tile(tile, self.conv1.weight(), false)?;
+                crate::quantum::before_tile(labels.tile, tile, source, self.conv1.weight(), false)?;
                 silu_glue(&norm1.apply(tile)?)
             },
         )?;
@@ -297,7 +392,7 @@ impl ResnetBlock2D {
             tile_edge,
             cancel,
             |tile| {
-                crate::quantum::before_tile(tile, self.conv2.weight(), false)?;
+                crate::quantum::before_tile(labels.tile, tile, source, self.conv2.weight(), false)?;
                 silu_glue(&norm2.apply(tile)?)
             },
         )?;
@@ -308,15 +403,81 @@ impl ResnetBlock2D {
         };
         let out = add(&residual, &y)?;
         out.eval()?;
-        mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&out])?;
+        mlx_gen::ios_quantum::finish(labels.tiled_stage, &[&out])?;
         Ok(out)
+    }
+
+    /// Header-only pricing of [`Self::forward_tiled_vae`] over the shape-only `x`: the stage and
+    /// each convolution's widest tile, with the guards' own formulas. Returns the shape-only output.
+    #[cfg(test)]
+    pub(crate) fn price_tiled_vae(
+        &self,
+        x: &Array,
+        tile_edge: i32,
+        labels: crate::quantum::VaeLabels,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<Array> {
+        let s = x.shape();
+        let (cin, cout) = crate::quantum::conv_channels(self.conv1.weight());
+        out.push((
+            labels.tiled_stage,
+            crate::quantum::tiled_stage_bytes(s, cin, cout, crate::quantum::element_bytes(x), true),
+        ));
+        let tile = |input: &[i32], channels: i32, width: u64, weight: &Array| {
+            let (th, tw) = crate::vae::max_conv_tile(input[1], input[2], tile_edge);
+            crate::quantum::tile_bytes(
+                &[input[0], th, tw, channels],
+                crate::quantum::TileSource {
+                    full_width: input[2],
+                    normalized: true,
+                },
+                width,
+                weight,
+                false,
+                crate::quantum::backend(),
+            )
+        };
+        out.push((
+            labels.tile,
+            tile(
+                s,
+                s[3],
+                crate::quantum::element_bytes(x),
+                self.conv1.weight(),
+            ),
+        ));
+        let mut conv1 = vec![&self.norm1_w, &self.norm1_b, self.conv1.weight()];
+        conv1.extend(self.conv1.bias());
+        let y = crate::quantum::promote_all(x.dtype(), &conv1);
+        let mid = [s[0], s[1], s[2], self.conv2.weight().shape()[3]];
+        out.push((
+            labels.tile,
+            tile(
+                &mid,
+                mid[3],
+                crate::quantum::dtype_bytes(y),
+                self.conv2.weight(),
+            ),
+        ));
+        crate::quantum::shaped(
+            &[s[0], s[1], s[2], cout],
+            self.output_dtype(x.dtype(), None),
+        )
     }
 
     /// The one LoRA-targetable **Linear** on a U-Net resnet — `time_emb_proj`. The convs
     /// (`conv1`/`conv2`/`conv_shortcut`) are conv-layer targets, enumerated by
     /// [`conv_target_paths`](Self::conv_target_paths) instead (sc-2919).
     pub fn lora_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
-        if self.time_emb_proj.is_some() {
+        Self::append_lora_target_paths(prefix, self.time_emb_proj.is_some(), out);
+    }
+
+    pub(crate) fn append_lora_target_paths(
+        prefix: &str,
+        time_projection: bool,
+        out: &mut Vec<String>,
+    ) {
+        if time_projection {
             out.push(format!("{prefix}.time_emb_proj"));
         }
     }
@@ -325,9 +486,13 @@ impl ResnetBlock2D {
     /// `conv_shortcut`. Merged only under [`crate::adapters::LoraCoverage::Complete`]; the
     /// Linear-only vendored coverage drops them (preserving byte-parity with the retired Python path).
     pub fn conv_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
+        Self::append_conv_target_paths(prefix, self.shortcut.is_some(), out);
+    }
+
+    pub(crate) fn append_conv_target_paths(prefix: &str, shortcut: bool, out: &mut Vec<String>) {
         out.push(format!("{prefix}.conv1"));
         out.push(format!("{prefix}.conv2"));
-        if self.shortcut.is_some() {
+        if shortcut {
             out.push(format!("{prefix}.conv_shortcut"));
         }
     }

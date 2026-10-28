@@ -15,6 +15,7 @@ const FIXTURE: &str = concat!(
 );
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn text_encoder_forward_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     // cfg = "VOCAB,H,NL,NH,NKV,HD,INTER,SEQ"
@@ -52,4 +53,7 @@ fn text_encoder_forward_matches_fork() {
             .item::<bool>(),
         "TextEncoder forward (embed + layers + second-to-last selection) diverged from the fork"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::text_encoder_forward_matches_fork");
 }

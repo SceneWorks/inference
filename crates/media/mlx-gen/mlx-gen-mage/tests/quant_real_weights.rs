@@ -226,7 +226,13 @@ fn scene_scores(got: &[u8], reference: &[u8]) -> (f64, f64, f64) {
 fn dit_packed_at_uniform_bits(bits: i32) -> MageTransformer {
     let dir = std::path::Path::new(&snapshot()).join("transformer");
     let cfg = MageFlowConfig::from_transformer_config_json(
-        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        &mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(dir.join("config.json")),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string(
+                dir.join("config.json")
+            )
+        )
+        .unwrap(),
     )
     .unwrap();
     let map = quantize_map(load_dir_map(&dir).unwrap(), bits, 64, is_dit_target).unwrap();
@@ -241,8 +247,16 @@ fn dit_packed_at_uniform_bits(bits: i32) -> MageTransformer {
 /// `LM_LAYER_MIN_BITS` floor defeated, loaded back through the real packed loader.
 fn text_encoder_packed_at_uniform_bits(bits: i32) -> MageTextEncoder {
     let dir = std::path::Path::new(&snapshot()).join("text_encoder");
-    let cfg =
-        verify_text_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let cfg = verify_text_config(
+        &mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(dir.join("config.json")),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string(
+                dir.join("config.json")
+            )
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let map = quantize_map(load_dir_map(&dir).unwrap(), bits, 64, is_te_target).unwrap();
     let mut w = Weights::empty();
     for (key, value) in map {
@@ -341,6 +355,8 @@ fn every_tier_renders_the_reference_scene_and_a_uniform_q4_head_fails_the_gate()
              module comment rather than deleting this assertion."
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_real_weights::every_tier_renders_the_reference_scene_and_a_uniform_q4_head_fails_the_gate");
 }
 
 #[test]
@@ -441,6 +457,8 @@ fn qwen_q8_beats_q4_and_both_preserve_prompt_fidelity() {
     );
     assert!(q8_rank >= 0.90, "Q8 prompt-similarity ranking regressed");
     assert!(q4_rank >= 0.90, "Q4 prompt-similarity ranking is unusable");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_real_weights::qwen_q8_beats_q4_and_both_preserve_prompt_fidelity");
 }
 
 #[test]
@@ -512,7 +530,7 @@ fn all_three_tiers_generate_and_round_trip_mean_latents() {
             None => (16.0, 20.0),
             Some(Quant::Q8) => (8.5, 12.0),
             Some(Quant::Q4) => (7.0, 9.0),
-            Some(Quant::Nvfp4) => unreachable!(),
+            Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => unreachable!(),
         };
         assert!(
             (low..=high).contains(&peak_gb),
@@ -558,4 +576,6 @@ fn all_three_tiers_generate_and_round_trip_mean_latents() {
         q4_bf16_mae <= 50.0,
         "Q4 output departed too far from the BF16 quality oracle"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_real_weights::all_three_tiers_generate_and_round_trip_mean_latents");
 }

@@ -104,7 +104,7 @@ impl StarCoder2 {
     }
 
     pub fn embed(&self, ids: &Tensor) -> Result<Tensor> {
-        embed(&self.embed_tokens, ids)
+        __model_proof_output!(embed(&self.embed_tokens, ids))
     }
 
     pub fn dtype(&self) -> DType {
@@ -127,7 +127,7 @@ impl StarCoder2 {
         let state = self.normed_states(embeds, cache, offset, self.attn_formulation)?;
         let sequence = state.dim(1)?;
         let last = state.narrow(1, sequence - 1, 1)?.squeeze(1)?;
-        linear(&last, &self.embed_tokens, None)
+        __model_proof_output!(linear(&last, &self.embed_tokens, None))
     }
 
     /// The decoder stack over `embeds` at `offset`, final-LayerNormed: `[batch, seq, hidden]`.
@@ -365,34 +365,33 @@ impl StarCoder2Layer {
         index: usize,
         formulation: AttnFormulation,
     ) -> Result<Tensor> {
-        let normed = layer_norm(
+        let normed = __model_proof_output!(layer_norm(
             hidden,
             &self.input_norm_weight,
             &self.input_norm_bias,
             self.eps,
-        )?;
+        ))?;
         let attended = self
             .attn
             .forward(&normed, cos, sin, cache, index, formulation)?;
         let hidden = hidden.broadcast_add(&attended)?;
-        let normed = layer_norm(
+        let normed = __model_proof_output!(layer_norm(
             &hidden,
             &self.post_attn_norm_weight,
             &self.post_attn_norm_bias,
             self.eps,
-        )?;
-        let mlp = gelu(&linear(
+        ))?;
+        let mlp = gelu(&__model_proof_output!(linear(
             &normed,
             &self.mlp_fc_weight,
             Some(&self.mlp_fc_bias),
-        )?)?;
-        hidden
-            .broadcast_add(&linear(
-                &mlp,
-                &self.mlp_proj_weight,
-                Some(&self.mlp_proj_bias),
-            )?)
-            .map_err(Into::into)
+        ))?)?;
+        __model_proof_output!(hidden.broadcast_add(&__model_proof_output!(linear(
+            &mlp,
+            &self.mlp_proj_weight,
+            Some(&self.mlp_proj_bias),
+        ))?))
+        .map_err(Into::into)
     }
 }
 
@@ -441,24 +440,12 @@ impl StarCoder2Attention {
     ) -> Result<Tensor> {
         let (batch, sequence, _) = hidden.dims3()?;
         let dim = self.cfg.head_dim();
-        let q = linear(hidden, &self.q_weight, Some(&self.q_bias))?.reshape((
-            batch,
-            sequence,
-            self.cfg.heads,
-            dim,
-        ))?;
-        let k = linear(hidden, &self.k_weight, Some(&self.k_bias))?.reshape((
-            batch,
-            sequence,
-            self.cfg.kv_heads,
-            dim,
-        ))?;
-        let v = linear(hidden, &self.v_weight, Some(&self.v_bias))?.reshape((
-            batch,
-            sequence,
-            self.cfg.kv_heads,
-            dim,
-        ))?;
+        let q = __model_proof_output!(linear(hidden, &self.q_weight, Some(&self.q_bias)))?
+            .reshape((batch, sequence, self.cfg.heads, dim))?;
+        let k = __model_proof_output!(linear(hidden, &self.k_weight, Some(&self.k_bias)))?
+            .reshape((batch, sequence, self.cfg.kv_heads, dim))?;
+        let v = __model_proof_output!(linear(hidden, &self.v_weight, Some(&self.v_bias)))?
+            .reshape((batch, sequence, self.cfg.kv_heads, dim))?;
         // Head-major and contiguous, as llama's `project` hands them over: the growing cache returns
         // the first append's K/V unchanged, and `sdpa_gqa_causal` attends them directly — a bare
         // transpose of a multi-token GQA projection is a layout the CUDA matmul rejects (sc-24164).
@@ -487,7 +474,7 @@ impl StarCoder2Attention {
         let out = out
             .transpose(1, 2)?
             .reshape((batch, sequence, self.cfg.hidden_size))?;
-        linear(&out, &self.o_weight, Some(&self.o_bias))
+        __model_proof_output!(linear(&out, &self.o_weight, Some(&self.o_bias)))
     }
 }
 
@@ -526,6 +513,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiny_gqa_rope_decoder_is_deterministic_and_uses_tied_head() {
         let cfg = StarCoder2Config {
             vocab_size: 3,
@@ -625,6 +613,9 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(run(), run());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::starcoder2::tests::tiny_gqa_rope_decoder_is_deterministic_and_uses_tied_head");
     }
 
     #[test]
@@ -813,15 +804,23 @@ mod tests {
     /// The sc-24164 regression on the CPU lane: the CPU `gemm` reads any strides, so this pins the
     /// no-copy contract (fix (a)) rather than the matmul failure.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn multi_token_gqa_prefill_through_the_growing_cache_copies_no_kv_on_cpu() {
         assert_multi_token_gqa_prefill_through_the_growing_cache(&Device::Cpu);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::starcoder2::tests::multi_token_gqa_prefill_through_the_growing_cache_copies_no_kv_on_cpu");
     }
 
     /// The sc-24164 regression where it failed: on CUDA, where the matmul rejects the layout.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn multi_token_gqa_prefill_through_the_growing_cache_runs_on_cuda() {
         let device = crate::device::new_cuda_for_test().expect("cuda device");
         assert_multi_token_gqa_prefill_through_the_growing_cache(&device);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::starcoder2::tests::multi_token_gqa_prefill_through_the_growing_cache_runs_on_cuda");
     }
 }

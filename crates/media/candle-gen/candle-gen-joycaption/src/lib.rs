@@ -21,6 +21,15 @@
 //! `backend = "candle"`, `mac_only = false`. Registered under
 //! `"fancyfeast/llama-joycaption-beta-one-hf-llava"`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod prompt;
 
 use candle_gen::gen_core::core_llm::{
@@ -226,6 +235,7 @@ impl Captioner for JoyCaptioner {
                 // CaptionSampling exposes no top-k; disabled (0) matches the prior engine sampler.
                 top_k: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
                 repetition_penalty: req.sampling.repetition_penalty,
                 repetition_context: req.sampling.repetition_context,
             },

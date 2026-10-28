@@ -148,6 +148,8 @@ fn dit_velocity_matches_reference() {
         mr <= DIT_F32_XSTACK_MEAN_REL,
         "dit velocity mean_rel {mr:.3e} exceeds the 0.32.0 cross-stack f32 bound {DIT_F32_XSTACK_MEAN_REL:.1e} (sc-12896)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::dit_velocity_matches_reference");
 }
 
 /// The reference's **native bf16+Q8** per-forward — the production-speed path ([`Precision::quant_bf16`]).
@@ -182,6 +184,8 @@ fn dit_velocity_matches_reference_bf16() {
         mr == 0.0,
         "dit velocity (bf16) mean_rel {mr:.3e} must be bit-exact"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::dit_velocity_matches_reference_bf16");
 }
 
 /// Sanity that the output head is exact: feed the reference post-block hidden through the Rust head
@@ -200,4 +204,6 @@ fn dit_output_head_exact() {
     let pr = peak_rel(&head, g.require("velocity").unwrap());
     eprintln!("output_head(golden h) peak_rel = {pr:.3e}");
     assert!(pr < 5e-3, "output head peak_rel {pr:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::dit_output_head_exact");
 }

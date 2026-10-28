@@ -201,6 +201,7 @@ fn the_registration_is_a_distinct_conforming_yue2_provider() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_registered_load_reaches_the_pipeline_and_publishes_the_run() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), true)).unwrap();
@@ -309,6 +310,9 @@ fn a_registered_load_reaches_the_pipeline_and_publishes_the_run() {
     let mut wrong = from_plan.clone();
     song_of(&mut wrong).plan.as_mut().unwrap().identity = Some("0".repeat(64));
     assert!(generator.generate(&wrong, &mut |_| {}).is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_registered_load_reaches_the_pipeline_and_publishes_the_run");
 }
 
 /// A restored plan fixes its request: a `prompt` or `audio.lyrics` that disagrees with it is an
@@ -318,6 +322,7 @@ fn a_registered_load_reaches_the_pipeline_and_publishes_the_run() {
 /// Mutations that must fail: drop the prompt comparison (`req.prompt != r.style()` → `false`), or
 /// drop the lyrics comparison.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_restored_plan_refuses_a_different_prompt_or_lyrics() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), false)).unwrap();
@@ -359,9 +364,13 @@ fn a_restored_plan_refuses_a_different_prompt_or_lyrics() {
     }
     let same = from_plan("warm piano pop", Some("[Verse]\nla la la\n"));
     audio_of(generator.generate(&same, &mut |_| {}).unwrap());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_restored_plan_refuses_a_different_prompt_or_lyrics");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cancellation_through_the_generator_publishes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), false)).unwrap();
@@ -378,6 +387,9 @@ fn cancellation_through_the_generator_publishes_nothing() {
     assert!(matches!(r, Err(gen_core::Error::Canceled)), "{r:?}");
     assert!(!dir.join(RESULT_JSON).exists());
     assert!(!dir.exists());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::cancellation_through_the_generator_publishes_nothing");
 }
 
 #[test]
@@ -525,6 +537,9 @@ fn registered_fp8_load_publishes_a_mode_bound_run() {
         verify_run(&run, None).unwrap()["identity"],
         report.artifacts.unwrap().identity
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::registered_fp8_load_publishes_a_mode_bound_run");
 }
 
 /// The advertised tiers are exactly the accepted ones: every `Quant` the descriptor lists passes
@@ -537,10 +552,10 @@ fn registered_fp8_load_publishes_a_mode_bound_run() {
 #[test]
 fn the_advertised_quants_are_exactly_the_accepted_ones() {
     // Exhaustive: a new `Quant` fails to compile here until it is classified.
-    let every = [Quant::Q4, Quant::Q8, Quant::Nvfp4];
+    let every = [Quant::Q4, Quant::Q8, Quant::Nvfp4, Quant::Fp8Rowwise];
     for q in every {
         match q {
-            Quant::Q4 | Quant::Q8 | Quant::Nvfp4 => {}
+            Quant::Q4 | Quant::Q8 | Quant::Nvfp4 | Quant::Fp8Rowwise => {}
         }
     }
     let advertised = descriptor().capabilities.supported_quants;
@@ -551,7 +566,10 @@ fn the_advertised_quants_are_exactly_the_accepted_ones() {
         spec.quantize = Some(q);
         let err = load_synthetic(&spec).err().unwrap().to_string();
         let accepted = err.contains("tier was requested but");
-        let refused = err.contains("is not an advertised YuE2 tier");
+        // fp8r is refused one layer earlier, by the registry's exact-format opt-in (it never
+        // aliases Q8), so it never reaches the YuE2 tier check.
+        let refused = err.contains("is not an advertised YuE2 tier")
+            || err.contains("does not advertise the exact fp8r packed format");
         assert!(accepted != refused, "{q:?}: {err}");
         assert_eq!(accepted, advertised.contains(&q), "{q:?}: {err}");
     }
@@ -711,6 +729,7 @@ fn a_supplied_score_outside_the_native_dialect_is_refused_visibly() {
 /// Mutations that must fail: map `plan_only` to `false` (a whole song renders), or let `generate`
 /// run it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn plan_only_publishes_a_plan_record_and_renders_no_audio() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), false)).unwrap();
@@ -753,6 +772,9 @@ fn plan_only_publishes_a_plan_record_and_renders_no_audio() {
         generator.validate(&orphan),
         Err(gen_core::Error::Msg(m)) if m.contains("requires audio.artifacts")
     ));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::plan_only_publishes_a_plan_record_and_renders_no_audio");
 }
 
 fn memory_render(
@@ -777,6 +799,7 @@ fn memory_render(
 /// Mutations that must fail (one at a time): `offload_ar: false` in `memory_options`; the query
 /// tile left at the engine's; the decode left at the engine's.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn memory_controls_reach_the_engine_per_request_and_change_no_result() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), false)).unwrap();
@@ -829,6 +852,9 @@ fn memory_controls_reach_the_engine_per_request_and_change_no_result() {
         .fold(0.0f32, f32::max);
     assert_eq!(audio.len(), base_audio.len());
     assert!(worst <= 1e-6, "tiling changed the audio by {worst}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::memory_controls_reach_the_engine_per_request_and_change_no_result");
 }
 
 /// `LoadSpec.offload_policy = Sequential` is the engine's own AR offload; an explicit memory block
@@ -836,6 +862,7 @@ fn memory_controls_reach_the_engine_per_request_and_change_no_result() {
 ///
 /// Mutation that must fail: `offload_ar: false` in `engine_options`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_offload_policy_is_the_engines_default_and_a_request_can_override_it() {
     let tmp = tempfile::tempdir().unwrap();
     let sequential = spec(tmp.path(), false).with_offload_policy(OffloadPolicy::Sequential);
@@ -848,6 +875,9 @@ fn the_offload_policy_is_the_engines_default_and_a_request_can_override_it() {
         Some(GenerationMemory::default()),
     );
     assert_eq!(config["offload_ar"], false);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::the_offload_policy_is_the_engines_default_and_a_request_can_override_it");
 }
 
 /// Every memory control YuE2 does not honour — and every honoured one with an unusable value — is
@@ -976,6 +1006,7 @@ fn cover_request(dir: Option<&Path>, mode: SongCoverMode, score: &str) -> Genera
 /// Mutations that must fail: publish no `cover.json` attachment; map a melody cover to
 /// `CoverMode::Full`; drop the cover warnings from the report.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cover_plans_from_the_reviewed_score_and_publishes_its_report() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), false)).unwrap();
@@ -1068,6 +1099,9 @@ fn a_cover_plans_from_the_reviewed_score_and_publishes_its_report() {
         ))
         .unwrap_err();
     assert!(err.to_string().contains("cover score"), "{err}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_cover_plans_from_the_reviewed_score_and_publishes_its_report");
 }
 
 /// A truncated phase is visible in the result, with or without artifacts: `abc_truncated` /
@@ -1076,6 +1110,7 @@ fn a_cover_plans_from_the_reviewed_score_and_publishes_its_report() {
 /// Mutations that must fail: drop the truncation warnings of the in-memory path, or of the
 /// published path.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_truncated_phase_is_reported_in_the_result() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), false)).unwrap();
@@ -1100,6 +1135,9 @@ fn a_truncated_phase_is_reported_in_the_result() {
         result["truncated"],
         serde_json::json!({"abc": true, "semantic": true})
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_truncated_phase_is_reported_in_the_result");
 }
 
 /// Progress covers the long AR phases: one `Step` per sampled token against the phase's
@@ -1108,6 +1146,7 @@ fn a_truncated_phase_is_reported_in_the_result() {
 ///
 /// Mutation that must fail: emit nothing from `ProgressBridge::on_token`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn progress_counts_each_ar_token_against_its_phase_budget() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), false)).unwrap();
@@ -1143,6 +1182,9 @@ fn progress_counts_each_ar_token_against_its_phase_budget() {
         "the acoustic steps follow"
     );
     assert_eq!(progress.last(), Some(&Progress::Decoding));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::progress_counts_each_ar_token_against_its_phase_budget");
 }
 
 /// An install with only the legacy decoder loads; it renders with `decoder: Legacy`, and a
@@ -1150,6 +1192,7 @@ fn progress_counts_each_ar_token_against_its_phase_budget() {
 ///
 /// Mutation that must fail: require the standard decoder at load again.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_legacy_only_install_loads_and_decodes_with_the_legacy_decoder() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec_with(tmp.path(), false, true)).unwrap();
@@ -1159,6 +1202,9 @@ fn a_legacy_only_install_loads_and_decodes_with_the_legacy_decoder() {
     song_of(&mut req).decoder = Some(SongDecoder::Legacy);
     let track = audio_of(generator.generate(&req, &mut |_| {}).unwrap());
     assert!(!track.samples.is_empty());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_legacy_only_install_loads_and_decodes_with_the_legacy_decoder");
 }
 
 #[test]
@@ -1226,6 +1272,7 @@ fn resume(mut req: GenerationRequest) -> GenerationRequest {
 /// Mutation that must fail: bind the memory controls into the run identity again
 /// (`identity_config` returning the full effective configuration).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_completed_run_resumes_under_other_memory_controls_and_offload_policy() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), false)).unwrap();
@@ -1252,6 +1299,9 @@ fn a_completed_run_resumes_under_other_memory_controls_and_offload_policy() {
     assert_eq!(report.artifacts.unwrap().identity, identity);
     // The record of the run as it was computed is untouched.
     assert_eq!(std::fs::read(dir.join(CONFIG_JSON)).unwrap(), config);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_completed_run_resumes_under_other_memory_controls_and_offload_policy");
 }
 
 /// A cached decode's identity does not bind the decode tiling either: the same cached decode
@@ -1259,6 +1309,7 @@ fn a_completed_run_resumes_under_other_memory_controls_and_offload_policy() {
 ///
 /// Mutation that must fail: bind the tiling into the cached-decode identity again.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cached_decode_resumes_under_other_decode_tiling() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), true)).unwrap();
@@ -1300,11 +1351,15 @@ fn a_cached_decode_resumes_under_other_decode_tiling() {
         audio_of(again.output.unwrap()).samples,
         audio_of(first.output.unwrap()).samples
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_cached_decode_resumes_under_other_decode_tiling");
 }
 
 /// A verified latent can be a source for a fresh target-policy decode. Its published waveform
 /// remains tied to the target policy; the original source config is immutable provenance.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_new_policy_redecodes_verified_latents_with_its_own_identity_and_config() {
     let tmp = tempfile::tempdir().unwrap();
     let old = load_synthetic(&spec(tmp.path(), true)).unwrap();
@@ -1352,6 +1407,9 @@ fn a_new_policy_redecodes_verified_latents_with_its_own_identity_and_config() {
     };
     assert!(err.to_string().contains("identity"), "{err}");
     assert_eq!(std::fs::read(target.join(RESULT_JSON)).unwrap(), before);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_new_policy_redecodes_verified_latents_with_its_own_identity_and_config");
 }
 
 /// What does change a result is still bound: resuming a completed run with another seed, other
@@ -1360,6 +1418,7 @@ fn a_new_policy_redecodes_verified_latents_with_its_own_identity_and_config() {
 ///
 /// Mutation that must fail: project the generation settings out of the identity too.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_result_changing_request_still_refuses_to_resume() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), true)).unwrap();
@@ -1392,6 +1451,9 @@ fn a_result_changing_request_still_refuses_to_resume() {
         assert!(err.to_string().contains("identity"), "{what}: {err}");
     }
     assert_eq!(std::fs::read(dir.join(RESULT_JSON)).unwrap(), before);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_result_changing_request_still_refuses_to_resume");
 }
 
 /// A cached decode binds its decoder: resuming a published legacy decode with the standard
@@ -1400,6 +1462,7 @@ fn a_result_changing_request_still_refuses_to_resume() {
 ///
 /// Mutation that must fail: drop `vae` from `IdentityKeys::cached_decode`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cached_decode_resumed_with_the_other_decoder_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let generator = load_synthetic(&spec(tmp.path(), true)).unwrap();
@@ -1444,4 +1507,7 @@ fn a_cached_decode_resumed_with_the_other_decoder_is_refused() {
     generator
         .generate(&decode(SongDecoder::Legacy, true), &mut |_| {})
         .unwrap();
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_cached_decode_resumed_with_the_other_decoder_is_refused");
 }

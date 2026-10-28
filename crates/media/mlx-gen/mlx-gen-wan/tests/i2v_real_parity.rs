@@ -73,6 +73,7 @@ fn wan_i2v_a14b_real_weight_e2e_matches_reference() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_I2V_MODEL_DIR to the converted I2V-A14B model dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_i2v_a14b_real_weight_e2e_matches_reference; see preceding skip diagnostic");
             return;
         }
     };
@@ -80,6 +81,7 @@ fn wan_i2v_a14b_real_weight_e2e_matches_reference() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_I2V_FIXTURE (run tools/dump_i2v_real_fixtures.py first)");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_i2v_a14b_real_weight_e2e_matches_reference; see preceding skip diagnostic");
             return;
         }
     };
@@ -231,4 +233,6 @@ fn wan_i2v_a14b_real_weight_e2e_matches_reference() {
     assert!(y_mr < 1e-2, "i2v y diverged: mean_rel={y_mr:.3e}");
     assert!(la_mr < 8e-2, "i2v latents diverged: mean_rel={la_mr:.3e}");
     assert!(vid_mr < 8e-2, "i2v video diverged: mean_rel={vid_mr:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED i2v_real_parity::wan_i2v_a14b_real_weight_e2e_matches_reference");
 }

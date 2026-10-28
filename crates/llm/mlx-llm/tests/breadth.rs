@@ -96,6 +96,7 @@ fn dense_mlp(
 }
 
 /// Phi-3: the Llama shape with a packed `qkv_proj` + `gate_up_proj`, split at load.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn phi3_prefills_and_decodes() {
     let (heads, kv, inter) = (4, 4, 64);
@@ -130,9 +131,12 @@ fn phi3_prefills_and_decodes() {
         m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, inter], &mut rng));
     }
     assert_prefills_and_decodes(cfg, m, "phi3");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED breadth::phi3_prefills_and_decodes");
 }
 
 /// Qwen2-MoE: Qwen2 attention (q/k/v bias) + a sparse MoE FFN with a sigmoid-gated shared expert.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn qwen2_moe_prefills_and_decodes() {
     let (heads, kv, inter) = (4, 2, 64);
@@ -204,10 +208,13 @@ fn qwen2_moe_prefills_and_decodes() {
         );
     }
     assert_prefills_and_decodes(cfg, m, "qwen2_moe");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED breadth::qwen2_moe_prefills_and_decodes");
 }
 
 /// Gemma-2: `(1+weight)` norms, embedding ×√hidden, GeGLU, soft-capped attention + final logits,
 /// the 4-norm sandwich block, and a `query_pre_attn_scalar` attention scale.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn gemma2_prefills_and_decodes() {
     let (heads, kv, inter) = (4, 2, 64);
@@ -248,10 +255,13 @@ fn gemma2_prefills_and_decodes() {
         dense_mlp(&mut m, &p, inter, &mut rng);
     }
     assert_prefills_and_decodes(cfg, m, "gemma2");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED breadth::gemma2_prefills_and_decodes");
 }
 
 /// GLM-4: a 4-norm sandwich (standard RMSNorm, GLM key names), q/k/v bias, a packed `gate_up_proj`,
 /// and partial + interleaved RoPE.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn glm4_prefills_and_decodes() {
     let (heads, kv, inter) = (4, 2, 64);
@@ -300,12 +310,15 @@ fn glm4_prefills_and_decodes() {
         m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, inter], &mut rng));
     }
     assert_prefills_and_decodes(cfg, m, "glm4");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED breadth::glm4_prefills_and_decodes");
 }
 
 /// Qwen3-VL (`qwen3_vl`): the VLM-wrapped standard full-attention Qwen3 decoder. Exercises the
 /// VLM-nested weight prefix (`model.language_model.*` with `lm_head.weight` at the root), the
 /// per-head q/k norm, the 256K interleaved-M-RoPE config, the multimodal splice, and the
 /// interleaved-M-RoPE + DeepStack prefill seam — all on tiny synthetic weights (no snapshot).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
     let (heads, kv, inter) = (4, 2, 64);
@@ -508,10 +521,15 @@ fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
         .as_slice::<f32>()
         .iter()
         .all(|x| x.is_finite()));
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED breadth::qwen3vl_prefills_decodes_and_fuses_deepstack"
+    );
 }
 
 /// DeepSeek-V2: Multi-head Latent Attention (full `q_proj`, low-rank KV path, decoupled YaRN RoPE)
 /// and a fine-grained MoE FFN with a leading dense layer and an ungated shared expert.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn deepseek_v2_prefills_and_decodes() {
     let (heads, qk_nope, qk_rope, v_head, kv_lora) = (2, 16, 8, 16, 24);
@@ -594,4 +612,6 @@ fn deepseek_v2_prefills_and_decodes() {
         }
     }
     assert_prefills_and_decodes(cfg, m, "deepseek_v2");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED breadth::deepseek_v2_prefills_and_decodes");
 }

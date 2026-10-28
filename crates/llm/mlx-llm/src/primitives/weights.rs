@@ -109,6 +109,12 @@ impl Weights {
         let path = path.as_ref();
         let tensors = Array::load_safetensors(path)
             .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", path.display())))?;
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_input_proof::record_reader_paths(
+            "mlx-llm::primitives::Weights::from_file",
+            crate::model_input_proof::InputRole::ModelWeights,
+            &[path],
+        );
         Ok(Self::from_map(tensors))
     }
 
@@ -125,13 +131,21 @@ impl Weights {
                 dir.display()
             )));
         }
-        shards.sort(); // deterministic merge order
+        shards.sort();
+        #[cfg(feature = "model-inference-proof")]
+        let __input_paths = shards.clone(); // deterministic merge order
         let mut tensors = HashMap::new();
         for shard in shards {
             let part = Array::load_safetensors(&shard)
                 .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", shard.display())))?;
             tensors.extend(part);
         }
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_input_proof::record_reader_paths(
+            "mlx-llm::primitives::Weights::from_dir",
+            crate::model_input_proof::InputRole::ModelWeights,
+            &__input_paths,
+        );
         Ok(Self::from_map(tensors))
     }
 

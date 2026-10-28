@@ -55,3 +55,6 @@ tempfile = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+[features]
+model-inference-proof = ["mlx-gen-perceptual/model-inference-proof", "mlx-gen/model-inference-proof", "mlx-gen-z-image/model-inference-proof", "mlx-llm/model-inference-proof"]

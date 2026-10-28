@@ -34,4 +34,7 @@ fn joycaption_conformance() {
         ..CaptionerProfile::cheap()
     };
     captioner_conformance(|| candle_gen_joycaption::load(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::joycaption_conformance");
 }

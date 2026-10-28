@@ -194,6 +194,8 @@ fn kv_cache_edit_is_coherent() {
         mean > 2.0 && mean < 253.0 && std > 5.0,
         "cache-on edit looks degenerate (mean={mean}, std={std}) — cache produced garbage?"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache_real_weights::kv_cache_edit_is_coherent");
 }
 
 #[test]
@@ -212,6 +214,8 @@ fn q8_kv_cache_edit_is_coherent() {
         mean > 2.0 && mean < 253.0 && std > 5.0,
         "Q8 cache-on edit looks degenerate (mean={mean}, std={std}) — cache×quant broke?"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache_real_weights::q8_kv_cache_edit_is_coherent");
 }
 
 #[test]
@@ -244,4 +248,5 @@ fn kv_cache_delivers_edit_speedup() {
         "KV-cache speedup {speedup:.2}× below the {floor}× floor ({size}², {nref} ref) — \
          cache not reducing work"
     );
+    crate::model_inference_device::record_model_inference_device();
 }

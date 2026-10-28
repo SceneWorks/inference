@@ -97,6 +97,7 @@ fn reference_shape_tiled(
 /// blended. Driving the reference's own shape through our decoder must therefore still land on the
 /// golden within the same conv float-ordering envelope as the S2 single-pass decode gate. A real
 /// port regression — a wrong layer, a wrong blend mask, a wrong tile offset — still fails here.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn reference_tiling_shape_still_matches_the_reference() {
     let (vae, tiled_in, exp) = golden();
@@ -115,6 +116,8 @@ fn reference_tiling_shape_still_matches_the_reference() {
         mean_rel < 1e-3,
         "the decoder port diverged from the reference: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiling_parity::reference_tiling_shape_still_matches_the_reference");
 }
 
 /// Claim 2 — the sc-19753 policy is **closer to a dense decode** than the reference's policy.
@@ -126,6 +129,7 @@ fn reference_tiling_shape_still_matches_the_reference() {
 ///
 /// A relative claim rather than a tolerance, because on this tiny random-weight fixture the causal
 /// conv zero-pad seam residual dominates both numbers and is untouched by this story.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn bounded_decode_is_closer_to_dense_than_reference_tiling() {
     let (vae, tiled_in, _) = golden();
@@ -145,8 +149,11 @@ fn bounded_decode_is_closer_to_dense_than_reference_tiling() {
         "keeping the middle-block attention whole must materially reduce the divergence from a \
          dense decode: bounded={bounded_rel:.3e} vs reference={reference_rel:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiling_parity::bounded_decode_is_closer_to_dense_than_reference_tiling");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_tiled_fallback_is_single_pass() {
     // When the config doesn't fire for the dims, decode_tiled must equal a single-pass decode.
@@ -168,11 +175,14 @@ fn wan_tiled_fallback_is_single_pass() {
         mean_rel < 1e-6,
         "no-tiling fallback must equal single-pass decode"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiling_parity::wan_tiled_fallback_is_single_pass");
 }
 
 /// SC-18309 N1: the generic z16 video adapter is an exact identity around the historical VAE
 /// decode, while the image adapter performs only the documented rank lift and leading-frame slice.
 /// The checked-in tiny VAE makes this a real de-normalization/decoder/output-layout regression gate.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_z16_adapters_are_byte_exact_to_legacy_routes() {
     let path = concat!(
@@ -208,11 +218,14 @@ fn wan_z16_adapters_are_byte_exact_to_legacy_routes() {
         seam_image.reshape(&[-1]).unwrap().as_slice::<f32>(),
         legacy_image.reshape(&[-1]).unwrap().as_slice::<f32>()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiling_parity::wan_z16_adapters_are_byte_exact_to_legacy_routes");
 }
 
 /// Valid z16 video and still-image latents prove that both an actually-firing plan and an actually
 /// non-firing monolithic fallback observe pre-cancellation before any decode work. The explicit
 /// `needs_tiling` assertions prevent malformed shapes from making the route classification vacuous.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_z16_valid_firing_and_fallback_routes_precancel() {
     let path = concat!(
@@ -259,10 +272,13 @@ fn wan_z16_valid_firing_and_fallback_routes_precancel() {
             Err(Error::Canceled)
         ));
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiling_parity::wan_z16_valid_firing_and_fallback_routes_precancel");
 }
 
 /// Malformed-input dominance is independent of the valid firing/fallback proof above: cancellation
 /// must still win before adapter rank checks or inherent VAE shape inspection.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_z16_precancel_wins_before_malformed_input_validation() {
     let path = concat!(
@@ -288,6 +304,8 @@ fn wan_z16_precancel_wins_before_malformed_input_validation() {
             Err(Error::Canceled)
         ));
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiling_parity::wan_z16_precancel_wins_before_malformed_input_validation");
 }
 
 /// Min/max/mean of a slice, plus the count of "flat" frames (per-frame range below `eps` — the
@@ -322,6 +340,7 @@ fn frame_health(v: &[f32], t: usize, h: usize, w: usize, eps: f32) -> (f32, f32,
 /// through the public [`WanVae::decode_tiled`] to a finite, full-shape, non-degenerate video (no flat
 /// frames). The exact blend equivalence is gated bit-for-bit by the `vae_common` unit tests and the
 /// reference golden above; this is the end-to-end sanity check on the real decode path.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_combined_plan_decode_is_sane() {
     let path = concat!(
@@ -377,6 +396,8 @@ fn wan_combined_plan_decode_is_sane() {
             "{label}: combined decode has no dynamic range (flat output)"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiling_parity::wan_combined_plan_decode_is_sane");
 }
 
 /// sc-5690 verification (real weights): the production `auto` path for a high-res long clip emits a
@@ -403,6 +424,7 @@ fn wan_combined_auto_decode_not_flat_real() {
         }
         None => {
             eprintln!("skip: set WAN_A14B_MODEL_DIR");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_combined_auto_decode_not_flat_real; see preceding skip diagnostic");
             return;
         }
     };
@@ -440,6 +462,10 @@ fn wan_combined_auto_decode_not_flat_real() {
     println!("[combined auto real] shape={s:?} min={mn:.4} max={mx:.4} mean={mean:.4} flat_frames={flat}/{}", s[2]);
     assert_eq!(flat, 0, "combined auto decode produced flat frames");
     assert!(mx - mn > 0.5, "combined auto decode looks degenerate");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED tiling_parity::wan_combined_auto_decode_not_flat_real"
+    );
 }
 
 /// Real-weight equivalence: on the **converted A14B z16 VAE** (a smooth learned decoder), tiled
@@ -463,6 +489,7 @@ fn wan_tiled_close_to_single_pass_real() {
         }
         None => {
             eprintln!("skip: set WAN_A14B_MODEL_DIR");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_tiled_close_to_single_pass_real; see preceding skip diagnostic");
             return;
         }
     };
@@ -482,4 +509,6 @@ fn wan_tiled_close_to_single_pass_real() {
         mean_rel < 5e-2,
         "real tiled decode diverged from single-pass: mean_rel={mean_rel:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiling_parity::wan_tiled_close_to_single_pass_real");
 }

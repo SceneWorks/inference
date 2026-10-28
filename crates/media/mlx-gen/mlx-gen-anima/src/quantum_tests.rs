@@ -43,6 +43,7 @@ fn in_cpu_child(name: &str) -> bool {
                 "--include-ignored",
             ])
             .env(CHILD, "1")
+            .env("IOS_CAPTURE_IN_CHILD", "1")
             .status()
             .unwrap();
         assert!(status.success(), "CPU child for {name} failed");
@@ -187,8 +188,10 @@ fn dit_inputs(cfg: &DitConfig, edge: i32, ctx: i32) -> (Array, Array, Array) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn dit_resident_blocks_are_guarded_quanta() {
     if !in_cpu_child("dit_resident_blocks_are_guarded_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::dit_resident_blocks_are_guarded_quanta");
         return;
     }
     let cfg = dit_cfg(3, 2.0);
@@ -260,12 +263,17 @@ fn dit_resident_blocks_are_guarded_quanta() {
         refused_events.is_empty(),
         "nothing may run past a refusal: {refused_events:?}"
     );
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::dit_resident_blocks_are_guarded_quanta"
+    );
 }
 
 /// The stage-4 golden hook shares `run_blocks`, so its partial stack is guarded per block too.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn dit_partial_stack_hook_is_guarded_per_block() {
     if !in_cpu_child("dit_partial_stack_hook_is_guarded_per_block") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::dit_partial_stack_hook_is_guarded_per_block");
         return;
     }
     let cfg = dit_cfg(3, 2.0);
@@ -277,6 +285,7 @@ fn dit_partial_stack_hook_is_guarded_per_block() {
     assert_eq!(f32_bytes(&guarded.unwrap()), host);
     assert_checked_before_synchronized(&events);
     assert_eq!(checked(&events, DIT_BLOCK_QUANTUM), 2);
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::dit_partial_stack_hook_is_guarded_per_block");
 }
 
 /// Every tensor `CosmosDiT::from_weights(.., "net", cfg)` reads, written to a temp safetensors so
@@ -392,8 +401,10 @@ fn write_dit_checkpoint_as(
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn dit_windowed_blocks_are_guarded_quanta() {
     if !in_cpu_child("dit_windowed_blocks_are_guarded_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::dit_windowed_blocks_are_guarded_quanta");
         return;
     }
     let cfg = dit_cfg(3, 2.0);
@@ -462,6 +473,9 @@ fn dit_windowed_blocks_are_guarded_quanta() {
     assert!(refused.is_err());
     assert_eq!(take_refusal().unwrap().label, DIT_EMBED_QUANTUM);
     assert!(refused_events.is_empty(), "{refused_events:?}");
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::dit_windowed_blocks_are_guarded_quanta"
+    );
 }
 
 // ---- Conditioner ---------------------------------------------------------------------------------
@@ -496,8 +510,10 @@ fn conditioner_inputs(cfg: &ConditionerConfig, ss: i32, st: i32) -> (Array, Arra
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn conditioner_blocks_are_guarded_quanta() {
     if !in_cpu_child("conditioner_blocks_are_guarded_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::conditioner_blocks_are_guarded_quanta");
         return;
     }
     let cfg = conditioner_cfg(4.0);
@@ -532,6 +548,9 @@ fn conditioner_blocks_are_guarded_quanta() {
     // after the refused block did.
     let label = assert_refuses_at_first_growth(&events, run);
     assert_eq!(label, CONDITIONER_BLOCK_QUANTUM);
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::conditioner_blocks_are_guarded_quanta"
+    );
 }
 
 // ---- Qwen3 text encoder --------------------------------------------------------------------------
@@ -610,8 +629,10 @@ fn qwen3_inputs(len: i32) -> (Array, Array) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn text_encoder_layers_are_guarded_quanta() {
     if !in_cpu_child("text_encoder_layers_are_guarded_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::text_encoder_layers_are_guarded_quanta");
         return;
     }
     let cfg = tiny_qwen3_cfg(3);
@@ -642,13 +663,18 @@ fn text_encoder_layers_are_guarded_quanta() {
     assert!(refused.is_err());
     assert_eq!(take_refusal().unwrap().label, TE_EMBED_QUANTUM);
     assert!(refused_events.is_empty(), "{refused_events:?}");
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::text_encoder_layers_are_guarded_quanta"
+    );
 }
 
 // ---- Scratch geometry ----------------------------------------------------------------------------
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn scratch_derives_from_loaded_tensors_and_grows_with_geometry() {
     if !in_cpu_child("scratch_derives_from_loaded_tensors_and_grows_with_geometry") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::scratch_derives_from_loaded_tensors_and_grows_with_geometry");
         return;
     }
     let scratch_of = |events: &[QuantumEvent], label: &str| {
@@ -859,6 +885,7 @@ fn scratch_derives_from_loaded_tensors_and_grows_with_geometry() {
             &|backend| te.layer(0, 1, 12, 4, backend).1,
         );
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::scratch_derives_from_loaded_tensors_and_grows_with_geometry");
 }
 
 // ---- Pre-load floors -----------------------------------------------------------------------------
@@ -1143,8 +1170,10 @@ fn sdpa_scores_follow_the_metal_kernel_support() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn dit_formulas_track_the_measured_peak() {
     if !in_cpu_child("dit_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::dit_formulas_track_the_measured_peak");
         return;
     }
     let dtype = Dtype::Bfloat16;
@@ -1299,6 +1328,15 @@ fn dit_formulas_track_the_measured_peak() {
             measured(|| dit.output(&f32_hidden, &embedded, &temb, (1, 8, 8))),
         );
     }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!(
+            "\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::dit_formulas_track_the_measured_peak"
+        );
+    }
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::dit_formulas_track_the_measured_peak"
+    );
 }
 
 /// Every tensor `AnimaTextConditioner::from_weights(.., "net.llm_adapter", cfg)` reads, at `dtype`.
@@ -1377,8 +1415,10 @@ fn conditioner_weights(cfg: &ConditionerConfig, dtype: Dtype) -> Weights {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn conditioner_formulas_track_the_measured_peak() {
     if !in_cpu_child("conditioner_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::conditioner_formulas_track_the_measured_peak");
         return;
     }
     // Production feeds the conditioner the Qwen3 tower's f32 states and runs it at their dtype.
@@ -1452,11 +1492,18 @@ fn conditioner_formulas_track_the_measured_peak() {
             measured(|| cond.output(&out, 1, st, Some(&weights), out.dtype())),
         );
     }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::conditioner_formulas_track_the_measured_peak");
+    }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::conditioner_formulas_track_the_measured_peak");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn text_encoder_formulas_track_the_measured_peak() {
     if !in_cpu_child("text_encoder_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::text_encoder_formulas_track_the_measured_peak");
         return;
     }
     // Qwen3-0.6B's proportions in miniature: q (heads x head_dim) twice the hidden width, GQA 2:1,
@@ -1537,6 +1584,11 @@ fn text_encoder_formulas_track_the_measured_peak() {
             measured(|| te.final_norm(&out)),
         );
     }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::text_encoder_formulas_track_the_measured_peak");
+    }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::text_encoder_formulas_track_the_measured_peak");
 }
 
 // ---- Phase-boundary materializations -------------------------------------------------------------
@@ -1602,352 +1654,726 @@ fn phase_boundary_materializations_are_guarded() {
     );
 }
 
+// ---- iOS pricing: label attribution --------------------------------------------------------------
+
+/// Every quantum label this crate declares (each `*_QUANTUM` string constant in its sources), the
+/// shared solver-step label its sampler emits, and every decode label the Qwen-Image VAE it decodes
+/// through declares, is attributed to a phase.
+#[test]
+fn every_quantum_label_maps_to_a_phase() {
+    use crate::ios_pricing::ios_quantum_phase;
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources: Vec<std::path::PathBuf> = std::fs::read_dir(manifest.join("src"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    // The Qwen-Image VAE decode this route runs (`mlx-gen-qwen-image/src/vae`).
+    let qwen_vae = manifest.join("../mlx-gen-qwen-image/src/vae");
+    sources.extend(["mod.rs", "blocks.rs"].map(|f| qwen_vae.join(f)));
+    // The curated solver's step boundary (`mlx_gen::sampler`).
+    sources.push(manifest.join("../src/sampler.rs"));
+    let mut labels = Vec::new();
+    for path in &sources {
+        let text = std::fs::read_to_string(path).unwrap();
+        for line in text.lines().filter(|l| l.contains("const ")) {
+            if let Some((_, rest)) = line.split_once("_QUANTUM: &str = \"") {
+                labels.push(rest.split('"').next().unwrap().to_string());
+            }
+        }
+    }
+    // 15 Anima labels + 7 Qwen-Image VAE decode labels + the solver step.
+    assert_eq!(labels.len(), 23, "{labels:?}");
+    for label in &labels {
+        assert!(
+            ios_quantum_phase(label).is_some(),
+            "unattributed quantum label {label:?}"
+        );
+    }
+    assert_eq!(ios_quantum_phase("not an Anima quantum"), None);
+}
+
+// ---- iOS pricing: proof on the tiny fixture ------------------------------------------------------
+
+/// The tiny configs the pricing proof drives the production path with: every width distinct where a
+/// confusion would hide (Qwen3 hidden 12 ≠ heads·head_dim 8; DiT context 16 ≠ hidden 24), the real
+/// tokenizers' vocabularies, and a RoPE range that covers a 512² request.
+fn proof_configs() -> (DitConfig, ConditionerConfig, Qwen3Config) {
+    let dit = DitConfig {
+        in_channels: crate::config::VAE_CHANNELS,
+        out_channels: crate::config::VAE_CHANNELS,
+        num_attention_heads: 2,
+        attention_head_dim: 12,
+        num_layers: 2,
+        mlp_ratio: 2.0,
+        text_embed_dim: 16,
+        adaln_lora_dim: 8,
+        max_size: (4, 64, 64),
+        patch_size: (1, 2, 2),
+        rope_scale: (1.0, 4.0, 4.0),
+        concat_padding_mask: true,
+    };
+    let conditioner = ConditionerConfig {
+        source_dim: 12,
+        target_dim: 16,
+        model_dim: 16,
+        num_layers: 2,
+        num_attention_heads: 2,
+        mlp_ratio: 4.0,
+        target_vocab_size: 32128,
+        min_sequence_length: 24,
+        rope_theta: 10000.0,
+        norm_eps: 1e-6,
+    };
+    let qwen3 = Qwen3Config {
+        vocab_size: 151_936,
+        hidden_size: 12,
+        n_layers: 2,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 4,
+        rope_theta: 1_000_000.0,
+        rms_norm_eps: 1e-6,
+    };
+    (dit, conditioner, qwen3)
+}
+
+fn save(path: &std::path::Path, tensors: &std::collections::HashMap<String, Array>) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(refs, None, path).unwrap();
+}
+
+/// A tiny Qwen-Image VAE in Anima's ORIGINAL on-disk naming (the layout of the real
+/// `qwen_image_vae.safetensors`, at base width `c` instead of 96), stored bf16.
+fn tiny_original_vae(c: i32) -> std::collections::HashMap<String, Array> {
+    let (d1, d2, d4) = (c, 2 * c, 4 * c);
+    let mut t = std::collections::HashMap::new();
+    let mut seed = 3000u64;
+    let mut put = |t: &mut std::collections::HashMap<String, Array>, k: String, shape: &[i32]| {
+        seed += 1;
+        let v = if k.ends_with("gamma") {
+            Array::ones::<f32>(shape).unwrap()
+        } else {
+            let a = random::normal::<f32>(shape, None, None, Some(&random::key(seed).unwrap()))
+                .unwrap();
+            mlx_rs::ops::multiply(&a, Array::from_slice(&[0.05f32], &[1])).unwrap()
+        };
+        t.insert(k, v.as_dtype(Dtype::Bfloat16).unwrap());
+    };
+    let mut resnet = |t: &mut std::collections::HashMap<String, Array>, p: &str, i: i32, o: i32| {
+        put(t, format!("{p}.residual.0.gamma"), &[i, 1, 1, 1]);
+        put(t, format!("{p}.residual.2.weight"), &[o, i, 3, 3, 3]);
+        put(t, format!("{p}.residual.2.bias"), &[o]);
+        put(t, format!("{p}.residual.3.gamma"), &[o, 1, 1, 1]);
+        put(t, format!("{p}.residual.6.weight"), &[o, o, 3, 3, 3]);
+        put(t, format!("{p}.residual.6.bias"), &[o]);
+        if i != o {
+            put(t, format!("{p}.shortcut.weight"), &[o, i, 1, 1, 1]);
+            put(t, format!("{p}.shortcut.bias"), &[o]);
+        }
+    };
+    for side in ["encoder", "decoder"] {
+        resnet(&mut t, &format!("{side}.middle.0"), d4, d4);
+        resnet(&mut t, &format!("{side}.middle.2"), d4, d4);
+    }
+    // Encoder: conv1, downsamples 0..10, head.
+    resnet(&mut t, "encoder.downsamples.0", d1, d1);
+    resnet(&mut t, "encoder.downsamples.1", d1, d1);
+    resnet(&mut t, "encoder.downsamples.3", d1, d2);
+    resnet(&mut t, "encoder.downsamples.4", d2, d2);
+    resnet(&mut t, "encoder.downsamples.6", d2, d4);
+    resnet(&mut t, "encoder.downsamples.7", d4, d4);
+    resnet(&mut t, "encoder.downsamples.9", d4, d4);
+    resnet(&mut t, "encoder.downsamples.10", d4, d4);
+    // Decoder: upsamples 0..14 (resnets; 3, 7, 11 resample).
+    for (i, (a, b)) in [
+        (0, (d4, d4)),
+        (1, (d4, d4)),
+        (2, (d4, d4)),
+        (4, (d2, d4)),
+        (5, (d4, d4)),
+        (6, (d4, d4)),
+        (8, (d2, d2)),
+        (9, (d2, d2)),
+        (10, (d2, d2)),
+        (12, (d1, d1)),
+        (13, (d1, d1)),
+        (14, (d1, d1)),
+    ] {
+        resnet(&mut t, &format!("decoder.upsamples.{i}"), a, b);
+    }
+    // The non-resnet tensors (`resnet` holds the first writer).
+    let mut seed = 4000u64;
+    let mut put = |t: &mut std::collections::HashMap<String, Array>, k: &str, shape: &[i32]| {
+        seed += 1;
+        let v = if k.ends_with("gamma") {
+            Array::ones::<f32>(shape).unwrap()
+        } else {
+            let a = random::normal::<f32>(shape, None, None, Some(&random::key(seed).unwrap()))
+                .unwrap();
+            mlx_rs::ops::multiply(&a, Array::from_slice(&[0.05f32], &[1])).unwrap()
+        };
+        t.insert(k.to_string(), v.as_dtype(Dtype::Bfloat16).unwrap());
+    };
+    for side in ["encoder", "decoder"] {
+        put(&mut t, &format!("{side}.middle.1.norm.gamma"), &[d4, 1, 1]);
+        put(
+            &mut t,
+            &format!("{side}.middle.1.to_qkv.weight"),
+            &[3 * d4, d4, 1, 1],
+        );
+        put(&mut t, &format!("{side}.middle.1.to_qkv.bias"), &[3 * d4]);
+        put(
+            &mut t,
+            &format!("{side}.middle.1.proj.weight"),
+            &[d4, d4, 1, 1],
+        );
+        put(&mut t, &format!("{side}.middle.1.proj.bias"), &[d4]);
+    }
+    put(&mut t, "encoder.conv1.weight", &[d1, 3, 3, 3, 3]);
+    put(&mut t, "encoder.conv1.bias", &[d1]);
+    for (i, ch, time) in [(2, d1, false), (5, d2, true), (8, d4, true)] {
+        put(
+            &mut t,
+            &format!("encoder.downsamples.{i}.resample.1.weight"),
+            &[ch, ch, 3, 3],
+        );
+        put(
+            &mut t,
+            &format!("encoder.downsamples.{i}.resample.1.bias"),
+            &[ch],
+        );
+        if time {
+            put(
+                &mut t,
+                &format!("encoder.downsamples.{i}.time_conv.weight"),
+                &[ch, ch, 3, 1, 1],
+            );
+            put(
+                &mut t,
+                &format!("encoder.downsamples.{i}.time_conv.bias"),
+                &[ch],
+            );
+        }
+    }
+    put(&mut t, "encoder.head.0.gamma", &[d4, 1, 1, 1]);
+    put(&mut t, "encoder.head.2.weight", &[32, d4, 3, 3, 3]);
+    put(&mut t, "encoder.head.2.bias", &[32]);
+    put(&mut t, "conv1.weight", &[32, 32, 1, 1, 1]);
+    put(&mut t, "conv1.bias", &[32]);
+    put(&mut t, "conv2.weight", &[16, 16, 1, 1, 1]);
+    put(&mut t, "conv2.bias", &[16]);
+    put(&mut t, "decoder.conv1.weight", &[d4, 16, 3, 3, 3]);
+    put(&mut t, "decoder.conv1.bias", &[d4]);
+    for (i, out, inp, time) in [(3, d2, d4, true), (7, d2, d4, true), (11, d1, d2, false)] {
+        put(
+            &mut t,
+            &format!("decoder.upsamples.{i}.resample.1.weight"),
+            &[out, inp, 3, 3],
+        );
+        put(
+            &mut t,
+            &format!("decoder.upsamples.{i}.resample.1.bias"),
+            &[out],
+        );
+        if time {
+            put(
+                &mut t,
+                &format!("decoder.upsamples.{i}.time_conv.weight"),
+                &[2 * inp, inp, 3, 1, 1],
+            );
+            put(
+                &mut t,
+                &format!("decoder.upsamples.{i}.time_conv.bias"),
+                &[2 * inp],
+            );
+        }
+    }
+    put(&mut t, "decoder.head.0.gamma", &[d1, 1, 1, 1]);
+    put(&mut t, "decoder.head.2.weight", &[3, d1, 3, 3, 3]);
+    put(&mut t, "decoder.head.2.bias", &[3]);
+    t
+}
+
+/// Write a tiny `split_files/` snapshot of the shipped layout: the DiT + bundled conditioner, the
+/// Qwen3 tower and the Qwen-Image VAE, each stored bf16 like the real files.
+fn write_tiny_snapshot(
+    root: &std::path::Path,
+    configs: &(DitConfig, ConditionerConfig, Qwen3Config),
+) {
+    let (dit_cfg, cond_cfg, qwen_cfg) = configs;
+    let scratch = tempfile::tempdir().unwrap();
+    let dit_path = write_dit_checkpoint_as(scratch.path(), dit_cfg, Dtype::Bfloat16);
+    let mut dit = Weights::from_file(&dit_path).unwrap().into_tensors();
+    dit.extend(conditioner_weights(cond_cfg, Dtype::Bfloat16).into_tensors());
+    save(
+        &root
+            .join("diffusion_models")
+            .join(crate::config::Variant::Turbo.dit_filename()),
+        &dit,
+    );
+    let te: std::collections::HashMap<String, Array> = tiny_qwen3_weights(qwen_cfg, 20)
+        .into_tensors()
+        .into_iter()
+        .map(|(k, v)| (k, v.as_dtype(Dtype::Bfloat16).unwrap()))
+        .collect();
+    save(&root.join(crate::loader::TEXT_ENCODER_FILE), &te);
+    save(&root.join(crate::loader::VAE_FILE), &tiny_original_vae(2));
+}
+
+/// PROOF that the iOS pricing prices what runs: the REAL production path — `load_turbo` on an iOS
+/// load spec (sequential + deferred materialization) and `Generator::generate` with the request
+/// memory the contract resolves — runs on a tiny bf16 snapshot under the CPU diagnostic fixture,
+/// and for every quantum label it checks, the largest scratch it checked EQUALS the price's
+/// (so every phase's largest counted quantum and its binding label match too), for the fully
+/// optimized selection (the cheapest rung-4 selection) and for rung 0 Resident. Text-to-image is
+/// Anima's only route (no encode mode exists).
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn ios_pricing_equals_the_checked_quanta_on_the_production_path() {
+    if !in_cpu_child("ios_pricing_equals_the_checked_quanta_on_the_production_path") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::ios_pricing_equals_the_checked_quanta_on_the_production_path");
+        return;
+    }
+    use crate::ios_pricing::{
+        fold, ios_quantum_phase, price_quanta, snapshot_facts, AnimaPricingWork,
+    };
+    use mlx_gen::gen_core::{MemoryNumericTier, MemoryStrategy};
+    use mlx_gen::ios_pricing::IosPhase;
+    use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy};
+
+    let configs = proof_configs();
+    crate::loader::FIXTURE_CONFIGS.with(|c| c.set(Some(configs)));
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_snapshot(tmp.path(), &configs);
+    // The iOS load (`mlx-gen-ios-catalog::anima::anima_turbo_load_spec`).
+    let spec = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()))
+        .with_offload_policy(OffloadPolicy::Sequential)
+        .with_load_shape(LoadShape::DeferredMaterialization);
+    let generator = crate::model::load_turbo(&spec).unwrap();
+    let contract = crate::memory_strategy::memory_strategy_contract("anima_turbo", &spec).unwrap();
+    let tier = MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    };
+    let prompt = "a silver-haired girl";
+    let tokenizers = crate::tokenizer::AnimaTokenizers::load().unwrap();
+    let qwen_tokens = tokenizers
+        .encode_qwen(&crate::prompt_weight::strip_prompt_weights(prompt))
+        .unwrap()
+        .0
+        .shape()[1] as u32;
+    let t5_tokens = tokenizers.encode_t5_weighted(prompt).unwrap().0.shape()[1] as u32;
+    let facts = snapshot_facts(&spec, crate::config::Variant::Turbo).unwrap();
+
+    for strategy in [
+        MemoryStrategy::BoundedTransformerResidency,
+        MemoryStrategy::Resident,
+    ] {
+        let selection = contract
+            .selection_space(strategy, tier, false)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let execution = contract.generation_memory(&selection).unwrap_or_default();
+        let req = GenerationRequest {
+            prompt: prompt.into(),
+            width: 512,
+            height: 512,
+            steps: Some(1),
+            memory: Some(execution),
+            ..Default::default()
+        };
+        let (result, events) = observed(AMPLE, || {
+            generator
+                .generate(&req, &mut |_| {})
+                .map_err(|e| mlx_gen::Error::Msg(e.to_string()))
+        });
+        result.unwrap();
+        assert_checked_before_synchronized_or_loads(&events);
+        let work = AnimaPricingWork {
+            width: 512,
+            height: 512,
+            count: 1,
+            qwen_tokens,
+            t5_tokens,
+            backend: crate::transformer::Backend::current(),
+        };
+        let priced = price_quanta(&facts, work, &execution).unwrap();
+        let largest = |pairs: &mut dyn Iterator<Item = (String, u64)>| {
+            let mut by_label = std::collections::BTreeMap::<String, u64>::new();
+            for (label, scratch) in pairs {
+                let slot = by_label.entry(label).or_default();
+                *slot = (*slot).max(scratch);
+            }
+            by_label
+        };
+        let checked = largest(&mut events.iter().filter_map(|e| match e {
+            QuantumEvent::Checked { label, scratch } => Some((label.clone(), *scratch)),
+            QuantumEvent::Synchronized { .. } => None,
+        }));
+        let prices = largest(
+            &mut priced
+                .iter()
+                .map(|q| (q.label.to_string(), q.scratch_bytes)),
+        );
+        assert_eq!(checked, prices, "{strategy:?}: checked vs priced quanta");
+        for label in checked.keys() {
+            assert!(ios_quantum_phase(label).is_some(), "{label}");
+        }
+        // Each non-load phase's price is its largest checked quantum, bound by that quantum's label
+        // (a phase's resident set is one regime); a load phase's is one of its checked loads.
+        let pricing = fold(&priced);
+        assert!(pricing.phase(IosPhase::Encode).is_none());
+        for phase in IosPhase::ALL {
+            let in_phase: Vec<(&String, &u64)> = checked
+                .iter()
+                .filter(|(l, _)| ios_quantum_phase(l) == Some(phase))
+                .collect();
+            let price = pricing.phase(phase);
+            assert_eq!(
+                price.is_some(),
+                !in_phase.is_empty(),
+                "{strategy:?} {phase:?}"
+            );
+            let Some(price) = price else { continue };
+            if phase == IosPhase::Load {
+                assert_eq!(checked[&price.binding], price.scratch_bytes);
+                continue;
+            }
+            let (label, scratch) = in_phase.into_iter().max_by_key(|(_, s)| **s).unwrap();
+            assert_eq!(
+                (price.binding.as_str(), price.scratch_bytes),
+                (label.as_str(), *scratch),
+                "{strategy:?} {phase:?}"
+            );
+        }
+        println!("{strategy:?}: {pricing:?}");
+    }
+    crate::loader::FIXTURE_CONFIGS.with(|c| c.set(None));
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::ios_pricing_equals_the_checked_quanta_on_the_production_path");
+}
+
+/// Load floors are single `Checked` events (`before_load*` checks without a synchronized graph);
+/// every other quantum is checked before it synchronizes.
+fn assert_checked_before_synchronized_or_loads(events: &[QuantumEvent]) {
+    let loads = [
+        crate::loader::TEXT_LOAD_QUANTUM,
+        crate::loader::HEAVY_LOAD_QUANTUM,
+        crate::loader::VAE_LOAD_QUANTUM,
+    ];
+    let rest: Vec<QuantumEvent> = events
+        .iter()
+        .filter(|e| !matches!(e, QuantumEvent::Checked { label, .. } if loads.contains(&label.as_str())))
+        .cloned()
+        .collect();
+    assert_checked_before_synchronized(&rest);
+}
+
 // ---- Reachable-sizes prediction ------------------------------------------------------------------
 
 /// The entitled iOS launch headroom the prediction compares against.
 const ENTITLED_HEADROOM_MIB: u64 = 6142;
 
-/// The real Anima `split_files/` snapshot, if this host has it (header reads only).
 /// The caller-provisioned `split_files/` snapshot (inference never derives a cache path).
 fn anima_snapshot() -> Option<std::path::PathBuf> {
     std::env::var_os("ANIMA_SPLIT_FILES").map(Into::into)
 }
 
-/// Stored bytes of a `[out, in]` `.weight` at a packed tier, by the convert-at-install rule
-/// (`mlx_gen::quant::quantize_map`): `bits`-wide codes plus bf16 scales and biases per 64-group.
-/// `None` for a tensor the converter leaves dense.
-fn packed_bytes(
-    header: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
-    bits: u64,
-) -> Option<u64> {
-    let base = header.name.strip_suffix(".weight")?;
-    if !crate::convert::is_dit_quant_target(base) || header.shape.len() != 2 {
-        return None;
+/// The DiT checkpoint's headers at a packed tier, by the convert-at-install rule
+/// (`convert::quantize_anima_dit` → `mlx_gen::quant::quantize_map`): every group-aligned 2-D DiT
+/// `.weight` (never the bundled conditioner) becomes `bits`-wide u32 codes plus bf16 scales and
+/// biases per 64-group; every other tensor passes through.
+fn packed_headers(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    bits: usize,
+) -> Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader> {
+    use mlx_gen::gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader as H};
+    const GROUP: usize = 64;
+    let mut out = Vec::with_capacity(headers.len());
+    for h in headers {
+        let base = h
+            .name
+            .strip_suffix(".weight")
+            .filter(|b| crate::convert::is_dit_quant_target(b));
+        match (base, h.shape.as_slice()) {
+            (Some(base), &[o, i]) if i % GROUP == 0 && i >= GROUP => {
+                out.push(H {
+                    name: h.name.clone(),
+                    dtype: Stored::U32,
+                    shape: vec![o, i * bits / 32],
+                    data_bytes: (o * i * bits / 8) as u64,
+                });
+                for part in ["scales", "biases"] {
+                    out.push(H {
+                        name: format!("{base}.{part}"),
+                        dtype: Stored::BF16,
+                        shape: vec![o, i / GROUP],
+                        data_bytes: (o * (i / GROUP) * 2) as u64,
+                    });
+                }
+            }
+            _ => out.push(h.clone()),
+        }
     }
-    let (out, inp) = (header.shape[0] as u64, header.shape[1] as u64);
-    (inp % 64 == 0 && inp >= 64).then(|| out * inp * bits / 8 + 2 * out * (inp / 64) * 2)
+    out
 }
 
-/// A HOST-DERIVED PREDICTION, not evidence: for `anima_turbo` at q4/q8/bf16 x 512/768/1024 and every
-/// ladder rung, the resident bytes of each phase (from the real snapshot's safetensors headers; no
-/// tensor data is read), the largest counted quantum scratch in that phase (every formula above,
-/// evaluated at production geometry on modules built lazily from those headers), and whether
-/// `resident + scratch + 512 MiB reserve <= 6142 MiB`. Load floors are reported as their own
-/// phases. Run: `cargo test -p mlx-gen-anima --lib reachable_sizes_prediction -- --ignored --nocapture`.
+/// A HOST-DERIVED PREDICTION, not evidence: `anima_turbo` text-to-image (its only route) at
+/// q4/q8/bf16 x 512/768/1024 on the iOS load, priced by `crate::ios_pricing` from the real
+/// snapshot's headers (no tensor data is read; q4/q8 project the bf16 headers through the
+/// convert-at-install rule). For each phase: resident + largest counted quantum + 512 MiB reserve
+/// against 6142 MiB, at
+///
+/// * (A) the FULLY OPTIMIZED selection — the cheapest (last) selection of the deepest rung the iOS
+///   load implements: `BoundedTransformerResidency` (rung 4, `Implemented` on a
+///   DeferredMaterialization load; it engages rungs 1–3) — which must fit; and
+/// * (B) rung 0 `Resident` (expected to refuse where the untiled decode or the whole warm set binds).
+///
+/// Run: `cargo test -p mlx-gen-anima --lib reachable_sizes_prediction -- --ignored --nocapture`.
 #[test]
 #[ignore = "prediction table over the real snapshot's headers; run with --ignored --nocapture"]
 fn reachable_sizes_prediction() {
     if !in_cpu_child("reachable_sizes_prediction") {
         return;
     }
+    use crate::ios_pricing::{fold, ios_pricing, price_quanta, snapshot_facts, AnimaPricingWork};
+    use mlx_gen::gen_core::{
+        MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryStrategy, MemoryStrategySupport,
+    };
+    use mlx_gen::ios_pricing::IosPricingRequest;
+    use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, Quant};
+
     let Some(root) = anima_snapshot() else {
         println!("no Anima snapshot on this host (set ANIMA_SPLIT_FILES); nothing to predict");
         return;
     };
-    let headers = |p: &std::path::Path| {
-        mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(p).unwrap()
-    };
-    let dit_path = root
-        .join("diffusion_models")
-        .join(crate::config::Variant::Turbo.dit_filename());
-    let te_path = root.join("text_encoders/qwen_3_06b_base.safetensors");
-    let vae_path = root.join("vae/qwen_image_vae.safetensors");
-    let (dit_h, te_h, vae_h) = (headers(&dit_path), headers(&te_path), headers(&vae_path));
-    let prefix = dit_h
-        .iter()
-        .find_map(|h| h.name.strip_suffix(".x_embedder.proj.1.weight"))
-        .unwrap()
-        .to_string();
-    let blocks_prefix = format!("{prefix}.blocks.");
     const MIB: u64 = 1024 * 1024;
     let mib = |b: u64| b as f64 / MIB as f64;
-
-    // Lazy modules over the real files: shapes only, nothing evaluated.
-    let dit_w = Weights::from_file(&dit_path).unwrap();
-    let dit = CosmosDiT::from_weights(&dit_w, &prefix, DitConfig::anima()).unwrap();
-    let cond = AnimaTextConditioner::from_weights(
-        &dit_w,
-        &format!("{prefix}.llm_adapter"),
-        ConditionerConfig::anima(),
-    )
-    .unwrap();
-    let te = AnimaQwen3::from_weights(
-        &Weights::from_file(&te_path).unwrap(),
-        "model",
-        &Qwen3Config::anima(),
-    )
-    .unwrap();
-    let vae = {
-        let src = Weights::from_file(&vae_path).unwrap();
-        let mut diff = Weights::empty();
-        let keys: Vec<String> = src.keys().map(String::from).collect();
-        for k in &keys {
-            diff.insert(
-                crate::vae::convert_vae_key(k),
-                src.require(k).unwrap().clone(),
-            );
-        }
-        diff.cast_all(Dtype::Float32).unwrap();
-        mlx_gen_qwen_image::loader::remap_vae_keys(&mut diff).unwrap();
-        crate::vae::QwenVae::from_weights(&diff).unwrap()
-    };
-
-    let te_bytes: u64 = te_h.iter().map(|h| h.data_bytes).sum();
-    let vae_stored: u64 = vae_h.iter().map(|h| h.data_bytes).sum();
-    let vae_f32: u64 = vae_h
-        .iter()
-        .map(|h| h.shape.iter().product::<usize>() as u64 * 4)
-        .sum();
-    let vae_load_floor = vae_stored + vae_f32;
-    let is_adapter = |n: &str| n.contains("llm_adapter.");
-    let cond_bytes: u64 = dit_h
-        .iter()
-        .filter(|h| is_adapter(&h.name))
-        .map(|h| h.data_bytes)
-        .sum();
-
+    let budget = ENTITLED_HEADROOM_MIB * MIB;
     println!(
         "Anima Turbo reachable-sizes PREDICTION (host-derived from {}; not evidence)",
         root.display()
     );
-    println!(
-        "files: DiT+conditioner {:.1} MiB (conditioner {:.1}), Qwen3 TE {:.1} MiB, VAE {:.1} MiB stored / {:.1} MiB as f32",
-        mib(dit_h.iter().map(|h| h.data_bytes).sum()),
-        mib(cond_bytes),
-        mib(te_bytes),
-        mib(vae_stored),
-        mib(vae_f32)
-    );
+    println!("mode: text (MemoryMode::TextToImage — Anima's only route; no encode phase)");
     println!(
         "budget: resident + scratch + {} MiB reserve <= {ENTITLED_HEADROOM_MIB} MiB",
         PROCESS_RESERVE_BYTES / MIB
     );
-    println!("| tier | edge | rung | phase | resident MiB | largest scratch (quantum) MiB | total MiB | fits |");
-    println!("|---|---:|---|---|---:|---|---:|---|");
-
-    #[derive(Clone, Copy)]
-    struct Rung {
-        name: &'static str,
-        staged: bool,
-        tiled: bool,
-        chunked: bool,
-        windowed: bool,
-    }
-    let rungs = [
-        Rung {
-            name: "Resident",
-            staged: false,
-            tiled: false,
-            chunked: false,
-            windowed: false,
-        },
-        Rung {
-            name: "StagedResidency",
-            staged: true,
-            tiled: false,
-            chunked: false,
-            windowed: false,
-        },
-        Rung {
-            name: "BoundedDecode@192",
-            staged: true,
-            tiled: true,
-            chunked: false,
-            windowed: false,
-        },
-        Rung {
-            name: "BoundedAttention@192",
-            staged: true,
-            tiled: true,
-            chunked: true,
-            windowed: false,
-        },
-        Rung {
-            name: "BoundedTransformerResidency@192 (planned)",
-            staged: true,
-            tiled: true,
-            chunked: true,
-            windowed: true,
-        },
-    ];
-    let tiling = mlx_gen::tiling::TilingConfig::spatial_only(192, 64);
-    for (tier, bits) in [("q4", Some(4u64)), ("q8", Some(8)), ("bf16", None)] {
-        let at_tier = |h: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader| {
-            bits.and_then(|b| packed_bytes(h, b))
-                .unwrap_or(h.data_bytes)
+    let mut fully_optimized_misses = Vec::new();
+    let mut header_printed = false;
+    for (tier_name, quant) in [
+        ("q4", Some(Quant::Q4)),
+        ("q8", Some(Quant::Q8)),
+        ("bf16", None),
+    ] {
+        // The iOS load, mirroring `mlx-gen-ios-catalog::anima::anima_turbo_load_spec` (that crate
+        // depends on this one, so it cannot be a dependency here): `IOS_OFFLOAD_POLICY`
+        // (sequential) + a deferred materialization, at the tier.
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        spec.quantize = quant;
+        let contract =
+            crate::memory_strategy::memory_strategy_contract("anima_turbo", &spec).unwrap();
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .map(|c| &c.support),
+            Some(&MemoryStrategySupport::Implemented),
+            "rung 4 is implemented on the iOS load"
+        );
+        let tier = MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
         };
-        let dit_tensors: Vec<u64> = dit_h
-            .iter()
-            .filter(|h| !is_adapter(&h.name))
-            .map(at_tier)
-            .collect();
-        let dit_bytes: u64 = dit_tensors.iter().sum();
-        let nonblock_bytes: u64 = dit_h
-            .iter()
-            .filter(|h| !is_adapter(&h.name) && !h.name.starts_with(&blocks_prefix))
-            .map(at_tier)
-            .sum();
-        let block_bytes = |i: usize| -> u64 {
-            let p = format!("{blocks_prefix}{i}.");
-            dit_h
-                .iter()
-                .filter(|h| h.name.starts_with(&p))
-                .map(at_tier)
-                .sum()
-        };
-        let largest_block = (0..28).map(block_bytes).max().unwrap();
-        for edge in [512u64, 768, 1024] {
-            let lat = edge / 8;
-            let tokens = (lat / 2) * (lat / 2);
-            let latent = [1u64, 16, 1, lat, lat];
-            let latent_elems = 16 * lat * lat;
-            let carried = 512 * 1024 * 4 + latent_elems * 4;
-            for rung in rungs {
-                let plan = if rung.chunked {
-                    AttentionPlan::budgeted(AttentionBudget::CONSTRAINED)
-                } else {
-                    AttentionPlan::UNBOUNDED
+        let deepest = MemoryStrategy::ALL
+            .into_iter()
+            .filter(|s| {
+                matches!(
+                    contract.capability(*s).map(|c| &c.support),
+                    Some(MemoryStrategySupport::Implemented)
+                )
+            })
+            .max()
+            .unwrap();
+        assert_eq!(deepest, MemoryStrategy::BoundedTransformerResidency);
+        let configs = [
+            (
+                "A",
+                contract
+                    .selection_space(deepest, tier, false)
+                    .unwrap()
+                    .pop()
+                    .unwrap(),
+            ),
+            (
+                "B",
+                contract
+                    .selection_space(MemoryStrategy::Resident, tier, false)
+                    .unwrap()
+                    .pop()
+                    .unwrap(),
+            ),
+        ];
+        let mut facts = snapshot_facts(&spec, crate::config::Variant::Turbo).unwrap();
+        if let Some(q) = quant {
+            let bits = if q == Quant::Q4 { 4 } else { 8 };
+            facts.dit = packed_headers(&facts.dit, bits);
+        }
+        if !header_printed {
+            header_printed = true;
+            for (name, selection) in &configs {
+                println!(
+                    "({name}) {:?} {:?} -> execution {:?}",
+                    selection.strategy,
+                    selection.parameters,
+                    contract.generation_memory(selection).unwrap_or_default()
+                );
+            }
+            println!("| tier | edge | config | phase | resident MiB | largest quantum MiB (binding) | peak + reserve MiB | fits |");
+            println!("|---|---:|---|---|---:|---|---:|---|");
+        }
+        for edge in [512u32, 768, 1024] {
+            for (name, selection) in &configs {
+                let execution = contract.generation_memory(selection).unwrap_or_default();
+                let tokens = crate::tokenizer::MAX_LEN as u32;
+                let work = AnimaPricingWork {
+                    width: edge,
+                    height: edge,
+                    count: 1,
+                    qwen_tokens: tokens,
+                    t5_tokens: tokens,
+                    backend: crate::transformer::Backend::Metal,
                 };
-                let dit_res = if rung.windowed {
-                    nonblock_bytes
-                } else {
-                    dit_bytes
-                };
-                let heavy = dit_res + cond_bytes + vae_f32;
-                // Carried through the decode: the latent, the mid-block output the tail reads (384
-                // channels at latent extent, f32) and, when tiled, the full-size f32 RGB slab and
-                // output accumulators.
-                let decode_carried = latent_elems * 4
-                    + 384 * lat * lat * 4
-                    + if rung.tiled {
-                        2 * 3 * edge * edge * 4
-                    } else {
-                        0
+                let quanta = price_quanta(&facts, work, &execution).unwrap();
+                let pricing = fold(&quanta);
+                if quant.is_none() {
+                    // The device entry point reads the same facts off the snapshot, header-only:
+                    // nothing it builds is evaluated, so MLX allocates nothing.
+                    // An actual valid Turbo text-to-image request at this edge: one serial output,
+                    // the provider's default FLOW sampler/scheduler/steps.
+                    let generation = mlx_gen::GenerationRequest {
+                        width: edge,
+                        height: edge,
+                        count: 1,
+                        ..Default::default()
                     };
-                let (text_res, denoise_res, decode_res) = if rung.staged {
-                    (te_bytes, heavy + carried, vae_f32 + decode_carried)
-                } else {
-                    let all = te_bytes + heavy + carried;
-                    (all, all, all)
-                };
-                let max_of =
-                    |v: Vec<(&'static str, u64)>| v.into_iter().max_by_key(|x| x.1).unwrap();
-                // Text phase: the Qwen3 tower over 512 tokens, then the conditioning inputs.
-                let s = 512i32;
-                let text = max_of(vec![
-                    (TE_EMBED_QUANTUM, te.embed_body_bytes(1, s)),
-                    (TE_LAYER_QUANTUM, te.layer(0, 1, s, 4, Backend::Metal).1),
-                    (TE_NORM_QUANTUM, te.norm_bytes(1, s, 4)),
-                    (
-                        crate::model::CONDITIONING_INPUTS_QUANTUM,
-                        mlx_gen::ios_quantum::elementwise_bytes(512 * 1024, 3),
-                    ),
-                ]);
-                // Denoise: the conditioner (512 T5 x 512 Qwen3 tokens) and every DiT quantum.
-                let block = &dit.blocks()[0];
-                let weight = if rung.windowed { largest_block } else { 0 };
-                let denoise = max_of(vec![
-                    (
-                        CONDITIONER_EMBED_QUANTUM,
-                        cond.embed_body_bytes(1, 512, 512, 4)
-                            + mlx_gen::ios_quantum::elementwise_bytes(512 * 1024, 3),
-                    ),
-                    (
-                        CONDITIONER_BLOCK_QUANTUM,
-                        cond.blocks()[0].quantum_scratch(1, 512, 512, 4, Backend::Metal),
-                    ),
-                    (
-                        CONDITIONER_OUTPUT_QUANTUM,
-                        cond.output_quantum_scratch(1, 512, 4),
-                    ),
-                    (
-                        DIT_EMBED_QUANTUM,
-                        dit.embed_body_bytes(&[1, 16, 1, lat as i32, lat as i32], 2)
-                            + mlx_gen::ios_quantum::sampler_step_bytes(latent_elems),
-                    ),
-                    (
-                        DIT_BLOCK_QUANTUM,
-                        // The snapshot is bf16: a packed tier's projections are consumed in
-                        // place, so its blocks carry no promoted f32 copies.
-                        block.quantum_scratch(
-                            1,
-                            tokens as i32,
-                            512,
-                            plan,
-                            4,
-                            weight,
-                            Backend::Metal,
-                        ) - if bits.is_some() {
-                            block.promoted_weight_bytes(4)
-                        } else {
-                            0
-                        },
-                    ),
-                    (
-                        DIT_OUTPUT_QUANTUM,
-                        dit.output_quantum_scratch(1, tokens as i32, 4),
-                    ),
-                    (
-                        crate::model::LATENTS_QUANTUM,
-                        mlx_gen::ios_quantum::sampler_step_bytes(latent_elems),
-                    ),
-                ]);
-                // Decode: every VAE quantum (the mid-block attention query-chunked, as on iOS).
-                let decode = max_of(vae.decode_quanta(
-                    latent,
-                    rung.tiled.then_some(&tiling),
-                    crate::vae::QwenVae::ios_decode_attention_plan(),
-                    4,
-                ));
-                // Load floors: the heavy DiT(+conditioner) file floor first (nothing resident yet:
-                // staged loads it after the TE is shed, a resident load before the TE), then the
-                // VAE's cast floor over the materialized DiT; a resident load reads the TE last.
-                let dit_floor = if rung.windowed {
-                    nonblock_bytes + cond_bytes
-                } else {
-                    dit_bytes + cond_bytes
-                };
-                let text_load_base = if rung.staged {
-                    0
-                } else {
-                    dit_res + cond_bytes + vae_f32
-                };
-                let rows = [
-                    (
-                        "text load",
-                        text_load_base,
-                        (crate::loader::TEXT_LOAD_QUANTUM, te_bytes),
-                    ),
-                    ("text", text_res, text),
-                    (
-                        "heavy load",
-                        0,
-                        (crate::loader::HEAVY_LOAD_QUANTUM, dit_floor),
-                    ),
-                    (
-                        "VAE load",
-                        dit_res + cond_bytes,
-                        (crate::loader::VAE_LOAD_QUANTUM, vae_load_floor),
-                    ),
-                    ("denoise", denoise_res, denoise),
-                    ("decode", decode_res, decode),
-                ];
-                for (phase, resident, (label, scratch)) in rows {
-                    let total = resident + scratch + PROCESS_RESERVE_BYTES;
-                    println!(
-                        "| {tier} | {edge} | {} | {phase} | {:.0} | {:.0} ({label}) | {:.0} | {} |",
-                        rung.name,
-                        mib(resident),
-                        mib(scratch),
-                        mib(total),
-                        if total <= ENTITLED_HEADROOM_MIB * MIB {
-                            "yes"
-                        } else {
-                            "NO"
+                    // Independent expected envelope from the sampler's source semantics, not the
+                    // entry's output: each DiT/sampler-body quantum is owned once per possible solver
+                    // callback family over the f32 (w/8)x(h/8)xC latent, holding the callback's outer
+                    // owners, the caller's f32 latent handle (except inside the step itself, which
+                    // owns that state), and the host sigma schedule; the sampler step additionally
+                    // owns a solve-complete window holding only the schedule. Other quanta are their
+                    // own windows, and Encode never runs.
+                    let sampling = crate::sampling::resolve(&generation).unwrap();
+                    let latent = u64::from(edge / crate::config::VAE_COMPRESSION).pow(2)
+                        * crate::config::VAE_CHANNELS as u64;
+                    let callbacks = mlx_gen::sampler::solver_memory::solver_callback_windows(
+                        sampling.solver(),
+                        sampling.convention(),
+                        latent,
+                        4,
+                        4,
+                    )
+                    .unwrap();
+                    let schedule = sampling.host_schedule_bytes().unwrap();
+                    let class = |window: &mlx_gen::ios_pricing::IosWindowPrice, family: &str| {
+                        format!(
+                            "{}/{}/{family}",
+                            window.class.as_deref().unwrap(),
+                            sampling.allocation_class()
+                        )
+                    };
+                    let mut expected = mlx_gen::ios_pricing::IosPricing::default();
+                    for quantum in &quanta {
+                        let step = quantum.label == mlx_gen::sampler::SAMPLER_STEP_QUANTUM;
+                        let body = step
+                            || [
+                                crate::transformer::DIT_EMBED_QUANTUM,
+                                crate::transformer::DIT_BLOCK_QUANTUM,
+                                crate::transformer::DIT_OUTPUT_QUANTUM,
+                            ]
+                            .contains(&quantum.label);
+                        if !body {
+                            expected.take_window(quantum.window.clone());
+                            continue;
                         }
+                        for callback in &callbacks {
+                            let mut window = quantum.window.clone();
+                            window.class = Some(class(&window, &callback.family()));
+                            window.held_bytes += callback.callback_outer_bytes
+                                + if step { 0 } else { callback.state_bytes }
+                                + schedule;
+                            expected.take_window(window);
+                        }
+                        if step {
+                            let mut window = quantum.window.clone();
+                            window.class = Some(class(&window, "solve-complete"));
+                            window.held_bytes += schedule;
+                            expected.take_window(window);
+                        }
+                    }
+                    expected.phase_not_run(
+                        mlx_gen::ios_pricing::IosPhase::Encode,
+                        "Anima serves text-to-image only",
+                    );
+                    assert!(
+                        !callbacks.is_empty(),
+                        "the Turbo FLOW sampler owns callbacks"
+                    );
+                    let before = mlx_rs::memory::get_active_memory();
+                    let entry = ios_pricing(&IosPricingRequest {
+                        provider: "anima_turbo",
+                        spec: &spec,
+                        mode: &MemoryMode::TextToImage,
+                        geometry: MemoryGeometry {
+                            width: edge,
+                            height: edge,
+                            batch: 1,
+                            frames: 1,
+                            reference_count: 0,
+                        },
+                        selection,
+                        execution: &execution,
+                        generation: Some(&generation),
+                        transform: None,
+                        depth: None,
+                        token_window: 0,
+                    })
+                    .unwrap();
+                    assert_eq!(mlx_rs::memory::get_active_memory(), before, "header-only");
+                    assert_eq!(entry, expected);
+                    assert_ne!(
+                        entry, pricing,
+                        "sampler callbacks are not the bare quantum fold"
+                    );
+                }
+                for price in &pricing.phases {
+                    let total = price.peak_bytes() + PROCESS_RESERVE_BYTES;
+                    let fits = total <= budget;
+                    if *name == "A" && !fits {
+                        fully_optimized_misses
+                            .push(format!("{tier_name} {edge} {:?}", price.phase));
+                    }
+                    println!(
+                        "| {tier_name} | {edge} | {name} | {} | {:.0} | {:.0} ({}) | {:.0} | {} |",
+                        price.phase.as_key(),
+                        mib(price.resident_bytes),
+                        mib(price.scratch_bytes),
+                        price.binding,
+                        mib(total),
+                        if fits { "yes" } else { "NO" }
                     );
                 }
             }
         }
     }
+    assert!(
+        fully_optimized_misses.is_empty(),
+        "the fully optimized selection must fit: {fully_optimized_misses:?}"
+    );
 }

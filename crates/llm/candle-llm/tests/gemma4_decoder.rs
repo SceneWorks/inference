@@ -21,6 +21,15 @@
 //! **mutation** oracles (the same forward with one plausible mistake); each is asserted to differ
 //! from the truth, so a golden that a near-miss would also satisfy cannot stand.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Tensor};
@@ -191,6 +200,7 @@ fn prefill_logits(m: &CausalLm, prompt: &[i32]) -> Vec<f32> {
 /// stack from the reference, so a wrong sandwich order, a wrong norm fold, a missed `layer_scalar`,
 /// or a missing final norm all fail here — none of which a logits-only assertion can see.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_hidden_state_stack_matches_the_shared_goldens() {
     let g = goldens();
     let m = model(&g);
@@ -224,6 +234,11 @@ fn gemma4_hidden_state_stack_matches_the_shared_goldens() {
             i - 1
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED gemma4_hidden_state_stack_matches_the_shared_goldens"
+    );
 }
 
 /// The embedding scale is `sqrt(hidden_size)` **rounded to the running dtype** before the multiply,
@@ -235,6 +250,7 @@ fn gemma4_hidden_state_stack_matches_the_shared_goldens() {
 /// Any *other* change in the embedding path (a missing scale, a `1 + weight` fold, the wrong gather)
 /// moves this far outside the budget.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_embedding_scale_is_the_dtype_rounded_sqrt_hidden() {
     let g = goldens();
     let m = model(&g);
@@ -260,10 +276,16 @@ fn gemma4_embedding_scale_is_the_dtype_rounded_sqrt_hidden() {
     }
     let got = host(&m.embed(&ids).unwrap());
     assert_abs_close(&got, &want, 1e-6, "scaled input embeddings");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED gemma4_embedding_scale_is_the_dtype_rounded_sqrt_hidden"
+    );
 }
 
 /// The **causal-LM** forward: every position's logits, soft-capped at 30.0 through the tied head.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_all_position_logits_match_the_shared_goldens() {
     let g = goldens();
     let m = model(&g);
@@ -286,6 +308,11 @@ fn gemma4_all_position_logits_match_the_shared_goldens() {
     let mut cache2 = m.new_cache();
     let last = m.decode_logits(&ids, &mut cache2, 0).unwrap();
     assert_abs_close(&host(&last), &want_last, 1e-4, "prefill last logits");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED gemma4_all_position_logits_match_the_shared_goldens"
+    );
 }
 
 /// A **cached decode step** continues from the prefill's cache: the sliding window now spans the
@@ -293,6 +320,7 @@ fn gemma4_all_position_logits_match_the_shared_goldens() {
 /// decode step, so this asserts the invariant instead — a one-shot forward over `prompt + [t]` and
 /// a cached step after `prompt` must agree on that token's logits.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_cached_decode_step_agrees_with_a_one_shot_forward() {
     let g = goldens();
     let m = model(&g);
@@ -320,6 +348,11 @@ fn gemma4_cached_decode_step_agrees_with_a_one_shot_forward() {
             .unwrap(),
     );
     assert_abs_close(&stepped, &one_shot, 1e-5, "cached step vs one-shot");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED gemma4_cached_decode_step_agrees_with_a_one_shot_forward"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -335,6 +368,7 @@ fn gemma4_cached_decode_step_agrees_with_a_one_shot_forward() {
 /// `sliding_attention` layer running a plain causal mask; and the `full_attention` layers using a
 /// leading-slice partial RoPE instead of the proportional schedule.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_forward_differs_from_every_committed_mutation() {
     let g = goldens();
     let m = model(&g);
@@ -355,12 +389,18 @@ fn gemma4_forward_differs_from_every_committed_mutation() {
             m["why"].as_str().unwrap_or("")
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED gemma4_forward_differs_from_every_committed_mutation"
+    );
 }
 
 /// `layer_scalar` gets its own named check because it is the one term whose *initializer* is 1.0 —
 /// a port that never reads the buffer passes any fixture that left it there, and the real
 /// checkpoint's values are not 1.0. The fixture's scalars are 0.9 / 1.1 / 0.95 / 1.05.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_layer_scalar_is_read_and_is_not_the_initializer() {
     let g = goldens();
     let scalars = floats(&g["layer_scalars"]);
@@ -388,6 +428,11 @@ fn gemma4_layer_scalar_is_read_and_is_not_the_initializer() {
         max_abs_err(&got, &skipped) > 1e-3,
         "a decoder that ignored layer_scalar would match the `no_layer_scalar` oracle"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED gemma4_layer_scalar_is_read_and_is_not_the_initializer"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -403,6 +448,7 @@ fn gemma4_layer_scalar_is_read_and_is_not_the_initializer() {
 /// exercised — and a decoder that ignored the two keys would run a different model in silence on
 /// any checkpoint that set them.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_kv_sharing_tail_matches_the_shared_goldens() {
     let g = goldens();
     let kv = &g["kv_shared"];
@@ -439,6 +485,9 @@ fn gemma4_kv_sharing_tail_matches_the_shared_goldens() {
         1e-4,
         "kv_shared logits",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_kv_sharing_tail_matches_the_shared_goldens");
 }
 
 /// The donor is resolved **per layer type**: a sliding tail layer reuses the last pre-tail sliding
@@ -518,6 +567,7 @@ fn gemma4_kv_donor_is_the_last_pre_tail_layer_of_the_same_type() {
 /// continued (cached) generation is refused rather than silently attending only the current step's
 /// keys. A single forward from an empty cache — what a text encoder runs — is exact.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_kv_sharing_refuses_a_continued_generation() {
     let g = goldens();
     let kv = &g["kv_shared"];
@@ -536,6 +586,9 @@ fn gemma4_kv_sharing_refuses_a_continued_generation() {
         Ok(_) => panic!("a cached continuation cannot serve a KV-sharing tail"),
     };
     assert!(err.contains("num_kv_shared_layers"), "{err}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_kv_sharing_refuses_a_continued_generation");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -582,6 +635,7 @@ fn gemma4_k_eq_v_layers_have_no_value_projection_in_the_checkpoint() {
 /// fails on the first weight lookup, and one that quietly fell back to the plain stem would build a
 /// model from nothing.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_nested_language_model_layout_loads_to_the_same_goldens() {
     let g = goldens();
 
@@ -618,6 +672,9 @@ fn gemma4_nested_language_model_layout_loads_to_the_same_goldens() {
         1e-4,
         "nested layout logits",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_nested_language_model_layout_loads_to_the_same_goldens");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -646,6 +703,7 @@ const PAD_ID: i32 = 0;
 /// Rows are compared against `decode_logits_all` on the *unpadded* prompt, so padding that leaked
 /// into attention, a window applied at the wrong offset, or a dropped second RoPE table all fail.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_left_padded_batch_prefill_matches_per_row_single_sequence_logits() {
     let g = goldens();
     let m = model(&g);
@@ -737,6 +795,9 @@ fn gemma4_left_padded_batch_prefill_matches_per_row_single_sequence_logits() {
             ),
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_left_padded_batch_prefill_matches_per_row_single_sequence_logits");
 }
 
 /// The same path at `q_len == 1`: a left-padded batched **decode step** must reproduce each row's
@@ -747,6 +808,7 @@ fn gemma4_left_padded_batch_prefill_matches_per_row_single_sequence_logits() {
 /// from the query length instead of `k_len - q_len` is correct in prefill and wrong here — and the
 /// per-row RoPE now has to place one token per row at a different absolute position.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_left_padded_batch_decode_step_matches_per_row_single_sequence_logits() {
     let g = goldens();
     let m = model(&g);
@@ -846,6 +908,9 @@ fn gemma4_left_padded_batch_decode_step_matches_per_row_single_sequence_logits()
             ),
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_left_padded_batch_decode_step_matches_per_row_single_sequence_logits");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -857,6 +922,7 @@ fn gemma4_left_padded_batch_decode_step_matches_per_row_single_sequence_logits()
 /// `new_paged_cache` + `generate_with_cache`, not just the Throughput path. It must say what is
 /// wrong at the first disagreeing layer rather than surfacing a raw tensor-shape mismatch.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_paged_cache_names_the_per_layer_head_shape_it_cannot_hold() {
     let g = goldens();
     let m = model(&g);
@@ -872,12 +938,16 @@ fn gemma4_paged_cache_names_the_per_layer_head_shape_it_cannot_hold() {
     let mut contiguous = m.new_cache();
     m.decode_logits(&ids, &mut contiguous, 0)
         .expect("the contiguous cache holds per-layer shapes");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_paged_cache_names_the_per_layer_head_shape_it_cannot_hold");
 }
 
 /// Interleaved multimodal RoPE is a **whole-model** schedule (Qwen3-VL's): it has no per-layer-type
 /// form, so running it on a Gemma 4 model would silently apply the sliding schedule to every layer
 /// — plausible numbers, wrong model. It must refuse by name instead.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_refuses_interleaved_mrope_by_name() {
     let g = goldens();
     let m = model(&g);
@@ -899,6 +969,9 @@ fn gemma4_refuses_interleaved_mrope_by_name() {
     };
     assert!(err.contains("multimodal RoPE"), "{err}");
     assert!(err.contains("per layer type"), "{err}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_refuses_interleaved_mrope_by_name");
 }
 
 /// The continuous-batching `Throughput` path sizes one shared block pool from a single
@@ -939,6 +1012,8 @@ fn gemma4_real_weight_forward_produces_a_finite_hidden_state_stack() {
         .filter(|v| !v.is_empty())
     else {
         eprintln!("skip: set CANDLE_LLM_GEMMA4_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/gemma4_decoder.rs:942 (gemma4_real_weight_forward_produces_a_finite_hidden_state_stack): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let device = candle_llm::device::select_device().expect("select the compile-time device");
@@ -986,4 +1061,7 @@ fn gemma4_real_weight_forward_produces_a_finite_hidden_state_stack() {
         row.iter().all(|x| x.abs() <= cap * 1.001),
         "soft-capped logits must stay within +/-{cap}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_real_weight_forward_produces_a_finite_hidden_state_stack");
 }

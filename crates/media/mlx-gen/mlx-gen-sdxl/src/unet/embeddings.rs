@@ -97,6 +97,13 @@ impl SinusoidalPositionalEncoding {
         mlx_rs::transforms::eval([&self.sigmas])?;
         Ok(())
     }
+
+    /// The host bytes [`Self::timestep`]`(dims)` holds from construction (its lazy `sigmas` graph
+    /// keeps the f32 `arange` table and its four f32 scalars): header-free pricing of the U-Net
+    /// load (`loader::unet_load_parts`).
+    pub(crate) fn timestep_table_bytes(dims: i32) -> u64 {
+        4 * (dims / 2).max(0) as u64 + 4 * 4
+    }
 }
 
 /// The 2-layer time-embedding MLP (`linear_1 → SiLU → linear_2`). Used both for the timestep
@@ -107,6 +114,13 @@ pub struct TimestepEmbedding {
 }
 
 impl TimestepEmbedding {
+    pub(super) fn pricing_facts(&self) -> super::pricing::TimeFacts {
+        super::pricing::TimeFacts {
+            linear1: crate::quantum::LinearWork::of(&self.linear1),
+            linear2: crate::quantum::LinearWork::of(&self.linear2),
+        }
+    }
+
     /// `prefix` is e.g. `time_embedding` or `add_embedding`; leaves are `linear_1`/`linear_2`.
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         // Packed-detect (sc-8746): both MLP Linears are quantized in [`Self::quantize`], so a
@@ -118,9 +132,22 @@ impl TimestepEmbedding {
         })
     }
 
-    pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        crate::quant::quantize_linear(&mut self.linear1, bits)?;
-        crate::quant::quantize_linear(&mut self.linear2, bits)?;
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
+        visit(
+            &crate::quant::child_path(prefix, "linear_1"),
+            &mut self.linear1,
+            bits,
+        )?;
+        visit(
+            &crate::quant::child_path(prefix, "linear_2"),
+            &mut self.linear2,
+            bits,
+        )?;
         Ok(())
     }
 
@@ -142,6 +169,61 @@ impl TimestepEmbedding {
         let x = silu_glue(&x)?;
         self.linear2.forward(&x)
     }
+
+    #[cfg(test)]
+    pub(crate) fn output_dtype_with_effects(
+        &self,
+        x: Dtype,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<Dtype> {
+        self.pricing_facts().output_dtype_with_effects(x, effects)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn out_features_with_effects(
+        &self,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<i32> {
+        self.pricing_facts().out_features_with_effects(effects)
+    }
+}
+
+/// Pure final projection facts for the existing time/add embedding flow.
+#[cfg(test)]
+pub(crate) fn text_time_temb_dtype_with_effects(
+    time_embedding: &TimestepEmbedding,
+    add_embedding: &TimestepEmbedding,
+    text_emb_dtype: Dtype,
+    dtype: Dtype,
+    effects: &crate::quantum::EffectScope<'_>,
+) -> Result<Dtype> {
+    Ok(Dtype::from_promoting_types(
+        time_embedding.output_dtype_with_effects(dtype, &effects.child("time_embedding"))?,
+        add_embedding.output_dtype_with_effects(
+            Dtype::from_promoting_types(text_emb_dtype, dtype),
+            &effects.child("add_embedding"),
+        )?,
+    ))
+}
+
+/// The actual stem's time/add MLP and optional context projection operands. Shared by the
+/// runtime guard and header overlay; no output graph is built to derive these extents.
+pub(crate) fn stem_projection_scratch(
+    time: &TimestepEmbedding,
+    add: &TimestepEmbedding,
+    encoder: Option<&AdaptableLinear>,
+    input: super::pricing::StemInput,
+    memory: &Array,
+    effects: &crate::quantum::EffectScope<'_>,
+) -> Result<u64> {
+    super::pricing::stem_projection_scratch(
+        &time.pricing_facts(),
+        &add.pricing_facts(),
+        encoder.map(crate::quantum::LinearWork::of).as_ref(),
+        input,
+        &crate::quantum::activation_facts(memory),
+        effects,
+    )
 }
 
 /// The SDXL timestep + `text_time` micro-conditioning embedding, shared verbatim by

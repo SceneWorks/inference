@@ -458,7 +458,7 @@ impl ZImageControlTransformer {
         let (x_cos, x_sin) = self.base.control_rope(&x_pos_ids)?;
         let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
         let (c_patches, _) = patchify(control_context, patch_size, f_patch_size)?;
-        let control = c_patches.apply(&self.control_x_embedder)?;
+        let control = __model_proof_output!(c_patches.apply(&self.control_x_embedder))?;
         let mut cap = self.base.control_embed_caption(cap_feats)?;
         let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
         let (cap_cos, cap_sin) = self.base.control_rope(&cap_pos_ids)?;
@@ -1692,6 +1692,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_control_conditioning_is_reused_by_actual_cfg_capable_forward() {
         use candle_gen::candle_nn::VarMap;
 
@@ -1750,6 +1751,9 @@ mod tests {
         assert!(transformer
             .forward_control_prepared(&latent, &t, &prepared, 0.7, memory, &cancel)
             .is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control::tests::prepared_control_conditioning_is_reused_by_actual_cfg_capable_forward");
     }
 
     fn valid_encoder() -> tempfile::TempDir {

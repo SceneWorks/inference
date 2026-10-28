@@ -240,4 +240,6 @@ fn gemma4_full_48_layer_forward_on_the_shipped_text_encoder() {
     drop(cache);
     drop(model);
     memory::clear_cache();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma4_real_weights::gemma4_full_48_layer_forward_on_the_shipped_text_encoder");
 }

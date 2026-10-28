@@ -212,6 +212,8 @@ fn streamed_conditioning_matches_resident_and_unscoped_runs_every_layer() {
         dropped > 1e-3,
         "the metric cannot distinguish a full encode from the bare embedding ({dropped:e})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder_window_real_weights::streamed_conditioning_matches_resident_and_unscoped_runs_every_layer");
 }
 
 #[test]
@@ -293,6 +295,8 @@ fn the_window_is_load_bearing_and_prompt_length_is_swept() {
         token_counts.windows(2).all(|pair| pair[0] < pair[1]),
         "prompt sweep did not produce strictly increasing token lengths: {token_counts:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder_window_real_weights::the_window_is_load_bearing_and_prompt_length_is_swept");
 }
 
 #[test]
@@ -319,4 +323,6 @@ fn resident_is_not_streamable_and_cancellation_stays_typed() {
         .encode_windowed(&ids, 1, &cancel)
         .expect_err("cancelled stream must stop");
     assert!(matches!(error, mlx_gen::Error::Canceled));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder_window_real_weights::resident_is_not_streamable_and_cancellation_stays_typed");
 }

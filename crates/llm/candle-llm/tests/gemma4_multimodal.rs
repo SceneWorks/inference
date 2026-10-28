@@ -12,6 +12,15 @@
 //! `model.vision_embedder` / `model.embed_vision` / `model.embed_audio`) — the layout
 //! `google/gemma-4-12B-it` actually ships, and the one the loader could not read before this story.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Tensor};
@@ -553,6 +562,7 @@ fn unsupported_modalities_are_rejected_not_dropped() {
 /// Text generation through the ordinary surface, at bf16-equivalent (dense) and at **both**
 /// quantized tiers — AC bullet 1's wiring half on the deterministic CPU path.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_generates_dense_and_at_each_quantized_tier() {
     let fx = write_snapshot(true, true);
     let dir: &std::path::Path = fx.as_ref();
@@ -577,6 +587,9 @@ fn gemma4_generates_dense_and_at_each_quantized_tier() {
             "quantize={quantize:?}: is_quantized must report the tier that was applied"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_generates_dense_and_at_each_quantized_tier");
 }
 
 /// An image is REFUSED on a checkpoint that ships a vision embedder, because the embedder is
@@ -614,6 +627,7 @@ fn images_are_refused_while_the_vision_path_is_unvalidated() {
 /// rows — and all of those stay green if `prepare_gemma4` computes the features and then forgets to
 /// splice them, which is precisely the silent failure this catches.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn audio_conditioning_changes_the_provider_output() {
     let fx = write_snapshot(true, true);
     let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
@@ -647,6 +661,9 @@ fn audio_conditioning_changes_the_provider_output() {
         clip(rising),
         "generation is deterministic"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_conditioning_changes_the_provider_output");
 }
 
 /// sc-24437: the cross-turn prefix cache keys on token ids, and two clips (or images) sit behind
@@ -654,6 +671,7 @@ fn audio_conditioning_changes_the_provider_output() {
 /// report names why. A second clip on the same provider therefore decodes exactly what it decodes
 /// on a fresh one, however much of its prompt the first clip's matched token for token.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_multimodal_prompt_never_reuses_another_clips_prefix() {
     let fx = write_snapshot(true, true);
     let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
@@ -684,6 +702,11 @@ fn a_multimodal_prompt_never_reuses_another_clips_prefix() {
     let fresh = LlamaProvider::load(&spec_of(&fx)).expect("load");
     assert_eq!(generate(&p, &falling), generate(&fresh, &falling));
     assert_ne!(generate(&p, &rising), generate(&p, &falling));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED a_multimodal_prompt_never_reuses_another_clips_prefix"
+    );
 }
 
 /// sc-24138: a Gemma 4 request — the soft-token splice and plain text alike — decodes through
@@ -693,6 +716,7 @@ fn a_multimodal_prompt_never_reuses_another_clips_prefix() {
 /// the two loops are bit-identical; a CUDA device's bf16 GEMMs over the two caches' layouts may
 /// round differently in the last bit, so there only the paths are compared).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_decodes_through_the_engine_and_the_reference_stays_selectable() {
     use candle_llm::decode::DecodePath;
     use candle_llm::primitives::KvCacheKind;
@@ -740,6 +764,9 @@ fn gemma4_decodes_through_the_engine_and_the_reference_stays_selectable() {
         );
         assert_eq!(record.kv_cache, KvCacheKind::Growing, "request {i}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_decodes_through_the_engine_and_the_reference_stays_selectable");
 }
 
 /// A clip at the wrong sample rate is refused rather than silently reinterpreted.
@@ -769,6 +796,7 @@ fn a_wrong_sample_rate_is_refused() {
 /// Gemma 4 in Llama-3's chat format. Nothing about that fails loudly: the prompt renders, the model
 /// generates, every length assertion holds. It just answers badly.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_sidecar_chat_template_wins_over_the_embedded_one() {
     let fx = write_snapshot(true, true);
     let dir: &std::path::Path = fx.as_ref();
@@ -802,11 +830,17 @@ fn the_sidecar_chat_template_wins_over_the_embedded_one() {
         both_len, embedded_len,
         "with a sidecar present the embedded template must NOT be the one that rendered"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED the_sidecar_chat_template_wins_over_the_embedded_one"
+    );
 }
 
 /// The audio span is reserved at exactly the right size and its rows are spliced. See
 /// [`image_span_is_reserved_and_spliced`] for why this is not a token-level assertion.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn audio_span_is_reserved_and_spliced() {
     let fx = write_snapshot(true, true);
     let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
@@ -830,6 +864,9 @@ fn audio_span_is_reserved_and_spliced() {
     );
 
     assert_splice_replaces_marked_rows(&fx, AUDIO_TOK as i32, frames);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_span_is_reserved_and_spliced");
 }
 
 /// Video is declared unsupported and refused with a message that says so — not rendered as an image
@@ -856,6 +893,7 @@ fn video_is_refused_with_a_reason() {
 /// one too short drops a patch. Both are silent — the model just answers slightly wrong — so the
 /// count identity is pinned directly rather than inferred from a successful generate.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_reserved_span_matches_the_feature_row_count() {
     let fx = write_snapshot(true, true);
     let dir: &std::path::Path = fx.as_ref();
@@ -901,6 +939,9 @@ fn the_reserved_span_matches_the_feature_row_count() {
             "{w}x{h}: grid {gh}x{gw} overruns the per-image budget"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED the_reserved_span_matches_the_feature_row_count");
 }
 
 /// The decoder itself still loads from the nested layout — the fix that lets `google/gemma-4-12B-it`
@@ -924,6 +965,7 @@ fn the_nested_decoder_layout_loads() {
 /// checked again once the expansion is known: the request runs `auto` (prompt lookup on this
 /// family) with the draft's context window named, never the draft past its window.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_draft_outrun_by_the_soft_token_expansion_falls_back_by_name() {
     use core_llm::{ProposerKind, Speculative, SpeculativeProposer};
 
@@ -977,4 +1019,7 @@ fn a_draft_outrun_by_the_soft_token_expansion_falls_back_by_name() {
     text.speculative = req.speculative;
     let report = p.generate(&text, &mut |_| {}).unwrap().decode.unwrap();
     assert_eq!(report.proposer, ProposerKind::DraftModel, "{report:?}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED a_draft_outrun_by_the_soft_token_expansion_falls_back_by_name");
 }

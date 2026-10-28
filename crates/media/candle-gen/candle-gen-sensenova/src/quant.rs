@@ -172,6 +172,7 @@ mod tests {
     /// bf16 matmul anywhere and the arithmetic cannot drift. Because nothing here needs a GPU, this
     /// is a stronger and cheaper gate than a cosine check on a real render.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn bf16_store_with_f32_compute_is_bit_identical_to_an_f32_store() {
         let tmp = tempfile::tempdir().unwrap();
         let (out_dim, in_dim) = (16usize, 32usize);
@@ -219,6 +220,9 @@ mod tests {
             max_delta, 0.0,
             "bf16 store must be bit-identical, not close"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::bf16_store_with_f32_compute_is_bit_identical_to_an_f32_store");
     }
 
     /// **Lever B, at the seam.** A projection whose `.scales` sibling is on disk loads PACKED — no
@@ -229,6 +233,7 @@ mod tests {
     /// regressed to always-dense, a q4 tier would try to read `U32` codes as floats and render
     /// garbage rather than fail — hence asserting the ARM, not just the output.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn detect_linear_takes_the_packed_arm_only_when_scales_are_present() {
         let tmp = tempfile::tempdir().unwrap();
         let (out_dim, in_dim) = (8usize, PACKED_GROUP_SIZE);
@@ -278,6 +283,9 @@ mod tests {
         )]);
         let vb = vb_over(&tmp, "dense-arm", dense, DType::BF16);
         assert!(!detect_linear(&vb, "proj", false).unwrap().is_quantized());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::detect_linear_takes_the_packed_arm_only_when_scales_are_present");
     }
 
     /// **Real-weight repack guard.** Dequantizing a projection loaded from an ACTUAL shipped q4/q8
@@ -316,6 +324,8 @@ mod tests {
                 "[repack-guard] {} is DENSE — nothing to check",
                 dir.display()
             );
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sensenova/src/quant.rs:319 (real_tier_repack_reproduces_the_on_disk_affine_grid): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return;
         }
 
@@ -405,6 +415,9 @@ mod tests {
                 "Q8 re-quant rel-RMS {rel_rms:.6} exceeds the measured band"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::real_tier_repack_reproduces_the_on_disk_affine_grid");
     }
 
     /// `get_f32` widens a bf16 on-disk leaf even though the VarBuilder stores bf16 — the norms and

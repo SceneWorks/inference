@@ -41,6 +41,7 @@ fn tiny_config() -> Flux2Config {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn transformer_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
@@ -59,4 +60,6 @@ fn transformer_matches_fork() {
     // 1e-2 = the repo's matmul-bearing bar (Metal fp32 reduced-precision, not bit-identical
     // cross-device); a real structural bug diverges by orders of magnitude.
     assert!(close(&out, want, 1e-2, 1e-2), "FLUX.2 transformer diverged");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer_parity::transformer_matches_fork");
 }

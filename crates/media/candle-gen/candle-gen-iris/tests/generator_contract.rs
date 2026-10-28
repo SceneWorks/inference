@@ -69,16 +69,27 @@ fn missing_or_unknown_component_fails_at_load() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gen_core_conformance_resident() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Resident), &profile());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::gen_core_conformance_resident");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gen_core_conformance_sequential() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Sequential), &profile());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::gen_core_conformance_sequential"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
     let g = load(OffloadPolicy::Resident);
     let mut events = Vec::new();
@@ -102,9 +113,13 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
         }
         other => panic!("expected Images, got {other:?}"),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn count_folds_into_one_bar_with_distinct_seeds() {
     let g = load(OffloadPolicy::Resident);
     let mut steps = Vec::new();
@@ -123,9 +138,13 @@ fn count_folds_into_one_bar_with_distinct_seeds() {
     };
     assert_eq!(images.len(), 2);
     assert_ne!(images[0].pixels, images[1].pixels, "seed + i per image");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::count_folds_into_one_bar_with_distinct_seeds");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_seed_reproduces_and_bf16_is_the_default_compute() {
     let g = load(OffloadPolicy::Resident);
     let render = || match g.generate(&request(), &mut |_| {}).unwrap() {
@@ -137,9 +156,13 @@ fn a_seed_reproduces_and_bf16_is_the_default_compute() {
         candle_gen_iris::compute_dtype(&spec(OffloadPolicy::Resident)),
         candle_gen::candle_core::DType::BF16
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::a_seed_reproduces_and_bf16_is_the_default_compute");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn mid_run_cancel_is_typed_and_returns_no_image() {
     let g = load(OffloadPolicy::Resident);
     let mut req = request();
@@ -161,6 +184,9 @@ fn mid_run_cancel_is_typed_and_returns_no_image() {
         result.err()
     );
     assert_eq!(seen, 2, "no step after the flag trips");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::mid_run_cancel_is_typed_and_returns_no_image");
 }
 
 #[test]

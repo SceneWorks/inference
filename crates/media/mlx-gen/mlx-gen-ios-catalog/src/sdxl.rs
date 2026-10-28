@@ -10,6 +10,9 @@ use mlx_gen::gen_core::{
     CfgBatching, Error, GenerationMemory, LoadShape, LoadSpec, Result, WeightsSource,
 };
 
+/// The production host-only recipe resolver, shared by capture, evidence and execution.
+pub use mlx_gen_sdxl::sampling;
+
 pub const SDXL_ID: &str = "sdxl";
 /// Catalog routes, not additional provider ids. Never substitute one sibling's capture for another.
 pub const SDXL_FAMILY_ROUTES: &[&str] = &[
@@ -51,9 +54,9 @@ pub fn sdxl_generation_memory() -> GenerationMemory {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::evidence::{EvidenceRow, DEVICE_CAPTURE_CLASS};
+    use crate::evidence::{AnchorKind, AnchorRow, AnchorSelection, ANCHOR_MARGIN_FLOOR_BYTES};
     use crate::ios_admission::{
-        admit_with_rows, build_candidate, capacity_budget, evidence_key, IosCandidate, IosWork,
+        build_candidate, capacity_budget, evidence_key, IosCandidate, IosWork,
     };
     use crate::refusal::{AdmissionError, RefusalKind};
     use mlx_gen::gen_core::{
@@ -63,6 +66,41 @@ pub(crate) mod tests {
     use std::path::Path;
 
     pub(crate) const DEVICE: &str = "synthetic-test-device";
+    /// Explicit positive unit-fixture footprint, NOT a device measurement or physical charge bound.
+    pub(crate) const FIXTURE_BML_BYTES: u64 = 1;
+
+    /// Synthetic request-boundary fact for positive admission mechanism tests. The caller must
+    /// explicitly supply a positive committed budget; never synthesize a zero/default baseline
+    /// or enlarge headroom. Production `admit_with_rows` remains the no-sidecar path.
+    pub(crate) fn admit_fixture_rows(
+        registry: &ProviderRegistry,
+        candidates: &[IosCandidate],
+        machine: &str,
+        budget: MemoryBudget,
+        rows: &[AnchorRow],
+    ) -> crate::refusal::AdmissionResult<crate::Admission> {
+        use mlx_gen::ios_pricing::{IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain};
+        assert!(
+            budget.committed_bytes > 0,
+            "fixture needs an explicit BML footprint"
+        );
+        let baseline = IosMemoryBaseline {
+            domain: IosMemoryDomain::ProcessGrowth,
+            coordinate: IosMemoryCoordinate::BeforeModelLoad,
+            bytes: budget.committed_bytes,
+            source: "synthetic-test-sdk-before-model-load".into(),
+        };
+        crate::ios_admission::admit_rows_at_boundary(
+            registry,
+            candidates,
+            machine,
+            budget,
+            rows,
+            Some(&baseline),
+        )
+    }
+
+    use admit_fixture_rows as admit_with_rows;
 
     pub(crate) fn write_tensor(path: &Path, dtype: &str, count: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -102,6 +140,123 @@ pub(crate) mod tests {
         root
     }
 
+    /// Source-header mechanism fixture only: complete inspected U-Net target inventory, not
+    /// model weights or native/physical evidence. Paths mirror the served SDXL block selectors;
+    /// deliberately tiny valid dimensions keep source-identity tests payload-independent.
+    type FixtureHeaders = Vec<(String, Vec<usize>)>;
+
+    fn unet_fixture_headers() -> (FixtureHeaders, usize) {
+        let cfg = mlx_gen_sdxl::config::UNetConfig::sdxl_base();
+        let mut headers = Vec::new();
+        let mut cross = 0;
+        let mut transformer = |prefix: String, depth: i32| {
+            for leaf in ["proj_in", "proj_out"] {
+                headers.push((format!("{prefix}.{leaf}.weight"), vec![8, 8]));
+            }
+            for block in 0..depth {
+                let prefix = format!("{prefix}.transformer_blocks.{block}");
+                for attention in ["attn1", "attn2"] {
+                    for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
+                        headers.push((format!("{prefix}.{attention}.{leaf}.weight"), vec![8, 8]));
+                    }
+                }
+                cross += 1;
+                for leaf in ["ff.net.0.proj", "ff.net.2"] {
+                    headers.push((format!("{prefix}.{leaf}.weight"), vec![8, 8]));
+                }
+            }
+        };
+        for up in [false, true] {
+            for index in 0..cfg.num_blocks() {
+                let ci = if up {
+                    cfg.num_blocks() - 1 - index
+                } else {
+                    index
+                };
+                let attention = if up {
+                    &cfg.up_block_types[ci]
+                } else {
+                    &cfg.down_block_types[ci]
+                };
+                if attention.contains("CrossAttn") {
+                    for resnet in 0..cfg.layers_per_block[ci] + i32::from(up) {
+                        transformer(
+                            format!(
+                                "{}_blocks.{index}.attentions.{resnet}",
+                                if up { "up" } else { "down" }
+                            ),
+                            cfg.transformer_layers_per_block[ci],
+                        );
+                    }
+                }
+            }
+        }
+        transformer(
+            "mid_block.attentions.0".into(),
+            *cfg.transformer_layers_per_block.last().unwrap(),
+        );
+        for leaf in ["conv_in", "conv_out"] {
+            headers.push((format!("{leaf}.weight"), vec![8, 8, 1, 1]));
+        }
+        for up in [false, true] {
+            for index in 0..cfg.num_blocks() {
+                let ci = if up {
+                    cfg.num_blocks() - 1 - index
+                } else {
+                    index
+                };
+                let prefix = format!("{}_blocks.{index}", if up { "up" } else { "down" });
+                for resnet in 0..cfg.layers_per_block[ci] + i32::from(up) {
+                    for leaf in ["conv1", "conv2"] {
+                        headers.push((
+                            format!("{prefix}.resnets.{resnet}.{leaf}.weight"),
+                            vec![8, 8, 1, 1],
+                        ));
+                    }
+                }
+                if (!up && index + 1 < cfg.num_blocks()) || (up && ci > 0) {
+                    headers.push((
+                        format!(
+                            "{prefix}.{}samplers.0.conv.weight",
+                            if up { "up" } else { "down" }
+                        ),
+                        vec![8, 8, 1, 1],
+                    ));
+                }
+            }
+        }
+        for resnet in 0..2 {
+            for leaf in ["conv1", "conv2"] {
+                headers.push((
+                    format!("mid_block.resnets.{resnet}.{leaf}.weight"),
+                    vec![8, 8, 1, 1],
+                ));
+            }
+        }
+        (headers, cross)
+    }
+
+    pub(crate) fn write_header_fixture(
+        path: &Path,
+        headers: impl IntoIterator<Item = (String, Vec<usize>)>,
+    ) {
+        use std::io::Write;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut map = serde_json::Map::new();
+        let mut offset = 0usize;
+        for (name, shape) in headers {
+            let bytes = shape.iter().product::<usize>() * 2;
+            assert!(map.insert(name, serde_json::json!({"dtype":"BF16", "shape":shape, "data_offsets":[offset,offset+bytes]})).is_none());
+            offset += bytes;
+        }
+        let header = serde_json::to_vec(&map).unwrap();
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.set_len((8 + header.len() + offset) as u64).unwrap();
+    }
+
     pub(crate) fn populate(root: &Path) {
         for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
             let name = if component.starts_with("text") {
@@ -111,6 +266,10 @@ pub(crate) mod tests {
             };
             write_tensor(&root.join(component).join(name), "F16", 8);
         }
+        write_header_fixture(
+            &root.join("unet/diffusion_pytorch_model.safetensors"),
+            unet_fixture_headers().0,
+        );
         write_tokenizer(&root.join("tokenizer"));
         write_tokenizer(&root.join("tokenizer_2"));
     }
@@ -156,9 +315,21 @@ pub(crate) mod tests {
         let mut spec = sdxl_load_spec(route, WeightsSource::Dir(root.to_owned())).unwrap();
         spec.quantize = quant;
         if mode == "ip_adapter" {
-            let ip = root.join("ip/ip.safetensors");
-            write_tensor(&ip, "F16", 8);
-            spec.ip_adapter = Some(WeightsSource::File(ip));
+            let ip = root.join("ip");
+            write_tensor(&ip.join("models/image_encoder/model.safetensors"), "F16", 8);
+            let pairs = (0..unet_fixture_headers().1).flat_map(|index| {
+                ["k", "v"].map(move |role| {
+                    (
+                        format!("ip_adapter.{}.to_{role}_ip.weight", 2 * index + 1),
+                        vec![8, 8],
+                    )
+                })
+            });
+            write_header_fixture(
+                &ip.join("sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors"),
+                pairs,
+            );
+            spec.ip_adapter = Some(WeightsSource::Dir(ip));
         }
         let request = GenerationRequest {
             prompt: "synthetic fixture".into(),
@@ -179,30 +350,37 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// A synthetic completed anchor at `candidate`'s own key whose admission charge (measured
+    /// demand + the floored margin) is exactly `bytes`.
     pub(crate) fn capture(
         registry: &ProviderRegistry,
         candidate: &IosCandidate,
         bytes: u64,
-    ) -> EvidenceRow {
-        EvidenceRow {
-            key: evidence_key(registry, candidate, DEVICE).unwrap(),
-            footprint_bytes: bytes,
-            // Synthetic rows: a zero capture baseline makes the demand the whole figure.
-            baseline_footprint_bytes: 0,
-            mlx_peak_bytes: bytes,
-            min_headroom_mib: 1.0,
-            elapsed_seconds: 1.0,
-            evidence_class: DEVICE_CAPTURE_CLASS.into(),
-            run_id: "synthetic".into(),
-            build_sha: "synthetic".into(),
-        }
+    ) -> AnchorRow {
+        let kind = if candidate.context.selection.strategy == MemoryStrategy::Resident {
+            AnchorKind::Resident
+        } else {
+            AnchorKind::Optimized
+        };
+        crate::evidence::fixture::completed(
+            crate::source_work::fixture_key(registry, candidate, DEVICE),
+            kind,
+            AnchorSelection::from_parts(
+                candidate.context.selection.strategy,
+                &candidate.context.selection.parameters,
+            ),
+            bytes
+                .checked_sub(ANCHOR_MARGIN_FLOOR_BYTES)
+                .filter(|demand| *demand > 0)
+                .expect("a completed fixture needs positive growth plus the explicit margin"),
+        )
     }
 
     pub(crate) fn budget() -> MemoryBudget {
         // Mechanism fixture, NOT an iPhone cap or a fabricated measured model fit.
         MemoryBudget {
             total_bytes: 1 << 30,
-            committed_bytes: 0,
+            committed_bytes: FIXTURE_BML_BYTES,
             reclaimable_bytes: 0,
             reserved_headroom_bytes: 0,
         }
@@ -236,7 +414,7 @@ pub(crate) mod tests {
             "text_to_image",
         );
         let key = evidence_key(&registry, &base, DEVICE).unwrap();
-        // Same artifact installed elsewhere, other prompt words of the same window, other seed.
+        // Same artifact elsewhere, different words with the same actual UTF8 byte basis/window, other seed.
         let mut moved = candidate(
             &registry,
             b.path(),
@@ -245,9 +423,22 @@ pub(crate) mod tests {
             Some(Quant::Q4),
             "text_to_image",
         );
-        generate(&mut moved).prompt = "another short prompt".into();
+        generate(&mut moved).prompt = "different fixture".into();
+        let crate::IosWork::Generate(base_request) = &base.work else {
+            unreachable!()
+        };
+        assert_eq!(generate(&mut moved).prompt.len(), base_request.prompt.len());
         generate(&mut moved).seed = Some(99);
         assert_eq!(evidence_key(&registry, &moved, DEVICE).unwrap(), key);
+        let mut longer = moved.clone();
+        generate(&mut longer).prompt.push(' ');
+        let longer_key = evidence_key(&registry, &longer, DEVICE).unwrap();
+        assert_eq!(longer_key.token_window, key.token_window);
+        assert_ne!(
+            longer_key, key,
+            "same window does not reconstruct actual input bytes"
+        );
+        assert_eq!(longer_key.family(), key.family());
         // Each memory-relevant change is a different key.
         let differs = |c: &IosCandidate| evidence_key(&registry, c, DEVICE).unwrap() != key;
         assert!(differs(&candidate(
@@ -291,7 +482,7 @@ pub(crate) mod tests {
             assert!(differs(&aspect), "{w}x{h} borrowed 512x512 evidence");
         }
         // Two modes with the same reference count, layout and execution differ only by mode.
-        let img2img = candidate(
+        let mut img2img = candidate(
             &registry,
             a.path(),
             "sdxl",
@@ -299,6 +490,13 @@ pub(crate) mod tests {
             Some(Quant::Q4),
             "image_to_image",
         );
+        // Isolate the mode/role distinction: do not additionally change a recipe's explicit
+        // reference-strength control while asserting the execution recipes are identical.
+        let Conditioning::Reference { strength, .. } = &mut generate(&mut img2img).conditioning[0]
+        else {
+            unreachable!()
+        };
+        *strength = None;
         let control = candidate(&registry, a.path(), "sdxl", 512, Some(Quant::Q4), "control");
         let (k1, k2) = (
             evidence_key(&registry, &img2img, DEVICE).unwrap(),
@@ -382,14 +580,14 @@ pub(crate) mod tests {
                 "text_to_image",
             ),
         ];
-        let cap = budget().total_bytes;
+        let cap = budget().effective_bytes();
         let rows = [
             capture(&registry, &candidates[0], cap + 1),
             capture(&registry, &candidates[1], cap + 1),
             capture(&registry, &candidates[2], cap),
         ];
         let admitted = admit_with_rows(&registry, &candidates, DEVICE, budget(), &rows).unwrap();
-        assert_eq!((admitted.index(), admitted.footprint_mib()), (2, 1024));
+        assert_eq!((admitted.index(), admitted.required_mib()), (2, 1024));
         // The next size up is refused as CAPACITY, typed, never as a string to parse.
         assert_eq!(
             refusal(admit_with_rows(
@@ -498,7 +696,7 @@ pub(crate) mod tests {
             Some(Quant::Q4),
             "text_to_image",
         );
-        let rows = [capture(&registry, &base, 1)];
+        let rows = [capture(&registry, &base, ANCHOR_MARGIN_FLOOR_BYTES + 1)];
         base.context.calibration_fingerprint = "wrong-provider-identity".into();
         assert_eq!(
             refusal(admit_with_rows(&registry, &[base], DEVICE, budget(), &rows)),
@@ -514,7 +712,7 @@ pub(crate) mod tests {
         );
         base.execution.tile_vae_decode = false;
         generate(&mut base).memory = Some(base.execution);
-        let rows = [capture(&registry, &base, 1)];
+        let rows = [capture(&registry, &base, ANCHOR_MARGIN_FLOOR_BYTES + 1)];
         assert_eq!(
             refusal(admit_with_rows(&registry, &[base], DEVICE, budget(), &rows)),
             RefusalKind::Strategy
@@ -528,7 +726,7 @@ pub(crate) mod tests {
             Some(Quant::Q4),
             "text_to_image",
         );
-        let rows = [capture(&registry, &base, 1)];
+        let rows = [capture(&registry, &base, ANCHOR_MARGIN_FLOOR_BYTES + 1)];
         generate(&mut base).width = 768;
         assert!(matches!(
             admit_with_rows(&registry, &[base], DEVICE, budget(), &rows),
@@ -554,7 +752,7 @@ pub(crate) mod tests {
             capture(&registry, &fallback, 2 << 30),
         ];
         let both = [preferred.clone(), fallback.clone()];
-        let live = capacity_budget(4 << 30, 0, Some(5 << 29)); // 4GiB fixed, 2.5GiB live
+        let live = capacity_budget(4 << 30, FIXTURE_BML_BYTES, Some(5 << 29)); // 4GiB fixed, 2.5GiB live
         assert_eq!(
             admit_with_rows(&registry, &both, DEVICE, live, &rows)
                 .unwrap()
@@ -597,7 +795,7 @@ pub(crate) mod tests {
                     &registry,
                     &[first, fallback.clone()],
                     DEVICE,
-                    capacity_budget(4 << 30, 0, None),
+                    capacity_budget(4 << 30, FIXTURE_BML_BYTES, None),
                     &rows
                 )
                 .unwrap()
@@ -610,9 +808,11 @@ pub(crate) mod tests {
 
 #[cfg(test)]
 mod execution_tests {
+    use super::tests::admit_fixture_rows as admit_with_rows;
     use super::tests::{budget, candidate, capture, fixture, write_tensor, DEVICE};
     use super::*;
-    use crate::ios_admission::{admit_with_rows, Admission, IosCandidate, IosWork};
+    use crate::evidence::ANCHOR_MARGIN_FLOOR_BYTES;
+    use crate::ios_admission::{Admission, IosCandidate, IosWork};
     use mlx_gen::gen_core::*;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -797,7 +997,11 @@ mod execution_tests {
             std::slice::from_ref(candidate),
             DEVICE,
             budget(),
-            &[capture(registry, candidate, 1 << 20)],
+            &[capture(
+                registry,
+                candidate,
+                ANCHOR_MARGIN_FLOOR_BYTES + (1 << 20),
+            )],
         )
         .unwrap()
     }

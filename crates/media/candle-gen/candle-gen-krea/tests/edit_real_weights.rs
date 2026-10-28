@@ -69,7 +69,16 @@ fn is_coherent(img: &Image) -> bool {
 /// Minimal binary-PPM (P6) reader → an [`Image`] (RGB8). Keeps the fixture format identical to the qwen
 /// edit smoke without depending on an image decoder in this test.
 fn read_ppm(path: &PathBuf) -> Image {
-    let bytes = std::fs::read(path).expect("read source PPM");
+    let bytes = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(path),
+"crates/media/candle-gen/candle-gen-krea/tests/edit_real_weights.rs::read_ppm::std::fs::read@3529",
+Reference,
+path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
+    .expect("read source PPM");
     assert_eq!(&bytes[0..2], b"P6", "expected a binary P6 PPM");
     // Parse the 3 whitespace-separated header numbers (width, height, maxval) after the magic.
     let mut it = bytes[2..].iter().copied();
@@ -110,7 +119,17 @@ fn read_source(path: &PathBuf) -> Image {
     if !is_png {
         return read_ppm(path);
     }
-    let rgb = image::open(path).expect("decode PNG source").to_rgb8();
+    let rgb = candle_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/candle-gen/candle-gen-krea/tests/edit_real_weights.rs::read_source::image::open@4924",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
+    .expect("decode PNG source")
+    .to_rgb8();
     let (width, height) = rgb.dimensions();
     Image {
         width,
@@ -147,6 +166,8 @@ fn edit_renders_coherent_with_dual_conditioning() {
         std::env::var("KREA_EDIT_SOURCE"),
     ) else {
         eprintln!("skipping: set KREA_RAW_DIR + KREA_EDIT_LORA + KREA_EDIT_SOURCE");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/edit_real_weights.rs:150 (edit_renders_coherent_with_dual_conditioning): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let root = PathBuf::from(root);
@@ -247,4 +268,7 @@ fn edit_renders_coherent_with_dual_conditioning() {
             .count();
         assert!(diff > 0, "the edit must change the source, not echo it");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED edit_real_weights::edit_renders_coherent_with_dual_conditioning");
 }

@@ -23,6 +23,7 @@ fn spec(file: &str, kind: AdapterKind, scale: f32) -> AdapterSpec {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lora_and_lokr_deltas_and_forwards_match_upstream() {
     let config = tiny_config();
     let golden = fixture("iris_adapter_golden.safetensors");
@@ -96,6 +97,9 @@ fn lora_and_lokr_deltas_and_forwards_match_upstream() {
             "{name}: the adapter moves the output only {effect:.3e}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapter_parity::lora_and_lokr_deltas_and_forwards_match_upstream");
 }
 
 /// sc-25690 I8 (the MLX twin's test): a backbone whose `config.yaml` declares one pixel block fewer

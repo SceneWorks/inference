@@ -40,17 +40,12 @@ fn fresh_adaln_tables_match_warm_projection_with_turbo() {
     assert_eq!(joint.num_evals(), 4);
     let schedule = adaln_schedule(&joint).unwrap();
     assert_eq!(schedule.num_distinct_timesteps(), 9);
-    let cache = AdaLnCache::precompute(dit.blocks(), schedule.clone(), |ts| {
-        dit.projections().time_embedder.forward(ts)
-    })
-    .expect("cold AdaLN precompute must complete without a Metal timeout");
+    let cache =
+        AdaLnCache::precompute(dit.blocks(), schedule.clone(), |ts| dit.embed_timesteps(ts))
+            .expect("cold AdaLN precompute must complete without a Metal timeout");
     assert_eq!(cache.num_layers(), 50);
     assert!(cache.is_current_for(&schedule));
-    let temb = dit
-        .projections()
-        .time_embedder
-        .forward(schedule.distinct_timesteps())
-        .unwrap();
+    let temb = dit.embed_timesteps(schedule.distinct_timesteps()).unwrap();
     let mut checked = 0;
     for (index, block) in dit.blocks().iter().enumerate() {
         let reference = block.modulation(&temb).unwrap();
@@ -107,4 +102,6 @@ fn fresh_adaln_tables_match_warm_projection_with_turbo() {
         started.elapsed(),
         mlx_rs::memory::get_peak_memory()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cold_start::fresh_adaln_tables_match_warm_projection_with_turbo");
 }

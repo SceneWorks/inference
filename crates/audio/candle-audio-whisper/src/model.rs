@@ -142,10 +142,21 @@ impl WhisperTranscriber {
         let config_text = std::fs::read_to_string(&config_path).map_err(|e| {
             AudioError::Msg(format!("whisper: reading {}: {e}", config_path.display()))
         })?;
-        let config: Config = serde_json::from_str(&config_text)
-            .map_err(|e| AudioError::Msg(format!("whisper: parsing {CONFIG_FILE}: {e}")))?;
-        let tokenizer = Tokenizer::from_file(self.root.join(TOKENIZER_FILE))
-            .map_err(|e| AudioError::Msg(format!("whisper: loading {TOKENIZER_FILE}: {e}")))?;
+        let config: Config = candle_audio::gen_core::__model_input_result!(
+            serde_json::from_str(&config_text)
+                .map_err(|e| AudioError::Msg(format!("whisper: parsing {CONFIG_FILE}: {e}"))),
+            "candle-audio-whisper::model::WhisperTranscriber::build/configuration",
+            Configuration,
+            &[&config_path]
+        )?;
+        let tokenizer = candle_audio::gen_core::__model_input_reader!(
+            Tokenizer::from_file(self.root.join(TOKENIZER_FILE)),
+            "candle-audio-whisper::model::WhisperTranscriber::build/tokenizer",
+            Tokenizer,
+            self.root.join(TOKENIZER_FILE),
+            |path| Tokenizer::from_file(path)
+        )
+        .map_err(|e| AudioError::Msg(format!("whisper: loading {TOKENIZER_FILE}: {e}")))?;
         let weights = self.root.join(WEIGHTS_FILE);
         // Safety: from_mmaped_safetensors mmaps a trusted, pinned-SHA snapshot file (F-029).
         let vb = unsafe {

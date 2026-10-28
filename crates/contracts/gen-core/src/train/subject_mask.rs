@@ -126,9 +126,14 @@ pub struct SubjectMask {
 impl SubjectMask {
     /// Decode a mask image (any format the `image` crate reads; colour is reduced to luma).
     pub fn load(path: &Path) -> crate::Result<Self> {
-        let gray = image::open(path)
-            .map_err(|e| crate::Error::Msg(format!("decode subject mask {}: {e}", path.display())))?
-            .to_luma8();
+        let gray = crate::__model_input_result!(
+            image::open(path),
+            "crates/contracts/gen-core/src/train/subject_mask.rs::SubjectMask::load/image::open",
+            Reference,
+            &[path]
+        )
+        .map_err(|e| crate::Error::Msg(format!("decode subject mask {}: {e}", path.display())))?
+        .to_luma8();
         let (width, height) = gray.dimensions();
         Ok(Self {
             width,
@@ -162,21 +167,33 @@ impl SubjectMask {
         let cols = coverage(crop.x, crop.width, grid_w);
         let rows = coverage(crop.y, crop.height, grid_h);
         let w = self.width as usize;
-        // Horizontal pass over the crop's rows, then vertical.
+        // Horizontal pass over the crop's rows, then vertical. Normalize F64 tap sums rather
+        // than assuming their floating sum is exactly one. This preserves constants/convex
+        // bounds without clamping or changing mask values. Intermediate/output buffers stay F32.
+        // Both tap tuples occupy 16 bytes on the supported 64-bit executors (tested below).
         let mut horiz = vec![0f32; crop.height as usize * grid_w];
         for sy in 0..crop.height as usize {
             let src = &self.values[(crop.y as usize + sy) * w..][..w];
             for (gx, taps) in cols.iter().enumerate() {
-                horiz[sy * grid_w + gx] = taps.iter().map(|&(sx, cov)| src[sx] * cov).sum();
+                let total: f64 = taps.iter().map(|&(_, cov)| cov).sum();
+                assert!(
+                    total > 0.0 && total.is_finite(),
+                    "empty mask column coverage"
+                );
+                let value: f64 = taps.iter().map(|&(sx, cov)| f64::from(src[sx]) * cov).sum();
+                horiz[sy * grid_w + gx] = (value / total) as f32;
             }
         }
         let mut out = vec![0f32; grid_h * grid_w];
         for (gy, taps) in rows.iter().enumerate() {
+            let total: f64 = taps.iter().map(|&(_, cov)| cov).sum();
+            assert!(total > 0.0 && total.is_finite(), "empty mask row coverage");
             for gx in 0..grid_w {
-                out[gy * grid_w + gx] = taps
+                let value: f64 = taps
                     .iter()
-                    .map(|&(sy, cov)| horiz[(sy - crop.y as usize) * grid_w + gx] * cov)
+                    .map(|&(sy, cov)| f64::from(horiz[(sy - crop.y as usize) * grid_w + gx]) * cov)
                     .sum();
+                out[gy * grid_w + gx] = (value / total) as f32;
             }
         }
         out
@@ -185,7 +202,7 @@ impl SubjectMask {
 
 /// For each of `cells` output cells spanning `[start, start + len)`, the source pixels it covers and
 /// each one's normalised coverage (the taps of one cell sum to 1).
-fn coverage(start: u32, len: u32, cells: usize) -> Vec<Vec<(usize, f32)>> {
+fn coverage(start: u32, len: u32, cells: usize) -> Vec<Vec<(usize, f64)>> {
     let scale = f64::from(len) / cells as f64;
     (0..cells)
         .map(|c| {
@@ -196,7 +213,7 @@ fn coverage(start: u32, len: u32, cells: usize) -> Vec<Vec<(usize, f32)>> {
             while f64::from(p) < hi && p < len {
                 let cov = (f64::from(p + 1).min(hi) - f64::from(p).max(lo)) / scale;
                 if cov > 0.0 {
-                    taps.push(((start + p) as usize, cov as f32));
+                    taps.push(((start + p) as usize, cov));
                 }
                 p += 1;
             }
@@ -253,6 +270,17 @@ impl PreparedSubjectMask {
             ))
         })?;
         let mask = SubjectMask::load(mask_path)?;
+        Self::from_decoded(label, &item.image_path, (iw, ih), mask, cfg)
+    }
+    /// Validate an already decoded, authenticated mask against its captured image geometry.
+    pub fn from_decoded(
+        label: &str,
+        image_path: &Path,
+        (iw, ih): (u32, u32),
+        mask: SubjectMask,
+        cfg: &SubjectMaskLoss,
+    ) -> crate::Result<Self> {
+        let name = display_name(image_path);
         if (mask.width, mask.height) != (iw, ih) {
             return Err(crate::Error::Msg(format!(
                 "{label}: subject mask for image {name} is {}x{} but the image is {iw}x{ih}; \

@@ -7,6 +7,15 @@
 //! CPU with no model download, so it guards the MLA wiring in CI alongside the real-weights breadth
 //! test (`CANDLE_LLM_DEEPSEEK_MODEL`, see `tests/breadth.rs`).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
@@ -246,23 +255,32 @@ fn run_decode(model: &CausalLm) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn mla_full_q_proj_prefills_and_decodes() {
     // DeepSeek-V2-Lite shape: a full q_proj (no query LoRA).
     let model = load_tiny_deepseek("fullq", None);
     run_decode(&model);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mla_full_q_proj_prefills_and_decodes");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn mla_query_lora_prefills_and_decodes() {
     // The larger DeepSeek-V2 shape: a low-rank q_a → q_a_layernorm → q_b query path.
     let model = load_tiny_deepseek("qlora", Some(20));
     run_decode(&model);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mla_query_lora_prefills_and_decodes");
 }
 
 /// sc-24138: DeepSeek-V2's materialized MLA caches `qk_nope + qk_rope`-wide keys beside
 /// `v_head_dim`-wide values; the step seam's static cache holds both widths, its preallocation is
 /// exactly the priced bytes, and the static decode is the reference decode token for token.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn mla_decodes_through_the_static_step_cache() {
     use candle_llm::decode::{generate, generate_step, CancelFlag, GenerationConfig, StepModel};
     use candle_llm::primitives::{DecodeCache, KvCacheKind};
@@ -312,4 +330,7 @@ fn mla_decodes_through_the_static_step_cache() {
         DecodeCache::graph_support(&cache),
         Err("positions_host_scalar")
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mla_decodes_through_the_static_step_cache");
 }

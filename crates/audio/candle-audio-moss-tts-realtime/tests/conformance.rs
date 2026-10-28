@@ -46,6 +46,16 @@
 //! (default temp dir). The fidelity gate additionally uses `whisper_base` — **required** from
 //! `WHISPER_SNAPSHOT` (the ~150 MB snapshot dir), also a passed-in path, never a hub fetch.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_moss_tts_realtime as moss;
@@ -207,6 +217,9 @@ fn moss_tts_realtime_emits_valid_rvq_frames() {
         std::fs::write(&out, text).expect("write RVQ frames");
         eprintln!("wrote {} RVQ frames to {out}", frames.len());
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_tts_realtime_emits_valid_rvq_frames");
 }
 
 /// AR-stage gate: the loop is genuinely incremental — first frame lands well before the full budget.
@@ -273,6 +286,9 @@ fn moss_tts_realtime_is_incremental() {
         steps.windows(2).all(|w| w[1] == w[0] + 1),
         "progress must advance one frame at a time and in order, got {steps:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_tts_realtime_is_incremental");
 }
 
 /// The streaming acceptance gate (sc-13334, released by the sc-13392 codec): the shared
@@ -436,6 +452,9 @@ fn moss_tts_realtime_streaming_gate() {
         chunks.first().map(|c| c.samples.len()).unwrap_or(0),
         track.samples.len(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_tts_realtime_streaming_gate");
 }
 
 /// Codec-only debug decode (no AR): loads the codec and decodes synthetic frames, printing per-stage
@@ -452,7 +471,15 @@ fn codec_only_decodes_synthetic_frames() {
     // Either the real dumped AR frames (MOSS_TTS_REALTIME_FRAMES_OUT) or 25 frames of pseudo-random
     // in-range codes (a fixed LCG so the run is reproducible).
     let frames: Vec<Vec<u32>> = if let Ok(path) = std::env::var("MOSS_TTS_REALTIME_FRAMES_OUT") {
-        std::fs::read_to_string(&path)
+        candle_audio::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/audio/candle-audio-moss-tts-realtime/tests/conformance.rs::codec_only_decodes_synthetic_frames::std::fs::read_to_string@22810",
+TensorInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = candle_audio::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
             .expect("read frames file")
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -490,6 +517,9 @@ fn codec_only_decodes_synthetic_frames() {
         rms > 1e-4,
         "codec produced near-silent output ({rms:.6}) from non-trivial codes — decode-path bug"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED codec_only_decodes_synthetic_frames");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -675,6 +705,9 @@ fn moss_tts_realtime_asr_roundtrip_fidelity() {
         "discrimination failed: a faithful transcript {first_transcript:?} scored CER {decoy_cer:.3} \
          against the unrelated decoy — the bound {MAX_PROMPT_CER} is too loose to be meaningful"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_tts_realtime_asr_roundtrip_fidelity");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -706,8 +739,22 @@ fn pearson(a: &[f32], b: &[f32]) -> f32 {
     num / (da.sqrt() * db.sqrt())
 }
 
-fn read_f32le(path: &str) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read f32-LE clip {path}: {e}"));
+fn read_f32le(
+    #[cfg(feature = "model-inference-proof")] input_origin: &std::cell::Cell<
+        candle_audio::gen_core::model_input_proof::SourceOrigin,
+    >,
+    path: &str,
+) -> Vec<f32> {
+    let bytes = candle_audio::gen_core::__model_input_reader!(
+std::fs::read(path),
+"crates/audio/candle-audio-moss-tts-realtime/tests/conformance.rs::read_f32le::std::fs::read@34736",
+Reference,
+path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = input_origin.get()
+)
+    .unwrap_or_else(|e| panic!("read f32-LE clip {path}: {e}"));
     // A trailing partial sample means the file is truncated, not that the last sample is optional;
     // `chunks_exact` would drop it and hand back a quietly shorter waveform.
     assert!(
@@ -722,8 +769,21 @@ fn read_f32le(path: &str) -> Vec<f32> {
 }
 
 /// Read a codes CSV (`frames[T][nq]`, one comma-separated row per frame).
-fn read_codes_csv(path: &str) -> Vec<Vec<u32>> {
-    std::fs::read_to_string(path)
+fn read_codes_csv(
+    #[cfg(feature = "model-inference-proof")] input_origin: &std::cell::Cell<
+        candle_audio::gen_core::model_input_proof::SourceOrigin,
+    >,
+    path: &str,
+) -> Vec<Vec<u32>> {
+    candle_audio::gen_core::__model_input_reader!(
+std::fs::read_to_string(path),
+"crates/audio/candle-audio-moss-tts-realtime/tests/conformance.rs::read_codes_csv::std::fs::read_to_string@35431",
+TensorInput,
+path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = input_origin.get()
+)
         .expect("read codes csv")
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -751,6 +811,7 @@ fn read_codes_csv(path: &str) -> Vec<Vec<u32>> {
 /// An empty or whitespace-only value counts as unset. An unconfigured `${{ vars.X }}` expands to
 /// the empty string in a workflow, so treating it as an override would turn a mis-wired lane into
 /// a confusing read failure instead of simply using the fixture that ships with the test.
+#[cfg(not(feature = "model-inference-proof"))]
 fn fixture_path(env: &str, file: &str) -> String {
     match std::env::var(env) {
         Ok(value) if !value.trim().is_empty() => value,
@@ -760,6 +821,30 @@ fn fixture_path(env: &str, file: &str) -> String {
             .join(file)
             .to_string_lossy()
             .into_owned(),
+    }
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn fixture_path_observing(
+    env: &str,
+    file: &str,
+    origin: &std::cell::Cell<candle_audio::gen_core::model_input_proof::SourceOrigin>,
+) -> String {
+    use candle_audio::gen_core::model_input_proof::SourceOrigin;
+    match std::env::var(env) {
+        Ok(value) if !value.trim().is_empty() => {
+            origin.set(SourceOrigin::ExternalSelected);
+            value
+        }
+        _ => {
+            origin.set(SourceOrigin::SourceDefinedDefault);
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join(file)
+                .to_string_lossy()
+                .into_owned()
+        }
     }
 }
 
@@ -783,11 +868,41 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
         "set MOSS_CODEC_CLIP and MOSS_CODEC_REF_CODES together or not at all — the codes are only \
          valid for the clip they were generated from"
     );
-    let clip_p = fixture_path("MOSS_CODEC_CLIP", "moss_codec_ref_clip.f32");
-    let ref_p = fixture_path("MOSS_CODEC_REF_CODES", "moss_codec_ref_codes.csv");
-    let clip = read_f32le(&clip_p);
+    #[cfg(feature = "model-inference-proof")]
+    let __selected_fixture_origin_0 = std::cell::Cell::new(
+        candle_audio::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
+    );
+    let clip_p = candle_audio::gen_core::__model_input_choose!(
+        fixture_path("MOSS_CODEC_CLIP", "moss_codec_ref_clip.f32"),
+        fixture_path_observing(
+            "MOSS_CODEC_CLIP",
+            "moss_codec_ref_clip.f32",
+            &__selected_fixture_origin_0
+        )
+    );
+    #[cfg(feature = "model-inference-proof")]
+    let __selected_fixture_origin_1 = std::cell::Cell::new(
+        candle_audio::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
+    );
+    let ref_p = candle_audio::gen_core::__model_input_choose!(
+        fixture_path("MOSS_CODEC_REF_CODES", "moss_codec_ref_codes.csv"),
+        fixture_path_observing(
+            "MOSS_CODEC_REF_CODES",
+            "moss_codec_ref_codes.csv",
+            &__selected_fixture_origin_1
+        )
+    );
+    let clip = read_f32le(
+        #[cfg(feature = "model-inference-proof")]
+        &__selected_fixture_origin_0,
+        &clip_p,
+    );
     let port = codec.encode(&clip, 24_000).expect("encode reference clip");
-    let refc = read_codes_csv(&ref_p);
+    let refc = read_codes_csv(
+        #[cfg(feature = "model-inference-proof")]
+        &__selected_fixture_origin_1,
+        &ref_p,
+    );
     let n = port.len().min(refc.len());
     assert!(n > 0, "no frames to compare");
     assert_eq!(
@@ -904,6 +1019,9 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
         corr > 0.3,
         "encode→decode must reconstruct the codec waveform (corr {corr:.3})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_audio_codec_encode_roundtrip_and_reference");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1233,6 +1351,11 @@ fn moss_audio_codec_chunked_encode_matches_single_shot() {
         secs / 2.0,
         chunk_spike / 1_000_000,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED moss_audio_codec_chunked_encode_matches_single_shot"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1261,10 +1384,22 @@ fn moss_tts_realtime_voice_clone() {
         .expect("whisper registry")
         .load_transcriber(candle_audio_whisper::MODEL_ID, &wspec)
         .expect("whisper_base loads");
-    let ref_clip = read_f32le(&fixture_path(
-        "MOSS_VOICECLONE_REF",
-        "moss_voiceclone_ref_clip.f32",
-    ));
+    #[cfg(feature = "model-inference-proof")]
+    let __selected_fixture_origin_2 = std::cell::Cell::new(
+        candle_audio::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
+    );
+    let ref_clip = read_f32le(
+        #[cfg(feature = "model-inference-proof")]
+        &__selected_fixture_origin_2,
+        &candle_audio::gen_core::__model_input_choose!(
+            fixture_path("MOSS_VOICECLONE_REF", "moss_voiceclone_ref_clip.f32",),
+            fixture_path_observing(
+                "MOSS_VOICECLONE_REF",
+                "moss_voiceclone_ref_clip.f32",
+                &__selected_fixture_origin_2
+            )
+        ),
+    );
 
     let text = "The quick brown fox jumps over the lazy dog.";
     let req = |conditioning: Vec<Conditioning>| GenerationRequest {
@@ -1378,6 +1513,9 @@ fn moss_tts_realtime_voice_clone() {
         "cloned output must resemble the reference speaker MORE than the default voice \
          (clone↔ref {sim_clone:.3} vs default↔ref {sim_def:.3})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_tts_realtime_voice_clone");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1604,6 +1742,9 @@ fn moss_tts_realtime_multi_turn_conversation() {
         "the assistant's turns must be the same speaker across the conversation (cross-turn CAMPPlus \
          cosine {cross_turn_sim:.3}) — a later turn drifting to a different voice fails here"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_tts_realtime_multi_turn_conversation");
 }
 
 /// Unwrap a `session.step` result to its `AudioTrack`, panicking with `ctx` on error.
@@ -1779,6 +1920,9 @@ fn moss_tts_realtime_multi_turn_user_context() {
         "the assistant reply must depend on the user turn — the same reply after two different user \
          turns produced near-identical audio (corr {corr:.3}), so the user turn is ignored"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_tts_realtime_multi_turn_user_context");
 }
 
 /// sc-14151 (M2) — voice cloning **composed with a multi-turn conversation**: the cloned timbre is
@@ -1794,10 +1938,22 @@ fn moss_tts_realtime_multi_turn_voice_clone() {
 
     let generator = load();
     let transcribe = whisper_transcriber();
-    let ref_clip = read_f32le(&fixture_path(
-        "MOSS_VOICECLONE_REF",
-        "moss_voiceclone_ref_clip.f32",
-    ));
+    #[cfg(feature = "model-inference-proof")]
+    let __selected_fixture_origin_3 = std::cell::Cell::new(
+        candle_audio::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
+    );
+    let ref_clip = read_f32le(
+        #[cfg(feature = "model-inference-proof")]
+        &__selected_fixture_origin_3,
+        &candle_audio::gen_core::__model_input_choose!(
+            fixture_path("MOSS_VOICECLONE_REF", "moss_voiceclone_ref_clip.f32",),
+            fixture_path_observing(
+                "MOSS_VOICECLONE_REF",
+                "moss_voiceclone_ref_clip.f32",
+                &__selected_fixture_origin_3
+            )
+        ),
+    );
     let ref_track = AudioTrack {
         samples: ref_clip.clone(),
         sample_rate: 24_000,
@@ -1901,4 +2057,7 @@ fn moss_tts_realtime_multi_turn_voice_clone() {
         sim_cross > 0.5,
         "the cloned turns must be the same speaker as each other (cross-turn {sim_cross:.3})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED moss_tts_realtime_multi_turn_voice_clone");
 }

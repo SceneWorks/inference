@@ -96,6 +96,7 @@ fn rope_matches_reference() -> Result<()> {
 /// One `SingleStreamBlock`: DoubleSharedModulation (6-factor pre/post), the sigmoid-gated GQA attention
 /// with interleaved RoPE, and the SwiGLU FFN.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn single_block_matches_reference() -> Result<()> {
     let w = load("single_block_golden.safetensors");
     let blk = SingleStreamBlock::load(
@@ -125,12 +126,15 @@ fn single_block_matches_reference() -> Result<()> {
         max_abs_diff(&y, &want) < 2e-2,
         "single block diverged beyond 2e-2 (cosine {c:.7})"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::single_block_matches_reference");
     Ok(())
 }
 
 /// The `TextFusionTransformer`: layer-axis aggregation (attention across the stacked layers) →
 /// `projector` 12→1 collapse → token-axis refiner blocks.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn text_fusion_matches_reference() -> Result<()> {
     let w = load("text_fusion_golden.safetensors");
     let tf = TextFusionTransformer::load(
@@ -155,6 +159,8 @@ fn text_fusion_matches_reference() -> Result<()> {
         max_abs_diff(&y, &want) < 2e-2,
         "text_fusion diverged beyond 2e-2 (cosine {c:.7})"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::text_fusion_matches_reference");
     Ok(())
 }
 
@@ -168,6 +174,7 @@ fn text_fusion_matches_reference() -> Result<()> {
 ///     *differs* from the base (the in-context tokens actually condition the output).
 ///  3. **Two refs** — the image-1/image-2 path runs and stays finite + correctly shaped (sc-10878).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn edit_forward_reduces_to_base_and_refs_influence() -> Result<()> {
     let w = load("dit_golden.safetensors");
     let cfg = tiny_dit_config();
@@ -213,6 +220,8 @@ fn edit_forward_reduces_to_base_and_refs_influence() -> Result<()> {
         vec_f32(&edit2).iter().all(|v| v.is_finite()),
         "two-ref edit finite"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::edit_forward_reduces_to_base_and_refs_influence");
     Ok(())
 }
 
@@ -220,6 +229,7 @@ fn edit_forward_reduces_to_base_and_refs_influence() -> Result<()> {
 /// text fusion + `txt_in`, the joint single-stream stack under 3-axis RoPE, the final layer, and
 /// unpatchify — end to end vs the reference velocity.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn dit_matches_reference() -> Result<()> {
     let w = load("dit_golden.safetensors");
     let cfg = tiny_dit_config();
@@ -242,5 +252,7 @@ fn dit_matches_reference() -> Result<()> {
         max_abs_diff(&velocity, &want) < 2e-2,
         "full-DiT velocity diverged beyond 2e-2 (cosine {c:.7})"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::dit_matches_reference");
     Ok(())
 }

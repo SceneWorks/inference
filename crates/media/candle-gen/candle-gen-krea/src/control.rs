@@ -73,7 +73,7 @@ struct VLin {
 impl VLin {
     fn forward(&self, x: &Tensor, frozen: bool) -> Result<Tensor> {
         let w = rd(&self.w, frozen).to_dtype(x.dtype())?;
-        Ok(x.broadcast_matmul(&w.t()?)?)
+        Ok(__model_proof_output!(x.broadcast_matmul(&w.t()?))?)
     }
 }
 
@@ -923,6 +923,7 @@ mod tests {
     /// The keystone zero-init gate: with untouched (zero) output projections the branched forward is
     /// **exactly** the base forward at `control_scale = 1.0` — the ControlNet step-0 identity.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn zero_init_branch_is_identity() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -941,12 +942,16 @@ mod tests {
         let b = with.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(a, b, "zero-init projections must be a step-0 identity");
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control::tests::zero_init_branch_is_identity");
     }
 
     /// The control request plan is produced once from the prompt and pose latent, then every denoise
     /// step reuses it. This CPU fixture pins parity with the historical unprepared forward and the
     /// fail-closed geometry check without a model download or CUDA device.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_control_conditioning_matches_the_unprepared_forward_and_rejects_stale_geometry() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -990,6 +995,9 @@ mod tests {
             "expected a typed prepared-state error, got {error:?}"
         );
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control::tests::prepared_control_conditioning_matches_the_unprepared_forward_and_rejects_stale_geometry");
     }
 
     /// Activation-chunking parity (sc-11745): forcing the smallest possible scores budget (`1` →
@@ -998,6 +1006,7 @@ mod tests {
     /// control forward level. This is the correctness gate for the fit-ladder's chunking rung (the
     /// fit-gate only ever LOWERS the budget from the i32-guard default, so unchunked == chunked).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn attention_chunking_matches_unchunked() {
         let dev = Device::Cpu;
         // ≥2 main blocks + a nudged branch so both the base attention and the injected branch
@@ -1030,11 +1039,17 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED control::tests::attention_chunking_matches_unchunked"
+        );
     }
 
     /// `control_scale = 0` short-circuits to the plain base forward even with a trained (nonzero)
     /// branch — the byte-identity contract of the inference hook.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn scale_zero_is_base_forward() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -1054,11 +1069,15 @@ mod tests {
         let b = with.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(a, b, "scale 0 must be the un-branched forward");
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control::tests::scale_zero_is_base_forward");
     }
 
     /// Backprop reaches **every** branch `Var` (through the frozen main stack into the injected
     /// residuals) with finite gradients, and a few AdamW steps lower the loss on a fixed batch.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn backward_reaches_branch_and_descends() {
         let dev = Device::Cpu;
         // Draw the ENTIRE fixture — base DiT weights, branch nudge, probe batch, control latent —
@@ -1136,6 +1155,11 @@ mod tests {
             loss1 / loss0
         );
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED control::tests::backward_reaches_branch_and_descends"
+        );
     }
 
     /// The correctness gate for the gradient-checkpointing lever: [`control_loss_grads`] with
@@ -1143,6 +1167,7 @@ mod tests {
     /// monolithic `loss.backward()` — same loss, same gradient on **every** branch `Var` (mod float
     /// reassociation). The control twin of the LoRA trainer's `dense_and_checkpoint_grads_match`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dense_and_checkpoint_grads_match_control() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -1206,6 +1231,9 @@ mod tests {
         }
         assert!(saw_nonzero, "expected nonzero branch grads to compare");
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control::tests::dense_and_checkpoint_grads_match_control");
     }
 
     /// Train/infer branch-path parity (the sc-8460 step-500 probe regression gate): with the SAME
@@ -1214,6 +1242,7 @@ mod tests {
     /// it) must be **exactly** equal — freezing changes graph tracking, never values — and
     /// [`probe_forward`]'s branched velocity must match both.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn train_and_infer_branch_paths_match() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -1254,6 +1283,11 @@ mod tests {
         // Nudged (nonzero) projections => the branched velocity differs from base.
         assert_ne!(flat(&v_base), v_infer);
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED control::tests::train_and_infer_branch_paths_match"
+        );
     }
 
     /// The residual RMS clamp (sc-8460 step-500 fix): with projections blown up far past the
@@ -1261,6 +1295,7 @@ mod tests {
     /// gradients still flow through the clamped path, an in-budget residual is untouched
     /// (clamp(None) == clamp(τ) when small), and the step-0 zero residual stays an exact identity.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn residual_clamp_caps_swamping() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -1357,11 +1392,15 @@ mod tests {
         let v_off = flat(&forward_with_control(&dit, &small, &x0, &t, &ctxt, &ctrl, 1.0).unwrap());
         assert_eq!(v_on, v_off, "an in-budget residual must pass unclamped");
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control::tests::residual_clamp_caps_swamping");
     }
 
     /// Save → load roundtrip: the reloaded branch (N inferred from the file) produces the same
     /// branched forward as the original.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn checkpoint_roundtrip() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -1398,6 +1437,9 @@ mod tests {
         assert_eq!(a, b, "checkpoint roundtrip must reproduce the forward");
         let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control::tests::checkpoint_roundtrip");
     }
 
     /// F-119 (sc-11208): a malformed/truncated overlay can ship a degenerate size-0
@@ -1438,6 +1480,7 @@ mod tests {
     /// checkpoint roundtrip (and its forward with it); and `from_base` rejects an offset that would
     /// push the injection window past the main stack.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn inject_offset_topology() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -1513,6 +1556,9 @@ mod tests {
         );
         let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control::tests::inject_offset_topology");
     }
 
     /// The quantized branch load (sc-11743): [`ControlBranch::from_checkpoint_quantized`] must build the
@@ -1523,6 +1569,7 @@ mod tests {
     /// determinism (the `10794` float-reassociation lesson). Visual pose-lock at real dims is the GPU
     /// validation; this is the CPU wiring gate for the packed leaves.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn from_checkpoint_quantized_preserves_branch_direction() {
         let dev = Device::Cpu;
         let mut rng = StdRng::seed_from_u64(11743);
@@ -1592,12 +1639,16 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control::tests::from_checkpoint_quantized_preserves_branch_direction");
     }
 
     /// A **zero-init** branch loaded quantized is still an exact step-0 identity: `proj_out` is all
     /// zeros, quantizing zeros yields zeros, so every injected residual is exactly zero regardless of
     /// how the (quantized) branch body drifts — the ControlNet identity contract survives quantization.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quantized_zero_init_is_identity() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
@@ -1624,5 +1675,10 @@ mod tests {
         );
         let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED control::tests::quantized_zero_init_is_identity"
+        );
     }
 }

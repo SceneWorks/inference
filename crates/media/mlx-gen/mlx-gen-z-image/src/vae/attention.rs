@@ -13,6 +13,8 @@ use mlx_gen::Result;
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-6;
 
+pub(crate) const QUANTIZATION_LINEAR_PATHS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
+
 pub struct VaeAttention {
     gn_w: Array,
     gn_b: Array,
@@ -20,10 +22,22 @@ pub struct VaeAttention {
     k: AdaptableLinear,
     v: AdaptableLinear,
     out: AdaptableLinear,
+    /// The quantum label of the side (encoder / decoder) this attention runs on.
+    label: &'static str,
 }
 
 impl VaeAttention {
+    /// A decoder-side attention (the decoder's quantum label).
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        Self::from_weights_labeled(w, prefix, &crate::quantum::DECODE_LABELS)
+    }
+
+    /// An attention whose iOS quantum carries `labels.attention`.
+    pub(crate) fn from_weights_labeled(
+        w: &Weights,
+        prefix: &str,
+        labels: &'static crate::quantum::VaeLabels,
+    ) -> Result<Self> {
         let g = |s: &str| w.require(&format!("{prefix}.{s}")).cloned();
         // Packed-detect (sc-8670): the mid-block attention QKV/out projections load packed from a
         // pre-quantized snapshot or dense otherwise; all carry a bias. They are the only quantizable
@@ -33,10 +47,11 @@ impl VaeAttention {
         Ok(Self {
             gn_w: g("group_norm.weight")?,
             gn_b: g("group_norm.bias")?,
-            q: lin("to_q")?,
-            k: lin("to_k")?,
-            v: lin("to_v")?,
-            out: lin("to_out.0")?,
+            q: lin(QUANTIZATION_LINEAR_PATHS[0])?,
+            k: lin(QUANTIZATION_LINEAR_PATHS[1])?,
+            v: lin(QUANTIZATION_LINEAR_PATHS[2])?,
+            out: lin(QUANTIZATION_LINEAR_PATHS[3])?,
+            label: labels.attention,
         })
     }
 
@@ -83,7 +98,7 @@ impl VaeAttention {
     pub(crate) fn forward_quantum(&self, x_nchw: &Array) -> Result<Array> {
         let plan = Self::plan();
         crate::quantum::conv_quantum(
-            crate::quantum::VAE_ATTENTION,
+            self.label,
             |backend| {
                 let [b, h, w, c] = crate::quantum::nhwc(x_nchw);
                 let n = h * w;

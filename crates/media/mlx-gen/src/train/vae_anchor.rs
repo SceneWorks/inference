@@ -505,7 +505,14 @@ pub struct VaeAnchorReference {
 impl VaeAnchorReference {
     /// Load the five taps back (f16, bit-identical to what was spilled).
     pub fn taps(&self) -> Result<Vec<Array>> {
-        let mut map: HashMap<String, Array> = Array::load_safetensors(&self.path).map_err(|e| {
+        let mut map: HashMap<String, Array> = gen_core::__model_input_reader!(
+            Array::load_safetensors(&self.path),
+            "crates/media/mlx-gen/src/train/vae_anchor.rs::taps::Array::load_safetensors@20026",
+            TensorInput,
+            &self.path,
+            |__model_input_path| Array::load_safetensors(__model_input_path)
+        )
+        .map_err(|e| {
             Error::Msg(format!(
                 "VAE anchor: cannot read the cached reference {}: {e}",
                 self.path.display()
@@ -673,6 +680,7 @@ mod tests {
     /// level term, the total, and the zero self-loss. Mutations: tap after the downsample instead
     /// of before it, drop the mid attention, or swap the level weights to uniform ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn matches_the_upstream_reference_on_formula_weights() {
         let fx = fixture();
         let case = &fx["vae_anchor"];
@@ -737,6 +745,8 @@ mod tests {
             2e-3,
         );
         assert!(scalar(&vae_anchor_feature_loss(&rf, &rf).unwrap().0).abs() < 1e-6);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED train::vae_anchor::tests::matches_the_upstream_reference_on_formula_weights");
     }
 
     /// Identity "decoder" for the shared-path tests: NCHW `[1, 3, H, W]` in `[0, 1]` → NHWC.
@@ -753,6 +763,7 @@ mod tests {
     /// into the live x0. Mutations: drop `PerceptualPath::ensure_reference`'s cache hit ⇒ the
     /// counter reads 6 ⇒ red; detach the live taps (`stop_gradient` in `loss`) ⇒ zero gradient ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn references_are_cached_once_per_image_and_the_loss_flows_gradient() {
         let spill = tempfile::tempdir().unwrap();
         let mut path = PerceptualPath::new(
@@ -806,6 +817,8 @@ mod tests {
         })(&off)
         .unwrap();
         assert!(scalar(&g.abs().unwrap().sum(None).unwrap()) > 0.0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED train::vae_anchor::tests::references_are_cached_once_per_image_and_the_loss_flows_gradient");
     }
 
     /// The loss counts its own reference encodes (one per `reference`, none per `loss`), spills each
@@ -813,6 +826,7 @@ mod tests {
     /// Mutations: re-encode on every `loss` call (bump the counter there) ⇒ red; spill the taps as
     /// f32 ⇒ the dtype assertion reds; load another entry's file ⇒ the bit-exact check reds.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn references_spill_to_disk_and_load_back_bit_exact() {
         let spill = tempfile::tempdir().unwrap();
         let loss = VaeAnchorLoss::with_spill_root(encoder(32), spill.path());
@@ -883,12 +897,15 @@ mod tests {
             ),
             "each entry has its own file"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED train::vae_anchor::tests::references_spill_to_disk_and_load_back_bit_exact");
     }
 
     /// The per-job cache directory is removed at job end (the loss — owned by the trainer's
     /// perceptual path — is dropped) and on an error / panic unwinding through the job. Mutation:
     /// drop `SpillDir`'s `Drop` impl ⇒ the directory survives ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_reference_cache_is_removed_at_job_end_and_on_error() {
         let spill = tempfile::tempdir().unwrap();
         let x = mlx_rs::random::uniform::<_, f32>(
@@ -918,6 +935,8 @@ mod tests {
         assert!(r.is_err());
         let dir = seen.lock().unwrap().clone().unwrap();
         assert!(!dir.exists(), "removed on error");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED train::vae_anchor::tests::the_reference_cache_is_removed_at_job_end_and_on_error");
     }
 
     /// A checkpoint whose encoder is not the configured width is refused.

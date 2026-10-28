@@ -67,7 +67,11 @@ fn ltx_trainer_trains_and_writes_lora_that_reloads() {
 
     let mut trainer = mlx_gen_ltx::provider_registry()
         .unwrap()
-        .load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .load_trainer(
+            "ltx_2_3",
+            &LoadSpec::new(WeightsSource::Dir(snapshot()))
+                .with_text_encoder(WeightsSource::Dir(snapshot().join("gemma"))),
+        )
         .expect("ltx_2_3 trainer should be registered");
 
     // LTX is a deep 48-block DiT with the full attention surface adapted (384 residuals stacked
@@ -177,6 +181,8 @@ fn ltx_trainer_trains_and_writes_lora_that_reloads() {
     let s = v.sum(None).unwrap().item::<f32>();
     assert!(s.is_finite(), "reloaded-LoRA forward should be finite");
     println!("[ltx-lora] e2e OK — {n_targets} targets reload, forward finite");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::ltx_trainer_trains_and_writes_lora_that_reloads");
 }
 
 /// sc-4942 — the gradient-checkpointing (block-recompute) training path drives the loss down and
@@ -192,7 +198,11 @@ fn ltx_trainer_trains_with_gradient_checkpointing() {
 
     let mut trainer = mlx_gen_ltx::provider_registry()
         .unwrap()
-        .load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .load_trainer(
+            "ltx_2_3",
+            &LoadSpec::new(WeightsSource::Dir(snapshot()))
+                .with_text_encoder(WeightsSource::Dir(snapshot().join("gemma"))),
+        )
         .expect("ltx_2_3 trainer should be registered");
 
     let config = TrainingConfig {
@@ -247,6 +257,8 @@ fn ltx_trainer_trains_with_gradient_checkpointing() {
         "checkpointed run should still write the attention LoRA keys"
     );
     println!("[ltx-lora-ckpt] e2e OK — gradient-checkpointed training converged + saved");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::ltx_trainer_trains_with_gradient_checkpointing");
 }
 
 /// sc-5637 — preview samples (one still frame). Proves the LTX render path (install in-progress
@@ -262,7 +274,11 @@ fn ltx_trainer_emits_preview_samples() {
     assert_eq!(mlx_gen_ltx::MODEL_ID, "ltx_2_3");
     let mut trainer = mlx_gen_ltx::provider_registry()
         .unwrap()
-        .load_trainer("ltx_2_3", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .load_trainer(
+            "ltx_2_3",
+            &LoadSpec::new(WeightsSource::Dir(snapshot()))
+                .with_text_encoder(WeightsSource::Dir(snapshot().join("gemma"))),
+        )
         .expect("ltx_2_3 trainer should be registered");
 
     let config = TrainingConfig {
@@ -326,4 +342,6 @@ fn ltx_trainer_emits_preview_samples() {
         "[ltx-samples] e2e OK — {} preview frame(s): {samples:?}",
         samples.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::ltx_trainer_emits_preview_samples");
 }

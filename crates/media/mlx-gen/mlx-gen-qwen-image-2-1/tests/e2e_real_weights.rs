@@ -309,6 +309,8 @@ fn render_golden() -> Option<PathBuf> {
 /// cache-shed render is comparable — the pre-epic revision had no cache — so a golden with a
 /// cached render is a usage error and panics at once.
 fn compare_with_golden(
+    #[cfg(feature = "model-inference-proof")]
+    golden_origin: mlx_gen::gen_core::model_input_proof::SourceOrigin,
     golden: Option<&Path>,
     out_dir: &Path,
     file_name: &str,
@@ -323,7 +325,15 @@ fn compare_with_golden(
          run with QWEN_IMAGE_2_1_PREFIX_KV_CACHE=prefill"
     );
     let path = golden.join(file_name);
-    let (line, failure) = match image::open(&path) {
+    let (line, failure) = match mlx_gen::gen_core::__model_input_reader!(
+image::open(&path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/e2e_real_weights.rs::compare_with_golden::image::open@15349",
+TensorInput,
+&path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = golden_origin
+) {
         Err(e) => {
             let failure = format!(
                 "{file_name}: {RENDER_GOLDEN_ENV}: {} is the golden for this render: {e}",
@@ -549,6 +559,8 @@ fn validation_render_default_preset() {
         PrefixKvCacheMode::Prefill,
         render_golden().as_deref(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_default_preset");
 }
 
 /// The distilled Turbo checkpoint's validation render (sc-25900): the same 1:1 2048×2048 preset,
@@ -587,6 +599,8 @@ fn validation_render_turbo_default() {
         [steps.unwrap_or(saved)],
         "a request with no step count runs one step per saved sigma"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_turbo_default");
 }
 
 /// The Turbo **step sweep** (sc-25902): the default 1:1 2048×2048 preset, same prompt and seed as
@@ -621,6 +635,8 @@ fn validation_render_turbo_step_sweep() {
         None,
     );
     assert_eq!(reported, steps, "every swept step count ran as asked");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_turbo_step_sweep");
 }
 
 /// What a render body renders with: the engine id, how the generator is loaded, the tier its
@@ -685,6 +701,8 @@ fn validation_render(
         height = h.parse().unwrap();
     }
     validation_render_at(
+        #[cfg(feature = "model-inference-proof")]
+        mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected,
         target,
         &out_dir(),
         (width, height),
@@ -698,6 +716,8 @@ fn validation_render(
 /// `QWEN_IMAGE_2_1_RENDER_SIZE` / `_RENDER_OUT` environment so the default-run dry run at the
 /// bottom of this file can drive it on the miniature fixture.
 fn validation_render_at(
+    #[cfg(feature = "model-inference-proof")]
+    golden_origin: mlx_gen::gen_core::model_input_proof::SourceOrigin,
     target: &Target,
     out_dir: &std::path::Path,
     (width, height): (u32, u32),
@@ -773,7 +793,14 @@ fn validation_render_at(
                     let label = match &p {
                         Progress::Loading(phase) => format!("loading {phase:?}"),
                         Progress::Step { current, .. } => format!("step {current} reported"),
+                        Progress::PromptUpsamplingComplete => {
+                            "prompt-upsampling-complete".to_owned()
+                        }
+                        Progress::ConditioningComplete => "conditioning-complete".to_owned(),
                         Progress::Decoding => "before decode".to_owned(),
+                        Progress::Upsampling { tokens, max_tokens } => {
+                            format!("upsampling {tokens}/{max_tokens}")
+                        }
                     };
                     memory_line(&label, &footprint_for_progress);
                 }
@@ -821,7 +848,13 @@ fn validation_render_at(
             render_started.elapsed().as_secs_f32()
         );
         golden_failures.extend(compare_with_golden(
-            golden, out_dir, &file_name, image, cache,
+            #[cfg(feature = "model-inference-proof")]
+            golden_origin,
+            golden,
+            out_dir,
+            &file_name,
+            image,
+            cache,
         ));
         // Evidence someone reads to pick a step count must not be a blank frame, and two step
         // counts must not have produced the same picture (a dead `steps` knob).
@@ -1193,7 +1226,15 @@ fn references(
         .into_iter()
         .take(count)
         .map(|path| {
-            let rgb = image::open(&path)
+            let rgb = mlx_gen::gen_core::__model_input_reader!(
+image::open(&path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/e2e_real_weights.rs::references::image::open@53337",
+Reference,
+&path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
                 .to_rgb8();
             mlx_gen::gen_core::Image {
@@ -1283,6 +1324,8 @@ fn validation_render_reference_edit() {
         false,
         golden.as_deref(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_reference_edit");
 }
 
 /// The Turbo twin of [`validation_render_reference_edit`] (sc-25902), through the
@@ -1360,6 +1403,10 @@ fn validation_render_turbo_reference_edit() {
         ],
         true,
         None,
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_turbo_reference_edit"
     );
 }
 
@@ -1686,6 +1733,8 @@ fn validation_render_turbo_prefix_kv_cache_velocity() {
         .unwrap();
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_turbo_prefix_kv_cache_velocity");
 }
 
 /// How many times the one-ulp control's gap a cached evaluation's velocity may sit from the
@@ -1942,6 +1991,7 @@ fn the_cached_evaluation_verdict_rejects_non_finite_and_over_bar_gaps() {
 ///
 /// *Mutations that red this:* [`block0_target_gaps`] reading the first `target` rows; the seam
 /// tracing past block 0 or stopping before it.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_block0_comparison_reads_the_target_rows_on_the_miniature_fixture() {
     use mlx_gen_qwen_image_2_1::{joint_images, load_transformer, JointLayout, Segment};
@@ -2016,6 +2066,8 @@ fn the_block0_comparison_reads_the_target_rows_on_the_miniature_fixture() {
         let worst = gaps.iter().map(|(_, rel, _, _)| *rel).fold(0.0, f64::max);
         assert!(worst > CACHED_BLOCK0_REL_BAR, "worst {worst:.3e}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::the_block0_comparison_reads_the_target_rows_on_the_miniature_fixture");
 }
 
 /// The reference-edit smoke of `target`: one render per [`EditCase`] — `steps: None` leaves the
@@ -2068,6 +2120,8 @@ fn reference_edit_renders(
         }
     }
     reference_edit_renders_in(
+        #[cfg(feature = "model-inference-proof")]
+        mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected,
         target,
         &out_dir(),
         references,
@@ -2252,6 +2306,8 @@ fn the_same_picture_difference_tolerates_a_shift_and_rejects_another_picture() {
 /// first `count` of them in order.
 #[allow(clippy::too_many_arguments)]
 fn reference_edit_renders_in(
+    #[cfg(feature = "model-inference-proof")]
+    golden_origin: mlx_gen::gen_core::model_input_proof::SourceOrigin,
     target: &Target,
     out_dir: &std::path::Path,
     references: ReferenceSource,
@@ -2261,6 +2317,8 @@ fn reference_edit_renders_in(
     golden: Option<&Path>,
 ) {
     reference_edit_renders_with(
+        #[cfg(feature = "model-inference-proof")]
+        golden_origin,
         target,
         out_dir,
         references,
@@ -2275,6 +2333,8 @@ fn reference_edit_renders_in(
 /// [`reference_edit_renders_in`] with `real_weights` explicit — see there.
 #[allow(clippy::too_many_arguments)]
 fn reference_edit_renders_with(
+    #[cfg(feature = "model-inference-proof")]
+    golden_origin: mlx_gen::gen_core::model_input_proof::SourceOrigin,
     target: &Target,
     out_dir: &std::path::Path,
     references: ReferenceSource,
@@ -2390,7 +2450,15 @@ fn reference_edit_renders_with(
             path.display(),
             render_started.elapsed().as_secs_f32()
         );
-        let golden_failure = compare_with_golden(golden, out_dir, &file_name, &image, cache);
+        let golden_failure = compare_with_golden(
+            #[cfg(feature = "model-inference-proof")]
+            golden_origin,
+            golden,
+            out_dir,
+            &file_name,
+            &image,
+            cache,
+        );
         let picture_failure = check_picture
             .then(|| mosaic_failure(&label, &image.pixels, width, height))
             .flatten();
@@ -2506,7 +2574,15 @@ fn transparent_reference(
     stem: &str,
 ) -> mlx_gen::RgbaImage {
     if let Ok(path) = std::env::var("QWEN_IMAGE_2_1_RGBA_REF") {
-        let rgba = image::open(&path)
+        let rgba = mlx_gen::gen_core::__model_input_reader!(
+image::open(&path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/e2e_real_weights.rs::transparent_reference::image::open@113529",
+Reference,
+&path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
             .unwrap_or_else(|e| panic!("QWEN_IMAGE_2_1_RGBA_REF={path}: {e}"))
             .to_rgba8();
         return mlx_gen::RgbaImage {
@@ -2625,6 +2701,8 @@ fn assert_nontrivial_alpha(label: &str, image: &mlx_gen::RgbaImage, out_dir: &st
 #[ignore]
 fn validation_render_transparency() {
     transparency_renders(mlx_gen_qwen_image_2_1::MODEL_ID, snapshot(), "", Some(8));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_transparency");
 }
 
 /// The Turbo twin of [`validation_render_transparency`] (sc-25902), through the
@@ -2650,6 +2728,10 @@ fn validation_render_turbo_transparency() {
     assert_eq!(
         reported, [saved; 2],
         "no step count runs one step per saved sigma"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_turbo_transparency"
     );
 }
 
@@ -2818,6 +2900,10 @@ fn validation_render_turbo_installed_tiers() {
             edge: REFERENCE_EDGE,
         },
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_turbo_installed_tiers"
+    );
 }
 
 /// [`validation_render_turbo_installed_tiers`]'s body over an explicit tier directory, size,
@@ -2844,6 +2930,8 @@ fn turbo_installed_tier_renders_in(
         );
         let target = Target::installed(id, tiers, tier);
         let reported = validation_render_at(
+            #[cfg(feature = "model-inference-proof")]
+            mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected,
             &target,
             out_dir,
             (width, height),
@@ -2858,6 +2946,8 @@ fn turbo_installed_tier_renders_in(
             target.stem
         );
         reference_edit_renders_in(
+            #[cfg(feature = "model-inference-proof")]
+            mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected,
             &target,
             out_dir,
             references,
@@ -2914,6 +3004,7 @@ fn turbo_installed_tier_renders_in(
 /// *Mutations that red this:* any collected check of [`reference_edit_renders_with`] (a
 /// reference's, an edit output's [`mosaic_failure`], a twin's [`observed_cache_delta_failures`]
 /// or [`twin_failures`]) asserting in place — the ten-reference files are then never written.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_edit_body_collects_every_check_and_asserts_after_its_last_case() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -2934,6 +3025,8 @@ fn the_edit_body_collects_every_check_and_asserts_after_its_last_case() {
     MOSAIC_BAR.with(|bar| bar.set(0.0));
     let err = catch_unwind(AssertUnwindSafe(|| {
         reference_edit_renders_with(
+            #[cfg(feature = "model-inference-proof")]
+            mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
             &turbo,
             &out,
             ReferenceSource::Rendered { edge: 64 },
@@ -2961,8 +3054,11 @@ fn the_edit_body_collects_every_check_and_asserts_after_its_last_case() {
             "the one failure carries the {count}-reference case's check:\n{message}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::the_edit_body_collects_every_check_and_asserts_after_its_last_case");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -2976,7 +3072,16 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
 
     let asked = [4, 6, 12, 16];
     let cached = PrefixKvCacheMode::Cached;
-    let reported = validation_render_at(&turbo, &out, (64, 64), &asked.map(Some), cached, None);
+    let reported = validation_render_at(
+        #[cfg(feature = "model-inference-proof")]
+        mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
+        &turbo,
+        &out,
+        (64, 64),
+        &asked.map(Some),
+        cached,
+        None,
+    );
     assert_eq!(reported, asked);
     for steps in asked {
         assert!(out
@@ -2985,12 +3090,23 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     }
     // No step count: the fixture's eight saved sigmas.
     assert_eq!(
-        validation_render_at(&turbo, &out, (64, 64), &[None], cached, None),
+        validation_render_at(
+            #[cfg(feature = "model-inference-proof")]
+            mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
+            &turbo,
+            &out,
+            (64, 64),
+            &[None],
+            cached,
+            None
+        ),
         [8]
     );
     // …and the same body with the cache shed, as the base renders run it.
     assert_eq!(
         validation_render_at(
+            #[cfg(feature = "model-inference-proof")]
+            mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
             &turbo,
             &out,
             (64, 64),
@@ -3015,6 +3131,8 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     // `the_observed_cache_delta_is_bounded_by_the_priced_cache`.
     // Rendered references, so the in-run reference renders are driven too (64² on the fixture).
     reference_edit_renders_with(
+        #[cfg(feature = "model-inference-proof")]
+        mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
         &turbo,
         &out,
         ReferenceSource::Rendered { edge: 64 },
@@ -3039,6 +3157,8 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     );
     // …and the base test's shape: a cached case beside a prefill boundary, no twin.
     reference_edit_renders_in(
+        #[cfg(feature = "model-inference-proof")]
+        mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
         &turbo,
         &out,
         ReferenceSource::Synthetic,
@@ -3102,8 +3222,19 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
             },
         ]
     };
-    validation_render_at(&base, &golden, (64, 64), &[Some(3)], prefill, None);
+    validation_render_at(
+        #[cfg(feature = "model-inference-proof")]
+        mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
+        &base,
+        &golden,
+        (64, 64),
+        &[Some(3)],
+        prefill,
+        None,
+    );
     reference_edit_renders_in(
+        #[cfg(feature = "model-inference-proof")]
+        mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
         &base,
         &golden,
         ReferenceSource::Synthetic,
@@ -3115,6 +3246,8 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     let checked = tmp.path().join("checked");
     std::fs::create_dir_all(&checked).unwrap();
     validation_render_at(
+        #[cfg(feature = "model-inference-proof")]
+        mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
         &base,
         &checked,
         (64, 64),
@@ -3123,6 +3256,8 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
         Some(&golden),
     );
     reference_edit_renders_in(
+        #[cfg(feature = "model-inference-proof")]
+        mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
         &base,
         &checked,
         ReferenceSource::Synthetic,
@@ -3143,7 +3278,16 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
         .unwrap();
     let render_against = |dir: &Path, mode| {
         catch_unwind(AssertUnwindSafe(|| {
-            validation_render_at(&base, &checked, (64, 64), &[Some(3)], mode, Some(dir));
+            validation_render_at(
+                #[cfg(feature = "model-inference-proof")]
+                mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
+                &base,
+                &checked,
+                (64, 64),
+                &[Some(3)],
+                mode,
+                Some(dir),
+            );
         }))
     };
     assert!(
@@ -3168,6 +3312,8 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
             reference_edit_renders_in(
+                #[cfg(feature = "model-inference-proof")]
+                mlx_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
                 &base,
                 &rechecked,
                 ReferenceSource::Synthetic,
@@ -3195,6 +3341,8 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
         "the second case was still compared:\n{report}"
     );
     assert!(rechecked.join(ten_refs).is_file(), "and its PNG written");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture");
 }
 
 /// [`assert_not_degenerate`] rejects a blank frame and accepts a dark, low-contrast picture.

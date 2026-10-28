@@ -975,8 +975,13 @@ fn resolve_target_paths(transformer: &LensTransformer, cfg: &TrainingConfig) -> 
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = image::open(path)
-        .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_result!(
+        image::open(path),
+        "crates/media/mlx-gen/mlx-gen-lens/src/training.rs::decode_image/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Ok(Image {
@@ -1694,6 +1699,8 @@ mod first_step_repro {
             max_rel < 1e-3,
             "checkpointed grads must match dense within tolerance: max rel {max_rel:.2e}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::checkpointed_grads_match_dense");
     }
 
     /// The always-on SDPA-segment checkpointing must not change the math: grads with the SDPA
@@ -1713,6 +1720,8 @@ mod first_step_repro {
             max_rel < 1e-5,
             "SDPA-segment checkpointing must not change grads: max rel {max_rel:.2e}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::attn_ckpt_grads_match_retained");
     }
 
     /// The fit basis: first-step peak by resolution on the production DENSE path (SDPA-segment
@@ -1758,6 +1767,10 @@ mod first_step_repro {
             drop(dit);
             clear_cache();
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_ckpt_sweep"
+        );
     }
 
     /// The fix demonstration: at production resolution 1024, gradient checkpointing must drop the
@@ -1803,6 +1816,8 @@ mod first_step_repro {
             ckpt_peak < 128.0,
             "checkpointed peak must fit unified memory: {ckpt_peak:.2} GB"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_1024_checkpointed_vs_dense");
     }
 
     /// sc-5188 — the silent-re-promotion detector. bf16 training must use materially LESS memory than
@@ -1860,6 +1875,8 @@ mod first_step_repro {
             "bf16 first-step peak {bf16_peak:.2} GB must be well below f32 {f32_peak:.2} GB — a \
              strong-f32 constant is re-promoting the bf16 DiT stream to f32 (sc-5188)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::bf16_peak_below_f32_no_silent_repromotion");
     }
 
     /// Flattened cosine over all elements (f32).
@@ -1921,6 +1938,10 @@ mod first_step_repro {
         assert!(
             cos > 0.99,
             "bf16 DiT forward must stay close to f32 (sound bf16, not broken): cosine {cos:.6}"
+        );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::bf16_forward_matches_f32"
         );
     }
 }
@@ -2096,6 +2117,7 @@ mod tests {
     /// An all-ones map equals the unweighted loss; an all-zero map gives loss exactly 0 and all-zero
     /// adapter grads on both paths; a half map lands strictly between and agrees across paths.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         use mlx_gen::train::loss::subject_mask_weight;
         use std::collections::HashMap;
@@ -2277,6 +2299,8 @@ mod tests {
             (dense - ckpt).abs() < 1e-4,
             "dense {dense} vs checkpoint {ckpt}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 
     /// sc-24828: the subject-mask weight is packed EXACTLY like the training latent. A 16×16 mask whose
@@ -2731,6 +2755,7 @@ mod depth_anchoring_tests {
 
     /// AC (a)/(b), dense and block-checkpointed. Mutation: force `diffusion_on = true` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_depth_only() {
         for ckpt in [false, true] {
             let cfg = cfg();
@@ -2760,12 +2785,15 @@ mod depth_anchoring_tests {
                 .sum();
             assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B |Σ| = {gb}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only");
     }
 
     /// The aux step trains at `t` remapped into `[0.6, 0.8]`, and its depth term is the depth loss
     /// of the explicitly recovered and unpacked `x_t − t·v`. Mutations: keep the sampled `t` ⇒ red;
     /// recover with the opposite flow sign ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn aux_step_trains_at_the_remapped_noise_level() {
         let mut cfg = cfg();
         let window = AuxLossSchedule {
@@ -2827,6 +2855,8 @@ mod depth_anchoring_tests {
             (want - got).abs() <= 1e-5 * want.abs().max(1.0),
             "{want} vs {got}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::aux_step_trains_at_the_remapped_noise_level");
     }
 
     /// Interleaved alternation (round-robin N = 2: no two depth steps in a row, each image both
@@ -2835,6 +2865,7 @@ mod depth_anchoring_tests {
     /// bare global step (no period) ⇒ image 0 never trains depth ⇒ red; pass the item as the
     /// `AuxStep` entry ⇒ a bucket-1 depth step compares against bucket 0's reference ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn alternation_interleaves_with_per_entry_references() {
         let cfg = cfg();
         let mut f = fixture(&cfg);
@@ -2938,12 +2969,15 @@ mod depth_anchoring_tests {
         }
         assert!(depth_off_item, "no depth step on an entry != its item");
         assert_eq!(d.path().reference_computations(), cache.len());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::alternation_interleaves_with_per_entry_references");
     }
 
     /// E1: depth off ⇒ nothing loaded, no footprint, and the step is bit-identical to the
     /// pre-epic-2123 closure; a diffusion-only step of an enabled path is bit-identical too.
     /// Mutation: flip MAE/MSE in the diffusion term ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn everything_off_is_bit_identical_to_the_legacy_step() {
         assert!(load_perceptual_path(&TrainingConfig::default())
             .unwrap()
@@ -3014,6 +3048,8 @@ mod depth_anchoring_tests {
         for (k, v) in &g_none1 {
             assert_eq!(bits(v), bits(&g_on1[k]), "{k}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::everything_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// E7: the estimate grows by TAEF2 + DA2 (more for Large); the guard refuses at a synthetic

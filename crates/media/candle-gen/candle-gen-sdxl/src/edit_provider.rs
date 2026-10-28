@@ -592,6 +592,7 @@ mod tests {
     /// never installed and no IP context is set (the edit path) — the add_embedding micro-conditioning
     /// alone, no panic on an absent IP branch. Built on a tiny add_embedding UNet (no `install_ip_adapter`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_instantid_runs_without_ip_install() {
         const ADD_TIME_DIM: usize = 8;
         const PROJ_DIM: usize = 32; // pooled(16) + time_ids_len(2)·8
@@ -645,5 +646,8 @@ mod tests {
             .unwrap()
             .iter()
             .all(|v| v.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED edit_provider::tests::forward_instantid_runs_without_ip_install");
     }
 }

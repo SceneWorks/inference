@@ -192,6 +192,7 @@ fn max_abs(a: &Array) -> f32 {
 /// `alpha=128` folds at exactly 1.0, `alpha=8` at 0.0625, and an absent alpha at 0.0625 — the last
 /// through [`DEFAULT_LORA_ALPHA`] and *not* through the rank.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_three_published_alphas_fold_at_one_and_one_sixteenth() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -257,6 +258,8 @@ fn the_three_published_alphas_fold_at_one_and_one_sixteenth() {
         "…and it must NOT equal the alpha = rank fallback (which would give 1.0), got \
          {vs_rank_fallback}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo_lora::the_three_published_alphas_fold_at_one_and_one_sixteenth");
 }
 
 /// **The fold scalar is dtype-matched — and only an assertion on the INSTALLED adapter can see it.**
@@ -273,6 +276,7 @@ fn the_three_published_alphas_fold_at_one_and_one_sixteenth() {
 /// `apply_minimax_h3_adapters` — it never recomputes the multiply, because a test that reimplements
 /// the thing under test validates only the reimplementation.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_installed_fold_keeps_the_bf16_factor_dtype() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -318,6 +322,7 @@ fn the_installed_fold_keeps_the_bf16_factor_dtype() {
 /// The user's `AdapterSpec::scale` multiplies the `alpha/rank` fold rather than replacing it — so a
 /// strength-0.5 install of the 8-step file lands at 0.03125, and a strength-0 one is inert.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_user_strength_multiplies_the_alpha_fold() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -333,11 +338,16 @@ fn the_user_strength_multiplies_the_alpha_fold() {
     );
     let off = max_abs(&probe_residual(&cfg, &a8, 0.0, &x));
     assert_eq!(off, 0.0, "a scale-0 adapter must be exactly inert");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED turbo_lora::the_user_strength_multiplies_the_alpha_fold"
+    );
 }
 
 /// **Coverage.** Every module of a published-shaped file resolves, on both stacks — including the
 /// token refiner, which 24 of the 624 published tensors target and which therefore cannot be a stub.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn every_target_resolves_across_both_stacks() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -388,6 +398,7 @@ fn every_target_resolves_across_both_stacks() {
 
 /// A key that resolves to no module is an **error**, not a quiet partial fold.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn an_unmatched_target_is_loud() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -413,8 +424,18 @@ fn an_unmatched_target_is_loud() {
     let err = apply_minimax_h3_adapters(&mut dit, &[spec(path, 1.0)])
         .expect_err("an unmatched target must fail the install");
     let msg = err.to_string();
+    // The offending stem is surfaced by name (actionability); the classification itself is the
+    // typed contract — asserted directly, never by pinning message wording (sc-26688).
     assert!(msg.contains("adaln_proj"), "got {msg}");
-    assert!(msg.contains("matched no module"), "got {msg}");
+    use mlx_gen_minimax_h3::{classify_unmatched_target, AdaLnSurface, UnmatchedTargetClass};
+    assert_eq!(
+        classify_unmatched_target(
+            "transformer_blocks.0.adaln_proj.linear",
+            AdaLnSurface::FullTimestepMlp
+        ),
+        UnmatchedTargetClass::DeliberatelyExcluded,
+        "the stray AdaLN projection is a real module the surface deliberately excludes"
+    );
 }
 
 /// `supports_lokr` is **reachable**, not merely declared: a genuine LoKr file (`networkType=lokr`
@@ -422,6 +443,7 @@ fn an_unmatched_target_is_loud() {
 /// installs. Routing is by the FILE, which is what keeps the turbo LoRAs — an `alpha` string with no
 /// `networkType` — off `parse_rank_alpha` and its 128x fold.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_genuine_lokr_routes_to_the_shared_seam_and_the_turbo_files_do_not() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -474,6 +496,7 @@ fn a_genuine_lokr_routes_to_the_shared_seam_and_the_turbo_files_do_not() {
 /// An exact H3 trainer namespace claim owns the whole file: a valid LoKr factor must not be allowed
 /// to route around trainer validation and make the malformed mixed file look successfully applied.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn h3_trainer_metadata_cannot_route_mixed_lokr_factors_around_validation() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -519,6 +542,7 @@ fn h3_trainer_metadata_cannot_route_mixed_lokr_factors_around_validation() {
 /// checkpoint, a textual inversion. A wrong-model file whose keys *do* end in `.lora_A.weight` is
 /// caught either way, by the unmatched-target guard.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_file_matching_nothing_names_the_expected_key_space() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -586,6 +610,7 @@ fn a_file_matching_nothing_names_the_expected_key_space() {
 /// MUTATION: delete `report.verified_source_tensors += verify_adapter_file(&w)?;` from
 /// `apply_minimax_h3_adapters` — every arm below goes to 0 and reds.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn every_adapter_file_is_forced_and_gpu_verified_at_its_load_boundary() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -634,6 +659,7 @@ fn every_adapter_file_is_forced_and_gpu_verified_at_its_load_boundary() {
 /// exists to close, arriving through a different door. PEFT writes `r` equal to the factor rank, so
 /// the consistent arm below shows the check rejects nothing legitimate.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_peft_blob_rank_disagreeing_with_the_factors_is_refused() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -686,6 +712,8 @@ fn a_peft_blob_rank_disagreeing_with_the_factors_is_refused() {
         "…and the blob alpha must WIN over DEFAULT_LORA_ALPHA, which would have given 1.0; got \
          {ratio}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo_lora::a_peft_blob_rank_disagreeing_with_the_factors_is_refused");
 }
 
 // ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
@@ -1157,6 +1185,7 @@ fn assert_twin_equivalence(spelling: AlphaSpelling) {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
 }
 
 /// One `#[test]` per alpha spelling, for both the residual gate and the emitted-alpha gate.
@@ -1378,6 +1407,7 @@ fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
 /// The conversion renames every ComfyUI module, the trunk container included, and the report says it
 /// ran — a diffusers file must NOT be counted.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_conversion_leaves_no_comfyui_module_behind() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -1805,6 +1835,10 @@ fn the_real_turbo_lora_folds_onto_the_real_dit() {
     assert_eq!(resolve_alpha(&w).unwrap(), 8.0);
     assert_eq!(alpha_rank_fold(8.0, 128.0), 0.0625);
     println!("[turbo e2e] EXAMINED the real DiT at fold 0.0625");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED turbo_lora::the_real_turbo_lora_folds_onto_the_real_dit"
+    );
 }
 
 // ─── sc-18729: the measured render ─────────────────────────────────────────────────────────────
@@ -1989,7 +2023,10 @@ fn render_once(recipe: &RenderRecipe<'_>) -> RenderReceipt {
                 ticks.push(now);
             }
             Progress::Decoding => decoding_at = Some(Instant::now()),
-            Progress::Loading(_) => {}
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .unwrap_or_else(|e| panic!("generate: {e}"));
     let wall_s = started.elapsed().as_secs_f64();
@@ -2543,7 +2580,15 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
 
     let dit_dir = trainer_dit_path();
     let config_path = dit_dir.join("config.json");
-    let config_text = std::fs::read_to_string(&config_path)
+    let config_text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&config_path),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/turbo_lora.rs::manual_metal_exact_h3_trainer_runtime_receipt::std::fs::read_to_string@111922",
+Configuration,
+&config_path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .unwrap_or_else(|error| panic!("read {}: {error}", config_path.display()));
     let config_sha256 = sha256_of(&config_path);
     let cfg = MiniMaxH3DitConfig::from_diffusers_json(&config_text)
@@ -2697,5 +2742,9 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
         "SC21028_TRAINER_RUNTIME_CORRECTNESS backend=mlx probe={} \
          observed_vs_independent_expected_relative_max_abs={:.6e} limit={:.6e}",
         probe, residual_correctness_rel_max, SC21028_RUNTIME_RESIDUAL_REL_MAX
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED turbo_lora::manual_metal_exact_h3_trainer_runtime_receipt"
     );
 }

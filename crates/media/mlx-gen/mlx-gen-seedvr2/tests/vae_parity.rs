@@ -54,6 +54,7 @@ fn run(label: &str, got: &Array, exp: &Array) {
     assert!(pr < 3e-2, "{label}: peak_rel {pr} too high");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn seedvr2_vae_matches_reference() {
     let dir = golden_dir();
@@ -63,6 +64,7 @@ fn seedvr2_vae_matches_reference() {
         eprintln!(
             "SKIP: goldens absent at {dir:?} (run tools/dump_seedvr2_goldens.py --component vae)"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_vae_matches_reference; see preceding skip diagnostic");
         return;
     }
 
@@ -89,4 +91,6 @@ fn seedvr2_vae_matches_reference() {
         .decode(io.require("enc_vid").unwrap())
         .expect("decode vid");
     run("decode_vid", &dec_vid, io.require("dec_vid").unwrap());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::seedvr2_vae_matches_reference");
 }

@@ -13,6 +13,20 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(iris_jaccl_linked)");
+    println!("cargo:rerun-if-env-changed=RUSTC");
+    let compiler = std::env::var_os("RUSTC")
+        .and_then(|rustc| std::process::Command::new(rustc).arg("-vV").output().ok())
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok());
+    let commit = compiler
+        .as_deref()
+        .and_then(|version| {
+            version
+                .lines()
+                .find_map(|line| line.strip_prefix("commit-hash: "))
+        })
+        .unwrap_or("unverified");
+    println!("cargo:rustc-env=IRIS_HOST_LAYOUT_COMPILER={commit}");
     #[cfg(feature = "training")]
     link_jaccl();
 }

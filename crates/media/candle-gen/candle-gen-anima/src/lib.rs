@@ -29,6 +29,15 @@
 //! conditioner targets folded at load, stacked + mixed, strict routing — [`adapters`]). Q4/Q8 candle
 //! quant tiers are the counterpart of MLX sc-10517 (see the `quant` gap note in [`loader`]).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapt;
 pub mod adapters;
 pub mod conditioner;
@@ -859,7 +868,7 @@ mod tests {
         let packed_columns = match quant {
             Quant::Q4 => 8,
             Quant::Q8 => 16,
-            Quant::Nvfp4 => unreachable!("Anima does not advertise NVFP4"),
+            Quant::Nvfp4 | Quant::Fp8Rowwise => unreachable!("Anima does not advertise NVFP4"),
         };
         // `[out, in·bits/32]` codes + `[out, in/64]` scales derive the physical bit width.
         m.insert(

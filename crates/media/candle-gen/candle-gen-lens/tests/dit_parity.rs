@@ -55,6 +55,8 @@ fn lens_dit_matches_reference() -> Result<()> {
         Ok(d) => d,
         Err(_) => {
             eprintln!("SKIP: set LENS_DIT_DIR to the Lens-Turbo transformer snapshot dir");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/dit_parity.rs:58 (lens_dit_matches_reference): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return Ok(());
         }
     };
@@ -64,6 +66,8 @@ fn lens_dit_matches_reference() -> Result<()> {
         eprintln!(
             "SKIP: goldens not found at {goldens_path} (run scripts/dump_lens_dit_golden.py)"
         );
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/dit_parity.rs:63 (lens_dit_matches_reference): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return Ok(());
     }
 
@@ -140,5 +144,7 @@ fn lens_dit_matches_reference() -> Result<()> {
     assert!(out_cos > 0.999, "full forward cosine {out_cos:.7} ≤ 0.999");
     assert!(out_pr < 2e-2, "full forward peak_rel {out_pr:.3e} ≥ 2e-2");
     eprintln!("ALL PASS");
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::lens_dit_matches_reference");
     Ok(())
 }

@@ -59,6 +59,7 @@
 pub mod adaln;
 pub mod block;
 pub mod config;
+pub mod curve;
 pub mod heads;
 pub mod layers;
 pub mod model;
@@ -70,6 +71,7 @@ pub mod rope;
 pub use adaln::{release_device_memory, AdaLnCache, AdaLnResidency, ScheduleKey, TimestepSchedule};
 pub use block::{AdaLnModulation, AdaLnProjection, DitBlock};
 pub use config::{MiniMaxH3DitConfig, MODALITY_NUM, MODULATION_PARAMS};
+pub use curve::{CurveAdaLn, CurveProjection};
 pub use heads::{
     timestep_sincos, AdaLayerNormOut, DitProjections, LinearBias, NormOutModulation,
     TimestepEmbedder,

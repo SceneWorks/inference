@@ -1,0 +1,272 @@
+name: Explicit MOSS and shared decoder fixture proofs
+
+# Learned model bodies execute only on explicit operator dispatch, never PR, push, or ordinary CI.
+on:
+  workflow_call:
+    inputs:
+      lanes:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      lanes:
+        description: Exact isolated fixture profile
+        type: choice
+        required: true
+        options: [moss-cpu-fixture, moss-metal-fixture, llm-decoder-fixture, moss-cuda-unit]
+
+permissions:
+  contents: read
+
+env:
+  MOSS_FIXTURE_SELECTED_LANE: ${{ inputs.lanes }}
+
+jobs:
+  moss-cpu-fixture:
+    name: MOSS CPU fixture (${{ matrix.backend }}, hosted)
+    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cpu-fixture'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: candle
+            runner: ubuntu-latest
+          - backend: mlx
+            runner: macos-15
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Ensure existing hosted Metal build toolchain
+        if: matrix.backend == 'mlx'
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+      - name: Fetch pinned prebuilt MLX
+        if: matrix.backend == 'mlx'
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::building the pinned libmlx from source"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      - name: Cache Cargo and pinned native dependencies
+        id: cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: moss-cpu-fixture-${{ matrix.backend }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run actual CPU fixture and assertion mutations
+        env:
+          MOSS_CPU_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: python3 scripts/ci/moss_fixture_cpu_profile.py ${{ matrix.backend }}
+      - name: Upload exact-head CPU evidence (not a pass by artifact existence)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moss-cpu-${{ matrix.backend }}-${{ github.sha }}
+          path: ${{ runner.temp }}/moss-cpu-${{ matrix.backend }}-evidence
+          if-no-files-found: error
+
+  moss-metal-fixture:
+    name: MOSS Metal author proofs (hosted)
+    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-metal-fixture'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Ensure existing hosted Metal build toolchain
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+      - name: Fetch pinned prebuilt MLX
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::building the pinned libmlx from source"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      - name: Cache Cargo and pinned native dependencies
+        id: cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: moss-metal-fixture
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run only original Metal author model proofs
+        env:
+          MOSS_CPU_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: python3 scripts/ci/moss_fixture_cpu_profile.py mlx --metal-only
+      - name: Upload exact-head Metal evidence (not a pass by artifact existence)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moss-metal-${{ github.sha }}
+          path: ${{ runner.temp }}/moss-metal-evidence
+          if-no-files-found: error
+
+  llm-decoder-fixture:
+    name: Shared LLM decoder fixture (${{ matrix.backend }}, hosted)
+    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'llm-decoder-fixture'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: candle
+            runner: ubuntu-latest
+          - backend: mlx
+            runner: macos-15
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Reject conflicting decoder selectors before toolchain setup
+        run: python3 scripts/ci/llm_decoder_fixture.py preflight
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Ensure existing hosted Metal build toolchain
+        if: matrix.backend == 'mlx'
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+      - name: Fetch pinned prebuilt MLX
+        if: matrix.backend == 'mlx'
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::building the pinned libmlx from source"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      - name: Cache Cargo and pinned native dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: llm-decoder-fixture-${{ matrix.backend }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Execute only registered shared decoder model cases
+        run: python3 scripts/ci/llm_decoder_fixture.py run ${{ matrix.backend }}
+      - name: Upload exact-head shared decoder evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llm-decoder-${{ matrix.backend }}-${{ github.sha }}
+          path: ${{ runner.temp }}/llm-decoder-${{ matrix.backend }}-evidence
+          if-no-files-found: error
+
+  moss-cuda-unit:
+    name: MOSS CUDA unit test (Windows, manual)
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.lanes == 'moss-cuda-unit' &&
+      github.repository == 'SceneWorks/inference' &&
+      github.ref_type == 'branch' &&
+      startsWith(github.ref, 'refs/heads/')
+    runs-on: [self-hosted, windows, cuda]
+    timeout-minutes: 60
+    # Job-level, so the workflow's per-sha group is untouched. Serializes only against workflows that
+    # use this group; other repositories and unrelated jobs are not covered.
+    concurrency:
+      group: inference-real-weights-physical-host
+      cancel-in-progress: false
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      RUST_TEST_THREADS: "1"
+      CI: "true"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      # Same runner-global sccache hazard as the other heavy Candle lanes (native-12219): clear the
+      # wrapper for THIS job only, in a step, never as a job-level env override.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Install pinned uv for the MOSS unit supervisor
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12 for the MOSS unit supervisor
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd
+      # The unit runs only inside a Windows Job Object. Prove that ownership (fake Python children,
+      # no CUDA/Cargo/weights) before any GPU step; the smoke fails if it is unavailable or skipped.
+      - name: Verify Windows Job Object ownership (no GPU)
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit smoke'
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      # No `save-if: main`, for the reason given on `windows-cuda`; cache-bin is off for the same
+      # persistent-runner rustup.exe reason.
+      - name: Cache Cargo and CUDA objects
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Compile the MOSS lib test binary (no GPU execution)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          "%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit compile
+      - name: Execute the one MOSS CUDA production-graph test
+        shell: cmd
+        timeout-minutes: 6
+        run: '"%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit run'
+

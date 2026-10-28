@@ -63,14 +63,21 @@ fn req(prompt: &str, init: &Image, mask: Option<&Image>, strength: f32) -> Gener
 }
 
 fn run(model: &dyn mlx_gen::Generator, req: &GenerationRequest) -> Image {
-    match model.generate(req, &mut |_| {}).unwrap() {
+    match (
+        crate::common::record_model_inference_device(),
+        model.generate(req, &mut |_| {}),
+    )
+        .1
+        .unwrap()
+    {
         GenerationOutput::Images(mut v) => v.remove(0),
         _ => unreachable!("sdxl returns images"),
     }
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot"]
 fn inpaint_blend_invariants() {
     let snap = snapshot();
     let model = mlx_gen_sdxl::load(&LoadSpec::new(WeightsSource::Dir(snap.clone()))).unwrap();
@@ -102,12 +109,21 @@ fn inpaint_blend_invariants() {
         &req("a fox in a field", &init, Some(&black), 0.85),
     );
     let vae = load_vae(&snap).unwrap();
-    let roundtrip = decode_image(
-        &vae,
-        &encode_init_latents(&vae, &init, 512, 512).unwrap(),
-        None,
+    let roundtrip = (
+        crate::common::record_model_inference_device(),
+        decode_image(
+            &vae,
+            &(
+                crate::common::record_model_inference_device(),
+                encode_init_latents(&vae, &init, 512, 512),
+            )
+                .1
+                .unwrap(),
+            None,
+        ),
     )
-    .unwrap();
+        .1
+        .unwrap();
     let diff2 = inpaint_black
         .pixels
         .iter()
@@ -122,4 +138,6 @@ fn inpaint_blend_invariants() {
         diff2, 0,
         "all-black inpaint must equal the init VAE round-trip"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED inpaint_real_weights::inpaint_blend_invariants");
 }

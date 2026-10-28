@@ -110,6 +110,15 @@
 //! (sc-19443) the ComfyUI key-space conversion the MLX lane originally refused. It reaches every
 //! task's DiT through the one [`model::MiniMaxH3::load_task_dit`] seam, `ref2va` included.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapters;
 pub mod alias_free;
 pub mod audio_config;
@@ -140,9 +149,10 @@ pub mod vae_encoder;
 pub mod veda;
 
 pub use adapters::{
-    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
-    is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha, resolve_rank,
-    MiniMaxH3LoraReport, BLOCK_TARGETS, DEFAULT_LORA_ALPHA,
+    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, classify_unmatched_target,
+    convert_comfyui_key_space, is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha,
+    resolve_rank, AdaLnSurface, MiniMaxH3LoraReport, UnmatchedTargetClass, BLOCK_TARGETS,
+    DEFAULT_LORA_ALPHA,
 };
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
 pub use audio_config::{

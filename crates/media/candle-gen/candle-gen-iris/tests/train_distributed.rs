@@ -403,6 +403,7 @@ fn shared_run(
 /// Two launches of the same 2-rank DDP job reproduce each other bit for bit (rank-order
 /// reductions; positional randomness keyed on the rank).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn ddp_runs_reproduce_bit_for_bit() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
@@ -419,6 +420,16 @@ fn ddp_runs_reproduce_bit_for_bit() {
     }
     assert_eq!(max_diff(&export(a.path()), &export(b.path())), 0.0);
     assert_eq!(read_checkpoint_state(&la).unwrap().step, 4);
+
+    #[cfg(feature = "model-inference-proof")]
+    {
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::ddp_runs_reproduce_bit_for_bit"
+        );
+        println!(
+            "\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::ddp_runs_reproduce_bit_for_bit"
+        );
+    }
 }
 
 /// The MLX transports are MLX's distributed layer: refused typed on the Candle trainer before any
@@ -479,6 +490,7 @@ fn assert_matches_ddp(ddp: &Path, other: &Path, what: &str, tol: f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn fsdp_full_and_grad_op_sharding_reproduce_ddp() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
@@ -526,9 +538,16 @@ fn fsdp_full_and_grad_op_sharding_reproduce_ddp() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp");
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp");
+    }
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
@@ -550,6 +569,12 @@ fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
     let d = max_diff(&export(ddp.path()), &export(hybrid.path()));
     eprintln!("hybrid 2x2 vs ddp export: max |Δ| = {d:.3e}");
     assert!(d <= ADAMW_TOL, "hybrid: {d}");
+
+    #[cfg(feature = "model-inference-proof")]
+    {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::hybrid_sharding_over_four_ranks_reproduces_ddp");
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::hybrid_sharding_over_four_ranks_reproduces_ddp");
+    }
 }
 
 /// sc-25690: once the collective cancel agreement decided, the cancel-save and the export wait
@@ -557,6 +582,7 @@ fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
 /// still ends in a clean cancel with a checkpoint and an export on every rank (no peer gives up
 /// at the grace, rank 0 sees no lost rank).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports() {
     let (data, scratch, out) = (tmp(), tmp(), tmp());
     write_dataset(data.path());
@@ -586,12 +612,19 @@ fn a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports() {
     let s = read_checkpoint_state(&latest(out.path())).unwrap();
     assert_eq!(s.step, 2);
     assert!(ok(&res[0]).is_file(), "the export was written");
+
+    #[cfg(feature = "model-inference-proof")]
+    {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports");
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports");
+    }
 }
 
 /// sc-25690: ranks that resolve different resume checkpoints (here `rank0` checkpoints on a
 /// storage rank 1 cannot see: one output directory per rank) refuse typed on every rank instead of
 /// resuming at different steps and silently averaging diverged replicas.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn ranks_that_see_different_checkpoints_refuse_to_resume() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
@@ -638,9 +671,16 @@ fn ranks_that_see_different_checkpoints_refuse_to_resume() {
             .unwrap_or_else(|| panic!("an untyped outcome: {r}"));
         assert!(typed.starts_with("SplitWorld"), "{typed}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::ranks_that_see_different_checkpoints_refuse_to_resume");
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::ranks_that_see_different_checkpoints_refuse_to_resume");
+    }
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_sharded_checkpoint_resumes_exactly_and_reshards() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
@@ -724,6 +764,12 @@ fn a_sharded_checkpoint_resumes_exactly_and_reshards() {
     assert_eq!(r[0]["steps"], 4, "{}", r[0]);
     let s = read_checkpoint_state(&latest(single.path())).unwrap();
     assert_eq!(s.step, 4, "the resharded run continued from step 2");
+
+    #[cfg(feature = "model-inference-proof")]
+    {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards");
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards");
+    }
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -741,18 +787,22 @@ fn copy_dir(from: &Path, to: &Path) {
 
 /// On a CUDA build, a rank whose `cuda:<local_rank>` does not exist is a typed `InvalidMesh`
 /// refusal — never silently folded onto another rank's card — unless the run opts into
-/// `dist.world.share_device`. Each rank process sees exactly one card (`CUDA_VISIBLE_DEVICES=0`),
-/// so rank 1's `cuda:1` is absent whatever the box holds. (A CPU build has no per-rank device:
-/// nothing to refuse, the case is vacuous there and says so.)
+/// `dist.world.share_device`. Each rank process inherits exactly the lane's bound card,
+/// so rank 1's `cuda:1` is absent whatever the box holds. CPU builds omit this device-only case.
+#[cfg(feature = "cuda")]
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in() {
-    if !trainer_device_is_cuda() {
-        eprintln!("CPU build: ranks share the CPU by construction; the refusal is CUDA-only");
-        return;
-    }
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+    let visible = inherited_single_cuda_device(visible.as_deref())
+        .expect("the rank fixture requires the lane's single physical GPU1 binding");
+    assert!(candle_gen::candle_core::Device::new_cuda(0)
+        .expect("the bound CUDA device is required")
+        .is_cuda());
     let (data, scratch, out) = (tmp(), tmp(), tmp());
     write_dataset(data.path());
-    let one_card = json!({"CUDA_VISIBLE_DEVICES": "0"});
+    // A literal "0" would override the outer UUID and expose physical GPU0 to children.
+    let one_card = json!({"CUDA_VISIBLE_DEVICES": visible});
     for share in [false, true] {
         let mut world = tcp_world(2, 1);
         world["share_device"] = json!(share);
@@ -793,13 +843,56 @@ fn a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in");
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in");
+    }
 }
 
-fn trainer_device_is_cuda() -> bool {
-    cfg!(feature = "cuda")
-        && candle_gen::candle_core::Device::new_cuda(0)
-            .map(|d| d.is_cuda())
-            .unwrap_or(false)
+fn inherited_single_cuda_device(value: Option<&str>) -> Result<&str, &'static str> {
+    let value = value.ok_or("CUDA_VISIBLE_DEVICES must retain the lane's GPU1 binding")?;
+    if value == "1" {
+        return Ok(value);
+    }
+    let error = "expected one full GPU UUID or physical index 1, without remapping or discovery";
+    let uuid = value.strip_prefix("GPU-").ok_or(error)?;
+    let mut groups = uuid.split('-');
+    for width in [8, 4, 4, 4, 12] {
+        let group = groups.next().ok_or(error)?;
+        if group.len() != width || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(error);
+        }
+    }
+    if groups.next().is_some() {
+        return Err(error);
+    }
+    Ok(value)
+}
+
+#[test]
+fn rank_children_preserve_only_the_single_bound_gpu1_mapping() {
+    for value in ["1", "GPU-01234567-89ab-cdef-0123-456789abcdef"] {
+        assert_eq!(inherited_single_cuda_device(Some(value)), Ok(value));
+    }
+    for value in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("2"),
+        Some("01"),
+        Some(" 1"),
+        Some("1 "),
+        Some("1,0"),
+        Some("GPU-01234567-89ab-cdef-0123-456789abcdef,1"),
+        Some("GPU-"),
+        Some("GPU-01234567-89ab-cdef-0123-456789abcdeg"),
+        Some("GPU-01234567-89ab-cdef-0123-456789abcdef-0000"),
+        Some("MIG-GPU-01234567-89ab-cdef-0123-456789abcdef/1/0"),
+    ] {
+        assert!(inherited_single_cuda_device(value).is_err(), "{value:?}");
+    }
 }
 
 fn lost_rank_case(field: &str) {
@@ -849,13 +942,27 @@ fn lost_rank_case(field: &str) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_rank_that_exits_mid_run_fails_the_survivor_typed() {
     lost_rank_case("die_at");
+
+    #[cfg(feature = "model-inference-proof")]
+    {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed");
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed");
+    }
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout() {
     lost_rank_case("stall_at");
+
+    #[cfg(feature = "model-inference-proof")]
+    {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout");
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout");
+    }
 }
 
 #[test]

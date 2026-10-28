@@ -635,11 +635,32 @@ pub fn clip_and_noise_grads(
     update_idx: u32,
     noise_seed: u64,
 ) -> Result<LoraParams> {
-    let (clipped, _norm) = mlx_rs::optimizers::clip_grad_norm(avg_grads, 1.0)?;
-    let mut clipped: LoraParams = clipped
+    // HashMap iteration is not a recovery-stable reduction order. Preserve the existing
+    // FP32 norm/clipping convention, but sum named factors in canonical order on every run.
+    let mut ordered: Vec<_> = avg_grads.iter().collect();
+    ordered.sort_unstable_by_key(|(a, _)| *a);
+    let mut squared = Array::from_f32(0.0);
+    for (_, grad) in &ordered {
+        squared = squared.add(grad.square()?.sum(None)?)?;
+    }
+    let norm = squared.sqrt()?.item::<f32>();
+    if !norm.is_finite() {
+        return Err(crate::Error::Msg("nonfinite adapter gradient norm".into()));
+    }
+    let normalizer = Array::from_f32(1.0 / (norm + 1e-6));
+    let mut clipped: LoraParams = ordered
         .into_iter()
-        .map(|(k, v)| (k, v.into_owned()))
-        .collect();
+        .map(|(key, value)| {
+            Ok((
+                key.clone(),
+                if norm < 1.0 {
+                    value.clone()
+                } else {
+                    value.multiply(&normalizer)?
+                },
+            ))
+        })
+        .collect::<Result<_>>()?;
     apply_gradient_noise(
         &mut clipped,
         cfg.gradient_noise_eta,

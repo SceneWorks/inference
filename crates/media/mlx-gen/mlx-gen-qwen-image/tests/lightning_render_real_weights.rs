@@ -175,6 +175,8 @@ fn lightning_render_is_coherent() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lightning_render_real_weights::lightning_render_is_coherent");
 }
 
 fn edit_snapshot() -> PathBuf {
@@ -199,7 +201,15 @@ fn edit_lightning_lora_4step() -> PathBuf {
 }
 
 fn load_ppm(path: PathBuf) -> Image {
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let bytes = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/mlx-gen/mlx-gen-qwen-image/tests/lightning_render_real_weights.rs::load_ppm::std::fs::read@8916",
+Reference,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut cursor = 0usize;
     let mut next_token = || {
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
@@ -312,6 +322,8 @@ fn edit_lightning_render_is_coherent() {
         adj < 40.0,
         "edit render looks like noise (adjacent |Δ| {adj:.1} ~ uniform)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lightning_render_real_weights::edit_lightning_render_is_coherent");
 }
 
 /// Repro gate for SceneWorks' Qwen Edit Lightning stack: Q8 base, 4-step lightx2v distill LoRA,
@@ -365,4 +377,6 @@ fn edit_lightning_user_lora_reference_repro() {
     println!("Rust edit-lightning user-LoRA repro: mean {mean:.1} std {std:.1} distinct {distinct} adj|Δ| {adj:.1}");
     assert!(std > 10.0, "render looks flat/degenerate (std {std:.1})");
     assert!(distinct > 32, "too few distinct levels ({distinct})");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lightning_render_real_weights::edit_lightning_user_lora_reference_repro");
 }

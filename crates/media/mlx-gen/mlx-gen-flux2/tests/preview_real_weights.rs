@@ -108,4 +108,6 @@ fn active_preview_emits_exact_outer_step_strip_without_changing_rgb() {
         )
         .unwrap();
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED preview_real_weights::active_preview_emits_exact_outer_step_strip_without_changing_rgb");
 }

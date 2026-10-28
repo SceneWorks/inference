@@ -46,7 +46,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
 }
 
 #[test]
-#[ignore = "needs real Z-Image-Turbo weights (ZIMAGE_SNAPSHOT or HF cache); macos-mlx / dev box only"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image-Turbo weights (ZIMAGE_SNAPSHOT or HF cache); macos-mlx / dev box only"]
 fn z_image_turbo_trainer_satisfies_gen_core_contract() {
     assert_eq!(mlx_gen_z_image::MODEL_ID, "z_image_turbo");
     let tmp_guard = tempfile::tempdir().unwrap();
@@ -65,4 +65,7 @@ fn z_image_turbo_trainer_satisfies_gen_core_contract() {
         },
         &profile,
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_conformance::z_image_turbo_trainer_satisfies_gen_core_contract");
 }

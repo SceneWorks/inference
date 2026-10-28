@@ -266,6 +266,7 @@ mod tests {
     /// argmax or stop-gradient), so the depth loss can train the adapter through it — for square
     /// and non-square inputs alike.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_anchor_loss_is_differentiable_in_the_pixels() {
         let loss = tiny_loss();
         for (h, w, depth_hw) in [(16, 16, [8, 8]), (16, 24, [6, 8])] {
@@ -288,12 +289,15 @@ mod tests {
                 "{h}x{w}: pixel gradient {mag}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED anchor::tests::depth_anchor_loss_is_differentiable_in_the_pixels");
     }
 
     /// Review minor: a non-square input is resized aspect-preservingly (long side `image_size`,
     /// short side a multiple of the patch size), not squashed to a square. Mutation: resize to
     /// `(image_size, image_size)` in `forward_pixels` ⇒ the 16×24 depth is 8×8 ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn non_square_inputs_keep_their_aspect() {
         let cfg = tiny_config(); // image_size 8, patch 2
         assert_eq!(cfg.input_hw(16, 16), (8, 8));
@@ -319,6 +323,10 @@ mod tests {
         let diff = a.subtract(&b).unwrap().abs().unwrap().max(None).unwrap();
         eval([&diff]).unwrap();
         assert!(diff.item::<f32>() < 1e-6);
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED anchor::tests::non_square_inputs_keep_their_aspect"
+        );
     }
 
     #[test]

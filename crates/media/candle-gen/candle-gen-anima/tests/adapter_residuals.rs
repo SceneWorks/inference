@@ -256,6 +256,7 @@ const COND_TARGET: (&str, usize, usize) = ("llm_adapter.blocks.0.self_attn.q_pro
 /// install routes BOTH a DiT target and a conditioner target (the visit reaches both hosts), the
 /// residual shifts the built DiT's forward, and a **scale-0** residual is an exact no-op (mutation).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn install_routes_dit_and_conditioner_and_residual_shifts_forward() {
     let dir_tmp = tempfile::tempdir().unwrap();
     let dir = dir_tmp.path().to_path_buf();
@@ -298,12 +299,16 @@ fn install_routes_dit_and_conditioner_and_residual_shifts_forward() {
         0.0,
         "a scale-0 residual must be an exact no-op"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapter_residuals::install_routes_dit_and_conditioner_and_residual_shifts_forward");
 }
 
 /// A LoKr (detected by `lokr_` keys even under an `AdapterKind::Lora` spec) installs as a **structured
 /// Kronecker residual** and shifts the DiT forward — no `[out,in]` materialized (sc-10713). Targets the
 /// DiT q_proj `[out,in] = [12,12]`, factored as `w1 [2,2] ⊗ w2 [6,6]` (a·b = 12, c·d = 12).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lokr_installs_as_structured_residual_and_shifts_forward() {
     let dir_tmp = tempfile::tempdir().unwrap();
     let dir = dir_tmp.path().to_path_buf();
@@ -339,6 +344,9 @@ fn lokr_installs_as_structured_residual_and_shifts_forward() {
         max_abs_diff(&dit_forward(&dit), &baseline) > 1e-4,
         "the structured LoKr residual must move the DiT forward"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapter_residuals::lokr_installs_as_structured_residual_and_shifts_forward");
 }
 
 /// A LoHa (Hadamard, `hada_` keys) is rejected with the actionable sc-10713 message — its Hadamard

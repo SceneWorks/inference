@@ -98,6 +98,7 @@ fn converter_errors_on_missing_tensor() {
 /// Assemble the reused `Vae` from the synthetic diffusers tensors via the SAME remap path
 /// `load_sd3_vae` uses, then run encode + decode and assert the spatial-scale + channel contract:
 /// image `[1,3,H,W]` ↔ latent `[1,16,H/8,W/8]`.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn encode_decode_round_trip_shapes() {
     let arch = tiny_sd3_like_arch();
@@ -131,6 +132,8 @@ fn encode_decode_round_trip_shapes() {
         [1, 3, 1, 32, 32],
         "decode → [1,3,1,H,W] at 8× spatial"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_wiring::encode_decode_round_trip_shapes");
 }
 
 /// The latent de-norm direction is the load-bearing parity risk. Assert the exact arithmetic the
@@ -227,4 +230,6 @@ fn sd3_vae_real_weights() {
         [1, 3, 1, 64, 64],
         "real VAE decode → [1,3,1,H,W]"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_wiring::sd3_vae_real_weights");
 }

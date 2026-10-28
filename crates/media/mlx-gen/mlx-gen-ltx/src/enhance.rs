@@ -241,6 +241,8 @@ impl<'a> EnhanceSampler<'a> {
                 top_p: knobs.top_p,
                 top_k: usize::try_from(knobs.top_k).unwrap_or(0),
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: knobs.repetition_penalty.unwrap_or(1.0),
                 repetition_context: knobs.repetition_context,
             },
@@ -689,6 +691,7 @@ mod tests {
     /// uncensored one and a top-k / nucleus mix, over several seeds — with both a stop-token end
     /// and a budget end among the cases.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn gemma3_enhancer_engine_decode_matches_the_pre_engine_loop() {
         let gemma = tiny_gemma3();
         let prompt: Vec<i32> = vec![2, 5, 9, 17, 33, 64, 100, 7];
@@ -739,12 +742,15 @@ mod tests {
             ),
             Err(Error::Canceled)
         ));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED enhance::tests::gemma3_enhancer_engine_decode_matches_the_pre_engine_loop");
     }
 
     /// `enhance_max_tokens = 0`: the pre-engine loop drew nothing, so it never reached its
     /// per-token cancel check and returned no tokens — even with a cancel tripped during the
     /// prefill. The engine port keeps that.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn gemma3_zero_budget_returns_no_tokens_even_when_cancelled() {
         let gemma = tiny_gemma3();
         let prompt: Vec<i32> = vec![2, 5, 9, 17, 33, 64, 100, 7];
@@ -769,6 +775,8 @@ mod tests {
                 cancel.is_some()
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED enhance::tests::gemma3_zero_budget_returns_no_tokens_even_when_cancelled");
     }
     use sha2::Digest as _;
 
@@ -950,6 +958,7 @@ mod tests {
     /// constraint, and a second request served from the prefix cache matches too. The report names
     /// what ran: no proposer, the host sampler for the constraint, the prefix cache miss then hit.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn gemma4_text_enhancer_engine_decode_matches_the_plain_loop() {
         let (model, vocab) = tiny_gemma4();
         let prompt = PARITY_PROMPT.to_vec();
@@ -1014,11 +1023,14 @@ mod tests {
                 "turn {turn}: {report:?}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED enhance::tests::gemma4_text_enhancer_engine_decode_matches_the_plain_loop");
     }
 
     /// The I2V enhancer prefill (spliced embeddings, caller-prefilled cache) on the engine matches
     /// the pre-engine `generate_from_prefill` loop token for token, and bypasses the prefix cache.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn gemma4_multimodal_enhancer_engine_decode_matches_the_plain_loop() {
         let (model, vocab) = tiny_gemma4();
         let prompt = PARITY_PROMPT.to_vec();
@@ -1064,6 +1076,8 @@ mod tests {
             cache.is_empty(),
             "a multimodal prompt must not feed the cache"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED enhance::tests::gemma4_multimodal_enhancer_engine_decode_matches_the_plain_loop");
     }
 
     /// A seeded stochastic run under the same constraint also matches: the engine's `MlxSampler`
@@ -1071,6 +1085,7 @@ mod tests {
     /// stream, one uniform per row, in the same order (the enhancer itself is greedy; this pins
     /// that the constraint seam does not perturb the draw order either).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn gemma4_constrained_stochastic_engine_run_matches_the_plain_loop() {
         let (model, vocab) = tiny_gemma4();
         let prompt = PARITY_PROMPT.to_vec();
@@ -1112,6 +1127,8 @@ mod tests {
         assert!(reference.len() >= 8, "non-trivial run: {reference:?}");
         assert_eq!(run.output.tokens, reference);
         assert_eq!(run.report.sampler, "host:constraint");
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED enhance::tests::gemma4_constrained_stochastic_engine_run_matches_the_plain_loop");
     }
 
     // `SampleParams` presets + `SplitMix64` determinism are covered in the shared

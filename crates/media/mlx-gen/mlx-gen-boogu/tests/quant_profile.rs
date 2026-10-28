@@ -87,6 +87,8 @@ fn profile_base_q4() {
         .generate("a red apple on a wooden table", &opts_1k(1))
         .expect("generate 1K");
     report("Base Q4", transient, resident, get_peak_memory());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_profile::profile_base_q4");
 }
 
 #[test]
@@ -103,6 +105,8 @@ fn profile_base_q8() {
         .generate("a red apple on a wooden table", &opts_1k(1))
         .expect("generate 1K");
     report("Base Q8", transient, resident, get_peak_memory());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_profile::profile_base_q8");
 }
 
 #[test]
@@ -144,6 +148,8 @@ fn profile_turbo_q4() {
         )
         .expect("generate turbo 1K");
     report("Turbo Q4", transient, resident, get_peak_memory());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_profile::profile_turbo_q4");
 }
 
 /// Edit path footprint = Base footprint + the lazily-loaded f32 vision tower + the reference image
@@ -181,4 +187,6 @@ fn profile_edit_q4() {
         .generate_edit(&reference, "make it green", &edit_opts(1024, 1024, 4))
         .expect("generate edit 1K");
     report("Edit Q4", transient, resident, get_peak_memory());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_profile::profile_edit_q4");
 }

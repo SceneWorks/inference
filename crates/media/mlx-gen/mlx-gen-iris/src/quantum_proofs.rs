@@ -3,9 +3,8 @@
 //! Each body below builds the REAL module (the committed miniature exports), materializes the
 //! quantum's inputs, then measures MLX's peak allocation while exactly that quantum's body builds
 //! and evaluates — UNTHROTTLED, natural and stalled, the worst of several runs ([`measure`]) — and
-//! asserts the counted formula ([`crate::retention`]) is at least the measurement (hard), reporting
-//! a ratio above [`PROOF_MAX`] ([`mlx_gen::ios_quantum::assert_tracks_measured`]: report-only;
-//! low-end accuracy is calibrated on the device). Shapes are small, so
+//! asserts the counted formula ([`crate::retention`]) is at least the measurement, reporting ratios
+//! above [`PROOF_MAX`] ([`mlx_gen::ios_quantum::assert_tracks_measured`]). Shapes are small, so
 //! the CPU's unfused fallbacks (RMSNorm, attention with materialized scores) are priced as such
 //! ([`crate::retention::unfused`]); the iOS GPU runs those fused. Every body runs at the f32 and
 //! the bf16 compute width, and the attention sites under both an unbounded and a chunking plan.
@@ -26,7 +25,7 @@ use crate::nn::key_padding_mask;
 
 use crate::test_metal_guard as metal_guard;
 
-/// The largest formula / measurement ratio a proof accepts.
+/// Report-only formula / measurement ratio, shared by decoder and other quanta.
 const PROOF_MAX: f64 = 1.5;
 
 fn fixtures() -> PathBuf {
@@ -42,8 +41,21 @@ fn in_cpu_child(test: &str, body: fn()) {
     const DONE: &str = "IRIS_QUANTUM_PROOF_CHILD_DONE";
     if std::env::var(CHILD).as_deref() == Ok(test) {
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert_eq!(
+            mlx_rs::Device::try_default().expect("CPU default-device query failed"),
+            mlx_rs::Device::cpu()
+        );
         assert!(metal_guard::forbid_metal());
         assert!(metal_guard::metal_forbidden());
+        // Select the native CPU stream before constructing any fixture, not just in scopes.
+        assert_eq!(
+            unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+            0
+        );
+        assert_eq!(
+            mlx_rs::Stream::new().get_index().unwrap(),
+            mlx_rs::Stream::cpu().get_index().unwrap()
+        );
         body();
         std::fs::write(std::env::var(DONE).unwrap(), b"ok").unwrap();
         return;
@@ -51,8 +63,16 @@ fn in_cpu_child(test: &str, body: fn()) {
     let done = tempfile::tempdir().unwrap();
     let marker = done.path().join("done");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .args([
+            "--exact",
+            test,
+            "--nocapture",
+            "--include-ignored",
+            "--test-threads",
+            "1",
+        ])
         .env(CHILD, test)
+        .env("IOS_CAPTURE_IN_CHILD", "1")
         .env(DONE, &marker)
         .status()
         .unwrap();
@@ -60,21 +80,31 @@ fn in_cpu_child(test: &str, body: fn()) {
     assert!(marker.is_file(), "{test}: the CPU child ran no body");
 }
 
-/// Assert `formula` tracks `measured` within [`PROOF_MAX`], printing both.
+/// Enforce `formula >= measured` in every mode, printing both and reporting ratios above
+/// [`PROOF_MAX`]. `IRIS_PROOF_PRINT_ONLY` no longer disables safety assertions.
 fn prove(label: &str, formula: u64, measured: u64) {
-    prove_within(label, formula, measured, PROOF_MAX);
-}
-
-/// [`prove`] with a stated, site-specific bound (never above 2.0).
-fn prove_within(label: &str, formula: u64, measured: u64, max: f64) {
-    assert!(max <= PROOF_MAX);
     eprintln!(
         "PROOF {label}: formula {formula} B, measured {measured} B, ratio {:.3}",
         formula as f64 / measured.max(1) as f64
     );
-    if std::env::var_os("IRIS_PROOF_PRINT_ONLY").is_none() {
-        assert_tracks_measured(label, formula, measured, max);
-    }
+    assert_tracks_measured(label, formula, measured, PROOF_MAX);
+}
+
+#[test]
+fn proof_policy_cannot_be_disabled_by_print_only() {
+    in_cpu_child(
+        "quantum_proofs::proof_policy_cannot_be_disabled_by_print_only",
+        || {
+            // This isolated, single-test child cannot affect the parent or another test.
+            std::env::set_var("IRIS_PROOF_PRINT_ONLY", "1");
+            prove("report-only control", 151, 100);
+            prove("decoder report-only control", 170, 100);
+            assert!(
+                std::panic::catch_unwind(|| prove("underpriced discriminator", 99, 100)).is_err(),
+                "print-only must not disable the measured lower bound"
+            );
+        },
+    );
 }
 
 fn rand(shape: &[i32], seed: u64, dtype: Dtype) -> Array {
@@ -332,11 +362,16 @@ fn backbone_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_backbone_quantum_price_tracks_its_measured_peak() {
     in_cpu_child(
         "quantum_proofs::every_backbone_quantum_price_tracks_its_measured_peak",
         backbone_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::every_backbone_quantum_price_tracks_its_measured_peak");
+    }
 }
 
 fn text_encoder_body() {
@@ -356,10 +391,8 @@ fn text_encoder_body() {
             // next state alone — a fresh graph per run, natural and stalled (see [`measure`]).
             let mut worst = 0;
             for stalled in [false, true] {
-                // Twice the runs: the layer (~80 CPU ops) outruns the CPU's encode-ahead window, so
-                // how much of it a run retains swings with timing. Its ratio (~1.53-1.56: the
-                // device holds the whole layer, the CPU the last ~50 ops) is reported against the
-                // shared threshold, not excused.
+                // Twice the runs: how much of the layer the CPU encode-ahead window retains
+                // swings with timing. Excess conservatism is reported at the common threshold.
                 for _ in 0..2 * RUNS {
                     let peak = with_cpu_diagnostic_headroom(PLENTY, || {
                         let _scope = mlx_gen::ios_quantum::Scope::new();
@@ -380,16 +413,11 @@ fn text_encoder_body() {
                 }
             }
             let (layer, _held) = te.layer_scratch_parts(n, k + 1);
-            prove_within(
-                &format!("text decoder layer {k} n{n}"),
-                layer,
-                worst,
-                PROOF_MAX,
-            );
+            prove(&format!("text decoder layer {k} n{n}"), layer, worst);
         }
     }
     // The decoder layer's counted components, each a graph short enough for the CPU to retain
-    // whole (so each is held to the plain bound): its bf16 RMSNorm, its NeoX RoPE and its causal
+    // whole (each uses the common reporting threshold): its bf16 RMSNorm, its NeoX RoPE and its causal
     // grouped-query attention, through `mlx_llm`'s own functions.
     use crate::retention::Retention;
     use crate::text_encoder::{decoder_attention, decoder_norm, decoder_rope};
@@ -472,6 +500,7 @@ fn text_encoder_body() {
         for state in &states {
             eval([state]).unwrap();
         }
+        let states: Vec<Option<Array>> = states.into_iter().map(Some).collect();
         let start = window.prefix_len as i32;
         let real = window.window_tokens() as i32;
         let (peak, _) = measure(|| Ok(vec![te.conditioning_body(&states, start, real)?]));
@@ -484,11 +513,16 @@ fn text_encoder_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_text_encoder_quantum_price_tracks_its_measured_peak() {
     in_cpu_child(
         "quantum_proofs::every_text_encoder_quantum_price_tracks_its_measured_peak",
         text_encoder_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::every_text_encoder_quantum_price_tracks_its_measured_peak");
+    }
 }
 
 fn small_steps_body() {
@@ -525,7 +559,17 @@ fn small_steps_body() {
             );
         }
     }
-    // The RGB8 conversion (its MLX part; the u8 host pixels are the formula's last term).
+    // The final solve clamp is its own guarded denoise quantum, not deferred decode work.
+    for (b, h, w) in [(1, 64, 64), (2, 32, 48)] {
+        let x = rand(&[b, 3, h, w], 6, Dtype::Float32);
+        let (peak, _) = measure(|| Ok(vec![mlx_rs::ops::clip(&x, (-1.0f32, 1.0f32))?]));
+        prove(
+            "final solver clamp",
+            crate::solver::final_clamp_scratch(x.size() as u64),
+            peak,
+        );
+    }
+    // RGB8 conversion starts from an evaluated solved batch; the host pixels are the last term.
     for (b, h, w) in [(1, 64, 64), (2, 32, 48)] {
         let x = rand(&[b, 3, h, w], 6, Dtype::Float32);
         let elements = x.size() as u64;
@@ -535,7 +579,7 @@ fn small_steps_body() {
         });
         prove(
             &format!("image conversion b{b} {h}x{w}"),
-            crate::model::image_scratch(elements) - elements,
+            crate::model::image_scratch(elements, b as u64) - elements,
             peak,
         );
     }
@@ -576,9 +620,358 @@ fn small_steps_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_small_step_quantum_price_tracks_its_measured_peak() {
     in_cpu_child(
         "quantum_proofs::every_small_step_quantum_price_tracks_its_measured_peak",
         small_steps_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::every_small_step_quantum_price_tracks_its_measured_peak");
+    }
+}
+
+/// Copy the complete miniature snapshot into this test's own temporary tree, then rewrite only
+/// native tensor dtypes/width-marker representations. Metadata and every non-weight file survive.
+fn rewrite_stream_snapshot(
+    root: &std::path::Path,
+    source: &std::path::Path,
+    label: &str,
+    rewrite: impl FnOnce(&mut std::collections::HashMap<String, Array>),
+) -> PathBuf {
+    fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let target = root.join(label);
+    copy_tree(source, &target);
+    let file = source.join("model.safetensors");
+    let mut tensors = Array::load_safetensors(&file).unwrap();
+    // Materialize the source fixture before rewriting its independent temporary copy.
+    for tensor in tensors.values() {
+        mlx_rs::transforms::eval_pending_loads([tensor]).unwrap();
+        eval([tensor]).unwrap();
+    }
+    rewrite(&mut tensors);
+    for tensor in tensors.values() {
+        eval([tensor]).unwrap();
+    }
+    let metadata: std::collections::HashMap<_, _> =
+        mlx_gen::gen_core::weightsmeta::safetensors_file_metadata(&file)
+            .unwrap()
+            .into_iter()
+            .collect();
+    let mut entries: Vec<_> = tensors
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    entries.sort_unstable_by_key(|(name, _)| *name);
+    Array::save_safetensors(entries, Some(&metadata), target.join("model.safetensors")).unwrap();
+    target
+}
+
+fn rewrite_backbone_window_dtypes(
+    tensors: &mut std::collections::HashMap<String, Array>,
+    marker_dtype: Option<Dtype>,
+) {
+    let keys: Vec<_> = tensors.keys().cloned().collect();
+    for key in keys {
+        let tensor = &tensors[&key];
+        let target = if tensor.ndim() == 1 && key.ends_with(".weight") {
+            Some(Dtype::Bfloat16)
+        } else if key.ends_with(".bias") {
+            Some(Dtype::Float16)
+        } else {
+            None
+        };
+        if let Some(dtype) = target {
+            let converted = tensor.as_dtype(dtype).unwrap();
+            tensors.insert(key, converted);
+        }
+    }
+    if let Some(dtype) = marker_dtype {
+        let scales: Vec<_> = tensors
+            .keys()
+            .filter_map(|key| key.strip_suffix(".scales").map(str::to_owned))
+            .collect();
+        for base in scales {
+            let key = format!("{base}{}", crate::packed::IN_FEATURES_SUFFIX);
+            let width = tensors.get(&key).map_or_else(
+                || {
+                    tensors[&format!("{base}.scales")].shape()[1]
+                        * crate::nn::QUANT_GROUP_SIZE as i32
+                },
+                |marker| marker.item::<i32>(),
+            );
+            let marker = match dtype {
+                Dtype::Int64 => Array::from_slice(&[i64::from(width)], &[1]),
+                Dtype::Int32 => Array::from_slice(&[width], &[1, 1]),
+                _ => unreachable!("the proof selects scalar I64 or matrix I32 width markers"),
+            };
+            tensors.insert(key, marker);
+        }
+    }
+}
+
+/// These are real root loader calls, not a copied decoder: the old price (without the affine
+/// targets) fits, while the shared joint guard must refuse before any native tower read. A full
+/// ample-headroom load is the positive control; refusal alone is not successful coverage.
+fn packed_tower_affine_root_checks(
+    dir: &std::path::Path,
+    text_config: &mlx_gen::gen_core::iris::TextEncoderConfig,
+    quant: mlx_gen::Quant,
+) {
+    use mlx_gen::ios_quantum::{take_refusal, PROCESS_RESERVE_BYTES};
+    let cfg = mlx_llm::ModelConfig::from_dir(dir).unwrap();
+    let mut headers = Vec::new();
+    for file in crate::text_encoder::weight_shards(dir, !cfg.tie_word_embeddings).unwrap() {
+        headers.extend(
+            crate::stream::headers(&file)
+                .unwrap()
+                .into_iter()
+                .filter(|h| {
+                    crate::text_encoder::is_text_tower_tensor(&h.name, !cfg.tie_word_embeddings)
+                }),
+        );
+    }
+    let (logical, additional) = crate::stream::tower_load_output_bytes(
+        &headers,
+        |_| true,
+        crate::stream::tower_rope_bytes(&cfg).unwrap(),
+    )
+    .unwrap();
+    let affine_targets: u64 = headers
+        .iter()
+        .filter(|h| h.name.ends_with(".scales") || h.name.ends_with(".biases"))
+        .map(|h| {
+            assert_ne!(h.dtype, mlx_gen::gen_core::weightsmeta::Dtype::BF16);
+            crate::retention::allocated(h.shape.iter().product::<usize>() as u64 * 2)
+        })
+        .sum();
+    assert!(affine_targets > 0);
+    let joint = logical + additional;
+    let old_price = joint - affine_targets;
+    take_refusal();
+    let active = mlx_rs::memory::get_active_memory();
+    let denied = with_cpu_diagnostic_headroom(old_price + PROCESS_RESERVE_BYTES, || {
+        crate::text_encoder::IrisTextEncoder::load_quantized(dir, text_config, Some(quant))
+    });
+    assert!(denied.is_err());
+    let refusal = take_refusal().expect("stored affine targets must discriminate the old price");
+    assert_eq!(refusal.label, crate::stream::LOAD_TARGET_QUANTUM);
+    assert_eq!(refusal.scratch_bytes, joint);
+    assert_eq!(
+        refusal.available_bytes,
+        Some(old_price + PROCESS_RESERVE_BYTES)
+    );
+    assert_eq!(
+        mlx_rs::memory::get_active_memory(),
+        active,
+        "affine target refusal precedes all native tower materialization"
+    );
+    drop(
+        with_cpu_diagnostic_headroom(PLENTY, || {
+            crate::text_encoder::IrisTextEncoder::load_quantized(dir, text_config, Some(quant))
+        })
+        .expect("the accepted packed affine fixture must actually load"),
+    );
+}
+
+/// The streamed (rung-4) quanta: a backbone window's read (every block of every stack, dense at
+/// both compute widths and packed at both tiers), the tower's layer read (f32-stored, packed), its
+/// cache-free decoder layer and its embedding + RoPE quantum, and the per-row output concatenation.
+fn streamed_body() {
+    use crate::dit::Stack;
+    use crate::packed::ConvertKind;
+    use mlx_gen::weights::Weights;
+    use mlx_gen::Quant;
+    let config = IrisConfig::from_dir(&backbone_dir()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut backbones = vec![
+        (backbone_dir(), Dtype::Float32, None),
+        (backbone_dir(), Dtype::Bfloat16, None),
+    ];
+    let mixed_dense =
+        rewrite_stream_snapshot(root.path(), &backbone_dir(), "mixed-dense", |tensors| {
+            rewrite_backbone_window_dtypes(tensors, None);
+        });
+    for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+        backbones.push((mixed_dense.clone(), dtype, None));
+    }
+    for quant in [Quant::Q4, Quant::Q8] {
+        let packed = crate::packed_tests::convert(
+            ConvertKind::Export { depth: false },
+            &backbone_dir(),
+            root.path(),
+            quant,
+        );
+        for marker in [Dtype::Int64, Dtype::Int32] {
+            let mixed = rewrite_stream_snapshot(
+                root.path(),
+                &packed,
+                &format!("mixed-{quant:?}-{marker:?}"),
+                |tensors| {
+                    rewrite_backbone_window_dtypes(tensors, Some(marker));
+                },
+            );
+            backbones.push((mixed, Dtype::Bfloat16, Some(quant)));
+        }
+        backbones.push((packed, Dtype::Bfloat16, Some(quant)));
+    }
+    for (dir, dtype, quant) in backbones {
+        let dit =
+            crate::model::load_backbone_streamed(&dir, &config, dtype, quant, Some(1)).unwrap();
+        let stream = dit.block_stream().unwrap();
+        for stack in Stack::ALL {
+            for i in 0..stream.len(stack) {
+                let (peak, _) = measure(|| {
+                    let mut view = Weights::from_file(stream.path())?;
+                    let built = stream.build(&mut view, &config.model, stack, i)?;
+                    Ok(built.arrays().into_iter().cloned().collect())
+                });
+                prove(
+                    &format!(
+                        "backbone block read {} {stack:?} {i} {dtype:?} {quant:?}",
+                        dir.display()
+                    ),
+                    crate::stream::window_read_bytes(&[stream.read(stack, i)]),
+                    peak,
+                );
+            }
+        }
+    }
+
+    use crate::text_encoder::IrisTextEncoder;
+    let aligned = crate::packed_tests::aligned_tiny_text_encoder(root.path());
+    let mut towers = vec![(fixtures().join("tiny-snapshot/text_encoder"), None)];
+    for quant in [Quant::Q4, Quant::Q8] {
+        let packed =
+            crate::packed_tests::convert(ConvertKind::TextEncoder, &aligned, root.path(), quant);
+        for affine_dtype in [Dtype::Float16, Dtype::Float32] {
+            let mixed = rewrite_stream_snapshot(
+                root.path(),
+                &packed,
+                &format!("tower-{quant:?}-{affine_dtype:?}"),
+                |tensors| {
+                    let affines: Vec<_> = tensors
+                        .keys()
+                        .filter(|key| key.ends_with(".scales") || key.ends_with(".biases"))
+                        .cloned()
+                        .collect();
+                    assert!(!affines.is_empty());
+                    for key in affines {
+                        let converted = tensors[&key].as_dtype(affine_dtype).unwrap();
+                        tensors.insert(key, converted);
+                    }
+                },
+            );
+            packed_tower_affine_root_checks(&mixed, &config.text_encoder, quant);
+            towers.push((mixed, Some(quant)));
+        }
+        towers.push((packed, Some(quant)));
+    }
+    for (dir, quant) in towers {
+        let te = IrisTextEncoder::load_streamed(&dir, &config.text_encoder, quant).unwrap();
+        let tower = te.streamed().unwrap();
+        let cfg = tower.config();
+        for i in [0, 1, cfg.num_layers - 1]
+            .into_iter()
+            .chain(2..cfg.num_layers.saturating_sub(1))
+        {
+            let (peak, arrays) = measure(|| tower.read_layer(i));
+            assert!(
+                arrays
+                    .iter()
+                    .all(|a| matches!(a.dtype(), Dtype::Bfloat16 | Dtype::Uint32)),
+                "the actual streamed constructors must normalize packed affine parameters"
+            );
+            prove(
+                &format!("text layer read {} {i} {quant:?}", dir.display()),
+                crate::stream::window_read_bytes(&[tower.read_price(i)]),
+                peak,
+            );
+        }
+        for n in [48, 96] {
+            let ids: Vec<i32> = (0..n).map(|i| (i * 7 + 3) % cfg.vocab_size).collect();
+            let (peak, out) = measure(|| {
+                let ids = Array::from_slice(&ids, &[1, n]);
+                let h = mlx_llm::primitives::nn::embed(tower.embed_table(), &ids)
+                    .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?;
+                let (cos, sin) = tower
+                    .rope()
+                    .cos_sin(n, 0, Dtype::Bfloat16)
+                    .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?;
+                Ok(vec![h, cos, sin])
+            });
+            prove(
+                &format!("text streamed embedding n{n} {quant:?}"),
+                crate::text_encoder::streamed_embedding_bytes(cfg, n as u64),
+                peak,
+            );
+            let (h, cos, sin) = (out[0].clone(), out[1].clone(), out[2].clone());
+            for i in [0, 1] {
+                let layer = tower.build_layer(i).unwrap();
+                // One cache-free decoder layer, with the same hard lower/report-only upper policy.
+                let mut worst = 0;
+                for stalled in [false, true] {
+                    for _ in 0..2 * RUNS {
+                        let peak = with_cpu_diagnostic_headroom(PLENTY, || {
+                            let _scope = mlx_gen::ios_quantum::Scope::new();
+                            let ahead = stalled.then(stall);
+                            let peak = measured_peak_bytes(|| {
+                                Ok(vec![layer.forward(cfg, &h, &cos, &sin)?])
+                            });
+                            drop(ahead);
+                            peak
+                        })
+                        .unwrap();
+                        worst = worst.max(peak);
+                    }
+                }
+                prove(
+                    &format!("text streamed layer {i} n{n} {quant:?}"),
+                    crate::text_encoder::streamed_layer_bytes(cfg, n as u64),
+                    worst,
+                );
+            }
+        }
+    }
+
+    // The per-row PiT stage's output rows concatenated into the batch.
+    for (b, h, w) in [(2, 16, 24), (4, 32, 32)] {
+        let rows: Vec<Array> = (0..b)
+            .map(|r| rand(&[1, 3, h, w], 20 + r as u64, Dtype::Float32))
+            .collect();
+        let (peak, _) = measure(|| {
+            let refs: Vec<&Array> = rows.iter().collect();
+            Ok(vec![mlx_rs::ops::concatenate_axis(&refs, 0)?])
+        });
+        prove(
+            &format!("output rows b{b} {h}x{w}"),
+            crate::dit::IrisDiT::output_rows_bytes(b, 3, h, w),
+            peak,
+        );
+    }
+}
+
+#[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+fn every_streamed_quantum_price_tracks_its_measured_peak() {
+    in_cpu_child(
+        "quantum_proofs::every_streamed_quantum_price_tracks_its_measured_peak",
+        streamed_body,
+    );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::every_streamed_quantum_price_tracks_its_measured_peak");
+    }
 }

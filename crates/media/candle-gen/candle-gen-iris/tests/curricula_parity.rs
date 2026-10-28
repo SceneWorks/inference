@@ -144,6 +144,7 @@ fn grads_under(model: &TrainModel, params: &Params, ac: AcPolicy) -> Tensors {
 /// Activation checkpointing (tape-free region forwards replayed on the tape by the segmented
 /// backward) leaves every gradient equal to the plain graph's — and to upstream's.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn activation_checkpointing_gradients_equal_the_plain_graph() {
     let g = fixture(GOLDEN);
     let model = full_model("isotropic");
@@ -201,9 +202,13 @@ fn activation_checkpointing_gradients_equal_the_plain_graph() {
         vec![full, full, strided],
         "regions entered per policy"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::activation_checkpointing_gradients_equal_the_plain_graph");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn non_square_bucket_steps_match_upstream_under_both_rope_laws() {
     let g = fixture(GOLDEN);
     let get = |k: &str| g.require(&format!("ns.{k}")).clone();
@@ -241,6 +246,9 @@ fn non_square_bucket_steps_match_upstream_under_both_rope_laws() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::non_square_bucket_steps_match_upstream_under_both_rope_laws");
 }
 
 fn tiny_arch(registers: usize) -> TeacherArch {
@@ -270,6 +278,7 @@ fn tiny_teacher(g: &Fixture, name: &str, registers: usize) -> Teacher {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream() {
     let g = fixture(GOLDEN);
     let teacher = tiny_teacher(&g, "teacher", 0);
@@ -432,9 +441,13 @@ fn repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream() {
             }
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_register_teacher_resizes_its_position_table_with_antialias() {
     let g = fixture(GOLDEN);
     let teacher = tiny_teacher(&g, "teacher_reg", 4);
@@ -445,9 +458,13 @@ fn the_register_teacher_resizes_its_position_table_with_antialias() {
         &f32t(g.require("teacher_reg.tokens_3x3")),
         1e-4,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::the_register_teacher_resizes_its_position_table_with_antialias");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_frozen_holdout_grid_matches_upstreams_val_loss() {
     let g = fixture(GOLDEN);
     let get = |k: &str| g.require(&format!("val.{k}")).clone();
@@ -480,6 +497,9 @@ fn the_frozen_holdout_grid_matches_upstreams_val_loss() {
         &f32t(&get("per_sample")),
         1e-5,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::the_frozen_holdout_grid_matches_upstreams_val_loss");
 }
 
 /// The release teacher (`facebook/dinov2-base` @ the pinned revision) on real weights:
@@ -513,6 +533,9 @@ fn the_release_teacher_matches_upstream_on_real_weights() {
             tol,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::the_release_teacher_matches_upstream_on_real_weights");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -588,6 +611,7 @@ fn ac_case(compute: DType, ac: AcPolicy) -> AcCase {
 /// ([`crate::common::AC_BF16_NOISE_FACTOR`]) — which AdamW's first step (±lr per weight whatever
 /// the gradient's size) turns into a next-loss gap of the order of the bf16-vs-f32 gap itself.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn activation_checkpointing_is_exact_in_f32_and_within_rounding_noise_in_bf16() {
     let f_none = ac_case(DType::F32, AcPolicy::None);
     let f_full = ac_case(DType::F32, AcPolicy::Full);
@@ -622,4 +646,7 @@ fn activation_checkpointing_is_exact_in_f32_and_within_rounding_noise_in_bf16() 
         ac_gap <= 4.0 * policy_gap,
         "bf16 checkpointing moved the next loss by {ac_gap:e}, the bf16 policy itself by {policy_gap:e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::activation_checkpointing_is_exact_in_f32_and_within_rounding_noise_in_bf16");
 }

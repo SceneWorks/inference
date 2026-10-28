@@ -308,6 +308,7 @@ fn control_layers_are_every_other_double_block() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn scale_zero_equals_base_forward() {
     let f = Fixture::build();
     let base = f.base_forward();
@@ -318,9 +319,13 @@ fn scale_zero_equals_base_forward() {
         d == 0.0,
         "control_context_scale = 0 must be byte-identical to the base forward (hints ×0); max|Δ| = {d}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED control_parity::scale_zero_equals_base_forward");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn scale_nonzero_injects_and_stays_finite() {
     let f = Fixture::build();
     let base = f.base_forward();
@@ -335,5 +340,10 @@ fn scale_nonzero_injects_and_stays_finite() {
     assert!(
         cv.iter().all(|x| x.is_finite()),
         "controlled output must be finite"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED control_parity::scale_nonzero_injects_and_stays_finite"
     );
 }

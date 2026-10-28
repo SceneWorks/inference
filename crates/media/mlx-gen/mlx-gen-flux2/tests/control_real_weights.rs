@@ -211,4 +211,6 @@ fn dev_control_renders_coherent_pose_image() {
         mean > 2.0 && mean < 253.0,
         "control render pinned to an extreme: mean={mean:.2}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_real_weights::dev_control_renders_coherent_pose_image");
 }

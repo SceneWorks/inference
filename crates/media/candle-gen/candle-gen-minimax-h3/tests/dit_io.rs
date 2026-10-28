@@ -56,6 +56,7 @@ fn model_weights(f: &Golden) -> candle_gen::Weights {
 /// modulation — every AdaLN projection in all 50 blocks plus `norm_out` — is a function of this one
 /// tensor, so an error here is a uniform bias applied at every step.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_timestep_mlp_reproduces_the_reference_embedding() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -102,10 +103,14 @@ fn the_timestep_mlp_reproduces_the_reference_embedding() {
         (norm(&unflipped) - norm(&sincos)).abs() / norm(&sincos) < 1e-6,
         "…and the two have the SAME norm, which is why a magnitude gate cannot see the flip"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_io::the_timestep_mlp_reproduces_the_reference_embedding");
 }
 
 /// **`context_embedder` reproduces the reference's refiner input.**
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_context_embedder_reproduces_the_reference_projection() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -122,12 +127,16 @@ fn the_context_embedder_reproduces_the_reference_projection() {
         got.dims(),
         rel(&got, &want).0
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_io::the_context_embedder_reproduces_the_reference_projection");
 }
 
 /// The whole model reproduces the refiner chain the reference dumped — `context_embedder` **then**
 /// `token_refiner`, which is the order the reference's `forward` applies and the order a port that
 /// refined before embedding would get wrong at the same shapes.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_model_embeds_the_context_before_refining_it() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -145,6 +154,11 @@ fn the_model_embeds_the_context_before_refining_it() {
     assert_eq!(dit.num_layers(), cfg.num_layers);
     assert!(dit.holds_adaln(), "nothing is evicted at load");
     assert!(dit.adaln_nbytes() > 0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED dit_io::the_model_embeds_the_context_before_refining_it"
+    );
 }
 
 /// **`norm_out.linear` is `shift` then `scale`**, and it is addressed by the **bare timestep
@@ -154,6 +168,7 @@ fn the_model_embeds_the_context_before_refining_it() {
 /// multiplicative one; feeding it the blocks' `adaln_indices` reads a row `MODALITY_NUM` times too
 /// far into the table.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_output_norm_is_shift_then_scale_and_keyed_on_the_timestep_alone() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -211,6 +226,9 @@ fn the_output_norm_is_shift_then_scale_and_keyed_on_the_timestep_alone() {
          refused: {e}",
         m.shift.dims()[0]
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_io::the_output_norm_is_shift_then_scale_and_keyed_on_the_timestep_alone");
 }
 
 /// The declared timestep index really is what an independent derivation from the schedule produces
@@ -257,7 +275,10 @@ fn the_seventeen_load_at_the_published_geometry() {
     let tiny = dit_fixture_config();
     let p = DitProjections::from_weights(&model_weights(&f), &tiny).unwrap();
     assert_eq!(
-        p.time_embedder.time_embed_dim(),
+        p.time_embedder
+            .as_ref()
+            .expect("stock checkpoint timestep MLP")
+            .time_embed_dim(),
         tiny.time_embed_dim,
         "the AdaLN projections consume this width"
     );
@@ -303,6 +324,7 @@ fn the_declared_names_partition_the_fixture() {
 /// fixture's packed layout, reproduced by `MiniMaxH3Dit::forward_packed` — which is the very
 /// function `JointDit` calls per step.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_whole_model_reproduces_the_reference_velocity() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -375,6 +397,9 @@ fn the_whole_model_reproduces_the_reference_velocity() {
         Some("converted-checkpoint"),
         "rule 3: the golden must come from the CONVERTED layout production loads"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_io::the_whole_model_reproduces_the_reference_velocity");
 }
 
 /// **The AdaLN bounds check is on the production path**, not only in `block.rs`'s unit test of the
@@ -387,6 +412,7 @@ fn the_whole_model_reproduces_the_reference_velocity() {
 /// naming the modulation table to an opaque kernel one, which is exactly the regression the
 /// hoisting invited, so the rejection is asserted here through `forward_packed` itself.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn forward_packed_rejects_an_out_of_range_adaln_index() {
     let f = fixture();
     let cfg = dit_fixture_config();
@@ -439,6 +465,9 @@ fn forward_packed_rejects_an_out_of_range_adaln_index() {
         e.contains("outside the modulation table") && e.contains(&rows.to_string()),
         "the rejection must name the modulation table and its row count, got: {e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_io::forward_packed_rejects_an_out_of_range_adaln_index");
 }
 
 /// The **cached** modulation path reproduces the same whole-model velocity as the resident one.
@@ -448,6 +477,7 @@ fn forward_packed_rejects_an_out_of_range_adaln_index() {
 /// land on the reference velocity exactly as the un-cached path does. `adaln_evict_memory.rs` is
 /// the memory half.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_cached_modulation_path_reproduces_the_resident_one() {
     use candle_gen_minimax_h3::AdaLnCache;
 
@@ -541,4 +571,7 @@ fn the_cached_modulation_path_reproduces_the_resident_one() {
         cache.bytes(),
         cache.num_layers()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_io::the_cached_modulation_path_reproduces_the_resident_one");
 }

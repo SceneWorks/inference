@@ -1366,6 +1366,7 @@ mod tests {
     /// a dense [`candle_gen::quant::AdaptLinear`] base — so the packed additive path and the dense fold
     /// path agree to f32 tolerance.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn resolve_lora_matches_fold_on_dense() {
         use candle_gen::candle_nn::Linear;
         use candle_gen::quant::AdaptLinear;
@@ -1406,6 +1407,11 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (2usize, in_dim), &dev).unwrap();
         let d = max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
         assert!(d < 1e-4, "resolved additive != folded ({d})");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::resolve_lora_matches_fold_on_dense"
+        );
     }
 
     /// **Fused-QKV additive row-slice (sc-11105).** A kohya-native fused `attn_qkv` LoRA resolves to the

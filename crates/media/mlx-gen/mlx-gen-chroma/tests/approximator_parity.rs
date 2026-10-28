@@ -33,6 +33,7 @@ fn max_abs_diff(a: &mlx_rs::Array, b: &mlx_rs::Array) -> f32 {
     max_abs(&subtract(a, b).unwrap())
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn pooled_temb_matches_diffusers() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
@@ -69,4 +70,6 @@ fn pooled_temb_matches_diffusers() {
         rel < 2e-3,
         "pooled_temb peak-rel = {rel} (max|Δ|={d}, scale={scale}) exceeds the mlx-Metal f32 floor"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED approximator_parity::pooled_temb_matches_diffusers");
 }

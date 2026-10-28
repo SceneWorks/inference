@@ -1,410 +1,380 @@
-//! Reachable-sizes PREDICTION for the iOS phone (epic 16774): per route, tier and edge, the
-//! resident bytes of each phase, the largest quantum scratch in it under the chosen ladder rung,
-//! and whether `resident + scratch + reserve` fits the entitled launch headroom. Derived on the
-//! host from the real snapshot's configs and tensor HEADERS (no payload is read, nothing runs) and
-//! the same counted formulas the device guards with. These are predictions, never evidence.
+//! Reachable-sizes PREDICTION for the iOS phone (epic 16774): per route, mode, tier and edge, every
+//! phase's counted peak — resident bytes + its largest quantum + the engineering reserve — against
+//! the entitled launch headroom, priced by the crate's own iOS pricing
+//! ([`crate::ios_pricing`], the formulas the device guards check) from the real snapshot's configs
+//! and tensor HEADERS (no payload is read, nothing runs). These are predictions, never evidence.
 //!
 //! `cargo test -p mlx-gen-iris --lib reachable_sizes -- --ignored --nocapture`, with
-//! `IRIS_WEIGHTS_DIR` / `IRIS_TEXT_ENCODER_DIR` or the Hugging Face cache snapshots.
+//! `IRIS_WEIGHTS_DIR` / `IRIS_TEXT_ENCODER_DIR` pointing at the snapshots.
 //!
-//! The rung: generation runs staged residency (the text tower is dropped before the backbone
-//! loads) with the attention unbounded — the iOS GPU's fused attention streams its scores, so a
-//! query-chunked plan only adds the chunk outputs and their concatenation. Every tier computes at
-//! bf16 (the packed tiers' scales are bf16; the bf16 tier is the dense release cast at load).
+//! The `q8` / `q4` cells price the packed exports an iOS load reads (`crate::packed`) from the dense
+//! release's headers. Columns, each the phase's peak in MiB:
+//!
+//! * **A — before**: the fully optimized configuration before the epic-16774 levers: the eager
+//!   load's deepest implemented rung (generation: rung 3, staged; the encoder-free routes: rung 0)
+//!   at its cheapest declared selection, with the PiT stage batched;
+//! * **B — after**: the deferred load's deepest rung (rung 4) at its cheapest declared selection
+//!   (staged, rung 3 with the per-row PiT stage, both components streamed at window 1), with its
+//!   binding quantum and the lever(s) that made a cell fit that A refused;
+//! * **C — rung 0**: the eager, warm (unstaged) resident configuration.
+//!
+//! Levers: **(a)** the Qwen3-VL tower streamed by layer window, **(b)** the backbone's block stacks
+//! streamed by window, **(c)** rung 3's per-row PiT stage. A lever is credited when it alone makes
+//! the phase fit (`a+b+c` when only their composition does). Outside the conditioning and denoise
+//! phases (load, encode, decode) the saving is the deferred load itself — both components hold only
+//! their skeletons, whichever scope streams — and is credited as `deferred load (a/b skeletons)`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use mlx_gen::gen_core::iris::restoration::{plan, Dims, RestorationOptions, TileGeometry};
-use mlx_gen::gen_core::iris::{IrisConfig, PROMPT_PREFIX, PROMPT_SUFFIX};
-use mlx_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use mlx_gen::{Precision, Quant};
+use mlx_gen::gen_core::{
+    GenerationMemory, LoadShape, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryStrategy,
+    TransformerComponent,
+};
+use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosPricingRequest};
+use mlx_gen::{LoadSpec, Quant, WeightsSource};
 
-use crate::dit::{EmbedGeometry, IrisDiT, PixelBlockGeometry, TextBlockGeometry, TrunkGeometry};
+use crate::ios_pricing::{price, Pricing};
 
 /// The entitled launch headroom of the target phone (MiB).
 const ENTITLED_MIB: u64 = 6142;
 const MIB: u64 = 1024 * 1024;
-const CW: u64 = 2;
 
-/// The caller-provisioned snapshot for `repo` (inference never derives a cache path).
-fn snapshot(env: &str, _repo: &str) -> Option<PathBuf> {
+/// The caller-provisioned snapshot (inference never derives a cache path).
+fn snapshot(env: &str) -> Option<PathBuf> {
     std::env::var_os(env).map(PathBuf::from)
 }
 
-fn header(path: &Path, name: &str) -> Vec<usize> {
-    mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
-        .unwrap()
-        .into_iter()
-        .find(|h| h.name == name)
-        .unwrap_or_else(|| panic!("{} has no {name}", path.display()))
-        .shape
+fn fits(peak: u64) -> bool {
+    peak.saturating_add(mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES) <= ENTITLED_MIB * MIB
 }
 
-/// Backbone widths read from the config and the weight file's headers.
-struct Backbone {
-    cfg: IrisConfig,
-    file: PathBuf,
-    prefix: &'static str,
+fn mib(bytes: u64) -> u64 {
+    (bytes + MIB / 2) / MIB
 }
 
-impl Backbone {
-    fn rows(&self, name: &str) -> u64 {
-        header(&self.file, &format!("{}{name}", self.prefix))[0] as u64
-    }
+/// One route of the prediction: its provider, request surface, load spec builder and geometry.
+struct Route {
+    name: String,
+    provider: &'static str,
+    mode: MemoryMode,
+    spec: Box<dyn Fn(Option<Quant>, LoadShape) -> LoadSpec>,
+    geometry: Box<dyn Fn(u64) -> MemoryGeometry>,
+}
 
-    /// Zero columns a `tier` load pads the `[out, in]` projection `name`'s input by.
-    fn pad(&self, name: &str, tier: Option<Quant>) -> u64 {
-        let input = header(&self.file, &format!("{}{name}", self.prefix))[1];
-        match crate::nn::ProjectionLayout::of(
-            input,
-            crate::nn::BackboneQuant::for_load(tier).unwrap(),
-        ) {
-            crate::nn::ProjectionLayout::Quantized { padded_in, .. } => (padded_in - input) as u64,
-            crate::nn::ProjectionLayout::Dense => 0,
-        }
-    }
-
-    /// The largest denoise-phase quantum of one forward over an `h × w` batch of `b` at `tier`,
-    /// priced for the device (fused norm and attention kernels).
-    fn forward_peak(&self, b: u64, h: u64, w: u64, tier: Option<Quant>) -> (u64, &'static str) {
-        let m = &self.cfg.model;
-        let p = m.patch_size as u64;
-        let n = (h / p) * (w / p);
-        let t = m.text_len as u64;
-        let tokens = n + t;
-        let hidden = m.hidden_size as u64;
-        let heads = m.num_heads as u64;
-        let kv_heads = m.num_kv_heads.unwrap_or(m.num_heads) as u64;
-        let layers = self.cfg.text_encoder.hidden_layers.len() as u64;
-        let text_dim = m.text_dim as u64;
-        let last = m.depth - 1;
-        let trunk = |ff: u64, text: bool, down_pad: u64| TrunkGeometry {
-            compute_bytes: CW,
-            batch: b,
-            img_tokens: n,
-            txt_tokens: t,
-            dim: hidden,
-            heads,
-            kv_heads,
-            ff,
-            query_rows: tokens,
-            eval_per_chunk: false,
-            split_qkv: kv_heads != heads,
-            text,
-            down_pad,
-            img_stream_bytes: 4,
-        };
-        let dual = TrunkGeometry {
-            img_stream_bytes: CW,
-            ..trunk(
-                self.rows("blocks.0.mlp_x.w1.weight"),
-                true,
-                self.pad("blocks.0.mlp_x.w2.weight", tier),
-            )
-        };
-        let single = trunk(
-            self.rows(&format!("blocks.{last}.mlp.w1.weight")),
-            true,
-            self.pad(&format!("blocks.{last}.mlp.w2.weight"), tier),
+/// The selection a configuration runs and the `GenerationMemory` it writes: the cheapest declared
+/// selection of `strategy` whose component scope is `component` (any when `None`).
+fn configure(
+    provider: &str,
+    spec: &LoadSpec,
+    strategy: MemoryStrategy,
+    component: Option<TransformerComponent>,
+) -> (mlx_gen::gen_core::MemorySelection, GenerationMemory) {
+    // The declaration (identical on every surface of a load shape); the packed export the cell
+    // prices is emulated, so the dense release's own artifact checks do not apply.
+    let contract =
+        crate::memory_strategy::weights_free_memory_strategy_contract(provider, spec).unwrap();
+    let tier = MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    };
+    let space = contract.selection_space(strategy, tier, false).unwrap();
+    let chosen = *space
+        .iter()
+        .rev()
+        .find(|s| component.is_none() || s.parameters.transformer_window_component == component)
+        .unwrap();
+    let memory = contract.generation_memory(&chosen).unwrap_or_else(|| {
+        assert_eq!(chosen.strategy, MemoryStrategy::Resident);
+        assert_eq!(
+            contract.resident_request_memory,
+            mlx_gen::gen_core::ResidentRequestMemory::PreserveLoadDefaults
         );
-        let text_block = |refiner: bool| {
-            let (batch, tokens, dim, heads, ff, pad) = if refiner {
-                (
-                    b,
-                    t,
-                    hidden,
-                    heads,
-                    self.rows("y_embedder.refiner.blocks.0.mlp.w1.weight"),
-                    self.pad("y_embedder.refiner.blocks.0.mlp.w2.weight", tier),
-                )
-            } else {
-                (
-                    b * t,
-                    layers,
-                    text_dim,
-                    m.text_lap_num_heads as u64,
-                    self.rows("y_embedder.layer_blocks.0.mlp.0.weight"),
-                    self.pad("y_embedder.layer_blocks.0.mlp.2.weight", tier),
-                )
-            };
-            IrisDiT::text_block_bytes(
-                TextBlockGeometry {
-                    compute_bytes: CW,
-                    batch,
-                    tokens,
-                    dim,
-                    heads,
-                    ff,
-                    query_rows: tokens,
-                    eval_per_chunk: false,
-                    refiner,
-                    down_pad: pad,
-                    stream_bytes: if refiner { CW } else { 4 },
-                },
-                false,
-            )
-        };
-        let mut quanta: Vec<(u64, &'static str)> = vec![
-            (
-                IrisDiT::dual_block_bytes(&dual, false)
-                    + IrisDiT::trunk_entry_bytes(b, n, t, hidden / heads, hidden),
-                "first (dual) trunk block + RoPE/positional entry",
-            ),
-            (
-                IrisDiT::single_block_bytes(&single, false),
-                "single trunk block",
-            ),
-            (
-                IrisDiT::pixel_block_bytes(
-                    PixelBlockGeometry {
-                        compute_bytes: CW,
-                        batch: b,
-                        patches: n,
-                        patch_pixels: p * p,
-                        pixel_width: m.pixel.hidden_size as u64,
-                        compact_width: m.pixel.attn_hidden_size as u64,
-                        modulation_width: self.rows("pixel_blocks.0.adaln.weight"),
-                        condition_width: hidden,
-                        fc1_width: self.rows("pixel_blocks.0.mlp.fc1.weight"),
-                        heads: m.pixel.num_heads as u64,
-                        query_rows: n,
-                        eval_per_chunk: false,
-                    },
-                    false,
-                ),
-                "pixel block",
-            ),
-            (
-                IrisDiT::embed_bytes(EmbedGeometry {
-                    compute_bytes: CW,
-                    batch: b,
-                    patches: n,
-                    patch_in: header(
-                        &self.file,
-                        &format!("{}s_embedder.proj.weight", self.prefix),
-                    )[1] as u64,
-                    hidden,
-                    sinusoid: header(
-                        &self.file,
-                        &format!("{}t_embedder.mlp.0.weight", self.prefix),
-                    )[1] as u64,
-                    t_hidden: self.rows("t_embedder.mlp.0.weight"),
-                    t_out: self.rows("t_embedder.mlp.2.weight"),
-                    cores: 2 * self.rows("modulation_cores.adaln_img.weight"),
-                }) + mlx_gen::ios_quantum::sampler_step_bytes(b * m.in_channels as u64 * h * w),
-                "embed + sampler allowance",
-            ),
-            (text_block(false), "text adapter layer block"),
-            (text_block(true), "text refiner block"),
-            (
-                IrisDiT::text_pool_bytes(CW, b, t, layers, text_dim, hidden),
-                "text pool",
-            ),
-            (
-                IrisDiT::text_output_bytes(CW, b, t, hidden, false),
-                "text output",
-            ),
-            (
-                IrisDiT::pixel_embed_bytes(
-                    CW,
-                    b,
-                    h,
-                    w,
-                    p,
-                    hidden,
-                    m.pixel.hidden_size as u64,
-                    header(
-                        &self.file,
-                        &format!("{}pixel_embedder.proj.weight", self.prefix),
-                    )[1] as u64,
-                ),
-                "pixel embed",
-            ),
-            (
-                IrisDiT::output_bytes(
-                    CW,
-                    b,
-                    n,
-                    p * p,
-                    m.pixel.hidden_size as u64,
-                    m.in_channels as u64,
-                    false,
-                ),
-                "output",
-            ),
-        ];
-        quanta.sort_by_key(|q| std::cmp::Reverse(q.0));
-        quanta[0]
-    }
-
-    fn resident(&self, tier: Option<Quant>) -> u64 {
-        crate::memory_strategy::backbone_bytes(
-            &self.file,
-            Precision::Bf16,
-            crate::nn::BackboneQuant::for_load(tier).unwrap(),
-        )
-        .unwrap()
-    }
+        GenerationMemory::default()
+    });
+    (chosen, memory)
 }
 
-fn row(route: &str, tier: &str, edge: u64, phase: &str, resident: u64, scratch: u64, what: &str) {
-    let need = resident + scratch + mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES;
-    let fits = need <= ENTITLED_MIB * MIB;
-    println!(
-        "| {route} | {tier} | {edge} | {phase} | {:.0} | {:.0} ({what}) | {:.0} | {} |",
-        resident as f64 / MIB as f64,
-        scratch as f64 / MIB as f64,
-        need as f64 / MIB as f64,
-        if fits { "fits" } else { "NO" }
-    );
+/// The deepest rung `spec`'s contract implements.
+fn deepest(provider: &str, spec: &LoadSpec) -> MemoryStrategy {
+    let contract =
+        crate::memory_strategy::weights_free_memory_strategy_contract(provider, spec).unwrap();
+    MemoryStrategy::ALL
+        .into_iter()
+        .rev()
+        .find(|s| {
+            matches!(
+                contract.capability(*s).map(|c| &c.support),
+                Some(mlx_gen::gen_core::MemoryStrategySupport::Implemented)
+            )
+        })
+        .unwrap()
+}
+
+fn priced(
+    route: &Route,
+    tier: Option<Quant>,
+    shape: LoadShape,
+    strategy: Option<MemoryStrategy>,
+    component: Option<TransformerComponent>,
+    pixel_rows: bool,
+    edge: u64,
+) -> IosPricing {
+    let spec = (route.spec)(tier, shape);
+    let strategy = strategy.unwrap_or_else(|| deepest(route.provider, &spec));
+    let (selection, memory) = configure(route.provider, &spec, strategy, component);
+    let geometry = (route.geometry)(edge);
+    // Explicit DEFAULT-sampling header diagnostic, not an inferred production request or fit claim.
+    let generation =
+        (route.provider == crate::model::MODEL_ID).then(|| mlx_gen::GenerationRequest {
+            prompt: "Iris header diagnostic".into(),
+            prompt_batch: if geometry.batch > 1 {
+                vec!["Iris header diagnostic".into(); geometry.batch as usize]
+            } else {
+                Vec::new()
+            },
+            width: geometry.width,
+            height: geometry.height,
+            count: 1,
+            seed: Some(0),
+            memory: (memory != GenerationMemory::default()).then_some(memory),
+            ..Default::default()
+        });
+    price(
+        &IosPricingRequest {
+            provider: route.provider,
+            spec: &spec,
+            mode: &route.mode,
+            geometry,
+            selection: &selection,
+            execution: &memory,
+            generation: generation.as_ref(),
+            transform: None,
+            depth: None,
+            token_window: 0,
+        },
+        Pricing {
+            assume_packed: true,
+            pixel_rows,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{} {tier:?} {edge}: {e}", route.name))
+    .pricing
+}
+
+fn phase_peak(pricing: &IosPricing, phase: IosPhase) -> Option<u64> {
+    pricing.phase(phase).map(|p| p.peak_bytes())
 }
 
 #[test]
 #[ignore = "prints the iOS reachable-sizes prediction from the real snapshot's headers"]
 fn print_the_reachable_sizes_prediction() {
     let (Some(root), Some(te_dir)) = (
-        snapshot("IRIS_WEIGHTS_DIR", "models--speridlabs--iris-3b"),
-        snapshot(
-            "IRIS_TEXT_ENCODER_DIR",
-            "models--Qwen--Qwen3-VL-4B-Instruct",
-        ),
+        snapshot("IRIS_WEIGHTS_DIR"),
+        snapshot("IRIS_TEXT_ENCODER_DIR"),
     ) else {
         println!("no Iris snapshot on disk: nothing to predict");
         return;
     };
-    let generation = Backbone {
-        cfg: IrisConfig::from_dir(&root).unwrap(),
-        file: root.join("model.safetensors"),
-        prefix: "",
+    let generation = |prompts: u32| {
+        let (root, te_dir) = (root.clone(), te_dir.clone());
+        Route {
+            name: if prompts == 1 {
+                "iris_3b text".into()
+            } else {
+                format!("iris_3b prompt_batch {prompts}")
+            },
+            provider: crate::model::MODEL_ID,
+            mode: MemoryMode::TextToImage,
+            spec: Box::new(move |tier, shape| {
+                let mut spec =
+                    LoadSpec::new(WeightsSource::Dir(root.clone())).with_load_shape(shape);
+                spec.quantize = tier;
+                spec.components.insert(
+                    mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT.into(),
+                    WeightsSource::Dir(te_dir.clone()),
+                );
+                spec
+            }),
+            geometry: Box::new(move |edge| MemoryGeometry {
+                width: edge as u32,
+                height: edge as u32,
+                batch: prompts,
+                frames: 1,
+                reference_count: 0,
+            }),
+        }
     };
-    let restore = Backbone {
-        cfg: IrisConfig::from_dir(&root.join("upscaler")).unwrap(),
-        file: root.join("upscaler/model.safetensors"),
-        prefix: "",
+    let export = |name: &str, provider: &'static str, task, dir: PathBuf| Route {
+        name: name.into(),
+        provider,
+        mode: crate::memory_strategy::memory_mode(task),
+        spec: Box::new(move |tier, shape| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone())).with_load_shape(shape);
+            spec.quantize = tier;
+            spec
+        }),
+        geometry: Box::new(move |edge| match task {
+            // Restoration: `edge` is the OUTPUT edge at the default 4x; admitted at the size its
+            // plan processes.
+            mlx_gen::gen_core::iris::IrisTask::Restoration => {
+                let p = plan(
+                    Dims::new((edge / 4) as u32, (edge / 4) as u32),
+                    &RestorationOptions {
+                        scale: 4.0,
+                        ..Default::default()
+                    },
+                    TileGeometry::RELEASE,
+                    crate::restoration::MODEL_ID,
+                )
+                .unwrap();
+                crate::memory_strategy::restoration_memory_geometry(&p)
+            }
+            _ => MemoryGeometry {
+                width: edge as u32,
+                height: edge as u32,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+        }),
     };
-    let depth = Backbone {
-        cfg: IrisConfig::from_dir(&root.join("depth")).unwrap(),
-        file: root.join("depth/model.safetensors"),
-        prefix: "pixel.",
-    };
-    let te_cfg = mlx_llm::ModelConfig::from_dir(&te_dir).unwrap();
-    let tokenizer = TextTokenizer::from_file(
-        te_dir.join("tokenizer.json"),
-        TokenizerConfig {
-            max_length: usize::MAX,
-            pad_token_id: 0,
-            chat_template: ChatTemplate::None,
-            pad_to_max_length: false,
-        },
-    )
-    .unwrap();
-    let prefix = tokenizer.encode_ids(PROMPT_PREFIX, false).unwrap().len() as i32;
-    let max_length = generation.cfg.text_encoder.max_length as i32;
-    // The full window: the prefix, a caption at the budget, the suffix.
-    let window = prefix + max_length;
-    let deepest = *generation.cfg.text_encoder.hidden_layers.last().unwrap();
-    let layers = generation.cfg.text_encoder.hidden_layers.len() as u64;
-    let dim = generation.cfg.text_encoder.dim as u64;
-    let conditioning = mlx_gen::ios_quantum::tensor_bytes(4, &[max_length as u64, layers, dim]);
-    let _ = PROMPT_SUFFIX;
+    use mlx_gen::gen_core::iris::IrisTask;
+    let routes = [
+        generation(1),
+        generation(2),
+        export(
+            "iris_3b_restore",
+            crate::restoration::MODEL_ID,
+            IrisTask::Restoration,
+            root.join("upscaler"),
+        ),
+        export(
+            "iris_3b_depth",
+            crate::depth::DEPTH_MODEL_ID,
+            IrisTask::Depth,
+            root.join("depth"),
+        ),
+    ];
     println!(
-        "| route | tier | edge | phase | resident MiB | largest quantum MiB | + {} MiB reserve = MiB | ≤ {ENTITLED_MIB} MiB |",
-        mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES / MIB
+        "| route | tier | edge | phase | A before (resident) MiB | A | B after (resident) MiB | B binding | B | lever | C rung 0 (resident) MiB | C |"
     );
-    println!("|---|---|---|---|---:|---|---:|---|");
+    println!("|---|---|---:|---|---:|---|---:|---|---|---|---:|---|");
+    let mark = |peak: u64| if fits(peak) { "fits" } else { "NO" };
+    let mut refused_after = Vec::new();
     for (tier, label) in [
         (Some(Quant::Q4), "q4"),
         (Some(Quant::Q8), "q8"),
         (None, "bf16"),
     ] {
-        let te = crate::memory_strategy::text_encoder_bytes(&te_dir, tier).unwrap();
-        let bb = generation.resident(tier);
-        for (mode, prompts) in [("text", 1u64), ("prompt_batch 2", 2)] {
-            let route = format!("iris_3b {mode}");
-            let b = 2 * prompts; // CFG doubles every solve
+        for route in &routes {
+            let generation = route.provider == crate::model::MODEL_ID;
             for edge in [512u64, 768, 1024] {
-                // Text phase: the tower alone (staged), each prompt and the CFG null encoded in
-                // turn; the conditionings already returned stay resident.
-                let (layer, held) =
-                    crate::text_encoder::decoder_layer_parts(&te_cfg, window, deepest);
-                let cond = crate::text_encoder::conditioning_bytes(
-                    layers,
-                    max_length as u64,
-                    dim,
-                    max_length,
-                );
-                row(
-                    &route,
-                    label,
+                let eager = LoadShape::EagerMaterialization;
+                let deferred = LoadShape::DeferredMaterialization;
+                let rung4 = Some(MemoryStrategy::BoundedTransformerResidency);
+                let a = priced(route, tier, eager, None, None, false, edge);
+                let b = priced(route, tier, deferred, None, None, true, edge);
+                let c = priced(
+                    route,
+                    tier,
+                    eager,
+                    Some(MemoryStrategy::Resident),
+                    None,
+                    true,
                     edge,
-                    "text",
-                    te + prompts * conditioning,
-                    (layer + held).max(cond),
-                    "deepest decoder layer + held states/KV",
                 );
-                // Denoise: the backbone, every conditioning and their CFG batch.
-                let resident = bb + (prompts + 1) * conditioning + b * conditioning;
-                let (scratch, what) = generation.forward_peak(b, edge, edge, tier);
-                row(&route, label, edge, "denoise", resident, scratch, what);
-                let image = crate::model::image_scratch(prompts * 3 * edge * edge);
-                row(&route, label, edge, "decode", bb, image, "RGB8 conversion");
+                // Each lever alone: (a) the tower streamed, (b) the backbone streamed (each without
+                // the per-row stage), (c) the per-row stage on the eager route.
+                let alone: Vec<(&str, IosPricing)> = if generation {
+                    vec![
+                        (
+                            "(a) tower stream",
+                            priced(
+                                route,
+                                tier,
+                                deferred,
+                                rung4,
+                                Some(TransformerComponent::TextEncoder),
+                                false,
+                                edge,
+                            ),
+                        ),
+                        (
+                            "(b) backbone stream",
+                            priced(
+                                route,
+                                tier,
+                                deferred,
+                                rung4,
+                                Some(TransformerComponent::Dit),
+                                false,
+                                edge,
+                            ),
+                        ),
+                        (
+                            "(c) per-row PiT",
+                            priced(route, tier, eager, None, None, true, edge),
+                        ),
+                    ]
+                } else {
+                    vec![("(b) backbone stream", b.clone())]
+                };
+                for phase in IosPhase::ALL {
+                    let (Some(pa), Some(pb)) = (phase_peak(&a, phase), phase_peak(&b, phase))
+                    else {
+                        continue;
+                    };
+                    let pc = phase_peak(&c, phase).unwrap_or(0);
+                    let lever = if fits(pa) {
+                        "—".to_string()
+                    } else if !fits(pb) {
+                        "NONE".to_string()
+                    } else if !matches!(phase, IosPhase::Conditioning | IosPhase::Denoise) {
+                        "deferred load (a/b skeletons)".to_string()
+                    } else {
+                        let single: Vec<&str> = alone
+                            .iter()
+                            .filter(|(_, p)| phase_peak(p, phase).is_some_and(fits))
+                            .map(|(name, _)| *name)
+                            .collect();
+                        if single.is_empty() {
+                            "a+b+c".to_string()
+                        } else {
+                            single.join(" or ")
+                        }
+                    };
+                    let bp = b.phase(phase).unwrap();
+                    if !fits(pb) {
+                        refused_after.push(format!("{} {label} {edge} {phase:?}", route.name));
+                    }
+                    println!(
+                        "| {} | {label} | {edge} | {} | {} ({}) | {} | {} ({}) | {} {} | {} | {lever} | {} ({}) | {} |",
+                        route.name,
+                        phase.as_key(),
+                        mib(pa + mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES),
+                        mib(a.phase(phase).unwrap().resident_bytes),
+                        mark(pa),
+                        mib(pb + mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES),
+                        mib(bp.resident_bytes),
+                        bp.binding,
+                        mib(bp.scratch_bytes),
+                        mark(pb),
+                        mib(pc + mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES),
+                        mib(c.phase(phase).map_or(0, |p| p.resident_bytes)),
+                        mark(pc),
+                    );
+                }
             }
         }
-        // Restoration: the upscaler export; edge = the OUTPUT edge at the default 4x.
-        let rb = restore.resident(tier) + conditioning;
-        for edge in [512u64, 768, 1024] {
-            let source = Dims::new((edge / 4) as u32, (edge / 4) as u32);
-            let p = plan(
-                source,
-                &RestorationOptions {
-                    scale: 4.0,
-                    ..Default::default()
-                },
-                TileGeometry::RELEASE,
-                crate::restoration::MODEL_ID,
-            )
-            .unwrap();
-            let (th, tw) = if p.single_pass() {
-                (p.padded.height as u64, p.padded.width as u64)
-            } else {
-                (p.tile as u64, p.tile as u64)
-            };
-            let (forward, what) = restore.forward_peak(1, th, tw, tier);
-            let host = crate::restoration::host_plane_bytes(&p);
-            row(
-                "iris_3b_restore",
-                label,
-                edge,
-                "tile",
-                rb + host.tile_phase,
-                forward + crate::restoration::tile_scratch(3 * th * tw),
-                what,
-            );
-            row(
-                "iris_3b_restore",
-                label,
-                edge,
-                "post-tile",
-                rb + host.live_at_last_tile,
-                host.post_tile_new(),
-                "host planes",
-            );
-        }
-        // Depth: the depth export at the request's model resolution.
-        let db = depth.resident(tier) + conditioning;
-        for edge in [512u64, 768, 1024] {
-            let (forward, what) = depth.forward_peak(1, edge, edge, tier);
-            let input = crate::depth::depth_input_scratch(1, edge as i32, edge as i32);
-            let reducer = crate::depth::depth_reducer_bytes(3 * edge * edge, 3, CW);
-            row(
-                "iris_3b_depth",
-                label,
-                edge,
-                "forward",
-                db,
-                forward.max(input).max(reducer),
-                what,
-            );
-        }
     }
+    println!(
+        "\nfully optimized (B) cells refused: {}",
+        if refused_after.is_empty() {
+            "none".to_string()
+        } else {
+            refused_after.join(", ")
+        }
+    );
 }

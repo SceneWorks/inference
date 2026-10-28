@@ -2132,6 +2132,7 @@ mod tests {
     fn downstream_context(contract: &MemoryProviderContract, mode: &str) -> MemoryRunContext {
         let calibration = contract.calibration.clone().unwrap();
         MemoryRunContext {
+            reference_resources: None,
             selection: gen_core::MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: Default::default(),

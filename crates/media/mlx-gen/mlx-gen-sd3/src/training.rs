@@ -954,8 +954,13 @@ fn resolve_target_paths(transformer: &Sd3Transformer, cfg: &TrainingConfig) -> V
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = image::open(path)
-        .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_result!(
+        image::open(path),
+        "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs::decode_image/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Ok(Image {
@@ -1796,6 +1801,7 @@ mod tests {
     /// and all-zero adapter grads on both paths; a half map lands strictly between and agrees across
     /// paths.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         use mlx_gen::train::loss::subject_mask_weight;
         let arch = crate::config::Sd3Arch {
@@ -1918,6 +1924,8 @@ mod tests {
             (dense - ckpt).abs() < 1e-4,
             "dense {dense} vs checkpoint {ckpt}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 }
 
@@ -2136,6 +2144,8 @@ mod real_weight_repro {
             max_rel < 1e-3,
             "checkpointed grads must match dense: max rel {max_rel:.2e}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::real_weight_repro::checkpointed_grads_match_dense");
     }
 
     /// END-TO-END TRAINING SMOKE + ROUND-TRIP (the T2 acceptance proof): train a tiny LoRA (few steps,
@@ -2288,6 +2298,10 @@ mod real_weight_repro {
         assert!(
             var > 1.0,
             "render has real variance (not a flat/degenerate frame)"
+        );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::real_weight_repro::training_smoke_round_trip"
         );
     }
 
@@ -2462,6 +2476,8 @@ mod real_weight_repro {
             var > 1.0,
             "render has real variance (not a flat/degenerate frame)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::real_weight_repro::medium_training_smoke_round_trip");
     }
 }
 
@@ -2662,6 +2678,7 @@ mod depth_anchoring_tests {
     /// alone (no diffusion term, total == aux, non-zero finite LoRA-B grad); a diffusion step has no
     /// depth term. Mutation: force `diffusion_on = true` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_depth_only() {
         for ckpt in [false, true] {
             let cfg = cfg();
@@ -2687,6 +2704,8 @@ mod depth_anchoring_tests {
             let gb = lora_b_sum(&g);
             assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B |Σ| = {gb}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only");
     }
 
     /// The aux step trains at `t` remapped into the window `[0.6, 0.8]` — equal to a direct
@@ -2694,6 +2713,7 @@ mod depth_anchoring_tests {
     /// explicitly recovered `x_t − t·v`. Mutations: keep the sampled `t` ⇒ red; recover with the
     /// opposite flow sign ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn aux_step_trains_at_the_remapped_noise_level() {
         let mut cfg = cfg();
         let window = AuxLossSchedule {
@@ -2780,6 +2800,8 @@ mod depth_anchoring_tests {
             (want - got).abs() <= 1e-5 * want.abs().max(1.0),
             "{want} vs {got}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::aux_step_trains_at_the_remapped_noise_level");
     }
 
     /// Interleaved alternation (N = 2, two buckets: never two depth steps in a row, every image
@@ -2789,6 +2811,7 @@ mod depth_anchoring_tests {
     /// `AuxDriver::prepare_keyed`) ⇒ a depth run ⇒ red; pass the item as the `AuxStep` entry ⇒ a
     /// bucket-1 depth step compares against bucket 0's reference ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn alternation_interleaves_with_per_entry_references() {
         let cfg = cfg();
         let mut f = fixture(&cfg);
@@ -2843,12 +2866,15 @@ mod depth_anchoring_tests {
         }
         assert!(depth_on_bucket1, "{kinds:?}");
         assert_eq!(d.path().reference_computations(), cache.len());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::alternation_interleaves_with_per_entry_references");
     }
 
     /// E1: depth off ⇒ nothing loaded, no footprint, and the step is bit-identical to the
     /// pre-epic-2123 closure (reproduced verbatim); a diffusion-only step of an enabled path is
     /// bit-identical too. Mutation: flip MAE/MSE in the diffusion term ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn everything_off_is_bit_identical_to_the_legacy_step() {
         assert!(load_perceptual_path(&TrainingConfig::default())
             .unwrap()
@@ -2921,6 +2947,8 @@ mod depth_anchoring_tests {
         for (k, v) in &g_none1 {
             assert_eq!(bits(v), bits(&g_on1[k]), "{k}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::everything_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// E7: the estimate grows by TAESD3 + DA2 (more for Large); the guard refuses at a synthetic
@@ -2965,6 +2993,7 @@ mod depth_anchoring_tests {
     /// odd (diffusion) steps forever; the period-drifting window key gives each image both kinds
     /// within 3 periods (6 steps). Mutation: drop the period drift ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn round_robin_images_each_get_depth_steps() {
         let cfg = cfg();
         let mut f = fixture(&cfg);
@@ -2988,6 +3017,8 @@ mod depth_anchoring_tests {
             let mine: Vec<bool> = kinds.iter().filter(|k| k.0 == image).map(|k| k.1).collect();
             assert!(mine.contains(&true) && mine.contains(&false), "{kinds:?}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::round_robin_images_each_get_depth_steps");
     }
 
     /// E3: both SD3.5 descriptors declare depth anchoring.

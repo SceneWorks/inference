@@ -409,6 +409,7 @@ fn a_turbo_tier_differs_from_the_base_tier_only_where_the_snapshots_do() {
 /// and renders through the generator contract, over the snapshot's saved sigmas, under both
 /// residency policies. The loaded contract prices the bf16 VAE the loader holds, under the Turbo
 /// id's own calibration identity.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn turbo_tiers_load_and_render_under_the_turbo_id() {
     let tmp = tempfile::tempdir().unwrap();
@@ -495,6 +496,8 @@ fn turbo_tiers_load_and_render_under_the_turbo_id() {
         mean_by_tier[1],
         mean_by_tier[0]
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo_tiers::turbo_tiers_load_and_render_under_the_turbo_id");
 }
 
 // ── refusals ─────────────────────────────────────────────────────────────────────────────────────

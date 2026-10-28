@@ -107,6 +107,9 @@ fn split_components() -> Option<(PathBuf, Option<tempfile::TempDir>)> {
         Some(d) => d,
         None => {
             eprintln!("skip: set LTX25_VAE_DIR to a directory holding {DIFF_VAE}");
+            crate::model_inference_device::record_model_inference_prerequisite_missing(
+                "required work unavailable in split_components; see preceding skip diagnostic",
+            );
             return None;
         }
     };
@@ -241,6 +244,8 @@ fn the_timestep_embedder_and_shared_adaln_match_the_reference() {
         err < BLOCK_TOL * max_abs(&adaln).max(1.0),
         "shared AdaLN max|delta| = {err:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::the_timestep_embedder_and_shared_adaln_match_the_reference");
 }
 
 #[test]
@@ -263,6 +268,8 @@ fn one_deterministic_na_block_matches_the_reference() {
         err < BLOCK_TOL,
         "deterministic NA block max|delta| = {err:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::one_deterministic_na_block_matches_the_reference");
 }
 
 #[test]
@@ -294,6 +301,8 @@ fn one_diffusion_block_matches_the_reference() {
         without > 20.0 * err,
         "zeroing the context barely moved the output ({without:.3e} vs {err:.3e})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::one_diffusion_block_matches_the_reference");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -374,6 +383,8 @@ fn the_full_decode_matches_the_reference() {
         moved > 50.0 * err,
         "negating the latent barely moved the picture ({moved:.3e} vs {err:.3e})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::the_full_decode_matches_the_reference");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -389,11 +400,13 @@ fn the_conv_vae_decode_matches_the_v1_2_0_reference() {
     // a latent and reference pixels, so `candle-gen-ltx` (sc-18767) asserts against the same file.
     let Some(src) = vae_dir() else {
         eprintln!("skip: set LTX25_VAE_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in the_conv_vae_decode_matches_the_v1_2_0_reference; see preceding skip diagnostic");
         return;
     };
     let conv = src.join(CONV_VAE);
     if !conv.is_file() {
         eprintln!("skip: {} not cached", conv.display());
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in the_conv_vae_decode_matches_the_v1_2_0_reference; see preceding skip diagnostic");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -421,6 +434,8 @@ fn the_conv_vae_decode_matches_the_v1_2_0_reference() {
         max_abs(&to_f32(want))
     );
     assert!(err < BLOCK_TOL, "conv VAE decode max|delta| = {err:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::the_conv_vae_decode_matches_the_v1_2_0_reference");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -539,6 +554,8 @@ fn tiled_decode_keeps_its_seams_and_its_temporal_continuity() {
         (tiled_mean - untiled_mean).abs() < 0.01,
         "the blend changed the picture's mean level"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::tiled_decode_keeps_its_seams_and_its_temporal_continuity");
 }
 
 #[test]
@@ -748,4 +765,6 @@ fn peak_memory_and_quality_at_production_geometries() {
         drop(latent);
         clear_cache();
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_diffvae_parity::peak_memory_and_quality_at_production_geometries");
 }

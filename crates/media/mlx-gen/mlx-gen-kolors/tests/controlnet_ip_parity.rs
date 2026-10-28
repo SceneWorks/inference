@@ -198,4 +198,6 @@ fn kolors_controlnet_ip_scale0_matches_img2img_and_renders() {
         "✓ Kolors combined ControlNet-pose + IP-Adapter img2img: scale-0 == img2img (wiring clean), \
          scales>0 perturb + render coherently"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED controlnet_ip_parity::kolors_controlnet_ip_scale0_matches_img2img_and_renders");
 }

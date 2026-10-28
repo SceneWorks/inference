@@ -151,7 +151,7 @@ use crate::pipeline::{
     align_frames_for_duration, fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents,
     prepend_condition_rows, render_latents_with_observer, resolve_geometry,
     revert_pixel_normalization, t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE,
-    PATCH_SIZE, SPATIAL_STRIDE,
+    SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
@@ -303,6 +303,11 @@ fn requested_tier(spec: &LoadSpec) -> candle_gen::gen_core::Result<Option<crate:
              distinct tier with different numerics (E2M1 elements over FP8 block scales), and \
              because it also reports 4 bits it would otherwise reconcile silently against a `q4` \
              marker and render int4-affine under an NVFP4 request. Request `Q4` or `Q8`."
+        ))),
+        Some(q @ Quant::Fp8Rowwise) => Err(candle_gen::gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: spec.quantize={q:?} is not a published MiniMax-H3 tier. This family ships \
+             MLX affine `q4` and `q8` only; FP8 rowwise is a distinct W8A8 format, never an alias \
+             of `q8`. Request `Q4` or `Q8`."
         ))),
     }
 }
@@ -773,6 +778,23 @@ impl MiniMaxH3 {
         }
     }
 
+    /// Read only the selected partition's JSON header, before any conditioner/VAE weights.
+    /// The resolved tier/sibling directory is the same one the eventual DiT loader uses.
+    pub(crate) fn task_dit_config(
+        &self,
+        task: MiniMaxH3Task,
+    ) -> Result<crate::dit::MiniMaxH3DitConfig> {
+        let path = self.partition_dir(task.partition())?.join("config.json");
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CandleError::Msg(format!("{MODEL_ID}: no task config for selected partition `{}` at {}; reimport with its config or select a partition that provides one", task.partition(), path.display()))
+            } else {
+                CandleError::Msg(format!("{MODEL_ID}: cannot read task config for selected partition `{}` at {}: {e}; verify the source and permissions", task.partition(), path.display()))
+            }
+        })?;
+        crate::dit::MiniMaxH3DitConfig::from_diffusers_json(&text)
+    }
+
     /// **The single render seam that maps a DiT partition and folds the staged adapters onto it**
     /// (sc-18728).
     ///
@@ -944,6 +966,7 @@ impl MiniMaxH3 {
         // is the only thing standing between a `ref2va` request and a plausible render off the
         // wrong 66 GB. See [`MiniMaxH3Task`] and `tests/ref2va_checkpoint.rs`.
         let (task, references) = self.resolve_task(req)?;
+        let patch = self.task_dit_config(task)?.patch_size;
         if let Some(refs) = &references {
             return self.generate_ref2va(req, refs, task, &geometry, &schedule, seed, on_progress);
         }
@@ -986,7 +1009,7 @@ impl MiniMaxH3 {
                 &vae,
                 &pixels,
                 &anchors,
-                PATCH_SIZE,
+                patch,
                 &crate::conditioning::KeyframeNoise::Seeded,
                 &self.device,
             )?;
@@ -1004,7 +1027,7 @@ impl MiniMaxH3 {
         // `transformer`. A bare `MiniMaxH3Dit::load` here would render a reference job with the
         // adapter silently dropped.
         let dit = self.load_task_dit(task.partition())?;
-        let patch = dit.config().patch_size;
+        debug_assert_eq!(patch, dit.config().patch_size);
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.dims()[1], patch, &self.device)?
         } else {
@@ -1142,8 +1165,8 @@ impl MiniMaxH3 {
         };
         use crate::dit::positions::ReferenceLatentGeometry;
         use crate::pipeline::{
-            audio_track_to_encoder_input, prepend_condition_audio_rows, ref2va_layout,
-            CANVAS_MAX_PIXELS,
+            audio_track_to_encoder_input, prepend_condition_audio_rows,
+            ref2va_layout_with_audio_channels, CANVAS_MAX_PIXELS,
         };
 
         // **The task is the caller's resolved one, and it must be the reference task.** The
@@ -1158,6 +1181,8 @@ impl MiniMaxH3 {
                 task.partition()
             )));
         }
+
+        let patch = self.task_dit_config(task)?.patch_size;
 
         // --- 0. normalize every reference onto the model's own rates and resolutions ------------
         // References do NOT bind the canvas: the geometry was already resolved (16:9 by default)
@@ -1224,6 +1249,7 @@ impl MiniMaxH3 {
         let mut condition_rows: Vec<candle_gen::candle_core::Tensor> = Vec::new();
         let mut audio_rows_per_ref: Vec<candle_gen::candle_core::Tensor> = Vec::new();
         let mut geometries: Vec<ReferenceLatentGeometry> = Vec::new();
+        let mut reference_audio_channels = Vec::new();
         {
             let vae = MiniMaxH3VideoVae::load(&self.root, &self.device, self.dtype)?;
             let audio_enc = self.load_audio_encoder()?;
@@ -1236,10 +1262,12 @@ impl MiniMaxH3 {
                     let normed = audio_enc.normalize(posterior.mode())?;
                     // `[B, latent_channels, latents]` -> `[channels, latents, features]`.
                     let t = normed.permute((0, 2, 1))?.contiguous()?;
+                    reference_audio_channels.push(t.dims()[0]);
                     let latents = t.dims()[1];
                     audio_rows_per_ref.push(reference_audio_rows(&t)?);
                     latents
                 } else {
+                    reference_audio_channels.push(0);
                     0
                 };
 
@@ -1258,7 +1286,7 @@ impl MiniMaxH3 {
                         let s = c.dims().to_vec();
                         condition_rows.push(keyframe_condition_rows(
                             &c,
-                            PATCH_SIZE,
+                            patch,
                             &KeyframeNoise::Seeded,
                             i,
                             &self.device,
@@ -1301,7 +1329,7 @@ impl MiniMaxH3 {
                         let s = c.dims().to_vec();
                         condition_rows.push(keyframe_condition_rows(
                             &c,
-                            PATCH_SIZE,
+                            patch,
                             &KeyframeNoise::Seeded,
                             i,
                             &self.device,
@@ -1342,8 +1370,15 @@ impl MiniMaxH3 {
         // caller's staged LoRA silently dropped, `Ok` and with no error. `tests/turbo_lora.rs`
         // covers the seam; the staging table below tracks this anchor.
         let dit = self.load_task_dit(task.partition())?;
-        let patch = dit.config().patch_size;
-        let layout = ref2va_layout(geometry, &text_tags, &geometries, patch, &self.device)?;
+        debug_assert_eq!(patch, dit.config().patch_size);
+        let layout = ref2va_layout_with_audio_channels(
+            geometry,
+            &text_tags,
+            &geometries,
+            &reference_audio_channels,
+            patch,
+            &self.device,
+        )?;
         let (video_rows, audio_rows) = initial_latents(geometry, patch, seed, &self.device)?;
         let video_rows = prepend_condition_rows(&layout, condition_video.as_ref(), &video_rows)?;
         let audio_rows =
@@ -1626,10 +1661,19 @@ impl MiniMaxH3 {
                 ))
             })
         };
-        crate::audio_config::MiniMaxH3AudioVaeConfig::from_source_files(
-            &read("config.json")?,
-            &read("config.yaml")?,
-            &read("metadata.json")?,
+        candle_gen::gen_core::__model_input_result!(
+            crate::audio_config::MiniMaxH3AudioVaeConfig::from_source_files(
+                &read("config.json")?,
+                &read("config.yaml")?,
+                &read("metadata.json")?,
+            ),
+            "candle-gen-minimax-h3::model::MiniMaxH3::audio_vae_config/configuration",
+            Configuration,
+            &[
+                src.join("config.json"),
+                src.join("config.yaml"),
+                src.join("metadata.json")
+            ]
         )
     }
 }
@@ -1912,7 +1956,7 @@ impl Generator for MiniMaxH3 {
         req: candle_gen::gen_core::veda::workspace::Request<'_>,
     ) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::veda::workspace::WorkspaceBound>>
     {
-        crate::memory_strategy::veda_workspace_bound(req)
+        crate::memory_strategy::veda_workspace_bound_for_contract(req, &self.contract)
     }
 
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
@@ -2074,6 +2118,112 @@ candle_gen::register_generators! {
 
 #[cfg(test)]
 mod tests {
+    use crate::pipeline::PATCH_SIZE;
+    /// Complements the real header/packing math tests: a stock literal at the render call site
+    /// must not survive merely because a helper can express the selected geometry.
+    #[test]
+    fn render_wires_selected_patch_and_actual_reference_channels_before_conditioning() {
+        let src = include_str!("model.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .unwrap();
+        assert!(
+            !src.contains("PATCH_SIZE"),
+            "render conditioning cannot use the stock patch constant"
+        );
+        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            compact
+                .matches("letpatch=self.task_dit_config(task)?.patch_size;")
+                .count(),
+            2
+        );
+        assert_eq!(
+            compact.matches("keyframe_condition_rows(&c,patch,").count(),
+            2
+        );
+        assert!(compact.contains("build_condition_rows(&vae,&pixels,&anchors,patch,"));
+        assert!(compact.contains("reference_audio_channels.push(t.dims()[0]);"));
+        assert!(compact.contains("ref2va_layout_with_audio_channels(geometry,&text_tags,&geometries,&reference_audio_channels,patch"));
+    }
+
+    #[test]
+    fn selected_task_patch_header_is_resolved_without_tensor_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("tier/transformer");
+        let reference = base.with_file_name("transformer_ref");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&reference).unwrap();
+        let root = staged_root_with_reference(&tmp);
+        let mut model = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+        model.tiers.dit_dir = base.clone();
+        model.tiers.reference_dit_dir = reference.clone();
+        let stock = r#"{"num_attention_heads":56,"attention_head_dim":128,"hidden_size":5376,"num_layers":50,"num_refiner_layers":2,"ffn_dim":14336,"in_channels":24,"audio_in_channels":32,"patch_size":[1,2,2],"text_dim":5120,"freq_dim":256,"time_embed_hidden_dim":5376,"time_embed_dim":2688,"rope_freq_dim":16,"rope_theta":10000.0,"norm_eps":0.00001,"qk_norm_eps":0.00001,"final_norm_eps":0.00001}"#;
+        std::fs::write(base.join("config.json"), stock).unwrap();
+        std::fs::write(
+            reference.join("config.json"),
+            stock.replace("[1,2,2]", "[1,1,1]"),
+        )
+        .unwrap();
+        // These selected tier directories have no shards: any accidental DiT load fails.
+        assert_eq!(
+            model
+                .task_dit_config(MiniMaxH3Task::T2va)
+                .unwrap()
+                .patch_size,
+            [1, 2, 2]
+        );
+        assert_eq!(
+            model
+                .task_dit_config(MiniMaxH3Task::Fl2va)
+                .unwrap()
+                .patch_size,
+            [1, 2, 2]
+        );
+        assert_eq!(
+            model
+                .task_dit_config(MiniMaxH3Task::Ref2va)
+                .unwrap()
+                .patch_size,
+            [1, 1, 1]
+        );
+        std::fs::write(
+            base.join("config.json"),
+            stock.replace("[1,2,2]", "[1,1,1]"),
+        )
+        .unwrap();
+        assert_eq!(
+            model
+                .task_dit_config(MiniMaxH3Task::Fl2va)
+                .unwrap()
+                .patch_size,
+            [1, 1, 1]
+        );
+        std::fs::remove_file(base.join("config.json")).unwrap();
+        let error = model
+            .task_dit_config(MiniMaxH3Task::T2va)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no task config")
+                && error.contains("transformer")
+                && error.contains("reimport")
+                && error.contains("select a partition"),
+            "{error}"
+        );
+        assert!(
+            error.contains(base.join("config.json").to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(
+            model
+                .task_dit_config(MiniMaxH3Task::Ref2va)
+                .unwrap()
+                .patch_size,
+            [1, 1, 1]
+        );
+    }
+
     #[test]
     fn sparse_requests_preserve_native_task_tier_and_adapter_staging() {
         use candle_gen::gen_core::{AdapterKind, VedaRequest};

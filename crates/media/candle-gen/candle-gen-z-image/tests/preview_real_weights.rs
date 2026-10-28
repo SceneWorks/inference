@@ -792,6 +792,9 @@ fn z_image_preview_frames_evolve_toward_the_final_image() {
         Some(staged_memory()),
         MIN_R_LAST_BASE,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::z_image_preview_frames_evolve_toward_the_final_image");
 }
 
 /// Exactly one frame per **outer** solver step on a multi-eval solver.
@@ -823,6 +826,9 @@ fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
     );
     // `assert_registered_route_previews_converge` already required exactly `steps` frames numbered
     // 1..=steps, so the dedup collapsed the extra evaluations. Stated here because that is the point.
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::a_multi_eval_solver_emits_one_frame_per_outer_step");
 }
 
 // ── Driving the name-driven providers ─────────────────────────────────────────────────────────────
@@ -948,6 +954,9 @@ fn the_control_routes_preview_their_target_latent() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::the_control_routes_preview_their_target_latent");
 }
 
 /// The img2img / masked-edit provider's bespoke loop, over the **reduced** schedule its strength
@@ -1040,6 +1049,9 @@ fn the_edit_route_previews_its_reduced_schedule() {
         live.height,
         "z_image_edit-final.png",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::the_edit_route_previews_its_reduced_schedule");
 }
 
 // ── The measured per-lane correlation floors ──────────────────────────────────────────────────────

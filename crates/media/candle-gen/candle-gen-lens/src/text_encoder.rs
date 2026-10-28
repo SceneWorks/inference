@@ -294,9 +294,9 @@ impl Attention {
 
     fn forward(&self, xs: &Tensor, rotary: &RotaryEmbedding, mask: &Tensor) -> Result<Tensor> {
         let (b, seq_len, _) = xs.dims3()?;
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
+        let q = __model_proof_output!(self.q_proj.forward(xs))?;
+        let k = __model_proof_output!(self.k_proj.forward(xs))?;
+        let v = __model_proof_output!(self.v_proj.forward(xs))?;
 
         let q = q
             .reshape((b, seq_len, self.num_heads, self.head_dim))?
@@ -331,7 +331,7 @@ impl Attention {
         let probs = probs.narrow(D::Minus1, 0, n_keys)?; // drop the sink column
         let out = probs.contiguous()?.matmul(&v.contiguous()?)?;
         let out = out.transpose(1, 2)?.reshape((b, seq_len, ()))?;
-        self.o_proj.forward(&out)
+        __model_proof_output!(self.o_proj.forward(&out))
     }
 
     /// Incremental (cached) attention for autoregressive generation (sc-5118): RoPE the `t` new tokens
@@ -351,19 +351,13 @@ impl Attention {
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b, t, _) = xs.dims3()?;
-        let q = self
-            .q_proj
-            .forward(xs)?
+        let q = __model_proof_output!(self.q_proj.forward(xs))?
             .reshape((b, t, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let k = self
-            .k_proj
-            .forward(xs)?
+        let k = __model_proof_output!(self.k_proj.forward(xs))?
             .reshape((b, t, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let v = self
-            .v_proj
-            .forward(xs)?
+        let v = __model_proof_output!(self.v_proj.forward(xs))?
             .reshape((b, t, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
@@ -409,7 +403,7 @@ impl Attention {
                 cache.truncate_last(w)?;
             }
         }
-        self.o_proj.forward(&out)
+        __model_proof_output!(self.o_proj.forward(&out))
     }
 }
 
@@ -800,7 +794,7 @@ impl Module for SparseMoe {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b, seq_len, hidden) = xs.dims3()?;
         let xs = xs.reshape(((), hidden))?;
-        let router_logits = self.router.forward(&xs)?;
+        let router_logits = __model_proof_output!(self.router.forward(&xs))?;
         let routing = softmax_last_dim(&router_logits)?;
         // PERF: full sort to take top-k; replace with a topk when candle exposes one. Note:
         // softmax-over-all then renormalize-over-topk is identical to HF's topk-then-softmax (the
@@ -890,11 +884,11 @@ impl DecoderLayer {
 
     fn forward(&self, xs: &Tensor, rotary: &RotaryEmbedding, mask: &Tensor) -> Result<Tensor> {
         let residual = xs;
-        let h = self.input_layernorm.forward(xs)?;
+        let h = __model_proof_output!(self.input_layernorm.forward(xs))?;
         let h = self.self_attn.forward(&h, rotary, mask)?;
         let xs = (residual + h)?;
         let residual = &xs;
-        let h = self.post_attention_layernorm.forward(&xs)?;
+        let h = __model_proof_output!(self.post_attention_layernorm.forward(&xs))?;
         let h = self.mlp.forward(&h)?;
         residual + h
     }
@@ -912,13 +906,13 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let sliding = self.is_sliding.then_some(self.sliding_window);
         let residual = xs;
-        let h = self.input_layernorm.forward(xs)?;
+        let h = __model_proof_output!(self.input_layernorm.forward(xs))?;
         let h = self
             .self_attn
             .forward_cached(&h, rotary, position, cache, sliding, mask)?;
         let xs = (residual + h)?;
         let residual = &xs;
-        let h = self.post_attention_layernorm.forward(&xs)?;
+        let h = __model_proof_output!(self.post_attention_layernorm.forward(&xs))?;
         let h = self.mlp.forward(&h)?;
         residual + h
     }
@@ -1050,7 +1044,7 @@ impl GptOssTextEncoder {
         cancel: &CancelFlag,
     ) -> candle_gen::Result<EncoderOutput> {
         let (_b, seq_len) = input_ids.dims2()?;
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let mut xs = __model_proof_output!(self.embed_tokens.forward(input_ids))?;
         // Full-causal mask for full-attention layers, sliding-window mask for the alternating sliding
         // layers; selected per layer.
         let full = causal_mask(seq_len, None, &self.device, self.dtype)?;
@@ -1109,7 +1103,7 @@ impl GptOssTextEncoder {
                 )?;
             }
         }
-        let last_hidden_state = self.norm.forward(&xs)?;
+        let last_hidden_state = __model_proof_output!(self.norm.forward(&xs))?;
         Ok(EncoderOutput {
             hidden_states,
             last_hidden_state,
@@ -1233,8 +1227,9 @@ impl LensReasonerModel {
     fn last_logits(&self, hidden: &Tensor) -> Result<Tensor> {
         let t = hidden.dim(1)?;
         let last = hidden.narrow(1, t - 1, 1)?; // [1, 1, hidden]
-        let normed = self.norm.forward(&last)?;
-        self.lm_head.forward(&normed)?.to_dtype(DType::F32) // [1, 1, vocab]
+        let normed = __model_proof_output!(self.norm.forward(&last))?;
+        __model_proof_output!(self.lm_head.forward(&normed))?.to_dtype(DType::F32)
+        // [1, 1, vocab]
     }
 
     /// **Greedy** autoregressive generation (the parity path): prefill `input_ids`, then decode until
@@ -1326,10 +1321,10 @@ impl LensReasonerModel {
         let mut caches: Vec<KvCache> = (0..self.layers.len()).map(|_| KvCache::default()).collect();
         let l = input_ids.len();
         let prompt = Tensor::from_vec(input_ids.to_vec(), (1, l), &self.device)?;
-        let hidden = self.embed_tokens.forward(&prompt)?;
+        let hidden = __model_proof_output!(self.embed_tokens.forward(&prompt))?;
         let hidden = self.run_layers(hidden, &mut caches, 0, true)?;
-        let normed = self.norm.forward(&hidden)?;
-        let logits = self.lm_head.forward(&normed)?.to_dtype(DType::F32)?; // [1, L, vocab]
+        let normed = __model_proof_output!(self.norm.forward(&hidden))?;
+        let logits = __model_proof_output!(self.lm_head.forward(&normed))?.to_dtype(DType::F32)?; // [1, L, vocab]
         let pred = logits.squeeze(0)?.argmax(D::Minus1)?; // [L]
         pred.to_vec1::<u32>()
     }
@@ -1512,6 +1507,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn unscoped_streamable_forward_cannot_return_the_bare_embedding() {
         let encoder = streamable_encoder_without_layer_files();
         let ids = Tensor::from_vec(vec![1u32, 2], (1, 2), &Device::Cpu).unwrap();
@@ -1521,9 +1517,13 @@ mod tests {
             "an unscoped streamable forward must try to materialize its all-covering layer window; \
              returning Ok would expose the bare token embedding as plausible conditioning"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::unscoped_streamable_forward_cannot_return_the_bare_embedding");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn pre_cancelled_streamable_forward_stops_before_opening_a_window() {
         let encoder = streamable_encoder_without_layer_files();
         let ids = Tensor::from_vec(vec![1u32, 2], (1, 2), &Device::Cpu).unwrap();
@@ -1537,6 +1537,9 @@ mod tests {
             matches!(error, candle_gen::CandleError::Canceled),
             "pre-cancel must remain typed and win over the intentionally missing layer file: {error:?}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::pre_cancelled_streamable_forward_stops_before_opening_a_window");
     }
 
     /// A tiny two-layer reasoner (layer 0 sliding with a window the decode crosses, layer 1 full),
@@ -1624,8 +1627,8 @@ mod tests {
         let argmax_token = |hidden: &Tensor| -> Result<u32> {
             let t = hidden.dim(1)?;
             let last = hidden.narrow(1, t - 1, 1)?; // [1, 1, hidden]
-            let normed = m.norm.forward(&last)?;
-            let logits = m.lm_head.forward(&normed)?.to_dtype(DType::F32)?; // [1, 1, vocab]
+            let normed = __model_proof_output!(m.norm.forward(&last))?;
+            let logits = __model_proof_output!(m.lm_head.forward(&normed))?.to_dtype(DType::F32)?; // [1, 1, vocab]
             let id = logits.flatten_all()?.argmax(D::Minus1)?.to_vec0::<u32>()?;
             Ok(id)
         };
@@ -1633,7 +1636,7 @@ mod tests {
         let mut caches: Vec<KvCache> = (0..m.layers.len()).map(|_| KvCache::default()).collect();
         let l = input_ids.len();
         let prompt = Tensor::from_vec(input_ids.to_vec(), (1, l), &m.device)?;
-        let hidden = m.embed_tokens.forward(&prompt)?;
+        let hidden = __model_proof_output!(m.embed_tokens.forward(&prompt))?;
         let hidden = m.run_layers(hidden, &mut caches, 0, true)?;
         let mut next = argmax_token(&hidden)?;
 
@@ -1642,7 +1645,7 @@ mod tests {
         while out.len() < max_new_tokens && next != stop {
             check_reasoner_cancel(cancel)?;
             let tok = Tensor::from_vec(vec![next], (1, 1), &m.device)?;
-            let h = m.embed_tokens.forward(&tok)?;
+            let h = __model_proof_output!(m.embed_tokens.forward(&tok))?;
             let h = m.run_layers(h, &mut caches, position, false)?;
             position += 1;
             next = argmax_token(&h)?;
@@ -1657,6 +1660,7 @@ mod tests {
     /// and a cancel stays typed where the pre-engine loop checked it: before the prefill and
     /// before every token after the first.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn reasoner_engine_decode_matches_the_pre_engine_loop() {
         let m = tiny_reasoner();
         let none = CancelFlag::new();
@@ -1707,6 +1711,9 @@ mod tests {
                 Err(CandleError::Canceled)
             ));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::reasoner_engine_decode_matches_the_pre_engine_loop");
     }
 
     /// Past the prefill check, a cancel set mid-decode is bridged onto the engine's flag: the
@@ -1714,6 +1721,7 @@ mod tests {
     /// typed [`CandleError::Canceled`]; a one-token budget (the pre-engine loop never reached its
     /// in-loop check) still returns its token.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_mid_run_cancel_ends_the_decode_typed() {
         let m = tiny_reasoner();
         let prompt = [3u32, 17, 42, 8];
@@ -1735,6 +1743,9 @@ mod tests {
                 assert_eq!(emitted, cancel_after + 1, "cancelled after that token");
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::a_mid_run_cancel_ends_the_decode_typed");
     }
 
     #[test]
@@ -1842,6 +1853,7 @@ mod tests {
     // exercises the exact GPU path the encoder uses (and would have caught the f32/bf16-activation
     // miscompute on Blackwell).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quant_expert_proj_matches_dense() {
         let dev = candle_gen::default_device().unwrap();
         let (out, inn, n) = (512usize, 256usize, 4usize); // inn ÷ 32 (block size); k like the real model
@@ -1866,6 +1878,11 @@ mod tests {
                 "{ggml:?} expert proj cosine {cos:.5} ≤ {thr} on {dev:?}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::quant_expert_proj_matches_dense"
+        );
     }
 
     // The vectorized `dequant_mxfp4` must give the same result on the default device as the CPU scalar
@@ -1922,6 +1939,7 @@ mod tests {
     // Runs on the default device, so `--features cuda` runs the *same* path on the GPU (catches CUDA-
     // only divergence, e.g. a NaN out of the quantized matmul) in milliseconds, not a 250 s load.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quant_moe_matches_dense() {
         let dev = candle_gen::default_device().unwrap();
         // Tiny config: 4 experts top-2, hidden 64, intermediate 32 (both ÷32 so the contraction tiles).
@@ -1993,6 +2011,9 @@ mod tests {
         );
         let cos = cosine_cpu(&got, &want);
         assert!(cos > 0.99, "Q8 MoE cosine {cos:.5} ≤ 0.99 vs dense");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::quant_moe_matches_dense");
     }
 
     // ---- sc-9457 packed-tier fused experts (`SceneWorks/lens-mlx`) ---------------------------
@@ -2053,6 +2074,7 @@ mod tests {
     /// the residual is only the `forward_via_f16` weight cast). `quant = None` here also proves the packed
     /// load is quant-independent.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_experts_detect_and_grid_parity() {
         use std::collections::HashMap;
         let dev = Device::Cpu;
@@ -2142,6 +2164,9 @@ mod tests {
             cos > 0.999,
             "packed-expert MoE cosine {cos:.5} ≤ 0.999 vs the dense affine grid"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::packed_experts_detect_and_grid_parity");
     }
 
     /// The detect guard (sc-9457): experts that are neither packed affine (`.scales`) nor MXFP4

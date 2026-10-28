@@ -120,7 +120,7 @@ impl Backbone {
         for (c, embed) in self.embeds.iter().enumerate() {
             let ids: Vec<u32> = frames.iter().map(|f| f[c]).collect();
             let ids_t = Tensor::from_vec(ids, (1, t), &self.device)?;
-            let e = embed.forward(&ids_t)?;
+            let e = __model_proof_output!(embed.forward(&ids_t))?;
             sum = Some(match sum {
                 Some(s) => (s + e)?,
                 None => e,
@@ -142,7 +142,7 @@ impl Backbone {
         for layer in &self.layers {
             h = layer.forward(&h, &cos, &sin, mask.as_ref())?;
         }
-        self.norm.forward(&h)
+        __model_proof_output!(self.norm.forward(&h))
     }
 
     /// Full-sequence forward, returning only the **last** position's hidden state `[1, 1, H]` — the
@@ -196,7 +196,7 @@ impl Backbone {
             h = layer.forward_cached(&h, &cos, &sin, mask.as_ref(), slot, t)?;
         }
         cache.offset += t;
-        let h = self.norm.forward(&h)?;
+        let h = __model_proof_output!(self.norm.forward(&h))?;
         let last = h.dim(1)?;
         h.i((.., last - 1..last, ..))?.contiguous()
     }
@@ -283,6 +283,7 @@ pub(crate) mod tests {
     /// The KV-cache path (prefill + steps) is numerically equivalent to the stateless full-sequence
     /// recompute at every AR position (sc-13417) — modulo float accumulation order.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn kv_cache_matches_full_recompute() {
         const TOL: f32 = 1e-4;
         let assert_close = |a: &Tensor, b: &Tensor, ctx: &str| {
@@ -326,11 +327,17 @@ pub(crate) mod tests {
             assert_close(&cached, &recompute, &format!("step {i}"));
             assert_eq!(cache.offset(), all.len());
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED backbone::tests::kv_cache_matches_full_recompute"
+        );
     }
 
     /// The tied per-channel heads have the right width (channel 0 = text vocab, audio channels =
     /// codebook vocab) and produce finite logits.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn channel_logits_have_per_channel_widths() {
         let cfg = tiny_cfg();
         let bb = tiny_backbone(&cfg);
@@ -353,5 +360,8 @@ pub(crate) mod tests {
             );
         }
         assert!(logits.iter().all(|row| row.iter().all(|v| v.is_finite())));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED backbone::tests::channel_logits_have_per_channel_widths");
     }
 }

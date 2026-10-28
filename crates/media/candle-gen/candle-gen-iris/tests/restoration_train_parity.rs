@@ -98,6 +98,7 @@ fn grad_of(x: &Tensor, f: impl Fn(&Tensor) -> Tensor) -> (f32, Vec<f32>) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lpips_vgg_matches_the_lpips_package() {
     let g = golden();
     let net = Lpips::formula(VGG16_WIDTHS, &Device::Cpu).unwrap();
@@ -116,9 +117,13 @@ fn lpips_vgg_matches_the_lpips_package() {
         &host_f32(g.require("lpips/grad_in0")),
         FWD,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_parity::lpips_vgg_matches_the_lpips_package");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn critic_trunk_features_match_hypirs_visual_forward() {
     let g = golden();
     let critic = mini_critic(&g);
@@ -137,9 +142,13 @@ fn critic_trunk_features_match_hypirs_visual_forward() {
         &host_f32(g.require("critic/feat3")),
         FWD,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_parity::critic_trunk_features_match_hypirs_visual_forward");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_generator_term_and_its_gradient_match() {
     let g = golden();
     let critic = mini_critic(&g);
@@ -175,9 +184,13 @@ fn the_generator_term_and_its_gradient_match() {
         &host_f32(g.require("critic/g_grad_x")),
         FWD,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_parity::the_generator_term_and_its_gradient_match");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_critic_step_matches_power_iterations_losses_grads_and_adamw() {
     let g = golden();
     let critic = mini_critic(&g);
@@ -273,9 +286,13 @@ fn the_critic_step_matches_power_iterations_losses_grads_and_adamw() {
             SCALAR,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_parity::the_critic_step_matches_power_iterations_losses_grads_and_adamw");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_generator_loss_terms_and_gradients_match_optimize_generator() {
     let g = golden();
     let critic = mini_critic(&g);
@@ -327,4 +344,7 @@ fn the_generator_loss_terms_and_gradients_match_optimize_generator() {
         &host_f32(g.require("gloss/grad_total")),
         1.5e-2,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_parity::the_generator_loss_terms_and_gradients_match_optimize_generator");
 }

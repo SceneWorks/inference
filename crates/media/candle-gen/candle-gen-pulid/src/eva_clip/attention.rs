@@ -65,9 +65,9 @@ impl Attention {
         let (h, hd) = (self.num_heads, self.head_dim);
 
         // subln projections: q/v biased, k unbiased.
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = __model_proof_output!(self.q_proj.forward(x))?;
+        let k = __model_proof_output!(self.k_proj.forward(x))?;
+        let v = __model_proof_output!(self.v_proj.forward(x))?;
 
         // [B, N, C] → [B, heads, N, hd]
         let to_heads = |t: &Tensor| -> candle_core::Result<Tensor> {
@@ -86,8 +86,8 @@ impl Attention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, n, h * hd))?;
-        let out = self.inner_ln.forward(&out)?;
-        self.proj.forward(&out)
+        let out = __model_proof_output!(self.inner_ln.forward(&out))?;
+        __model_proof_output!(self.proj.forward(&out))
     }
 
     /// Apply RoPE to `x[:, :, 1:, :]` (patch tokens) only; the CLS token at index 0 is untouched.

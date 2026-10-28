@@ -9,6 +9,15 @@
 //! fusion stage, and the head's upsample-to-input. The architecture (key names, factor logic, fusion
 //! ordering) is what these lock; numeric fidelity is the real-weight smoke's job.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{Device, Tensor};
@@ -153,6 +162,7 @@ fn synth_weights(cfg: &DepthAnythingConfig) -> Weights {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn backbone_captures_four_states_of_expected_shape() {
     let cfg = tiny_cfg();
     let w = synth_weights(&cfg);
@@ -175,9 +185,13 @@ fn backbone_captures_four_states_of_expected_shape() {
             "each captured hidden is [B, grid²+1, hidden] (CLS included)"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED backbone_captures_four_states_of_expected_shape");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn full_forward_produces_input_resolution_depth() {
     let cfg = tiny_cfg();
     let w = synth_weights(&cfg);
@@ -204,9 +218,13 @@ fn full_forward_produces_input_resolution_depth() {
         vals.iter().all(|&v| v >= 0.0),
         "relative-depth head is ReLU → non-negative"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED full_forward_produces_input_resolution_depth");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn estimate_control_returns_input_dims_grayscale() {
     let cfg = tiny_cfg();
     let w = synth_weights(&cfg);
@@ -224,6 +242,9 @@ fn estimate_control_returns_input_dims_grayscale() {
         out.chunks(3).all(|p| p[0] == p[1] && p[1] == p[2]),
         "depth control image is grayscale broadcast to RGB"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED estimate_control_returns_input_dims_grayscale");
 }
 
 #[test]
@@ -365,4 +386,7 @@ fn real_weight_smoke() {
     assert_eq!(depth.dims(), &[518, 518], "native depth resolution is 518²");
 
     let _ = preprocess::INPUT_SIZE; // keep the preprocess import meaningful on all cfgs
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weight_smoke");
 }

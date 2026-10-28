@@ -212,6 +212,7 @@ fn the_visitor_names_every_projection_once_in_the_mlx_dotted_spelling() {
 /// A dense LoRA moves the velocity; stacking a second adapter at its own weight moves it again;
 /// a PEFT LoKr moves it too.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lora_and_lokr_install_on_the_dense_dit_and_stack() {
     let temp = tempfile::tempdir().unwrap();
     let base = velocity(&dense_dit());
@@ -264,11 +265,15 @@ fn lora_and_lokr_install_on_the_dense_dit_and_stack() {
     .unwrap();
     assert_eq!(report.residuals, 1);
     assert!(max_abs_diff(&base, &velocity(&kron)) > 1e-4);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::lora_and_lokr_install_on_the_dense_dit_and_stack");
 }
 
 /// On the packed q8 and q4 DiTs a LoRA rides as a residual over the still-packed projection, and a
 /// PEFT LoKr does too.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lora_and_lokr_install_as_residuals_over_packed_projections() {
     for tier in [Tier::Q8, Tier::Q4] {
         let temp = tempfile::tempdir().unwrap();
@@ -307,10 +312,14 @@ fn lora_and_lokr_install_as_residuals_over_packed_projections() {
         assert_eq!(report.residuals, 1);
         assert!(max_abs_diff(&base, &velocity(&kron)) > 1e-4, "{tier:?}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::lora_and_lokr_install_as_residuals_over_packed_projections");
 }
 
 /// A LoHa folds into the dense bf16-tier weights and moves the output.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn loha_folds_into_the_dense_dit() {
     let temp = tempfile::tempdir().unwrap();
     let base = velocity(&dense_dit());
@@ -333,6 +342,9 @@ fn loha_folds_into_the_dense_dit() {
     })
     .unwrap();
     assert!(max_abs_diff(&base, &velocity(&dit)) > 1e-4);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::loha_folds_into_the_dense_dit");
 }
 
 /// A LoHa on a packed tier is a typed `Unsupported` naming LoHa and the tier — at preflight and at
@@ -473,6 +485,7 @@ fn refusal<T: std::fmt::Debug>(result: candle_gen::Result<T>) -> String {
 /// factors over the `[out=32, in=64]` `img_mlp.out`) is refused — at install, by the provider's own
 /// orientation check, and at the header-only preflight — never folded as scrambled weights.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_transposed_loha_is_refused() {
     let temp = tempfile::tempdir().unwrap();
     let adapter = temp.path().join("transposed.safetensors");
@@ -506,12 +519,16 @@ fn a_transposed_loha_is_refused() {
         error.contains("transformer_blocks.1.img_mlp.out") && error.contains("not oriented"),
         "{error}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::a_transposed_loha_is_refused");
 }
 
 /// Two raw keys that normalize to one module (`transformer.X` beside `X`) are refused rather than
 /// one silently winning, and two spellings of one projection (`X` beside `lora_unet_X`) are
 /// refused rather than folded twice — at install and at preflight.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn duplicate_spellings_of_one_projection_are_refused() {
     let temp = tempfile::tempdir().unwrap();
     let namespaced = temp.path().join("namespaced.safetensors");
@@ -592,6 +609,9 @@ fn duplicate_spellings_of_one_projection_are_refused() {
         Tier::Bf16,
     ));
     assert!(error.contains("name the same module"), "{error}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::duplicate_spellings_of_one_projection_are_refused");
 }
 
 /// The header-only preflight refuses what install would — an unmatched LoRA target, a mis-shaped
@@ -660,6 +680,7 @@ fn preflight_key_matches_and_shape_checks_from_headers() {
 /// `load` admits an adapter stack now (the old blanket refusal is gone) and renders with it; a
 /// zero-match adapter fails the load.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn load_wires_adapters_through_the_generator() {
     let temp = tempfile::tempdir().unwrap();
     let adapter = temp.path().join("load.safetensors");
@@ -684,6 +705,11 @@ fn load_wires_adapters_through_the_generator() {
     let spec =
         LoadSpec::new(WeightsSource::Dir(tiny_snapshot())).with_adapters(vec![lora(&missing, 1.0)]);
     assert!(candle_gen_qwen_image_2_1::load(&spec).is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED adapters::load_wires_adapters_through_the_generator"
+    );
 }
 
 /// Under `Sequential` the DiT — and so the adapter install — is deferred to the first render, so
@@ -871,6 +897,7 @@ const KOHYA_HARD_TARGETS: [&str; 8] = [
 /// underscore-ambiguous leaves — passes the header-only preflight, and lands on exactly the
 /// projections it names (never a neighbour a blind `_` → `.` split would pick).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_lora_spelling_applies_to_exactly_its_projections_on_the_dense_dit() {
     let temp = tempfile::tempdir().unwrap();
     let shapes = projection_shapes();
@@ -906,10 +933,14 @@ fn every_lora_spelling_applies_to_exactly_its_projections_on_the_dense_dit() {
             spelling.name
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::every_lora_spelling_applies_to_exactly_its_projections_on_the_dense_dit");
 }
 
 /// The same spellings ride as residuals over the packed q8 / q4 projection, which stays packed.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_lora_spelling_applies_over_a_packed_projection() {
     let shapes = projection_shapes();
     for tier in [Tier::Q8, Tier::Q4] {
@@ -937,6 +968,9 @@ fn every_lora_spelling_applies_over_a_packed_projection() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::every_lora_spelling_applies_over_a_packed_projection");
 }
 
 /// One LoKr module's factors, by suffix.
@@ -1042,6 +1076,7 @@ const LYCORIS_LOKR_LAYOUTS: [LycorisLayout; 4] = [
 /// over the packed q8 / q4 projection — the base staying packed — and passes the preflight, under
 /// either declared kind (a third-party file carries no stamp a caller could read the kind from).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_lycoris_lokr_layout_applies_on_dense_and_packed() {
     let temp = tempfile::tempdir().unwrap();
     let dense_targets = [
@@ -1133,12 +1168,16 @@ fn every_lycoris_lokr_layout_applies_on_dense_and_packed() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::every_lycoris_lokr_layout_applies_on_dense_and_packed");
 }
 
 /// The LyCORIS per-module scale (`alpha / lora_dim`; forced 1 when both factors are full) and the
 /// tucker rebuild are exact: each unstamped layout renders the same velocity as the stamped LoKr
 /// carrying the equivalent full right factor at scale 1.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lycoris_lokr_scale_and_tucker_match_the_equivalent_full_factor_lokr() {
     let temp = tempfile::tempdir().unwrap();
     let render =
@@ -1211,6 +1250,9 @@ fn lycoris_lokr_scale_and_tucker_match_the_equivalent_full_factor_lokr() {
             "{name}: the LyCORIS scale / rebuild must equal the full-factor LoKr"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::lycoris_lokr_scale_and_tucker_match_the_equivalent_full_factor_lokr");
 }
 
 /// The projections whose output on a fixed probe differs between `before` and `after`, in visitor
@@ -1242,6 +1284,7 @@ fn changed_projections(
 /// (`diffusion_model.…`) and raw PEFT (`base_model.model.…`) spellings alike — the resolution the
 /// MLX twin uses.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn loha_folds_under_every_key_spelling() {
     let temp = tempfile::tempdir().unwrap();
     let base = velocity(&dense_dit());
@@ -1269,6 +1312,9 @@ fn loha_folds_under_every_key_spelling() {
         );
         assert!(max_abs_diff(&base, &velocity(&dit)) > 1e-4, "{module}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::loha_folds_under_every_key_spelling");
 }
 
 /// The `__metadata__` the MLX trainer (sc-24159) stamps: the provenance block plus the
@@ -1333,6 +1379,7 @@ fn write_trainer_adapter(path: &Path, network: &str, targets: &[&str]) {
 /// An adapter in the MLX trainer's output layout loads on candle with no conversion — LoRA and
 /// LoKr, on the dense DiT and over the packed q8 / q4 projection.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_mlx_trainer_adapter_loads_on_candle_without_conversion() {
     let temp = tempfile::tempdir().unwrap();
     let dense_targets = [
@@ -1375,6 +1422,9 @@ fn an_mlx_trainer_adapter_loads_on_candle_without_conversion() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::an_mlx_trainer_adapter_loads_on_candle_without_conversion");
 }
 
 /// Files the DiT genuinely cannot serve are typed, actionable refusals — at the header-only
@@ -1715,6 +1765,7 @@ impl MixedStack {
 /// spec's scale for every file) — that file at 0 then still applies, so it no longer equals the
 /// stack without it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_mixed_adapter_stack_installs_with_independent_per_file_strengths() {
     let stack = mixed_stack();
     let full = [Some(0.75), Some(0.5), Some(1.0), Some(1.25)];
@@ -1752,6 +1803,9 @@ fn a_mixed_adapter_stack_installs_with_independent_per_file_strengths() {
             "{name} at twice its strength must move the stack"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::a_mixed_adapter_stack_installs_with_independent_per_file_strengths");
 }
 
 /// Per-adapter strength on the two routes this crate installs itself (the LoHa fold and the
@@ -1762,6 +1816,7 @@ fn a_mixed_adapter_stack_installs_with_independent_per_file_strengths() {
 /// *Mutation that reds this:* `spec.scale` → `1.0` at the `group.delta(…)` call in `fold_loha`, or
 /// at the `group.factors(…)` call in `install_lycoris_lokr`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn loha_and_lycoris_lokr_strength_scales_the_projection_delta() {
     let temp = tempfile::tempdir().unwrap();
     let loha = temp.path().join("loha.safetensors");
@@ -1807,6 +1862,9 @@ fn loha_and_lycoris_lokr_strength_scales_the_projection_delta() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::loha_and_lycoris_lokr_strength_scales_the_projection_delta");
 }
 
 /// A large-amplitude LoRA (the MLX twin's `render_lora`) over a block attention, a packable FFN
@@ -1864,6 +1922,7 @@ fn t2i_request(edge: u32) -> GenerationRequest {
 /// *Mutation that reds this:* `load_heavy` skipping `adapters::install` (both adapted renders equal
 /// the plain one), or installing only on the `Resident` path (Sequential ≠ Resident).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn adapters_reach_the_render_under_both_residencies() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("render.safetensors");
@@ -1886,6 +1945,9 @@ fn adapters_reach_the_render_under_both_residencies() {
     );
     let off = render_pixels(&bare.with_adapters(vec![lora(&file, 0.0)]), &request);
     assert_eq!(off, plain, "strength 0 is pixel-identical to no adapter");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::adapters_reach_the_render_under_both_residencies");
 }
 
 /// The documented boundary — ten ordered references — renders with an adapter installed, and the
@@ -1894,6 +1956,7 @@ fn adapters_reach_the_render_under_both_residencies() {
 ///
 /// *Mutation that reds this:* the reference/edit route denoising through an un-adapted DiT.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_adapter_reaches_a_ten_reference_edit_render() {
     use candle_gen::gen_core::{Conditioning, Image};
 
@@ -1922,5 +1985,10 @@ fn an_adapter_reaches_a_ten_reference_edit_render() {
     assert_ne!(
         adapted, plain,
         "the LoRA must change the 10-reference render"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED adapters::an_adapter_reaches_a_ten_reference_edit_render"
     );
 }

@@ -780,7 +780,7 @@ impl Nvfp4Linear {
             Some(b) => Some(b.to_dtype(x.dtype())?),
             None => None,
         };
-        Linear::new(w, bias).forward(x)
+        __model_proof_output!(Linear::new(w, bias).forward(x))
     }
 
     /// The W4A4 FP4 forward (cuda-only) over this layer's resident weight — see [`w4a4_forward`],
@@ -791,7 +791,7 @@ impl Nvfp4Linear {
             .fp4
             .as_ref()
             .expect("Fp4W4A4 regime holds a staged weight");
-        w4a4_forward(&fp4.lt, &fp4.w_staged, x, self.bias.as_ref())
+        __model_proof_output!(w4a4_forward(&fp4.lt, &fp4.w_staged, x, self.bias.as_ref()))
     }
 
     /// [`Self::forward`] plus a **NaN/inf guard** (sc-11044 AC): asserts the output is finite and
@@ -1060,6 +1060,7 @@ mod tests {
     /// On a CPU device (no cuda / not sm_120) `from_packed` always selects the dequant→bf16 fallback,
     /// never crashes, and forwards a coherent result matching the packed weight's dequant reference.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cpu_selects_dequant_fallback_and_forwards() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
@@ -1093,6 +1094,8 @@ mod tests {
             rr < 0.02,
             "dequant fallback forward rel-RMS {rr} vs its own dequant ref"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_linear::tests::cpu_selects_dequant_fallback_and_forwards");
         Ok(())
     }
 
@@ -1140,6 +1143,7 @@ mod tests {
     /// The dequant fallback forward preserves the input dtype and handles a rank-3 activation (leading
     /// dims broadcast through `candle_nn::Linear`), with a bias added back.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dequant_forward_rank3_and_bias_and_dtype() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (48usize, 64usize);
@@ -1170,6 +1174,8 @@ mod tests {
         let y = lin.forward(&x)?;
         assert_eq!(y.dims(), &[2, 5, out_dim]);
         assert_eq!(y.dtype(), x.dtype());
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_linear::tests::dequant_forward_rank3_and_bias_and_dtype");
         Ok(())
     }
 

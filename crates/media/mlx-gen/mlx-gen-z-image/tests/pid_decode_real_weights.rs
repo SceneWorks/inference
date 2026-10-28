@@ -83,7 +83,7 @@ fn save_png(img: &Image, path: &str) {
 }
 
 #[test]
-#[ignore = "needs the Z-Image-Turbo snapshot + converted flux PiD checkpoint + gemma-2-2b-it"]
+#[ignore = "model inference; explicit model-proof workflow; needs the Z-Image-Turbo snapshot + converted flux PiD checkpoint + gemma-2-2b-it"]
 fn z_image_turbo_pid_decode_vs_vae() {
     let size: u32 = std::env::var("ZIMAGE_PID_SIZE")
         .ok()
@@ -155,6 +155,11 @@ fn z_image_turbo_pid_decode_vs_vae() {
         vae_img.width,
         pid_img.width,
         pid_dt / vae_dt.max(1e-3)
+    );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::z_image_turbo_pid_decode_vs_vae"
     );
 }
 

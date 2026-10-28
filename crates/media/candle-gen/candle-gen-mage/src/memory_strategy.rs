@@ -105,7 +105,13 @@ fn transformer_has_device_format(spec: &LoadSpec) -> gen_core::Result<bool> {
         return Ok(false);
     };
     let path = root.join("transformer").join("config.json");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/candle-gen/candle-gen-mage/src/memory_strategy.rs::transformer_has_device_format::std::fs::read_to_string@4618",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
@@ -235,7 +241,13 @@ fn folded_projection_bytes(
 /// an error here.
 fn packed_group_size(dir: &std::path::Path) -> gen_core::Result<Option<usize>> {
     let path = dir.join("config.json");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/candle-gen/candle-gen-mage/src/memory_strategy.rs::packed_group_size::std::fs::read_to_string@11147",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -494,7 +506,13 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     // The exact reader the pipeline uses, over the exact file it reads. `Err` — a missing file, a
     // partial config, a drifted geometry — means the loader would refuse this snapshot, and a trunk
     // that never constructs has no axes to declare.
-    let dit = std::fs::read_to_string(root.join("transformer").join("config.json"))
+    let dit = gen_core::__model_input_reader!(
+std::fs::read_to_string(root.join("transformer").join("config.json")),
+"crates/media/candle-gen/candle-gen-mage/src/memory_strategy.rs::architecture_facts::std::fs::read_to_string@24049",
+ArtifactInput,
+root.join("transformer").join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
         .ok()
         .and_then(|text| config::MageConfig::from_json(&text).ok());
     let (attention_heads, head_dim, transformer_blocks, patch_size) = match &dit {

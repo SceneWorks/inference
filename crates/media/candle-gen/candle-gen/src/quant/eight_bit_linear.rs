@@ -60,7 +60,7 @@ impl Fp8Linear {
             .matmul_fp8(&self.w_fp8, self.scale_w, &qx.q, qx.scale)?;
         let y = restore(y)?;
         match &self.bias {
-            Some(b) => y.broadcast_add(&b.to_dtype(y.dtype())?),
+            Some(b) => __model_proof_output!(y.broadcast_add(&b.to_dtype(y.dtype())?)),
             None => Ok(y),
         }
     }
@@ -75,6 +75,8 @@ enum WeightScale {
     PerTensor(f32),
     /// One scale per output row (sc-9300): `dequant[o, :] = q[o, :] · scale[o]`.
     PerChannel(Vec<f32>),
+    /// Kitchen native path: resident F32 output-row scales, dynamic activation-row scales.
+    Kitchen(Tensor),
 }
 
 /// An int8 IGEMM linear: exact int32 accumulate, dequant scale folded on the candle side. Same
@@ -171,6 +173,51 @@ impl Int8Linear {
             ondevice_dequant,
         })
     }
+    /// Exact I8 byte-pattern parts, one staged compact base and resident F32 scales.
+    /// The source map can be dropped immediately: this retains no dense or host code copy.
+    pub fn from_native_bytes(
+        codes: &Tensor,
+        scales: Tensor,
+        bias: Option<Tensor>,
+        lt: Arc<CublasLt>,
+    ) -> Result<Self> {
+        let (n, _) = codes.dims2()?;
+        if scales.dtype() != candle_core::DType::F32 || scales.dims() != [n, 1] {
+            candle_core::bail!("native INT8 requires F32 [out,1] scales");
+        }
+        let w_staged = Some(lt.stage_int8_bytes(codes)?);
+        Ok(Self {
+            w_i8: Tensor::zeros((0, 0), candle_core::DType::U8, &Device::Cpu)?,
+            w_staged,
+            scale_w: WeightScale::Kitchen(scales.reshape((1, n))?.to_device(codes.device())?),
+            bias,
+            lt,
+            ondevice_dequant: true,
+        })
+    }
+
+    /// Kitchen's per-token quantization, exact int32 cuBLASLt GEMM and FP32 epilogue.
+    /// Bias is added BEFORE the one output-dtype rounding. No host-fold fallback.
+    pub fn forward_kitchen(&self, rotated: &Tensor, dtype: candle_core::DType) -> Result<Tensor> {
+        let WeightScale::Kitchen(sw) = &self.scale_w else {
+            candle_core::bail!("not a native Kitchen INT8 projection")
+        };
+        let w = self
+            .w_staged
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("native INT8 weight is not staged".into()))?;
+        let (qx, sx) = self.lt.quantize_kitchen_int8(rotated, dtype)?;
+        let acc = self
+            .lt
+            .matmul_int8_staged(w, &qx)?
+            .to_dtype(candle_core::DType::F32)?;
+        let y = acc.broadcast_mul(&sx)?.broadcast_mul(sw)?;
+        let y = match &self.bias {
+            Some(b) => y.broadcast_add(&b.to_dtype(dtype)?.to_dtype(candle_core::DType::F32)?)?,
+            None => y,
+        };
+        y.to_dtype(dtype)
+    }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (flat, restore) = flatten_tokens(x)?;
@@ -188,10 +235,13 @@ impl Int8Linear {
             (WeightScale::PerTensor(s), _) => {
                 self.lt.matmul_int8(&self.w_i8, *s, &qx.q, qx.scale)?
             }
+            (WeightScale::Kitchen(_), _) => {
+                candle_core::bail!("Kitchen INT8 must use forward_kitchen")
+            }
         };
         let y = restore(y)?;
         match &self.bias {
-            Some(b) => y.broadcast_add(&b.to_dtype(y.dtype())?),
+            Some(b) => __model_proof_output!(y.broadcast_add(&b.to_dtype(y.dtype())?)),
             None => Ok(y),
         }
     }

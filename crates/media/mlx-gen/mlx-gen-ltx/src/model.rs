@@ -665,7 +665,13 @@ pub(crate) fn resolve_gemma_quant(gemma_dir: &std::path::Path) -> Result<Option<
     if !path.exists() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&path)?;
+    let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
     let v: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| Error::Msg(format!("ltx_2_3: parse gemma config.json: {e}")))?;
     let Some(q) = v.get("quantization") else {

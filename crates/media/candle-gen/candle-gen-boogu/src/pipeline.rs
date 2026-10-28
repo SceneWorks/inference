@@ -1114,7 +1114,7 @@ fn vae_encode(encoder: &Encoder, reference: &Image, device: &Device) -> Result<T
 /// and map to latent space as `(mean − shift) · scale`. The shared leaf the Edit reference encode
 /// ([`vae_encode`]) and the Base/Turbo img2img latent-init ([`encode_reference`]) both build on.
 fn encode_mean_latent(encoder: &Encoder, pixels: &Tensor) -> Result<Tensor> {
-    let moments = encoder.forward(pixels)?; // [1, 2C, H/8, W/8]
+    let moments = __model_proof_output!(encoder.forward(pixels))?; // [1, 2C, H/8, W/8]
     let two_c = moments.dim(1)?;
     if two_c % 2 != 0 {
         return Err(CandleError::Msg(format!(
@@ -1280,8 +1280,10 @@ fn decode(vae: &AutoEncoderKL, pid: Option<&PidDecoder>, lat: &Tensor) -> Result
             pid.decode(lat)?
         }
         // [1, 3, H, W] in [-1, 1]
-        None => candle_gen::bounded_kl_decode(&VAE_DECODER, lat, |l| vae.decode(l))?
-            .to_dtype(DType::F32)?,
+        None => candle_gen::bounded_kl_decode(&VAE_DECODER, lat, |l| {
+            __model_proof_output!(vae.decode(l))
+        })?
+        .to_dtype(DType::F32)?,
     };
     let img = postprocess_image(&decoded)?.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;

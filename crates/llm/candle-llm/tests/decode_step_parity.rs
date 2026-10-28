@@ -14,6 +14,15 @@
 //! `BONSAI_QWEN38_SNAPSHOT` is the manifest's own environment name for this model
 //! (`release/real-weight-models.toml`); it is a passed-in path, never derived.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 mod common;
 
 use candle_core::{DType, Tensor};
@@ -95,6 +104,9 @@ fn ac1_step_model_greedy_fixture_is_token_identical_to_reference() {
         "[ac1] {} tokens identical; record {record:?}",
         reference.tokens.len()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ac1_step_model_greedy_fixture_is_token_identical_to_reference");
 }
 
 #[test]
@@ -165,4 +177,7 @@ fn ac2_rollback_then_redecode_matches_fresh_decode_on_real_weights() {
         "rollback_to({n}) then re-decode must equal a fresh decode to {n} + 1"
     );
     eprintln!("[ac2] rollback from {m} to {n}: logits identical (max diff {max_diff}); cache {before:?} -> {after:?}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ac2_rollback_then_redecode_matches_fresh_decode_on_real_weights");
 }

@@ -66,9 +66,18 @@ pub enum NormInput {
     Held,
 }
 
+/// A projection's request rows and its input/output feature widths.
+#[derive(Clone, Copy, Debug)]
+pub struct LinearShape {
+    pub rows: u64,
+    pub input: u64,
+    pub output: u64,
+}
+
 /// One quantum's counted retention, phase by phase.
 #[derive(Clone, Copy, Debug)]
-pub struct Retention {
+pub struct Retention<'a> {
+    adapters: Option<(&'a crate::adapters::ProjectionAdapterFacts, &'a str)>,
     /// Bytes of the earlier phases' named buffers.
     held: u64,
     /// Named bytes allocated in the current phase.
@@ -82,10 +91,11 @@ pub struct Retention {
     pub cw: u64,
 }
 
-impl Retention {
+impl<'a> Retention<'a> {
     /// A quantum at compute width `cw`, pricing the unfused fallbacks when `unfused`.
     pub fn on(cw: u64, unfused: bool) -> Self {
         Self {
+            adapters: None,
             held: 0,
             named: 0,
             phase: SCALARS_BYTES,
@@ -93,6 +103,95 @@ impl Retention {
             unfused,
             cw,
         }
+    }
+
+    /// Bind upstream projection identities for this counted quantum. `prefix` is the actual
+    /// block path (or empty for skeleton projections), shared with the header-only price.
+    pub fn with_adapters(
+        mut self,
+        facts: &'a crate::adapters::ProjectionAdapterFacts,
+        prefix: &'a str,
+    ) -> Self {
+        self.adapters = Some((facts, prefix));
+        self
+    }
+
+    /// Count one named production projection, with its exact attached residuals and request rows.
+    pub fn linear_at(
+        &mut self,
+        path: &str,
+        shape: LinearShape,
+        cast: bool,
+        pad: u64,
+        kind: Kind,
+    ) -> &mut Self {
+        let facts = self.adapters.and_then(|(facts, prefix)| {
+            let key = if prefix.is_empty() {
+                path.to_owned()
+            } else {
+                format!("{prefix}.{path}")
+            };
+            facts.get(&key)
+        });
+        self.adapted_linear(
+            shape,
+            cast,
+            pad,
+            kind,
+            facts.map(Vec::as_slice).unwrap_or(&[]),
+        )
+    }
+
+    /// Residual-only allocations for a skeleton projection whose base output the pre-existing
+    /// law already counted (e.g. the two modulation cores' combined outputs). No base/cast/padding
+    /// is charged twice. Each stack's own factors give the exact input/output widths.
+    pub fn adapter_extras_at(&mut self, path: &str, rows: u64, copy_input: bool) -> &mut Self {
+        let facts = self.adapters.and_then(|(facts, prefix)| {
+            let key = if prefix.is_empty() {
+                path.to_owned()
+            } else {
+                format!("{prefix}.{path}")
+            };
+            facts.get(&key)
+        });
+        if let Some(facts) = facts {
+            let compute = if self.cw == 4 {
+                mlx_rs::Dtype::Float32
+            } else {
+                mlx_rs::Dtype::Bfloat16
+            };
+            for adapter in facts.iter().filter(|a| !a.disabled()) {
+                use mlx_gen::adapters::facts::AdapterFacts;
+                let (input, output) = match adapter {
+                    AdapterFacts::Lora { a, b, .. } => (a.shape[0], b.shape[1]),
+                    AdapterFacts::Materialized { delta, .. } => (delta.shape[1], delta.shape[0]),
+                    AdapterFacts::Structured { w1, w2, .. } => {
+                        (w1.shape[1] * w2.shape[1], w1.shape[0] * w2.shape[0])
+                    }
+                };
+                if copy_input {
+                    let dtype = match adapter {
+                        AdapterFacts::Lora { a, .. } => {
+                            mlx_rs::Dtype::from_promoting_types(compute, a.dtype)
+                        }
+                        _ => compute,
+                    };
+                    self.temp(
+                        mlx_gen::adapters::facts::dtype_width(dtype),
+                        rows * input.max(0) as u64,
+                    );
+                }
+                self.adapter_residual(
+                    rows,
+                    input.max(0) as u64,
+                    output.max(0) as u64,
+                    compute,
+                    adapter,
+                );
+                self.temp(self.cw, rows * output.max(0) as u64);
+            }
+        }
+        self
     }
 
     /// Whether the compute dtype is narrower than f32 (bf16).
@@ -188,6 +287,114 @@ impl Retention {
             self.temp(cw, rows * (in_features + pad));
         }
         self.alloc(out_kind, 1, cw, rows * out_features)
+    }
+
+    /// The same base projection as [`Self::linear`], followed by its actual ordered residual
+    /// stack. No-adapter (including all-disabled) pricing is exactly the old base law. Parameters
+    /// are already resident; only casts/copies and newly produced forward buffers belong here.
+    ///
+    /// This is a source-counted allocation upper bound: it does not require multiply/add donation
+    /// to succeed. It is NOT physical-footprint evidence or a subtractable anchor basis.
+    pub fn adapted_linear(
+        &mut self,
+        shape: LinearShape,
+        cast: bool,
+        pad: u64,
+        out_kind: Kind,
+        adapters: &[mlx_gen::adapters::facts::AdapterFacts],
+    ) -> &mut Self {
+        let LinearShape {
+            rows,
+            input: in_features,
+            output: out_features,
+        } = shape;
+        let live = adapters.iter().filter(|a| !a.disabled()).count();
+        self.linear(
+            rows,
+            in_features,
+            out_features,
+            cast,
+            pad,
+            if live == 0 { out_kind } else { Kind::Temp },
+        );
+        if live == 0 {
+            return self;
+        }
+        let compute = if self.cw == 4 {
+            mlx_rs::Dtype::Float32
+        } else {
+            mlx_rs::Dtype::Bfloat16
+        };
+        for (index, adapter) in adapters.iter().filter(|a| !a.disabled()).enumerate() {
+            self.adapter_residual(rows, in_features, out_features, compute, adapter);
+            // `apply_adapters`: narrow the natural residual to the base output dtype, then add.
+            // Its preceding output remains referenced by the add's input graph.
+            self.alloc(
+                if index + 1 == live {
+                    out_kind
+                } else {
+                    Kind::Temp
+                },
+                1,
+                self.cw,
+                rows * out_features,
+            );
+        }
+        self
+    }
+
+    fn adapter_residual(
+        &mut self,
+        rows: u64,
+        input: u64,
+        output: u64,
+        compute: mlx_rs::Dtype,
+        adapter: &mlx_gen::adapters::facts::AdapterFacts,
+    ) {
+        use mlx_gen::adapters::facts::{dtype_width, AdapterFacts};
+        use mlx_rs::Dtype;
+        let cast = |r: &mut Self, from: Dtype, to: Dtype, n| {
+            if from != to {
+                r.temp(dtype_width(to), n);
+            }
+        };
+        let residual_dtype = match adapter {
+            AdapterFacts::Lora { a, b, .. } => {
+                let rank = a.shape[1].max(0) as u64;
+                let first = Dtype::from_promoting_types(compute, a.dtype);
+                let second = Dtype::from_promoting_types(first, b.dtype);
+                cast(self, compute, first, rows * input);
+                cast(self, a.dtype, first, a.elements());
+                self.temp(dtype_width(first), rows * rank);
+                cast(self, first, second, rows * rank);
+                cast(self, b.dtype, second, b.elements());
+                self.temp(dtype_width(second), rows * output);
+                second
+            }
+            AdapterFacts::Materialized { delta, .. } => {
+                cast(self, delta.dtype, compute, delta.elements());
+                self.temp(self.cw, rows * output);
+                compute
+            }
+            AdapterFacts::Structured { w1, w2, .. } => {
+                cast(self, w1.dtype, compute, w1.elements());
+                cast(self, w2.dtype, compute, w2.elements());
+                // w1 [a,c] @ x [rows,c,d] -> [rows,a,d], then @ w2.T -> [rows,a,b].
+                let cw = self.cw;
+                self.temp(
+                    cw,
+                    rows * w1.shape[0].max(0) as u64 * w2.shape[1].max(0) as u64,
+                )
+                .temp(cw, rows * output);
+                // The structured scale is already baked into w2, so no scale op here.
+                return;
+            }
+        };
+        // `scalar(scale).as_dtype(r.dtype())`, followed by multiply, even at scale one.
+        self.temp(4, 1);
+        cast(self, Dtype::Float32, residual_dtype, 1);
+        self.temp(dtype_width(residual_dtype), rows * output);
+        cast(self, residual_dtype, compute, rows * output);
     }
 
     /// `crate::nn::RmsNorm::forward` over `elements` in `rows` rows, its f32 result held as

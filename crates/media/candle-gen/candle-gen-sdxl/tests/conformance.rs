@@ -81,6 +81,9 @@ fn sdxl_conformance() {
 
     // Resolve through this provider's direct loader. Panics with aggregated failures.
     conformance(|| candle_gen_sdxl::load(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::sdxl_conformance");
 }
 
 /// sc-3677: the same conformance suite against a **RealVisXL_V5.0** snapshot — the parity evidence
@@ -112,6 +115,9 @@ fn realvisxl_conformance() {
     };
 
     conformance(|| candle_gen_sdxl::load(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::realvisxl_conformance");
 }
 
 /// sc-6128 acceptance: the candle SDXL lightning path renders a **non-degenerate** image at ~5 steps
@@ -178,6 +184,9 @@ fn realvisxl_lightning_render() {
         max - min > 16,
         "lightning render looks degenerate (flat): min={min} max={max}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::realvisxl_lightning_render");
 }
 
 /// sc-14195 acceptance, real weights: `guidanceScale = 1.0` on the **default** (curated `ddim`)
@@ -281,6 +290,9 @@ fn sdxl_cfg_off_guidance_one_render() {
         off.pixels, on.pixels,
         "CFG-off must not silently render the CFG-on image"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::sdxl_cfg_off_guidance_one_render");
 }
 
 /// A ~150-CLIP-token prompt (the story's 106-word repro shape) — comfortably past CLIP's 77-token
@@ -386,4 +398,7 @@ fn sdxl_long_prompt_render() {
         long_negative.pixels, truncated.pixels,
         "an over-long negative prompt must actually condition the render"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::sdxl_long_prompt_render");
 }

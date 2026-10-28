@@ -18,6 +18,7 @@ fn close(a: &Array, b: &Array, rtol: f64, atol: f64) -> bool {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn timestep_embedder_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let te = TimestepEmbedder::from_weights(&w, "te.w", 256).unwrap();
@@ -25,6 +26,9 @@ fn timestep_embedder_matches_fork() {
     let want = w.require("te.out").unwrap();
     assert_eq!(out.shape(), want.shape());
     assert!(close(&out, want, 1e-2, 1e-2));
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED z_submodules::timestep_embedder_matches_fork");
 }
 
 #[test]
@@ -38,6 +42,7 @@ fn rope_embedder_matches_fork() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn final_layer_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let fl = FinalLayer::from_weights(&w, "fl.w").unwrap();
@@ -47,9 +52,13 @@ fn final_layer_matches_fork() {
     let want = w.require("fl.out").unwrap();
     assert_eq!(out.shape(), want.shape());
     assert!(close(&out, want, 1e-2, 1e-2));
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED z_submodules::final_layer_matches_fork");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn context_block_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let cb = ZImageContextBlock::from_weights(&w, "cb.w", 96, 4, 1e-5).unwrap();
@@ -62,4 +71,7 @@ fn context_block_matches_fork() {
     let want = w.require("cb.out").unwrap();
     assert_eq!(out.shape(), want.shape());
     assert!(close(&out, want, 1e-2, 1e-2));
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED z_submodules::context_block_matches_fork");
 }

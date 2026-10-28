@@ -85,6 +85,8 @@ fn ckpt_dir() -> Option<String> {
         Ok(p) => Some(p),
         Err(_) => {
             eprintln!("SKIP: set SEEDVR2_CKPT to a numz/SeedVR2_comfyUI checkpoint dir");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_quant_smoke.rs:86 (ckpt_dir): Implicit None on missing required SEEDVR2_CKPT propagates to NN test successful return.");
             None
         }
     }
@@ -112,7 +114,11 @@ fn upscale(pipe: &Seedvr2Pipeline, lr: &Image, tgt: usize, seed: u64) -> Vec<f32
 #[test]
 #[ignore = "needs SEEDVR2_CKPT weights + a CUDA build"]
 fn cuda_quant_near_lossless() {
-    let Some(ckpt) = ckpt_dir() else { return };
+    let Some(ckpt) = ckpt_dir() else {
+        #[cfg(feature = "model-inference-proof")]
+                                       crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_quant_smoke.rs:115 (cuda_quant_near_lossless): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
+        return;
+    };
     let dt = dtype();
     let device = candle_gen::default_device().expect("device");
     eprintln!("[seedvr2-quant] device={device:?} dtype={dt:?} ckpt={ckpt}");
@@ -164,6 +170,9 @@ fn cuda_quant_near_lossless() {
             "{label} upscale not sharper than bicubic (grad {ge_q:.3} ≤ {ge_base:.3}) — quant destroyed the SR"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda_quant_smoke::cuda_quant_near_lossless");
 }
 
 /// The 7B variant loads (zero missing tensors → the pixel-mode-RoPE config + key renames match the
@@ -171,10 +180,16 @@ fn cuda_quant_near_lossless() {
 #[test]
 #[ignore = "needs SEEDVR2_CKPT 7B weights + a CUDA build"]
 fn cuda_7b_upscale_smoke() {
-    let Some(ckpt) = ckpt_dir() else { return };
+    let Some(ckpt) = ckpt_dir() else {
+        #[cfg(feature = "model-inference-proof")]
+                                       crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_quant_smoke.rs:174 (cuda_7b_upscale_smoke): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
+        return;
+    };
     let dit_path = std::path::Path::new(&ckpt).join(DIT_FILE_7B);
     if !dit_path.exists() {
         eprintln!("SKIP: {DIT_FILE_7B} not present in {ckpt} (7B checkpoint not downloaded)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_quant_smoke.rs:176 (cuda_7b_upscale_smoke): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     }
     let dt = dtype();
@@ -220,4 +235,7 @@ fn cuda_7b_upscale_smoke() {
         ge_out > ge_base,
         "7B upscale not sharper than bicubic (grad {ge_out:.3} ≤ {ge_base:.3})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda_quant_smoke::cuda_7b_upscale_smoke");
 }

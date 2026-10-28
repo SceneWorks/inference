@@ -94,6 +94,9 @@ fn run_load_time(bits: i32, golden_file: &str) {
     let model_path = snapshot_dir().join("model.safetensors");
     if !model_path.exists() {
         eprintln!("skip: {} not found (set WAN_5B_DIR)", model_path.display());
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in run_load_time; see preceding skip diagnostic",
+        );
         return;
     }
     let cfg = WanModelConfig::wan22_ti2v_5b();
@@ -114,6 +117,9 @@ fn run_prequantized(bits: i32, golden_file: &str) {
             "skip: {} not found (run tools/dump_quant_snapshot.py)",
             model_path.display()
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in run_prequantized; see preceding skip diagnostic",
+        );
         return;
     }
     let cfg = WanModelConfig::from_model_dir(&dir).expect("read config.json");
@@ -132,22 +138,34 @@ fn run_prequantized(bits: i32, golden_file: &str) {
 #[ignore = "needs the converted 5B model.safetensors (~9 GB) — run tools/dump_quant_fixtures.py"]
 fn q4_dit_forward_matches_reference() {
     run_load_time(4, "tests/fixtures/q4_dit_golden.safetensors");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::q4_dit_forward_matches_reference");
 }
 
 #[test]
 #[ignore = "needs the converted 5B model.safetensors (~9 GB) — run tools/dump_quant_fixtures.py"]
 fn q8_dit_forward_matches_reference() {
     run_load_time(8, "tests/fixtures/q8_dit_golden.safetensors");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::q8_dit_forward_matches_reference");
 }
 
 #[test]
 #[ignore = "needs the pre-quantized 5B snapshot — run tools/dump_quant_snapshot.py (WAN_5B_Q4_DIR)"]
 fn q4_prequantized_snapshot_matches_reference() {
     run_prequantized(4, "tests/fixtures/q4_dit_golden.safetensors");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED quant_parity::q4_prequantized_snapshot_matches_reference"
+    );
 }
 
 #[test]
 #[ignore = "needs the pre-quantized 5B snapshot — run tools/dump_quant_snapshot.py (WAN_5B_Q8_DIR)"]
 fn q8_prequantized_snapshot_matches_reference() {
     run_prequantized(8, "tests/fixtures/q8_dit_golden.safetensors");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED quant_parity::q8_prequantized_snapshot_matches_reference"
+    );
 }

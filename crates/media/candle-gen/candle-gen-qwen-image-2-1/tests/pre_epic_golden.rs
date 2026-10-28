@@ -5,6 +5,13 @@
 //! `feature/sc-2123-perceptual-character-lora`), on candle's CPU backend (the default lane's
 //! device — no accelerator in the result).
 //!
+//! This oracle always loads on `Device::Cpu`, including CUDA/Metal builds. `train_dtype = f32`
+//! alone only sets the DiT dtype: the default GPU trainer still caches text/VAE features at bf16
+//! and uses different device kernels, so it cannot be compared to this CPU/F32 adapter. The
+//! registered default-device training path remains covered separately by `trainer_conformance`
+//! (captioned and edit datasets); on CUDA builds those tests train on CUDA, without claiming
+//! equivalence to this frozen CPU adapter.
+//!
 //! Regenerate (only when the off path is *meant* to change, which epic 2123 E1 forbids): check out
 //! that merge base in a scratch worktree, copy this file into the same place, add it to
 //! `tests/main.rs`, and run
@@ -20,9 +27,10 @@ use std::path::{Path, PathBuf};
 
 use candle_core::Device;
 use candle_gen::gen_core::{
-    LoadSpec, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
+    LoadSpec, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
+    WeightsSource,
 };
-use candle_gen_qwen_image_2_1::provider_registry;
+use candle_gen_qwen_image_2_1::training::QwenImage21Trainer;
 
 use crate::common::{host_f32, tiny_snapshot};
 
@@ -69,6 +77,7 @@ fn read_adapter(path: &Path) -> HashMap<String, (Vec<i64>, Vec<f32>)> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn everything_off_trains_the_pre_epic_adapter() {
     let tmp = tempfile::Builder::new()
         .prefix(&format!("qwen21_pre_epic_golden_{}_", std::process::id()))
@@ -98,13 +107,11 @@ fn everything_off_trains_the_pre_epic_adapter() {
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
-    let mut trainer = provider_registry()
-        .unwrap()
-        .load_trainer(
-            "qwen_image_2_1",
-            &LoadSpec::new(WeightsSource::Dir(tiny_snapshot())),
-        )
-        .expect("the tiny snapshot loads as a trainer");
+    let mut trainer = QwenImage21Trainer::load_on(
+        &LoadSpec::new(WeightsSource::Dir(tiny_snapshot())),
+        Device::Cpu,
+    )
+    .expect("the tiny snapshot loads as a CPU/F32 trainer");
     let out = trainer
         .train(&req, &mut |_: TrainingProgress| {})
         .expect("the seeded run trains");
@@ -149,4 +156,7 @@ fn everything_off_trains_the_pre_epic_adapter() {
         worst.0
     );
     assert!(trained_b, "the golden carries no trained up factor");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pre_epic_golden::everything_off_trains_the_pre_epic_adapter");
 }

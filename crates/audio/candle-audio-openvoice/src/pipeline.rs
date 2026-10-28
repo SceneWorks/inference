@@ -190,6 +190,12 @@ fn validate_config(path: &Path) -> Result<()> {
             )));
         }
     }
+    #[cfg(feature = "model-inference-proof")]
+    candle_audio::gen_core::model_input_proof::record_reader_paths(
+        "candle-audio-openvoice::pipeline::validate_config",
+        candle_audio::gen_core::model_input_proof::InputRole::Configuration,
+        &[path],
+    );
     Ok(())
 }
 

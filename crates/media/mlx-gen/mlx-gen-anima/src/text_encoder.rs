@@ -85,8 +85,7 @@ impl AnimaQwen3 {
     }
 
     /// Layer `i` and its counted iOS quantum scratch at `(batch, tokens, element_bytes)` (the CPU
-    /// proofs run the layer's quantum body directly).
-    #[cfg(test)]
+    /// proofs run the layer's quantum body directly; the iOS pricing prices each layer's quantum).
     pub(crate) fn layer(
         &self,
         i: usize,
@@ -105,6 +104,11 @@ impl AnimaQwen3 {
     #[cfg(test)]
     pub(crate) fn final_norm(&self, h: &Array) -> Result<Array> {
         Ok(rms_norm(h, &self.norm, self.eps)?)
+    }
+
+    /// The number of decoder layers.
+    pub(crate) fn num_layers(&self) -> usize {
+        self.layers.len()
     }
 
     /// The tower's compute dtype (`Bfloat16` shipped; `Float32` for the sc-10577 fp32-TE reference).
@@ -180,7 +184,7 @@ impl AnimaQwen3 {
     pub fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         mlx_gen::ios_quantum::before(TE_EMBED_QUANTUM, self.embed_body_bytes(b, s))?;
         let (mut h, cos, sin, mask) = self.embed(input_ids, attention_mask)?;
         mlx_gen::ios_quantum::finish(TE_EMBED_QUANTUM, &[&h, &cos, &sin, &mask])?;

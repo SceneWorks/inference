@@ -19,14 +19,46 @@
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{
-    group_norm, linear, Conv2dConfig, GroupNorm, Linear, Module, VarBuilder,
+    linear, Conv2dConfig, GroupNorm as CandleGroupNorm, Linear, Module, VarBuilder,
 };
 use candle_gen::{budgeted_conv2d as conv2d, BudgetedConv2d as Conv2d};
+
+// The normal path delegates to the identical Candle constructor. Test-support keeps only
+// shallow handles to the EXACT parameters handed to that same GroupNorm implementation.
+struct VaeGroupNorm {
+    inner: CandleGroupNorm,
+    #[cfg(feature = "test-support")]
+    parameters: [Tensor; 2],
+}
+impl Module for VaeGroupNorm {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.inner.forward(input)
+    }
+}
+fn group_norm(groups: usize, channels: usize, eps: f64, vb: VarBuilder) -> Result<VaeGroupNorm> {
+    #[cfg(feature = "test-support")]
+    {
+        let weight =
+            vb.get_with_hints(channels, "weight", candle_gen::candle_nn::Init::Const(1.))?;
+        let bias = vb.get_with_hints(channels, "bias", candle_gen::candle_nn::Init::Const(0.))?;
+        let inner = CandleGroupNorm::new(weight.clone(), bias.clone(), channels, groups, eps)?;
+        Ok(VaeGroupNorm {
+            inner,
+            parameters: [weight, bias],
+        })
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        Ok(VaeGroupNorm {
+            inner: candle_gen::candle_nn::group_norm(groups, channels, eps, vb)?,
+        })
+    }
+}
 
 const GN_GROUPS: usize = 32;
 const GN_EPS: f64 = 1e-6;
 const BN_EPS: f64 = 1e-4;
-/// Channel width of each encoder/decoder stage. Public so a provider that decodes through this VAE
+/// Default channel width of each encoder/decoder stage. Public so a provider using this VAE
 /// (Lens) can publish its spatial scale from the stage count the decoder is actually built with.
 pub const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
 /// Latent channels this autoencoder produces and consumes. Public for the same reason.
@@ -35,6 +67,37 @@ pub const LATENT_CHANNELS: usize = 32;
 const DECODER_RESNETS: usize = 3;
 /// Encoder down_blocks have `layers_per_block = 2` resnets each.
 const ENCODER_RESNETS: usize = 2;
+
+/// Decoder widths in encoder stage order (the decoder visits them in reverse).
+/// The encoder remains the standard FLUX.2 `[128, 256, 512, 512]` architecture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Flux2VaeDecoderConfig {
+    pub block_out_channels: [usize; 4],
+}
+
+impl Default for Flux2VaeDecoderConfig {
+    fn default() -> Self {
+        Self {
+            block_out_channels: BLOCK_OUT,
+        }
+    }
+}
+
+impl Flux2VaeDecoderConfig {
+    /// Four stages retain FLUX.2's 8× spatial scale. Every width must support 32-group norm.
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .block_out_channels
+            .iter()
+            .any(|&width| width == 0 || width % GN_GROUPS != 0)
+        {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "FLUX.2 decoder widths must be positive multiples of 32".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 fn conv3x3(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
     let cfg = Conv2dConfig {
@@ -51,9 +114,9 @@ fn conv1x1(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
 
 /// Diffusers ResnetBlock2D (temb-free): `gn→silu→conv1 → gn→silu→conv2 + shortcut`.
 struct Resnet {
-    norm1: GroupNorm,
+    norm1: VaeGroupNorm,
     conv1: Conv2d,
-    norm2: GroupNorm,
+    norm2: VaeGroupNorm,
     conv2: Conv2d,
     shortcut: Option<Conv2d>,
 }
@@ -79,9 +142,9 @@ impl Resnet {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = self.norm1.forward(x)?.silu()?;
+        let h = __model_proof_output!(self.norm1.forward(x))?.silu()?;
         let h = self.conv1.forward(&h)?;
-        let h = self.norm2.forward(&h)?.silu()?;
+        let h = __model_proof_output!(self.norm2.forward(&h))?.silu()?;
         let h = self.conv2.forward(&h)?;
         let res = match &self.shortcut {
             Some(c) => c.forward(x)?,
@@ -93,7 +156,7 @@ impl Resnet {
 
 /// Single-head spatial self-attention in the mid block (diffusers `Attention`).
 struct MidAttention {
-    norm: GroupNorm,
+    norm: VaeGroupNorm,
     q: Linear,
     k: Linear,
     v: Linear,
@@ -115,15 +178,15 @@ impl MidAttention {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (b, c, h, w) = x.dims4()?;
-        let normed = self.norm.forward(x)?;
+        let normed = __model_proof_output!(self.norm.forward(x))?;
         // (B, C, H, W) -> (B, H*W, C)
         let seq = normed
             .reshape((b, c, h * w))?
             .transpose(1, 2)?
             .contiguous()?;
-        let q = self.q.forward(&seq)?;
-        let k = self.k.forward(&seq)?;
-        let v = self.v.forward(&seq)?;
+        let q = __model_proof_output!(self.q.forward(&seq))?;
+        let k = __model_proof_output!(self.k.forward(&seq))?;
+        let v = __model_proof_output!(self.v.forward(&seq))?;
         let scale = (self.channels as f64).powf(-0.5);
         // i32-overflow guard (sc-9116): the single-head spatial scores `[B, HW, HW]` reach `65536² ≈
         // 4.3e9 > i32::MAX` at a 2048² decode, so chunk over the query rows (byte-identical for the
@@ -136,7 +199,7 @@ impl MidAttention {
             candle_gen::candle_nn::ops::softmax_last_dim,
             candle_gen::ATTN_SCORES_BUDGET,
         )?; // (B, HW, C)
-        let o = self.out.forward(&o)?;
+        let o = __model_proof_output!(self.out.forward(&o))?;
         // back to (B, C, H, W) and residual
         let o = o.transpose(1, 2)?.reshape((b, c, h, w))?;
         x + o
@@ -231,26 +294,26 @@ struct Encoder {
     mid_resnet0: Resnet,
     mid_attn: MidAttention,
     mid_resnet1: Resnet,
-    conv_norm_out: GroupNorm,
+    conv_norm_out: VaeGroupNorm,
     conv_out: Conv2d,
 }
 
 impl Encoder {
-    fn new(vb: VarBuilder) -> Result<Self> {
-        let conv_in = conv3x3(3, BLOCK_OUT[0], vb.pp("conv_in"))?;
+    fn new(vb: VarBuilder, widths: [usize; 4]) -> Result<Self> {
+        let conv_in = conv3x3(3, widths[0], vb.pp("conv_in"))?;
 
         // down_blocks iterate block_out forward; resnet 0 of block i bridges the previous block's
         // output channels into block_out[i]. Downsample after every block except the last.
-        let mut down_blocks = Vec::with_capacity(BLOCK_OUT.len());
-        let mut in_c = BLOCK_OUT[0];
-        for (i, &out_c) in BLOCK_OUT.iter().enumerate() {
+        let mut down_blocks = Vec::with_capacity(widths.len());
+        let mut in_c = widths[0];
+        for (i, &out_c) in widths.iter().enumerate() {
             let db = vb.pp("down_blocks").pp(i);
             let mut resnets = Vec::with_capacity(ENCODER_RESNETS);
             for j in 0..ENCODER_RESNETS {
                 let rin = if j == 0 { in_c } else { out_c };
                 resnets.push(Resnet::new(rin, out_c, db.pp("resnets").pp(j))?);
             }
-            let is_final = i == BLOCK_OUT.len() - 1;
+            let is_final = i == widths.len() - 1;
             let downsampler = if is_final {
                 None
             } else {
@@ -263,7 +326,7 @@ impl Encoder {
             in_c = out_c;
         }
 
-        let top = *BLOCK_OUT.last().unwrap(); // 512
+        let top = *widths.last().unwrap(); // 512
         let mid = vb.pp("mid_block");
         let mid_resnet0 = Resnet::new(top, top, mid.pp("resnets").pp("0"))?;
         let mid_attn = MidAttention::new(top, mid.pp("attentions").pp("0"))?;
@@ -291,7 +354,7 @@ impl Encoder {
         h = self.mid_resnet0.forward(&h)?;
         h = self.mid_attn.forward(&h)?;
         h = self.mid_resnet1.forward(&h)?;
-        let h = self.conv_norm_out.forward(&h)?.silu()?;
+        let h = __model_proof_output!(self.conv_norm_out.forward(&h))?.silu()?;
         self.conv_out.forward(&h)
     }
 }
@@ -307,25 +370,135 @@ pub struct Flux2Vae {
     mid_attn: MidAttention,
     mid_resnet1: Resnet,
     up_blocks: Vec<UpBlock>,
-    conv_norm_out: GroupNorm,
+    conv_norm_out: VaeGroupNorm,
     conv_out: Conv2d,
     encoder: Option<(Encoder, Conv2d)>, // (encoder, quant_conv 64→64)
 }
 
 impl Flux2Vae {
+    /// Actual loaded frozen tensors, shallow handles only; callers stream bounded host chunks.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn frozen_training_tensors(&self) -> Vec<Tensor> {
+        fn conv(c: &Conv2d, v: &mut Vec<Tensor>) {
+            v.push(c.weight().clone());
+            v.extend(c.bias().cloned());
+        }
+        fn norm(n: &VaeGroupNorm, v: &mut Vec<Tensor>) {
+            v.extend(n.parameters.iter().cloned());
+        }
+        fn resnet(r: &Resnet, v: &mut Vec<Tensor>) {
+            norm(&r.norm1, v);
+            conv(&r.conv1, v);
+            norm(&r.norm2, v);
+            conv(&r.conv2, v);
+            if let Some(c) = &r.shortcut {
+                conv(c, v);
+            }
+        }
+        fn attention(a: &MidAttention, v: &mut Vec<Tensor>) {
+            norm(&a.norm, v);
+            for p in [&a.q, &a.k, &a.v, &a.out] {
+                v.push(p.weight().clone());
+                v.extend(p.bias().cloned());
+            }
+        }
+        let mut values = vec![self.bn_mean.clone(), self.bn_std.clone()];
+        conv(&self.post_quant_conv, &mut values);
+        conv(&self.conv_in, &mut values);
+        resnet(&self.mid_resnet0, &mut values);
+        attention(&self.mid_attn, &mut values);
+        resnet(&self.mid_resnet1, &mut values);
+        for block in &self.up_blocks {
+            for r in &block.resnets {
+                resnet(r, &mut values);
+            }
+            if let Some(u) = &block.upsampler {
+                conv(&u.conv, &mut values);
+            }
+        }
+        norm(&self.conv_norm_out, &mut values);
+        conv(&self.conv_out, &mut values);
+        if let Some((encoder, quant)) = &self.encoder {
+            conv(quant, &mut values);
+            conv(&encoder.conv_in, &mut values);
+            for block in &encoder.down_blocks {
+                for r in &block.resnets {
+                    resnet(r, &mut values);
+                }
+                if let Some(d) = &block.downsampler {
+                    conv(&d.conv, &mut values);
+                }
+            }
+            resnet(&encoder.mid_resnet0, &mut values);
+            attention(&encoder.mid_attn, &mut values);
+            resnet(&encoder.mid_resnet1, &mut values);
+            norm(&encoder.conv_norm_out, &mut values);
+            conv(&encoder.conv_out, &mut values);
+        }
+        values
+    }
+
     /// Build a **decode-only** VAE from a `vae/` VarBuilder (diffusers AutoencoderKLFlux2 keys, f32) —
     /// the txt2img path (no `encoder.*` / `quant_conv` loaded).
     pub fn new(vb: VarBuilder) -> Result<Self> {
-        Self::build(vb, false)
+        Self::build(vb, false, &Flux2VaeDecoderConfig::default())
     }
 
     /// Build the VAE **with the encoder** (training latents / img2img). Additionally loads `encoder.*`
     /// and `quant_conv`, enabling [`Self::encode`] / [`Self::encode_packed`].
     pub fn new_with_encoder(vb: VarBuilder) -> Result<Self> {
-        Self::build(vb, true)
+        Self::build(vb, true, &Flux2VaeDecoderConfig::default())
     }
 
-    fn build(vb: VarBuilder, with_encoder: bool) -> Result<Self> {
+    /// Build a decode-only VAE with explicit decoder widths, independent of the encoder.
+    pub fn new_with_decoder_config(vb: VarBuilder, config: &Flux2VaeDecoderConfig) -> Result<Self> {
+        Self::build(vb, false, config)
+    }
+
+    /// Build the standard encoder together with an independently configured decoder.
+    pub fn new_with_encoder_and_decoder_config(
+        vb: VarBuilder,
+        config: &Flux2VaeDecoderConfig,
+    ) -> Result<Self> {
+        Self::build(vb, true, config)
+    }
+
+    /// Full-topology synthetic fixtures only. Not a request/model capability or a runtime profile.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn from_fixture_widths(
+        vb: VarBuilder,
+        encoder_widths: [usize; 4],
+        decoder: &Flux2VaeDecoderConfig,
+    ) -> Result<Self> {
+        Self::build_profile(vb, true, decoder, encoder_widths)
+    }
+    fn build(vb: VarBuilder, with_encoder: bool, config: &Flux2VaeDecoderConfig) -> Result<Self> {
+        Self::build_profile(vb, with_encoder, config, BLOCK_OUT)
+    }
+    // Private geometry seam for the independent source encoder oracle. Public constructors
+    // retain the frozen standard encoder widths, independently of decoder configuration.
+    #[cfg(test)]
+    fn build_with_encoder_channels(
+        vb: VarBuilder,
+        with_encoder: bool,
+        config: &Flux2VaeDecoderConfig,
+        encoder_channels: &[usize; 4],
+    ) -> Result<Self> {
+        Self::build_profile(vb, with_encoder, config, *encoder_channels)
+    }
+    fn build_profile(
+        vb: VarBuilder,
+        with_encoder: bool,
+        config: &Flux2VaeDecoderConfig,
+        encoder_widths: [usize; 4],
+    ) -> Result<Self> {
+        Flux2VaeDecoderConfig {
+            block_out_channels: encoder_widths,
+        }
+        .validate()?;
+        config.validate()?;
         // bn stats live at the top level (packed 128-ch space).
         let bn_mean = vb.get(128, "bn.running_mean")?.reshape((1, 128, 1, 1))?;
         let bn_var = vb.get(128, "bn.running_var")?;
@@ -334,7 +507,7 @@ impl Flux2Vae {
         let post_quant_conv = conv1x1(LATENT_CHANNELS, LATENT_CHANNELS, vb.pp("post_quant_conv"))?;
 
         let dec = vb.pp("decoder");
-        let top = *BLOCK_OUT.last().unwrap(); // 512
+        let top = config.block_out_channels[3];
         let conv_in = conv3x3(LATENT_CHANNELS, top, dec.pp("conv_in"))?;
 
         let mid = dec.pp("mid_block");
@@ -343,7 +516,7 @@ impl Flux2Vae {
         let mid_resnet1 = Resnet::new(top, top, mid.pp("resnets").pp("1"))?;
 
         // Decoder up_blocks iterate the reversed block_out channels.
-        let reversed: Vec<usize> = BLOCK_OUT.iter().rev().copied().collect(); // [512,512,256,128]
+        let reversed: Vec<usize> = config.block_out_channels.iter().rev().copied().collect();
         let mut up_blocks = Vec::with_capacity(reversed.len());
         let mut prev = top;
         for (i, &out_c) in reversed.iter().enumerate() {
@@ -367,7 +540,7 @@ impl Flux2Vae {
         let conv_out = conv3x3(prev, 3, dec.pp("conv_out"))?;
 
         let encoder = if with_encoder {
-            let enc = Encoder::new(vb.pp("encoder"))?;
+            let enc = Encoder::new(vb.pp("encoder"), encoder_widths)?;
             let quant_conv = conv1x1(
                 2 * LATENT_CHANNELS,
                 2 * LATENT_CHANNELS,
@@ -441,7 +614,7 @@ impl Flux2Vae {
                 for block in &self.up_blocks {
                     h = block.forward(&h)?;
                 }
-                let h = self.conv_norm_out.forward(&h)?.silu()?;
+                let h = __model_proof_output!(self.conv_norm_out.forward(&h))?.silu()?;
                 self.conv_out.forward(&h)?.unsqueeze(2)
             },
         )?;
@@ -456,7 +629,7 @@ impl Flux2Vae {
         for ub in &self.up_blocks {
             h = ub.forward(&h)?;
         }
-        let h = self.conv_norm_out.forward(&h)?.silu()?;
+        let h = __model_proof_output!(self.conv_norm_out.forward(&h))?.silu()?;
         self.conv_out.forward(&h)
     }
 
@@ -548,7 +721,7 @@ impl Flux2Vae {
                 for block in &self.up_blocks {
                     h = block.forward(&h)?;
                 }
-                let h = self.conv_norm_out.forward(&h)?.silu()?;
+                let h = __model_proof_output!(self.conv_norm_out.forward(&h))?.silu()?;
                 self.conv_out.forward(&h)?.unsqueeze(2)
             },
         )?
@@ -617,6 +790,65 @@ mod tests {
 
     /// The 2×2 unpatchify channel/spatial order matches the fork's `c·4 + ph·2 + pw` pinning.
     #[test]
+    fn decoder_config_supports_asymmetric_widths_and_preserves_defaults() {
+        assert_eq!(
+            Flux2VaeDecoderConfig::default().block_out_channels,
+            BLOCK_OUT
+        );
+        Flux2VaeDecoderConfig {
+            block_out_channels: [96, 192, 384, 384],
+        }
+        .validate()
+        .unwrap();
+        for widths in [[0, 32, 32, 32], [16, 32, 32, 32]] {
+            assert!(Flux2VaeDecoderConfig {
+                block_out_channels: widths
+            }
+            .validate()
+            .is_err());
+        }
+        let config = Flux2VaeDecoderConfig {
+            block_out_channels: [32, 64, 96, 96],
+        };
+        let vae =
+            Flux2Vae::new_with_decoder_config(VarBuilder::zeros(DType::F32, &Device::Cpu), &config)
+                .unwrap();
+        assert!(vae.encoder.is_none());
+        let packed = Tensor::zeros((1, 128, 1, 1), DType::F32, &Device::Cpu).unwrap();
+        let image = vae.decode_packed(&packed).unwrap();
+        assert_eq!(image.dims(), &[1, 3, 16, 16]);
+    }
+
+    #[test]
+    fn decoder_config_rejects_checkpoint_width_mismatch() {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        for (key, shape) in [
+            ("bn.running_mean", vec![128]),
+            ("bn.running_var", vec![128]),
+            ("post_quant_conv.weight", vec![32, 32, 1, 1]),
+            ("post_quant_conv.bias", vec![32]),
+            ("decoder.conv_in.weight", vec![512, 32, 3, 3]),
+            ("decoder.conv_in.bias", vec![512]),
+        ] {
+            tensors.insert(
+                key.into(),
+                Tensor::zeros(shape, DType::F32, &Device::Cpu).unwrap(),
+            );
+        }
+        let config = Flux2VaeDecoderConfig {
+            block_out_channels: [96, 192, 384, 384],
+        };
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let error = Flux2Vae::new_with_decoder_config(vb, &config)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("decoder.conv_in.weight"), "{error}");
+        assert!(error.contains("384") && error.contains("512"), "{error}");
+    }
+
+    #[test]
     fn unpatchify_channel_spatial_order() {
         // Build [1, 8, 1, 1] where channel value = c*4+ph*2+pw for c4=2.
         let data: Vec<f32> = (0..8).map(|x| x as f32).collect();
@@ -643,3 +875,6 @@ mod tests {
         assert_eq!(back.flatten_all().unwrap().to_vec1::<f32>().unwrap(), data);
     }
 }
+
+#[cfg(test)]
+mod moss_edit_encoder_tests;

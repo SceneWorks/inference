@@ -2,13 +2,13 @@
 //!
 //! Two tests:
 //!
-//!  * [`trunk_matches_diffusers_tiny`] — DEFAULT (not `#[ignore]`d). Loads a SMALL, committed golden
+//!  * [`trunk_matches_diffusers_tiny`] — explicit model-proof workflow only. Loads a SMALL, committed golden
 //!    (`tests/fixtures/sana_transformer_golden.safetensors`, ~74 KB) produced by
 //!    `tools/dump_sana_transformer_golden.py`: a faithful random-init `SanaTransformer2DModel`
 //!    (ReLU linear self-attn + cross-attn + GLUMBConv Mix-FFN + adaLN-single + NoPE) at a reduced
 //!    dim/depth, plus its inputs and reference noise prediction. The Rust trunk loads those exact
-//!    weights and must reproduce the diffusers output. This keeps the parity gate reproducible in CI
-//!    without the ~1.6B-param real weights.
+//!    weights and must reproduce the diffusers output. The dedicated proof remains reproducible
+//!    without the ~1.6B-param real weights; ordinary CI compiles it but does not run inference.
 //!
 //!  * [`trunk_matches_diffusers_real`] — `#[ignore]`d, gated behind `SANA_TRANSFORMER_WEIGHTS` +
 //!    `SANA_TRANSFORMER_GOLDEN` (a large fp16 single-step golden from `--real`). Characterises
@@ -34,11 +34,13 @@ use crate::common::quantum_metal_guard;
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn sana_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
     const CHILD: &str = "SANA_QUANTUM_CPU_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--include-ignored",
                 "--exact",
                 "transformer_parity::sana_quantum_cpu_matches_lazy_and_refuses_low_headroom",
                 "--nocapture",
@@ -49,9 +51,9 @@ fn sana_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
         assert!(status.success());
         return;
     }
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
     assert!(quantum_metal_guard::forbid_metal());
     assert!(quantum_metal_guard::metal_forbidden());
-    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
     let golden = Weights::from_file(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/sana_transformer_golden.safetensors"
@@ -107,6 +109,8 @@ fn sana_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
         .unwrap_err()
         .to_string()
         .contains("before construction"));
+
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer_parity::sana_quantum_cpu_matches_lazy_and_refuses_low_headroom");
 }
 
 /// The SANA block floor is derived from the loaded block's actual GLUMBConv tensors and cross-head
@@ -114,18 +118,19 @@ fn sana_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
 /// expansion or head count produces a different scratch value here.
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks() {
     const CHILD: &str = "SANA_QUANTUM_GEOMETRY_CANCEL_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "transformer_parity::sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks", "--nocapture"])
+            .args(["--include-ignored", "--exact", "transformer_parity::sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks", "--nocapture"])
             .env(CHILD, "1").status().unwrap();
         assert!(status.success());
         return;
     }
     use mlx_gen::ios_quantum::QuantumEvent;
-    assert!(quantum_metal_guard::forbid_metal());
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    assert!(quantum_metal_guard::forbid_metal());
     let golden = Weights::from_file(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/sana_transformer_golden.safetensors"
@@ -252,6 +257,8 @@ fn sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks() {
         1,
         "a SANA block quantum ran after cancellation"
     );
+
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer_parity::sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks");
 }
 
 fn f32(x: &Array) -> Array {
@@ -282,6 +289,7 @@ fn weights_with_w_prefix(golden: &Weights) -> Weights {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn trunk_matches_diffusers_tiny() {
     let golden_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -311,6 +319,10 @@ fn trunk_matches_diffusers_tiny() {
         "mean_rel {mean} too high — that IS a port bug, not rounding"
     );
     assert!(peak < 5e-2, "peak_rel {peak} above the precision ceiling");
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer_parity::trunk_matches_diffusers_tiny");
 }
 
 /// SANA-Sprint **guidance-embed trunk** parity vs diffusers `SanaTransformer2DModel(guidance_embeds=
@@ -321,6 +333,7 @@ fn trunk_matches_diffusers_tiny() {
 /// config and run through `forward_with_guidance` must reproduce it — a wrong guidance-embed sum or
 /// missing qk-norm wrecks `mean_rel` by orders of magnitude. f32, so the bar is tight.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn sprint_trunk_matches_diffusers_tiny() {
     let golden_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -350,6 +363,12 @@ fn sprint_trunk_matches_diffusers_tiny() {
         "mean_rel {mean} too high — that IS a port bug in the guidance-embed / qk-norm path"
     );
     assert!(peak < 5e-2, "peak_rel {peak} above the precision ceiling");
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED transformer_parity::sprint_trunk_matches_diffusers_tiny"
+    );
 }
 
 #[test]
@@ -382,6 +401,10 @@ fn trunk_matches_diffusers_real() {
         mean < 3.4e-2,
         "mean_rel {mean} above the per-step drift band"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer_parity::trunk_matches_diffusers_real");
 }
 
 /// The Sprint sampler's latent evaluations happen inside guarded quanta (item: latent evals were
@@ -390,11 +413,13 @@ fn trunk_matches_diffusers_real() {
 /// and a refusal leaves the loop before any trunk work. Arithmetic is unchanged by the guards.
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn sprint_latent_evaluations_are_guarded_quanta() {
     const CHILD: &str = "SANA_SPRINT_LATENT_GUARD_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--include-ignored",
                 "--exact",
                 "transformer_parity::sprint_latent_evaluations_are_guarded_quanta",
                 "--nocapture",
@@ -406,8 +431,8 @@ fn sprint_latent_evaluations_are_guarded_quanta() {
         return;
     }
     use mlx_gen::ios_quantum::QuantumEvent;
-    assert!(quantum_metal_guard::forbid_metal());
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    assert!(quantum_metal_guard::forbid_metal());
     let sprint = Weights::from_file(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/sana_sprint_trunk_golden.safetensors"
@@ -487,4 +512,6 @@ fn sprint_latent_evaluations_are_guarded_quanta() {
     );
     let refused = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(step_scratch, run);
     assert!(refused.unwrap_err().to_string().contains("SANA SCM step"));
+
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer_parity::sprint_latent_evaluations_are_guarded_quanta");
 }

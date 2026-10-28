@@ -14,7 +14,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, zeros_dtype};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, LinearFacts};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, LinearFacts};
 use mlx_gen::nn::{gelu_exact, TextRope, TokenEmbedding};
 use mlx_gen::qkv::{self, AttnPrepSpec, QkNormSpec, QkvPart, RopeSpec, RopeStyle, RopeTables};
 
@@ -386,7 +386,12 @@ impl AnimaTextConditioner {
     /// Allowance for the lazy Qwen3 mask-multiply feeding `source_hidden`: the states, the cast
     /// mask broadcast and the product (three source-sized f32 buffers).
     pub(crate) fn mask_multiply_bytes(source_hidden: &Array) -> u64 {
-        mlx_gen::ios_quantum::elementwise_bytes(source_hidden.size() as u64, 3)
+        Self::mask_multiply_bytes_for(source_hidden.size() as u64)
+    }
+
+    /// [`Self::mask_multiply_bytes`] over `source_elements` Qwen3 state elements.
+    pub(crate) fn mask_multiply_bytes_for(source_elements: u64) -> u64 {
+        mlx_gen::ios_quantum::elementwise_bytes(source_elements, 3)
     }
 
     pub fn forward_weighted(
@@ -400,7 +405,7 @@ impl AnimaTextConditioner {
         let (b, ss) = (ssh[0], ssh[1]);
         let st = target_ids.shape()[1];
         let eb = crate::transformer::dtype_bytes(dtype);
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         // The entry quantum: its own counted body plus the caller's lazy Qwen3 mask-multiply
         // (states, cast mask, product), which is materialized in this quantum.
         mlx_gen::ios_quantum::before(
@@ -560,8 +565,8 @@ impl AnimaTextConditioner {
         }
     }
 
-    /// The blocks (the CPU proofs run one block's quantum body directly).
-    #[cfg(test)]
+    /// The blocks (the CPU proofs run one block's quantum body directly; the iOS pricing prices
+    /// each block's quantum).
     pub(crate) fn blocks(&self) -> &[Block] {
         &self.blocks
     }
@@ -621,6 +626,33 @@ impl AdaptableHost for Attention {
     }
 }
 
+/// Actual conditioner adapter namespace, shared by live enumeration and header-only facts.
+pub(crate) fn adapter_block_paths() -> Vec<String> {
+    let mut out = Vec::new();
+    for attention in ["self_attn", "cross_attn"] {
+        for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            out.push(format!("{attention}.{projection}"));
+        }
+    }
+    out.extend(["mlp.0".to_owned(), "mlp.2".to_owned()]);
+    out
+}
+const OUTPUT_ADAPTER_TARGET: &str = "out_proj";
+pub(crate) fn adapter_target_paths(blocks: usize, include_globals: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for index in 0..blocks {
+        out.extend(
+            adapter_block_paths()
+                .into_iter()
+                .map(|path| format!("blocks.{index}.{path}")),
+        );
+    }
+    if include_globals {
+        out.push(OUTPUT_ADAPTER_TARGET.into());
+    }
+    out
+}
+
 impl AdaptableHost for Block {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
@@ -633,12 +665,7 @@ impl AdaptableHost for Block {
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        out.extend(prefixed_paths("self_attn", &self.self_attn));
-        out.extend(prefixed_paths("cross_attn", &self.cross_attn));
-        out.push("mlp.0".to_string());
-        out.push("mlp.2".to_string());
-        out
+        adapter_block_paths()
     }
 }
 
@@ -652,17 +679,13 @@ impl AdaptableHost for AnimaTextConditioner {
                 .blocks
                 .get_mut(n.parse::<usize>().ok()?)?
                 .adaptable_mut(rest),
-            ["out_proj"] => Some(&mut self.out_proj),
+            [name] if *name == OUTPUT_ADAPTER_TARGET => Some(&mut self.out_proj),
             _ => None,
         }
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for (i, b) in self.blocks.iter().enumerate() {
-            out.extend(prefixed_paths(&format!("blocks.{i}"), b));
-        }
-        out
+        adapter_target_paths(self.blocks.len(), false)
     }
 }
 

@@ -31,6 +31,7 @@ fn vae() -> Flux2Vae {
 /// The Lens bounded decode must track the Lens dense decode. This is the inheritance proof: it
 /// fails if `decode_with_tiling` stops routing to the fixed FLUX.2 tail (or if that tail regresses
 /// to whole-tail tiling, which moves the same comparison by ~2e0 against this 3e-3 bound).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn lens_bounded_decode_tracks_the_dense_decode() {
     let vae = vae();
@@ -54,12 +55,15 @@ fn lens_bounded_decode_tracks_the_dense_decode() {
         delta < 3e-3,
         "Lens bounded decode diverged from its dense decode: max|delta|={delta:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_inheritance::lens_bounded_decode_tracks_the_dense_decode");
 }
 
 /// The tiling request must physically split this geometry, otherwise the assertion above would pass
 /// against an untiled fall-through and prove nothing. A tile edge wide enough to hold the whole
 /// output takes that fall-through and is therefore *exactly* equal — the mutation control that
 /// distinguishes "bounded and correct" from "never bounded".
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_bounded_request_actually_tiles_and_the_wide_request_does_not() {
     let vae = vae();
@@ -101,6 +105,8 @@ fn the_bounded_request_actually_tiles_and_the_wide_request_does_not() {
         plan.h.len(),
         plan.w.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_inheritance::the_bounded_request_actually_tiles_and_the_wide_request_does_not");
 }
 
 /// A pre-tripped cancel must be observed before any tensor work, on the Lens seam too.

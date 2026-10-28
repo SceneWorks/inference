@@ -112,6 +112,8 @@ fn connector_matches_reference() {
     eprintln!("connector peak_rel = {pr:.3e}");
     // f32 Rust vs f32 reference (both f64 rope → f32, f32 sdpa) → tight.
     assert!(pr < 5e-3, "connector peak_rel {pr:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED connector_parity::connector_matches_reference");
 }
 
 #[test]
@@ -155,4 +157,6 @@ fn audio_connector_matches_reference() {
         "audio connector valid-row peak_rel {pr_valid:.3e} too high"
     );
     assert!(pr < 1.2e-1, "audio connector peak_rel {pr:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED connector_parity::audio_connector_matches_reference");
 }

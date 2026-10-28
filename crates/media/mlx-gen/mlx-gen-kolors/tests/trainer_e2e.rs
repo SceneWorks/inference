@@ -181,6 +181,8 @@ fn kolors_trainer_trains_and_writes_lora_that_reloads() {
     assert_eq!(report.skipped_keys, 0, "no LoRA key should be skipped");
     forward_finite(&unet);
     println!("[kolors-lora] e2e OK — {n_targets} targets reload + merge, forward finite");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::kolors_trainer_trains_and_writes_lora_that_reloads");
 }
 
 #[test]
@@ -216,6 +218,8 @@ fn kolors_trainer_trains_and_writes_lokr_that_reloads() {
     assert_eq!(report.skipped_keys, 0, "no LoKr key should be skipped");
     forward_finite(&unet);
     println!("[kolors-lokr] e2e OK — {n_targets} targets reload + merge, forward finite");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::kolors_trainer_trains_and_writes_lokr_that_reloads");
 }
 
 /// sc-7781 — the `gradient_checkpointing` path (per-block recompute) trains end-to-end on Kolors too,
@@ -265,6 +269,8 @@ fn kolors_trainer_gradient_checkpointing_converges() {
     println!(
         "[kolors-gc] e2e OK — checkpointed training converged {first_q:.5} -> {last_q:.5}, reloads"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::kolors_trainer_gradient_checkpointing_converges");
 }
 
 /// A forward over the adapted Kolors U-Net produces a finite eps (the reloaded adapter installs +
@@ -351,4 +357,6 @@ fn kolors_trainer_emits_preview_samples() {
         "[kolors-samples] e2e OK — {} previews: {samples:?}",
         samples.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::kolors_trainer_emits_preview_samples");
 }

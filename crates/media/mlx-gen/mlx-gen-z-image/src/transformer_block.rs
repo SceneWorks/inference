@@ -12,7 +12,7 @@ use mlx_rs::{
 
 use crate::attention::ZImageAttention;
 use crate::feed_forward::FeedForward;
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
@@ -93,6 +93,11 @@ pub struct ZImageTransformerBlock {
 }
 
 impl ZImageTransformerBlock {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_storage_witness(&self) -> &Array {
+        &self.attention_norm1
+    }
+
     /// Load a block from weights under `prefix` (e.g. `"transformer.layers.0"`, or `"w"` for
     /// the standalone parity fixture). Keys mirror the Python `tree_flatten` layout.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: ZImageBlockConfig) -> Result<Self> {
@@ -315,6 +320,22 @@ pub(crate) fn dit_block_scratch(
     )
 }
 
+pub(crate) fn adapter_target_paths() -> Vec<String> {
+    let mut out = Vec::new();
+    out.push("adaLN_modulation.0".to_owned());
+    out.extend(
+        crate::attention::ADAPTER_TARGET_PATHS
+            .iter()
+            .map(|path| format!("attention.{path}")),
+    );
+    out.extend(
+        crate::feed_forward::ADAPTER_TARGET_PATHS
+            .iter()
+            .map(|path| format!("feed_forward.{path}")),
+    );
+    out
+}
+
 impl AdaptableHost for ZImageTransformerBlock {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
@@ -326,9 +347,6 @@ impl AdaptableHost for ZImageTransformerBlock {
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        let mut out = vec!["adaLN_modulation.0".to_string()];
-        out.extend(prefixed_paths("attention", &self.attention));
-        out.extend(prefixed_paths("feed_forward", &self.feed_forward));
-        out
+        adapter_target_paths()
     }
 }

@@ -20,10 +20,10 @@ const LN_EPS: f64 = 1e-5;
 /// GEGLU feed-forward: `proj` is `ff.net.0.proj` (`[2·inner, D]`), split into value/gate halves;
 /// `out` is `ff.net.2`. `value · gelu(gate) → out`.
 fn geglu(x: &Tensor, proj: &Linear, out: &Linear) -> Result<Tensor> {
-    let p = proj.forward(x)?; // [..., 2·inner]
+    let p = __model_proof_output!(proj.forward(x))?; // [..., 2·inner]
     let halves = p.chunk(2, D::Minus1)?;
     let y = (&halves[0] * halves[1].gelu_erf()?)?;
-    out.forward(&y)
+    __model_proof_output!(out.forward(&y))
 }
 
 /// Multi-head attention: bias-free q/k/v, biased `to_out.0`, no mask. `head_dim = inner/heads`,
@@ -69,9 +69,9 @@ impl Attention {
                 .transpose(1, 2)?
                 .contiguous()
         };
-        let q = split(self.q.forward(x)?, lq)?;
-        let k = split(self.k.forward(context)?, lk)?;
-        let v = split(self.v.forward(context)?, lk)?;
+        let q = split(__model_proof_output!(self.q.forward(x))?, lq)?;
+        let k = split(__model_proof_output!(self.k.forward(context))?, lk)?;
+        let v = split(__model_proof_output!(self.v.forward(context))?, lk)?;
         // The UNet defaults to f32 (fp16/bf16 only via `SVD_FORCE_*`), so `q·kᵀ` does not overflow in
         // VALUE as it would in fp16 — the scores + softmax stay in the module dtype. i32-overflow guard
         // (sc-9116): the self-attn scores `[B,H,Lq,Lk]` reach `8·16384² ≈ 3.4e9 > i32::MAX` at 1024²
@@ -88,7 +88,7 @@ impl Attention {
         )?
         .transpose(1, 2)?
         .reshape((b, lq, self.heads * self.head_dim))?;
-        self.out.forward(&o)
+        __model_proof_output!(self.out.forward(&o))
     }
 }
 
@@ -118,11 +118,11 @@ impl BasicBlock {
     }
 
     fn forward(&self, x: &Tensor, context: &Tensor) -> Result<Tensor> {
-        let y = self.norm1.forward(x)?;
+        let y = __model_proof_output!(self.norm1.forward(x))?;
         let x = (x + self.attn1.forward(&y, &y)?)?;
-        let y = self.norm2.forward(&x)?;
+        let y = __model_proof_output!(self.norm2.forward(&x))?;
         let x = (&x + self.attn2.forward(&y, context)?)?;
-        let y = self.norm3.forward(&x)?;
+        let y = __model_proof_output!(self.norm3.forward(&x))?;
         &x + geglu(&y, &self.ff_proj, &self.ff_out)?
     }
 }
@@ -174,13 +174,13 @@ impl TemporalBlock {
             .reshape((b * seq, num_frames, c))?
             .contiguous()?;
         let residual = h.clone();
-        let n = self.norm_in.forward(&h)?;
+        let n = __model_proof_output!(self.norm_in.forward(&h))?;
         let h = (geglu(&n, &self.ffin_proj, &self.ffin_out)? + residual)?; // is_res
-        let n = self.norm1.forward(&h)?;
+        let n = __model_proof_output!(self.norm1.forward(&h))?;
         let h = (self.attn1.forward(&n, &n)? + h)?;
-        let n = self.norm2.forward(&h)?;
+        let n = __model_proof_output!(self.norm2.forward(&h))?;
         let h = (self.attn2.forward(&n, context)? + h)?;
-        let n = self.norm3.forward(&h)?;
+        let n = __model_proof_output!(self.norm3.forward(&h))?;
         let h = (geglu(&n, &self.ff_proj, &self.ff_out)? + h)?;
         // back to [B·F, seq, C].
         h.reshape((b, seq, num_frames, c))?
@@ -270,7 +270,7 @@ impl TransformerSpatioTemporal {
         let n = self.norm.forward(x)?;
         // [B·F, C, H, W] → [B·F, seq, C] tokens.
         let tokens = n.reshape((bf, c, seq))?.transpose(1, 2)?.contiguous()?;
-        let mut tokens = self.proj_in.forward(&tokens)?;
+        let mut tokens = __model_proof_output!(self.proj_in.forward(&tokens))?;
 
         // Per-frame position embedding: arange(F) tiled over the batch. The sinusoidal is built in f32
         // and cast to the running dtype (the UNet defaults to f32, fp16/bf16 only via `SVD_FORCE_*`)
@@ -297,7 +297,7 @@ impl TransformerSpatioTemporal {
                 .add(&mix.broadcast_mul(&one_minus)?)?;
         }
 
-        let tokens = self.proj_out.forward(&tokens)?;
+        let tokens = __model_proof_output!(self.proj_out.forward(&tokens))?;
         // [B·F, seq, C] → [B·F, C, H, W].
         let out = tokens.transpose(1, 2)?.reshape((bf, c, h_, w_))?;
         out + residual

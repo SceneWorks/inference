@@ -74,6 +74,8 @@ fn fp16_unet_forward_within_f32_floor() {
     // fp16 carries ~3 decimal digits; one forward through the 4-stage spatiotemporal UNet stays at
     // the low-percent fp16 floor (the fused norm/SDPA reductions upcast internally).
     assert!(rel < 0.03, "fp16 UNet rel-L2 {rel} exceeds the fp16 floor");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fp16_fast_path::fp16_unet_forward_within_f32_floor");
 }
 
 #[test]
@@ -103,4 +105,6 @@ fn fp16_image_encoder_within_f32_floor() {
         rel < 0.02,
         "fp16 encoder rel-L2 {rel} exceeds the fp16 floor"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fp16_fast_path::fp16_image_encoder_within_f32_floor");
 }

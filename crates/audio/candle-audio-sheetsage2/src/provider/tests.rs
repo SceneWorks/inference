@@ -70,6 +70,7 @@ fn unload_releases_the_model_observably() {
 ///
 /// Mutation that must fail: a token limit one below the decoder context (`max_len - 1`).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn transcribe_reproduces_the_reference_and_builds_a_transcription() {
     let _serial = crate::test_lock();
     let transcriber = Transcriber::from_files(tiny_files(), tiny_identity(), &Device::Cpu).unwrap();
@@ -118,6 +119,9 @@ fn transcribe_reproduces_the_reference_and_builds_a_transcription() {
         reference["tokenizer"]["fingerprint"]
     );
     transcriber.unload();
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::transcribe_reproduces_the_reference_and_builds_a_transcription");
 }
 
 /// A generated sequence that does not decode is an error, never an empty transcription: the

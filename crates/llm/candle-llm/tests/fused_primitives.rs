@@ -14,6 +14,15 @@
 //! The `#[ignore]`d real-weight test is the story's AC2 as a test: Qwen3.8-27B greedy decode of the
 //! 256-token fixture, fused on vs off, token-identical.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_core::{DType, Device, Tensor};
 use candle_llm::primitives::{
     apply_rope, fused_kernels_enabled, fused_policy_guard, fused_tally, rms_norm,
@@ -311,7 +320,15 @@ mod cuda {
         let dev = candle_llm::device::select_device().expect("device");
         assert!(dev.is_cuda(), "the parity run needs the CUDA device");
         let config: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json")).unwrap())
+            serde_json::from_str(&candle_llm::__model_input_reader!(
+std::fs::read_to_string(snapshot.join("config.json")),
+"crates/llm/candle-llm/tests/fused_primitives.rs::qwen38_27b_greedy_decode_is_token_identical_fused_on_vs_off::std::fs::read_to_string@12806",
+Configuration,
+snapshot.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap())
                 .unwrap();
         let cfg = Qwen35Config::from_json(&config).expect("qwen3_5 config");
         let weights = Weights::from_dir(&snapshot, &dev).expect("weights");
@@ -324,7 +341,15 @@ mod cuda {
 
         let tokenizer =
             Tokenizer::from_file(snapshot.join("tokenizer.json")).expect("tokenizer.json");
-        let template = match std::fs::read_to_string(snapshot.join("chat_template.jinja")) {
+        let template = match candle_llm::__model_input_reader!(
+std::fs::read_to_string(snapshot.join("chat_template.jinja")),
+"crates/llm/candle-llm/tests/fused_primitives.rs::qwen38_27b_greedy_decode_is_token_identical_fused_on_vs_off::std::fs::read_to_string@13452",
+Tokenizer,
+snapshot.join("chat_template.jinja"),
+|__model_input_path| std::fs::read_to_string(__model_input_path),
+origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected,
+when = |__value: &String| !__value.trim().is_empty()
+) {
             Ok(source) if !source.trim().is_empty() => JinjaChatTemplate::new(source),
             _ => JinjaChatTemplate::from_tokenizer_config_file(
                 snapshot.join("tokenizer_config.json"),
@@ -393,5 +418,8 @@ mod cuda {
             "fused-on diverged from fused-off at token {first_divergence:?}"
         );
         assert_eq!(off, on);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda::qwen38_27b_greedy_decode_is_token_identical_fused_on_vs_off");
     }
 }

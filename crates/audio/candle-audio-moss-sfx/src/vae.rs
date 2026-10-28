@@ -114,7 +114,7 @@ impl DacDecoder {
     /// polled between decoder stages (the upsampling blocks dominate the cost) so a cancel
     /// lands mid-decode, per the audio-lane cancellation contract.
     pub fn decode(&self, z: &Tensor, cancel: &dyn Fn() -> bool) -> CandleResult<Option<Tensor>> {
-        let x = self.post_quant_conv.forward(z)?;
+        let x = __model_proof_output!(self.post_quant_conv.forward(z))?;
         Ok(match self.decoder.decode(&x, cancel)? {
             Some(x) => Some(x.tanh()?),
             None => None,

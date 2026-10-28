@@ -321,6 +321,7 @@ fn transparency_changes_both_consumers() {
 /// Subject extraction / transparent-layer editing is an ordinary reference call with an ordinary
 /// prompt (upstream ships no dedicated mode and no matting model), so this is the S3 end-to-end
 /// gate run with an alpha-carrying reference.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn transparent_layer_editing_matches_upstream_end_to_end() {
     let w = rgba_fixture();
@@ -432,6 +433,8 @@ fn transparent_layer_editing_matches_upstream_end_to_end() {
             IMAGE_TOL,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED rgba_parity::transparent_layer_editing_matches_upstream_end_to_end");
 }
 
 /// **Gate 4 — the request seam.** The transparent reference travels as
@@ -482,6 +485,7 @@ fn the_request_seam_carries_the_reference_alpha() {
 /// **The output surface, through the registry-facing generator contract.** `Rgba` on this
 /// provider yields `GenerationOutput::ImagesRgba`; the default still yields
 /// `GenerationOutput::Images`, and the two agree under the white composite.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_generator_emits_rgba_on_request_and_rgb_by_default() {
     // Through the catalog path a consumer actually uses, so the descriptor's
@@ -538,4 +542,6 @@ fn the_generator_emits_rgba_on_request_and_rgb_by_default() {
         .unwrap_or(0);
     println!("generator: RGB vs composited RGBA worst byte delta {worst}");
     assert!(worst <= COMPOSITE_LSB, "worst delta {worst}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED rgba_parity::the_generator_emits_rgba_on_request_and_rgb_by_default");
 }

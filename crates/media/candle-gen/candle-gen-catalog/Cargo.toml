@@ -14,6 +14,7 @@ candle-gen-chroma = { path = "../candle-gen-chroma" }
 candle-gen-clip = { path = "../candle-gen-clip" }
 candle-gen-flux = { path = "../candle-gen-flux" }
 candle-gen-flux2 = { path = "../candle-gen-flux2" }
+candle-gen-flux3 = { path = "../candle-gen-flux3" }
 candle-gen-depth = { path = "../candle-gen-depth" }
 candle-gen-face = { path = "../candle-gen-face" }
 candle-gen-ideogram = { path = "../candle-gen-ideogram" }
@@ -27,6 +28,7 @@ candle-gen-ltx = { path = "../candle-gen-ltx" }
 candle-gen-mage = { path = "../candle-gen-mage" }
 candle-gen-minimax-h3 = { path = "../candle-gen-minimax-h3" }
 candle-gen-mochi = { path = "../candle-gen-mochi" }
+candle-gen-moss-image = { path = "../candle-gen-moss-image" }
 candle-gen-pid = { path = "../candle-gen-pid" }
 candle-gen-pulid = { path = "../candle-gen-pulid" }
 candle-gen-qwen-image = { path = "../candle-gen-qwen-image" }
@@ -38,6 +40,7 @@ candle-gen-sd3 = { path = "../candle-gen-sd3" }
 candle-gen-sdxl = { path = "../candle-gen-sdxl" }
 candle-gen-seedvr2 = { path = "../candle-gen-seedvr2" }
 candle-gen-sensenova = { path = "../candle-gen-sensenova" }
+candle-gen-supra2 = { path = "../candle-gen-supra2" }
 candle-gen-svd = { path = "../candle-gen-svd" }
 candle-gen-wan = { path = "../candle-gen-wan" }
 candle-gen-z-image = { path = "../candle-gen-z-image" }
@@ -63,6 +66,7 @@ metal = [
     "candle-gen-ideogram/metal",
     "candle-gen-instantid/metal",
     "candle-gen-iris/metal",
+    "candle-gen-flux3/metal",
     "candle-gen-joycaption/metal",
     "candle-gen-kolors/metal",
     "candle-gen-krea/metal",
@@ -70,6 +74,7 @@ metal = [
     "candle-gen-ltx/metal",
     "candle-gen-minimax-h3/metal",
     "candle-gen-mochi/metal",
+    "candle-gen-moss-image/metal",
     "candle-gen-pid/metal",
     "candle-gen-pulid/metal",
     "candle-gen-qwen-image/metal",
@@ -81,6 +86,7 @@ metal = [
     "candle-gen-sdxl/metal",
     "candle-gen-seedvr2/metal",
     "candle-gen-sensenova/metal",
+    "candle-gen-supra2/metal",
     "candle-gen-svd/metal",
     "candle-gen-wan/metal",
     "candle-gen-z-image/metal",
@@ -99,6 +105,7 @@ cuda = [
     "candle-gen-ideogram/cuda",
     "candle-gen-instantid/cuda",
     "candle-gen-iris/cuda",
+    "candle-gen-flux3/cuda",
     "candle-gen-joycaption/cuda",
     "candle-gen-kolors/cuda",
     "candle-gen-krea/cuda",
@@ -107,6 +114,7 @@ cuda = [
     "candle-gen-mage/cuda",
     "candle-gen-minimax-h3/cuda",
     "candle-gen-mochi/cuda",
+    "candle-gen-moss-image/cuda",
     "candle-gen-pid/cuda",
     "candle-gen-pulid/cuda",
     "candle-gen-qwen-image/cuda",
@@ -118,6 +126,7 @@ cuda = [
     "candle-gen-sdxl/cuda",
     "candle-gen-seedvr2/cuda",
     "candle-gen-sensenova/cuda",
+    "candle-gen-supra2/cuda",
     "candle-gen-svd/cuda",
     "candle-gen-wan/cuda",
     "candle-gen-z-image/cuda",

@@ -11,6 +11,16 @@
 //! yields the reference envelope directly, and re-verifying it in-test means the gate's premise is
 //! re-checked rather than assumed.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::{Path, PathBuf};
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{
@@ -440,6 +450,9 @@ fn music_and_sfx_produce_materially_different_audio_from_the_same_prompt_and_see
          {MIN_RUNTIME_RMS_DELTA})",
         SEEDS.len()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED music_and_sfx_produce_materially_different_audio_from_the_same_prompt_and_seed");
 }
 
 /// The exact reference-derived number, at the DiT boundary where the frozen artifacts are directly
@@ -504,4 +517,7 @@ fn single_step_dit_divergence_matches_the_frozen_torch_reference() {
         "candle music-vs-SFX DiT divergence {observed} does not reproduce the frozen torch value {}",
         expected.dit_cosine
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED single_step_dit_divergence_matches_the_frozen_torch_reference");
 }

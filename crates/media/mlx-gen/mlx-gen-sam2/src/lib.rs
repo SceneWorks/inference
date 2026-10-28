@@ -34,3 +34,6 @@ pub use memory::{MemoryAttention, MemoryEncoder, MemoryEncoderOutput};
 pub use sam_heads::{MaskDecoder, PromptEncoder};
 pub use segmenter::Sam2Segmenter;
 pub use video_predictor::{Sam2VideoPredictor, VideoState};
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

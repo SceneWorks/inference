@@ -172,4 +172,6 @@ fn from_clean_runa() {
         save_png(&out, &png);
         eprintln!("[{name}] wrote {png}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED from_clean_decode::from_clean_runa");
 }

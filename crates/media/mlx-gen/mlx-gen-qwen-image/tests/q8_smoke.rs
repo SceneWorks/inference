@@ -13,6 +13,7 @@ fn rel(a: &Array, b: &Array) -> f64 {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn q8_forward_close_to_dense() {
     let key = random::key(0).unwrap();
     // (out, in) shapes spanning the transformer's Linears.
@@ -57,4 +58,6 @@ fn q8_forward_close_to_dense() {
         worst < 0.05,
         "some Q8 shape/dtype diverged: worst {worst:.4}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED q8_smoke::q8_forward_close_to_dense");
 }

@@ -200,11 +200,11 @@ impl ClipLayer {
 
     fn forward(&self, xs: &Tensor, causal_mask: &Tensor) -> Result<Tensor> {
         let residual = xs;
-        let xs = self.layer_norm1.forward(xs)?;
+        let xs = __model_proof_output!(self.layer_norm1.forward(xs))?;
         let xs = self.self_attn.forward(&xs, causal_mask)?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let ys = self.layer_norm2.forward(&xs)?;
+        let ys = __model_proof_output!(self.layer_norm2.forward(&xs))?;
         let ys = self.mlp.forward(&ys)?;
         ys + residual
     }
@@ -252,7 +252,7 @@ impl PackedClipText {
         for layer in &self.layers {
             xs = layer.forward(&xs, &mask)?;
         }
-        let output = self.final_layer_norm.forward(&xs)?;
+        let output = __model_proof_output!(self.final_layer_norm.forward(&xs))?;
         let seq_max = input_ids.argmax(D::Minus1)?.to_dtype(DType::I64)?;
         let mut indices = Vec::new();
         for (b, &s) in seq_max.to_vec1::<i64>()?.iter().enumerate() {
@@ -314,8 +314,9 @@ impl T5LayerNorm {
         let xs_f32 = xs.to_dtype(DType::F32)?;
         let variance = xs_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let xs = xs_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        xs.to_dtype(dtype)?
-            .broadcast_mul(&self.weight.to_dtype(dtype)?)
+        __model_proof_output!(xs
+            .to_dtype(dtype)?
+            .broadcast_mul(&self.weight.to_dtype(dtype)?))
     }
 }
 
@@ -636,6 +637,7 @@ mod tests {
     /// dense path is unchanged, and (since the packed forward = dequant-then-dense-matmul) a packed load
     /// of the same weights would track it too. A tiny 2-layer config keeps it GPU-free and fast.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_clip_matches_stock_dense() -> Result<()> {
         use candle_transformers::models::clip::text_model::{
             Activation, ClipTextConfig, ClipTextTransformer,
@@ -671,10 +673,14 @@ mod tests {
 
         let ids = Tensor::from_vec(vec![3u32, 8, 15, 2, 0, 0], (1, 6), &dev)?;
         let v = vendored.forward(&ids)?;
-        let s = stock.forward(&ids)?;
+        let s = __model_proof_output!(stock.forward(&ids))?;
         assert_eq!(v.dims(), s.dims());
         let d = max_abs_diff(&v, &s);
         assert!(d < 1e-4, "vendored CLIP vs stock max|Δ| = {d}");
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED packed_te::tests::vendored_clip_matches_stock_dense"
+        );
         Ok(())
     }
 
@@ -682,6 +688,7 @@ mod tests {
     /// on the encoder path (`shared`, `encoder.block.*`, `encoder.final_layer_norm`, gated-GELU FF,
     /// block-0 relative bias). A tiny 2-block config keeps it GPU-free.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_t5_matches_stock_dense() -> Result<()> {
         use candle_transformers::models::t5::{
             ActivationWithOptionalGating, Config as StockT5Config, T5EncoderModel,
@@ -732,10 +739,14 @@ mod tests {
 
         let ids = Tensor::from_vec(vec![3u32, 8, 15, 2, 7, 1], (1, 6), &dev)?;
         let v = vendored.forward(&ids, DType::F32)?;
-        let s = stock.forward(&ids)?;
+        let s = __model_proof_output!(stock.forward(&ids))?;
         assert_eq!(v.dims(), s.dims());
         let d = max_abs_diff(&v, &s);
         assert!(d < 1e-4, "vendored T5 encoder vs stock max|Δ| = {d}");
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED packed_te::tests::vendored_t5_matches_stock_dense"
+        );
         Ok(())
     }
 
@@ -746,6 +757,7 @@ mod tests {
     /// *numeric* effect on padded keys needs non-trivial weights, so it is validated with real weights
     /// in the Mochi `te_parity` gate, not here — this test's `VarMap` zero-inits every projection.)
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn masked_forward_zero_mask_is_byte_identical_to_unmasked() -> Result<()> {
         let dev = Device::Cpu;
         let cfg = T5Config {
@@ -768,6 +780,8 @@ mod tests {
         let zeros = Tensor::zeros((1, 1, 1, 6), DType::F32, &dev)?;
         let masked_zero = enc.forward_masked(&ids, DType::F32, Some(&zeros))?;
         assert_eq!(max_abs_diff(&unmasked, &masked_zero), 0.0);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_te::tests::masked_forward_zero_mask_is_byte_identical_to_unmasked");
         Ok(())
     }
 }

@@ -126,4 +126,6 @@ fn active_preview_emits_native_four_step_strip_without_changing_rgb() {
             && active.pixels == inert.pixels,
         "warm active preview changed RGB8 bytes"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED preview_real_weights::active_preview_emits_native_four_step_strip_without_changing_rgb");
 }

@@ -34,6 +34,7 @@ fn tiny_config() -> Qwen3TextEncoderConfig {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn qwen3_text_encoder_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
@@ -52,4 +53,6 @@ fn qwen3_text_encoder_matches_fork() {
         close(&out, want, 1e-2, 1e-2),
         "Qwen3 prompt_embeds diverged"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::qwen3_text_encoder_matches_fork");
 }

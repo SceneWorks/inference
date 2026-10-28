@@ -124,4 +124,7 @@ fn real_weight_vae_inplace_matches_snapshot() {
          bug (expected byte-identical: same weights, different key layout)"
     );
     println!("sc-10830 in-place VAE parity PASS ✅ (byte-identical decode)");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED comfyui_vae_validate::real_weight_vae_inplace_matches_snapshot");
 }

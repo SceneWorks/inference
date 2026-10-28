@@ -94,6 +94,7 @@ fn wan_trim_first_frames_runs_and_preserves_count() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_A14B_MODEL_DIR");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_trim_first_frames_runs_and_preserves_count; see preceding skip diagnostic");
             return;
         }
     };
@@ -105,4 +106,6 @@ fn wan_trim_first_frames_runs_and_preserves_count() {
         "trim_first_frames must preserve the output frame count"
     );
     assert!(n0 > 0, "no frames produced");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trim::wan_trim_first_frames_runs_and_preserves_count");
 }

@@ -95,6 +95,7 @@ fn max_abs(a: &Array, b: &Array) -> f32 {
 /// A deferred load must hold *no* materialized blocks. `resident_blocks()` is the observable, and it
 /// is separate from `num_layers()` on purpose: the forward still runs all of them.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_deferred_load_materializes_no_blocks() {
     let staged = tempfile::tempdir().unwrap();
     let cfg = stage_fixture(staged.path());
@@ -143,6 +144,7 @@ fn a_deferred_load_materializes_no_blocks() {
 /// driver must run two windows, and a plan that collapsed to one would make the equivalence above
 /// trivially true with the streaming gone.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn windowed_and_resident_stacks_agree() {
     let staged = tempfile::tempdir().unwrap();
     let cfg = stage_fixture(staged.path());
@@ -270,6 +272,8 @@ fn windowed_and_resident_stacks_agree() {
         short_delta > 1e-4,
         "mutation check: running one fewer block moved the metric only {short_delta:e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_window::windowed_and_resident_stacks_agree");
 }
 
 /// A stack cannot be both resident and streamed, and neither can it be neither.
@@ -277,6 +281,7 @@ fn windowed_and_resident_stacks_agree() {
 /// The failure this refuses is a deferred load that also kept its blocks: it would satisfy every
 /// output assertion, report itself as rung 4, and bound nothing.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_two_residency_modes_are_mutually_exclusive() {
     let staged = tempfile::tempdir().unwrap();
     stage_fixture(staged.path());
@@ -296,6 +301,7 @@ fn the_two_residency_modes_are_mutually_exclusive() {
 /// has to be windowed too. Compared table by table against `AdaLnCache::precompute`, which is the
 /// shipped resident path.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_windowed_adaln_precompute_matches_the_resident_one() {
     let staged = tempfile::tempdir().unwrap();
     let cfg = stage_fixture(staged.path());
@@ -361,6 +367,8 @@ fn the_windowed_adaln_precompute_matches_the_resident_one() {
             }
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_window::the_windowed_adaln_precompute_matches_the_resident_one");
 }
 
 /// **Every window must get its own view.** A stream that cached one and handed it out repeatedly
@@ -372,6 +380,7 @@ fn the_windowed_adaln_precompute_matches_the_resident_one() {
 /// if two `open()` calls returned the same map the second window would find block 0's tensors gone.
 /// A shared view therefore fails as a missing tensor, which is exactly the shape of the real defect.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn every_window_opens_an_independent_view() {
     let staged = tempfile::tempdir().unwrap();
     let cfg = stage_fixture(staged.path());
@@ -405,6 +414,7 @@ fn every_window_opens_an_independent_view() {
 /// Window sizes cover AC5's floor (1), a ragged tail (3 over 4 tapped layers), and the
 /// all-covering plan (4), so the boundary bookkeeping of `run_layers`' carried activation is
 /// exercised at every plan shape the scheduler can produce.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_windowed_te_matches_the_resident_one_on_the_fixture() {
     use mlx_gen_minimax_h3::text_encoder::MiniMaxH3TextEncoder;
@@ -455,6 +465,8 @@ fn the_windowed_te_matches_the_resident_one_on_the_fixture() {
         MiniMaxH3TextEncoder::from_dir_deferred(staged.path(), "language_model", &cfg).unwrap();
     let err = deferred.forward(&ids, &mask).unwrap_err().to_string();
     assert!(err.contains("set_block_window"), "{err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_window::the_windowed_te_matches_the_resident_one_on_the_fixture");
 }
 
 /// **`from_dir_deferred` must MATERIALIZE the token table, not merely map it** (sc-17153).

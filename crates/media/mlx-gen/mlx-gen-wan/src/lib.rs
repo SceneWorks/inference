@@ -724,3 +724,10 @@ mod explicit_registry_tests {
         assert_eq!(peak(super::MODEL_ID, 9), Some(126_812_160));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;
+
+mod ios_build_identity;
+#[doc(hidden)]
+pub use ios_build_identity::IOS_ENGINEERING_FEATURES_SUPPORTED;

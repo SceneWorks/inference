@@ -68,7 +68,8 @@ fn init_image(g: &Weights, w: u32, h: u32) -> Image {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + img2img golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + img2img golden"]
 fn img2img_components_match_reference() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let seed: u64 = g.metadata("seed").unwrap().parse().unwrap();
@@ -83,7 +84,12 @@ fn img2img_components_match_reference() {
     let sampler = EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, DT).unwrap();
 
     // x_0 = VAE-encode mean of the preprocessed init.
-    let x0 = encode_init_latents(&vae, &image, w, h).unwrap();
+    let x0 = (
+        crate::common::record_model_inference_device(),
+        encode_init_latents(&vae, &image, w, h),
+    )
+        .1
+        .unwrap();
     let pr_x0 = peak_rel(&x0, g.require("x0_mean").unwrap());
 
     // x_t = add_noise(x_0, max_time·strength) — the first RNG draw (#0).
@@ -102,17 +108,26 @@ fn img2img_components_match_reference() {
             Some(g.metadata("negative").unwrap()),
         )
         .unwrap();
-    let (cond, pooled) = encode_conditioning(
-        &load_text_encoder_1_dtype(&snap, DT).unwrap(),
-        &load_text_encoder_2_dtype(&snap, DT).unwrap(),
-        &tokens,
+    let (cond, pooled) = (
+        crate::common::record_model_inference_device(),
+        encode_conditioning(
+            &load_text_encoder_1_dtype(&snap, DT).unwrap(),
+            &load_text_encoder_2_dtype(&snap, DT).unwrap(),
+            &tokens,
+        ),
     )
-    .unwrap();
+        .1
+        .unwrap();
     let time_ids = text_time_ids(pooled.shape()[0]);
     let unet = load_unet_dtype(&snap, DT).unwrap();
     let s0 = g.require("step0_latents").unwrap();
     let xu = mlx_rs::ops::concatenate_axis(&[s0, s0], 0).unwrap();
-    let eps = unet.forward(&xu, ts[1], &cond, &pooled, &time_ids).unwrap();
+    let eps = (
+        crate::common::record_model_inference_device(),
+        unet.forward(&xu, ts[1], &cond, &pooled, &time_ids),
+    )
+        .1
+        .unwrap();
     let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0).unwrap();
     let (et, en) = (row(0), row(1));
     let cfg_s = mlx_gen::array::scalar(cfg).as_dtype(et.dtype()).unwrap();
@@ -143,10 +158,15 @@ fn img2img_components_match_reference() {
         "img2img step-1 eps diverged: {pr_eps:.3e} (sc-12896 bound)"
     );
     println!("✓ img2img init pipeline (encode + add_noise + eps) matches the reference within the sc-12896 cross-stack bounds");
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::img2img_components_match_reference"
+    );
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + img2img golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + img2img golden"]
 fn img2img_matches_vendored() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let seed: u64 = g.metadata("seed").unwrap().parse().unwrap();
@@ -176,7 +196,12 @@ fn img2img_matches_vendored() {
         }],
         ..Default::default()
     };
-    let out = model.generate(&req, &mut |_| {}).unwrap();
+    let out = (
+        crate::common::record_model_inference_device(),
+        model.generate(&req, &mut |_| {}),
+    )
+        .1
+        .unwrap();
     let img = match out {
         GenerationOutput::Images(mut v) => v.pop().unwrap(),
         other => panic!("expected Images, got {other:?}"),
@@ -216,6 +241,8 @@ fn img2img_matches_vendored() {
         "SDXL img2img lost pixel-parity: {:.3}% px>8",
         px8 * 100.0
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::img2img_matches_vendored");
 }
 
 /// Regression (Codex adversarial review): img2img at strength 0.0 must return a clean image, not a
@@ -223,7 +250,8 @@ fn img2img_matches_vendored() {
 /// ancestral `σ_up = sqrt(σ_prev²·(σ²−σ_prev²)/σ²)` divides 0/0 → NaN. Faithful behaviour (matching
 /// the reference's `int(steps·strength)` = 0 steps) returns the VAE round-trip of the init image.
 #[test]
-#[ignore = "needs the real SDXL snapshot + img2img golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + img2img golden"]
 fn img2img_strength_zero_returns_clean_init() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let seed: u64 = g.metadata("seed").unwrap().parse().unwrap();
@@ -252,7 +280,12 @@ fn img2img_strength_zero_returns_clean_init() {
         }],
         ..Default::default()
     };
-    let out = model.generate(&req, &mut |_| {}).unwrap();
+    let out = (
+        crate::common::record_model_inference_device(),
+        model.generate(&req, &mut |_| {}),
+    )
+        .1
+        .unwrap();
     let img = match out {
         GenerationOutput::Images(mut v) => v.pop().unwrap(),
         other => panic!("expected Images, got {other:?}"),
@@ -267,4 +300,6 @@ fn img2img_strength_zero_returns_clean_init() {
         "✓ strength-0 img2img returned a clean {}x{} init render",
         img.width, img.height
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::img2img_strength_zero_returns_clean_init");
 }

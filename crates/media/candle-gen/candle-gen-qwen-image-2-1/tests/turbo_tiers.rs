@@ -235,6 +235,7 @@ fn profile() -> gen_core_testkit::Profile {
 /// selector, holds the bf16 VAE at the lane's compute dtype, renders over the eight sigmas its
 /// own `model_index.json` saves, and passes the generator contract under both residency policies.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn turbo_tiers_load_and_render_under_the_turbo_id() {
     let source = turbo_snapshot();
     let tmp = tempfile::tempdir().unwrap();
@@ -304,6 +305,9 @@ fn turbo_tiers_load_and_render_under_the_turbo_id() {
         mean_by_tier[1],
         mean_by_tier[0]
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_tiers::turbo_tiers_load_and_render_under_the_turbo_id");
 }
 
 /// **The schedule is the tier's own.** A tier whose `model_index.json` saves a different list
@@ -313,6 +317,7 @@ fn turbo_tiers_load_and_render_under_the_turbo_id() {
 /// *Mutation that reds this:* the Turbo load reading a constant sigma list instead of the
 /// snapshot's.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_turbo_tier_renders_over_the_sigmas_its_own_model_index_saves() {
     let other = [1.0, 0.9, 0.7, 0.4, 0.1];
     let source = turbo_snapshot_with(&other);
@@ -325,6 +330,9 @@ fn a_turbo_tier_renders_over_the_sigmas_its_own_model_index_saves() {
     assert_eq!(pixels, render_over(&root, &plus_zero(&other)));
     // The control: the same tier's components over the released eight is a different picture.
     assert_ne!(pixels, render_over(&root, &plus_zero(&TURBO_SAMPLE_SIGMAS)));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_tiers::a_turbo_tier_renders_over_the_sigmas_its_own_model_index_saves");
 }
 
 // ── refusals ─────────────────────────────────────────────────────────────────────────────────────

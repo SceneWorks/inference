@@ -75,6 +75,7 @@ fn color_mask(w: usize, h: usize, split: usize) -> Image {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn missing_reference_errors() {
     // load() only needs an existing dir (config.json is optional → defaults) and no sealed memory
@@ -104,6 +105,8 @@ fn missing_reference_errors() {
         msg.contains("Reference"),
         "expected a Reference-required error, got: {msg}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_smoke::missing_reference_errors");
 }
 
 /// Run the full pipeline once for one driving mode (`replace=false` → animation,
@@ -208,12 +211,16 @@ fn run_mode(label: &str, replace: bool, quant: Option<Quant>) {
 #[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
 fn generate_animation_smoke() {
     run_mode("animation/bf16", false, None);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_smoke::generate_animation_smoke");
 }
 
 #[test]
 #[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
 fn generate_replacement_smoke() {
     run_mode("replacement/bf16", true, None);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_smoke::generate_replacement_smoke");
 }
 
 // Load-time DiT quantization (sc-5445): the same e2e path with Q4 (the SceneWorks worker default)
@@ -223,16 +230,22 @@ fn generate_replacement_smoke() {
 #[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
 fn generate_animation_q4_smoke() {
     run_mode("animation/Q4", false, Some(Quant::Q4));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_smoke::generate_animation_q4_smoke");
 }
 
 #[test]
 #[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
 fn generate_replacement_q4_smoke() {
     run_mode("replacement/Q4", true, Some(Quant::Q4));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_smoke::generate_replacement_q4_smoke");
 }
 
 #[test]
 #[ignore = "real ~46 GB snapshot; run with --ignored on macOS (see module doc)"]
 fn generate_animation_q8_smoke() {
     run_mode("animation/Q8", false, Some(Quant::Q8));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generate_smoke::generate_animation_q8_smoke");
 }

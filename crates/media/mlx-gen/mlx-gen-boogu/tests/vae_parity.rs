@@ -57,6 +57,8 @@ fn vae_decode_matches_reference() {
         c > 0.999,
         "VAE decode parity cosine {c} too low — structural mismatch"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::vae_decode_matches_reference");
 }
 
 #[test]
@@ -80,4 +82,6 @@ fn vae_encode_matches_reference() {
         c > 0.999,
         "VAE encode parity cosine {c} too low — structural mismatch"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::vae_encode_matches_reference");
 }

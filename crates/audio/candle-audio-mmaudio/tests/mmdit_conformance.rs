@@ -35,6 +35,16 @@
 //! inference never self-fetches and never derives a hub-cache location (epic 13657). There is no
 //! hub fallback.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 mod common;
 
 use candle_audio_mmaudio as m;
@@ -118,6 +128,9 @@ fn mmdit_flow_shape_finite_deterministic() {
         a.iter().cloned().fold(f32::INFINITY, f32::min),
         a.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mmdit_flow_shape_finite_deterministic");
 }
 
 #[test]
@@ -149,6 +162,9 @@ fn mmdit_sample_shape_finite_deterministic() {
         a.iter().cloned().fold(f32::INFINITY, f32::min),
         a.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mmdit_sample_shape_finite_deterministic");
 }
 
 #[test]
@@ -197,4 +213,7 @@ fn mmdit_matches_reference() {
         "sample relative max-abs-diff {} too large",
         s_mad / ref_absmax
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED mmdit_matches_reference");
 }

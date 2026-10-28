@@ -28,6 +28,16 @@
 //! Whisper *source* repository) at an immutable commit, never a mutable ref. **No Python at
 //! runtime.**
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 pub use candle_audio;
 pub use candle_audio::gen_core;
 

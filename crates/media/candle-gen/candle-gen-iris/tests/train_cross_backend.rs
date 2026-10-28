@@ -130,14 +130,22 @@ fn check_trained_elsewhere(backend: &str) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn mlx_trained_artifacts_load_and_match_on_candle() {
     check_trained_elsewhere("mlx");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_cross_backend::mlx_trained_artifacts_load_and_match_on_candle");
 }
 
 /// The Candle-produced fixtures still load here (and their recorded forward is this backend's).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn candle_trained_fixtures_match_their_recorded_forward() {
     check_trained_elsewhere("candle");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_cross_backend::candle_trained_fixtures_match_their_recorded_forward");
 }
 
 /// Producer of `fixtures/cross-backend/candle/` (run once on purpose, never in CI):
@@ -224,4 +232,9 @@ fn produce_cross_backend_fixtures() {
     let list: Vec<(&str, &Tensor)> = forwards.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let meta: HashMap<String, String> = [("backend".to_string(), "candle".to_string())].into();
     safetensors::serialize_to_file(list, Some(meta), &out.join("forward.safetensors")).unwrap();
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train_cross_backend::produce_cross_backend_fixtures"
+    );
 }

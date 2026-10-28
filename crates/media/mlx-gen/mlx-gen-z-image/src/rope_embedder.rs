@@ -33,6 +33,15 @@ impl RopeEmbedder {
         Self { tables }
     }
 
+    /// The tables' allocated bytes (resident beside the DiT's weights; the iOS pricing's DiT
+    /// residency).
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.tables
+            .iter()
+            .map(|t| mlx_gen::ios_quantum::allocated_bytes(t.nbytes() as u64))
+            .sum()
+    }
+
     /// `ids`: `(N, n_axes)` int32 position ids → `(N, Σ axes_dims / 2, 2)`.
     pub fn forward(&self, ids: &Array) -> Result<Array> {
         let n = ids.shape()[0] as usize;

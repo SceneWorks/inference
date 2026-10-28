@@ -42,9 +42,9 @@ impl SoftNorm {
     }
 
     pub fn encode(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x
+        let x = __model_proof_output!(x
             .broadcast_mul(&self.scaling_factor)?
-            .broadcast_add(&self.bias)?;
+            .broadcast_add(&self.bias))?;
         match &self.running_std {
             Some(std) => x.broadcast_div(std),
             None => Ok(x),
@@ -148,6 +148,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn varmap_initialization_matches_upstream_constants() {
         let dev = Device::Cpu;
         let vars = VarMap::new();
@@ -174,5 +175,8 @@ mod tests {
                 .unwrap(),
             vec![1.0]
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED softnorm::tests::varmap_initialization_matches_upstream_constants");
     }
 }

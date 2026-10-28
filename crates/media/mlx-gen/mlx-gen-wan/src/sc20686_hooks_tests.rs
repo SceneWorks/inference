@@ -80,6 +80,7 @@ fn of(events: &[Value], phase: &str) -> Vec<Value> {
         .collect()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_cross_kv_hooks_are_inert_off_and_bit_identical_on() {
     let cfg = tiny_cfg();
@@ -178,6 +179,8 @@ fn wan_cross_kv_hooks_are_inert_off_and_bit_identical_on() {
         metadata["geometry"]["sq"],
         (grid.0 * grid.1 * grid.2) as u64
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline::sc20686_hooks_tests::wan_cross_kv_hooks_are_inert_off_and_bit_identical_on");
 }
 
 /// The tiny golden VACE transformer (4 main + 2 VACE blocks, f32) with its latent, control and
@@ -221,6 +224,7 @@ fn tiny_vace() -> (crate::vace::WanVaceTransformer, Array, Array, Array) {
     (transformer, init, control, context)
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vace_text_kv_is_recomputed_and_hooks_are_bit_identical() {
     let (transformer, init, control, context) = tiny_vace();
@@ -278,12 +282,15 @@ fn vace_text_kv_is_recomputed_and_hooks_are_bit_identical() {
         2 * 4 * skv * 16 * 4,
         "2·B·H·Skv·D·f32 for the recomputed text K/V"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline::sc20686_hooks_tests::vace_text_kv_is_recomputed_and_hooks_are_bit_identical");
 }
 
 /// SC-20686: the product feeds Wan-VACE each CFG branch's prompt zero-padded to `text_len` (512),
 /// as the reference does, so every recomputed text K/V slice spans 512 tokens on both branches even
 /// though the prompts differ in length; the bound `skv` is that length (never the context width the
 /// 2-D product shape once yielded), and every projection records its own live dtype.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vace_padded_branches_recompute_512_token_slices_and_record_each_dtype() {
     let (transformer, init, control, context) = tiny_vace();
@@ -341,8 +348,11 @@ fn vace_padded_branches_recompute_512_token_slices_and_record_each_dtype() {
         metrics["current_read_transient_bytes"],
         2 * 4 * 512 * 16 * 4
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline::sc20686_hooks_tests::vace_padded_branches_recompute_512_token_slices_and_record_each_dtype");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_sequential_expert_swap_is_its_own_load_window_and_windows_stay_unique() {
     let cfg = tiny_cfg();
@@ -411,4 +421,6 @@ fn a_sequential_expert_swap_is_its_own_load_window_and_windows_stay_unique() {
         .map(|(_, index)| *index)
         .collect();
     assert_eq!(steps, vec![1, 2, 3, 4], "{windows:?}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline::sc20686_hooks_tests::a_sequential_expert_swap_is_its_own_load_window_and_windows_stay_unique");
 }

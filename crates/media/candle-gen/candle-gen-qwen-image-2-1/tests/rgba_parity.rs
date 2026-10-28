@@ -342,6 +342,7 @@ fn transparency_changes_both_consumers() {
 /// prompt (upstream ships no dedicated mode and no matting model), so this is the end-to-end gate
 /// run with an alpha-carrying reference.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn transparent_layer_editing_matches_upstream_end_to_end() {
     let w = rgba_fixture();
     let snap = snapshot();
@@ -457,6 +458,9 @@ fn transparent_layer_editing_matches_upstream_end_to_end() {
             IMAGE_TOL,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rgba_parity::transparent_layer_editing_matches_upstream_end_to_end");
 }
 
 /// **Gate 4 — the request seam.** The transparent reference travels as
@@ -508,6 +512,7 @@ fn the_request_seam_carries_the_reference_alpha() {
 /// provider yields `GenerationOutput::ImagesRgba`; the default still yields
 /// `GenerationOutput::Images`, and the two agree under the white composite.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_generator_emits_rgba_on_request_and_rgb_by_default() {
     // Through the catalog path a consumer actually uses, so the descriptor's
     // `supports_alpha_output` and the shared request floor are both in the loop.
@@ -563,4 +568,7 @@ fn the_generator_emits_rgba_on_request_and_rgb_by_default() {
         .unwrap_or(0);
     eprintln!("generator: RGB vs composited RGBA worst byte delta {worst}");
     assert!(worst <= COMPOSITE_LSB, "worst delta {worst}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rgba_parity::the_generator_emits_rgba_on_request_and_rgb_by_default");
 }

@@ -6,6 +6,7 @@
 mod block;
 mod controlnet;
 mod embeddings;
+pub(crate) mod pricing;
 mod resnet;
 // `pub(crate)` for ladder rung 4: `crate::block_stream` names `TransformerBlock` so it can rebuild
 // one with the SAME constructor the resident stack used (SC-16355).
@@ -26,7 +27,8 @@ use mlx_gen::Result;
 
 use crate::config::UNetConfig;
 use block::{BlockSpec, UNetBlock2D};
-use embeddings::{text_time_temb, SinusoidalPositionalEncoding, TimestepEmbedding};
+pub(crate) use embeddings::SinusoidalPositionalEncoding;
+use embeddings::{text_time_temb, TimestepEmbedding};
 pub use transformer::Transformer2D;
 
 // Shared with the VAE (the vendored VAE reuses the UNet `ResnetBlock2D` without a time embedding).
@@ -98,23 +100,37 @@ pub(crate) fn stem_bytes(
     extra_out: u64,
     backend: crate::quantum::Backend,
 ) -> u64 {
-    let call =
-        crate::quantum::ConvCall::new(x.shape(), crate::quantum::element_bytes(x), conv_in, 1, 1);
-    let conv = crate::quantum::single_conv_bytes(&call, 0, extra_out, backend);
-    let e = encoder_x.shape();
-    let context = encoder_hid_proj.map_or(0, |proj| {
-        (e[0].max(0) as u64)
-            .saturating_mul(e[1].max(0) as u64)
-            .saturating_mul(crate::quantum::linear_out(proj))
-            .saturating_mul(crate::quantum::element_bytes(encoder_x))
-    });
-    let temb_width = 4 * crate::quantum::conv_channels(conv_in).1.max(0) as u64;
-    let temb =
-        mlx_gen::ios_quantum::elementwise_bytes((e[0].max(0) as u64).saturating_mul(temb_width), 8);
-    let upstream = mlx_gen::ios_quantum::elementwise_bytes(x.size() as u64, 3);
-    conv.saturating_add(context)
-        .saturating_add(temb)
-        .saturating_add(upstream)
+    stem_work_bytes(
+        x,
+        encoder_x,
+        &crate::quantum::ConvWork {
+            weight: mlx_gen::adapters::facts::TensorFacts::of(conv_in),
+            bias: None,
+        },
+        encoder_hid_proj,
+        extra_out,
+        backend,
+    )
+}
+
+fn stem_work_bytes(
+    x: &Array,
+    encoder_x: &Array,
+    conv_in: &crate::quantum::ConvWork,
+    encoder_hid_proj: Option<&AdaptableLinear>,
+    extra_out: u64,
+    backend: crate::quantum::Backend,
+) -> u64 {
+    pricing::stem_work_bytes(
+        &crate::quantum::activation_facts(x),
+        &crate::quantum::activation_facts(encoder_x),
+        conv_in,
+        encoder_hid_proj
+            .map(crate::quantum::LinearWork::of)
+            .as_ref(),
+        extra_out,
+        backend,
+    )
 }
 
 /// Transpose a stored NCHW conv weight `[out, in, kH, kW]` to mlx's NHWC `[out, kH, kW, in]`.
@@ -131,6 +147,102 @@ pub(crate) fn cast_array(a: &mut Array, dtype: mlx_rs::Dtype) -> Result<()> {
         *a = a.as_dtype(dtype)?;
     }
     Ok(())
+}
+
+/// Pure production block selector, shared by model construction and header target enumeration.
+fn adapter_block_spec<'a>(
+    cfg: &UNetConfig,
+    index: usize,
+    up: bool,
+    prefix: &'a str,
+) -> BlockSpec<'a> {
+    let n = cfg.num_blocks();
+    let ci = if up { n - 1 - index } else { index };
+    BlockSpec {
+        prefix,
+        num_resnets: cfg.layers_per_block[ci] + i32::from(up),
+        out_channels: cfg.block_out_channels[ci],
+        num_heads: cfg.num_attention_heads[ci],
+        transformer_layers: cfg.transformer_layers_per_block[ci],
+        add_cross_attention: if up {
+            cfg.up_block_types[ci].contains("CrossAttn")
+        } else {
+            cfg.down_block_types[ci].contains("CrossAttn")
+        },
+        add_downsample: !up && index < n - 1,
+        add_upsample: up && ci > 0,
+    }
+}
+
+/// Header-only counterpart of the actual constructed target topology. Block selection and leaf
+/// name producers are SHARED with construction/runtime enumeration; no model/Array is created.
+/// Returns (vendored Linear, complete Linear, convolution) paths in runtime enumeration order.
+pub(crate) fn adapter_target_paths_from_headers(
+    cfg: &UNetConfig,
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let names: std::collections::BTreeSet<&str> = headers.iter().map(|h| h.name.as_str()).collect();
+    let mut vendored = Vec::new();
+    let mut feed_forward = Vec::new();
+    let mut down_convs = Vec::new();
+    let mut up_convs = Vec::new();
+    let resnet = |prefix: &str, linear: &mut Vec<String>, conv: &mut Vec<String>| {
+        // These are precisely ResnetBlock2D::from_weights' optional source selectors, including
+        // the packed time projection and the dense 1x1 shortcut represented as a Linear.
+        let time = names.contains(format!("{prefix}.time_emb_proj.weight").as_str())
+            || names.contains(format!("{prefix}.time_emb_proj.scales").as_str());
+        let shortcut = names.contains(format!("{prefix}.conv_shortcut.weight").as_str());
+        ResnetBlock2D::append_lora_target_paths(prefix, time, linear);
+        ResnetBlock2D::append_conv_target_paths(prefix, shortcut, conv);
+    };
+    for up in [false, true] {
+        for index in 0..cfg.num_blocks() {
+            let prefix = format!("{}_blocks.{index}", if up { "up" } else { "down" });
+            let spec = adapter_block_spec(cfg, index, up, &prefix);
+            let conv = if up { &mut up_convs } else { &mut down_convs };
+            for j in 0..spec.num_resnets {
+                resnet(&format!("{prefix}.resnets.{j}"), &mut vendored, conv);
+            }
+            if spec.add_cross_attention {
+                for j in 0..spec.num_resnets {
+                    let prefix = format!("{prefix}.attentions.{j}");
+                    let depth = spec.transformer_layers.max(0) as usize;
+                    Transformer2D::append_lora_target_paths(&prefix, depth, &mut vendored);
+                    Transformer2D::append_lora_target_paths_ff(&prefix, depth, &mut feed_forward);
+                }
+            }
+            if spec.add_downsample {
+                conv.push(format!("{prefix}.downsamplers.0.conv"));
+            }
+            if spec.add_upsample {
+                conv.push(format!("{prefix}.upsamplers.0.conv"));
+            }
+        }
+    }
+    let mut complete = vendored.clone();
+    let mut mid_convs = Vec::new();
+    resnet("mid_block.resnets.0", &mut complete, &mut mid_convs);
+    let depth = cfg
+        .transformer_layers_per_block
+        .last()
+        .copied()
+        .unwrap_or(0)
+        .max(0) as usize;
+    Transformer2D::append_lora_target_paths("mid_block.attentions.0", depth, &mut complete);
+    resnet("mid_block.resnets.1", &mut complete, &mut mid_convs);
+    // Runtime's complete order is down FF, mid FF, up FF (not down+up then mid).
+    let first_up = feed_forward
+        .iter()
+        .position(|p| p.starts_with("up_blocks."))
+        .unwrap_or(feed_forward.len());
+    complete.extend_from_slice(&feed_forward[..first_up]);
+    Transformer2D::append_lora_target_paths_ff("mid_block.attentions.0", depth, &mut complete);
+    complete.extend_from_slice(&feed_forward[first_up..]);
+    let mut convs = vec!["conv_in".into(), "conv_out".into()];
+    convs.extend(down_convs);
+    convs.extend(mid_convs);
+    convs.extend(up_convs);
+    (vendored, complete, convs)
 }
 
 /// The SDXL conditional U-Net.
@@ -165,24 +277,13 @@ impl UNet2DConditionModel {
         let boc = &cfg.block_out_channels;
         let temb_dim_src = boc[0]; // sinusoidal timestep width
 
-        // Down blocks: block i goes block_channels[i] -> block_channels[i+1].
+        // The same pure block selector drives header-only adapter target enumeration.
         let mut down_blocks = Vec::with_capacity(n);
-        // `i` indexes five parallel config arrays + the block prefix, not just `boc` — an
-        // `enumerate()` rewrite would be strictly worse here.
-        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
+            let prefix = format!("down_blocks.{i}");
             down_blocks.push(UNetBlock2D::from_weights(
                 w,
-                &BlockSpec {
-                    prefix: &format!("down_blocks.{i}"),
-                    num_resnets: cfg.layers_per_block[i],
-                    out_channels: boc[i],
-                    num_heads: cfg.num_attention_heads[i],
-                    transformer_layers: cfg.transformer_layers_per_block[i],
-                    add_cross_attention: cfg.down_block_types[i].contains("CrossAttn"),
-                    add_downsample: i < n - 1,
-                    add_upsample: false,
-                },
+                &adapter_block_spec(cfg, i, false, &prefix),
             )?);
         }
 
@@ -197,23 +298,12 @@ impl UNet2DConditionModel {
         )?;
         let mid_resnet1 = ResnetBlock2D::from_weights(w, "mid_block.resnets.1")?;
 
-        // Up blocks: checkpoint up_blocks.{k} corresponds to config index `n-1-k` (the vendored
-        // builds them in reversed order). add_upsample on all but the last config index (0).
         let mut up_blocks = Vec::with_capacity(n);
         for k in 0..n {
-            let ci = n - 1 - k;
+            let prefix = format!("up_blocks.{k}");
             up_blocks.push(UNetBlock2D::from_weights(
                 w,
-                &BlockSpec {
-                    prefix: &format!("up_blocks.{k}"),
-                    num_resnets: cfg.layers_per_block[ci] + 1,
-                    out_channels: boc[ci],
-                    num_heads: cfg.num_attention_heads[ci],
-                    transformer_layers: cfg.transformer_layers_per_block[ci],
-                    add_cross_attention: cfg.up_block_types[ci].contains("CrossAttn"),
-                    add_downsample: false,
-                    add_upsample: ci > 0,
-                },
+                &adapter_block_spec(cfg, k, true, &prefix),
             )?);
         }
 
@@ -262,19 +352,34 @@ impl UNet2DConditionModel {
     /// samplers, **and the resnet `conv_shortcut`** (a 1×1 conv stored as a Linear; quantizing it
     /// collapses 1024² renders, sc-3329 — see [`ResnetBlock2D::quantize`]).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.time_embedding.quantize(bits)?;
-        self.add_embedding.quantize(bits)?;
+        self.quantize_using(bits, &mut |_, linear, bits| {
+            crate::quant::quantize_linear(linear, bits)
+        })
+    }
+
+    pub(crate) fn quantize_using(
+        &mut self,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
+        self.time_embedding
+            .quantize_using("time_embedding", bits, visit)?;
+        self.add_embedding
+            .quantize_using("add_embedding", bits, visit)?;
         if let Some(proj) = &mut self.encoder_hid_proj {
-            crate::quant::quantize_linear(proj, bits)?; // Kolors context projection (sc-3096 validates)
+            visit("encoder_hid_proj", proj, bits)?;
         }
-        for b in &mut self.down_blocks {
-            b.quantize(bits)?;
+        for (index, b) in self.down_blocks.iter_mut().enumerate() {
+            b.quantize_using(&format!("down_blocks.{index}"), bits, visit)?;
         }
-        self.mid_resnet0.quantize(bits)?;
-        self.mid_transformer.quantize(bits)?;
-        self.mid_resnet1.quantize(bits)?;
-        for b in &mut self.up_blocks {
-            b.quantize(bits)?;
+        self.mid_resnet0
+            .quantize_using("mid_block.resnets.0", bits, visit)?;
+        self.mid_transformer
+            .quantize_using("mid_block.attentions.0", bits, visit)?;
+        self.mid_resnet1
+            .quantize_using("mid_block.resnets.1", bits, visit)?;
+        for (index, b) in self.up_blocks.iter_mut().enumerate() {
+            b.quantize_using(&format!("up_blocks.{index}"), bits, visit)?;
         }
         Ok(())
     }
@@ -601,6 +706,27 @@ impl UNet2DConditionModel {
         )
     }
 
+    /// The common denoiser carries its actual deferred ControlNet add work to the EXISTING
+    /// injection barriers. Historical public wrappers keep their signatures and do not invent
+    /// producer provenance for externally supplied residual DAGs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_planned_with_control_work(
+        &self,
+        x: &Array,
+        timestep: f32,
+        encoder_x: &Array,
+        text_emb: &Array,
+        time_ids: &Array,
+        control: Option<&ControlResiduals>,
+        ip: Option<(&Array, f32)>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+        pending: crate::quantum::ControlMergeWork,
+    ) -> Result<Array> {
+        self.forward_core_with_control_work(
+            x, timestep, encoder_x, text_emb, time_ids, control, ip, plan, pending,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_core(
         &self,
@@ -613,18 +739,88 @@ impl UNet2DConditionModel {
         ip: Option<(&Array, f32)>,
         plan: crate::plan::SdxlForwardPlan<'_>,
     ) -> Result<Array> {
+        self.forward_core_with_control_work(
+            x,
+            timestep,
+            encoder_x,
+            text_emb,
+            time_ids,
+            control,
+            ip,
+            plan,
+            crate::quantum::ControlMergeWork::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_core_with_control_work(
+        &self,
+        x: &Array,
+        timestep: f32,
+        encoder_x: &Array,
+        text_emb: &Array,
+        time_ids: &Array,
+        control: Option<&ControlResiduals>,
+        ip: Option<(&Array, f32)>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+        pending: crate::quantum::ControlMergeWork,
+    ) -> Result<Array> {
         let batch = x.shape()[0];
         let dtype = x.dtype();
+        let input_elements = x.size() as u64;
         // sc-26270: one iOS quantum scope per forward; every quantum below is checked against live
         // headroom before its graph is built and materialized after. Pass-through off device.
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
-        mlx_gen::ios_quantum::before(crate::quantum::UNET_STEM, self.stem_scratch(x, encoder_x))?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        mlx_gen::ios_quantum::before(
+            crate::quantum::UNET_STEM,
+            self.stem_scratch(x, encoder_x)
+                .saturating_add(embeddings::stem_projection_scratch(
+                    &self.time_embedding,
+                    &self.add_embedding,
+                    self.encoder_hid_proj.as_ref(),
+                    pricing::StemInput {
+                        batch: plan.conditioning_batch(batch),
+                        dtype,
+                        text: text_emb.dtype(),
+                    },
+                    encoder_x,
+                    &crate::quantum::EffectScope::native(),
+                )?),
+        )?;
 
         let (mut x, temb, projected) = self.stem(
             x, timestep, encoder_x, text_emb, time_ids, plan, batch, dtype,
         )?;
         let encoder_x = projected.as_ref().unwrap_or(encoder_x);
         mlx_gen::ios_quantum::finish(crate::quantum::UNET_STEM, &[&x, &temb, encoder_x])?;
+        if mlx_gen::ios_quantum::enabled() {
+            // Actual existing materialization + stream-completion barrier, not Rust-drop or a
+            // planned epoch. Pending cast/init parents cannot use the later persistent-only law.
+            mlx_gen::ios_quantum::diagnostic_metadata(
+                "sdxl",
+                "forward-input-materialized",
+                &[
+                    ("schema", 1),
+                    ("rows", batch as u64),
+                    ("dtype", mlx_gen::sampler::sampling_dtype_code(dtype)),
+                    ("elements", input_elements),
+                ],
+            );
+        }
+
+        if let Some(control) = control {
+            control.diagnostic_ownership("control-unet-after-stem", 0);
+            mlx_gen::ios_quantum::diagnostic_metadata(
+                "sdxl",
+                "control-pending-merge-work",
+                &[
+                    ("schema", 1),
+                    ("down_logical_upper_bytes", pending.down),
+                    ("mid_logical_upper_bytes", pending.mid),
+                    ("physical_certificate", 0),
+                ],
+            );
+        }
 
         // Down path — collect skip residuals (starting with the stem output).
         let mut residuals: Vec<Array> = vec![x.clone()];
@@ -635,18 +831,23 @@ impl UNet2DConditionModel {
         }
 
         // ControlNet (sc-3058): add the (scaled) control down residuals to the skip connections.
-        if control.is_some() {
-            // One new sum per skip residual; both operands are already materialized.
-            let live: Vec<&Array> = residuals.iter().collect();
-            mlx_gen::ios_quantum::before(
-                crate::quantum::CONTROL_DOWN_INJECTION,
-                crate::quantum::elementwise_bytes(&live, 1),
-            )?;
+        if let Some(control) = control {
+            let scratch = residuals
+                .iter()
+                .zip(&control.down)
+                .map(|(x, c)| crate::quantum::control_injection_bytes(x, c))
+                .sum::<u64>()
+                .saturating_add(pending.down);
+            control.diagnostic_ownership("control-before-down-injection", 0);
+            mlx_gen::ios_quantum::before(crate::quantum::CONTROL_DOWN_INJECTION, scratch)?;
         }
         inject_control_down_residuals(&mut residuals, control)?;
         if control.is_some() {
             let refs: Vec<&Array> = residuals.iter().collect();
             mlx_gen::ios_quantum::finish(crate::quantum::CONTROL_DOWN_INJECTION, &refs)?;
+            if let Some(control) = control {
+                control.diagnostic_ownership("control-after-down-injection", 0);
+            }
         }
 
         // Mid.
@@ -658,14 +859,21 @@ impl UNet2DConditionModel {
             .mid_resnet1
             .forward_quantum(&x, None, Some(&temb), plan)?;
         // ControlNet: add the (scaled) control mid residual to the mid output.
+        if let Some(control) = control {
+            control.diagnostic_ownership("control-before-mid-injection", 0);
+        }
         x = match control {
-            Some(_) => mlx_gen::ios_quantum::run(
+            Some(c) => mlx_gen::ios_quantum::run(
                 crate::quantum::CONTROL_MID_INJECTION,
-                crate::quantum::elementwise_bytes(&[&x], 1),
+                crate::quantum::control_injection_bytes(&x, &c.mid).saturating_add(pending.mid),
                 || inject_control_mid_residual(x.clone(), control),
             )?,
             None => x,
         };
+
+        if let Some(control) = control {
+            control.diagnostic_ownership("control-after-mid-injection", 0);
+        }
 
         // Up path — each block pops its skip residuals.
         for block in &self.up_blocks {
@@ -675,16 +883,7 @@ impl UNet2DConditionModel {
         }
 
         // Conv head.
-        let head_scratch = crate::quantum::norm_conv_bytes(
-            &crate::quantum::ConvCall::new(
-                x.shape(),
-                crate::quantum::element_bytes(&x),
-                self.conv_out.weight(),
-                1,
-                1,
-            ),
-            crate::quantum::Backend::current(),
-        );
+        let head_scratch = self.conv_out_scratch(&x);
         mlx_gen::ios_quantum::run(crate::quantum::UNET_CONV_OUT, head_scratch, || {
             let x = group_norm(
                 &x,
@@ -696,6 +895,247 @@ impl UNet2DConditionModel {
             let x = silu_glue(&x)?;
             conv2d(&x, self.conv_out.weight(), self.conv_out.bias(), 1, 1)
         })
+    }
+
+    /// iOS scratch (sc-26270) of the output GroupNorm + SiLU + `conv_out` over `x`.
+    fn conv_out_scratch(&self, x: &Array) -> u64 {
+        crate::quantum::norm_conv_bytes(
+            &crate::quantum::ConvCall::new(
+                x.shape(),
+                crate::quantum::element_bytes(x),
+                self.conv_out.weight(),
+                1,
+                1,
+            ),
+            crate::quantum::backend(),
+        )
+    }
+
+    /// Header-only pricing of one [`Self::forward_planned`] (sc-26270 quanta, epic 16774 pricing):
+    /// every quantum the forward checks, in order, with the guards' own formulas, over shape-only
+    /// inputs — the latent `x` `[B, h, w, 4]` at the forward's batch and dtype, the text memory
+    /// `encoder_x` and pooled `text_emb` at the conditioning batch, the shape-only ControlNet
+    /// residuals when a branch is injected, and the IP tokens when the IP branch runs. Pushes into
+    /// `out`; builds no graph that is ever evaluated. Returns the predicted noise's dtype.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
+    pub(crate) fn price_forward(
+        &self,
+        x: &Array,
+        encoder_x: &Array,
+        text_emb: &Array,
+        control: Option<&(Vec<Array>, Array)>,
+        ip: Option<(&Array, f32)>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<Dtype> {
+        self.price_forward_with_effects(
+            x,
+            pricing::UNetConditioning {
+                encoder_x,
+                text_emb,
+                control,
+                ip,
+            },
+            plan,
+            crate::quantum::ControlMergeWork::default(),
+            out,
+            &crate::quantum::EffectScope::native(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn price_forward_with_effects(
+        &self,
+        x: &Array,
+        conditioning: pricing::UNetConditioning<'_, Array>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+        pending: crate::quantum::ControlMergeWork,
+        out: &mut crate::quantum::Quanta,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<Dtype> {
+        let pricing::UNetConditioning {
+            encoder_x,
+            text_emb,
+            control,
+            ip,
+        } = conditioning;
+        let batch = x.shape()[0];
+        let dtype = x.dtype();
+        let conv_in = effects.conv("conv_in", &self.conv_in);
+        out.push((
+            crate::quantum::UNET_STEM,
+            stem_work_bytes(
+                x,
+                encoder_x,
+                &conv_in,
+                self.encoder_hid_proj.as_ref(),
+                0,
+                crate::quantum::backend(),
+            )
+            .saturating_add(embeddings::stem_projection_scratch(
+                &self.time_embedding,
+                &self.add_embedding,
+                self.encoder_hid_proj.as_ref(),
+                pricing::StemInput {
+                    batch: plan.conditioning_batch(batch),
+                    dtype,
+                    text: text_emb.dtype(),
+                },
+                encoder_x,
+                effects,
+            )?),
+        ));
+        let projected = match &self.encoder_hid_proj {
+            Some(proj) => {
+                let e = encoder_x.shape();
+                Some(crate::quantum::shaped(
+                    &effects
+                        .linear("encoder_hid_proj", proj)?
+                        .output_shape(&[e[0], e[1], e[2]])?,
+                    effects
+                        .linear("encoder_hid_proj", proj)?
+                        .output_dtype(encoder_x.dtype()),
+                )?)
+            }
+            None => None,
+        };
+        let encoder_x = projected.as_ref().unwrap_or(encoder_x);
+        let temb = crate::quantum::shaped(
+            &[
+                plan.conditioning_batch(batch),
+                self.time_embedding
+                    .out_features_with_effects(&effects.child("time_embedding"))?,
+            ],
+            embeddings::text_time_temb_dtype_with_effects(
+                &self.time_embedding,
+                &self.add_embedding,
+                text_emb.dtype(),
+                dtype,
+                effects,
+            )?,
+        )?;
+        let mut x = crate::quantum::shaped(
+            &conv_in.output_shape(x.shape(), 1, 1)?,
+            conv_in.output_dtype(dtype),
+        )?;
+        let mut residuals: Vec<Array> = vec![x.clone()];
+        for (index, block) in self.down_blocks.iter().enumerate() {
+            let (o, res) = block.price_forward_with_effects(
+                &x,
+                pricing::BlockForwardInputs {
+                    encoder_x,
+                    temb: &temb,
+                    ip,
+                    plan,
+                },
+                None,
+                out,
+                pricing::BlockOwners {
+                    outer_held: 0,
+                    owners: None,
+                },
+                &effects.child(&format!("down_blocks.{index}")),
+            )?;
+            x = o;
+            residuals.extend(res);
+        }
+        if let Some((down, _)) = control {
+            let scratch = residuals
+                .iter()
+                .zip(down)
+                .map(|(x, c)| crate::quantum::control_injection_bytes(x, c))
+                .sum::<u64>()
+                .saturating_add(pending.down);
+            out.push((crate::quantum::CONTROL_DOWN_INJECTION, scratch));
+            for (residual, c) in residuals.iter_mut().zip(down) {
+                *residual = crate::quantum::shaped(
+                    residual.shape(),
+                    Dtype::from_promoting_types(residual.dtype(), c.dtype()),
+                )?;
+            }
+        }
+        for (index, (resnet, attention)) in [
+            (&self.mid_resnet0, Some(&self.mid_transformer)),
+            (&self.mid_resnet1, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push((
+                crate::quantum::UNET_RESNET,
+                resnet.quantum_scratch_with_effects(
+                    &x,
+                    Some(&temb),
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
+            ));
+            x = crate::quantum::shaped(
+                &resnet.output_shape_with_effects(
+                    x.shape(),
+                    None,
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
+                resnet.output_dtype_with_effects(
+                    x.dtype(),
+                    Some(temb.dtype()),
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
+            )?;
+            if let Some(attention) = attention {
+                x = attention.price_forward_with_effects(
+                    &x,
+                    encoder_x,
+                    ip,
+                    plan,
+                    out,
+                    &effects.child("mid_block.attentions.0"),
+                )?;
+            }
+        }
+        if let Some((_, mid)) = control {
+            out.push((
+                crate::quantum::CONTROL_MID_INJECTION,
+                crate::quantum::control_injection_bytes(&x, mid).saturating_add(pending.mid),
+            ));
+            x = crate::quantum::shaped(
+                x.shape(),
+                Dtype::from_promoting_types(x.dtype(), mid.dtype()),
+            )?;
+        }
+        for (index, block) in self.up_blocks.iter().enumerate() {
+            let (o, _) = block.price_forward_with_effects(
+                &x,
+                pricing::BlockForwardInputs {
+                    encoder_x,
+                    temb: &temb,
+                    ip,
+                    plan,
+                },
+                Some(&mut residuals),
+                out,
+                pricing::BlockOwners {
+                    outer_held: 0,
+                    owners: None,
+                },
+                &effects.child(&format!("up_blocks.{index}")),
+            )?;
+            x = o;
+        }
+        let conv_out = effects.conv("conv_out", &self.conv_out);
+        out.push((
+            crate::quantum::UNET_CONV_OUT,
+            crate::quantum::norm_conv_bytes(
+                &conv_out.call(x.shape(), crate::quantum::element_bytes(&x), 1, 1),
+                crate::quantum::backend(),
+            ),
+        ));
+        // Validate the final biased convolution's actual broadcast geometry, not its old base shape.
+        conv_out.output_shape(x.shape(), 1, 1)?;
+        Ok(conv_out.output_dtype(crate::quantum::promote_all(
+            x.dtype(),
+            &[&self.conv_norm_out_w, &self.conv_norm_out_b],
+        )))
     }
 
     /// The stem quantum's body: the Kolors context projection (when loaded), the timestep +
@@ -762,7 +1202,7 @@ impl UNet2DConditionModel {
             self.conv_in.weight(),
             self.encoder_hid_proj.as_ref(),
             0,
-            crate::quantum::Backend::current(),
+            crate::quantum::backend(),
         )
     }
 

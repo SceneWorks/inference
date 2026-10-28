@@ -70,13 +70,13 @@ impl MappingMlp {
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let h = self.l0.forward(x)?;
-        let h = self.ln1.forward(&h)?;
+        let h = __model_proof_output!(self.l0.forward(x))?;
+        let h = __model_proof_output!(self.ln1.forward(&h))?;
         let h = leaky_relu(&h)?;
-        let h = self.l3.forward(&h)?;
-        let h = self.ln4.forward(&h)?;
+        let h = __model_proof_output!(self.l3.forward(&h))?;
+        let h = __model_proof_output!(self.ln4.forward(&h))?;
         let h = leaky_relu(&h)?;
-        self.l6.forward(&h)
+        __model_proof_output!(self.l6.forward(&h))
     }
 }
 
@@ -114,13 +114,13 @@ impl PerceiverAttention {
 
     /// `ctx`: `[B, n_ctx, dim]` (image/id features); `latents`: `[B, n_lat, dim]` (queries).
     fn forward(&self, ctx: &Tensor, latents: &Tensor) -> candle_core::Result<Tensor> {
-        let x = self.norm1.forward(ctx)?;
-        let lat = self.norm2.forward(latents)?;
+        let x = __model_proof_output!(self.norm1.forward(ctx))?;
+        let lat = __model_proof_output!(self.norm2.forward(latents))?;
         let (b, n_lat, _dim) = lat.dims3()?;
         let (h, hd) = (self.heads, self.dim_head);
 
-        let q = self.to_q.forward(&lat)?;
-        let kv = self.to_kv.forward(&Tensor::cat(&[&x, &lat], 1)?)?;
+        let q = __model_proof_output!(self.to_q.forward(&lat))?;
+        let kv = __model_proof_output!(self.to_kv.forward(&Tensor::cat(&[&x, &lat], 1)?))?;
         let n_kv = kv.dim(1)?;
         let parts = kv.chunk(2, D::Minus1)?; // [k | v] along the feature axis
         let to_heads = |t: &Tensor, n: usize| -> candle_core::Result<Tensor> {
@@ -137,7 +137,7 @@ impl PerceiverAttention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, n_lat, h * hd))?;
-        self.to_out.forward(&out)
+        __model_proof_output!(self.to_out.forward(&out))
     }
 }
 
@@ -158,10 +158,10 @@ impl FeedForward {
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let h = self.ln.forward(x)?;
-        let h = self.l1.forward(&h)?;
+        let h = __model_proof_output!(self.ln.forward(x))?;
+        let h = __model_proof_output!(self.l1.forward(&h))?;
         let h = h.gelu_erf()?;
-        self.l3.forward(&h)
+        __model_proof_output!(self.l3.forward(&h))
     }
 }
 

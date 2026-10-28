@@ -51,4 +51,8 @@ fn decoder_runs_on_real_weights() {
         lo > -50.0 && hi < 50.0,
         "output range exploded: [{lo}, {hi}]"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED smoke_decode::decoder_runs_on_real_weights");
 }

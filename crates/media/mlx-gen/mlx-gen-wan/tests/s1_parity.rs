@@ -141,6 +141,8 @@ fn umt5_embeds_match_reference() {
             "[{name}] exceeds the 0.32.0 cross-stack bound: max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e} (sc-12896)"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED s1_parity::umt5_embeds_match_reference");
 }
 
 /// `(max|Δ|, Σ|Δ| / Σ|ref|)` over two equal-length f32 slices.

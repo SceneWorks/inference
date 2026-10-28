@@ -114,7 +114,7 @@ impl ChanNorm {
             4 => vec![1, c, 1, 1],
             _ => vec![1, c],
         };
-        normed.broadcast_mul(&self.gamma.reshape(gshape)?)
+        __model_proof_output!(normed.broadcast_mul(&self.gamma.reshape(gshape)?))
     }
 }
 
@@ -145,7 +145,7 @@ impl Conv2dW {
     /// e.g. the last z16 upsampler resample (192-ch 3×3 at 1280×720, ~1.59B-elem im2col) — cannot drive
     /// candle's CUDA conv2d into its silent-corruption band; low-res stays a single un-chunked pass.
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        chunked_conv2d(x, &self.w, self.pad, 1)?.broadcast_add(&self.b)
+        __model_proof_output!(chunked_conv2d(x, &self.w, self.pad, 1)?.broadcast_add(&self.b))
     }
 }
 
@@ -1596,6 +1596,7 @@ mod norm_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chan_norm_bf16_stays_close_to_f32_and_preserves_dtype() -> Result<()> {
         let dev = Device::Cpu;
         let c = 384usize; // the z16 mid width — a wide channel-L2 where a naive bf16 sum would drift
@@ -1628,10 +1629,13 @@ mod norm_tests {
             max_rel < 0.05,
             "bf16 ChanNorm drifted from the f32 reference: max relative diff {max_rel}"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::norm_tests::chan_norm_bf16_stays_close_to_f32_and_preserves_dtype");
         Ok(())
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chan_norm_f32_forward_is_unchanged() -> Result<()> {
         // The f32 path must be byte-for-byte what it always was (the z48 5B decode still runs f32): the
         // two `to_dtype(F32)` casts collapse to identity, so recompute the exact pre-sc-12818 formula
@@ -1653,6 +1657,10 @@ mod norm_tests {
         assert_eq!(
             g, e,
             "the f32 ChanNorm forward must be bit-identical to pre-sc-12818"
+        );
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED vae::norm_tests::chan_norm_f32_forward_is_unchanged"
         );
         Ok(())
     }

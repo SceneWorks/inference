@@ -46,7 +46,7 @@ impl Linear {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        linear(x, &self.weight, &self.bias)
+        __model_proof_output!(linear(x, &self.weight, &self.bias))
     }
 
     /// Tensor names an instance consumes, for the exhaustive-mapping check.
