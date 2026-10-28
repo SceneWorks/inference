@@ -123,6 +123,8 @@ fn step_value(
 pub fn host_process_rss_bytes() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
     let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: `info` is a live, zeroed buffer of exactly `size` bytes for PROC_PIDTASKINFO, which
+    // writes at most `size` bytes; getpid takes no arguments.
     let returned = unsafe {
         libc::proc_pidinfo(
             libc::getpid(),
@@ -132,6 +134,8 @@ pub fn host_process_rss_bytes() -> Option<u64> {
             size,
         )
     };
+    // SAFETY: proc_taskinfo is plain-old-data and `info` was zero-initialised (a valid value);
+    // `returned == size` means the kernel filled the whole struct.
     (returned == size).then(|| unsafe { info.assume_init().pti_resident_size })
 }
 
@@ -139,6 +143,7 @@ pub fn host_process_rss_bytes() -> Option<u64> {
 pub fn host_process_rss_bytes() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    // SAFETY: sysconf takes no pointers and is thread-safe; a non-positive result is rejected below.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     (size > 0).then(|| pages.saturating_mul(size as u64))
 }
@@ -149,8 +154,11 @@ pub fn host_process_rss_bytes() -> Option<u64> {
         ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         Threading::GetCurrentProcess,
     };
+    // SAFETY: PROCESS_MEMORY_COUNTERS is a plain-old-data C struct of integers; all-zero is valid.
     let mut counters = unsafe { std::mem::zeroed::<PROCESS_MEMORY_COUNTERS>() };
     counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no close; `counters` is a live
+    // struct whose `cb` (passed as the size) is its exact byte size, so the call writes within it.
     let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     (ok != 0).then_some(counters.WorkingSetSize as u64)
 }
