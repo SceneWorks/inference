@@ -441,7 +441,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 822
+              "line": 739
             }
           ],
           "release": [
@@ -490,7 +490,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 822
+              "line": 739
             }
           ],
           "release": [
@@ -548,7 +548,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 822
+              "line": 739
             }
           ],
           "release": [
