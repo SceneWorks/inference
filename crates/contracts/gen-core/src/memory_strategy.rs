@@ -3863,6 +3863,47 @@ pub enum MemorySafetyDecision {
     Reject { reason: String },
 }
 
+impl MemorySafetyDecision {
+    /// `Ok(())` accepts; an error rejects with the error's display text as the reason (sc-27254:
+    /// the shared form of the providers' `match … { Ok(()) => Accept, Err(e) => Reject { .. } }`).
+    pub fn from_result(result: Result<()>) -> Self {
+        match result {
+            Ok(()) => Self::Accept,
+            Err(error) => Self::Reject {
+                reason: error.to_string(),
+            },
+        }
+    }
+}
+
+/// Validate a request's selected bounded-decode tile against a provider's published domain: both
+/// `edge` and `overlap` must be selected, `edge` must be one of `edges`, and `overlap` must equal
+/// `expected_overlap` (sc-27295: the shared body of the per-provider `validate_decode` copies). Each
+/// failure is an [`Error::Unsupported`] prefixed with `model_id`.
+pub fn validate_bounded_decode_params(
+    model_id: &str,
+    edges: &[u32],
+    expected_overlap: u32,
+    edge: Option<u32>,
+    overlap: Option<u32>,
+) -> Result<()> {
+    let edge = edge.ok_or_else(|| {
+        Error::Unsupported(format!("{model_id}: bounded decode requires a tile edge"))
+    })?;
+    let overlap = overlap.ok_or_else(|| {
+        Error::Unsupported(format!(
+            "{model_id}: bounded decode requires a tile overlap"
+        ))
+    })?;
+    if !edges.contains(&edge) || overlap != expected_overlap {
+        return Err(Error::Unsupported(format!(
+            "{model_id}: decode tile {edge}/{overlap} is outside the published domain \
+             {edges:?} at overlap {expected_overlap}"
+        )));
+    }
+    Ok(())
+}
+
 /// Terminal cleanup reason supplied to a request scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemoryRunOutcome {
@@ -4554,6 +4595,46 @@ pub struct MemoryRejection {
 mod tests {
     use super::*;
     use crate::{LoadSpec, WeightsSource};
+
+    #[test]
+    fn safety_decision_from_result_accepts_ok_and_rejects_with_the_error_text() {
+        assert_eq!(
+            MemorySafetyDecision::from_result(Ok(())),
+            MemorySafetyDecision::Accept
+        );
+        let error = Error::Unsupported("route refused".into());
+        let reason = error.to_string();
+        assert_eq!(
+            MemorySafetyDecision::from_result(Err(error)),
+            MemorySafetyDecision::Reject { reason }
+        );
+    }
+
+    #[test]
+    fn bounded_decode_params_require_a_published_edge_and_the_exact_overlap() {
+        let check =
+            |edge, overlap| validate_bounded_decode_params("m", &[512, 256], 64, edge, overlap);
+        assert!(check(Some(512), Some(64)).is_ok());
+        assert!(check(Some(256), Some(64)).is_ok());
+        for (edge, overlap, needle) in [
+            (None, Some(64), "m: bounded decode requires a tile edge"),
+            (Some(512), None, "m: bounded decode requires a tile overlap"),
+            (
+                Some(384),
+                Some(64),
+                "m: decode tile 384/64 is outside the published domain",
+            ),
+            (
+                Some(512),
+                Some(32),
+                "m: decode tile 512/32 is outside the published domain",
+            ),
+        ] {
+            let error = check(edge, overlap).unwrap_err();
+            assert!(matches!(error, Error::Unsupported(_)), "{error}");
+            assert!(error.to_string().contains(needle), "{error}");
+        }
+    }
 
     #[test]
     fn adapter_residency_distinguishes_folded_additive_and_missing_evidence() {

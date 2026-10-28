@@ -1084,12 +1084,7 @@ pub fn registered_safety_check(
     } else {
         SanaLoadSeal::capture(variant, spec).and_then(|seal| validate_context(&seal, context))
     };
-    match result {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_result(result)
 }
 
 /// Executable conformance entry point. Only rungs this contract actually declares `Implemented`

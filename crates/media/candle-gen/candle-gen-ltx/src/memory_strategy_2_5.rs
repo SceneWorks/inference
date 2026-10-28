@@ -515,22 +515,13 @@ pub(crate) fn contract_for_loaded(
 }
 
 fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<()> {
-    let edge = edge.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!(
-            "{LTX_2_5_DISTILLED_MODEL_ID}: bounded decode requires a selected tile edge"
-        ))
-    })?;
-    let overlap = overlap.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!(
-            "{LTX_2_5_DISTILLED_MODEL_ID}: bounded decode requires a selected overlap"
-        ))
-    })?;
-    if !DECODE_TILE_EDGES.contains(&edge) || overlap != DECODE_OVERLAP {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{LTX_2_5_DISTILLED_MODEL_ID}: decode tile {edge}/{overlap} is outside the published convolutional-VAE domain"
-        )));
-    }
-    Ok(())
+    gen_core::validate_bounded_decode_params(
+        LTX_2_5_DISTILLED_MODEL_ID,
+        DECODE_TILE_EDGES,
+        DECODE_OVERLAP,
+        edge,
+        overlap,
+    )
 }
 
 pub(crate) fn safety_check(

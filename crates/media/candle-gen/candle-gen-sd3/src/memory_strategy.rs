@@ -1245,14 +1245,10 @@ pub fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match registered_tier_and_contract(spec, contract)
-        .and_then(|(route, tier)| validate_context(route, contract, context, tier))
-    {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_result(
+        registered_tier_and_contract(spec, contract)
+            .and_then(|(route, tier)| validate_context(route, contract, context, tier)),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1602,18 +1602,13 @@ pub fn validate_loaded_contract(
 }
 
 fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<()> {
-    let edge = edge.ok_or_else(|| {
-        gen_core::Error::Unsupported("Bernini bounded decode needs tile edge".into())
-    })?;
-    let overlap = overlap.ok_or_else(|| {
-        gen_core::Error::Unsupported("Bernini bounded decode needs overlap".into())
-    })?;
-    if !DECODE_TILE_EDGES.contains(&edge) || overlap != DECODE_OVERLAP {
-        return Err(gen_core::Error::Unsupported(format!(
-            "Bernini bounded decode requires edge in {DECODE_TILE_EDGES:?} and overlap {DECODE_OVERLAP}, got {edge}/{overlap}"
-        )));
-    }
-    Ok(())
+    gen_core::validate_bounded_decode_params(
+        "Bernini",
+        DECODE_TILE_EDGES,
+        DECODE_OVERLAP,
+        edge,
+        overlap,
+    )
 }
 
 fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> gen_core::Result<()> {

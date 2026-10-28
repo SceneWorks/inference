@@ -41,17 +41,6 @@ fn is_edit(provider_id: &str) -> bool {
     )
 }
 
-/// The label a tier carries inside a calibration string. `Quant`s this family does not ship are
-/// unnameable; `resolved_quant` has already refused them by the time a string is built.
-fn calibration_tier_label(quant: Option<Quant>) -> Option<&'static str> {
-    match quant {
-        None => Some("bf16"),
-        Some(Quant::Q4) => Some("q4"),
-        Some(Quant::Q8) => Some("q8"),
-        Some(_) => None,
-    }
-}
-
 /// The production calibration identity of one Candle Mage-Flow (route, tier) cell (sc-22733, epic
 /// sc-22723 E1/E4): `mage-flow-cuda-<provider>-<tier>-shared-ladder-v3`, eighteen distinct
 /// strings.
@@ -75,7 +64,8 @@ pub fn production_calibration_fingerprint(
             "unknown Mage-Flow memory provider {provider_id}"
         )));
     }
-    let tier = calibration_tier_label(quant).ok_or_else(|| {
+    // `Quant`s this family does not ship are unnameable; `resolved_quant` has already refused them.
+    let tier = Quant::affine_tier_label(quant).ok_or_else(|| {
         gen_core::Error::Unsupported(format!(
             "Mage-Flow does not ship the {quant:?} numeric tier"
         ))
@@ -776,12 +766,9 @@ pub fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match resolved_quant(spec).and_then(|quant| validate_context(contract, context, quant)) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_result(
+        resolved_quant(spec).and_then(|quant| validate_context(contract, context, quant)),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

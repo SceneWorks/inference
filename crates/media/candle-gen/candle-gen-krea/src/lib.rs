@@ -2410,15 +2410,10 @@ pub fn krea_turbo_production_calibration_fingerprint(tier: Option<Quant>) -> Opt
 /// declaration walk down with it, which is exactly what `raw_and_edit_catalog_surfaces_are_exact…`
 /// caught. Before sc-22735 every one of these surfaces published the MEASURED q4 string instead.
 fn krea_turbo_static_behavior_fingerprint(tier: Option<Quant>) -> Option<String> {
-    // Deliberately exhaustive over `Quant`: the declared surface covers every tier, so a new
-    // variant must fail to compile here rather than silently fall into a "no declaration" refusal.
-    let tier = match tier {
-        None => "bf16",
-        Some(Quant::Q4) => "q4",
-        Some(Quant::Q8) => "q8",
-        Some(Quant::Nvfp4) => "nvfp4",
-        Some(Quant::Fp8Rowwise) => "fp8r",
-    };
+    // `Quant::tier_label` is exhaustive over `Quant`: the declared surface covers every tier, so a
+    // new variant must fail to compile there rather than silently fall into a "no declaration"
+    // refusal.
+    let tier = Quant::tier_label(tier);
     Some(format!("krea-2-turbo-candle-registry-behavior-v1-{tier}"))
 }
 
@@ -3701,12 +3696,8 @@ mod request_scoped_calibration_identity_tests {
     const TIERS: [Option<Quant>; 3] = [None, Some(Quant::Q4), Some(Quant::Q8)];
 
     fn tier_token(tier: Option<Quant>) -> &'static str {
-        match tier {
-            None => "bf16",
-            Some(Quant::Q4) => "q4",
-            Some(Quant::Q8) => "q8",
-            Some(other) => unreachable!("this lane ships no {other:?} request-scoped tier"),
-        }
+        Quant::affine_tier_label(tier)
+            .unwrap_or_else(|| unreachable!("this lane ships no {tier:?} request-scoped tier"))
     }
 
     /// A snapshot whose `transformer/config.json` declares `tier` — the marker
