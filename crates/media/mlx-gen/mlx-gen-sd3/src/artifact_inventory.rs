@@ -98,7 +98,7 @@ fn turnkey_path_tier(provider_id: &str, root: &Path) -> Option<Option<Quant>> {
 }
 
 /// The packed tier the transformer on disk actually is, read from the `quantization` manifest the
-/// converter writes into `transformer/config.json` (`crate::convert::write_quantized_config`) and
+/// converter writes into `transformer/config.json` (`mlx_gen::quant::write_quantized_config`) and
 /// cross-checked against the packed triples in the safetensors headers.
 ///
 /// Header-only: `safetensors_header_shapes` reads the JSON header and never the weight body, so this

@@ -240,35 +240,9 @@ fn place(src: &Path, dst: &Path, link: bool) -> Result<()> {
     if link {
         std::os::unix::fs::symlink(src, dst)?;
     } else if src.is_dir() {
-        copy_dir_all(src, dst)?;
+        mlx_gen::quant::copy_dir(src, dst)?;
     } else {
         std::fs::copy(src, dst)?;
-    }
-    Ok(())
-}
-
-/// Recursively copy a directory, following symlinks (HF cache entries point into `../../blobs`).
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        // Hidden entries (macOS AppleDouble sidecars) must not reach the assembled tier — they would
-        // ship with the upload and break `Weights::from_dir` on download (SceneWorks#1333).
-        if mlx_gen::gen_core::weightsmeta::is_hidden_file(&from) {
-            continue;
-        }
-        let to = dst.join(entry.file_name());
-        // Use `symlink_metadata` (the entry's OWN type) so only a REAL subdirectory is recursed into;
-        // a symlink — even one pointing at a directory — falls to `fs::copy` (which follows it to the
-        // target). This preserves HF-cache behavior (entries are file symlinks into `../../blobs`,
-        // copied via the target) while a circular *directory* symlink can no longer drive infinite
-        // recursion → stack overflow (F-080).
-        if std::fs::symlink_metadata(&from)?.is_dir() {
-            copy_dir_all(&from, &to)?;
-        } else {
-            std::fs::copy(&from, &to)?;
-        }
     }
     Ok(())
 }
