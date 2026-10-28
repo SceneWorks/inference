@@ -69,6 +69,9 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
+use mlx_gen::train::vocab::{
+    clamp_unit_timestep, normalize_cfg, sample_unit_timestep, validate_common_request,
+};
 use mlx_gen::{
     LoadSpec, Modality, NetworkType, Precision, Result, TrainOptimizer, Trainer, TrainerDescriptor,
     TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -136,76 +139,13 @@ fn build_batch(x0: &Array, noise: &Array, sigma: f32) -> Result<(Array, Array, f
 // Request validation (capability-free, unit-testable)
 // ==================================================================================================
 
-/// Recognized `timestep_type` values (`sigmoid` is the fall-through default).
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values (`balanced`/`none`/`neutral` are neutral).
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values (`mse`/`l2` = MSE, `mae`/`l1` = MAE).
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
-
-/// Normalize a free-form config string the way the parsers do (trim, lowercase, `-`/space → `_`).
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
 /// Capability-free training-request validation (mirrors z-image's `validate_request`): rejects an
 /// empty dataset, zero rank, zero steps, an unsupported optimizer, and an unrecognized
 /// `timestep_type` / `timestep_bias` / `loss_type` (rather than silently falling back to a default).
 /// The non-empty target-module resolution is checked in [`Trainer::validate`], which has the loaded
 /// model to enumerate adaptable paths against.
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    if req.items.is_empty() {
-        return Err("anima trainer: dataset is empty".into());
-    }
-    if req.config.rank == 0 {
-        return Err("anima trainer: rank must be > 0".into());
-    }
-    if req.config.steps == 0 {
-        return Err("anima trainer: steps must be > 0".into());
-    }
-    if !TrainOptimizer::is_supported(&req.config.optimizer) {
-        return Err(format!(
-            "anima trainer: optimizer '{}' is not available on MLX training (supported: adamw, \
-             adam, rose, prodigy)",
-            req.config.optimizer
-        )
-        .into());
-    }
-    if !TIMESTEP_TYPES.contains(&normalize_cfg(&req.config.timestep_type).as_str()) {
-        return Err(format!(
-            "anima trainer: timestep_type '{}' is not recognized (supported: {})",
-            req.config.timestep_type,
-            TIMESTEP_TYPES.join(", ")
-        )
-        .into());
-    }
-    if !TIMESTEP_BIASES.contains(&normalize_cfg(&req.config.timestep_bias).as_str()) {
-        return Err(format!(
-            "anima trainer: timestep_bias '{}' is not recognized (supported: {})",
-            req.config.timestep_bias,
-            TIMESTEP_BIASES.join(", ")
-        )
-        .into());
-    }
-    if !LOSS_TYPES.contains(&normalize_cfg(&req.config.loss_type).as_str()) {
-        return Err(format!(
-            "anima trainer: loss_type '{}' is not recognized (supported: {})",
-            req.config.loss_type,
-            LOSS_TYPES.join(", ")
-        )
-        .into());
-    }
-    Ok(())
+    validate_common_request("anima trainer", req)
 }
 
 /// Resolve the config's target modules to the full dotted-path set on the Anima adapter surface (DiT
@@ -1040,13 +980,7 @@ fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// Sample a normalised flow-match base timestep `σ ∈ [1e-3, 1−1e-3]` (a faithful port of the
@@ -1054,29 +988,9 @@ fn decode_image(path: &Path) -> Result<Image> {
 /// `(uniform + sigmoid(randn))/2` weighted; bias `high` → `√σ`, `low` → `σ²`), then run it through
 /// the static `shift = 3.0` warp the inference schedule uses. Deterministic in `seed`.
 fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let ttype = normalize_cfg(timestep_type);
-    let t = match ttype.as_str() {
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            let k2 = random::key(seed.wrapping_add(0x9E37_79B9))?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
-    };
-    let bias = normalize_cfg(timestep_bias);
-    let t = match bias.as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
+    let t = sample_unit_timestep(timestep_type, timestep_bias, seed)?;
     let shifted = apply_static_shift(t, SIGMA_SHIFT);
-    Ok(shifted.clamp(1e-3, 1.0 - 1e-3))
+    Ok(clamp_unit_timestep(shifted))
 }
 
 /// The cache entry the 1-based training `step` reads (sc-2127). One bucket ⇒ `(step - 1) % items`,
