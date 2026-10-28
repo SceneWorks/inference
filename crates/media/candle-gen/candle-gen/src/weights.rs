@@ -42,6 +42,9 @@ pub struct Weights {
     map: HashMap<String, Tensor>,
     int8: std::sync::Mutex<Option<crate::quant::Int8Context>>,
     convrot_rotations: std::sync::Mutex<HashMap<usize, Tensor>>,
+    /// The device the set is *destined for* when some tensors were deliberately left on the host
+    /// (see [`Weights::from_files_filtered_host_packed`]). `None` for every ordinary constructor.
+    target: Option<Device>,
 }
 
 /// Decode a little-endian F32 plane into its `f32` values, for value-validating native scale and
@@ -210,6 +213,74 @@ impl Weights {
         Ok(Self::from_map(map))
     }
 
+    /// [`from_files_filtered`](Self::from_files_filtered) that keeps every MLX packed affine triple
+    /// (`{base}.weight` u32 codes + `{base}.scales` + `{base}.biases`, detected by the `.scales`
+    /// sibling) **on the host** and puts everything else on `device` (sc-26691).
+    ///
+    /// Repacking a triple into its GGML block layout is host work (`quant::repack`), so uploading the
+    /// triple to a CUDA device only for the repack to copy it straight back made a 24 B-weight q4 text
+    /// encoder load at ~40 MB/s. The consumer ([`crate::quant::linear_from_weights_gs`], the packed
+    /// loaders) uploads only the final repacked buffer to [`host_packed_target`](Self::host_packed_target).
+    /// Tensor values are identical to `from_files_filtered`; only their residency differs, so a
+    /// caller must reach packed triples through a packed-aware loader and take the destination from
+    /// `host_packed_target`, not from a tensor.
+    pub fn from_files_filtered_host_packed(
+        files: &[impl AsRef<Path>],
+        device: &Device,
+        dtype: DType,
+        prefixes: &[&str],
+    ) -> Result<Self> {
+        let mut stores = Vec::with_capacity(files.len());
+        let mut packed_bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for path in files {
+            // SAFETY: read-only, process-owned weight file, mapped only for this load and not mutated
+            // behind the mapping — the standard candle weight-loading invariant.
+            let st = unsafe { MmapedSafetensors::new(path.as_ref())? };
+            for (k, _view) in st.tensors() {
+                if prefixes.iter().any(|p| k.starts_with(p)) {
+                    if let Some(base) = k.strip_suffix(".scales") {
+                        packed_bases.insert(base.to_owned());
+                    }
+                }
+            }
+            stores.push(st);
+        }
+        let host = Device::Cpu;
+        let mut map = HashMap::new();
+        for (path, st) in files.iter().zip(&stores) {
+            let path = path.as_ref();
+            for (k, _view) in st.tensors() {
+                if !prefixes.iter().any(|p| k.starts_with(p)) {
+                    continue;
+                }
+                let in_triple = [".weight", ".scales", ".biases"].iter().any(|s| {
+                    k.strip_suffix(s)
+                        .is_some_and(|base| packed_bases.contains(base))
+                });
+                let v = coerce_float(st.load(&k, if in_triple { &host } else { device })?, dtype)?;
+                if map.insert(k.clone(), v).is_some() {
+                    return Err(CandleError::Msg(format!(
+                        "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
+                         must each live in exactly one .safetensors shard — this snapshot has \
+                         {k:?} in more than one file (mis-sharded checkpoint or a stray \
+                         .safetensors in the dir)",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        let mut w = Self::from_map(map);
+        w.target = Some(device.clone());
+        Ok(w)
+    }
+
+    /// The destination device of a [`from_files_filtered_host_packed`](Self::from_files_filtered_host_packed)
+    /// set, whose packed triples sit on the host so the triple's own tensors cannot name it. `None`
+    /// for every other constructor — consumers then keep using the weight tensor's device.
+    pub fn host_packed_target(&self) -> Option<&Device> {
+        self.target.as_ref()
+    }
+
     /// Fetch a required tensor, erroring (not panicking) when a checkpoint is missing a key.
     pub fn require(&self, key: &str) -> Result<Tensor> {
         self.map
@@ -237,6 +308,7 @@ impl Weights {
             map,
             int8: std::sync::Mutex::new(None),
             convrot_rotations: std::sync::Mutex::new(HashMap::new()),
+            target: None,
         }
     }
 
@@ -594,6 +666,54 @@ mod tests {
         );
         assert!(w.contains("visual_projection.weight"));
         assert!(!w.contains("text_model.dead.weight"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// sc-26691: the host-packed loader returns the same tensor values as `from_files_filtered`,
+    /// records the destination, and (on CPU, where residency cannot differ) still unions shards.
+    #[test]
+    fn host_packed_loader_matches_filtered_values_and_records_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = scratch_dir(&tmp, "host_packed");
+        let a = dir.join("a.safetensors");
+        let mut m = HashMap::new();
+        m.insert(
+            "lm.q.weight".to_string(),
+            Tensor::new(&[0x1234_5678u32, 7], &Device::Cpu).unwrap(),
+        );
+        m.insert(
+            "lm.q.scales".to_string(),
+            Tensor::new(&[0.5f32], &Device::Cpu).unwrap(),
+        );
+        m.insert(
+            "lm.q.biases".to_string(),
+            Tensor::new(&[0.25f32], &Device::Cpu).unwrap(),
+        );
+        m.insert(
+            "lm.n.weight".to_string(),
+            Tensor::new(&[3.0f32], &Device::Cpu).unwrap(),
+        );
+        m.insert(
+            "other.x".to_string(),
+            Tensor::new(&[9.0f32], &Device::Cpu).unwrap(),
+        );
+        cst::save(&m, &a).unwrap();
+        let hp =
+            Weights::from_files_filtered_host_packed(&[&a], &Device::Cpu, DType::F32, &["lm."])
+                .unwrap();
+        let plain =
+            Weights::from_files_filtered(&[&a], &Device::Cpu, DType::F32, &["lm."]).unwrap();
+        assert!(hp.host_packed_target().is_some() && plain.host_packed_target().is_none());
+        assert!(!hp.contains("other.x"));
+        for k in ["lm.q.weight", "lm.q.scales", "lm.q.biases", "lm.n.weight"] {
+            let (x, y) = (hp.require(k).unwrap(), plain.require(k).unwrap());
+            assert_eq!(x.dtype(), y.dtype());
+            assert_eq!(x.to_vec1::<f32>().ok(), y.to_vec1::<f32>().ok(), "{k}");
+        }
+        assert_eq!(
+            hp.require("lm.q.weight").unwrap().to_vec1::<u32>().unwrap(),
+            vec![0x1234_5678, 7]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

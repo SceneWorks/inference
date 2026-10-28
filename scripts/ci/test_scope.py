@@ -143,6 +143,14 @@ def load_workspace(root: Path = ROOT) -> Workspace:
         for name, spec in table.items()
         if isinstance(spec, dict) and "path" in spec
     }
+    # A shared PATH dependency outside the member set (an excluded vendored fork reached without a
+    # [patch], e.g. vendor/candle-flash-attn, sc-26691) behaves like a patched vendor dir: an edit
+    # under it selects its lockfile dependents.
+    member_dir_set = set(members)
+    for name, path in shared.items():
+        vendored_dir = _posix(os.path.normpath(path))
+        if vendored_dir not in member_dir_set:
+            patched.setdefault(vendored_dir, name)
     return Workspace(manifest, members, deps, patched, inherits)
 
 

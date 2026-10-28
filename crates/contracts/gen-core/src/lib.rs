@@ -59,6 +59,7 @@ pub mod guidance;
 pub mod h3_adapter_memory;
 pub mod h3_conditioning_memory;
 pub mod h3_memory;
+pub mod h3_reference;
 pub mod hdr;
 pub mod image_embed;
 pub mod imageops;
@@ -185,6 +186,10 @@ pub use generator::{
     REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
     REFERENCE_IMAGE_SHORT_EDGE_MIN,
 };
+pub use h3_reference::{
+    effective_reference_image_resize_mode, resolve_reference_image_size, truncate_reference_audio,
+    ReferenceImageResizeMode,
+};
 pub use hdr::{
     exr_conditioning_to_vae_range, from_vae_range, hlg_inverse_oetf, hlg_oetf,
     rgb_signal_to_yuv420p10, to_vae_range, working_frame_to_exr_payload,
@@ -268,14 +273,15 @@ pub use registry::{
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
-    AdapterApplyReport, AdapterKind, AdapterSpec, ArtifactSeal, CancelFlag, FileStatFingerprint,
-    HdrFrameSink, HdrOutputFrame, IdentityWeights, LoadPhase, LoadShape,
-    LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile,
-    Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress, PromptEnhancementOutcome,
-    PromptEnhancementReport, PromptEnhancementSink, Quant, ResolvedFileIdentity, SingleFlight,
-    SingleFlightGuard, WeightsSource, Yue2ArMode, Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT,
-    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
-    LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
+    AdapterApplyReport, AdapterKind, AdapterSpec, ArtifactDigestAttestation, ArtifactSeal,
+    CancelFlag, FileStatFingerprint, HdrFrameSink, HdrOutputFrame, IdentityWeights, LoadPhase,
+    LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy, PidWeights,
+    PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress,
+    PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,
+    ResolvedFileIdentity, SingleFlight, SingleFlightGuard, WeightsSource, Yue2ArMode,
+    Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT,
+    COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT,
+    VAE_COMPONENT,
 };
 pub use sd3_encoder_artifacts::{
     resolve_sd3_text_encoder_artifacts, Sd3TextEncoderArtifactError, Sd3TextEncoderArtifacts,

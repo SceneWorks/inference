@@ -1359,6 +1359,20 @@ jobs:
           # `windows-cuda` lane below, this one runs on every PR that touches the CUDA paths, so it
           # is one of the lanes that was writing a PR-scoped cache nothing else could read.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # sc-26691: `runtime-cuda`'s default features include `media-flash-attn`, so every cargo step
+      # below that selects `-p runtime-cuda` unifies `candle-gen/flash-attn` into the whole graph:
+      # the FlashAttention-2 dispatch code is compiled and linted here, and the vendored multi-arch
+      # flash fatbin (vendor/candle-flash-attn: 37 CUTLASS kernels x sm_80/90/120 + compute_120)
+      # is built by nvcc. Nothing executes attention — compile/lint only. The objects go to a
+      # per-runner persistent directory (cudaforge reuses an object whose source/args hash is
+      # unchanged), so the nvcc cost is paid once per runner rather than per run; rust-cache does
+      # not reliably keep path-dependency build-script outputs.
+      - name: Persistent FlashAttention object cache (per runner)
+        shell: powershell
+        run: |
+          $dir = Join-Path $env:RUNNER_TOOL_CACHE "candle-flash-attn-objects\$env:RUNNER_NAME"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          "CANDLE_FLASH_ATTN_BUILD_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
       - name: Compile Candle CUDA packages and test binaries (no GPU required)
         shell: cmd
         run: |

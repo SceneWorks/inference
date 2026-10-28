@@ -429,6 +429,10 @@ pub enum ArtifactSealAcquisition {
     MemoryMemo,
     PersistedMemo,
     DriftAudit,
+    /// A caller-supplied digest whose bound target identity matched at pin time (sc-26691).
+    Attested,
+    /// A seal carried across a hard link this seal itself created (sc-26691).
+    Relinked,
 }
 
 /// Completing a read does not authorize a seal; only Acquired follows identity validation.
@@ -853,6 +857,82 @@ fn parse_hex_digest(text: &str) -> Option<[u8; 32]> {
     Some(digest)
 }
 
+/// A SHA-256 the caller already proved for one file, bound to that file's resolved-target identity
+/// at the moment of proof (sc-26691).
+///
+/// The motivating producer is a derivative written by a hashing writer: every byte went through
+/// SHA-256 on its way to disk, so re-reading the finished file to seal it is pure cost (a 34 GB
+/// MiniMax-H3 derivative re-read cold before every first load). [`ArtifactSeal::pin_attested`]
+/// redeems the digest only while a fresh capture of the file's target fingerprint is IDENTICAL to
+/// the one bound here — size, mtime, file id/inode, volume/device, and Windows ChangeTime / Unix
+/// ctime, which a content write always moves and userspace cannot backdate. Any difference is a full
+/// read, exactly as [`ArtifactSeal::pin`] would perform. The trust is the same predicate the
+/// in-process digest memo already applies; the attestation only lets the hashing party seed it.
+///
+/// Capture it only after the bytes are final (after the hashing writer closed), never before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactDigestAttestation {
+    target_fingerprint: FileStatFingerprint,
+    sha256: [u8; 32],
+}
+
+impl ArtifactDigestAttestation {
+    /// Bind `sha256` to `path`'s resolved-target identity as it is right now.
+    pub fn capture(path: impl AsRef<Path>, sha256: [u8; 32]) -> crate::Result<Self> {
+        let target_fingerprint = stat_fingerprint(path.as_ref(), true)?;
+        if target_fingerprint.is_symlink || !std::fs::metadata(path.as_ref())?.is_file() {
+            return Err(crate::Error::Msg(format!(
+                "attested weights source is not a regular file: {}",
+                path.as_ref().display()
+            )));
+        }
+        Ok(Self {
+            target_fingerprint,
+            sha256,
+        })
+    }
+
+    pub fn target_fingerprint(&self) -> &FileStatFingerprint {
+        &self.target_fingerprint
+    }
+
+    pub fn content_sha256(&self) -> &[u8; 32] {
+        &self.sha256
+    }
+}
+
+/// `fingerprint` with the fields a new hard link legitimately moves (Windows ChangeTime, Unix ctime)
+/// cleared. Every other field — size, mtime, file id/inode, volume/device — must still agree.
+fn without_change_time(fingerprint: &FileStatFingerprint) -> FileStatFingerprint {
+    #[allow(unused_mut)]
+    let mut fingerprint = fingerprint.clone();
+    #[cfg(unix)]
+    {
+        fingerprint.changed_seconds = 0;
+        fingerprint.changed_nanoseconds = 0;
+    }
+    #[cfg(windows)]
+    {
+        fingerprint.change_time = 0;
+    }
+    fingerprint
+}
+
+#[cfg(unix)]
+fn same_file_object(left: &FileStatFingerprint, right: &FileStatFingerprint) -> bool {
+    left.device == right.device && left.inode == right.inode
+}
+
+#[cfg(windows)]
+fn same_file_object(left: &FileStatFingerprint, right: &FileStatFingerprint) -> bool {
+    left.volume_serial_number == right.volume_serial_number && left.file_id == right.file_id
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_object(_left: &FileStatFingerprint, _right: &FileStatFingerprint) -> bool {
+    false
+}
+
 impl ArtifactSeal {
     /// Persist proven seal digests under `dir` for the rest of this process (first call wins).
     ///
@@ -925,13 +1005,9 @@ impl ArtifactSeal {
         Self::pin_with_store_and_check(path, store, &mut || Ok(()), &mut |_| {})
     }
 
-    fn pin_with_store_and_check(
-        path: &Path,
-        store: Option<&Path>,
-        check: &mut impl FnMut() -> crate::Result<()>,
-        observe: &mut impl FnMut(&ArtifactSealProgress),
-    ) -> crate::Result<Self> {
-        check()?;
+    /// Capture and self-verify every identity field of `path` without reading its content. The
+    /// returned seal carries a zero digest and must never escape before one is assigned.
+    fn capture_identity(path: &Path) -> crate::Result<Self> {
         let loader_path = std::path::absolute(path)?;
         let canonical_target_path = std::fs::canonicalize(&loader_path)?;
         let path_component_fingerprints = path_component_fingerprints(&loader_path)?;
@@ -956,17 +1032,160 @@ impl ArtifactSeal {
         // Prove the entry, parent chain, resolution, and target still agree after the multi-stat
         // capture. This closes persistent changes during pin construction itself.
         pinned.ensure_unchanged()?;
+        Ok(pinned)
+    }
+
+    fn seal_identity(&self) -> SealIdentity {
+        SealIdentity {
+            loader_path: self.loader_path.clone(),
+            canonical_target_path: self.canonical_target_path.clone(),
+            path_component_fingerprints: self.path_component_fingerprints.clone(),
+            entry_fingerprint: self.entry_fingerprint.clone(),
+            target_fingerprint: self.target_fingerprint.clone(),
+        }
+    }
+
+    /// Record a digest proven for this seal's exact identity in the process memo and, when one is
+    /// configured, the persisted store — the same two places a cold read records it.
+    fn remember_digest(&self, store: Option<&Path>, sha256: [u8; 32]) {
+        let identity = self.seal_identity();
+        if let Some(entry) = store.and_then(|store| {
+            let volume = volume_identity(&self.canonical_target_path)?;
+            Some(proven_digest_store_entry(store, &identity, &volume))
+        }) {
+            store_proven_digest(&entry, &sha256);
+        }
+        remember_proven_digest(identity, sha256);
+    }
+
+    /// [`Self::pin`] for a file whose digest the caller already proved (see
+    /// [`ArtifactDigestAttestation`]). No content is read when the attested target identity still
+    /// matches; otherwise this is exactly [`Self::pin`], memo and cold read included.
+    pub fn pin_attested(
+        path: impl AsRef<Path>,
+        attestation: &ArtifactDigestAttestation,
+    ) -> crate::Result<Self> {
+        Self::pin_attested_with_progress(path, attestation, || Ok(()), |_| {})
+    }
+
+    /// Checked, observed form of [`Self::pin_attested`]. A redeemed attestation reports
+    /// [`ArtifactSealAcquisition::Attested`] with zero hashed bytes.
+    pub fn pin_attested_with_progress(
+        path: impl AsRef<Path>,
+        attestation: &ArtifactDigestAttestation,
+        mut check: impl FnMut() -> crate::Result<()>,
+        mut observe: impl FnMut(&ArtifactSealProgress),
+    ) -> crate::Result<Self> {
+        let path = path.as_ref();
         check()?;
-        // Only AFTER that proof is the identity worth trusting as a memo key: the lookup below is
-        // allowed to stand in for the content read precisely because everything it compares has just
-        // been re-verified against the filesystem.
-        let identity = SealIdentity {
-            loader_path: pinned.loader_path.clone(),
-            canonical_target_path: pinned.canonical_target_path.clone(),
-            path_component_fingerprints: pinned.path_component_fingerprints.clone(),
-            entry_fingerprint: pinned.entry_fingerprint.clone(),
-            target_fingerprint: pinned.target_fingerprint.clone(),
+        let pinned = Self::capture_identity(path)?;
+        check()?;
+        if pinned.target_fingerprint == attestation.target_fingerprint {
+            pinned.remember_digest(
+                PROVEN_DIGEST_STORE.get().map(PathBuf::as_path),
+                attestation.sha256,
+            );
+            observe(&seal_progress(
+                &pinned.loader_path,
+                ArtifactSealAcquisition::Attested,
+                ArtifactSealProgressState::Acquired,
+                0,
+                Some(pinned.target_fingerprint.size),
+            ));
+            return Ok(Self {
+                sha256: attestation.sha256,
+                ..pinned
+            });
+        }
+        Self::pin_with_progress(path, check, observe)
+    }
+
+    /// Create a hard link to this seal's target at `link` and return the seal re-captured after it,
+    /// carrying the SAME digest without re-reading content (sc-26691).
+    ///
+    /// Adding a hard link moves the shared file's Windows ChangeTime (Unix ctime), which every
+    /// seal reads as drift; re-pinning the file afterwards was a full cold read of bytes the link
+    /// never touched. Here the seal performs the link itself, so it can prove what changed: the
+    /// seal must be unchanged immediately before the link, the re-capture must agree on every
+    /// field except the change time (size, mtime, file id/inode, volume, resolution, parent chain),
+    /// and `link` must name the very same file object. Anything else refuses — the link is left in
+    /// place and the caller's ordinary re-pin re-reads and compares the content.
+    ///
+    /// # The window in which the change time is not compared
+    ///
+    /// The change time is ignored only between two stats that bracket the `hard_link` syscall:
+    /// the last pre-link stat of the target and of the entry (each compared IN FULL, change time
+    /// included, against this seal — after [`Self::ensure_unchanged`] has verified the parent
+    /// chain and resolution) and the first post-link stat of the target and of the entry (compared
+    /// against this seal with only the change time cleared). Everything captured after those
+    /// post-link stats — the full re-capture and the link's own stat — must then agree with them
+    /// IN FULL, so a write after the bracket is caught by its change time as usual. The only write
+    /// this cannot distinguish from the link is one that lands inside that bracket (two stats,
+    /// the link syscall, two stats) AND preserves size, mtime and file id.
+    pub fn hard_link_with_check(
+        &self,
+        link: impl AsRef<Path>,
+        mut check: impl FnMut() -> crate::Result<()>,
+    ) -> crate::Result<Self> {
+        let link = link.as_ref();
+        let changed = || {
+            crate::Error::Unsupported(format!(
+                "pinned weights changed while being hard-linked: {}",
+                self.loader_path.display()
+            ))
         };
+        check()?;
+        self.ensure_unchanged()?;
+        // Bracket open: the last full-identity proof before the link.
+        if stat_fingerprint(&self.loader_path, true)? != self.target_fingerprint
+            || stat_fingerprint(&self.loader_path, false)? != self.entry_fingerprint
+        {
+            return Err(changed());
+        }
+        std::fs::hard_link(&self.canonical_target_path, link)?;
+        // Bracket close: the first stats after the link; only the change time may have moved.
+        let target_after = stat_fingerprint(&self.loader_path, true)?;
+        let entry_after = stat_fingerprint(&self.loader_path, false)?;
+        if without_change_time(&target_after) != without_change_time(&self.target_fingerprint)
+            || without_change_time(&entry_after) != without_change_time(&self.entry_fingerprint)
+        {
+            return Err(changed());
+        }
+        let relinked = Self::capture_identity(&self.loader_path)?;
+        let linked = stat_fingerprint(link, false)?;
+        // From here on the full identity, change time included, must equal the bracket-close one.
+        let unchanged_but_for_the_link = relinked.loader_path == self.loader_path
+            && relinked.canonical_target_path == self.canonical_target_path
+            && relinked.path_component_fingerprints == self.path_component_fingerprints
+            && relinked.entry_fingerprint == entry_after
+            && relinked.target_fingerprint == target_after
+            && !linked.is_symlink
+            && same_file_object(&linked, &relinked.target_fingerprint)
+            && linked == target_after;
+        if !unchanged_but_for_the_link {
+            return Err(changed());
+        }
+        check()?;
+        relinked.remember_digest(PROVEN_DIGEST_STORE.get().map(PathBuf::as_path), self.sha256);
+        Ok(Self {
+            sha256: self.sha256,
+            ..relinked
+        })
+    }
+
+    fn pin_with_store_and_check(
+        path: &Path,
+        store: Option<&Path>,
+        check: &mut impl FnMut() -> crate::Result<()>,
+        observe: &mut impl FnMut(&ArtifactSealProgress),
+    ) -> crate::Result<Self> {
+        check()?;
+        let pinned = Self::capture_identity(path)?;
+        check()?;
+        // Only AFTER `capture_identity`'s self-verification is the identity worth trusting as a
+        // memo key: the lookup below is allowed to stand in for the content read precisely because
+        // everything it compares has just been re-verified against the filesystem.
+        let identity = pinned.seal_identity();
         // Concurrent first pins of one identity read it once: later callers wait here and then hit
         // the memo the first caller filled.
         let _flight = seal_flights().claim(identity.clone(), &mut *check)?;
@@ -4183,6 +4402,216 @@ mod tests {
             ArtifactSeal::pin_with_store(&file, Some(&store)).expect("re-pin with corrupt store");
         assert!(test_full_hash_work_count() > before);
         assert_eq!(first.content_sha256(), second.content_sha256());
+    }
+
+    fn sha256_of(bytes: &[u8]) -> [u8; 32] {
+        Sha256::digest(bytes).into()
+    }
+
+    /// sc-26691: a digest proven by the hashing writer seals the file without a content read, and
+    /// seeds the memo so later plain pins of the same identity read nothing either.
+    #[test]
+    fn an_attested_digest_seals_without_reading_while_the_identity_matches() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("derivative.safetensors");
+        let bytes = vec![7_u8; 3 * 1024 * 1024];
+        std::fs::write(&file, &bytes).expect("write fixture");
+        let attestation =
+            ArtifactDigestAttestation::capture(&file, sha256_of(&bytes)).expect("attest");
+
+        let before = test_full_hash_work_count();
+        let mut acquisitions = Vec::new();
+        let sealed = ArtifactSeal::pin_attested_with_progress(
+            &file,
+            &attestation,
+            || Ok(()),
+            |progress| acquisitions.push((progress.acquisition, progress.hashed_bytes)),
+        )
+        .expect("attested pin");
+        let again = ArtifactSeal::pin(&file).expect("plain pin after attestation");
+        assert_eq!(
+            test_full_hash_work_count(),
+            before,
+            "neither the attested pin nor the memo-seeded plain pin may read content"
+        );
+        assert_eq!(sealed.content_sha256(), &sha256_of(&bytes));
+        assert_eq!(again.content_sha256(), sealed.content_sha256());
+        assert_eq!(acquisitions, vec![(ArtifactSealAcquisition::Attested, 0)]);
+        sealed
+            .ensure_unchanged()
+            .expect("the attested seal is a live seal");
+    }
+
+    /// The resolved cache publishes a produced bundle by renaming its staging DIRECTORY; the files
+    /// inside keep their identity, so the attestation captured in staging still redeems.
+    #[test]
+    fn an_attestation_survives_a_rename_of_the_parent_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let staging = dir.path().join("staging");
+        std::fs::create_dir(&staging).expect("staging");
+        std::fs::write(staging.join("weights.safetensors"), b"produced bytes").expect("write");
+        let attestation = ArtifactDigestAttestation::capture(
+            staging.join("weights.safetensors"),
+            sha256_of(b"produced bytes"),
+        )
+        .expect("attest");
+        let bundle = dir.path().join("bundle");
+        std::fs::rename(&staging, &bundle).expect("publish rename");
+
+        let before = test_full_hash_work_count();
+        let sealed =
+            ArtifactSeal::pin_attested(bundle.join("weights.safetensors"), &attestation).unwrap();
+        assert_eq!(test_full_hash_work_count(), before);
+        assert_eq!(sealed.content_sha256(), &sha256_of(b"produced bytes"));
+    }
+
+    /// Tamper semantics are unchanged: a rewrite after the attestation moves the target identity,
+    /// so the pin reads the file and seals what is really there, never the attested digest.
+    #[test]
+    fn an_attestation_never_authorizes_a_rewritten_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("derivative.safetensors");
+        std::fs::write(&file, b"original bytes").expect("write fixture");
+        let attestation =
+            ArtifactDigestAttestation::capture(&file, sha256_of(b"original bytes")).unwrap();
+        // Same length; the identity still moves (ChangeTime/ctime, and mtime set explicitly so a
+        // coarse filesystem clock cannot make this a race).
+        std::fs::write(&file, b"tampered bytes").expect("mutate fixture");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+
+        let before = test_full_hash_work_count();
+        let sealed = ArtifactSeal::pin_attested(&file, &attestation).expect("falls back to a pin");
+        assert!(
+            test_full_hash_work_count() > before,
+            "a moved identity must be re-read"
+        );
+        assert_eq!(sealed.content_sha256(), &sha256_of(b"tampered bytes"));
+        assert_ne!(sealed.content_sha256(), attestation.content_sha256());
+    }
+
+    /// Overwrite `file` IN PLACE (same file object, same length) with `bytes`, then restore its
+    /// original mtime — the tamper only the change time (Windows ChangeTime / Unix ctime) can see.
+    /// The sleep first steps past the filesystem clock tick (NTFS / Linux timestamps come from a
+    /// coarse kernel clock), so the rewrite's change time is a later tick than the captured one.
+    fn rewrite_in_place_restoring_mtime(file: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        let before = std::fs::metadata(file).unwrap();
+        assert_eq!(before.len(), bytes.len() as u64, "a same-size rewrite");
+        let mtime = before.modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut handle = std::fs::File::options().write(true).open(file).unwrap();
+        handle.write_all(bytes).unwrap();
+        handle.sync_all().unwrap();
+        handle.set_modified(mtime).unwrap();
+        drop(handle);
+        let after = std::fs::metadata(file).unwrap();
+        assert_eq!(after.modified().unwrap(), mtime, "mtime restored exactly");
+        assert_eq!(after.len(), before.len());
+        assert_eq!(std::fs::read(file).unwrap(), bytes);
+    }
+
+    /// A same-size in-place rewrite that restores the original mtime keeps size, mtime and file
+    /// id — only the change time moves. It must still not redeem the attestation: the pin re-reads
+    /// and seals the real bytes. (Mutation-checked: with the change time not captured, this test
+    /// fails because the attested digest is returned without a read.)
+    #[test]
+    fn an_attestation_never_authorizes_an_mtime_restoring_same_size_rewrite() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("derivative.safetensors");
+        std::fs::write(&file, b"original bytes").expect("write fixture");
+        let attestation =
+            ArtifactDigestAttestation::capture(&file, sha256_of(b"original bytes")).unwrap();
+        rewrite_in_place_restoring_mtime(&file, b"tampered bytes");
+
+        let before = test_full_hash_work_count();
+        let mut acquisitions = Vec::new();
+        let sealed = ArtifactSeal::pin_attested_with_progress(
+            &file,
+            &attestation,
+            || Ok(()),
+            |progress| acquisitions.push(progress.acquisition),
+        )
+        .expect("falls back to a pin");
+        assert!(
+            !acquisitions.contains(&ArtifactSealAcquisition::Attested),
+            "a change-time-only tamper must not redeem the attestation: {acquisitions:?}"
+        );
+        assert!(
+            test_full_hash_work_count() > before,
+            "the tampered file must be re-read"
+        );
+        assert_eq!(sealed.content_sha256(), &sha256_of(b"tampered bytes"));
+    }
+
+    /// The hard-link path's twin: the same change-time-only tamper between the pin and the link
+    /// refuses the relink, so the old digest never labels the rewritten bytes. (Mutation-checked
+    /// like the attestation test above.)
+    #[test]
+    fn a_seal_refuses_to_hard_link_after_an_mtime_restoring_same_size_rewrite() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("derivative.safetensors");
+        std::fs::write(&file, b"derivative bytes").expect("write fixture");
+        let sealed = ArtifactSeal::pin(&file).expect("pin");
+        rewrite_in_place_restoring_mtime(&file, b"tampered!! bytes");
+
+        let link = dir.path().join("staged.safetensors");
+        let error = sealed
+            .hard_link_with_check(&link, || Ok(()))
+            .expect_err("a change-time-only tamper must never be relinked under the old digest");
+        assert!(error.to_string().contains("changed"), "{error}");
+        assert!(
+            !link.exists(),
+            "the refusal happens before the link is created"
+        );
+    }
+
+    /// sc-26691: a hard link the seal creates itself carries the digest across the ChangeTime/ctime
+    /// move it causes — no cold re-read — and the carried seal is live at the new identity.
+    #[test]
+    fn a_seal_carries_its_digest_across_a_hard_link_it_creates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("derivative.safetensors");
+        std::fs::write(&file, b"derivative bytes").expect("write fixture");
+        let sealed = ArtifactSeal::pin(&file).expect("pin");
+        let link = dir.path().join("staged.safetensors");
+
+        let before = test_full_hash_work_count();
+        let relinked = sealed
+            .hard_link_with_check(&link, || Ok(()))
+            .expect("hard link from the seal");
+        let after_link = ArtifactSeal::pin(&file).expect("plain re-pin");
+        assert_eq!(
+            test_full_hash_work_count(),
+            before,
+            "neither the relink nor a later pin of the relinked identity may read content"
+        );
+        relinked
+            .ensure_unchanged()
+            .expect("live at the new identity");
+        assert_eq!(relinked.content_sha256(), sealed.content_sha256());
+        assert_eq!(after_link.content_sha256(), sealed.content_sha256());
+        assert_eq!(std::fs::read(&link).unwrap(), b"derivative bytes");
+    }
+
+    /// A file rewritten before the link is not carried: the seal refuses rather than relabeling
+    /// changed bytes with its old digest.
+    #[test]
+    fn a_seal_refuses_to_hard_link_a_file_that_changed_since_it_was_pinned() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("derivative.safetensors");
+        std::fs::write(&file, b"derivative bytes").expect("write fixture");
+        let sealed = ArtifactSeal::pin(&file).expect("pin");
+        std::fs::write(&file, b"rewritten, longer bytes").expect("mutate fixture");
+
+        let error = sealed
+            .hard_link_with_check(dir.path().join("staged.safetensors"), || Ok(()))
+            .expect_err("a changed file must never be relinked under the old digest");
+        assert!(error.to_string().contains("changed"), "{error}");
     }
 
     #[test]
