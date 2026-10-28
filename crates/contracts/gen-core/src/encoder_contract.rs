@@ -34,6 +34,8 @@ mod facts;
 pub use facts::*;
 
 mod contract;
+mod contract_config;
+mod contract_headers;
 
 mod discovery;
 pub use discovery::*;
