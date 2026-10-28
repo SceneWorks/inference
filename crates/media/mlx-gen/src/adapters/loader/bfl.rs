@@ -33,7 +33,7 @@ impl LoraRowSlice {
         let rows = t.shape()[0];
         // `n`/`index`/`dims` come from a static `bfl_targets()` table built in code, not the file —
         // but a miswritten entry (n<=0, index out of [0,n), or an out-of-range `dims` index) would
-        // divide-by-zero / index out of bounds and panic. Reject it with a typed error (F-033).
+        // divide-by-zero / index out of bounds and panic. Reject it with a typed error (sc-5283).
         let (start, end) = match self {
             LoraRowSlice::Chunk { n, index } => {
                 if *n <= 0 || *index < 0 || *index >= *n {
@@ -41,7 +41,7 @@ impl LoraRowSlice {
                         "LoraRowSlice::Chunk: invalid chunk spec (n={n}, index={index})"
                     )));
                 }
-                // F-060: `Chunk` ALWAYS slices (vs `ChunkIfDivisible`'s fall-through), so a non-divisible
+                // sc-9099: `Chunk` ALWAYS slices (vs `ChunkIfDivisible`'s fall-through), so a non-divisible
                 // `rows` silently mis-slices the fused qkv delta (truncating division drops the tail).
                 // The fork's `_split_qkv_up` is only ever emitted for an exactly-divisible fused linear,
                 // so a non-divisible shape means a mis-converted/mismatched adapter — reject it.
@@ -208,8 +208,8 @@ pub fn apply_lora_bfl(
                     });
                 }
                 KohyaRole::Alpha => {
-                    // Detect a genuine conflict rather than nondeterministic last-wins (F-014,
-                    // sc-11129): a file with two `.alpha` spellings mapping to one target resolved by
+                    // Detect a genuine conflict rather than nondeterministic last-wins
+                    // (sc-11129): a file with two `.alpha` spellings mapping to one target resolved by
                     // HashMap visit order, installing at a nondeterministic scale across runs while
                     // reporting success. Mirror `apply_lora_peft`'s hard "alpha conflict" error. A
                     // repeated identical value (the same key visited twice) is not a conflict.
@@ -337,7 +337,7 @@ where
     }
 
     // Pass 1 — resolve each module's fused shape and sum the bytes the reconstruction will materialize
-    // (F-010, sc-11129). This BFL fused→split path has NO deferred/allocation-free form: each
+    // (sc-11129). This BFL fused→split path has NO deferred/allocation-free form: each
     // destination row-slices the fully reconstructed `[Σout,in]` bf16 delta, so every install
     // materializes. Its plain-path twin (`install_lycoris_groups`) already applies the sc-10678 memory
     // guard; this sibling did not, so a full-coverage BFL LoKr on FLUX could hold multiple GB of
@@ -353,7 +353,7 @@ where
         // Fused reconstruction shape: rows = Σ destination out dims, cols = the shared in dim. Every
         // fused destination MUST share one in_dim — the reconstruction uses the first destination's
         // input dim for all rows, so a miswritten `bfl_targets()` entry fusing mismatched in-dims would
-        // otherwise surface as an opaque kron/reshape error far from the cause (F-013, sc-11129).
+        // otherwise surface as an opaque kron/reshape error far from the cause (sc-11129).
         let mut fused_out = 0i32;
         let mut in_dim: Option<i32> = None;
         let mut resolvable = true;
@@ -397,7 +397,7 @@ where
         });
     }
 
-    // sc-10678 / F-010 — pre-flight memory guard, the same policy as `install_lycoris_groups`.
+    // sc-10678 / sc-11129 — pre-flight memory guard, the same policy as `install_lycoris_groups`.
     if projected_materialize > 0 {
         let active = get_active_memory();
         let limit = get_memory_limit();

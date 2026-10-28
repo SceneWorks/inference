@@ -186,7 +186,7 @@ fn read_control_scalar_f32_at(
 /// This is the load-time seam (sc-2534): a provider calls it inside `load()` with its model's
 /// [`AdaptableHost`] while the model is still mutable. Empty `specs` is a no-op (empty report).
 ///
-/// **Scope (F-035):** this fixed-prefix variant routes PEFT/diffusers LoRA, metadata-stamped LoKr,
+/// **Scope (sc-5285):** this fixed-prefix variant routes PEFT/diffusers LoRA, metadata-stamped LoKr,
 /// and keyless third-party LyCORIS LoKr/LoHa. Unlike [`apply_adapter_specs_autoprefix`] it does NOT
 /// detect BFL/ComfyUI fused→split or kohya-flattened files — both require walking the host module
 /// tree (`bfl_targets()` / `kohya_table()`), which only the autoprefix path does. Callers that may
@@ -212,7 +212,7 @@ pub fn apply_adapter_specs(
                 // optional tucker `lokr_t2` are invisible to the peft parser — routing it to
                 // `apply_lokr` would silently drop both and install a mis-scaled delta. Detect by
                 // keys and route to the third-party applier, mirroring the `Lora` arm below and
-                // the autoprefix dispatch (F-012).
+                // the autoprefix dispatch (sc-9099).
                 if !is_lokr(&w) && is_lokr_keys(&w) {
                     apply_lokr_thirdparty(host, &w, spec.scale)?
                 } else {
@@ -293,7 +293,7 @@ impl HostTables {
 }
 
 /// The on-disk format of one adapter file, as resolved by [`classify_adapter_format`] — the single
-/// routing truth for [`apply_adapter_specs_autoprefix`]'s dispatch (F-069). Variant order mirrors
+/// routing truth for [`apply_adapter_specs_autoprefix`]'s dispatch (sc-9099). Variant order mirrors
 /// the detection precedence:
 ///
 /// 1. **Third-party LyCORIS keys** (`lokr_*` without a `networkType` stamp, or `hada_*`) — before
@@ -442,7 +442,7 @@ pub fn peft_lora_factor<'a>(key: &'a str, prefix: &str) -> Option<(&'a str, Lora
     None
 }
 
-/// Classify one adapter file for the autoprefix dispatch (F-069). A pure function of the file's
+/// Classify one adapter file for the autoprefix dispatch (sc-9099). A pure function of the file's
 /// keys/metadata, the declared `kind`, and the host's kohya/BFL surface; `tables` caches the
 /// host-tree walks across specs. See [`AdapterFormat`] for the precedence rationale.
 fn classify_adapter_format(
@@ -528,8 +528,8 @@ fn apply_adapter_specs_autoprefix_reported(
     let mut tables = HostTables::default();
     let mut reports = Vec::with_capacity(specs.len());
     for spec in specs {
-        // Load + classify the file once per spec (F-004); `classify_adapter_format` is the single
-        // source of routing truth (F-069) — the arms below only fetch the table the applier needs
+        // Load + classify the file once per spec (sc-4015); `classify_adapter_format` is the single
+        // source of routing truth (sc-9099) — the arms below only fetch the table the applier needs
         // and apply.
         // iOS: header-only floor of the adapter file before it is eagerly read (no-op elsewhere).
         crate::ios_quantum::before_load(ADAPTER_LOAD_QUANTUM, std::slice::from_ref(&spec.path))?;

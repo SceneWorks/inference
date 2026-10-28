@@ -570,7 +570,7 @@ fn merge_one_loha_thirdparty(
 /// Emit a single, uniform warning for adapter targets that aren't present in the loaded checkpoint —
 /// a *partial* skip, distinct from the hard "matched no module" error the model entries return. The
 /// three Wan `Generator` load paths (`model.rs` ×2, `model_vace.rs`) share this so the message can't
-/// drift (F-026). The structured per-adapter outcome is published through
+/// drift (sc-4031). The structured per-adapter outcome is published through
 /// `Generator::adapter_apply_reports` (sc-27451, built by [`adapter_apply_reports`]); this stderr
 /// line is kept as a secondary log for runs nobody inspects programmatically. A no-op when nothing
 /// was skipped.

@@ -171,7 +171,7 @@ pub fn u8_frames_to_images(frames: &Array) -> Result<Vec<Image>> {
 /// reference `((x + 1) / 2).clamp(0, 1)·255` + round, computed in the video's own dtype. The
 /// Mochi and LTX `to_uint8_frames` bodies, which were identical apart from the error prefix `who`
 /// (sc-27319). Batch must be 1: the reshape drops the batch axis, so B>1 would interleave frames
-/// across batch items (F-051).
+/// across batch items (sc-5301).
 pub fn video_bcfhw_to_u8_frames(video: &Array, who: &str) -> Result<Array> {
     let sh = video.shape(); // (1, 3, F, H, W)
     if sh.len() != 5 {

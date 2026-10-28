@@ -212,10 +212,10 @@ impl ThirdPartyLokr {
     /// non-tucker `lokr_w2_a` is `[shape0, dim]` (dim = `shape[1]`). `None` when **both** factors are
     /// full — lycoris then forces `alpha = lora_dim` ⇒ scale 1, so rank is unused.
     ///
-    /// F-010: a corrupt/adversarial third-party file can carry a 1-D/0-D factor (the shape index used
+    /// sc-9099: a corrupt/adversarial third-party file can carry a 1-D/0-D factor (the shape index used
     /// to panic) or a zero dim (→ `scale = alpha/0` = inf/NaN baked into the reconstructed delta and
     /// silently installed). `Result` so both are rejected with a typed error instead; mirrors the
-    /// F-002 LoRA rank-0 guard.
+    /// sc-5252 LoRA rank-0 guard.
     pub(super) fn rank(&self) -> Result<Option<f32>> {
         thirdparty_lokr_rank(
             self.w1_a.as_ref().map(Array::shape),

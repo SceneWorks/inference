@@ -22,7 +22,7 @@ pub(super) fn scalar_alpha(a: &Array) -> Result<Option<f32>> {
         // present-but-empty tensor is a malformed file — NOT an absent alpha. Returning `Ok(None)`
         // here would be indistinguishable from "no alpha key", silently falling back to the
         // `alpha == rank ⇒ scale 1.0` default and mis-scaling the adapter while reporting success.
-        // Fail this one job with a typed error instead (F-031, matching the contract documented above).
+        // Fail this one job with a typed error instead (sc-5281, matching the contract documented above).
         return Err(Error::Msg(
             "scalar_alpha: alpha tensor present but empty (size 0) — malformed adapter file".into(),
         ));
@@ -128,7 +128,7 @@ pub(super) enum LycorisPlan<F> {
 }
 
 /// Shared install skeleton for the non-BFL LyCORIS appliers ([`apply_lokr`],
-/// [`apply_lokr_thirdparty`], [`apply_loha_thirdparty`] — F-067): resolve each module's raw key to
+/// [`apply_lokr_thirdparty`], [`apply_loha_thirdparty`] — sc-9099): resolve each module's raw key to
 /// a host dotted path per `resolution`, then stack a residual onto the target. A key that resolves to
 /// no module is surfaced in `unmatched_paths` under its raw spelling, never silently dropped. The BFL
 /// fused→split twin is [`install_bfl_lycoris`].
@@ -177,7 +177,7 @@ where
     // Pass 1 — resolve every group to a concrete plan, consuming the `factors` probe (which is cheap:
     // it builds the small Kronecker factors or returns `None`, but never the `[out,in]` delta). Sum the
     // bytes EVERY **materialization** will allocate — the packed + non-deferrable case AND the dense-base
-    // case, both of which stack a full `[out,in]` bf16 delta per target (F-011, sc-11129) — so we can
+    // case, both of which stack a full `[out,in]` bf16 delta per target (sc-11129) — so we can
     // budget-check them before the (potentially multi-GB) reconstruction runs. Only deferred (structured,
     // allocation-free) and unmatched groups add nothing to `projected_materialize`.
     let mut plans: Vec<LycorisPlan<F>> = Vec::new();
@@ -223,7 +223,7 @@ where
             }
             Some(facts) => {
                 // Dense base still materializes the same `[out,in]` bf16 delta as a stacked residual —
-                // the OOM the guard prevents on packed tiers is reachable here too (F-011). Project it.
+                // the OOM the guard prevents on packed tiers is reachable here too (sc-11129). Project it.
                 projected_materialize += projected_delta_bytes(&facts.base_shape, dtype);
                 plans.push(LycorisPlan::Dense { dotted, delta });
             }
@@ -233,7 +233,7 @@ where
 
     // sc-10678 — pre-flight memory guard. A non-deferrable adapter (LoHa / tucker-LoKr) must materialize
     // a dense `[out,in]` delta per target — on a PACKED (q4/q8) base (no deferred form) OR a dense base
-    // (F-011: the stacked residual is the same footprint). Over a whole model that can dwarf the base
+    // (sc-11129: the stacked residual is the same footprint). Over a whole model that can dwarf the base
     // footprint; left unchecked it OOMs the worker via an uncatchable SIGKILL mid-run. Refuse UP FRONT —
     // but only when the projected materialization would actually exceed the budget, so an adapter that
     // fits still runs on the user's chosen tier (a plain LoRA or an all-deferred LoKr never reach this
@@ -261,8 +261,8 @@ where
     // is not structurally mutated between passes).
     // A pass-2 re-resolution that returns `None` (the module vanished between passes — unreachable on a
     // stable host today, but lazy/offloaded module trees are now a live pattern, epic 10834) must be
-    // SURFACED in `unmatched_paths`, never silently dropped, honoring the function's contract (F-012,
-    // sc-11129). The dotted path is the resolved spelling (the raw key is gone by pass 2).
+    // SURFACED in `unmatched_paths`, never silently dropped, honoring the function's contract
+    // (sc-11129). The dotted path is the resolved spelling (the raw key is gone by pass 2).
     for plan in plans {
         match plan {
             LycorisPlan::Unmatched(raw) => report.unmatched_paths.push(raw),

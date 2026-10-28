@@ -100,7 +100,7 @@ pub(super) fn install_lora_groups(
                 let a = a_raw.t(); // [r, in] -> [in, r]
                 let mut b = b_raw.t(); // [out, r] -> [r, out]
                                        // A Linear LoRA's factors are 2-D; a malformed 1-D/scalar factor would panic on the
-                                       // `a.shape()[1]` rank read below. Reject it with a typed error up front (F-034).
+                                       // `a.shape()[1]` rank read below. Reject it with a typed error up front (sc-5284).
                 validate_lora_shapes(&path, a_raw.shape(), b_raw.shape())?;
                 // Effective scaling. Precedence: per-target `.alpha` tensor (kohya / SceneWorks
                 // trainer / BFL) → the PEFT/diffusers `lora_adapter_metadata` blob's

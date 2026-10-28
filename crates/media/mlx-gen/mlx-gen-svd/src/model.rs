@@ -600,7 +600,7 @@ impl Svd {
 
 /// Decoded frames NHWC `[1, F, H, W, 3]` (roughly `[-1,1]`) → `Vec<Image>` (`clip(x·0.5+0.5)·255`).
 /// The per-frame split is the shared [`mlx_gen::image::u8_frames_to_images`] (sc-27319): its
-/// frame-major `[F, H·W·3]` readback carries the sc-12748 / F-076 i32-overflow guard this copy
+/// frame-major `[F, H·W·3]` readback carries the sc-12748 / sc-5326 i32-overflow guard this copy
 /// introduced, plus rank/shape validation. The rounded `[0, 255]` values convert to u8 on device;
 /// for every finite value and NaN that matches the host `v as u8` cast this replaced (probed on the
 /// pinned MLX: NaN → 0, as Rust's saturating cast gives).

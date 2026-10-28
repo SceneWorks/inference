@@ -56,8 +56,8 @@ impl ThirdPartyLoha {
     /// rank (`lora_dim`) = `hada_w1_b.shape[0]` (lycoris stores `hada_w1_b` as `[lora_dim, …]` in
     /// both the tucker and non-tucker layouts).
     ///
-    /// F-010: a 1-D/0-D factor panics on the shape index; a zero leading dim → `scale = alpha/0` =
-    /// inf/NaN baked into the reconstructed delta. `Result` so both are rejected (F-002 LoRA twin).
+    /// sc-9099: a 1-D/0-D factor panics on the shape index; a zero leading dim → `scale = alpha/0` =
+    /// inf/NaN baked into the reconstructed delta. `Result` so both are rejected (sc-5252 LoRA twin).
     pub(super) fn rank(&self) -> Result<Option<f32>> {
         thirdparty_loha_rank(self.w1_b.as_ref().map(Array::shape))
     }

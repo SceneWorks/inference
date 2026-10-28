@@ -472,7 +472,7 @@ fn lora_bf16_scalar_alpha_reads_without_panic() {
 fn scalar_alpha_empty_tensor_errors_not_panic() {
     // sc-3959 added the no-panic guard for a malformed third-party adapter with a zero-length
     // `.alpha` (before it, `as_slice::<f32>()` panicked on the size-0 array, aborting the worker).
-    // F-031 then tightened it from a silent `Ok(None)` to a typed error: the callers only reach
+    // sc-5281 then tightened it from a silent `Ok(None)` to a typed error: the callers only reach
     // `scalar_alpha` for a *present* alpha key, so present-but-empty is a malformed file — returning
     // `None` would be indistinguishable from "no alpha" and silently mis-scale the adapter.
     let empty = Array::from_slice(&[] as &[f32], &[0]);
@@ -1570,7 +1570,7 @@ fn lora_row_slice_matches_fork_transforms() {
         "rank 6 ÷3 → sliced"
     );
 
-    // F-060: `Chunk` ALWAYS slices (vs `ChunkIfDivisible`'s fall-through), so a non-divisible
+    // sc-9099: `Chunk` ALWAYS slices (vs `ChunkIfDivisible`'s fall-through), so a non-divisible
     // rows count must be rejected instead of silently truncating the fused qkv delta.
     let err = LoraRowSlice::Chunk { n: 3, index: 0 }
         .apply(&d4)
@@ -1946,7 +1946,7 @@ fn thirdparty_loha_routes_and_installs_via_autoprefix() {
     );
 }
 
-/// F-012: the fixed-prefix `apply_adapter_specs` must route a keys-only third-party LoKr
+/// sc-9099: the fixed-prefix `apply_adapter_specs` must route a keys-only third-party LoKr
 /// declared `AdapterKind::Lokr` to `apply_lokr_thirdparty` — the peft applier's global-metadata
 /// parse ignores the per-module `.alpha` (and a tucker `lokr_t2`), so it would install the
 /// delta at the wrong scale while reporting success.
@@ -2008,7 +2008,7 @@ fn fixed_prefix_lokr_kind_routes_keys_only_file_to_thirdparty() {
         array_eq(&got_y, &want_y, false).unwrap().item::<bool>(),
         "fixed-prefix Lokr dispatch must install the identical third-party delta"
     );
-    // The pre-F-012 route: the peft applier drops the per-module alpha (scale 1, not 0.5).
+    // The pre-sc-9099 route: the peft applier drops the per-module alpha (scale 1, not 0.5).
     let mut peft = OneLinear {
         lin: AdaptableLinear::dense(base, None),
     };
@@ -2024,7 +2024,7 @@ fn fixed_prefix_lokr_kind_routes_keys_only_file_to_thirdparty() {
     println!("MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::fixed_prefix_lokr_kind_routes_keys_only_file_to_thirdparty");
 }
 
-// ---- F-069 format classification --------------------------------------------------------------
+// ---- sc-9099 format classification -----------------------------------------------------------
 
 /// Save a tiny safetensors of `keys` (dummy `[1,1]` tensors — classification reads only
 /// keys/metadata) and load it back as `Weights`.
@@ -2041,7 +2041,7 @@ fn classify_weights(
     Weights::from_file(&path).unwrap()
 }
 
-/// F-069: `classify_adapter_format` is the single routing truth — one minimal key-set per
+/// sc-9099: `classify_adapter_format` is the single routing truth — one minimal key-set per
 /// [`AdapterFormat`] variant, plus the precedence corners (LyCORIS keys beat kohya's shared
 /// `lora_unet_` prefix; BFL naming beats kohya; the `networkType=lokr` stamp gates `lokr_*`
 /// keys; a BFL-named LyCORIS file on a host without a BFL surface stays third-party).
@@ -2686,7 +2686,7 @@ fn write_loha_lin(tmp: &tempfile::TempDir, name: &str) -> Weights {
 #[ignore = "mutates the process-global MLX memory limit; run alone"]
 fn dense_base_loha_over_budget_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
-    // F-011 (sc-11129): a DENSE-base LoHa materializes the same `[out,in]` bf16 delta as a stacked
+    // sc-11129: a DENSE-base LoHa materializes the same `[out,in]` bf16 delta as a stacked
     // residual, so it must be included in the sc-10678 budget projection — the OOM the packed guard
     // prevents is reachable on the dense tier too. Before the fix a dense group added 0 to the
     // projection and this install went through unchecked.
@@ -2697,7 +2697,7 @@ fn dense_base_loha_over_budget_is_refused() {
     let prev = mlx_rs::memory::set_memory_limit(1);
     let result = apply_loha_thirdparty(&mut dense, &w, 1.0);
     mlx_rs::memory::set_memory_limit(prev);
-    result.expect_err("a dense LoHa over budget must now be refused up front (F-011)");
+    result.expect_err("a dense LoHa over budget must now be refused up front (sc-11129)");
     assert!(
         dense.lin.adapters().is_empty(),
         "a refused install must leave no partial adapter on the dense base"
@@ -2707,7 +2707,7 @@ fn dense_base_loha_over_budget_is_refused() {
 #[test]
 fn dense_base_loha_within_budget_still_installs() {
     let tmp = tempfile::tempdir().unwrap();
-    // F-011 regression: counting the dense materialization must only refuse GENUINELY over-budget
+    // sc-11129 regression: counting the dense materialization must only refuse GENUINELY over-budget
     // runs — a LoHa that fits still installs on the dense base (the default, unlimited-limit path).
     let w = write_loha_lin(&tmp, "f011_dense_ok_loha.safetensors");
     let mut dense = OneLinear {
@@ -2723,7 +2723,7 @@ fn dense_base_loha_within_budget_still_installs() {
 #[test]
 fn lycoris_pass2_resolution_miss_is_surfaced_not_dropped() {
     let tmp = tempfile::tempdir().unwrap();
-    // F-012 (sc-11129): if a module resolves in pass 1 but vanishes by pass 2 (a lazy/offloaded
+    // sc-11129: if a module resolves in pass 1 but vanishes by pass 2 (a lazy/offloaded
     // host, epic 10834), the plan must be SURFACED in `unmatched_paths`, never silently dropped —
     // honoring `install_lycoris_groups`'s contract. Modeled with a host whose `adaptable_mut`
     // returns the linear only on its FIRST call (pass 1) and `None` after (pass 2).
@@ -2761,7 +2761,7 @@ fn lycoris_pass2_resolution_miss_is_surfaced_not_dropped() {
 #[test]
 #[allow(clippy::type_complexity)]
 fn bfl_lycoris_fused_mismatched_in_dim_errors() {
-    // F-013 (sc-11129): a fused BFL destination set that does not share one input dim must fail with
+    // sc-11129: a fused BFL destination set that does not share one input dim must fail with
     // a NAMED validation error (module + dims), not an opaque downstream kron/reshape error. Drive
     // `install_bfl_lycoris` directly with a host whose two fused destinations disagree on in_dim.
     struct MismatchHost {
@@ -2826,7 +2826,7 @@ fn bfl_lycoris_fused_mismatched_in_dim_errors() {
 #[ignore = "mutates the process-global MLX memory limit; run alone"]
 #[allow(clippy::type_complexity)]
 fn bfl_lycoris_over_budget_is_refused() {
-    // F-010 (sc-11129): the BFL fused→split path materializes the whole fused delta with no
+    // sc-11129: the BFL fused→split path materializes the whole fused delta with no
     // deferred form, so it must apply the sc-10678 memory guard like its plain-path twin — refusing
     // UP FRONT rather than OOMing the worker mid-reconstruct. Drive `install_bfl_lycoris` with a
     // 1-byte memory limit so any projected materialization is over budget.
@@ -2843,7 +2843,7 @@ fn bfl_lycoris_over_budget_is_refused() {
     let result = install_bfl_lycoris(&mut host, &map, groups, 1.0);
     mlx_rs::memory::set_memory_limit(prev);
     let err =
-        result.expect_err("a BFL LyCORIS materialization over budget must be refused (F-010)");
+        result.expect_err("a BFL LyCORIS materialization over budget must be refused (sc-11129)");
     assert!(
         err.to_string().contains("budget"),
         "the refusal must be the actionable budget error: {err}"
@@ -2863,7 +2863,7 @@ fn bfl_lycoris_over_budget_is_refused() {
 #[test]
 fn bfl_lora_conflicting_alpha_errors() {
     let tmp = tempfile::tempdir().unwrap();
-    // F-014 (sc-11129): two `.alpha` spellings mapping to one BFL target must be a hard conflict
+    // sc-11129: two `.alpha` spellings mapping to one BFL target must be a hard conflict
     // error (mirroring `apply_lora_peft`), not a nondeterministic HashMap-order last-wins scale.
     let a = Array::from_slice(&[0.1f32, 0.2, 0.3], &[1, 3]);
     let b = Array::from_slice(&[0.4f32, 0.5], &[2, 1]);
