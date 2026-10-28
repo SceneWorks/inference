@@ -1210,27 +1210,26 @@ fn a_working_directory_is_claimed_by_one_run_at_a_time() {
     });
     assert!(r.is_err());
     let work = partial_dir(&dir);
-    assert!(
-        !work.join(LOCK_FILE).exists(),
-        "a failed run releases its claim"
-    );
+    let lock = claim_path(&dir);
+    assert!(!lock.exists(), "a failed run releases its claim");
 
     // Two concurrent claims: the second is refused while the first is held.
-    let first = Claim::take(&work).unwrap();
-    assert!(matches!(Claim::take(&work), Err(RunError::Locked(_))));
+    let first = Claim::take(&lock).unwrap();
+    assert!(matches!(Claim::take(&lock), Err(RunError::Locked(_))));
     let before = snapshot(&work);
     let (r, rec) = run(&engine, &input, &s, &RunOutput::resume(&dir));
     assert!(matches!(r, Err(RunError::Locked(_))), "{r:?}");
     assert!(rec.events.is_empty(), "a refused run does nothing");
     assert_eq!(snapshot(&work), before);
     drop(first);
-    assert!(!work.join(LOCK_FILE).exists());
+    assert!(!lock.exists());
 
     // Released: the resume proceeds, and the published run carries no lock.
     run(&engine, &input, &s, &RunOutput::resume(&dir))
         .0
         .unwrap();
     assert!(!dir.join(LOCK_FILE).exists());
+    assert!(!lock.exists());
     assert!(!work.exists());
     verify_run(&dir, None).unwrap();
 
@@ -1318,29 +1317,90 @@ fn files_and_directories_sync_through_handles_the_platform_accepts() {
     assert!(sync_dir(&tmp.path().join("missing-dir")).is_err());
 }
 
-/// sc-27347: the claim is an OS lock, not the lock file's existence — a lock file left by a run
-/// that died without releasing it (SIGKILL, OOM, power loss) is taken over so the resume that
-/// crash needs can proceed, while a live holder still refuses a second claim.
-#[test]
-fn a_stale_lock_file_is_taken_over_but_a_live_claim_still_refuses() {
-    let tmp = tempfile::tempdir().unwrap();
-    let work = tmp.path().join("song.partial");
-    fs::create_dir(&work).unwrap();
-    let lock = work.join(LOCK_FILE);
-    fs::write(&lock, "pid 4294967295\n").unwrap();
+fn opened_work(output: &RunOutput) -> Result<WorkDir, RunError> {
+    match open_output(output)? {
+        Opened::Work(work) => Ok(work),
+        Opened::Complete => panic!("expected a working directory, got a complete run"),
+    }
+}
 
-    let claim = Claim::take(&work).expect("an unheld lock file is stale and taken over");
+/// sc-27347: the claim is an OS lock, not the lock file's existence — a claim file left by a run
+/// that died without releasing it (SIGKILL, OOM, power loss) is taken over so the resume that
+/// crash needs can proceed, while a live holder still refuses a second claimant, fresh or resumed.
+#[test]
+fn a_stale_claim_is_taken_over_but_a_live_claim_still_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("song");
+    let work = partial_dir(&dir);
+    fs::create_dir(&work).unwrap();
+    let lock = claim_path(&dir);
+    assert_eq!(lock, tmp.path().join("song.partial.lock"));
+    fs::write(&lock, "pid 4294967295\n").unwrap();
+    // An earlier build's in-directory claim file is stale too.
+    fs::write(work.join(LOCK_FILE), "pid 4294967295\n").unwrap();
+
+    let held = opened_work(&RunOutput::resume(&dir)).expect("an unheld claim is taken over");
     assert_eq!(
         fs::read_to_string(&lock).unwrap(),
         format!("pid {}\n", std::process::id())
     );
-    assert!(matches!(Claim::take(&work), Err(RunError::Locked(_))));
-    drop(claim);
-    assert!(!lock.exists(), "a released claim removes its lock file");
+    assert!(
+        !work.join(LOCK_FILE).exists(),
+        "the legacy claim file is removed"
+    );
+    assert!(matches!(
+        opened_work(&RunOutput::resume(&dir)),
+        Err(RunError::Locked(_))
+    ));
+    assert!(matches!(
+        opened_work(&RunOutput::fresh(&dir)),
+        Err(RunError::Locked(_))
+    ));
+    drop(held);
+    assert!(!lock.exists(), "a released claim removes its file");
+    assert!(
+        work.is_dir(),
+        "releasing the claim leaves the work for a resume"
+    );
 
     // A fresh claim after release works, and is exclusive again.
-    let again = Claim::take(&work).unwrap();
-    assert!(matches!(Claim::take(&work), Err(RunError::Locked(_))));
+    let again = Claim::take(&lock).unwrap();
+    assert!(matches!(Claim::take(&lock), Err(RunError::Locked(_))));
     drop(again);
     assert!(!lock.exists());
+}
+
+/// sc-27347: publication renames the working directory while the claim is still held — it lives
+/// beside that directory, so it never has to be let go for the rename (Windows) — and a second
+/// run is refused until the publisher's claim drops, after which it sees the complete run.
+#[test]
+fn the_claim_is_held_across_publication() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("song");
+    let lock = claim_path(&dir);
+    let run = opened_work(&RunOutput::fresh(&dir)).unwrap();
+    fs::write(run.path(REQUEST_JSON), "{}").unwrap();
+
+    let (published, _) = run.publish(Map::new()).unwrap();
+    assert_eq!(published, dir);
+    assert!(dir.join(REQUEST_JSON).is_file());
+    assert!(!partial_dir(&dir).exists());
+    assert!(!dir.join(LOCK_FILE).exists());
+    assert!(lock.exists(), "the claim survives the rename");
+    assert!(matches!(Claim::take(&lock), Err(RunError::Locked(_))));
+    assert!(matches!(
+        open_output(&RunOutput::resume(&dir)),
+        Err(RunError::Locked(_))
+    ));
+
+    drop(run);
+    assert!(!lock.exists());
+    assert!(matches!(
+        open_output(&RunOutput::resume(&dir)),
+        Ok(Opened::Complete)
+    ));
+    assert!(
+        !lock.exists(),
+        "inspecting a complete run releases its claim"
+    );
 }

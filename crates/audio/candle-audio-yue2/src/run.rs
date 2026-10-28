@@ -50,12 +50,15 @@
 //! `runtime_sha256` the same way), so work done on another backend or by other code is never
 //! reused; the run identity additionally binds the decoder's pinned identity.
 //!
-//! A run holds an exclusive claim on `D.partial` for its whole duration: an OS advisory lock
-//! (`File::try_lock`) on [`LOCK_FILE`]. A second run — fresh or resumed — is refused with
-//! [`RunError::Locked`] while it is held. The claim is released (and the lock file removed) when the
-//! run publishes, fails or is cancelled; because the lock belongs to the open handle, the OS also
-//! releases it when the process dies (SIGKILL, OOM, power loss), so a lock file left behind by a
-//! crashed run no longer blocks the resume that crash needs (sc-27347).
+//! A run holds an exclusive claim on `D` for its whole duration, publication included: an OS
+//! advisory lock (`File::try_lock`) on the sibling file [`claim_path`] (`D.partial.lock`), outside
+//! the working directory so the claim never has to be let go for `D.partial` to be renamed onto `D`
+//! (Windows cannot rename a directory holding an open handle). A second run — fresh or resumed — is
+//! refused with [`RunError::Locked`] while it is held, and inspects `D`/`D.partial` only once it
+//! holds the claim. The claim is released (and its file removed) after the run publishes, fails or
+//! is cancelled; because the lock belongs to the open handle, the OS also releases it when the
+//! process dies (SIGKILL, OOM, power loss), so a lock file left behind by a crashed run never blocks
+//! the resume that crash needs (sc-27347).
 //!
 //! A cached decode refuses an output that is, is inside, or contains its source (paths resolved
 //! through symlinks and `..`), and carries the source's latent bytes over — checked against the
@@ -115,8 +118,11 @@ pub const STAGES_DIR: &str = "stages";
 pub const PARTIAL_SUFFIX: &str = ".partial";
 /// Schema of `result.json`.
 pub const RUN_SCHEMA: &str = "yue2-run-v1";
-/// The exclusive claim a run holds on its working directory while it assembles it.
+/// The in-directory claim file earlier builds kept inside `D.partial`. The claim now lives beside
+/// it ([`claim_path`]); a leftover one is removed on resume and is never hashed or published.
 pub const LOCK_FILE: &str = ".yue2-run.lock";
+/// Suffix of the claim file beside the working directory: `D.partial.lock`.
+pub const CLAIM_SUFFIX: &str = ".lock";
 
 /// Every way an artifact-backed run fails.
 #[derive(Debug, thiserror::Error)]
@@ -376,6 +382,13 @@ pub fn partial_dir(dir: &Path) -> PathBuf {
     dir.with_file_name(name)
 }
 
+/// The claim file of a run into `dir`: `dir.partial.lock` beside it (see the module docs).
+pub fn claim_path(dir: &Path) -> PathBuf {
+    let mut path = partial_dir(dir).into_os_string();
+    path.push(CLAIM_SUFFIX);
+    PathBuf::from(path)
+}
+
 pub(crate) fn is_nonempty_dir(dir: &Path) -> Result<bool, RunError> {
     match fs::read_dir(dir) {
         Ok(mut entries) => Ok(entries.next().is_some()),
@@ -626,23 +639,24 @@ struct WorkDir {
     target: PathBuf,
     /// `target.partial`.
     work: PathBuf,
-    /// This run's exclusive claim on `work`.
+    /// This run's exclusive claim on `target` and `work`, held through publication.
     _claim: Claim,
 }
 
-/// An exclusive claim on a working directory: an OS advisory lock held on [`LOCK_FILE`] for the
-/// claim's lifetime (so two runs can never hold it at once), with the file removed when the run
-/// publishes, fails or is cancelled. A lock file nobody holds is stale — its run died without
-/// releasing it — and is taken over (sc-27347).
+/// An exclusive claim on a run: an OS advisory lock held on its [`claim_path`] file for the claim's
+/// lifetime (so two runs can never hold it at once), with the file removed when the claim drops. A
+/// claim file nobody holds is stale — its run died without releasing it — and is taken over
+/// (sc-27347). The file sits outside the working directory, so publication renames that directory
+/// while the claim is still held.
 struct Claim {
     path: PathBuf,
-    /// The locked handle; `None` once [`Self::release_handle`] closed it.
-    file: std::sync::Mutex<Option<fs::File>>,
+    /// The locked handle, closed (unlocking it) after [`Drop`] removed the file.
+    _file: fs::File,
 }
 
 impl Claim {
-    fn take(work: &Path) -> Result<Self, RunError> {
-        let path = work.join(LOCK_FILE);
+    fn take(path: &Path) -> Result<Self, RunError> {
+        let path = path.to_path_buf();
         // A releasing holder removes the file while still locked, then closes it: a handle opened
         // just before that removal can lock the orphaned file. Such a lock is detected (the path no
         // longer names the locked file) and the claim is retried on the current file.
@@ -675,20 +689,9 @@ impl Claim {
             file.set_len(0).map_err(io(&path))?;
             file.write_all(format!("pid {}\n", std::process::id()).as_bytes())
                 .map_err(io(&path))?;
-            return Ok(Self {
-                path,
-                file: std::sync::Mutex::new(Some(file)),
-            });
+            return Ok(Self { path, _file: file });
         }
         Err(RunError::Locked(path))
-    }
-
-    /// Close the locked handle early. Windows cannot rename a directory holding an open handle,
-    /// so the publisher closes it immediately before renaming the working directory.
-    #[cfg_attr(not(windows), allow(dead_code))]
-    fn release_handle(&self) {
-        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
-        file.take();
     }
 }
 
@@ -718,8 +721,7 @@ fn names_file(path: &Path, _file: &fs::File) -> std::io::Result<bool> {
 impl Drop for Claim {
     fn drop(&mut self) {
         // Remove the file while still holding the lock, then close (unlocking) the handle when the
-        // `file` field drops. After publication the working directory was renamed away and the
-        // claim travelled with it (the publisher removes it there); nothing is left to remove here.
+        // `_file` field drops.
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -741,6 +743,11 @@ fn open_output(output: &RunOutput) -> Result<Opened, RunError> {
             target.display()
         )));
     }
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(io(parent))?;
+    }
+    // Claim first, then inspect: whatever this run finds stays true until it publishes or fails.
+    let claim = Claim::take(&claim_path(&target))?;
     if is_nonempty_dir(&target)? {
         if output.resume {
             return Ok(Opened::Complete);
@@ -754,20 +761,21 @@ fn open_output(output: &RunOutput) -> Result<Opened, RunError> {
         if !output.resume {
             return Err(RunError::Interrupted(work));
         }
-        let claim = Claim::take(&work)?;
-        return Ok(Opened::Work(WorkDir {
-            target,
-            work,
-            _claim: claim,
-        }));
+        // An earlier build's in-directory claim file (see [`LOCK_FILE`]) is stale under ours.
+        let legacy = work.join(LOCK_FILE);
+        match fs::remove_file(&legacy) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(RunError::Io {
+                    path: legacy,
+                    source: e,
+                })
+            }
+        }
+    } else {
+        fs::create_dir(&work).map_err(io(&work))?;
     }
-    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(io(parent))?;
-    }
-    // `create_dir` (not `_all`) claims the working directory: a concurrent fresh run into the same
-    // target fails here instead of interleaving files; the lock file then covers resumes too.
-    fs::create_dir(&work).map_err(io(&work))?;
-    let claim = Claim::take(&work)?;
     Ok(Opened::Work(WorkDir {
         target,
         work,
@@ -889,12 +897,9 @@ impl WorkDir {
             // An empty target directory (checked when the run opened) is replaced.
             fs::remove_dir(&self.target).map_err(io(&self.target))?;
         }
-        #[cfg(windows)]
-        self._claim.release_handle();
+        // The claim (beside, not inside, the working directory) stays held across the rename and
+        // is released when this run's `WorkDir` drops.
         fs::rename(&self.work, &self.target).map_err(io(&self.target))?;
-        // The claim moved with the directory; it is not an artifact (never hashed) — release it.
-        let moved = self.target.join(LOCK_FILE);
-        fs::remove_file(&moved).map_err(io(&moved))?;
         if let Some(parent) = self.target.parent().filter(|p| !p.as_os_str().is_empty()) {
             durable::sync_dir(parent)?;
         }
