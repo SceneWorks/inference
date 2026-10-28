@@ -466,10 +466,18 @@ fn registered_fp8_mode_refuses_unsupported_loads_before_weights() {
     assert!(load_synthetic(&base).is_ok());
 
     let fp8 = base.with_yue2_ar_mode(Yue2ArMode::ExperimentalFp8);
+    // `check_fp8_request` gates tier, then compute dtype, then device, all before any weight is
+    // read. The default precision resolves to F32 on the CPU, so the dtype gate refuses first; a
+    // Metal build (`candle_audio::default_device` selects Metal) computes in BF16, so the device
+    // gate refuses first instead. Either way the refusal is typed and precedes the weights.
     let err = load_synthetic(&fp8).err().unwrap();
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let gate = "a CUDA device of compute capability >= 8.9, this model is on Metal";
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    let gate = "BF16 compute dtype";
     assert!(
         matches!(&err, gen_core::Error::Unsupported(message)
-        if message.contains("experimental FP8 AR") && message.contains("BF16 compute dtype")),
+        if message.contains("experimental FP8 AR") && message.contains(gate)),
         "{err}"
     );
 
