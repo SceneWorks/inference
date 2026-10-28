@@ -1225,6 +1225,67 @@ pub fn apply_rope_rotate_half_f32(x: &Array, cos: &Array, sin: &Array) -> Result
     Ok(out.as_dtype(orig)?)
 }
 
+/// Bias-free **SwiGLU** feed-forward `down(silu(gate(x)) · up(x))` over three
+/// [`AdaptableLinear`](crate::adapters::AdaptableLinear)s — the Qwen/Qwen3(-VL) text-encoder MLP the
+/// z-image, krea, boogu, ideogram and mage text encoders each re-declared (sc-27326). The provider
+/// loads the projections through its own seam (packed-detect vs dense, its group size) and picks the
+/// forward that matches its parity regime: [`forward`](Self::forward) (activation-dtype matmuls) or
+/// [`forward_upcast`](Self::forward_upcast). Same op sequence as each prior copy.
+pub struct SwiGluMlp {
+    gate: crate::adapters::AdaptableLinear,
+    up: crate::adapters::AdaptableLinear,
+    down: crate::adapters::AdaptableLinear,
+}
+
+impl SwiGluMlp {
+    /// Assemble from already-loaded `gate_proj` / `up_proj` / `down_proj`.
+    pub fn new(
+        gate: crate::adapters::AdaptableLinear,
+        up: crate::adapters::AdaptableLinear,
+        down: crate::adapters::AdaptableLinear,
+    ) -> Self {
+        Self { gate, up, down }
+    }
+
+    /// `down(silu(gate(x)) · up(x))` with each projection's plain
+    /// [`forward`](crate::adapters::AdaptableLinear::forward).
+    pub fn forward(&self, x: &Array) -> Result<Array> {
+        let gated = multiply(&silu(&self.gate.forward(x)?)?, &self.up.forward(x)?)?;
+        self.down.forward(&gated)
+    }
+
+    /// As [`forward`](Self::forward), through each projection's
+    /// [`forward_upcast`](crate::adapters::AdaptableLinear::forward_upcast).
+    pub fn forward_upcast(&self, x: &Array) -> Result<Array> {
+        let gated = multiply(
+            &silu(&self.gate.forward_upcast(x)?)?,
+            &self.up.forward_upcast(x)?,
+        )?;
+        self.down.forward_upcast(&gated)
+    }
+
+    /// Quantize all three projections to `bits` at `group_size` (`None` = the default 64).
+    pub fn quantize(&mut self, bits: i32, group_size: Option<i32>) -> Result<()> {
+        for lin in [&mut self.gate, &mut self.up, &mut self.down] {
+            lin.quantize(bits, group_size)?;
+        }
+        Ok(())
+    }
+
+    /// The three projections, in `gate, up, down` order.
+    pub fn projections(&self) -> [&crate::adapters::AdaptableLinear; 3] {
+        [&self.gate, &self.up, &self.down]
+    }
+
+    /// Materialize the three projections' (lazy) weights.
+    pub fn materialize_weights(&self) -> Result<()> {
+        for lin in self.projections() {
+            lin.materialize_weights()?;
+        }
+        Ok(())
+    }
+}
+
 /// Grouped-query-attention key/value expansion: `[b, s, hkv, hd]` → `[b, s, hkv·groups, hd]`,
 /// repeating each kv head `groups` times consecutively (`repeat_interleave` over the head axis,
 /// matching `mx.repeat(x, groups, axis=2)` / torch `enable_gqa`). `groups == 1` is the identity.
