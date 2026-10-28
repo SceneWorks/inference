@@ -86,8 +86,9 @@ pub use geometry::{
 };
 pub use packing::{PackedLayout, RowClass, AUDIO_TAG, NUM_ROW_CLASSES, TEXT_TAG, VIDEO_TAG};
 pub use schedule::{
-    shift_sigma, DenoiseModality, JointSchedule, SigmaSchedule, AUDIO_SIGMA_SHIFT,
-    KEYFRAME_NOISE_AUG, MIN_INFERENCE_STEPS, REFERENCE_AUDIO_TIMESTEP, VIDEO_SIGMA_SHIFT,
+    shift_sigma, DenoiseModality, JointSchedule, SigmaSchedule, SigmaScheduleStep,
+    AUDIO_SIGMA_SHIFT, KEYFRAME_NOISE_AUG, MIN_INFERENCE_STEPS, REFERENCE_AUDIO_TIMESTEP,
+    VIDEO_SIGMA_SHIFT,
 };
 
 /// Everything one model evaluation needs, besides the weights.

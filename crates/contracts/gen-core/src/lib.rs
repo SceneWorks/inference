@@ -64,6 +64,7 @@ pub mod h3_conditioning_memory;
 pub mod h3_keyframe;
 pub mod h3_memory;
 pub mod h3_reference;
+pub mod h3_schedule;
 pub mod hdr;
 pub mod ideogram_scheduler;
 pub mod image_embed;
