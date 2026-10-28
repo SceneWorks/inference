@@ -336,6 +336,8 @@ impl Decoder {
         // a nonzero floor, audio-EOS on codebook 0 is masked for the first `min_frames` steps (capped
         // at half the budget). The reference applies no floor; correct delay-pattern conditioning
         // ([`build_prompt_frames`]) — not this floor — is what keeps prompts faithful.
+        // The cap is a no-op while the constant is 0; kept so raising the floor stays bounded.
+        #[allow(clippy::unnecessary_min_or_max)]
         let min_frames = DEFAULT_MIN_EOS_FRAMES.min(max_frames / 2);
         let mut rng = Rng::seed(seed);
         // KV-cache AR (sc-13417): prefill the block once (onto the passed cache), then feed each
