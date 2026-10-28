@@ -511,11 +511,8 @@ impl AudioTokenDetokenizer {
 
 /// mmap a single-file component safetensors into an f32 [`VarBuilder`].
 fn load_vb(weights: &Path, device: &Device) -> Result<VarBuilder<'static>> {
-    // Safety: mmap of a pinned-SHA snapshot file the contract guarantees is not mutated.
-    unsafe {
-        VarBuilder::from_mmaped_safetensors(&[weights.to_path_buf()], DType::F32, device)
-            .map_err(|e| AudioError::Msg(format!("mmap {}: {e}", weights.display())))
-    }
+    candle_audio::weights::mmap_var_builder(&[weights], DType::F32, device)
+        .map_err(|e| AudioError::Msg(format!("mmap {}: {e}", weights.display())))
 }
 
 #[cfg(test)]

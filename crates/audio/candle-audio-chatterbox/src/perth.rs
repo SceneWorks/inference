@@ -193,11 +193,12 @@ impl PerthWatermarker {
             )));
         }
         let device = candle_audio::default_device()?;
-        // SAFETY: mmap of a provider-resolved safetensors file — the shared audio-lane idiom.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&path), DType::F32, &device)
-                .map_err(|e| AudioError::Msg(format!("perth: load {}: {e}", path.display())))?
-        };
+        let vb = candle_audio::weights::mmap_var_builder(
+            std::slice::from_ref(&path),
+            DType::F32,
+            &device,
+        )
+        .map_err(|e| AudioError::Msg(format!("perth: load {}: {e}", path.display())))?;
         Self::from_var_builder(vb, device)
     }
 
