@@ -23,10 +23,10 @@
 //! **white** before the Qwen3-VL processor sees it ("the checkpoint was trained with the alpha
 //! composited over white for the vision encoder"), while `image_processor.preprocess` hands the
 //! VAE all four channels. Both of those are reproduced here literally (sc-24111): a
-//! [`Conditioning::ReferenceRgba`] reference's alpha reaches the VAE encode intact and is
+//! [`Conditioning::ReferenceRgba`](candle_gen::gen_core::Conditioning::ReferenceRgba) reference's alpha reaches the VAE encode intact and is
 //! flattened over white for the vision tower only.
 //!
-//! An ordinary RGB [`Conditioning::Reference`] is the `A = 255` special case of exactly that
+//! An ordinary RGB [`Conditioning::Reference`](candle_gen::gen_core::Conditioning::Reference) is the `A = 255` special case of exactly that
 //! path — the widening upstream's `convert("RGBA")` performs — so the white composite is the
 //! identity and the VAE alpha is the constant `+1.0`. The RGB reference route is therefore
 //! byte-for-byte what it was before transparent references existed, which `rgb_reference_is_the_
