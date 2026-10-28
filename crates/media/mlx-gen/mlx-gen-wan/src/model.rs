@@ -22,16 +22,16 @@ use mlx_gen::gen_core::{
 use mlx_gen::tiling::VaeTiling;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    AdapterSpec, CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
+    AdapterApplyReport, AdapterSpec, CancelFlag, Capabilities, Conditioning, ConditioningKind,
+    Error, GenerationOutput, GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality,
+    ModelDescriptor, MoeExpert, OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::random;
 use mlx_rs::Array;
 
 use crate::adapters::{
-    apply_wan_adapters_additive, merge_wan_adapters, reject_loha_on_packed, warn_skipped_adapters,
-    WanLoraReport,
+    adapter_apply_reports, apply_wan_adapters_additive, merge_wan_adapters, reject_loha_on_packed,
+    warn_skipped_adapters, WanLoraReport,
 };
 use crate::config::{WanModelConfig, WanQuant, MIN_SIZE};
 use crate::feature_cache::TrunkCache;
@@ -363,6 +363,10 @@ pub struct Wan {
     memory_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
     /// Exact provider-owned public-I2V artifact and adapter receipt, when the caller prepared one.
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
+    /// Per-adapter apply outcomes from the most recent adapter fold/install (sc-27451), published
+    /// through [`Generator::adapter_apply_reports`]. Interior-mutable because the adapters apply
+    /// inside `generate(&self)`.
+    adapter_reports: std::sync::Mutex<Vec<AdapterApplyReport>>,
 }
 
 impl Wan {
@@ -397,6 +401,11 @@ impl Wan {
                 self.adapters.len()
             )));
         }
+        *self
+            .adapter_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            adapter_apply_reports(&self.adapters, &[report.per_spec.as_slice()]);
         warn_skipped_adapters(self.descriptor.id, &report.skipped);
         Ok(())
     }
@@ -483,6 +492,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy,
         memory_tier,
         i2v_memory,
+        adapter_reports: Default::default(),
     }))
 }
 
@@ -492,6 +502,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 impl Generator for Wan {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+        self.adapter_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
@@ -1081,6 +1098,10 @@ pub struct Wan14b {
     offload_policy: OffloadPolicy,
     /// Exact provider-owned public-I2V artifact and adapter receipt. Absent on direct T2V loads.
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
+    /// Per-adapter apply outcomes from the most recent adapter fold/install (sc-27451), published
+    /// through [`Generator::adapter_apply_reports`]. Interior-mutable because the adapters apply
+    /// inside `generate(&self)`.
+    adapter_reports: std::sync::Mutex<Vec<AdapterApplyReport>>,
 }
 
 impl Wan14b {
@@ -1104,6 +1125,13 @@ impl Wan14b {
                 self.adapters.len()
             )));
         }
+        *self
+            .adapter_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = adapter_apply_reports(
+            &self.adapters,
+            &[low.per_spec.as_slice(), high.per_spec.as_slice()],
+        );
         let mut skipped = low.skipped;
         skipped.extend(high.skipped);
         skipped.sort();
@@ -1455,12 +1483,20 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         quant,
         offload_policy: spec.offload_policy,
         i2v_memory,
+        adapter_reports: Default::default(),
     }))
 }
 
 impl Generator for Wan14b {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+        self.adapter_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn validate(&self, request: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
@@ -2386,6 +2422,7 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         quant,
         offload_policy: spec.offload_policy,
         i2v_memory,
+        adapter_reports: Default::default(),
     }))
 }
 
@@ -2565,6 +2602,7 @@ mod tests {
             quant: None,
             offload_policy: OffloadPolicy::Resident,
             i2v_memory: None,
+            adapter_reports: Default::default(),
         };
         let reference = |strength: Option<f32>| Conditioning::Reference {
             image: dummy_image(),
@@ -2849,6 +2887,7 @@ mod tests {
             memory_strategy: None,
             memory_tier: None,
             i2v_memory: None,
+            adapter_reports: Default::default(),
         }
     }
 
@@ -2861,6 +2900,7 @@ mod tests {
             quant: None,
             offload_policy: OffloadPolicy::Resident,
             i2v_memory: None,
+            adapter_reports: Default::default(),
         }
     }
 
@@ -3320,6 +3360,7 @@ mod tests {
             memory_strategy: None,
             memory_tier: None,
             i2v_memory: None,
+            adapter_reports: Default::default(),
         }
     }
 
@@ -3338,6 +3379,7 @@ mod tests {
             quant: None,
             offload_policy: OffloadPolicy::Resident,
             i2v_memory: None,
+            adapter_reports: Default::default(),
         }
     }
 
