@@ -330,7 +330,8 @@ impl Decoder {
         let mut stop = StopReason::Budget;
         // The reference sampling distribution (temp 0.8 / top-k 30 / top-p 0.6 / rep-penalty 1.1).
         // The sc-13433 env overrides (`MOSS_TTS_TEMPERATURE` / `_TOP_P` / `_TOP_K` /
-        // `_REP_PENALTY`) were removed by sc-27267; a future sweep should add explicit fields.
+        // `_REP_PENALTY`) were removed by sc-27267 (and are banned as src reads by
+        // `scripts/check-workspace.py`): ambient host env must not change the sampled audio.
         let params = DEFAULT_PARAMS;
         // Optional minimum-length EOS suppression (off by default — reference parity, sc-13570): with
         // a nonzero floor, audio-EOS on codebook 0 is masked for the first `min_frames` steps (capped

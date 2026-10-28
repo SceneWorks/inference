@@ -89,6 +89,18 @@ pub fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
         .collect()
 }
 
+/// Planar `[channels][frames]` PCM (channel-major, as a `[1, C, T]` decoder tensor flattens) →
+/// interleaved `[t0c0, t0c1, t1c0, …]` (sc-27357). Pure data movement. Panics if `channels == 0`;
+/// a trailing remainder of fewer than `channels` samples is dropped.
+pub fn planar_to_interleaved(planar: &[f32], channels: usize) -> Vec<f32> {
+    let frames = planar.len() / channels;
+    let mut out = Vec::with_capacity(frames * channels);
+    for t in 0..frames {
+        out.extend((0..channels).map(|c| planar[c * frames + t]));
+    }
+    out
+}
+
 // An odd tap count makes the zero phase exactly sample-centered. With β=8.6, 197
 // unity-rate taps span the 6% guarded transition to approximately the window's
 // 85 dB stopband. Stronger downsampling scales this by src/dst so the kernel
@@ -614,33 +626,73 @@ impl Spectrogram {
     }
 }
 
+/// The sample type of an [`FftPlan`]: `f32` (the STFT front-ends) or `f64` (long analysis FFTs such
+/// as Sheet Sage's octave check). Sealed — only those two.
+pub trait FftScalar:
+    Copy
+    + std::fmt::Debug
+    + std::ops::Add<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Mul<Output = Self>
+    + sealed::Sealed
+{
+    /// Round an f64 twiddle to this precision (the identity for `f64`).
+    fn from_f64(x: f64) -> Self;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+}
+
+impl FftScalar for f32 {
+    fn from_f64(x: f64) -> Self {
+        x as f32
+    }
+}
+
+impl FftScalar for f64 {
+    fn from_f64(x: f64) -> Self {
+        x
+    }
+}
+
 /// A radix-2 complex FFT plan: the size and its precomputed twiddle tables (sc-27356), shared by
 /// [`stft`] / [`istft`] and by providers whose framing differs from theirs (sc-27261).
 ///
-/// The transform is the in-place iterative Cooley–Tukey FFT over `(re, im)` pairs. Its twiddles
-/// are computed once per plan in f64 and cast to f32: `tw[j] = (cos, sin)(±2π/n · j)`. The stage of
-/// span `len` reads `tw[k · n/len]`, and because `n/len` is a power of two, `±2π/n · (k · n/len)`
-/// is the same real number as the per-stage angle `±2π/len · k` and rounds to the same f64 — so
-/// the plan is **bit-identical** to evaluating each butterfly's twiddle on the fly (the
-/// pre-sc-27356 code, pinned by `fft_plan_matches_per_butterfly_twiddles_bit_for_bit`), at
-/// `n/2` trig pairs per plan instead of `n/2 · log2 n` per frame.
+/// The transform is the in-place iterative Cooley–Tukey FFT over `(re, im)` pairs of `T` (`f32` by
+/// default, or `f64`). Its twiddles are computed once per plan in f64 and rounded to `T`:
+/// `tw[j] = (cos, sin)(±2π/n · j)`. The stage of span `len` reads `tw[k · n/len]`, and because
+/// `n/len` is a power of two, `±2π/n · (k · n/len)` is the same real number as the per-stage angle
+/// `±2π/len · k` and rounds to the same f64 — so the plan is **bit-identical** to evaluating each
+/// butterfly's twiddle on the fly (the pre-sc-27356 code, pinned by
+/// `fft_plan_matches_per_butterfly_twiddles_bit_for_bit`), at `n/2` trig pairs per plan instead of
+/// `n/2 · log2 n` per frame. For the same reason (division by a power of two is exact) it is also
+/// bit-identical to a table spelled `−2π·j / n`, the form Sheet Sage's front-end and octave check
+/// carried (`fft_plan_matches_the_table_spellings_it_replaced`).
 #[derive(Clone, Debug)]
-pub struct FftPlan {
+pub struct FftPlan<T: FftScalar = f32> {
     n: usize,
     /// Forward (`e^{-iθ}`) twiddles, `n / 2` entries.
-    forward: Vec<(f32, f32)>,
+    forward: Vec<(T, T)>,
     /// Inverse (`e^{+iθ}`) twiddles, `n / 2` entries.
-    inverse: Vec<(f32, f32)>,
+    inverse: Vec<(T, T)>,
 }
 
-impl FftPlan {
+impl<T: FftScalar> FftPlan<T> {
     /// Plan an `n`-point transform. `n` must be a power of two `>= 2`.
     pub fn new(n: usize) -> Result<Self> {
         require_power_of_two(n)?;
-        let table = |sign: f64| -> Vec<(f32, f32)> {
+        let table = |sign: f64| -> Vec<(T, T)> {
             let ang = sign * 2.0 * std::f64::consts::PI / n as f64;
             (0..n / 2)
-                .map(|j| ((ang * j as f64).cos() as f32, (ang * j as f64).sin() as f32))
+                .map(|j| {
+                    (
+                        T::from_f64((ang * j as f64).cos()),
+                        T::from_f64((ang * j as f64).sin()),
+                    )
+                })
                 .collect()
         };
         Ok(Self {
@@ -662,17 +714,17 @@ impl FftPlan {
 
     /// Forward FFT of `data` in place (no scaling — the `torch.stft(normalized=False)` / numpy
     /// convention). Panics if `data.len() != self.len()`.
-    pub fn forward_in_place(&self, data: &mut [(f32, f32)]) {
+    pub fn forward_in_place(&self, data: &mut [(T, T)]) {
         self.transform(data, &self.forward);
     }
 
     /// Inverse FFT of `data` in place **without** the `1/n` scale (callers apply it). Panics if
     /// `data.len() != self.len()`.
-    pub fn inverse_in_place(&self, data: &mut [(f32, f32)]) {
+    pub fn inverse_in_place(&self, data: &mut [(T, T)]) {
         self.transform(data, &self.inverse);
     }
 
-    fn transform(&self, data: &mut [(f32, f32)], twiddles: &[(f32, f32)]) {
+    fn transform(&self, data: &mut [(T, T)], twiddles: &[(T, T)]) {
         let n = self.n;
         assert_eq!(
             data.len(),
@@ -1381,10 +1433,82 @@ mod tests {
             n <<= 1;
         }
         assert!(
-            FftPlan::new(12).is_err(),
+            FftPlan::<f32>::new(12).is_err(),
             "non-power-of-two sizes are rejected"
         );
-        assert!(FftPlan::new(1).is_err());
+        assert!(FftPlan::<f64>::new(1).is_err());
+    }
+
+    /// The table-driven radix-2 FFTs Sheet Sage carried (an f32 front-end plan and the f64 octave
+    /// check), verbatim: twiddles spelled `−2π·k / n` and a precomputed bit-reversal table.
+    fn sheetsage_reference_fft<T: FftScalar>(data: &mut [(T, T)]) {
+        let n = data.len();
+        let bits = n.trailing_zeros();
+        let twiddles: Vec<(T, T)> = (0..n / 2)
+            .map(|k| {
+                let angle = -2.0 * std::f64::consts::PI * k as f64 / n as f64;
+                (T::from_f64(angle.cos()), T::from_f64(angle.sin()))
+            })
+            .collect();
+        for i in 0..n {
+            let j = i.reverse_bits() >> (usize::BITS - bits);
+            if i < j {
+                data.swap(i, j);
+            }
+        }
+        let mut len = 2;
+        while len <= n {
+            let stride = n / len;
+            for start in (0..n).step_by(len) {
+                for k in 0..len / 2 {
+                    let (wr, wi) = twiddles[k * stride];
+                    let (ar, ai) = data[start + k];
+                    let (br, bi) = data[start + k + len / 2];
+                    let (tr, ti) = (br * wr - bi * wi, br * wi + bi * wr);
+                    data[start + k] = (ar + tr, ai + ti);
+                    data[start + k + len / 2] = (ar - tr, ai - ti);
+                }
+            }
+            len <<= 1;
+        }
+    }
+
+    /// sc-27261: the shared plan reproduces both Sheet Sage FFTs bit-for-bit — f32 up to the
+    /// front-end's sizes and f64 up to the octave check's 2^16 points.
+    #[test]
+    fn fft_plan_matches_the_table_spellings_it_replaced() {
+        let mut n = 2usize;
+        while n <= 1 << 16 {
+            let input = |i: usize| {
+                let x = i as f64;
+                ((x * 0.37).sin() + 0.1 * x / n as f64, (x * 1.3).cos() * 0.5)
+            };
+            if n <= 4096 {
+                let src: Vec<(f32, f32)> = (0..n)
+                    .map(|i| (input(i).0 as f32, input(i).1 as f32))
+                    .collect();
+                let (mut want, mut got) = (src.clone(), src);
+                sheetsage_reference_fft(&mut want);
+                FftPlan::<f32>::new(n).unwrap().forward_in_place(&mut got);
+                let bits = |v: &[(f32, f32)]| {
+                    v.iter()
+                        .flat_map(|&(r, i)| [r.to_bits(), i.to_bits()])
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&got), bits(&want), "f32 n={n}");
+            }
+            let src: Vec<(f64, f64)> = (0..n).map(input).collect();
+            let (mut want, mut got) = (src.clone(), src);
+            sheetsage_reference_fft(&mut want);
+            FftPlan::<f64>::new(n).unwrap().forward_in_place(&mut got);
+            let bits = |v: &[(f64, f64)]| {
+                v.iter()
+                    .flat_map(|&(r, i)| [r.to_bits(), i.to_bits()])
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&got), bits(&want), "f64 n={n}");
+            n <<= 1;
+        }
     }
 
     /// The direct DFT agrees with the radix-2 FFT where both apply, a zero-padded instance equals
@@ -1424,6 +1548,37 @@ mod tests {
             .is_empty());
     }
 
+    /// sc-27268: `DirectRdft` is bit-identical to the table-driven DFT the Chatterbox front-ends
+    /// carried (f32 angle `−2π·k·t / n_fft`, row-wise re/im accumulation), for a full frame
+    /// (S3 tokenizer `n_fft = 400`) and a zero-padded one (CAM++ 400 → 512).
+    #[test]
+    fn direct_rdft_matches_the_private_copies_bit_for_bit() {
+        for (n_fft, frame_len) in [(400usize, 400usize), (512, 400)] {
+            let frame: Vec<f32> = (0..frame_len)
+                .map(|i| ((i as f32) * 0.173).sin() * 0.7 + ((i * 7 % 13) as f32 - 6.0) * 0.01)
+                .collect();
+            let n_bins = n_fft / 2 + 1;
+            let mut want = vec![0f32; n_bins];
+            for (k, slot) in want.iter_mut().enumerate() {
+                let (mut re, mut im) = (0f32, 0f32);
+                for (t, &x) in frame.iter().enumerate() {
+                    let ang = -2.0 * std::f32::consts::PI * k as f32 * t as f32 / n_fft as f32;
+                    re += x * ang.cos();
+                    im += x * ang.sin();
+                }
+                *slot = re * re + im * im;
+            }
+            let mut got = vec![0f32; n_bins];
+            DirectRdft::zero_padded(n_fft, frame_len).power_into(&frame, &mut got);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&got),
+                bits(&want),
+                "n_fft={n_fft} frame_len={frame_len}"
+            );
+        }
+    }
+
     /// The Hann spellings agree to a few ULP but are not bit-identical — the reason they stay
     /// separate (sc-27357) — and the shared padding/down-mix helpers keep their exact semantics.
     #[test]
@@ -1453,6 +1608,12 @@ mod tests {
         assert_eq!(to_mono(&[1.0, 3.0, 2.0, 4.0], 2), vec![2.0, 3.0]);
         assert_eq!(to_mono(&[1.0, 2.0], 1), vec![1.0, 2.0]);
         assert_eq!(to_mono(&[1.0, 2.0], 0), vec![1.0, 2.0]);
+
+        assert_eq!(
+            planar_to_interleaved(&[1.0, 2.0, 3.0, 10.0, 20.0, 30.0], 2),
+            vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0]
+        );
+        assert_eq!(planar_to_interleaved(&[1.0, 2.0], 1), vec![1.0, 2.0]);
     }
 
     #[test]

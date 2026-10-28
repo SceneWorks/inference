@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use candle_audio::candle_core::{Device, Result as CandleResult, Tensor};
-use candle_audio::ops::repeat_kv;
+use candle_audio::ops::{repeat_kv, rope_tables};
 use candle_nn::{linear, linear_b, rms_norm, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::config::ConditionEncoderConfig;
@@ -41,29 +41,6 @@ fn to_heads(x: &Tensor, num_heads: usize, head_dim: usize) -> CandleResult<Tenso
 fn from_heads(x: &Tensor) -> CandleResult<Tensor> {
     let (b, h, l, d) = x.dims4()?;
     x.transpose(1, 2)?.reshape((b, l, h * d))
-}
-
-fn rope_tables(
-    head_dim: usize,
-    len: usize,
-    theta: f64,
-    device: &Device,
-) -> CandleResult<(Tensor, Tensor)> {
-    let half = head_dim / 2;
-    let mut cos = Vec::with_capacity(len * half);
-    let mut sin = Vec::with_capacity(len * half);
-    for pos in 0..len {
-        for j in 0..half {
-            let inv = 1.0 / theta.powf(2.0 * j as f64 / head_dim as f64);
-            let a = pos as f64 * inv;
-            cos.push(a.cos() as f32);
-            sin.push(a.sin() as f32);
-        }
-    }
-    Ok((
-        Tensor::from_vec(cos, (len, half), device)?,
-        Tensor::from_vec(sin, (len, half), device)?,
-    ))
 }
 
 struct EncoderLayer {
@@ -136,7 +113,7 @@ impl EncoderLayer {
             self.num_kv_heads,
             self.head_dim,
         )?;
-        let (cos, sin) = rope_tables(self.head_dim, len, self.theta, device)?;
+        let (cos, sin) = rope_tables(device, len, self.head_dim, self.theta)?;
         let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         let groups = self.num_heads / self.num_kv_heads;

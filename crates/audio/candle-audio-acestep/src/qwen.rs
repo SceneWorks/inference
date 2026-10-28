@@ -1,288 +1,44 @@
 //! Qwen3-Embedding-0.6B as ACE-Step's **text encoder** (sc-12842).
 //!
 //! Two entry points, both stateless full-sequence forwards (no KV-cache accumulation across
-//! prompts — the same statelessness argument as the MOSS SFX Qwen3 encoder):
+//! prompts), on the audio commons' shared [`candle_audio::qwen3::TextEncoder`] (sc-27270):
 //!
 //! - [`Qwen3Encoder::encode`] — the full causal stack + final RMSNorm, returning the
 //!   post-norm hidden states the reference feeds as the DiT **prompt** conditioning.
 //! - [`Qwen3Encoder::embed`] — the embedding-layer token lookup only, returning the raw token
 //!   embeddings the condition encoder's lyric encoder contextualizes (the reference lyric path).
 //!
-//! The module mirrors the upstream weight layout byte-for-byte (`model.embed_tokens` /
-//! `model.layers.N.*` / `model.norm`) and the HF Qwen3 math: GQA with per-head q/k RMSNorm,
-//! half-split (NeoX) RoPE at `rope_theta`, SiLU MLP.
+//! The Qwen3-Embedding-0.6B safetensors store the bare `Qwen3Model` (no `model.` prefix):
+//! `embed_tokens.weight` / `layers.N.*` / `norm.weight`.
 
-use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor};
-use candle_audio::ops::repeat_kv;
-use candle_nn::{linear_b, rms_norm, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use candle_audio::candle_core::Result as CandleResult;
+use candle_audio::qwen3::BlockConfig;
+use candle_nn::VarBuilder;
 
 use crate::config::TextEncoderConfig;
 
-struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-}
+/// The stateless Qwen3 text encoder — the audio commons' shared stack (sc-27270).
+pub use candle_audio::qwen3::TextEncoder as Qwen3Encoder;
 
-impl Attention {
-    fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> CandleResult<Self> {
-        let d = cfg.head_dim;
-        Ok(Self {
-            q_proj: linear_b(
-                cfg.hidden_size,
-                cfg.num_attention_heads * d,
-                cfg.attention_bias,
-                vb.pp("q_proj"),
-            )?,
-            k_proj: linear_b(
-                cfg.hidden_size,
-                cfg.num_key_value_heads * d,
-                cfg.attention_bias,
-                vb.pp("k_proj"),
-            )?,
-            v_proj: linear_b(
-                cfg.hidden_size,
-                cfg.num_key_value_heads * d,
-                cfg.attention_bias,
-                vb.pp("v_proj"),
-            )?,
-            o_proj: linear_b(
-                cfg.num_attention_heads * d,
-                cfg.hidden_size,
-                cfg.attention_bias,
-                vb.pp("o_proj"),
-            )?,
-            q_norm: rms_norm(d, cfg.rms_norm_eps, vb.pp("q_norm"))?,
-            k_norm: rms_norm(d, cfg.rms_norm_eps, vb.pp("k_norm"))?,
-            num_heads: cfg.num_attention_heads,
-            num_kv_heads: cfg.num_key_value_heads,
-            head_dim: d,
-        })
-    }
-
-    fn forward(
-        &self,
-        x: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        mask: Option<&Tensor>,
-    ) -> CandleResult<Tensor> {
-        let (b, l, _) = x.dims3()?;
-        let q = __model_proof_output!(self.q_proj.forward(x))?
-            .reshape((b, l, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = __model_proof_output!(self.k_proj.forward(x))?
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = __model_proof_output!(self.v_proj.forward(x))?
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let q = __model_proof_output!(self.q_norm.forward(&q.contiguous()?))?;
-        let k = __model_proof_output!(self.k_norm.forward(&k.contiguous()?))?;
-        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?;
-        let k = candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?;
-
-        let groups = self.num_heads / self.num_kv_heads;
-        let k = repeat_kv(&k, groups)?;
-        let v = repeat_kv(&v, groups)?;
-
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut att = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        if let Some(m) = mask {
-            att = att.broadcast_add(m)?;
-        }
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
-        let out = att.matmul(&v.contiguous()?)?.transpose(1, 2)?.reshape((
-            b,
-            l,
-            self.num_heads * self.head_dim,
-        ))?;
-        __model_proof_output!(self.o_proj.forward(&out))
-    }
-}
-
-struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl Mlp {
-    fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> CandleResult<Self> {
-        Ok(Self {
-            gate_proj: linear_b(
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                false,
-                vb.pp("gate_proj"),
-            )?,
-            up_proj: linear_b(
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                false,
-                vb.pp("up_proj"),
-            )?,
-            down_proj: linear_b(
-                cfg.intermediate_size,
-                cfg.hidden_size,
-                false,
-                vb.pp("down_proj"),
-            )?,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let gate = __model_proof_output!(self.gate_proj.forward(x))?.silu()?;
-        let up = __model_proof_output!(self.up_proj.forward(x))?;
-        __model_proof_output!(self.down_proj.forward(&(gate * up)?))
-    }
-}
-
-struct Layer {
-    input_layernorm: RmsNorm,
-    attn: Attention,
-    post_attention_layernorm: RmsNorm,
-    mlp: Mlp,
-}
-
-impl Layer {
-    fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> CandleResult<Self> {
-        Ok(Self {
-            input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
-            attn: Attention::new(cfg, vb.pp("self_attn"))?,
-            post_attention_layernorm: rms_norm(
-                cfg.hidden_size,
-                cfg.rms_norm_eps,
-                vb.pp("post_attention_layernorm"),
-            )?,
-            mlp: Mlp::new(cfg, vb.pp("mlp"))?,
-        })
-    }
-
-    fn forward(
-        &self,
-        x: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        mask: Option<&Tensor>,
-    ) -> CandleResult<Tensor> {
-        let h = self.attn.forward(
-            &__model_proof_output!(self.input_layernorm.forward(x))?,
-            cos,
-            sin,
-            mask,
-        )?;
-        let x = (x + h)?;
-        let h = self.mlp.forward(&__model_proof_output!(self
-            .post_attention_layernorm
-            .forward(&x))?)?;
-        x + h
-    }
-}
-
-/// The stateless Qwen3 text encoder.
-pub struct Qwen3Encoder {
-    embed_tokens: Embedding,
-    layers: Vec<Layer>,
-    norm: RmsNorm,
-    rope_theta: f64,
-    head_dim: usize,
-    hidden_size: usize,
-    device: Device,
-}
-
-impl Qwen3Encoder {
-    pub fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> CandleResult<Self> {
-        // The Qwen3-Embedding-0.6B safetensors store the bare `Qwen3Model` (no `model.` prefix):
-        // `embed_tokens.weight` / `layers.N.*` / `norm.weight`.
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
-        let vb_l = vb.pp("layers");
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for i in 0..cfg.num_hidden_layers {
-            layers.push(Layer::new(cfg, vb_l.pp(i))?);
-        }
-        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
-        Ok(Self {
-            embed_tokens,
-            layers,
-            norm,
-            rope_theta: cfg.rope_theta,
-            head_dim: cfg.head_dim,
-            hidden_size: cfg.hidden_size,
-            device: vb.device().clone(),
-        })
-    }
-
-    pub fn hidden_size(&self) -> usize {
-        self.hidden_size
-    }
-
-    pub fn device(&self) -> &Device {
-        &self.device
-    }
-
-    fn rope_tables(&self, len: usize) -> CandleResult<(Tensor, Tensor)> {
-        let half = self.head_dim / 2;
-        let mut cos = Vec::with_capacity(len * half);
-        let mut sin = Vec::with_capacity(len * half);
-        for pos in 0..len {
-            for i in 0..half {
-                let inv = 1.0 / self.rope_theta.powf(2.0 * i as f64 / self.head_dim as f64);
-                let angle = pos as f64 * inv;
-                cos.push(angle.cos() as f32);
-                sin.push(angle.sin() as f32);
-            }
-        }
-        Ok((
-            Tensor::from_vec(cos, (len, half), &self.device)?,
-            Tensor::from_vec(sin, (len, half), &self.device)?,
-        ))
-    }
-
-    fn causal_mask(&self, len: usize, dtype: DType) -> CandleResult<Tensor> {
-        let data: Vec<f32> = (0..len)
-            .flat_map(|i| (0..len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
-            .collect();
-        Tensor::from_vec(data, (1, 1, len, len), &self.device)?.to_dtype(dtype)
-    }
-
-    /// The embedding-layer token lookup only → `[1, len, hidden]` (the lyric path).
-    pub fn embed(&self, ids: &[u32]) -> CandleResult<Tensor> {
-        let input = Tensor::from_vec(ids.to_vec(), (1, ids.len()), &self.device)?;
-        __model_proof_output!(self.embed_tokens.forward(&input))
-    }
-
-    /// The full causal stack + final RMSNorm → `[1, len, hidden]` post-norm hidden states (the
-    /// prompt path).
-    pub fn encode(&self, ids: &[u32]) -> CandleResult<Tensor> {
-        let len = ids.len();
-        let input = Tensor::from_vec(ids.to_vec(), (1, len), &self.device)?;
-        let mut h = __model_proof_output!(self.embed_tokens.forward(&input))?;
-        let (cos, sin) = self.rope_tables(len)?;
-        let mask = if len > 1 {
-            Some(self.causal_mask(len, h.dtype())?)
-        } else {
-            None
-        };
-        for layer in &self.layers {
-            h = layer.forward(&h, &cos, &sin, mask.as_ref())?;
-        }
-        __model_proof_output!(self.norm.forward(&h))
-    }
+/// Build the encoder from the checkpoint's text-encoder config. The weights sit at the root.
+pub fn load(cfg: &TextEncoderConfig, vb: VarBuilder) -> CandleResult<Qwen3Encoder> {
+    let block = BlockConfig {
+        hidden_size: cfg.hidden_size,
+        intermediate_size: cfg.intermediate_size,
+        num_attention_heads: cfg.num_attention_heads,
+        num_key_value_heads: cfg.num_key_value_heads,
+        head_dim: cfg.head_dim,
+        rms_norm_eps: cfg.rms_norm_eps,
+        rope_theta: cfg.rope_theta,
+        attention_bias: cfg.attention_bias,
+    };
+    Qwen3Encoder::new(&block, cfg.vocab_size, cfg.num_hidden_layers, vb)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_audio::candle_core::IndexOp;
+    use candle_audio::candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::VarMap;
 
     fn tiny_cfg() -> TextEncoderConfig {
@@ -299,7 +55,7 @@ mod tests {
         let cfg = tiny_cfg();
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-        let enc = Qwen3Encoder::new(&cfg, vb).unwrap();
+        let enc = load(&cfg, vb).unwrap();
         for (i, (_, var)) in varmap.data().lock().unwrap().iter().enumerate() {
             let t = var.as_tensor();
             let n: usize = t.shape().elem_count();

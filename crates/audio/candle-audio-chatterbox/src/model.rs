@@ -92,11 +92,9 @@ fn prepare_reference_audio(audio: &AudioTrack) -> gen_core::Result<Cow<'_, Audio
         return Ok(Cow::Borrowed(audio));
     }
 
-    let samples = audio
-        .samples
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32)
-        .collect();
+    // Whole frames were validated above, so the shared down-mix (sc-27357) averages exactly
+    // `channels` samples per frame.
+    let samples = candle_audio::dsp::to_mono(&audio.samples, audio.channels);
     Ok(Cow::Owned(AudioTrack {
         samples,
         sample_rate: audio.sample_rate,

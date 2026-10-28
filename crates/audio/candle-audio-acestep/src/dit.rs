@@ -25,7 +25,7 @@
 //! bit-faithful (see the crate docs and the real-weight conformance test).
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor, D};
-use candle_audio::ops::repeat_kv;
+use candle_audio::ops::{repeat_kv, rope_tables};
 use candle_nn::{
     conv1d, conv_transpose1d, linear, linear_b, rms_norm, Conv1d, Conv1dConfig, ConvTranspose1d,
     ConvTranspose1dConfig, Linear, Module, RmsNorm, VarBuilder,
@@ -50,30 +50,6 @@ fn sinusoidal(dim: usize, t: f64, device: &Device) -> CandleResult<Tensor> {
         out[half + j] = angle.sin() as f32;
     }
     Tensor::from_vec(out, (1, dim), device)
-}
-
-/// Half-split RoPE tables `[len, head_dim/2]` (candle `rope`, the `use_real_unbind_dim=-2` branch).
-fn rope_tables(
-    head_dim: usize,
-    len: usize,
-    theta: f64,
-    device: &Device,
-) -> CandleResult<(Tensor, Tensor)> {
-    let half = head_dim / 2;
-    let mut cos = Vec::with_capacity(len * half);
-    let mut sin = Vec::with_capacity(len * half);
-    for pos in 0..len {
-        for j in 0..half {
-            let inv = 1.0 / theta.powf(2.0 * j as f64 / head_dim as f64);
-            let angle = pos as f64 * inv;
-            cos.push(angle.cos() as f32);
-            sin.push(angle.sin() as f32);
-        }
-    }
-    Ok((
-        Tensor::from_vec(cos, (len, half), device)?,
-        Tensor::from_vec(sin, (len, half), device)?,
-    ))
 }
 
 fn to_heads(x: &Tensor, num_heads: usize, head_dim: usize) -> CandleResult<Tensor> {
@@ -433,7 +409,7 @@ impl DiT {
         let temb = (temb_t + temb_r)?; // [1, dim]
         let tproj = (tproj_t + tproj_r)?.reshape((1, 6, self.time_embed.dim()))?;
 
-        let (cos, sin) = rope_tables(self.cfg.head_dim, patched_len, self.cfg.rope_theta, device)?;
+        let (cos, sin) = rope_tables(device, patched_len, self.cfg.head_dim, self.cfg.rope_theta)?;
         let full_mask: Option<Tensor> = None;
         let sliding_mask = if self
             .cfg
@@ -506,7 +482,7 @@ mod tests {
     #[test]
     fn rope_tables_start_at_identity() {
         let dev = Device::Cpu;
-        let (cos, sin) = rope_tables(4, 3, 1_000_000.0, &dev).unwrap();
+        let (cos, sin) = rope_tables(&dev, 3, 4, 1_000_000.0).unwrap();
         assert_eq!(cos.dims(), &[3, 2]);
         let c = cos.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let s = sin.flatten_all().unwrap().to_vec1::<f32>().unwrap();

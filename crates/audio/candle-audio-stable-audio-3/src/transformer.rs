@@ -204,10 +204,7 @@ pub fn apply_rotary(t: &Tensor, freqs: &Tensor) -> Result<Tensor> {
         .narrow(D::Minus2, freq_seq - seq, seq)?
         .to_dtype(DType::F32)?;
     let rotating = t32.narrow(D::Minus1, 0, rot_dim)?;
-    let half = rot_dim / 2;
-    let first = rotating.narrow(D::Minus1, 0, half)?;
-    let second = rotating.narrow(D::Minus1, half, half)?;
-    let rotated = Tensor::cat(&[&second.neg()?, &first], D::Minus1)?;
+    let rotated = candle_audio::ops::rotate_half(&rotating)?;
     let y = rotating
         .broadcast_mul(&freqs.cos()?)?
         .broadcast_add(&rotated.broadcast_mul(&freqs.sin()?)?)?;

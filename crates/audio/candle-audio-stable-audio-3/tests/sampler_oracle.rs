@@ -20,10 +20,10 @@ use candle_audio_stable_audio_3::config::DiffusionObjective;
 use candle_audio_stable_audio_3::dit::{Guidance, StableAudio3Dit};
 use candle_audio_stable_audio_3::sampler::{
     adapt_sample_size_for_max, build_schedule, effective_schedule_lengths, initialize_latents,
-    padding_mask, resource_estimate, sample, sample_dit, sample_initialized, sample_with_callback,
+    padding_mask, resource_estimate, sample, sample_dit, sample_initialized,
     sample_with_host_timestep, validate_guidance, DistributionShift, DitConditioning,
-    GuidanceInterval, InjectedNoise, NoiseSource, SampleDitArgs, SamplerKind, Schedule,
-    SeededNoise,
+    GuidanceInterval, InitMix, InjectedNoise, NoiseSource, SampleDitArgs, SampleOptions,
+    SamplerKind, Schedule, SeededNoise,
 };
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
 use candle_nn::VarBuilder;
@@ -99,9 +99,11 @@ fn frozen_torch_euler_dpmpp_and_scalar_rk4_match_every_step() {
             kind,
             &initial,
             &Schedule::Shared(schedule.clone()),
-            None,
+            SampleOptions {
+                record_trajectory: true,
+                ..SampleOptions::default()
+            },
             &mut unused_noise,
-            true,
             |x, t| Ok((((x * 0.25)? + (t.unsqueeze(1)?.unsqueeze(2)? * 0.5)?)? - 0.125)?),
         )
         .unwrap();
@@ -359,12 +361,16 @@ fn init_mix_bounds_shapes_and_zero_short_circuit_are_explicit() {
     let output = sample_initialized(
         SamplerKind::Euler,
         &noise,
-        Some(&init),
-        0.0,
+        InitMix {
+            init_latents: Some(&init),
+            strength: 0.0,
+        },
         &Schedule::Shared(vec![0.0, 0.0]),
-        None,
+        SampleOptions {
+            record_trajectory: true,
+            ..SampleOptions::default()
+        },
         &mut zero_noise,
-        true,
         move |x, _| {
             *observed.borrow_mut() += 1;
             Ok(x.clone())
@@ -378,12 +384,13 @@ fn init_mix_bounds_shapes_and_zero_short_circuit_are_explicit() {
     assert!(sample_initialized(
         SamplerKind::Euler,
         &noise,
-        Some(&init),
-        0.5,
+        InitMix {
+            init_latents: Some(&init),
+            strength: 0.5,
+        },
         &Schedule::Shared(vec![1.0, 0.0]),
-        None,
+        SampleOptions::default(),
         &mut mismatched_noise,
-        false,
         |x, _| Ok(x.clone()),
     )
     .is_err());
@@ -410,14 +417,15 @@ fn live_callback_is_pre_update_and_error_cancels_before_mutation() {
             Ok(())
         }
     };
-    let result = sample_with_callback(
+    let result = sample(
         SamplerKind::Euler,
         &initial,
         &schedule,
-        None,
+        SampleOptions {
+            callback: Some(&mut callback),
+            ..SampleOptions::default()
+        },
         &mut no_noise(),
-        false,
-        Some(&mut callback),
         move |x, _| {
             *model_calls.borrow_mut() += 1;
             Ok(x.clone())
@@ -502,10 +510,8 @@ fn rk4_host_timestep_surface_covers_every_stage_and_terminal_clamp() {
         SamplerKind::Rk4,
         &initial,
         &schedule,
-        None,
+        SampleOptions::default(),
         &mut no_noise(),
-        false,
-        None,
         move |x, _, host_timestep| {
             captured.borrow_mut().push(host_timestep.to_vec());
             Tensor::zeros_like(x).map_err(Into::into)
@@ -541,9 +547,8 @@ fn nonzero_per_example_euler_dpmpp_and_pingpong_are_locked() {
             kind,
             &initial,
             &schedule,
-            None,
+            SampleOptions::default(),
             &mut no_noise(),
-            false,
             field,
         )
         .unwrap();
@@ -558,9 +563,8 @@ fn nonzero_per_example_euler_dpmpp_and_pingpong_are_locked() {
         SamplerKind::Pingpong,
         &initial,
         &schedule,
-        None,
+        SampleOptions::default(),
         &mut InjectedNoise::new(draws),
-        false,
         field,
     )
     .unwrap();
@@ -579,9 +583,12 @@ fn euler_sign_callbacks_and_mask_shape_are_exact() {
         SamplerKind::Euler,
         &initial,
         &schedule,
-        Some(&mask),
+        SampleOptions {
+            padding_mask: Some(&mask),
+            record_trajectory: true,
+            ..SampleOptions::default()
+        },
         &mut noise,
-        true,
         |x, _| Ok((x * 2f64)?),
     )
     .unwrap();
@@ -604,9 +611,11 @@ fn corrected_rk4_supports_per_example_schedule_and_terminal_clamp() {
         SamplerKind::Rk4,
         &initial,
         &schedule,
-        None,
+        SampleOptions {
+            record_trajectory: true,
+            ..SampleOptions::default()
+        },
         &mut noise,
-        true,
         move |x, t| {
             capture.borrow_mut().push(values(t));
             Ok(x.clone()) // dx/dt=x; each element has its own dt.
@@ -657,9 +666,11 @@ fn rf_dpmpp_zero_velocity_is_identity_for_shared_and_batched_schedules() {
             SamplerKind::Dpmpp,
             &initial,
             &schedule,
-            None,
+            SampleOptions {
+                record_trajectory: true,
+                ..SampleOptions::default()
+            },
             &mut noise,
-            true,
             |x, _| Tensor::zeros_like(x).map_err(Into::into),
         )
         .unwrap();
@@ -682,9 +693,11 @@ fn pingpong_consumes_terminal_draw_and_seeded_requests_are_reproducible() {
         SamplerKind::Pingpong,
         &initial,
         &schedule,
-        None,
+        SampleOptions {
+            record_trajectory: true,
+            ..SampleOptions::default()
+        },
         &mut injected,
-        true,
         |x, _| Tensor::zeros_like(x).map_err(Into::into),
     )
     .unwrap();
@@ -699,9 +712,8 @@ fn pingpong_consumes_terminal_draw_and_seeded_requests_are_reproducible() {
             SamplerKind::Pingpong,
             &request_initial,
             &schedule,
-            None,
+            SampleOptions::default(),
             &mut seeded,
-            false,
             |x, _| Tensor::zeros_like(x).map_err(Into::into),
         )
         .unwrap();
@@ -739,9 +751,8 @@ fn truthful_defaults_and_fail_closed_objective_are_locked() {
             SamplerKind::Euler,
             &initial,
             &invalid,
-            None,
+            SampleOptions::default(),
             &mut no_noise(),
-            false,
             |x, _| Tensor::zeros_like(x).map_err(Into::into),
         )
         .is_err());
