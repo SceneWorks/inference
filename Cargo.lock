@@ -1392,6 +1392,7 @@ dependencies = [
 name = "core-llm"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "minijinja",
  "minijinja-contrib",
  "serde",
@@ -1399,6 +1400,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
+ "windows-sys",
 ]
 
 [[package]]

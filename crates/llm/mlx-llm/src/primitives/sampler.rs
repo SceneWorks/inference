@@ -254,6 +254,24 @@ impl SamplingParams {
     }
 }
 
+/// The contract's sampling knobs as the sampler's — the one mapping every provider uses
+/// (sc-27398). `presence_penalty_prompt_len` starts at `0`: it is request-local and the decode
+/// engine resets it after prefill.
+impl From<&core_llm::Sampling> for SamplingParams {
+    fn from(s: &core_llm::Sampling) -> Self {
+        Self {
+            temperature: s.temperature,
+            top_p: s.top_p,
+            top_k: s.top_k,
+            presence_penalty: s.presence_penalty,
+            presence_penalty_generated_only: s.presence_penalty_generated_only,
+            presence_penalty_prompt_len: 0,
+            repetition_penalty: s.repetition_penalty,
+            repetition_context: s.repetition_context,
+        }
+    }
+}
+
 /// Sample the next token id from `logits` on the **host reference** (see the module docs; the
 /// decode loops draw through [`sample_with_path`]).
 ///
