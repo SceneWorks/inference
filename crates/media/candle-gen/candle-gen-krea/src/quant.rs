@@ -451,7 +451,8 @@ impl QLinear {
 
     /// Whether this projection loaded as an INT8-ConvRot int8 layer (sc-9300) — the detect-arm assertion
     /// (a ConvRot checkpoint's quantized surface fired the int8 path, not a silent dense fallback).
-    #[cfg(test)]
+    /// Public, not `#[cfg(test)]`: the CUDA integration test `tests/convrot_int8_gpu.rs` links the
+    /// library built without `cfg(test)` and asserts on it.
     pub fn is_convrot_int8(&self) -> bool {
         matches!(self, Self::ConvRotInt8(_))
     }
