@@ -265,7 +265,12 @@ class RealWorkspaceTests(unittest.TestCase):
         names = {package["name"] for package in metadata["packages"]}
         self.assertEqual(set(self.ws.members.values()), names)
         for package in metadata["packages"]:
-            expected = {dep["name"] for dep in package["dependencies"] if "path" in dep}
+            # Path edges to non-member vendored forks are modelled as patched dirs, not deps.
+            expected = {
+                dep["name"]
+                for dep in package["dependencies"]
+                if "path" in dep and dep["name"] in names
+            }
             self.assertEqual(self.ws.deps[package["name"]], expected, package["name"])
 
     def test_a_one_model_change_does_not_select_the_other_models(self) -> None:

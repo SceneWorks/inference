@@ -1,0 +1,26 @@
+[package]
+name = "candle-flash-attn"
+version = "0.10.2"
+edition = "2021"
+
+description = "Flash attention layer for the candle ML framework."
+repository = "https://github.com/huggingface/candle"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+# Vendored (sc-26691): upstream reaches candle-core by sibling path; this copy names the same crate at
+# the same pinned git revision, which the root [patch] (and SceneWorks' own root [patch]) redirects
+# to the vendored candle-core — exactly as vendor/candle-core does for candle-kernels.
+candle = { git = "https://github.com/huggingface/candle", rev = "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d", features = ["cuda"], package = "candle-core", version = "0.10.2" }
+half = { version = "2.3.1", features = ["num-traits"] }
+
+[build-dependencies]
+cudaforge = "0.1.2"
+anyhow = { version = "1", features = ["backtrace"] }
+
+[features]
+default = []
+cudnn = ["candle/cudnn"]

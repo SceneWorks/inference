@@ -18,7 +18,13 @@
 //! toolkit. The kernel is taken only when **all** of these hold:
 //!
 //! - the build enables `candle-gen/flash-attn` (it compiles CUTLASS kernels and needs nvcc);
-//! - the tensors live on a CUDA device;
+//! - the tensors live on a CUDA device **whose compute capability the compiled fatbin serves**:
+//!   at least sm_8.0 (FlashAttention-2's floor) and covered by the vendored
+//!   `vendor/candle-flash-attn` `-gencode` ladder (SASS within one major, PTX forward), read back
+//!   through `build.rs` ([`crate::cuda_arch::FatbinLadder::flash_from_build`]). A cubin-only
+//!   kernel with no image for the device would not error — it would leave the output unwritten —
+//!   so an uncovered device always takes the budgeted path. The capability is read once per GPU
+//!   ordinal and cached;
 //! - the dtype is bf16 or f16 (the kernel has no f32 path — f32 callers keep their numerics);
 //! - there is **no additive mask** — the wrapper exposes only dense / causal, and an arbitrary
 //!   additive bias cannot be expressed, so a masked call keeps the budgeted path;
@@ -60,6 +66,9 @@ pub enum FlashRefusal {
     NotCompiled,
     /// The tensors are not on a CUDA device.
     NotCuda,
+    /// The CUDA device's compute capability (`None`: unreadable) is below sm_8.0 or not served by
+    /// the compiled flash fatbin.
+    UnsupportedArch(Option<u32>),
     /// The dtype has no fused kernel (only bf16 / f16 do).
     Dtype(DType),
     /// The call carries an additive mask, which the fused kernel cannot express.
@@ -91,10 +100,39 @@ impl AttentionKernel {
     }
 }
 
+/// The device side of [`flash_eligibility`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashDevice {
+    /// CPU / Metal.
+    NotCuda,
+    /// A CUDA device with its packed compute capability (`120` = sm_12.0), `None` if unreadable,
+    /// and whether [`flash_arch_supported`] accepted it.
+    Cuda {
+        compute_cap: Option<u32>,
+        supported: bool,
+    },
+}
+
+/// FlashAttention-2's architecture floor: sm_8.0 (Ampere).
+pub const FLASH_MIN_COMPUTE_CAP: u32 = 80;
+
+/// Whether the fused kernel may launch on a device of `compute_cap` given the compiled `ladder`:
+/// the capability is known, at least [`FLASH_MIN_COMPUTE_CAP`], and covered by a non-empty ladder.
+/// Pure — the unit tests drive it with synthetic ladders.
+pub fn flash_arch_supported(
+    compute_cap: Option<u32>,
+    ladder: &crate::cuda_arch::FatbinLadder,
+) -> bool {
+    match compute_cap {
+        Some(cap) => cap >= FLASH_MIN_COMPUTE_CAP && !ladder.is_empty() && ladder.covers(cap),
+        None => false,
+    }
+}
+
 /// The pure selection rule (see the module docs). `q`/`k`/`v` are the `[B, H, S, D]` dims.
 pub fn flash_eligibility(
     compiled: bool,
-    is_cuda: bool,
+    device: FlashDevice,
     dtype: DType,
     q: &[usize],
     k: &[usize],
@@ -105,8 +143,13 @@ pub fn flash_eligibility(
     if !compiled {
         return Budgeted(FlashRefusal::NotCompiled);
     }
-    if !is_cuda {
-        return Budgeted(FlashRefusal::NotCuda);
+    match device {
+        FlashDevice::NotCuda => return Budgeted(FlashRefusal::NotCuda),
+        FlashDevice::Cuda {
+            compute_cap,
+            supported: false,
+        } => return Budgeted(FlashRefusal::UnsupportedArch(compute_cap)),
+        FlashDevice::Cuda { .. } => {}
     }
     if !matches!(dtype, DType::BF16 | DType::F16) {
         return Budgeted(FlashRefusal::Dtype(dtype));
@@ -136,13 +179,35 @@ pub fn select_attention_kernel(
 ) -> AttentionKernel {
     flash_eligibility(
         FLASH_ATTN_COMPILED,
-        q.device().is_cuda(),
+        flash_device(q.device()),
         q.dtype(),
         q.dims(),
         k.dims(),
         v.dims(),
         mask.is_some(),
     )
+}
+
+/// Classify a real device for [`flash_eligibility`]. The compute capability is cached per GPU
+/// ordinal ([`crate::cuda_arch::device_compute_cap`]) and the baked ladder parsed once, so this is
+/// a couple of lookups per attention call. Skipped entirely when the kernel is not compiled.
+pub fn flash_device(device: &candle_core::Device) -> FlashDevice {
+    if !device.is_cuda() {
+        return FlashDevice::NotCuda;
+    }
+    if !FLASH_ATTN_COMPILED {
+        return FlashDevice::Cuda {
+            compute_cap: None,
+            supported: false,
+        };
+    }
+    static LADDER: std::sync::OnceLock<crate::cuda_arch::FatbinLadder> = std::sync::OnceLock::new();
+    let ladder = LADDER.get_or_init(crate::cuda_arch::FatbinLadder::flash_from_build);
+    let compute_cap = crate::cuda_arch::device_compute_cap(device);
+    FlashDevice::Cuda {
+        compute_cap,
+        supported: flash_arch_supported(compute_cap, ladder),
+    }
 }
 
 /// Scaled-dot-product attention over `q,k,v: [B, H, S, D]` (any strides whose last dim is
@@ -211,8 +276,51 @@ mod tests {
 
     const H3: [usize; 4] = [1, 56, 4096, 128];
 
+    const SM120: FlashDevice = FlashDevice::Cuda {
+        compute_cap: Some(120),
+        supported: true,
+    };
+
     fn pick(dtype: DType, q: &[usize], k: &[usize], masked: bool) -> AttentionKernel {
-        flash_eligibility(true, true, dtype, q, k, k, masked)
+        flash_eligibility(true, SM120, dtype, q, k, k, masked)
+    }
+
+    fn shipped_ladder() -> crate::cuda_arch::FatbinLadder {
+        // The vendored fatbin at the SceneWorks cap=80 baseline: sm_80/90/120 SASS + compute_120.
+        crate::cuda_arch::FatbinLadder::explicit_plus_baseline("90,120", "120", "80")
+    }
+
+    #[test]
+    fn the_arch_guard_admits_only_devices_the_fatbin_serves() {
+        let ladder = shipped_ladder();
+        for cap in [80, 86, 89, 90, 120, 121, 130] {
+            assert!(flash_arch_supported(Some(cap), &ladder), "sm_{cap}");
+        }
+        // Below FA2's floor, the datacenter-Blackwell gap (major 10), and an unreadable device.
+        for cap in [Some(61), Some(75), Some(100), Some(103), None] {
+            assert!(!flash_arch_supported(cap, &ladder), "{cap:?}");
+        }
+        // A cap=120-only build (no sm_80 rung) must not launch on Ampere.
+        let native = crate::cuda_arch::FatbinLadder::explicit_plus_baseline("120", "", "120");
+        assert!(!flash_arch_supported(Some(86), &native));
+        assert!(flash_arch_supported(Some(120), &native));
+        // An empty ladder is "unknown", which for a launch means "no".
+        assert!(!flash_arch_supported(
+            Some(120),
+            &crate::cuda_arch::FatbinLadder::default()
+        ));
+    }
+
+    #[test]
+    fn an_unsupported_arch_refuses_before_any_shape_check() {
+        let old = FlashDevice::Cuda {
+            compute_cap: Some(75),
+            supported: false,
+        };
+        assert_eq!(
+            flash_eligibility(true, old, DType::BF16, &H3, &H3, &H3, false),
+            AttentionKernel::Budgeted(FlashRefusal::UnsupportedArch(Some(75)))
+        );
     }
 
     #[test]
@@ -237,8 +345,10 @@ mod tests {
     #[test]
     fn every_refusal_is_typed_and_ordered() {
         use AttentionKernel::Budgeted;
-        let f =
-            |compiled, cuda, dtype| flash_eligibility(compiled, cuda, dtype, &H3, &H3, &H3, false);
+        let f = |compiled, cuda: bool, dtype| {
+            let device = if cuda { SM120 } else { FlashDevice::NotCuda };
+            flash_eligibility(compiled, device, dtype, &H3, &H3, &H3, false)
+        };
         assert_eq!(
             f(false, true, DType::BF16),
             Budgeted(FlashRefusal::NotCompiled)
@@ -268,7 +378,7 @@ mod tests {
         assert_eq!(
             flash_eligibility(
                 true,
-                true,
+                SM120,
                 DType::BF16,
                 &H3,
                 &H3,

@@ -13,7 +13,7 @@ candle-audio-catalog = { workspace = true, features = ["cuda"], optional = true 
 candle-llm = { workspace = true, features = ["cuda"] }
 
 [features]
-default = ["media", "audio"]
+default = ["media", "audio", "media-flash-attn"]
 # SceneWorks consumes the complete bundle. LLM-only products can disable default features while
 # retaining the explicitly composed CUDA LLM catalog.
 media = ["dep:candle-gen-catalog"]
@@ -22,10 +22,12 @@ media = ["dep:candle-gen-catalog"]
 # text + TTS via `--no-default-features --features audio` without the image/video provider graph.
 audio = ["dep:candle-audio-catalog"]
 flash-attn = ["candle-llm/flash-attn"]
-# FlashAttention-2 for the media lane (sc-26691) — separate from the LLM `flash-attn` above because
-# a candle-llm flash build refuses the CUDA-graph runner (`flash_attn_stream`), and the media lane
-# should not impose that. Long-sequence MiniMax-H3 renders need it: without it their attention runs
-# the materialized, query-chunked fallback.
+# FlashAttention-2 for the media lane (sc-26691), ON BY DEFAULT: it is the shipped attention path
+# for long-sequence MiniMax-H3 renders (without it they run the materialized, query-chunked
+# fallback, ~10x slower). Separate from the LLM `flash-attn` above because a candle-llm flash build
+# refuses the CUDA-graph runner (`flash_attn_stream`), which the media lane must not impose. The
+# kernels are the vendored multi-arch fatbin (vendor/candle-flash-attn), and candle-gen dispatches
+# to them only on a device that fatbin covers.
 media-flash-attn = ["media", "candle-gen-catalog?/flash-attn"]
 
 [dev-dependencies]
