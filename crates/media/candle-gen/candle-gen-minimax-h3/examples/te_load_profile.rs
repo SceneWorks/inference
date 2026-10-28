@@ -68,7 +68,7 @@ fn main() {
     let t_te = t.elapsed();
     let (calls, parts, repack, upload) = candle_gen::quant::repack::profile::snapshot();
     eprintln!(
-        "Weights load {t_weights:.1?}  from_weights {t_te:.1?}  | q4 tensors {calls}: parts/D2H {parts:.2}s  repack {repack:.2}s  upload {upload:.2}s | layers {}",
+        "Weights load {t_weights:.1?}  from_weights {t_te:.1?}  | q4 tensors (cumulative, process) {calls}: parts/D2H {parts:.2}s  repack {repack:.2}s  upload {upload:.2}s | layers {}",
         te.num_loaded_layers()
     );
 }

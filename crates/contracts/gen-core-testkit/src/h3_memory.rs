@@ -404,7 +404,8 @@ pub fn assert_stereo_packing_bound(actual_target_rows: u64) {
     assert_eq!(
         referenced.packed - base.packed,
         575 * u64::from(gen_core::h3_memory::AUDIO_OUTPUT_CHANNELS),
-        "per-channel truncated duration becomes channel-major rows once, including a long          reference clip"
+        "per-channel truncated duration becomes channel-major rows once, including a long \
+         reference clip"
     );
 }
 

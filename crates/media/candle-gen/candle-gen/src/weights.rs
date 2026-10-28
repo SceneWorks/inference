@@ -260,7 +260,10 @@ impl Weights {
                 let v = coerce_float(st.load(&k, if in_triple { &host } else { device })?, dtype)?;
                 if map.insert(k.clone(), v).is_some() {
                     return Err(CandleError::Msg(format!(
-                        "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors                          must each live in exactly one .safetensors shard — this snapshot has {k:?}                          in more than one file (mis-sharded checkpoint or a stray .safetensors in                          the dir)",
+                        "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
+                         must each live in exactly one .safetensors shard — this snapshot has \
+                         {k:?} in more than one file (mis-sharded checkpoint or a stray \
+                         .safetensors in the dir)",
                         path.display()
                     )));
                 }

@@ -321,14 +321,23 @@ impl MiniMaxH3TextEncoder {
     ) -> Result<Self> {
         // sc-26691: the q4 repack + upload runs inside this call and used to be invisible in logs.
         let started = std::time::Instant::now();
+        let before = candle_gen::quant::repack::profile::snapshot();
         let te = Self::build(w, prefix, cfg, dtype)?;
+        // The counters are process-wide and cumulative; log this load's delta. (A packed load
+        // running concurrently on another thread would be counted here too.)
+        let after = candle_gen::quant::repack::profile::snapshot();
         let (tensors, bytes) = w.keys().fold((0usize, 0usize), |(n, b), k| {
             let bytes = w
                 .require(k)
                 .map_or(0, |t| t.elem_count() * t.dtype().size_in_bytes());
             (n + 1, b + bytes)
         });
-        let (calls, parts_s, repack_s, upload_s) = candle_gen::quant::repack::profile::snapshot();
+        let (calls, parts_s, repack_s, upload_s) = (
+            after.0.saturating_sub(before.0),
+            after.1 - before.1,
+            after.2 - before.2,
+            after.3 - before.3,
+        );
         tracing::info!(
             layers = te.num_loaded_layers(),
             tensors,
