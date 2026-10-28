@@ -192,16 +192,9 @@ impl Precision {
     }
 }
 
-/// Round to the nearest bfloat16 (ties to even), returned as f32.
-pub fn round_bf16(x: f32) -> f32 {
-    if x.is_nan() {
-        return x;
-    }
-    let b = x.to_bits();
-    let lsb = (b >> 16) & 1;
-    let r = b.wrapping_add(0x7FFF + lsb) & 0xFFFF_0000;
-    f32::from_bits(r)
-}
+/// Round to the nearest bfloat16 (ties to even), returned as f32 — the shared
+/// [`crate::numeric::round_bf16`], re-exported at its historical path (sc-27419).
+pub use crate::numeric::round_bf16;
 
 /// Round to the nearest IEEE half (ties to even, overflow to ±inf, subnormals kept), as f32.
 pub fn round_f16(x: f32) -> f32 {

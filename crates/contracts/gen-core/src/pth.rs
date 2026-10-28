@@ -630,31 +630,9 @@ fn decode_to_f32(bytes: &[u8], dtype: PthDtype, numel: usize) -> Result<Vec<f32>
     Ok(out)
 }
 
-/// IEEE-754 half → f32 (no `half` crate dep).
-pub fn f16_bits_to_f32(h: u16) -> f32 {
-    let sign = (h & 0x8000) as u32;
-    let exp = (h >> 10) & 0x1f;
-    let mant = (h & 0x3ff) as u32;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign << 16
-        } else {
-            let mut e: i32 = -1;
-            let mut m = mant;
-            while m & 0x400 == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            m &= 0x3ff;
-            (sign << 16) | (((127 - 15 + 1 + e) as u32) << 23) | (m << 13)
-        }
-    } else if exp == 0x1f {
-        (sign << 16) | 0x7f80_0000 | (mant << 13)
-    } else {
-        (sign << 16) | (((exp as i32 - 15 + 127) as u32) << 23) | (mant << 13)
-    };
-    f32::from_bits(bits)
-}
+/// IEEE-754 half → f32: the shared [`crate::numeric`] decoder, re-exported at its historical path
+/// (sc-27419).
+pub use crate::numeric::f16_bits_to_f32;
 
 /// Validate externally supplied tensor metadata and compute the contiguous `[start..end)` byte range
 /// and element count. Every dimension must be non-negative and fit an `i32` axis (so a backend's
