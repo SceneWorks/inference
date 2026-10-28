@@ -12,6 +12,7 @@ use candle_gen::candle_nn::ops::softmax_last_dim;
 use super::rope::apply_interleaved_rope;
 use crate::loader::{linear_detect, rmsnorm, Weights};
 use crate::quant::QLinear;
+use candle_gen::attention::repeat_kv_bshd;
 
 /// diffusers `Attention(eps=1e-5)` — the per-head q/k RMSNorm epsilon.
 const QK_EPS: f64 = 1e-5;
@@ -25,28 +26,6 @@ fn join(prefix: &str, name: &str) -> String {
     }
 }
 
-/// Repeat each kv head `groups` times consecutively ([b,s,hkv,hd] → [b,s,hkv·groups,hd]) —
-/// `repeat_interleave` over the head axis, matching the reference.
-fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let (b, s, hkv, hd) = x.dims4()?;
-    x.unsqueeze(3)?
-        .expand((b, s, hkv, groups, hd))?
-        .contiguous()?
-        .reshape((b, s, hkv * groups, hd))
-}
-
-/// Max elements in a single attention scores tensor `[b,h,Sq,Sk]` before [`sdpa`] chunks over the query
-/// rows. candle CUDA kernels index elements with **i32**, so a scores/probs tensor exceeding `i32::MAX`
-/// (~2.147B) silently corrupts its tail. T2I runs attention over `[instruct, noise]` (~4.3k tokens at
-/// 1024², 28 heads ⇒ ~0.52B, safe); the **Edit** path prepends each reference's image tokens to the
-/// noise tokens (`forward_inner` ⇒ `[instruct, ref(×N), noise]`), so a single 1024² reference roughly
-/// doubles the image sequence (~8.4k joint tokens ⇒ `h·Sq·Sk` ~1.98B, and >1 reference goes well past
-/// `i32::MAX`) → the trailing query rows get garbage attention → washed-out output (sc-7523). A 1.0B
-/// budget keeps each chunk's scores well under the i32 limit while leaving the T2I sizes a single
-/// un-chunked pass, so the txt2img / Base / Turbo paths stay byte-identical.
 /// Bidirectional, unmasked scaled-dot-product attention. `q`/`k`/`v`: `[b, h, s, hd]` → `[b, h, s, hd]`.
 /// Delegates to the shared i32-overflow-safe [`candle_gen::sdpa_budgeted_bhsd`] (sc-9570), which chunks
 /// over the query rows once the full `[b,h,Sq,Sk]` scores tensor would exceed
@@ -118,8 +97,8 @@ impl SelfAttention {
         let k = apply_interleaved_rope(&k, cos, sin)?;
 
         let groups = nh / nkv;
-        let k = repeat_kv(&k, groups)?;
-        let v = repeat_kv(&v, groups)?;
+        let k = repeat_kv_bshd(&k, groups)?;
+        let v = repeat_kv_bshd(&v, groups)?;
 
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
@@ -225,8 +204,8 @@ impl JointAttention {
         let k = apply_interleaved_rope(&k, cos, sin)?;
 
         let groups = self.heads / self.kv_heads;
-        let k = repeat_kv(&k, groups)?;
-        let v = repeat_kv(&v, groups)?;
+        let k = repeat_kv_bshd(&k, groups)?;
+        let v = repeat_kv_bshd(&v, groups)?;
 
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;

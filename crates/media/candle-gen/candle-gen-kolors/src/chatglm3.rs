@@ -39,6 +39,7 @@ use candle_gen::quant::{QLinear, MLX_GROUP_SIZE};
 
 use crate::config::ChatGlmConfig;
 use crate::tokenizer::KolorsTokens;
+use candle_gen::attention::repeat_kv;
 
 struct GlmBlock {
     input_ln: RmsNorm,
@@ -309,20 +310,6 @@ impl ChatGlmModel {
         let data = causal_padding_data(attention_mask, 1, s);
         Tensor::from_vec(data, (1, 1, s, s), &self.device)?.to_dtype(dtype)
     }
-}
-
-/// Broadcast each of `x`'s `kv` heads to `g` contiguous query heads — `[b, kv, s, d] → [b, kv·g, s, d]`,
-/// head `kv_idx·g + j` served by KV head `kv_idx` (so query head `i` uses KV head `i / g`). `g == 1` is
-/// a no-op (SDXL/standard MHA).
-fn repeat_kv(x: &Tensor, g: usize) -> CandleResult<Tensor> {
-    if g == 1 {
-        return Ok(x.clone());
-    }
-    let (b, kv, s, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .broadcast_as((b, kv, g, s, d))?
-        .contiguous()?
-        .reshape((b, kv * g, s, d))
 }
 
 /// Flat `[b·s·s]` additive-mask data: for each batch row, query `i` is masked off key `j` (value

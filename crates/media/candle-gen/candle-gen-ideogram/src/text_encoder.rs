@@ -24,10 +24,12 @@
 //! half the resident footprint.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::{ops::softmax_last_dim, rotary_emb::rope, Module, RmsNorm, VarBuilder};
+use candle_gen::candle_nn::{ops::softmax_last_dim, Module, RmsNorm, VarBuilder};
 use candle_gen::quant::{embedding_dtype, lin, QEmbedding, QLinear};
 
 use crate::config::Ideogram4TextEncoderConfig;
+use candle_gen::attention::repeat_kv;
+use candle_gen::grounding::Rotary;
 
 /// Build a candle_nn [`RmsNorm`] whose weight is forced to **f32** (sc-12828). The encoder stores its
 /// bulk weights bf16 but computes in f32 (module docs); candle_nn's RmsNorm applies its weight at the
@@ -37,40 +39,6 @@ use crate::config::Ideogram4TextEncoderConfig;
 fn rms_norm_f32(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
     let weight = vb.get(size, "weight")?.to_dtype(DType::F32)?;
     Ok(RmsNorm::new(weight, eps))
-}
-
-/// HF half-split RoPE table (θ over `head_dim`), built once for the max sequence length.
-struct Rotary {
-    cos: Tensor,
-    sin: Tensor,
-}
-
-impl Rotary {
-    fn new(head_dim: usize, theta: f32, max_seq: usize, device: &Device) -> Result<Self> {
-        let inv_freq: Vec<f32> = (0..head_dim)
-            .step_by(2)
-            .map(|i| 1f32 / theta.powf(i as f32 / head_dim as f32))
-            .collect();
-        let n = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, n), device)?;
-        let t = Tensor::arange(0u32, max_seq as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq, 1))?;
-        let freqs = t.matmul(&inv_freq)?; // (max_seq, head_dim/2)
-        Ok(Self {
-            cos: freqs.cos()?,
-            sin: freqs.sin()?,
-        })
-    }
-
-    fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (_, _, seq, _) = q.dims4()?;
-        let cos = self.cos.narrow(0, 0, seq)?;
-        let sin = self.sin.narrow(0, 0, seq)?;
-        let q = rope(&q.contiguous()?, &cos, &sin)?;
-        let k = rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q, k))
-    }
 }
 
 struct Attention {
@@ -129,17 +97,6 @@ impl Attention {
         let o = o.transpose(1, 2)?.reshape((b, s, nh * hd))?;
         self.o_proj.forward_upcast(&o)
     }
-}
-
-/// Repeat each kv head `groups` times along the head axis ([B, nkv, S, D] → [B, nkv·groups, S, D]).
-fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let (b, nkv, s, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, nkv, groups, s, d))?
-        .reshape((b, nkv * groups, s, d))
 }
 
 struct Mlp {
