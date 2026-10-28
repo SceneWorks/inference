@@ -390,36 +390,6 @@ fn quantize_targets(
     })
 }
 
-/// Copy `src_dir/config.json` to `dst_dir/config.json` with a `"quantization": {bits, group_size}`
-/// manifest block added (informational + the E9 turnkey marker; the loader itself auto-detects packed
-/// weights per-key, so it does not depend on this block). A missing source config starts empty.
-fn write_quantized_config(
-    src_dir: &Path,
-    dst_dir: &Path,
-    bits: i32,
-    group_size: i32,
-) -> Result<()> {
-    let src_cfg = src_dir.join("config.json");
-    let mut v: serde_json::Value = if src_cfg.exists() {
-        serde_json::from_str(&mlx_gen::gen_core::__model_input_reader!(
-std::fs::read_to_string(&src_cfg),
-"crates/media/mlx-gen/mlx-gen-boogu/src/convert.rs::write_quantized_config::std::fs::read_to_string@16466",
-ArtifactInput,
-&src_cfg,
-|__model_input_path| std::fs::read_to_string(__model_input_path)
-)?)
-            .map_err(|e| Error::Msg(format!("boogu: parse {}: {e}", src_cfg.display())))?
-    } else {
-        serde_json::json!({})
-    };
-    v["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
-    let text = serde_json::to_string_pretty(&v)
-        .map_err(|e| Error::Msg(format!("boogu: serialize config.json: {e}")))?;
-    std::fs::create_dir_all(dst_dir)?;
-    std::fs::write(dst_dir.join("config.json"), text)?;
-    Ok(())
-}
-
 /// Offline one-shot: read the dense `{src_root}/transformer/` (all shards) and write a pre-quantized
 /// `{dst_root}/transformer/diffusion_pytorch_model.safetensors` (packed Q4/Q8) + `config.json` (with
 /// the `quantization` manifest). `group_size` is Boogu's [`QUANT_GROUP_SIZE`] (**32**, not the
@@ -436,7 +406,7 @@ pub fn quantize_transformer(src_root: &Path, dst_root: &Path, bits: i32) -> Resu
         QUANT_GROUP_SIZE,
     )?;
     save_map(&dst.join("diffusion_pytorch_model.safetensors"), &quantized)?;
-    write_quantized_config(&src, &dst, bits, QUANT_GROUP_SIZE)?;
+    mlx_gen::quant::write_quantized_config(&src, &dst, bits, QUANT_GROUP_SIZE)?;
     Ok(())
 }
 
@@ -451,7 +421,7 @@ pub fn quantize_mllm(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> 
     let map = load_dir_map(&src)?;
     let quantized = quantize_targets(map, &mllm_quant_targets(num_layers), bits, QUANT_GROUP_SIZE)?;
     save_map(&dst.join("model.safetensors"), &quantized)?;
-    write_quantized_config(&src, &dst, bits, QUANT_GROUP_SIZE)?;
+    mlx_gen::quant::write_quantized_config(&src, &dst, bits, QUANT_GROUP_SIZE)?;
     Ok(())
 }
 

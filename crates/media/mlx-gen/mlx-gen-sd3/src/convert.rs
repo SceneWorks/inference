@@ -540,27 +540,6 @@ pub fn quantize_sd3_dir(
     let arrays: Vec<&Array> = quantized.values().collect();
     eval(arrays)?;
     save_map(&dst.join("diffusion_pytorch_model.safetensors"), &quantized)?;
-    write_quantized_config(src, dst, bits, group_size)?;
-    Ok(())
-}
-
-/// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}`
-/// block added (the manifest a packed loader reads). A missing source config starts from `{}`.
-fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
-    let src_cfg = src.join("config.json");
-    let mut v: serde_json::Value = if src_cfg.exists() {
-        serde_json::from_str(&mlx_gen::gen_core::__model_input_choose!(
-            std::fs::read_to_string(&src_cfg),
-            mlx_gen::gen_core::model_input_proof::read_configuration_to_string(&src_cfg)
-        )?)
-        .map_err(|e| Error::Msg(format!("sd3: parse {}: {e}", src_cfg.display())))?
-    } else {
-        serde_json::json!({})
-    };
-    v["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
-    let text = serde_json::to_string_pretty(&v)
-        .map_err(|e| Error::Msg(format!("sd3: serialize config.json: {e}")))?;
-    std::fs::create_dir_all(dst)?;
-    std::fs::write(dst.join("config.json"), text)?;
+    mlx_gen::quant::write_quantized_config(src, dst, bits, group_size)?;
     Ok(())
 }
