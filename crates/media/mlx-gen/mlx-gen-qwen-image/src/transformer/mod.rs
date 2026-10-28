@@ -42,12 +42,12 @@ pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 /// Load a Linear at `{prefix}.weight` (+ `{prefix}.bias` when `has_bias`) into an
 /// [`AdaptableLinear`] — the dense-or-quantizable base every transformer Linear uses, so the whole
 /// model can be Q8-quantized in place without touching the forward. Routes through
-/// [`crate::quant::lin`], which **auto-detects** a pre-quantized (packed) snapshot via
+/// [`mlx_gen::quant::lin`], which **auto-detects** a pre-quantized (packed) snapshot via
 /// `{prefix}.scales` and loads it packed with no dense transient (sc-8670); a dense snapshot loads
 /// dense exactly as before. The post-load `transformer.quantize(bits)` is a no-op on an
 /// already-packed module, so the same path serves both pre-quantized tiers and dense control loads.
 pub(crate) fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLinear> {
-    crate::quant::lin(w, prefix, has_bias)
+    mlx_gen::quant::lin(w, prefix, has_bias, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
 
 // The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).

@@ -299,7 +299,7 @@ fn resident_overlay_components(
             //
             // `unwrap_or(0)` preserves the zero-on-absent contract the module doc above states:
             // this runs inside the production contract builder, ahead of any deferred load.
-            let group_size = crate::quant::GROUP_SIZE as usize;
+            let group_size = mlx_gen::quant::DEFAULT_GROUP_SIZE as usize;
             let bits = spec.quantize.map(mlx_gen::Quant::bits);
             let projection =
                 move |tensor: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader| match bits {

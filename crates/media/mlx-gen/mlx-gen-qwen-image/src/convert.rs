@@ -23,7 +23,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::Array;
 
-use crate::quant::GROUP_SIZE;
+use mlx_gen::quant::DEFAULT_GROUP_SIZE;
 
 // ============================================================================================
 // Transformer pack predicate (operates on the **raw on-disk diffusers base** = key minus `.weight`,
@@ -55,9 +55,14 @@ fn is_transformer_target(base: &str) -> bool {
 /// size is the codebase default 64. Packs every Linear, leaves the q/k RMSNorms + `txt_norm` dense.
 pub fn quantize_qwen_image_transformer(src: &Path, dst: &Path, bits: i32) -> Result<()> {
     std::fs::create_dir_all(dst)?;
-    let map = quantize_map(load_dir_map(src)?, bits, GROUP_SIZE, is_transformer_target)?;
+    let map = quantize_map(
+        load_dir_map(src)?,
+        bits,
+        DEFAULT_GROUP_SIZE,
+        is_transformer_target,
+    )?;
     save_map(&dst.join("model.safetensors"), &map)?;
-    write_quantized_config(src, dst, bits, GROUP_SIZE)
+    write_quantized_config(src, dst, bits, DEFAULT_GROUP_SIZE)
 }
 
 /// Assemble a full pre-quantized turnkey snapshot in `dst_root`: pack the transformer and copy the
@@ -116,7 +121,7 @@ pub fn quantize_qwen_control_branch(src: &Path, dst: &Path, bits: i32) -> Result
         .keys()
         .map(|k| (k.to_string(), w.get(k).expect("listed key").clone()))
         .collect();
-    let packed = quantize_map(map, bits, GROUP_SIZE, is_transformer_target)?;
+    let packed = quantize_map(map, bits, DEFAULT_GROUP_SIZE, is_transformer_target)?;
     save_map(&dst.join("model.safetensors"), &packed)?;
     // Provenance: a `{"quantization": {...}}` config.json (the loaders auto-detect packed weights via
     // `{base}.scales` and ignore this block) + the source repo's README/LICENSE, so the hosted tier
@@ -127,7 +132,7 @@ pub fn quantize_qwen_control_branch(src: &Path, dst: &Path, bits: i32) -> Result
     } else {
         src.parent().unwrap_or(src)
     };
-    write_quantized_config(src_root, dst, bits, GROUP_SIZE)?;
+    write_quantized_config(src_root, dst, bits, DEFAULT_GROUP_SIZE)?;
     copy_turnkey_assets(src_root, dst)
 }
 
@@ -193,7 +198,7 @@ mod tests {
             Array::ones::<f32>(&[128]).unwrap(),
         );
 
-        let out = quantize_map(map, 4, GROUP_SIZE, is_transformer_target).unwrap();
+        let out = quantize_map(map, 4, DEFAULT_GROUP_SIZE, is_transformer_target).unwrap();
 
         let wq = out
             .get("transformer_blocks.0.attn.to_q.weight")
@@ -202,7 +207,7 @@ mod tests {
         let scales = out.get("transformer_blocks.0.attn.to_q.scales").unwrap();
         let biases = out.get("transformer_blocks.0.attn.to_q.biases").unwrap();
         let (ewq, esc, ebi) =
-            quantize(w.as_dtype(Dtype::Bfloat16).unwrap(), GROUP_SIZE, 4).unwrap();
+            quantize(w.as_dtype(Dtype::Bfloat16).unwrap(), DEFAULT_GROUP_SIZE, 4).unwrap();
         assert!(byte_equal(wq, &ewq), "packed weight != load-time quantize");
         assert!(byte_equal(scales, &esc), "scales != load-time quantize");
         assert!(byte_equal(biases, &ebi), "biases != load-time quantize");

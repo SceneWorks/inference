@@ -18,9 +18,7 @@
 //! can quantize them Q4/Q8 at load.
 
 use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, matmul, multiply, softmax_axis, split, split_sections,
-};
+use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, softmax_axis, split, split_sections};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -341,18 +339,6 @@ impl Qwen25VlText {
         )?)
     }
 
-    /// Expand `[B,L,Hkv,D]` → `[B,L,Hkv*groups,D]` (GQA repeat).
-    fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
-        if groups == 1 {
-            return Ok(x.clone());
-        }
-        let s = x.shape();
-        let (b, l, hkv, d) = (s[0], s[1], s[2], s[3]);
-        let x = x.expand_dims(3)?;
-        let x = broadcast_to(&x, &[b, l, hkv, groups, d])?;
-        Ok(x.reshape(&[b, l, hkv * groups, d])?)
-    }
-
     /// Eager attention with an external additive 4D `mask` (`[*,*,L,L]`, broadcast): q/k/v project →
     /// reshape to heads → MRoPE q,k → GQA → `softmax(q·kᵀ/√d + mask)·v` (f32 softmax) → o_proj.
     fn attention(
@@ -376,8 +362,8 @@ impl Qwen25VlText {
 
         let groups = nh / nkv;
         let q = q.transpose_axes(&[0, 2, 1, 3])?; // [B,H,L,D]
-        let k = Self::repeat_kv(&k, groups)?.transpose_axes(&[0, 2, 1, 3])?;
-        let v = Self::repeat_kv(&v, groups)?.transpose_axes(&[0, 2, 1, 3])?;
+        let k = mlx_gen::nn::repeat_kv(&k, groups)?.transpose_axes(&[0, 2, 1, 3])?;
+        let v = mlx_gen::nn::repeat_kv(&v, groups)?.transpose_axes(&[0, 2, 1, 3])?;
 
         let scale = (hd as f32).powf(-0.5);
         let scores = multiply(

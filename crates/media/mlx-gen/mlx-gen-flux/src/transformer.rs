@@ -1418,12 +1418,12 @@ fn time_proj(time_steps: &Array) -> Result<Array> {
     mlx_gen::nn::timestep_sincos(time_steps, 256, 10000.0, 0.0)
 }
 
-/// Load `{prefix}` into an [`AdaptableLinear`], routed through [`crate::quant::lin`] so a
+/// Load `{prefix}` into an [`AdaptableLinear`], routed through [`mlx_gen::quant::lin`] so a
 /// pre-quantized (packed) snapshot auto-detects via `{prefix}.scales` and loads packed with no dense
 /// transient (sc-8669); a dense snapshot loads dense as before. Every transformer Linear is built
 /// here, so this one edit covers the whole DiT.
 pub(crate) fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLinear> {
-    crate::quant::lin(w, prefix, has_bias)
+    mlx_gen::quant::lin(w, prefix, has_bias, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
 
 /// ControlNet residual injection interval (diffusers `FluxTransformer2DModel`):

@@ -23,7 +23,7 @@ use mlx_gen::quant::{
 };
 use mlx_gen::Result;
 
-use crate::quant::GROUP_SIZE;
+use mlx_gen::quant::DEFAULT_GROUP_SIZE;
 
 // ============================================================================================
 // Pack predicates (operate on the **base** = the on-disk key minus its `.weight`).
@@ -49,7 +49,7 @@ fn is_vae_target(base: &str) -> bool {
 
 /// Pre-quantize one component dir (`src` sharded/single `*.safetensors` + `config.json`) → a packed
 /// `model.safetensors` + annotated `config.json` in `dst`. `is_target` is the component's pack
-/// predicate; `bits` = 4 (Q4) or 8 (Q8) at group size [`GROUP_SIZE`].
+/// predicate; `bits` = 4 (Q4) or 8 (Q8) at group size [`DEFAULT_GROUP_SIZE`].
 fn quantize_component(
     src: &Path,
     dst: &Path,
@@ -57,9 +57,9 @@ fn quantize_component(
     is_target: fn(&str) -> bool,
 ) -> Result<()> {
     std::fs::create_dir_all(dst)?;
-    let map = quantize_map(load_dir_map(src)?, bits, GROUP_SIZE, is_target)?;
+    let map = quantize_map(load_dir_map(src)?, bits, DEFAULT_GROUP_SIZE, is_target)?;
     save_map(&dst.join("model.safetensors"), &map)?;
-    write_quantized_config(src, dst, bits, GROUP_SIZE)
+    write_quantized_config(src, dst, bits, DEFAULT_GROUP_SIZE)
 }
 
 /// Assemble a full pre-quantized turnkey snapshot in `dst_root`: pack the transformer, CLIP text
@@ -152,7 +152,7 @@ mod tests {
             Array::ones::<f32>(&[128]).unwrap(),
         );
 
-        let out = quantize_map(map, 4, GROUP_SIZE, pack_all).unwrap();
+        let out = quantize_map(map, 4, DEFAULT_GROUP_SIZE, pack_all).unwrap();
 
         let wq = out
             .get("transformer_blocks.0.attn.to_q.weight")
@@ -161,7 +161,7 @@ mod tests {
         let scales = out.get("transformer_blocks.0.attn.to_q.scales").unwrap();
         let biases = out.get("transformer_blocks.0.attn.to_q.biases").unwrap();
         let (ewq, esc, ebi) =
-            quantize(w.as_dtype(Dtype::Bfloat16).unwrap(), GROUP_SIZE, 4).unwrap();
+            quantize(w.as_dtype(Dtype::Bfloat16).unwrap(), DEFAULT_GROUP_SIZE, 4).unwrap();
         assert!(byte_equal(wq, &ewq), "packed weight != load-time quantize");
         assert!(byte_equal(scales, &esc), "scales != load-time quantize");
         assert!(byte_equal(biases, &ebi), "biases != load-time quantize");

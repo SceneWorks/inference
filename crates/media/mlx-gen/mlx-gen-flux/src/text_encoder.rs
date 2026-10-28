@@ -1,10 +1,10 @@
 //! FLUX.1 prompt text path: CLIP pooled prompt embedding + T5 sequence prompt embedding.
 //! Ports the fork's `flux_text_encoder` modules directly.
 
-use crate::quant::GROUP_SIZE;
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::{host_i32, scalar};
 use mlx_gen::nn::gelu_tanh;
+use mlx_gen::quant::DEFAULT_GROUP_SIZE;
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
@@ -42,7 +42,7 @@ enum TokenEmbedding {
 impl TokenEmbedding {
     /// Load `{base}` — **packed** ([`Self::Quantized`]) when `{base}.scales` is present (a
     /// pre-quantized snapshot; bit-width inferred from the packed shapes at `group_size`), else
-    /// **dense** ([`Self::Dense`]). The embedding analogue of [`crate::quant::lin`] for this local
+    /// **dense** ([`Self::Dense`]). The embedding analogue of [`mlx_gen::quant::lin`] for this local
     /// enum (sc-8669), so a published Q4/Q8 text encoder loads its token/position/relative-bias
     /// tables packed with no dense bf16 transient.
     fn from_weights(w: &Weights, base: &str, group_size: i32) -> Result<Self> {
@@ -89,7 +89,7 @@ impl TokenEmbedding {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.quantize_with_group_size(bits, GROUP_SIZE)
+        self.quantize_with_group_size(bits, DEFAULT_GROUP_SIZE)
     }
 
     fn quantize_with_group_size(&mut self, bits: i32, group_size: i32) -> Result<()> {
@@ -129,12 +129,12 @@ impl ClipTextEncoder {
             token_embedding: TokenEmbedding::from_weights(
                 w,
                 &p("text_model.embeddings.token_embedding"),
-                GROUP_SIZE,
+                DEFAULT_GROUP_SIZE,
             )?,
             position_embedding: TokenEmbedding::from_weights(
                 w,
                 &p("text_model.embeddings.position_embedding"),
-                GROUP_SIZE,
+                DEFAULT_GROUP_SIZE,
             )?,
             layers,
             final_ln_w: w.require(&p("text_model.final_layer_norm.weight"))?.clone(),
@@ -229,7 +229,8 @@ struct ClipAttention {
 impl ClipAttention {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         // Packed-detect (sc-8669): loads Q4/Q8 packed when `{name}.scales` is present, else dense.
-        let linear = |name: &str| crate::quant::lin(w, &join(prefix, name), true);
+        let linear =
+            |name: &str| mlx_gen::quant::lin(w, &join(prefix, name), true, DEFAULT_GROUP_SIZE);
         Ok(Self {
             q: linear("q_proj")?,
             k: linear("k_proj")?,
@@ -290,7 +291,8 @@ struct ClipMlp {
 impl ClipMlp {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         // Packed-detect (sc-8669): loads Q4/Q8 packed when `{name}.scales` is present, else dense.
-        let linear = |name: &str| crate::quant::lin(w, &join(prefix, name), true);
+        let linear =
+            |name: &str| mlx_gen::quant::lin(w, &join(prefix, name), true, DEFAULT_GROUP_SIZE);
         Ok(Self {
             fc1: linear("fc1")?,
             fc2: linear("fc2")?,
@@ -445,7 +447,7 @@ pub(crate) fn validate_t5_group_size(group_size: i32) -> Result<()> {
 
 impl T5TextEncoder {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        Self::from_weights_with_group_size(w, prefix, GROUP_SIZE)
+        Self::from_weights_with_group_size(w, prefix, DEFAULT_GROUP_SIZE)
     }
 
     /// Load T5 at the affine group size its packed component declares. FLUX keeps the codebase
@@ -522,7 +524,7 @@ impl T5TextEncoder {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.quantize_with_group_size(bits, GROUP_SIZE)
+        self.quantize_with_group_size(bits, DEFAULT_GROUP_SIZE)
     }
 
     /// Pack the complete quantizable T5 surface at an explicit affine group size. Byte-identical to
@@ -882,8 +884,8 @@ mod tests {
         use mlx_gen::WeightsSource;
         let dir_tmp = tempfile::tempdir().unwrap();
         let dir = dir_tmp.path().to_path_buf();
-        let stream =
-            T5BlockStream::new(WeightsSource::Dir(dir.clone()), "", GROUP_SIZE).expect("stream");
+        let stream = T5BlockStream::new(WeightsSource::Dir(dir.clone()), "", DEFAULT_GROUP_SIZE)
+            .expect("stream");
         assert_eq!(stream.n_blocks(), T5_BLOCKS);
 
         // A hand-built encoder with the right block count and no weights: `with_block_stream` only
@@ -898,7 +900,7 @@ mod tests {
         // Unarmed: the guard does not fire (the discriminating control — without it the assertion
         // below would pass on a `quantize` that always errored).
         let unarmed = encoder
-            .quantize_with_group_size(8, GROUP_SIZE)
+            .quantize_with_group_size(8, DEFAULT_GROUP_SIZE)
             .err()
             .map(|e| e.to_string());
         assert!(
@@ -911,7 +913,7 @@ mod tests {
         encoder.block_stream = Some(stream);
         assert!(encoder.is_streamable());
         assert_eq!(encoder.resident_block_count(), 0);
-        let error = match encoder.quantize_with_group_size(8, GROUP_SIZE) {
+        let error = match encoder.quantize_with_group_size(8, DEFAULT_GROUP_SIZE) {
             Ok(()) => panic!("quantize after arming packed no blocks and reported success"),
             Err(error) => error.to_string(),
         };
