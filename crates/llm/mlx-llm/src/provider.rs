@@ -68,7 +68,7 @@ struct CacheLifecycleCapture {
 }
 
 impl CacheLifecycleCapture {
-    fn replay(self, observer: &mut dyn crate::campaign::Observer) {
+    fn replay(self, observer: &mut dyn crate::decode::observe::Observer) {
         for event in self.events {
             match event {
                 CapturedCacheLifecycle::Allocation(kind, role, lifetime, bytes) => {
@@ -97,7 +97,7 @@ impl CacheLifecycleCapture {
     }
 }
 
-impl crate::campaign::Observer for CacheLifecycleCapture {
+impl crate::decode::observe::Observer for CacheLifecycleCapture {
     fn phase(&mut self, _name: &'static str) {}
 
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64) {
@@ -163,7 +163,7 @@ impl crate::campaign::Observer for CacheLifecycleCapture {
 /// than silently replacing the fused path.
 struct PackedCampaignDecoder<'a> {
     model: &'a CausalLm,
-    arm: &'a crate::campaign::CompressedKvArm,
+    arm: &'a crate::decode::observe::CompressedKvArm,
     selection_fallbacks: RefCell<Vec<String>>,
 }
 
@@ -196,7 +196,7 @@ fn campaign_steady_decode_on(
     prompt_ids: &[i32],
     tokens: usize,
     stop_tokens: &[i32],
-    compressed: Option<&crate::campaign::CompressedKvArm>,
+    compressed: Option<&crate::decode::observe::CompressedKvArm>,
 ) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
     let measured = campaign_forced_decode_on(
         model,
@@ -225,7 +225,7 @@ fn campaign_forced_decode_on(
     prompt_ids: &[i32],
     tokens: usize,
     stop_tokens: &[i32],
-    compressed: Option<&crate::campaign::CompressedKvArm>,
+    compressed: Option<&crate::decode::observe::CompressedKvArm>,
     teacher_forced: Option<&[i32]>,
     score: bool,
 ) -> CoreResult<crate::decode::ForcedDecode> {
@@ -1268,7 +1268,7 @@ impl LlamaProvider {
         }
     }
 
-    pub(crate) fn campaign_geometry(&self) -> crate::campaign::ProductGeometry {
+    pub(crate) fn campaign_geometry(&self) -> crate::decode::observe::ProductGeometry {
         let (query_heads, kv_heads, head_dimension, layers) = match &self.model {
             Decoder::Causal(model) => {
                 let config = model.config();
@@ -1289,7 +1289,7 @@ impl LlamaProvider {
                 )
             }
         };
-        crate::campaign::ProductGeometry {
+        crate::decode::observe::ProductGeometry {
             query_heads: query_heads.max(0) as u64,
             kv_heads: kv_heads.max(0) as u64,
             head_dimension: head_dimension.max(0) as u64,
@@ -1396,8 +1396,8 @@ impl LlamaProvider {
     pub(crate) fn campaign_prefix_reuse_observed(
         &self,
         prompt: &str,
-        observer: &mut dyn crate::campaign::Observer,
-        compressed: Option<&crate::campaign::CompressedKvArm>,
+        observer: &mut dyn crate::decode::observe::Observer,
+        compressed: Option<&crate::decode::observe::CompressedKvArm>,
     ) -> CoreResult<(GenerationOutput, u64, u64)> {
         let ids = self
             .tokenizer
@@ -1515,7 +1515,7 @@ impl LlamaProvider {
         &self,
         prompt: &str,
         batch: usize,
-        observer: &mut dyn crate::campaign::Observer,
+        observer: &mut dyn crate::decode::observe::Observer,
     ) -> CoreResult<(Vec<GenerationOutput>, u64)> {
         if batch < 2 {
             return Err(CoreError::InvalidRequest(
@@ -1570,8 +1570,8 @@ impl LlamaProvider {
     /// stream, so reusing a structured-output fixture would never trigger a content-token cancel.
     pub(crate) fn campaign_cancel_after_first_token(
         &self,
-        observer: &mut dyn crate::campaign::Observer,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        observer: &mut dyn crate::decode::observe::Observer,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
     ) -> CoreResult<()> {
         let mut request = campaign_cancellation_probe_request();
         let cancel = crate::decode::CancelFlag::new();
@@ -1602,7 +1602,7 @@ impl LlamaProvider {
         &self,
         prompt: &str,
         tokens: usize,
-        compressed: Option<&crate::campaign::CompressedKvArm>,
+        compressed: Option<&crate::decode::observe::CompressedKvArm>,
     ) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
         let ids = self
             .tokenizer
@@ -1634,7 +1634,7 @@ impl LlamaProvider {
         &self,
         prompt: &str,
         tokens: usize,
-        compressed: Option<&crate::campaign::CompressedKvArm>,
+        compressed: Option<&crate::decode::observe::CompressedKvArm>,
         teacher_forced: Option<&[i32]>,
     ) -> CoreResult<crate::campaign::ScoredContinuation> {
         let ids = self
@@ -3382,8 +3382,8 @@ impl LlamaProvider {
         &self,
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
-        observer: &mut dyn crate::campaign::Observer,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        observer: &mut dyn crate::decode::observe::Observer,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
     ) -> CoreResult<TextLlmOutput> {
         self.generate_inner(req, on_event, Some(observer), packed, None)
     }
@@ -3496,8 +3496,8 @@ impl LlamaProvider {
         turn1: &TextLlmRequest,
         follow_up: &str,
         on_event: &mut dyn FnMut(CoreEvent),
-        observer: &mut dyn crate::campaign::Observer,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        observer: &mut dyn crate::decode::observe::Observer,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
     ) -> CoreResult<(TextLlmOutput, crate::campaign::MultiTurnPromptCacheTurns)> {
         let mut store = crate::decode::PrefixCache::with_budget(u64::MAX);
         let (answer, turn1_cache, turn1_ids) = self.campaign_turn_one(turn1, &mut store)?;
@@ -3530,7 +3530,7 @@ impl LlamaProvider {
         turn1: &TextLlmRequest,
         follow_up: &str,
         tokens: usize,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
         teacher_forced: Option<&[i32]>,
     ) -> CoreResult<(Vec<i32>, crate::campaign::MultiTurnPromptCacheTurns)> {
         self.campaign_multi_turn_continuation(
@@ -3564,7 +3564,7 @@ impl LlamaProvider {
         turn1: &TextLlmRequest,
         follow_up: &str,
         tokens: usize,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
         teacher_forced: Option<&[i32]>,
         score: bool,
     ) -> CoreResult<(
@@ -3742,8 +3742,8 @@ impl LlamaProvider {
         &self,
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
-        observer: Option<&mut dyn crate::campaign::Observer>,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        observer: Option<&mut dyn crate::decode::observe::Observer>,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
         prefix_cache: Option<&mut crate::decode::PrefixCache>,
     ) -> CoreResult<TextLlmOutput> {
         self.validate(req)?;
@@ -6038,7 +6038,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct RecordingLifecycleObserver(Vec<(&'static str, u64)>);
 
-    impl crate::campaign::Observer for RecordingLifecycleObserver {
+    impl crate::decode::observe::Observer for RecordingLifecycleObserver {
         fn phase(&mut self, _name: &'static str) {}
 
         fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
@@ -6061,8 +6061,8 @@ pub(crate) mod tests {
     #[test]
     fn cancellation_capture_replays_persistent_then_release_without_allocation_aliasing() {
         let mut capture = CacheLifecycleCapture::default();
-        crate::campaign::Observer::cache_snapshot(&mut capture, 64, 8, 8, 4);
-        crate::campaign::Observer::release_event(&mut capture, "cache_release", "cache", 64);
+        crate::decode::observe::Observer::cache_snapshot(&mut capture, 64, 8, 8, 4);
+        crate::decode::observe::Observer::release_event(&mut capture, "cache_release", "cache", 64);
         assert!(matches!(
             capture.events.first(),
             Some(CapturedCacheLifecycle::Snapshot(64, 8, 8, 4))
@@ -9099,7 +9099,7 @@ pub(crate) mod tests {
         storage_tokens: Vec<u64>,
     }
 
-    impl crate::campaign::Observer for CompressedArmCapture {
+    impl crate::decode::observe::Observer for CompressedArmCapture {
         fn phase(&mut self, _name: &'static str) {}
         fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
         fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _capacity: u64, _element: u64) {
@@ -9160,7 +9160,7 @@ pub(crate) mod tests {
             store
         };
 
-        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+        let arm = crate::decode::observe::CompressedKvMethod::GroupAffine
             .arm()
             .unwrap();
         let mut store = seeded_store();
@@ -9192,8 +9192,8 @@ pub(crate) mod tests {
         assert_eq!(capture.storage_tokens.first(), Some(&40));
         assert_eq!(store.len(), 1, "the compressed cache is not stored back");
 
-        let refused = crate::campaign::CompressedKvArm::with_reader(
-            crate::campaign::CompressedKvMethod::GroupAffine,
+        let refused = crate::decode::observe::CompressedKvArm::with_reader(
+            crate::decode::observe::CompressedKvMethod::GroupAffine,
             crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
                 crate::primitives::OpaqueCompiledKernel::new(
                     "sc20676-prefix-refused",
@@ -9239,7 +9239,7 @@ pub(crate) mod tests {
         fallbacks: Vec<(String, String)>,
     }
 
-    impl crate::campaign::Observer for PrefillLogitsCapture {
+    impl crate::decode::observe::Observer for PrefillLogitsCapture {
         fn phase(&mut self, _name: &'static str) {}
         fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
         fn logits(&mut self, stage: &'static str, values: &[f32]) {
@@ -9275,7 +9275,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let cancel = CancelFlag::new();
-        let arm = crate::campaign::CompressedKvMethod::GroupAffine8
+        let arm = crate::decode::observe::CompressedKvMethod::GroupAffine8
             .arm()
             .unwrap();
         let turn1_store = || {
@@ -9299,7 +9299,7 @@ pub(crate) mod tests {
 
         let turn2_run =
             |store: &mut crate::decode::PrefixCache,
-             compressed: Option<&crate::campaign::CompressedKvArm>| {
+             compressed: Option<&crate::decode::observe::CompressedKvArm>| {
                 let mut capture = PrefillLogitsCapture::default();
                 let out = crate::decode::prefix::generate_cached_with_observer(
                     &model,
@@ -9619,7 +9619,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let follow_up = "w7 w9 w11 w13 w15 w17 w19 w21 w23";
-        let arm = crate::campaign::CompressedKvMethod::GroupAffine8
+        let arm = crate::decode::observe::CompressedKvMethod::GroupAffine8
             .arm()
             .unwrap();
 
@@ -9669,7 +9669,7 @@ pub(crate) mod tests {
         );
 
         // The observed fixture: both arms' turn 2 is the same prompt-cache hit.
-        let observed = |packed: Option<&crate::campaign::CompressedKvArm>| {
+        let observed = |packed: Option<&crate::decode::observe::CompressedKvArm>| {
             let mut capture = CompressedArmCapture::default();
             let (output, turns) = provider
                 .campaign_multi_turn_observed(&turn1, follow_up, &mut |_| {}, &mut capture, packed)
@@ -9748,8 +9748,8 @@ pub(crate) mod tests {
                 std::sync::Arc::new(()),
             ),
         ));
-        let arm = crate::campaign::CompressedKvArm::with_reader(
-            crate::campaign::CompressedKvMethod::GroupAffine,
+        let arm = crate::decode::observe::CompressedKvArm::with_reader(
+            crate::decode::observe::CompressedKvMethod::GroupAffine,
             reader,
         );
         let decoder = PackedCampaignDecoder {
@@ -9777,7 +9777,7 @@ pub(crate) mod tests {
     #[ignore = "model inference; explicit model-proof workflow"]
     fn compressed_campaign_decoder_keeps_prefill_and_decode_on_the_fused_reader() {
         let model = tiny_packed_capable_model();
-        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+        let arm = crate::decode::observe::CompressedKvMethod::GroupAffine
             .arm()
             .unwrap();
         let decoder = PackedCampaignDecoder {
@@ -9837,7 +9837,7 @@ pub(crate) mod tests {
             prefill_kv: u64,
             element_bytes: u64,
         }
-        impl crate::campaign::Observer for PrefillCapture {
+        impl crate::decode::observe::Observer for PrefillCapture {
             fn phase(&mut self, name: &'static str) {
                 self.phase = Some(name);
                 if name == "prefill-peak" {
@@ -9861,14 +9861,14 @@ pub(crate) mod tests {
             seed: Some(0),
             ..Default::default()
         };
-        for method in crate::campaign::CompressedKvMethod::ALL {
+        for method in crate::decode::observe::CompressedKvMethod::ALL {
             let arm = method.arm().unwrap();
             let decoder = PackedCampaignDecoder {
                 model: &model,
                 arm: &arm,
                 selection_fallbacks: RefCell::new(Vec::new()),
             };
-            let run = |observer: Option<&mut dyn crate::campaign::Observer>| {
+            let run = |observer: Option<&mut dyn crate::decode::observe::Observer>| {
                 crate::decode::generate_with_observer(
                     &decoder,
                     &prompt,
@@ -9927,7 +9927,7 @@ pub(crate) mod tests {
             snapshots: Vec<(u64, u64)>,
             storage: Vec<crate::primitives::CompressedCacheStorage>,
         }
-        impl crate::campaign::Observer for StorageCapture {
+        impl crate::decode::observe::Observer for StorageCapture {
             fn phase(&mut self, _name: &'static str) {}
             fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
             fn cache_snapshot(&mut self, bytes: u64, tokens: u64, _capacity: u64, _element: u64) {
@@ -9940,7 +9940,7 @@ pub(crate) mod tests {
         let model = tiny_packed_capable_model();
         // 300 prompt tokens: one full block plus 44 (a 12-token residual after 32-token groups).
         let prompt = (0..300).map(|i| (i % 31) + 1).collect::<Vec<i32>>();
-        for method in crate::campaign::CompressedKvMethod::ALL {
+        for method in crate::decode::observe::CompressedKvMethod::ALL {
             let arm = method.arm().unwrap();
             let decoder = PackedCampaignDecoder {
                 model: &model,
@@ -9967,7 +9967,7 @@ pub(crate) mod tests {
             let mut observer = crate::campaign::ProductObserver::new();
             observer.begin_coordinate_operation();
             for storage in &capture.storage {
-                crate::campaign::Observer::compressed_storage(&mut observer, storage);
+                crate::decode::observe::Observer::compressed_storage(&mut observer, storage);
             }
             observer.end_coordinate_operation();
             let peak = observer.coordinate_storage_peak().unwrap();
@@ -10021,7 +10021,7 @@ pub(crate) mod tests {
         let model = Decoder::Causal(Box::new(tiny_packed_capable_model()));
         let every_id = (0..32).collect::<Vec<i32>>();
         let prompt = [1, 2, 3, 4, 5];
-        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+        let arm = crate::decode::observe::CompressedKvMethod::GroupAffine
             .arm()
             .unwrap();
         for compressed in [None, Some(&arm)] {
@@ -10035,8 +10035,8 @@ pub(crate) mod tests {
                 "every token was a forced stop"
             );
         }
-        let refused = crate::campaign::CompressedKvArm::with_reader(
-            crate::campaign::CompressedKvMethod::GroupAffine,
+        let refused = crate::decode::observe::CompressedKvArm::with_reader(
+            crate::decode::observe::CompressedKvMethod::GroupAffine,
             crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
                 crate::primitives::OpaqueCompiledKernel::new(
                     "sc20671-refused",
@@ -10066,7 +10066,7 @@ pub(crate) mod tests {
         let model = Decoder::Causal(Box::new(tiny_packed_capable_model()));
         let every_id = (0..32).collect::<Vec<i32>>();
         let prompt = [1, 2, 3, 4, 5];
-        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+        let arm = crate::decode::observe::CompressedKvMethod::GroupAffine
             .arm()
             .unwrap();
         let scored = |compressed, stream: Option<&[i32]>| {
@@ -10160,8 +10160,8 @@ pub(crate) mod tests {
         assert!(miss.first_flip_positions.contains(&10), "{miss:?}");
         assert!(miss.agreement < 1.0);
         assert!(forced(Some(&arm), Some(&reference[..63])).is_err());
-        let refused = crate::campaign::CompressedKvArm::with_reader(
-            crate::campaign::CompressedKvMethod::GroupAffine,
+        let refused = crate::decode::observe::CompressedKvArm::with_reader(
+            crate::decode::observe::CompressedKvMethod::GroupAffine,
             crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
                 crate::primitives::OpaqueCompiledKernel::new(
                     "sc20671-refused",

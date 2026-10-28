@@ -599,8 +599,8 @@ pub(crate) fn generate_cached_with_observer(
     prefix_cache: &mut PrefixCache,
     constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
-    mut observer: Option<&mut dyn crate::campaign::Observer>,
-    compressed: Option<&crate::campaign::CompressedKvArm>,
+    mut observer: Option<&mut dyn crate::decode::observe::Observer>,
+    compressed: Option<&crate::decode::observe::CompressedKvArm>,
 ) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(crate::error::Error::Canceled); // typed pre-inference cancel
@@ -684,8 +684,8 @@ fn request_cache(
     model: &CausalLm,
     prompt_ids: &[i32],
     prefix_cache: &mut PrefixCache,
-    compressed: Option<&crate::campaign::CompressedKvArm>,
-    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    compressed: Option<&crate::decode::observe::CompressedKvArm>,
+    observer: &mut Option<&mut dyn crate::decode::observe::Observer>,
 ) -> Result<(Box<dyn KvCache>, usize)> {
     let seed = prefix_cache
         .restore::<ContiguousKvCache>(prompt_ids, false)?
@@ -719,7 +719,7 @@ pub(crate) fn forced_cached_decode(
     model: &CausalLm,
     prompt_ids: &[i32],
     prefix_cache: &mut PrefixCache,
-    compressed: Option<&crate::campaign::CompressedKvArm>,
+    compressed: Option<&crate::decode::observe::CompressedKvArm>,
     tokens: usize,
     stop_tokens: &[i32],
     teacher_forced: Option<&[i32]>,
@@ -727,7 +727,7 @@ pub(crate) fn forced_cached_decode(
 ) -> Result<ForcedCachedDecode> {
     let mut fallbacks = FallbackCapture::default();
     let (mut cache, reused_prefix_tokens) = {
-        let mut observer: Option<&mut dyn crate::campaign::Observer> = Some(&mut fallbacks);
+        let mut observer: Option<&mut dyn crate::decode::observe::Observer> = Some(&mut fallbacks);
         request_cache(model, prompt_ids, prefix_cache, compressed, &mut observer)?
     };
     let measured = crate::decode::forced_greedy_decode_from(
@@ -754,7 +754,7 @@ pub(crate) fn forced_cached_decode(
 #[derive(Default)]
 struct FallbackCapture(Vec<(String, String)>);
 
-impl crate::campaign::Observer for FallbackCapture {
+impl crate::decode::observe::Observer for FallbackCapture {
     fn phase(&mut self, _name: &'static str) {}
     fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
     fn dense_fallback(&mut self, operation: &str, reason: &str) {
@@ -766,7 +766,7 @@ impl crate::campaign::Observer for FallbackCapture {
 pub(crate) const COMPRESSED_PREFIX_IMPORT_OPERATION: &str = "chunked-prefix-import";
 
 fn record_prefix_fallback(
-    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    observer: &mut Option<&mut dyn crate::decode::observe::Observer>,
     operation: &str,
     reason: &str,
 ) {
@@ -779,8 +779,8 @@ fn record_prefix_fallback(
 /// before any mutation is recorded, exactly as the campaign's compressed decoder records it.
 fn compressed_cache(
     model: &CausalLm,
-    arm: &crate::campaign::CompressedKvArm,
-    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    arm: &crate::decode::observe::CompressedKvArm,
+    observer: &mut Option<&mut dyn crate::decode::observe::Observer>,
 ) -> (Box<dyn KvCache>, bool) {
     let selection = arm.select_cache(model);
     let accepted = match selection.route() {
@@ -797,9 +797,9 @@ fn compressed_cache(
 /// dense seed (the ordinary dense reuse path) and records why.
 fn import_compressed_prefix(
     model: &CausalLm,
-    arm: &crate::campaign::CompressedKvArm,
+    arm: &crate::decode::observe::CompressedKvArm,
     seed: ContiguousKvCache,
-    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    observer: &mut Option<&mut dyn crate::decode::observe::Observer>,
 ) -> Result<Box<dyn KvCache>> {
     let (mut cache, accepted) = compressed_cache(model, arm, observer);
     if !accepted {

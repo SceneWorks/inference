@@ -14,6 +14,7 @@ pub mod batch;
 pub mod cancel;
 pub mod continuous;
 pub mod engine;
+pub mod observe;
 pub mod prefix;
 pub mod proposers;
 pub mod speculative;

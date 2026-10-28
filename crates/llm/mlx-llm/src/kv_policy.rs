@@ -442,7 +442,7 @@ mod tests {
     /// profile must be the ones this builder uses.
     #[test]
     fn campaign_arms_record_the_reader_this_builder_makes() {
-        for method in crate::campaign::CompressedKvMethod::ALL {
+        for method in crate::decode::observe::CompressedKvMethod::ALL {
             assert_eq!(
                 method.representation_identity(),
                 packed_metal_identity(method.code_bits())
