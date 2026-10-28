@@ -174,9 +174,10 @@ jobs:
   # the pinned rustfmt; they were normalized in a dedicated format-only baseline commit
   # (sc-13275), which is exactly the precondition the old `contracts` note called for. Data
   # tables that are hand-formatted on purpose (e.g. the GGUF IQ grids) carry `#[rustfmt::skip]`
-  # so `--all` leaves them intact. Deliberately NOT gated by `changes` (like `resolve`):
-  # formatting can drift in any .rs file. `cargo fmt --all` also invokes `cargo metadata`, so
-  # this doubles as a second resolution tripwire — no compile, so it stays fast.
+  # so rustfmt leaves them intact. Deliberately NOT gated by `changes` (like `resolve`):
+  # formatting can drift in any .rs file. At this virtual workspace root, plain `cargo fmt`
+  # selects every workspace member/target; `--all` additionally recurses into excluded path
+  # dependencies, including byte-certified upstream vendors. Metadata still checks resolution.
   format:
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
     name: workspace formatting
@@ -188,7 +189,7 @@ jobs:
           rustup show
           rustup component add rustfmt
       - name: Check whole-workspace formatting
-        run: cargo fmt --all --check
+        run: cargo fmt --check
 
   workspace:
     timeout-minutes: 20
