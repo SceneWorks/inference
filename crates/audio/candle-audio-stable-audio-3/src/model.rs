@@ -45,8 +45,9 @@ use crate::config::DiffusionObjective;
 use crate::dit::Guidance;
 use crate::pipeline::{
     AudioEdit, EditRegionSecs, ForwardedConditioning, ReferenceAudio, StableAudio3Pipeline,
-    SynthesisParameters, ValidatedForwardedConditioning, VariantGeometry, BASE_DEFAULT_GUIDANCE,
-    BASE_DEFAULT_STEPS, CHANNELS, DEFAULT_GUIDANCE, DEFAULT_STEPS, SAMPLE_RATE,
+    SynthesisHooks, SynthesisParameters, SynthesisRequest, ValidatedForwardedConditioning,
+    VariantGeometry, BASE_DEFAULT_GUIDANCE, BASE_DEFAULT_STEPS, CHANNELS, DEFAULT_GUIDANCE,
+    DEFAULT_STEPS, SAMPLE_RATE,
 };
 use crate::sampler::SamplerKind;
 use crate::weights::SnapshotLayout;
@@ -1989,10 +1990,7 @@ impl StableAudio3Generator {
         &self,
         cancel: &gen_core::CancelFlag,
     ) -> gen_core::Result<Arc<StableAudio3Pipeline>> {
-        let mut guard = match self.pipeline.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = candle_audio::lock_recover(&self.pipeline);
         if let Some(pipeline) = guard.as_ref() {
             return Ok(pipeline.clone());
         }
@@ -2176,10 +2174,7 @@ impl Generator for StableAudio3Generator {
         // Candle's shared Metal graph is not safe to execute concurrently: command-buffer
         // interleaving can change the resulting PCM even when every request owns its RNG stream.
         // Serialize graph execution while keeping all stochastic state request-local.
-        let _generation = match self.generation.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let _generation = candle_audio::lock_recover(&self.generation);
         let parameters = synthesis_parameters(self.variant, request);
         let pipeline = self.pipeline(&request.cancel)?;
         let cancel = request.cancel.clone();
@@ -2206,13 +2201,17 @@ impl Generator for StableAudio3Generator {
         // decides internally, so there is no arm for an edit to be routed into.
         let conditioning = validated_conditioning_for(request);
         let samples = pipeline.synthesize_conditioned_validated(
-            &request.prompt,
-            request.negative_prompt.as_deref(),
-            parameters,
+            SynthesisRequest {
+                prompt: &request.prompt,
+                negative_prompt: request.negative_prompt.as_deref(),
+                parameters,
+            },
             conditioning,
-            &mut step_progress,
-            &mut decoding,
-            &|| cancel.is_cancelled(),
+            SynthesisHooks {
+                on_progress: &mut step_progress,
+                on_decoding: &mut decoding,
+                is_canceled: &|| cancel.is_cancelled(),
+            },
         )?;
         Ok(GenerationOutput::Audio(AudioTrack {
             samples,

@@ -16,7 +16,9 @@ use candle_audio_stable_audio_3::candle_audio::candle_core::{
     safetensors::MmapedSafetensors, DType, Device, Tensor,
 };
 use candle_audio_stable_audio_3::dit::Guidance;
-use candle_audio_stable_audio_3::pipeline::{StableAudio3Pipeline, SynthesisParameters};
+use candle_audio_stable_audio_3::pipeline::{
+    StableAudio3Pipeline, SynthesisHooks, SynthesisParameters, SynthesisRequest,
+};
 use candle_audio_stable_audio_3::same::SameDecodeChunkNoise;
 use candle_audio_stable_audio_3::sampler::SamplerKind;
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
@@ -125,26 +127,30 @@ fn thirty_second_eight_step_provider_matches_frozen_torch() {
     let mut decoding = 0;
     let (latents, audio) = pipeline
         .synthesize_controlled(
-            PROMPT,
-            None,
-            SynthesisParameters {
-                duration_secs: 30.0,
-                steps: 8,
-                sampler: SamplerKind::Pingpong,
-                guidance: Guidance {
-                    cfg_scale: 1.0,
-                    apg_scale: 1.0,
-                    cfg_norm_threshold: 0.0,
-                    scale_phi: 0.0,
+            SynthesisRequest {
+                prompt: PROMPT,
+                negative_prompt: None,
+                parameters: SynthesisParameters {
+                    duration_secs: 30.0,
+                    steps: 8,
+                    sampler: SamplerKind::Pingpong,
+                    guidance: Guidance {
+                        cfg_scale: 1.0,
+                        apg_scale: 1.0,
+                        cfg_norm_threshold: 0.0,
+                        scale_phi: 0.0,
+                    },
+                    seed: SEED,
                 },
-                seed: SEED,
             },
             &initial,
             pingpong,
             &decode,
-            &mut |current, total| progress.push((current, total)),
-            &mut || decoding += 1,
-            &|| false,
+            SynthesisHooks {
+                on_progress: &mut |current, total| progress.push((current, total)),
+                on_decoding: &mut || decoding += 1,
+                is_canceled: &|| false,
+            },
         )
         .unwrap();
     assert_eq!(progress, (1..=8).map(|step| (step, 8)).collect::<Vec<_>>());

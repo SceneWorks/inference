@@ -91,8 +91,8 @@ to 60s/120s, compilation to 2400s, and whole suite invocations to 2700s routine 
 matrix members explicitly allow 4500s routine per invocation, and hosted
 `Test MLX packages` allows 3600s routine. Both retain 7200s exhaustive. A timeout
 terminates the child process tree, including rank fixtures. All CI jobs also have explicit
-deadlines; ordinary Candle CPU members and hosted Metal are bounded to 90 and
-75 minutes, with explicit exhaustive budgets of 150 and 180 minutes respectively.
+deadlines; ordinary Candle CPU members and hosted Metal are each bounded to
+90 minutes, with explicit exhaustive budgets of 150 and 180 minutes respectively.
 
 The CPU split preserves the existing full graph: 20 base native targets and 76 gen
 native targets, with the original package selectors, `--lib`/`--tests` flags and
@@ -113,8 +113,9 @@ passed: base finished in 21m04s and gen in 56m05s, with gen's test step taking
 approximately 55m29s. That leaves only about 4m31s below the initial 60-minute
 invocation limit. The CPU routine invocation limit is therefore 75 minutes,
 about 35% above that observed cold step, and its job limit is 90 minutes for
-setup/cache headroom. The 900s target watchdog, Metal job bounds and explicit
-exhaustive budgets are unchanged. This is deadline headroom, not a latency claim.
+setup/cache headroom. The 900s target watchdog and explicit exhaustive budgets
+are unchanged. The hosted Metal job headroom is documented below. This is
+deadline headroom, not a latency claim.
 
 The pinned `Swatinem/rust-cache` action includes `key: ${{ matrix.group }}` in
 both primary and restore prefixes, alongside the job, platform and Rust environment.
@@ -129,9 +130,26 @@ Hosted Metal job 121596995674 passed in 54m29s; `Test MLX packages` ran from
 13:32:14 to 14:13:21 (41m07s), compared with 36m55s in the prior run. That leaves
 only 3m53s below the default 45-minute routine suite limit. Its explicit 60-minute
 routine invocation budget provides headroom for the full native graph while
-preserving the 75-minute job bound, 900s target watchdog and 120-minute exhaustive
-invocation budget. The override belongs only to that step; other callers retain
-their existing budgets.
+preserving the 900s target watchdog and 120-minute exhaustive invocation budget.
+The override belongs only to that step; other callers retain their existing
+budgets.
+
+Main runs 40691949793 (`0b80ec518`) and 40732695026 (`9ddabbea2`) passed all
+product build, lint and test steps, including 268 successful test-result summaries
+in each hosted Metal job, then their 75-minute job deadlines cancelled the
+main-only Rust cache upload. The last product test completed after 74m50s and
+73m46s respectively, leaving insufficient time for cache cleanup, compression
+and upload. The hosted Metal job now has a 90-minute bound for that post-job
+work and runner variance. Target, suite and exhaustive invocation budgets,
+package selection and required-gate failure handling stay the same.
+
+CI_IMPACT: this changes only the existing hosted Metal job deadline, adding no
+jobs, tests or model execution. Two existing policy-test expectations follow the
+new deadline; their suite, watchdog, cache and failure assertions stay intact.
+Its maximum wall-clock allowance increases by
+15 minutes; build/test work and compilation inputs are unchanged. The two main
+runs above are the measured evidence. Post-cache completion cost remains
+variable; the extra headroom is an engineering allowance, not a latency claim.
 
 These bounds prevent an accidental campaign/hang from consuming the former
 six-hour job default. They are not performance claims. This change was validated

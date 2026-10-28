@@ -177,6 +177,14 @@ DELETED_ENV_SIDE_CHANNELS = (
     "LTX_UNCENSORED_GEMMA_DIR",
     "PULID_EVA_WEIGHTS",
     "PULID_FACE_WEIGHTS_DIR",
+    # sc-27267: MOSS-TTS-Realtime's sc-13433 sweep knobs. Not a fetch channel, but the same defect
+    # class -- ambient host env silently changing production output (here the sampled audio,
+    # breaking same-seed-same-bytes across machines) -- so they must not return as src reads.
+    "MOSS_TTS_TEMPERATURE",
+    "MOSS_TTS_TOP_P",
+    "MOSS_TTS_TOP_K",
+    "MOSS_TTS_REP_PENALTY",
+    "MOSS_TTS_MIN_FRAMES",
 )
 
 # Every process-environment variable production `crates/**/src/**` code (outside `#[cfg(test)]`)

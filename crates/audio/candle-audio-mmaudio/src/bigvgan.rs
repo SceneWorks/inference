@@ -36,6 +36,7 @@
 //! per-channel grouped conv, but without candle's O(C) grouped-conv decomposition.
 
 use candle_audio::candle_core::{DType, Result as CResult, Tensor};
+use candle_audio::neural_codec::fold_weight_norm_gv;
 use candle_nn::VarBuilder;
 
 /// Mel bands the vocoder consumes (`num_mels`).
@@ -124,10 +125,10 @@ fn get_padding(kernel_size: usize, dilation: usize) -> usize {
 }
 
 /// Rebuild a `weight_norm`-parametrized conv weight: `w = g · v / ‖v‖`, with `‖v‖` the L2 norm over
-/// every dim except 0 (torch default `dim=0`). `g` is `(d0, 1, 1)`, `v` is `(d0, d1, k)`.
+/// every dim except 0 (torch default `dim=0`). `g` is `(d0, 1, 1)`, `v` is `(d0, d1, k)`. The
+/// commons [`fold_weight_norm_gv`] — the order this port is pinned to (sc-27269).
 fn weight_norm_reconstruct(g: &Tensor, v: &Tensor) -> CResult<Tensor> {
-    let norm = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?; // (d0,1,1)
-    v.broadcast_mul(g)?.broadcast_div(&norm)
+    fold_weight_norm_gv(v, g)
 }
 
 /// A `weight_norm`-parametrized `Conv1d`, reconstructed at load. Bias is optional — BigVGAN v2's

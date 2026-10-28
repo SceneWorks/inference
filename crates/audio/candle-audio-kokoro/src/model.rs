@@ -41,6 +41,7 @@ use crate::decoder::SAMPLE_RATE;
 use crate::g2p::{EnglishVariant, KokoroG2p};
 use crate::pipeline::{KokoroPipeline, SAMPLES_PER_FRAME, STAGES};
 use crate::weights::VoicePack;
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes `payload.model` to this exact id).
 pub const MODEL_ID: &str = "kokoro_82m";
@@ -215,15 +216,6 @@ impl KokoroGenerator {
         let built = Arc::new(KokoroG2p::new(variant));
         *guard = Some(built.clone());
         built
-    }
-}
-
-/// Recover a poisoned mutex (a prior panic mid-build leaves `None`/stale state, which the
-/// lazy builders tolerate) — the audio twin of `candle_gen::lock_recover`.
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 

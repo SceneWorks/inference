@@ -10,9 +10,9 @@ use crate::same::{
     SameAutoencoder, SameChunkingParameters, SameChunkingPolicy, SameDecodeChunkNoise,
 };
 use crate::sampler::{
-    build_schedule, default_sample_geometry, inference_shift, padding_mask,
-    sample_dit_initialized_with_interval_and_cancel, GuidanceInterval, InjectedNoise, NoiseSource,
-    ProgressCallback, SampleGeometry, SamplerKind, SeededNoise, LATENT_DOWNSAMPLING,
+    build_schedule, default_sample_geometry, inference_shift, padding_mask, sample_dit,
+    DitConditioning, InitMix, InjectedNoise, NoiseSource, ProgressCallback, SampleDitArgs,
+    SampleGeometry, SamplerKind, SeededNoise, LATENT_DOWNSAMPLING,
 };
 use crate::t5gemma::T5GemmaConditioner;
 use crate::weights::{SnapshotKind, SnapshotLayout};
@@ -1129,6 +1129,42 @@ pub struct SynthesisParameters {
     pub seed: u64,
 }
 
+/// The text half of a synthesis request: the prompt pair and the runtime choices (sc-27262 — one
+/// argument instead of three threaded through every entry point).
+#[derive(Debug, Clone, Copy)]
+pub struct SynthesisRequest<'a> {
+    pub prompt: &'a str,
+    pub negative_prompt: Option<&'a str>,
+    pub parameters: SynthesisParameters,
+}
+
+/// The per-request callbacks every synthesis entry point takes (sc-27262): sampler-step progress
+/// `(step, total)`, the switch to decoding, and the cooperative cancellation probe.
+pub struct SynthesisHooks<'a> {
+    pub on_progress: &'a mut dyn FnMut(usize, usize),
+    pub on_decoding: &'a mut dyn FnMut(),
+    pub is_canceled: &'a dyn Fn() -> bool,
+}
+
+/// One interleaved source clip to conform and encode (the shared half of [`ReferenceAudio`] and
+/// [`AudioEdit`]).
+struct SourceClip<'a> {
+    samples: &'a [f32],
+    sample_rate: u32,
+    channels: u16,
+}
+
+/// What [`StableAudio3Pipeline::sample`] receives from the source-encode stage: the restyle init
+/// latents and the reference they were encoded from (two forwarded halves of one decision — see
+/// [`reference_halves_agree`]), and the `[1, 257, latent_length]` local conditioning (exactly zero
+/// on the text-only and restyle paths, the masked source on the edit path; built by the caller so
+/// the construction is reachable — and gated — without weights).
+struct SampleSource<'a> {
+    init_latents: Option<&'a Tensor>,
+    local: &'a Tensor,
+    reference: Option<&'a ReferenceAudio<'a>>,
+}
+
 /// A loaded, connected text-to-stereo-audio graph.
 pub struct StableAudio3Pipeline {
     config: crate::config::StableAudioConfig,
@@ -1230,27 +1266,25 @@ impl StableAudio3Pipeline {
         self.dtypes
     }
 
+    /// Text-to-audio: no reference, no edit.
     pub fn synthesize(
         &self,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        parameters: SynthesisParameters,
-        on_progress: &mut dyn FnMut(usize, usize),
-        on_decoding: &mut dyn FnMut(),
-        is_canceled: &dyn Fn() -> bool,
+        request: SynthesisRequest<'_>,
+        hooks: SynthesisHooks<'_>,
     ) -> Result<Vec<f32>> {
-        self.synthesize_with_reference(
-            prompt,
-            negative_prompt,
-            parameters,
-            None,
-            on_progress,
-            on_decoding,
-            is_canceled,
-        )
+        Ok(self
+            .synthesize_traced(
+                request,
+                None,
+                None,
+                ReferenceInputValidation::Required,
+                hooks,
+            )?
+            .0)
     }
 
-    /// Synthesize, optionally starting from a caller-supplied source clip (sc-14547).
+    /// Synthesize from a caller-supplied source clip (sc-14547), plus the request stream's
+    /// draw-order provenance.
     ///
     /// With `reference` present the source is conformed by [`prepare_reference_pcm`], SAME-encoded
     /// on the request's own stream, and mixed into the sampler's initial noise at
@@ -1258,57 +1292,23 @@ impl StableAudio3Pipeline {
     /// path: a whole-clip restyle supplies its source as `init_data` only, never as masked local
     /// input, and the attention/padding mask still comes from the *requested* duration plus the
     /// configured headroom rather than from the source's extent.
-    #[allow(clippy::too_many_arguments)]
-    pub fn synthesize_with_reference(
-        &self,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        parameters: SynthesisParameters,
-        reference: Option<ReferenceAudio<'_>>,
-        on_progress: &mut dyn FnMut(usize, usize),
-        on_decoding: &mut dyn FnMut(),
-        is_canceled: &dyn Fn() -> bool,
-    ) -> Result<Vec<f32>> {
-        Ok(self
-            .synthesize_with_reference_traced(
-                prompt,
-                negative_prompt,
-                parameters,
-                reference,
-                on_progress,
-                on_decoding,
-                is_canceled,
-            )?
-            .0)
-    }
-
-    /// [`Self::synthesize_with_reference`] plus the request stream's draw-order provenance.
     ///
     /// Exists so the draw-order requirement is *gated* rather than asserted in prose: the returned
     /// [`ReferenceDrawOrder`] is the only observation that separates "initial noise first, then the
-    /// source encode" from the reverse.
+    /// source encode" from the reverse. Providers go through [`Self::synthesize_conditioned`].
     #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
     pub fn synthesize_with_reference_traced(
         &self,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        parameters: SynthesisParameters,
+        request: SynthesisRequest<'_>,
         reference: Option<ReferenceAudio<'_>>,
-        on_progress: &mut dyn FnMut(usize, usize),
-        on_decoding: &mut dyn FnMut(),
-        is_canceled: &dyn Fn() -> bool,
+        hooks: SynthesisHooks<'_>,
     ) -> Result<(Vec<f32>, Option<ReferenceDrawOrder>)> {
         self.synthesize_traced(
-            prompt,
-            negative_prompt,
-            parameters,
+            request,
             reference,
             None,
             ReferenceInputValidation::Required,
-            on_progress,
-            on_decoding,
-            is_canceled,
+            hooks,
         )
     }
 
@@ -1336,109 +1336,67 @@ impl StableAudio3Pipeline {
     ///
     /// The conditioning arrives as a [`ForwardedConditioning`] receipt rather than as two optional
     /// arguments, and is re-checked here, on the far side of the boundary — see that type.
-    #[allow(clippy::too_many_arguments)]
     pub fn synthesize_conditioned(
         &self,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        parameters: SynthesisParameters,
+        request: SynthesisRequest<'_>,
         conditioning: ForwardedConditioning<'_>,
-        on_progress: &mut dyn FnMut(usize, usize),
-        on_decoding: &mut dyn FnMut(),
-        is_canceled: &dyn Fn() -> bool,
+        hooks: SynthesisHooks<'_>,
     ) -> Result<Vec<f32>> {
         self.synthesize_conditioned_with_validation(
-            prompt,
-            negative_prompt,
-            parameters,
+            request,
             conditioning,
             ReferenceInputValidation::Required,
-            on_progress,
-            on_decoding,
-            is_canceled,
+            hooks,
         )
     }
 
     /// Production request route after [`crate::model::validate_request`] has checked source shape
     /// and finiteness. Kept crate-private so direct pipeline callers retain defensive validation.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn synthesize_conditioned_validated(
         &self,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        parameters: SynthesisParameters,
+        request: SynthesisRequest<'_>,
         conditioning: ValidatedForwardedConditioning<'_>,
-        on_progress: &mut dyn FnMut(usize, usize),
-        on_decoding: &mut dyn FnMut(),
-        is_canceled: &dyn Fn() -> bool,
+        hooks: SynthesisHooks<'_>,
     ) -> Result<Vec<f32>> {
         self.synthesize_conditioned_with_validation(
-            prompt,
-            negative_prompt,
-            parameters,
+            request,
             conditioning.into_inner(),
             ReferenceInputValidation::Complete,
-            on_progress,
-            on_decoding,
-            is_canceled,
+            hooks,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn synthesize_conditioned_with_validation(
         &self,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        parameters: SynthesisParameters,
+        request: SynthesisRequest<'_>,
         conditioning: ForwardedConditioning<'_>,
         reference_validation: ReferenceInputValidation,
-        on_progress: &mut dyn FnMut(usize, usize),
-        on_decoding: &mut dyn FnMut(),
-        is_canceled: &dyn Fn() -> bool,
+        hooks: SynthesisHooks<'_>,
     ) -> Result<Vec<f32>> {
         conditioning.check()?;
         let ForwardedConditioning {
             reference, edit, ..
         } = conditioning;
         Ok(self
-            .synthesize_traced(
-                prompt,
-                negative_prompt,
-                parameters,
-                reference,
-                edit,
-                reference_validation,
-                on_progress,
-                on_decoding,
-                is_canceled,
-            )?
+            .synthesize_traced(request, reference, edit, reference_validation, hooks)?
             .0)
     }
 
     /// [`Self::synthesize_conditioned`] with an edit, plus the request stream's draw-order
     /// provenance. Exists so the draw order is *gated* on this path rather than asserted in prose.
     #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
     pub fn synthesize_with_edit_traced(
         &self,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        parameters: SynthesisParameters,
+        request: SynthesisRequest<'_>,
         edit: AudioEdit<'_>,
-        on_progress: &mut dyn FnMut(usize, usize),
-        on_decoding: &mut dyn FnMut(),
-        is_canceled: &dyn Fn() -> bool,
+        hooks: SynthesisHooks<'_>,
     ) -> Result<(Vec<f32>, Option<ReferenceDrawOrder>)> {
         self.synthesize_traced(
-            prompt,
-            negative_prompt,
-            parameters,
+            request,
             None,
             Some(edit),
             ReferenceInputValidation::Required,
-            on_progress,
-            on_decoding,
-            is_canceled,
+            hooks,
         )
     }
 
@@ -1447,19 +1405,16 @@ impl StableAudio3Pipeline {
     /// Deliberately a single function rather than one per mode. The frozen draw order (initial
     /// sampler noise **first**, then any source encode) and the decode/finish tail are invariants of
     /// all three paths, and a second copy of them is a second place for them to drift.
-    #[allow(clippy::too_many_arguments)]
     fn synthesize_traced(
         &self,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        parameters: SynthesisParameters,
+        request: SynthesisRequest<'_>,
         reference: Option<ReferenceAudio<'_>>,
         edit: Option<AudioEdit<'_>>,
         reference_validation: ReferenceInputValidation,
-        on_progress: &mut dyn FnMut(usize, usize),
-        on_decoding: &mut dyn FnMut(),
-        is_canceled: &dyn Fn() -> bool,
+        mut hooks: SynthesisHooks<'_>,
     ) -> Result<(Vec<f32>, Option<ReferenceDrawOrder>)> {
+        let parameters = request.parameters;
+        let is_canceled = hooks.is_canceled;
         canceled(is_canceled)?;
         if reference.is_some() && edit.is_some() {
             return Err(AudioError::Msg(
@@ -1504,9 +1459,11 @@ impl StableAudio3Pipeline {
         )?;
         if let Some(reference) = reference {
             let (_, latents) = self.prepare_and_encode(
-                reference.samples,
-                reference.sample_rate,
-                reference.channels,
+                SourceClip {
+                    samples: reference.samples,
+                    sample_rate: reference.sample_rate,
+                    channels: reference.channels,
+                },
                 &geometry,
                 &mut noise,
                 reference_validation,
@@ -1520,9 +1477,11 @@ impl StableAudio3Pipeline {
         }
         if let Some(edit) = edit {
             let (prepared, latents) = self.prepare_and_encode(
-                edit.samples,
-                edit.sample_rate,
-                edit.channels,
+                SourceClip {
+                    samples: edit.samples,
+                    sample_rate: edit.sample_rate,
+                    channels: edit.channels,
+                },
                 &geometry,
                 &mut noise,
                 reference_validation,
@@ -1553,24 +1512,24 @@ impl StableAudio3Pipeline {
             tensor_has_nonzero(&local)?,
         )?;
         let (sampled, padding) = self.sample(
-            prompt,
-            negative_prompt,
-            parameters,
+            &request,
             &geometry,
             &initial,
-            init_latents.as_ref(),
-            &local,
-            // The reference itself, not a scalar derived here: `sample` runs `sampler_strength_for`
-            // separately at each of its two consumer sites, so no single expression feeds both sides
-            // of the sampler's schedule/strength cross-check. See that function. Dropping this
-            // argument while keeping `init_latents` above is rejected by `reference_halves_agree`.
-            reference.as_ref(),
-            on_progress,
+            SampleSource {
+                init_latents: init_latents.as_ref(),
+                local: &local,
+                // The reference itself, not a scalar derived here: `sample` runs
+                // `sampler_strength_for` separately at each of its two consumer sites, so no single
+                // expression feeds both sides of the sampler's schedule/strength cross-check. See
+                // that function. Dropping this field while keeping `init_latents` above is rejected
+                // by `reference_halves_agree`.
+                reference: reference.as_ref(),
+            },
             &mut noise,
-            is_canceled,
+            &mut hooks,
         )?;
         canceled(is_canceled)?;
-        on_decoding();
+        (hooks.on_decoding)();
 
         let diffusion = match &self.config.model {
             ModelConfig::Diffusion(model) => model,
@@ -1601,18 +1560,20 @@ impl StableAudio3Pipeline {
     /// Returns the prepared interleaved PCM alongside the latents because the edit path needs the
     /// exact same buffer again for [`stitch_outside_region`] — re-running `prepare_reference_pcm` at
     /// the tail would be a second, independently-drifting copy of the source's timeline.
-    #[allow(clippy::too_many_arguments)]
     fn prepare_and_encode(
         &self,
-        samples: &[f32],
-        sample_rate: u32,
-        channels: u16,
+        source: SourceClip<'_>,
         geometry: &SampleGeometry,
         noise: &mut SeededNoise,
         reference_validation: ReferenceInputValidation,
         is_canceled: &dyn Fn() -> bool,
     ) -> Result<(Vec<f32>, Tensor)> {
         canceled(is_canceled)?;
+        let SourceClip {
+            samples,
+            sample_rate,
+            channels,
+        } = source;
         let prepared = match reference_validation {
             ReferenceInputValidation::Required => {
                 prepare_reference_pcm(samples, sample_rate, channels, geometry.sample_size)?
@@ -1652,19 +1613,16 @@ impl StableAudio3Pipeline {
     /// This exists for numerical-oracle tests. Production requests always use one request-local
     /// [`SeededNoise`] stream instead.
     #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
     pub fn synthesize_controlled(
         &self,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        parameters: SynthesisParameters,
+        request: SynthesisRequest<'_>,
         initial: &Tensor,
         pingpong_noises: Vec<Tensor>,
         decode_noises: &[SameDecodeChunkNoise],
-        on_progress: &mut dyn FnMut(usize, usize),
-        on_decoding: &mut dyn FnMut(),
-        is_canceled: &dyn Fn() -> bool,
+        mut hooks: SynthesisHooks<'_>,
     ) -> Result<(Tensor, Vec<f32>)> {
+        let parameters = request.parameters;
+        let is_canceled = hooks.is_canceled;
         canceled(is_canceled)?;
         let geometry = self.geometry(parameters.duration_secs)?;
         if initial.dims() != [1, LATENT_CHANNELS, geometry.latent_length] {
@@ -1685,19 +1643,18 @@ impl StableAudio3Pipeline {
             &self.device,
         )?;
         let (sampled, padding) = self.sample(
-            prompt,
-            negative_prompt,
-            parameters,
+            &request,
             &geometry,
             &initial,
-            None,
-            &local,
-            // No reference: the replay path is text-only, and `sampler_strength_for` turns that
-            // into the `1.0` this call used to spell out as a literal.
-            None,
-            on_progress,
+            SampleSource {
+                init_latents: None,
+                local: &local,
+                // No reference: the replay path is text-only, and `sampler_strength_for` turns
+                // that into the `1.0` this call used to spell out as a literal.
+                reference: None,
+            },
             &mut noise,
-            is_canceled,
+            &mut hooks,
         )?;
         if noise.draws() != parameters.steps {
             return Err(AudioError::Msg(format!(
@@ -1707,7 +1664,7 @@ impl StableAudio3Pipeline {
             )));
         }
         canceled(is_canceled)?;
-        on_decoding();
+        (hooks.on_decoding)();
         let diffusion = match &self.config.model {
             ModelConfig::Diffusion(model) => model,
             ModelConfig::Autoencoder(_) => unreachable!("validated full snapshot"),
@@ -1775,26 +1732,28 @@ impl StableAudio3Pipeline {
         )?)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// `source.reference` is the request's reference itself rather than a pre-computed `strength`,
+    /// on purpose — see `sampler_strength_for`.
     fn sample<N: NoiseSource>(
         &self,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        parameters: SynthesisParameters,
+        request: &SynthesisRequest<'_>,
         geometry: &SampleGeometry,
         initial: &Tensor,
-        init_latents: Option<&Tensor>,
-        // The `[1, 257, latent_length]` local conditioning: exactly zero on the text-only and
-        // restyle paths, the masked source on the edit path. Built by the caller rather than here
-        // so the construction is reachable — and gated — without weights.
-        local: &Tensor,
-        // The request's reference, if any. `sample` takes the reference rather than a pre-computed
-        // `strength` on purpose — see `sampler_strength_for`.
-        reference: Option<&ReferenceAudio<'_>>,
-        on_progress: &mut dyn FnMut(usize, usize),
+        source: SampleSource<'_>,
         noise: &mut N,
-        is_canceled: &dyn Fn() -> bool,
+        hooks: &mut SynthesisHooks<'_>,
     ) -> Result<(Tensor, Tensor)> {
+        let &SynthesisRequest {
+            prompt,
+            negative_prompt,
+            parameters,
+        } = request;
+        let SampleSource {
+            init_latents,
+            local,
+            reference,
+        } = source;
+        let is_canceled = hooks.is_canceled;
         // `init_latents` and `reference` are two forwarded halves of one decision: the caller
         // encodes the source *because* there is a reference, and the strength that decides what to
         // do with the encode is derived from that same reference below. Dropping either half at the
@@ -1848,31 +1807,37 @@ impl StableAudio3Pipeline {
         let total = parameters.steps;
         let mut progress = |step: &crate::sampler::SampleStep| -> Result<()> {
             canceled(is_canceled)?;
-            on_progress(step.index + 1, total);
+            (hooks.on_progress)(step.index + 1, total);
             Ok(())
         };
-        let sampled = sample_dit_initialized_with_interval_and_cancel(
+        let sampled = sample_dit(
             &self.dit,
-            parameters.sampler,
+            SampleDitArgs {
+                init: Some(InitMix {
+                    init_latents,
+                    // Recomputed, not read from a binding shared with `build_schedule` above: an
+                    // edit to this expression alone leaves it disagreeing with `schedule[0]`,
+                    // which `initialized_start` rejects.
+                    strength: sampler_strength_for(reference),
+                }),
+                is_canceled: Some(is_canceled),
+                ..SampleDitArgs::new(
+                    parameters.sampler,
+                    &schedule,
+                    DitConditioning {
+                        positive_prompt: &positive.embeddings,
+                        negative_prompt: negative.as_ref().map(|value| &value.embeddings),
+                        negative_prompt_mask: negative.as_ref().map(|value| &value.attention_mask),
+                        seconds_total: &seconds,
+                        local_conditioning: local,
+                        padding: Some(&padding),
+                    },
+                    parameters.guidance,
+                )
+            },
             initial,
-            init_latents,
-            // Recomputed, not read from a binding shared with `build_schedule` above: an edit to
-            // this expression alone leaves it disagreeing with `schedule[0]`, which
-            // `initialized_start` rejects.
-            sampler_strength_for(reference),
-            &schedule,
-            &positive.embeddings,
-            negative.as_ref().map(|value| &value.embeddings),
-            negative.as_ref().map(|value| &value.attention_mask),
-            &seconds,
-            local,
-            Some(&padding),
-            parameters.guidance,
-            GuidanceInterval::FULL,
-            Some(&mut progress as &mut ProgressCallback<'_>),
             noise,
-            false,
-            is_canceled,
+            Some(&mut progress as &mut ProgressCallback<'_>),
         )?;
         Ok((sampled.latents, padding))
     }
@@ -2062,13 +2027,11 @@ fn planar_to_interleaved(audio: &Tensor) -> Result<Vec<f32>> {
             "SA3 small decode expected [1,{CHANNELS},frames], got [{batch},{channels},{frames}]"
         )));
     }
-    let planar = audio.to_dtype(DType::F32)?.to_vec3::<f32>()?;
-    let mut output = Vec::with_capacity(frames * channels);
-    for (&left, &right) in planar[0][0].iter().zip(&planar[0][1]) {
-        output.push(left);
-        output.push(right);
-    }
-    Ok(output)
+    let planar = audio
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(candle_audio::dsp::planar_to_interleaved(&planar, channels))
 }
 
 #[cfg(test)]

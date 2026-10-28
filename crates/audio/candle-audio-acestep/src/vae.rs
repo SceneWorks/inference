@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_audio::candle_core::{DType, Device, Module, Result as CandleResult, Tensor, D};
-use candle_audio::{AudioError, Result};
+use candle_audio::{neural_codec, AudioError, Result};
 use candle_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig};
 
 use crate::config::VaeConfig;
@@ -157,37 +157,13 @@ impl W<'_> {
 }
 
 /// Fold every `weight_norm` parametrization in `raw` to a plain `.weight`, tolerant of the three
-/// common storage shapes (folded, `weight_g`/`weight_v`, `parametrizations.*.original0/1`).
+/// common storage shapes (folded, `weight_g`/`weight_v`, `parametrizations.*.original0/1`) — the
+/// shared commons resolver with the `w = g · v / ‖v‖` order this port is pinned to (sc-27263).
 fn resolve_weight_norm(raw: &HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
-    let mut out: HashMap<String, Tensor> = HashMap::with_capacity(raw.len());
-    for (name, tensor) in raw {
-        if let Some(base) = name.strip_suffix(".weight_g") {
-            let v = raw
-                .get(&format!("{base}.weight_v"))
-                .ok_or_else(|| AudioError::Msg(format!("{base}: weight_g without weight_v")))?;
-            out.insert(format!("{base}.weight"), fold(v, tensor)?);
-        } else if let Some(base) = name.strip_suffix(".parametrizations.weight.original0") {
-            // original0 = g, original1 = v.
-            let v = raw
-                .get(&format!("{base}.parametrizations.weight.original1"))
-                .ok_or_else(|| AudioError::Msg(format!("{base}: original0 without original1")))?;
-            out.insert(format!("{base}.weight"), fold(v, tensor)?);
-        } else if name.ends_with(".weight_v")
-            || name.ends_with(".parametrizations.weight.original1")
-        {
-            // Consumed alongside its `g` partner above.
-        } else {
-            out.insert(name.clone(), tensor.clone());
-        }
-    }
-    Ok(out)
-}
-
-/// `w = g · v / ‖v‖`, the norm taken over every dim except 0 (torch `weight_norm(dim=0)`).
-fn fold(v: &Tensor, g: &Tensor) -> Result<Tensor> {
-    let dims: Vec<usize> = (1..v.rank()).collect();
-    let norm = v.sqr()?.sum_keepdim(dims)?.sqrt()?;
-    Ok(v.broadcast_mul(g)?.broadcast_div(&norm)?)
+    Ok(neural_codec::resolve_weight_norm_parametrized(
+        raw,
+        neural_codec::fold_weight_norm_gv,
+    )?)
 }
 
 impl OobleckDecoder {
