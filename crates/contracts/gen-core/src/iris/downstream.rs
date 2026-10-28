@@ -338,25 +338,28 @@ fn weights_metadata_impl(
     use std::io::Read as _;
     let io = |e: std::io::Error| Error::Msg(format!("iris: read {}: {e}", path.display()));
     let mut f = std::fs::File::open(path).map_err(io)?;
-    let mut len = [0u8; 8];
-    if f.read_exact(&mut len).is_err() {
+    let file_bytes = f.metadata().map_err(io)?.len();
+    if file_bytes < 8 {
         return Ok(None);
     }
-    let n = u64::from_le_bytes(len);
-    if n > 100 << 20 {
-        return Err(Error::Msg(format!(
-            "iris: {} has an implausible {n}-byte safetensors header",
-            path.display()
-        )));
-    }
+    // The crate-wide bounded header read (sc-27314): one ceiling, and the header must end inside
+    // the file.
+    let (n, _data_start) = crate::weightsmeta::read_safetensors_header_len(
+        &mut f, file_bytes, path,
+    )
+    .map_err(|error| match error {
+        Error::Io(e) => io(e),
+        Error::Msg(message) => Error::Msg(format!("iris: {message}")),
+        other => other,
+    })?;
     if let Some(observe) = observer.as_deref_mut() {
-        observe(crate::weightsmeta::SourceMetadataRead::Input(n))?;
+        observe(crate::weightsmeta::SourceMetadataRead::Input(n as u64))?;
     }
-    let mut header = vec![0u8; n as usize];
+    let mut header = vec![0u8; n];
     f.read_exact(&mut header).map_err(io)?;
     if let Some(observe) = observer {
         observe(crate::weightsmeta::SourceMetadataRead::Json {
-            file_bytes: f.metadata().map_err(io)?.len(),
+            file_bytes,
             bytes: &header,
         })?;
     }
