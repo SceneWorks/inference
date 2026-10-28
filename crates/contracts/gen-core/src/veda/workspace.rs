@@ -492,7 +492,11 @@ impl<'a> From<&'a GenerationRequest> for Request<'a> {
             veda: r.veda.as_ref(),
             width: r.width,
             height: r.height,
-            frames: r.frames.unwrap_or(124),
+            // The engine's own resolution (`frames` wins, `duration` aligns upward, neither is the
+            // lattice floor). A duration the engine refuses prices at the lattice ceiling — the
+            // conservative envelope; the render itself is refused before allocating.
+            frames: crate::h3_memory::resolve_request_frames(r.frames, r.duration)
+                .unwrap_or(crate::h3_memory::MAX_FRAMES),
             count: r.count,
             prompt: &r.prompt,
             conditioning: &r.conditioning,
@@ -831,6 +835,48 @@ mod tests {
             ..Default::default()
         }
     }
+    /// sc-26691: a duration-only request is priced at the frame count the engine resolves from
+    /// that duration (aligned upward onto the lattice), not at the 124-frame floor.
+    #[test]
+    fn a_duration_only_request_prices_the_engines_resolved_frame_count() {
+        let mut by_duration = req();
+        by_duration.frames = None;
+        by_duration.duration = Some(10.0); // 240 frames requested -> the 243 rung
+        assert_eq!(Request::from(&by_duration).frames, 243);
+        let mut by_frames = req();
+        by_frames.frames = Some(243);
+        let price = |r: &GenerationRequest| {
+            let bound = for_request(r, Backend::Cuda)
+                .unwrap()
+                .expect("veda enabled");
+            (
+                bound.execution_grid,
+                bound.total_bytes,
+                format!("{bound:?}"),
+            )
+        };
+        assert_eq!(
+            price(&by_duration),
+            price(&by_frames),
+            "a duration prices exactly as its resolved frame count"
+        );
+        let (floor_grid, floor_bytes, _) = price(&req());
+        let (grid, bytes, _) = price(&by_duration);
+        assert!(
+            grid[0] > floor_grid[0] && bytes > floor_bytes,
+            "a 10 s clip must not be priced as the 124-frame floor: {grid:?}/{bytes} vs \
+             {floor_grid:?}/{floor_bytes}"
+        );
+        // `frames` wins over `duration`; neither is the floor; a refused duration prices the ceiling.
+        by_frames.duration = Some(14.0);
+        assert_eq!(Request::from(&by_frames).frames, 243);
+        let mut neither = req();
+        neither.frames = None;
+        assert_eq!(Request::from(&neither).frames, 124);
+        neither.duration = Some(30.0);
+        assert_eq!(Request::from(&neither).frames, 345);
+    }
+
     #[test]
     fn selected_unit_patch_prices_all_visual_carriers_without_changing_pixels() {
         let mut r = req();

@@ -148,10 +148,9 @@ use crate::dit::adaln::AdaLnResidency;
 use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::dit::positions::KeyframeAnchor;
 use crate::pipeline::{
-    align_frames_for_duration, fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents,
-    prepend_condition_rows, render_latents_with_observer, resolve_geometry,
-    revert_pixel_normalization, t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE,
-    SPATIAL_STRIDE,
+    fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents, prepend_condition_rows,
+    render_latents_with_observer, resolve_geometry, revert_pixel_normalization, t2va_layout,
+    RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE, SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
@@ -906,11 +905,10 @@ impl MiniMaxH3 {
     /// Resolve the request's geometry: `frames` wins over `duration`, and the canvas falls back to
     /// the checkpoint's own 16:9 default when the caller names none.
     fn request_geometry(&self, req: &GenerationRequest) -> Result<RequestGeometry> {
-        let frames = match (req.frames, req.duration) {
-            (Some(f), _) => f as usize,
-            (None, Some(seconds)) => align_frames_for_duration(seconds)?,
-            (None, None) => align_frames_for_duration(MIN_DEFAULT_SECONDS)?,
-        };
+        // The shared resolver allocation admission (`gen_core::veda::workspace`) prices with.
+        let frames =
+            candle_gen::gen_core::h3_memory::resolve_request_frames(req.frames, req.duration)?
+                as usize;
         let (width, height) = if req.width == 0 || req.height == 0 {
             (
                 CANVAS_SHORT_EDGE * 16 / 9 / SPATIAL_STRIDE * SPATIAL_STRIDE,
@@ -1855,9 +1853,6 @@ fn finish_audio(
     }
     Ok(audio)
 }
-
-/// Duration a request that names neither `frames` nor `duration` renders at — the lattice floor.
-const MIN_DEFAULT_SECONDS: f32 = 5.1667;
 
 /// **Refuse a conditioning strength rather than ignore it** (sc-19571).
 ///

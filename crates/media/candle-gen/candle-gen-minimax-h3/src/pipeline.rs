@@ -57,8 +57,8 @@ use crate::audio_config::{AUDIO_LATENT_CHANNELS, AUDIO_OUTPUT_CHANNELS, AUDIO_SA
 const AUDIO_CHANNELS: usize = AUDIO_OUTPUT_CHANNELS as usize;
 use crate::config::{LATENT_CHANNELS, VAE_RATIO};
 use crate::denoise::{
-    adaln_schedule, align_num_frames, JointGeometry, JointSchedule, JointVelocity, PackedLayout,
-    LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS, TEXT_TAG,
+    adaln_schedule, JointGeometry, JointSchedule, JointVelocity, PackedLayout, LEGAL_FRAME_COUNTS,
+    MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS, TEXT_TAG,
 };
 use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
 
@@ -193,23 +193,9 @@ pub fn resolve_geometry(width: u32, height: u32, num_frames: usize) -> Result<Re
 /// never leave it, so no ceiling clamp is needed and there is no duration in range that silently
 /// renders shorter than it asked for.
 pub fn align_frames_for_duration(seconds: f32) -> Result<usize> {
-    if !seconds.is_finite() {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: duration must be finite, got {seconds}"
-        )));
-    }
-    let seconds = f64::from(seconds);
-    if !(MIN_DURATION_SECONDS - 1e-6..=MAX_DURATION_SECONDS + 1e-6).contains(&seconds) {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: duration {seconds} s is outside the model's \
-             {MIN_DURATION_SECONDS}-{MAX_DURATION_SECONDS} s range (the {} legal frame counts \
-             124-345 at {MINIMAX_H3_FPS} fps; the reference pipeline advertises 5-15 s but its own \
-             17n+5 lattice tops out at 14.375 s)",
-            LEGAL_FRAME_COUNTS.len()
-        )));
-    }
-    let requested = (seconds * MINIMAX_H3_FPS).round().max(1.0) as usize;
-    let aligned = align_num_frames(requested);
+    // One definition, shared with allocation admission (`gen_core::veda::workspace`), so pricing
+    // and rendering can never resolve the same duration to different rungs (sc-26691).
+    let aligned = candle_gen::gen_core::h3_memory::align_frames_for_duration(seconds)? as usize;
     debug_assert!(
         LEGAL_FRAME_COUNTS.contains(&aligned),
         "an in-range duration must align onto a lattice rung, got {aligned}"
@@ -998,6 +984,24 @@ mod tests {
         for &f in &LEGAL_FRAME_COUNTS {
             let secs = f as f32 / MINIMAX_H3_FPS as f32;
             assert_eq!(align_frames_for_duration(secs).unwrap(), f);
+        }
+        // The shared gen-core resolver admission prices with is this lattice, not a copy of it.
+        use candle_gen::gen_core::h3_memory as shared;
+        assert_eq!(shared::FPS, MINIMAX_H3_FPS);
+        assert_eq!(shared::MIN_FRAMES as usize, LEGAL_FRAME_COUNTS[0]);
+        assert_eq!(
+            shared::MAX_FRAMES as usize,
+            LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1]
+        );
+        assert_eq!(shared::resolve_request_frames(None, None).unwrap(), 124);
+        // ...and its upward alignment is this crate's `align_num_frames` at every in-range request.
+        for requested in LEGAL_FRAME_COUNTS[0]..=LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1] {
+            let secs = requested as f32 / MINIMAX_H3_FPS as f32;
+            assert_eq!(
+                align_frames_for_duration(secs).unwrap(),
+                crate::denoise::align_num_frames(requested),
+                "{requested} frames"
+            );
         }
     }
 
