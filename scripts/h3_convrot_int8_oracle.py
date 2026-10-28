@@ -19,11 +19,29 @@ LOADER = "ad1d4e072bd2ed5eec1d30d07ec390f327a3af52"
 HF = "a56850c870825d6a8ae501a595c4dbbbc77bbc7e"
 
 
+# Digests recorded in tests/fixtures/h3_convrot_int8.json. Every fetched source is verified
+# against them before use, so nothing downloaded is exec'd (or recorded) unverified.
+EXPECTED_SHA256 = {
+    ("Comfy-Org/comfy-kitchen", KITCHEN, "comfy_kitchen/tensor/int8_utils.py"):
+        "4776532e7394c56262cc02c48217a20b520d123c2bf9539eaf77cf0ff32ff1b8",
+    ("Comfy-Org/comfy-kitchen", KITCHEN, "comfy_kitchen/backends/cuda/ops/int8_linear.cu"):
+        "d6285998530ee699259052a88ee05eb8054b1d118d98b399b7ea1df0f9462989",
+    ("Comfy-Org/comfy-model-tools", PRODUCER, "quant_int8_convrot.py"):
+        "dd85ca376b985222719f052acbe47081c6fdf54742791ac1b44209923828146a",
+}
+
+
 def source(repo, revision, path):
     url = f"https://raw.githubusercontent.com/{repo}/{revision}/{path}"
+    expected = EXPECTED_SHA256.get((repo, revision, path))
+    if expected is None:
+        raise SystemExit(f"no pinned sha256 for {url}")
     with urllib.request.urlopen(url, timeout=60) as response:
         data = response.read(1024 * 1024)
-    return data, {"url": url, "sha256": hashlib.sha256(data).hexdigest()}
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        raise SystemExit(f"sha256 mismatch for {url}: expected {expected}, got {actual}")
+    return data, {"url": url, "sha256": actual}
 
 
 def main():
