@@ -60,6 +60,15 @@ fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=kernels/block_info.h");
     println!("cargo::rerun-if-changed=kernels/static_switch.h");
     println!("cargo::rerun-if-changed=kernels/hardware_info.h");
+    // sc-26691 (vendored delta 4): the list above misses several headers the kernels include
+    // (alibi.h, dropout.h, mask.h, rotary.h, kernel_traits_sm90.h, ...). Watching the whole
+    // directory reruns this script on ANY kernel-tree edit, and `.watch(["kernels"])` below folds
+    // every header's CONTENT into cudaforge's per-object rebuild key, so a persistent
+    // CANDLE_FLASH_ATTN_BUILD_DIR cache can never serve objects compiled against an older header.
+    // (nvcc flags and the -gencode ladder are already in that key via cudaforge's args hash; the
+    // CUDA_COMPUTE_CAP arch via its per-object arch.)
+    println!("cargo::rerun-if-changed=kernels");
+    println!("cargo::rerun-if-env-changed=CANDLE_FLASH_ATTN_BUILD_DIR");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     let build_dir = match std::env::var("CANDLE_FLASH_ATTN_BUILD_DIR") {
         Err(_) =>
@@ -80,6 +89,7 @@ fn main() -> Result<()> {
     let kernels: Vec<_> = KERNEL_FILES.iter().collect();
     let mut builder = KernelBuilder::new()
         .source_files(kernels)
+        .watch(["kernels"])
         .out_dir(&build_dir)
         .with_cutlass(Some(CUTLASS_COMMIT)) // ✅ Auto-fetch and include CUTLASS from GitHub
         .arg("-std=c++17")
