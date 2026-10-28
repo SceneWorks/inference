@@ -32,6 +32,15 @@ use crate::Result;
 /// the Kolors ChatGLM3 quantizer).
 pub const DEFAULT_GROUP_SIZE: i32 = 64;
 
+/// Whether an `in_features`-wide Linear can be group-wise affine-quantized at `group_size`: MLX
+/// `quantize` requires the contraction dim to be a multiple of the group, so the per-model quantize
+/// cascades leave a misaligned projection (tiny embedders, odd patch projections) dense. The one
+/// spelling of that predicate (sc-27320) — see
+/// [`AdaptableLinear::quantize_if_aligned`](crate::adapters::AdaptableLinear::quantize_if_aligned).
+pub fn is_quant_aligned(in_features: i32, group_size: i32) -> bool {
+    in_features % group_size == 0
+}
+
 /// Read the packed Q4/Q8 tier declared by `<root>/<component>/config.json`.
 ///
 /// A missing config, or a valid config with no `quantization` member, denotes a dense component.
