@@ -18,10 +18,12 @@ use candle_gen::gen_core::{
 };
 use sha2::{Digest, Sha256};
 
-pub const REQUEST_EVIDENCE_REVISION: &str = "sdxl-candle-request-contract-v1";
+pub const REQUEST_EVIDENCE_REVISION: &str = "sdxl-candle-request-contract-v3";
 const DECODE_TILE_EDGE: u32 = 512;
 const DECODE_OVERLAP: u32 = 64;
+const DECODE_TILE_EDGES: &[u32] = &[DECODE_TILE_EDGE, 256];
 const ATTENTION_CHUNK_SIZE: u32 = gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
+const ATTENTION_CHUNK_SIZES: &[u32] = &[ATTENTION_CHUNK_SIZE, 1 << 24];
 const CLIP_L_REPO: &str = "openai/clip-vit-large-patch14";
 const CLIP_L_REVISION: &str = "32bd64288804d66eefd0ccbe215aa642df71cc41";
 const CLIP_BIGG_REPO: &str = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k";
@@ -121,13 +123,17 @@ fn route_identity_tokens(route: SdxlRoute) -> String {
 
 /// The exact calibration fingerprint naming one route's executable memory semantics.
 ///
+/// v3 bounds SDXL's full-image GroupNorm statistics one group at a time. Resident monolithic decode
+/// is unchanged, but earlier optimized peaks describe a different working set and remain historical
+/// evidence; they must not be reused as measurements of the new minimum.
+///
 /// This is the *whole* identity, not a prefix: `realvisxl` and `realvisxl_lightning` both render
 /// `sdxl-candle-realvisxl…`, so any substring or prefix comparison silently resolves the lightning
 /// route to `realvisxl` — which declares `edit: true` — and admits the edit/inpaint/detail/
 /// character modes the lightning route's own row refuses.
 fn route_fingerprint(route: SdxlRoute) -> String {
     format!(
-        "sdxl-candle-{}-staged-decode-attention-v1",
+        "sdxl-candle-{}-staged-decode-attention-v3",
         route_identity_tokens(route)
     )
 }
@@ -1047,12 +1053,12 @@ fn build_contract(
                 },
                 parameters: match strategy {
                     MemoryStrategy::BoundedDecode => MemoryParameterRanges {
-                        decode_tile_edges: vec![DECODE_TILE_EDGE],
+                        decode_tile_edges: DECODE_TILE_EDGES.to_vec(),
                         decode_overlaps: vec![DECODE_OVERLAP],
                         ..Default::default()
                     },
                     MemoryStrategy::BoundedAttention => MemoryParameterRanges {
-                        attention_chunk_sizes: vec![ATTENTION_CHUNK_SIZE],
+                        attention_chunk_sizes: ATTENTION_CHUNK_SIZES.to_vec(),
                         ..Default::default()
                     },
                     _ => MemoryParameterRanges::default(),
@@ -1391,11 +1397,11 @@ pub(crate) fn request_scope(
                     "sdxl: PiD has no admitted native-VAE tiled decode receipt".into(),
                 ));
             }
-            if edge == DECODE_TILE_EDGE && overlap == DECODE_OVERLAP {
+            if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
                 Ok(())
             } else {
                 Err(gen_core::Error::Unsupported(format!(
-                    "sdxl: decode tile {edge}/{overlap} is outside {DECODE_TILE_EDGE}/{DECODE_OVERLAP}"
+                    "sdxl: decode tile {edge}/{overlap} is outside edges {DECODE_TILE_EDGES:?} with overlap {DECODE_OVERLAP}"
                 )))
             }
         },
@@ -1978,25 +1984,25 @@ mod tests {
         // none of them catch a change to the format literal in `route_fingerprint` or to
         // `route_identity_tokens`'s token rendering.
         //
-        // *Mutation that reds this:* changing the `"sdxl-candle-{}-staged-decode-attention-v1"`
+        // *Mutation that reds this:* changing the `"sdxl-candle-{}-staged-decode-attention-v3"`
         // format literal in `route_fingerprint` (e.g. to `"…-staged-decode-attn-v1"`).
         const SHIPPED_ROUTE_FINGERPRINTS: &[(&str, &str)] = &[
-            ("sdxl", "sdxl-candle-sdxl-staged-decode-attention-v1"),
+            ("sdxl", "sdxl-candle-sdxl-staged-decode-attention-v3"),
             (
                 "realvisxl",
-                "sdxl-candle-realvisxl-staged-decode-attention-v1",
+                "sdxl-candle-realvisxl-staged-decode-attention-v3",
             ),
             (
                 "realvisxl_lightning",
-                "sdxl-candle-realvisxl-lightning-staged-decode-attention-v1",
+                "sdxl-candle-realvisxl-lightning-staged-decode-attention-v3",
             ),
             (
                 "illustrious_xl_v1",
-                "sdxl-candle-illustrious-xl-rev1-staged-decode-attention-v1",
+                "sdxl-candle-illustrious-xl-rev1-staged-decode-attention-v3",
             ),
             (
                 "illustrious_xl_v2",
-                "sdxl-candle-illustrious-xl-rev2-staged-decode-attention-v1",
+                "sdxl-candle-illustrious-xl-rev2-staged-decode-attention-v3",
             ),
         ];
         assert_eq!(SDXL_ROUTES.len(), SHIPPED_ROUTE_FINGERPRINTS.len());
@@ -2513,8 +2519,8 @@ mod tests {
 
     /// sc-20799 blocker 2: **declared == validated == executed.**
     ///
-    /// The contract publishes exactly one candidate edge and one candidate overlap,
-    /// `CandleRequestScopeCore` re-validates exactly those, and the decoder must execute the same
+    /// The contract publishes the supported edges and one candidate overlap,
+    /// `CandleRequestScopeCore` re-validates exactly those, and the decoder must execute the selected
     /// pair — the executed config used to be a second hardcoded `512/128` literal that neither the
     /// contract nor the scope named.
     #[test]
@@ -2523,10 +2529,7 @@ mod tests {
         let declared = contract
             .capability(MemoryStrategy::BoundedDecode)
             .expect("bounded decode is declared");
-        assert_eq!(
-            declared.parameters.decode_tile_edges,
-            vec![DECODE_TILE_EDGE]
-        );
+        assert_eq!(declared.parameters.decode_tile_edges, DECODE_TILE_EDGES);
         assert_eq!(declared.parameters.decode_overlaps, vec![DECODE_OVERLAP]);
 
         // What an unstated selection executes must be exactly what the contract advertises.
@@ -2546,13 +2549,13 @@ mod tests {
         let selected = decode_tiling_config(Some(gen_core::GenerationMemory {
             tile_vae_decode: true,
             decode_tile_edge: Some(256),
-            decode_overlap: Some(32),
+            decode_overlap: Some(DECODE_OVERLAP),
             ..Default::default()
         }))
         .spatial
         .expect("the SDXL decode is spatially tiled");
         assert_eq!(selected.tile_px, 256);
-        assert_eq!(selected.overlap_px, 32);
+        assert_eq!(selected.overlap_px, DECODE_OVERLAP as i32);
     }
 
     /// sc-20799 blocker 3. Every route must be priceable pre-load under its **own** identity; the
@@ -2807,6 +2810,75 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("component tokenizer_clip_l"));
+    }
+
+    #[test]
+    fn lower_decode_and_attention_choices_are_declared_validated_and_executed() {
+        use gen_core::MemoryRequestScope as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = dense_spec(&temp);
+        let seal = SdxlArtifactSeal::capture(&spec).unwrap();
+        let contract = seal.contract();
+        let template = gen_core::standard_memory_behavior_context(
+            contract,
+            MemoryStrategy::BoundedAttention,
+            seal.tier(),
+            gen_core::MemoryBehaviorRoute {
+                mode: MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedAttention)
+                .unwrap()
+                .parameters
+                .attention_chunk_sizes,
+            ATTENTION_CHUNK_SIZES
+        );
+        for edge in DECODE_TILE_EDGES {
+            for attention in ATTENTION_CHUNK_SIZES {
+                let mut context = template.clone();
+                context.selection.parameters.decode_tile_edge = Some(*edge);
+                context.selection.parameters.decode_overlap = Some(DECODE_OVERLAP);
+                context.selection.parameters.attention_chunk_size = Some(*attention);
+                validate_context(contract, &context, &seal).unwrap();
+                let mut scope = request_scope(Device::Cpu, contract, &context).unwrap();
+                scope
+                    .configure_decode(*edge, DECODE_OVERLAP, context.geometry)
+                    .unwrap();
+                scope.configure_attention(*attention).unwrap();
+                let mut request = gen_core::GenerationRequest {
+                    width: context.geometry.width,
+                    height: context.geometry.height,
+                    count: context.geometry.batch,
+                    ..Default::default()
+                };
+                scope.configure_request(&mut request).unwrap();
+                let spatial = decode_tiling_config(request.memory).spatial.unwrap();
+                assert_eq!(spatial.tile_px, *edge as i32);
+                assert_eq!(spatial.overlap_px, DECODE_OVERLAP as i32);
+                assert_eq!(
+                    crate::effective_attention_budget(request.memory),
+                    *attention as usize
+                );
+                assert!(scope
+                    .configure_decode(128, DECODE_OVERLAP, context.geometry)
+                    .is_err());
+                scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+            }
+        }
+        let mut refused = template;
+        refused.selection.parameters.decode_tile_edge = Some(128);
+        assert!(validate_context(contract, &refused, &seal).is_err());
+        refused.selection.parameters.decode_tile_edge = Some(DECODE_TILE_EDGE);
+        refused.selection.parameters.attention_chunk_size = Some(1 << 22);
+        assert!(validate_context(contract, &refused, &seal).is_err());
     }
 
     #[test]

@@ -9,6 +9,19 @@ use mlx_rs::{Array, Dtype};
 
 use crate::{Error, Result};
 
+/// Create lazy file-backed arrays on MLX's CPU stream even inside a scoped GPU default.
+/// The default safetensors wrapper honors task-local streams, but `Load` has no Metal
+/// implementation. Keep payload reads lazy; callers drain them at their admitted consume boundary.
+#[allow(clippy::type_complexity)]
+pub fn load_safetensors_on_cpu(
+    path: impl AsRef<Path>,
+) -> Result<(HashMap<String, Array>, HashMap<String, String>)> {
+    Ok(Array::load_safetensors_with_metadata_device(
+        path,
+        mlx_rs::Stream::cpu(),
+    )?)
+}
+
 /// A loaded set of named tensors (dotted keys, e.g. `"layers.0.attention.to_q.weight"`)
 /// plus the file's string metadata (e.g. a LoKr adapter's `networkType` / `alpha` / `rank`).
 #[derive(Clone)]
@@ -43,7 +56,7 @@ impl Weights {
 
     /// Load a single `.safetensors` file (tensors + metadata).
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let (tensors, metadata) = Array::load_safetensors_with_metadata(path.as_ref())?;
+        let (tensors, metadata) = load_safetensors_on_cpu(path)?;
         Ok(Self {
             tensors,
             metadata,
@@ -286,7 +299,7 @@ impl Weights {
         for f in files {
             // Name the offending file: the underlying mlx-c error carries only its own C++ source
             // location, so a corrupt/foreign file in a shard dir was previously undiagnosable.
-            let (t, m) = Array::load_safetensors_with_metadata(f)
+            let (t, m) = load_safetensors_on_cpu(f)
                 .map_err(|e| Error::from(format!("loading shard {}: {e}", f.display())))?;
             // Shards are expected to be disjoint; a key collision means the shard set is wrong (e.g.
             // a stray extra file in the dir) and a plain `extend` would silently let the later shard
@@ -473,6 +486,30 @@ pub fn join(prefix: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_file_and_shard_ingestion_stays_lazy_until_the_io_boundary() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("weights.safetensors");
+            let source = Array::from_slice(&[1.0f32, -2.0, 3.0, 4.0], &[2, 2]);
+            let metadata = HashMap::from([("networkType".to_owned(), "lora".to_owned())]);
+            Array::save_safetensors([("weight", &source)], Some(&metadata), &path).unwrap();
+            let single = Weights::from_file(&path).unwrap();
+            let shards = Weights::from_paths(std::slice::from_ref(&path), root.path()).unwrap();
+            for loaded in [single, shards] {
+                let raw = loaded.require("weight").unwrap();
+                assert!(
+                    !is_available(raw),
+                    "generic weight construction eagerly read a payload"
+                );
+                assert_eq!(loaded.metadata("networkType"), Some("lora"));
+                mlx_rs::transforms::eval_pending_loads([raw]).unwrap();
+                assert!(is_available(raw));
+                assert_eq!(raw.try_as_slice::<f32>().unwrap(), &[1.0, -2.0, 3.0, 4.0]);
+            }
+        });
+    }
 
     #[test]
     fn round_trip_file_with_metadata() {

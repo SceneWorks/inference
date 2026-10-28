@@ -3,31 +3,18 @@ use crate::loader::Sources;
 use candle_gen::gen_core::{self, moss_image::*, *};
 
 pub(crate) fn footprint_sources(s: &Sources) -> gen_core::Result<PerComponentBytes> {
-    let mut result = PerComponentBytes::default();
-    for a in &s.ordinary {
-        if !a.relative.ends_with(".safetensors") {
-            continue;
-        }
-        a.pin.verify_unchanged()?;
-        let bytes = moss_image_asset(a.repo, a.revision, &a.relative)
-            .ok_or_else(|| {
-                gen_core::Error::Unsupported("MOSS missing frozen footprint identity".into())
-            })?
-            .bytes;
-        match a.role {
-            MossImageAssetRole::Transformer => result.dit += bytes,
-            MossImageAssetRole::TextEncoder => result.text_encoder += bytes,
-            MossImageAssetRole::Vae => result.vae += bytes,
-            _ => (),
-        }
-    }
-    Ok(result)
+    let facts = selected_facts(s, MossImageAcceleration::Off)?;
+    Ok(PerComponentBytes {
+        dit: facts.transformer_bytes.saturating_add(facts.overlay_bytes),
+        text_encoder: facts.conditioning_bytes,
+        vae: facts.decoder_bytes,
+    })
 }
 pub(crate) fn contract_sources(
     variant: MossImageVariant,
     s: &Sources,
 ) -> gen_core::Result<MemoryProviderContract> {
-    let bytes = footprint_sources(s)?;
+    let bytes = selected_facts(s, MossImageAcceleration::Off)?;
     let mut c = MemoryProviderContract::compatibility_default(
         variant.provider_id(),
         MemoryBackendRealization::CandleCuda {
@@ -39,11 +26,11 @@ pub(crate) fn contract_sources(
     );
     c.load_shape = s.spec.load_shape;
     c.asset_facts = MemoryAssetFacts {
-        base_bytes: bytes.dit + bytes.text_encoder + bytes.vae,
-        transformer_bytes: bytes.dit,
-        conditioning_bytes: bytes.text_encoder,
-        decoder_bytes: bytes.vae,
-        overlay_bytes: 0,
+        base_bytes: bytes.base_bytes,
+        transformer_bytes: bytes.transformer_bytes,
+        conditioning_bytes: bytes.conditioning_bytes,
+        decoder_bytes: bytes.decoder_bytes,
+        overlay_bytes: bytes.overlay_bytes,
     };
     c.architecture_facts = architecture_facts(s);
     c.lifecycle = MemoryLifecycleCapabilities {
@@ -103,11 +90,24 @@ pub(crate) fn estimate(
         .saturating_add(owned))
 }
 
+fn adapter_bytes(s: &Sources) -> gen_core::Result<u64> {
+    s.ensure_unchanged()?;
+    let mut bytes = 0u64;
+    for spec in &s.spec.adapters {
+        for header in gen_core::weightsmeta::safetensors_path_tensor_headers(&spec.path)? {
+            bytes = bytes
+                .checked_add(header.data_bytes)
+                .ok_or_else(|| gen_core::Error::Unsupported("MOSS adapter byte overflow".into()))?;
+        }
+    }
+    s.ensure_unchanged()?;
+    Ok(bytes)
+}
 fn selected_facts(s: &Sources, mode: MossImageAcceleration) -> gen_core::Result<MemoryAssetFacts> {
     let mut text = 0u64;
     let mut dit = 0u64;
     let mut vae = 0u64;
-    let mut extra = 0u64;
+    let mut extra = adapter_bytes(s)?;
     for a in s.assets(mode)? {
         if !a.relative.ends_with(".safetensors") {
             continue;
@@ -189,11 +189,28 @@ pub fn selected_preload_estimate(
     request: &GenerationRequest,
     inputs: MossImageAdvancedInputs<'_>,
 ) -> gen_core::Result<SelectedPreloadEstimate> {
+    selected_preload_estimate_with_check(variant, spec, request, inputs, &mut || Ok(()))
+}
+
+/// Cooperatively check caller-owned cancellation/deadlines throughout cold source validation.
+/// The native request cancellation flag remains active alongside the synchronous callback.
+pub fn selected_preload_estimate_with_check(
+    variant: MossImageVariant,
+    spec: &LoadSpec,
+    request: &GenerationRequest,
+    inputs: MossImageAdvancedInputs<'_>,
+    check: &mut dyn FnMut() -> gen_core::Result<()>,
+) -> gen_core::Result<SelectedPreloadEstimate> {
+    if request.cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    check_request(request)?;
+    check()?;
     let r = MossImageResolved::resolve(variant, request)?;
     let images = inputs.validate(request, &r)?;
     crate::checked_host_elements(request, images)?;
     check_request(request)?;
-    let s = Sources::selected_with_cancel(variant, spec, r.acceleration, &request.cancel)?;
+    let s = Sources::selected_with_check(variant, spec, r.acceleration, &request.cancel, check)?;
     let asset_facts = selected_facts(&s, r.acceleration)?;
     let branches = branches(&r);
     let workspace_bytes = request_workspace_bytes(
@@ -210,6 +227,11 @@ pub fn selected_preload_estimate(
             m.stage_residency
         });
     let peak_bytes = estimate(&s, &r, request, images, staged)?;
+    if request.cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    check_request(request)?;
+    check()?;
     Ok(SelectedPreloadEstimate {
         asset_facts,
         workspace_bytes,
@@ -231,13 +253,20 @@ fn branches(r: &MossImageResolved) -> u32 {
     }
 }
 fn owned_shard_bytes(s: &Sources, mode: MossImageAcceleration) -> gen_core::Result<u64> {
-    Ok(s.assets(mode)?
+    let mut largest = s
+        .assets(mode)?
         .iter()
         .filter(|a| a.relative.ends_with(".safetensors"))
         .filter_map(|a| moss_image_asset(a.repo, a.revision, &a.relative))
         .map(|a| a.bytes)
         .max()
-        .unwrap_or(0))
+        .unwrap_or(0);
+    for adapter in &s.spec.adapters {
+        // Source staging is separate from the header-backed resident FP32 factors.
+        largest = largest.max(std::fs::metadata(&adapter.path)?.len());
+    }
+    s.ensure_unchanged()?;
+    Ok(largest)
 }
 struct Workspace {
     denoise: u64,
@@ -548,6 +577,8 @@ mod tests {
             };
             s.headers.insert(*pin.content_sha256(), vec![h]);
             crate::loader::Asset {
+                #[cfg(feature = "test-support")]
+                fixture_digest: None,
                 pin,
                 role,
                 repo,
@@ -663,6 +694,41 @@ mod tests {
         );
         assert!(
             selected_facts(&s, MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32)).is_err()
+        );
+        let adapter = tmp.path().join("custom.safetensors");
+        let tensor = candle_gen::candle_core::Tensor::ones(
+            (2, 3),
+            candle_gen::candle_core::DType::F32,
+            &candle_gen::candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let tensors =
+            std::collections::HashMap::from([("layers.0.proj.q.lora_A.weight".to_owned(), tensor)]);
+        candle_gen::candle_core::safetensors::save(&tensors, &adapter).unwrap();
+        let headers = weightsmeta::safetensors_path_tensor_headers(&adapter).unwrap();
+        let actual = headers.iter().map(|h| h.data_bytes).sum::<u64>();
+        assert!(
+            std::fs::metadata(&adapter).unwrap().len() > actual,
+            "file/header bytes must not masquerade as resident factors"
+        );
+        s.adapter_pins = vec![PinnedWeightsFile::pin(&adapter).unwrap()];
+        s.spec.adapters = vec![AdapterSpec {
+            path: adapter,
+            scale: 1.,
+            kind: AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }];
+        let adapted = selected_facts(&s, MossImageAcceleration::Off).unwrap();
+        assert_eq!(adapted.overlay_bytes, actual);
+        let footprint = footprint_sources(&s).unwrap();
+        assert_eq!(footprint.dit, adapted.transformer_bytes + actual);
+        let contract = contract_sources(MossImageVariant::Sft, &s).unwrap();
+        assert_eq!(contract.asset_facts.overlay_bytes, actual);
+        assert_eq!(
+            contract.asset_facts.base_bytes + contract.asset_facts.overlay_bytes,
+            footprint.dit + footprint.text_encoder + footprint.vae,
+            "adapter must be charged exactly once in the public memory contract"
         );
     }
 }

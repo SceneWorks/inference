@@ -1049,6 +1049,7 @@ fn hash_file_sha256_with_progress(
     let mut reader = File::open(path)?;
     let source_bytes = Some(reader.metadata()?.len());
     checked(0, source_bytes)?;
+    let _activity = crate::LoadActivityScope::enter(crate::LoadActivity::VerifyingFiles);
     // Release the callback borrow so progress is reported BEFORE the post-read cancellation check.
     let mut hash = Sha256::new();
     let mut buffer = vec![0_u8; HASH_READ_BYTES];

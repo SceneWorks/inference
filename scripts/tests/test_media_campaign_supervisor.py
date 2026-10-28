@@ -13,6 +13,122 @@ from unittest.mock import patch
 from scripts import media_campaign_supervisor as safety
 
 
+class FixtureDeadlineClock:
+    """Test-only: arm the teardown budget after bounded positive fixture readiness."""
+    def __init__(self, now=time.monotonic, pause=time.sleep):
+        self.now, self.pause, self.ready_at = now, pause, None
+
+    def __call__(self):
+        return 0.0 if self.ready_at is None else self.now() - self.ready_at
+
+    def admit(self, ready, timeout=30.0):
+        until = self.now() + timeout
+        while not ready():
+            if self.now() >= until:
+                raise AssertionError("fixture startup readiness deadline exceeded")
+            self.pause(.01)
+        self.ready_at = self.now()
+
+
+def published_fixture_pid(path):
+    """Read only the closed/renamed PID record, within bounded bootstrap polling."""
+    try:
+        published = path.read_text(encoding="ascii")
+    except (FileNotFoundError, PermissionError):
+        # Atomic rename prevents partial publication, but a Windows sharing/access
+        # denial can still make the published name temporarily unreadable. This is
+        # not readiness; the caller's existing bootstrap deadline remains in force.
+        return None
+    if not published.isdecimal() or int(published) <= 0:
+        raise AssertionError("malformed published fixture PID")
+    return int(published)
+
+
+class FixtureDeadlineClockTests(unittest.TestCase):
+    def test_bootstrap_is_bounded_separately_from_three_second_teardown_budget(self):
+        now = [0.0]
+        clock = FixtureDeadlineClock(lambda: now[0], lambda delay: now.__setitem__(0, now[0] + delay))
+        self.assertEqual(clock(), 0)
+        now[0] = 7
+        self.assertEqual(clock(), 0)  # Slow bootstrap has not armed the teardown clock.
+        clock.admit(lambda: now[0] >= 10)
+        self.assertEqual(clock(), 0)
+        now[0] += 3
+        self.assertAlmostEqual(clock(), 3)
+
+    def test_missing_readiness_fails_closed_without_arming_teardown_clock(self):
+        now = [0.0]
+        clock = FixtureDeadlineClock(lambda: now[0], lambda delay: now.__setitem__(0, now[0] + delay))
+        with self.assertRaisesRegex(AssertionError, "fixture startup readiness deadline"):
+            clock.admit(lambda: False, timeout=.05)
+        self.assertIsNone(clock.ready_at)
+        self.assertLess(now[0], .1)
+
+
+class PublishedFixturePidTests(unittest.TestCase):
+    def clock(self):
+        now = [0.0]
+        return FixtureDeadlineClock(lambda: now[0], lambda delay: now.__setitem__(0, now[0] + delay))
+
+    def test_access_denial_is_not_ready_until_a_valid_record_is_read(self):
+        clock, observed = self.clock(), []
+        def ready():
+            pid = published_fixture_pid(Path("grandchild-pid"))
+            if pid is not None:
+                observed.append(pid)
+            return pid is not None
+        with patch.object(Path, "read_text", side_effect=[PermissionError(13, "sharing denial"), "1234"]) as read:
+            clock.admit(ready)
+        self.assertEqual(observed, [1234])
+        self.assertEqual(read.call_count, 2)
+        self.assertIsNotNone(clock.ready_at)
+
+    def test_permanent_access_denial_fails_at_the_existing_bootstrap_deadline(self):
+        clock = self.clock()
+        with patch.object(Path, "read_text", side_effect=PermissionError(13, "persistent denial")), \
+             self.assertRaisesRegex(AssertionError, "fixture startup readiness deadline"):
+            clock.admit(lambda: published_fixture_pid(Path("grandchild-pid")) is not None, timeout=.05)
+        self.assertIsNone(clock.ready_at)
+
+    def test_partial_temporary_record_is_never_used_as_published_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grandchild-pid"
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text("12", encoding="ascii")
+            self.assertIsNone(published_fixture_pid(path))
+            temporary.write_text("1234", encoding="ascii")
+            os.replace(temporary, path)
+            self.assertEqual(published_fixture_pid(path), 1234)
+
+    def test_malformed_published_records_and_unrelated_io_errors_remain_terminal(self):
+        for record in ("", "0", "-1", "123partial", "123\n"):
+            with self.subTest(record=record), patch.object(Path, "read_text", return_value=record), \
+                 self.assertRaisesRegex(AssertionError, "malformed published fixture PID"):
+                published_fixture_pid(Path("grandchild-pid"))
+        with patch.object(Path, "read_text", side_effect=OSError(5, "I/O failure")), self.assertRaises(OSError):
+            published_fixture_pid(Path("grandchild-pid"))
+
+    def test_reaping_assertions_use_only_the_validated_invocation_snapshot(self):
+        case = WindowsSupervisorTests()
+        case.root, case.sampled = Path("fixture"), [1]
+        case.data = {"deadlineSeconds": 3}
+        case._has_exited = lambda pid: pid == 1234
+        observed = []
+        case._assert_exited = observed.append
+        def run(script, *, on_spawn, clock):
+            # Simulate the real Probe's real-clock membership sampling: the supervisor observed the
+            # live grandchild as owned (the root is already gone) before the deadline fired.
+            case.supervision_start = 0.0
+            case.membership_samples = [(1.0, {5678})]
+            on_spawn(1234, None)
+            raise safety.SupervisionError("deadline", "fixture deadline")
+        case._run = run
+        with patch.object(Path, "read_text", side_effect=["1234", "5678", AssertionError("reopened PID publication")]) as read:
+            case._deadline_reaps_root_and_grandchild_after_root_exit()
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(observed, [1234, 5678])
+
+
 class Probe:
     def __init__(self, *, free=10**12, footprint=1024, gpu_free=10**12):
         self.free = free
@@ -322,6 +438,21 @@ class SupervisorTests(unittest.TestCase):
         (self.root / "stderr").unlink()
         with self.assertRaisesRegex(safety.SupervisionError, "child-exit"):
             self.run_child("import sys; sys.exit(7)")
+
+    def test_production_deadline_still_includes_on_spawn_bootstrap(self):
+        now, owned = [0.0], []
+        def bootstrap(pid, pgid):
+            owned.append(pgid)
+            now[0] = 2.0  # The ordinary one-second policy is already expired.
+        with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
+            safety.run_guarded(
+                [sys.executable, "-c", "import threading; threading.Event().wait()"],
+                cwd=self.root, env=os.environ.copy(), policy=self.policy, probe=Probe(),
+                stdout_path=self.root / "stdout", stderr_path=self.root / "stderr",
+                clock=lambda: now[0], on_spawn=bootstrap,
+            )
+        self.assertEqual(len(owned), 1)
+        self.assertFalse(safety._group_pids(owned[0]))
 
     def test_on_spawn_persists_owned_identity_before_sampling(self):
         status_path = self.root / "spawn-status.json"
@@ -1358,13 +1489,15 @@ class WindowsSupervisorTests(unittest.TestCase):
             "gpuFreeReserveBytes": 1024, "childGpuCapBytes": 1024**2,
         }
         self.sampled = []
+        self.membership_samples = []
+        self.supervision_start = None
 
     def test_native_host_probe_and_trusted_cuda_probe_path(self):
         from scripts import media_campaign_windows as windows
         self.assertGreater(windows.host_free_bytes(), 0)
         self.assertTrue(Path(windows.trusted_nvidia_smi()).is_absolute())
 
-    def _run(self, script, *, cap=None, on_spawn=None):
+    def _run(self, script, *, cap=None, on_spawn=None, clock=time.monotonic):
         policy_data = dict(self.data)
         if cap is not None:
             policy_data["childFootprintCapBytes"] = cap
@@ -1372,6 +1505,11 @@ class WindowsSupervisorTests(unittest.TestCase):
         path.write_text(json.dumps(policy_data), encoding="utf-8")
         policy = safety.load_policy(path)
         parent = self
+        def observed_real_clock():
+            now = time.monotonic()  # Observe, never pause/advance/substitute the real deadline clock.
+            if parent.supervision_start is None:
+                parent.supervision_start = now
+            return now
         class Probe:
             def host_free(self):
                 return 10**12
@@ -1382,6 +1520,8 @@ class WindowsSupervisorTests(unittest.TestCase):
             def tree_footprint(self, owner):
                 amount = owner.footprint_bytes()
                 parent.sampled.append(amount)
+                members = owner.members()
+                parent.membership_samples.append((observed_real_clock(), members))
                 return amount
             def gpu_free_and_tree_bytes(self, owner):
                 # GPU collection is separately fixture-tested; these children never touch CUDA.
@@ -1390,7 +1530,7 @@ class WindowsSupervisorTests(unittest.TestCase):
             [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
             policy=policy, stdout_path=self.root / "stdout", stderr_path=self.root / "stderr",
             probe=Probe(),
-            on_spawn=on_spawn,
+            on_spawn=on_spawn, clock=clock,
         )
 
     def test_on_spawn_reports_job_owned_root_without_posix_group(self):
@@ -1399,20 +1539,33 @@ class WindowsSupervisorTests(unittest.TestCase):
                            on_spawn=lambda pid, pgid: calls.append((pid, pgid)))
         self.assertEqual(calls, [(result.pid, None)])
 
-    def _assert_exited(self, pid):
+    def _has_exited(self, pid):
         import ctypes
         from scripts import media_campaign_windows as windows
         kernel, _ = windows._apis()
         handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
         if not handle:
             self.assertEqual(ctypes.get_last_error(), 87)  # PID no longer exists.
-            return
+            return True
         try:
             kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
             kernel.WaitForSingleObject.restype = ctypes.c_uint32
-            self.assertEqual(kernel.WaitForSingleObject(handle, 0), 0)
+            return kernel.WaitForSingleObject(handle, 0) == 0
         finally:
             kernel.CloseHandle(handle)
+
+    def _assert_exited(self, pid):
+        self.assertTrue(self._has_exited(pid), f"owned process {pid} is still alive")
+
+    def test_missing_readiness_reaps_owned_root(self):
+        clock, owned = FixtureDeadlineClock(), []
+        def never_ready(pid, _pgid):
+            owned.append(pid)
+            clock.admit(lambda: False, timeout=.05)
+        with self.assertRaisesRegex(AssertionError, "fixture startup readiness deadline"):
+            self._run("import threading; threading.Event().wait()", on_spawn=never_ready, clock=clock)
+        self.assertEqual(len(owned), 1)
+        self._assert_exited(owned[0])
 
     def test_deadline_reaps_root_and_grandchild_after_root_exit(self):
         self._deadline_reaps_root_and_grandchild_after_root_exit()
@@ -1424,8 +1577,8 @@ class WindowsSupervisorTests(unittest.TestCase):
         from contextlib import nullcontext
         original_root = self.root
         try:
-            # Twenty independent 3s deadlines exercise root-exit ordering repeatedly;
-            # this adds 60s of configured deadline workload, never a speed assertion.
+            # Twenty independent post-readiness 3s deadlines exercise root-exit ordering;
+            # bootstrap has its own bound, never a Python-startup speed assertion.
             for attempt in range(20):
                 context = self.subTest(attempt=attempt) if subtests else nullcontext()
                 with context, tempfile.TemporaryDirectory(dir=original_root) as directory:
@@ -1435,17 +1588,55 @@ class WindowsSupervisorTests(unittest.TestCase):
             self.root = original_root
 
     def _deadline_reaps_root_and_grandchild_after_root_exit(self):
-        grandchild = "import os,threading; b=bytearray(4*1024*1024); open('grandchild-pid','w').write(str(os.getpid())); threading.Event().wait()"
-        script = (
-            "import os,subprocess,sys,time; "
-            f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}]); "
-            "open('root-pid','w').write(str(os.getpid())); time.sleep(.5)"
+        # Atomic PID publication avoids observing a newly-created but unflushed file.
+        grandchild = (
+            "import os,pathlib,threading; b=bytearray(4*1024*1024); "
+            "pathlib.Path('grandchild-pid.tmp').write_text(str(os.getpid()),encoding='ascii'); "
+            "os.replace('grandchild-pid.tmp','grandchild-pid'); threading.Event().wait()"
         )
+        script = (
+            "import os,pathlib,subprocess,sys; "
+            "pathlib.Path('root-pid.tmp').write_text(str(os.getpid()),encoding='ascii'); "
+            "os.replace('root-pid.tmp','root-pid'); "
+            f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}])"
+        )
+        clock = FixtureDeadlineClock()
+        ready_pids = None
+        # Membership observation is per attempt: each repeated run gets its own real-clock start.
+        self.membership_samples = []
+        self.supervision_start = None
+        def fixture_ready(pid, _pgid):
+            def ready():
+                nonlocal ready_pids
+                root_pid = published_fixture_pid(self.root / "root-pid")
+                grandchild_pid = published_fixture_pid(self.root / "grandchild-pid")
+                if root_pid is None or grandchild_pid is None:
+                    return False
+                self.assertEqual(root_pid, pid)
+                self.assertGreater(grandchild_pid, 0)
+                self.assertNotEqual(grandchild_pid, root_pid)
+                if not self._has_exited(root_pid):
+                    return False
+                ready_pids = (root_pid, grandchild_pid)
+                return True
+            clock.admit(ready)  # Independent 30s bootstrap bound, not an extended teardown limit.
         with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
-            self._run(script)
+            self._run(script, on_spawn=fixture_ready, clock=clock)
+        self.assertIsNotNone(clock.ready_at)
         self.assertTrue(any(amount > 0 for amount in self.sampled))
-        self._assert_exited(int((self.root / "root-pid").read_text(encoding="ascii")))
-        self._assert_exited(int((self.root / "grandchild-pid").read_text(encoding="ascii")))
+        self.assertIsNotNone(ready_pids)
+        root_pid, grandchild_pid = ready_pids
+        # The epic's ownership proof: the supervisor must have observed the live grandchild as
+        # owned while the root was already gone, and before the deadline fired.
+        self.assertIsNotNone(self.supervision_start)
+        self.assertTrue(
+            any(grandchild_pid in members and root_pid not in members
+                and at < self.supervision_start + self.data["deadlineSeconds"]
+                for at, members in self.membership_samples),
+            "deadline test never observed an owned live grandchild after root exit and before the deadline",
+        )
+        for pid in ready_pids:
+            self._assert_exited(pid)
 
     def test_repeated_reaping_case_rejects_skip_descendant_reap_mutant(self):
         from scripts import media_campaign_windows as windows

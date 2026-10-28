@@ -1,11 +1,17 @@
 //! Native frozen MOSS-Image Base/SFT, ordinary guidance and optional data-space DMD.
+mod adapters;
 mod edit;
 pub mod loader;
 pub mod memory_strategy;
 pub mod model;
 mod pipeline;
 mod precision;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 mod text_encoder;
+pub mod training;
+mod training_memory;
 mod transformer;
 pub use model::{descriptor_base, descriptor_sft, load_base, load_sft, MossImage};
 
@@ -15,6 +21,8 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     use mlx_gen::gen_core::{moss_image::MossImageVariant, MemoryContractFixtureRegistration};
     registry
+        .register_trainer(training::BASE_REGISTRATION)
+        .register_trainer(training::SFT_REGISTRATION)
         .register_generator(model::BASE_REGISTRATION)
         .register_generator(model::SFT_REGISTRATION)
         .register_memory_strategy(model::BASE_MEMORY)
@@ -33,3 +41,21 @@ pub fn register_providers(
 
 /// Frozen MOSS canvas lattice in output pixels.
 pub const SIZE_MULTIPLE: u32 = 16;
+
+#[cfg(test)]
+pub(crate) struct CpuTestDevice(mlx_rs::Device);
+#[cfg(test)]
+pub(crate) fn cpu_test_device() -> CpuTestDevice {
+    let previous = mlx_rs::Device::try_default().expect("default device metadata");
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    CpuTestDevice(previous)
+}
+#[cfg(test)]
+impl Drop for CpuTestDevice {
+    fn drop(&mut self) {
+        mlx_rs::Device::set_default(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod portable_exchange_tests;
