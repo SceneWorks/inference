@@ -86,17 +86,9 @@ use crate::alias_free::SnakeBeta;
 use crate::audio_config::MiniMaxH3AudioVaeConfig;
 use crate::tensor::slice_axis;
 
-/// Heads in the `pre_block` causal attention.
-///
-/// The original `DacAudioVAE` **hardcodes** `AttnProjection(latent_dim, attn_proj_dim,
-/// num_heads=8)` — it is not in `metadata.json`, `config.yaml` or the FL2VA `config.json`, so
-/// [`MiniMaxH3AudioVaeConfig`] has no field for it. The diffusers repackaging promoted it to a
-/// config key (`audio_vae/config.json`: `"num_attention_heads": 8`), and the two agree.
-///
-/// Pinned as a constant for the same reason [`crate::layout::PUBLISHED_GATED_FFN_LAYOUT`] is:
-/// changing the head count changes `head_dim`, which changes the attention scale *and* the
-/// adaptive pool's window layout, while every tensor shape stays identical.
-pub const ATTN_PROJ_HEADS: i32 = 8;
+/// Heads in the `pre_block` causal attention — the shared, cross-checked
+/// [`crate::audio_config::ATTN_PROJ_HEADS`] in this crate's `i32` shape convention.
+pub const ATTN_PROJ_HEADS: i32 = crate::audio_config::ATTN_PROJ_HEADS as i32;
 
 /// `eps` for every `nn.LayerNorm` in `pre_block` — torch's default, declared in no config file.
 pub const LAYER_NORM_EPS: f32 = 1e-5;
@@ -355,12 +347,16 @@ impl DacEncoder {
     ) -> Result<Self> {
         let conv_in = WnConv1d::from_weights(w, &format!("{prefix}.block.0"), 1, 3, 1, dtype)?;
         let mut blocks = Vec::with_capacity(cfg.encoder_rates.len());
-        for (i, &stride) in cfg.encoder_rates.iter().enumerate() {
-            if stride < 1 {
-                return Err(Error::Msg(format!(
-                    "minimax-h3 audio encoder: encoder_rates[{i}] = {stride} must be positive"
-                )));
-            }
+        for (i, &rate) in cfg.encoder_rates.iter().enumerate() {
+            let stride = i32::try_from(rate)
+                .ok()
+                .filter(|stride| *stride >= 1)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "minimax-h3 audio encoder: encoder_rates[{i}] = {rate} must be positive \
+                         and fit i32"
+                    ))
+                })?;
             blocks.push(EncoderBlock::from_weights(
                 w,
                 &format!("{prefix}.block.{}", i + 1),
@@ -877,8 +873,8 @@ impl MiniMaxH3AudioVaeEncoder {
                     .into(),
             ));
         }
-        let latent_dim = cfg.bigvgan.num_mels;
-        let channels = cfg.latent_channels;
+        let latent_dim = cfg.bigvgan.num_mels as i32;
+        let channels = cfg.latent_channels as i32;
         if channels < 1 || latent_dim < 1 || latent_dim % channels != 0 {
             return Err(Error::Msg(format!(
                 "minimax-h3 audio encoder: latent_dim {latent_dim} is not a multiple of \
@@ -1016,7 +1012,7 @@ impl MiniMaxH3AudioVaeEncoder {
             )));
         }
         let channels = z.shape()[rank - 2];
-        if channels != self.cfg.latent_channels {
+        if channels != self.cfg.latent_channels as i32 {
             return Err(Error::Msg(format!(
                 "minimax-h3 audio encoder: latent has {channels} channels, config declares {}",
                 self.cfg.latent_channels
@@ -1031,7 +1027,7 @@ impl MiniMaxH3AudioVaeEncoder {
 }
 
 /// `∏ encoder_rates`, checked for overflow and for a degenerate zero rate.
-fn hop_length(rates: &[i32]) -> Result<i32> {
+fn hop_length(rates: &[usize]) -> Result<i32> {
     if rates.is_empty() {
         return Err(Error::Msg(
             "minimax-h3 audio encoder: encoder_rates is empty, so the hop length is undefined"
@@ -1040,11 +1036,14 @@ fn hop_length(rates: &[i32]) -> Result<i32> {
     }
     let mut hop: i32 = 1;
     for &rate in rates {
-        if rate < 1 {
-            return Err(Error::Msg(format!(
-                "minimax-h3 audio encoder: encoder rate {rate} must be positive"
-            )));
-        }
+        let rate = i32::try_from(rate)
+            .ok()
+            .filter(|rate| *rate >= 1)
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "minimax-h3 audio encoder: encoder rate {rate} must be positive and fit i32"
+                ))
+            })?;
         hop = hop.checked_mul(rate).ok_or_else(|| {
             Error::Msg(format!(
                 "minimax-h3 audio encoder: encoder_rates {rates:?} overflow the hop length"
@@ -1237,7 +1236,7 @@ mod tests {
         assert_eq!(hop_length(&[2]).unwrap(), 2);
         assert!(hop_length(&[]).is_err());
         assert!(hop_length(&[2, 0, 4]).is_err());
-        assert!(hop_length(&[i32::MAX, 2]).is_err());
+        assert!(hop_length(&[i32::MAX as usize, 2]).is_err());
     }
 
     /// The declared name list must be unique and exactly the encode half's cardinality — 173 for

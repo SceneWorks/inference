@@ -82,33 +82,9 @@ use crate::alias_free::SnakeBeta;
 use crate::audio_config::MiniMaxH3AudioVaeConfig;
 use crate::nn::{layer_norm, linear};
 
-/// Heads in the `pre_block` causal attention.
-///
-/// The original `DacAudioVAE` **hardcodes** `AttnProjection(latent_dim, attn_proj_dim,
-/// num_heads=8)` — it is not in `metadata.json`, `config.yaml` or the FL2VA `config.json`, so
-/// [`MiniMaxH3AudioVaeConfig`] has no field for it. The diffusers repackaging promoted it to a
-/// config key (`audio_vae/config.json`: `"num_attention_heads": 8`), and the two agree.
-///
-/// Pinned as a constant for the same reason [`crate::layout::PUBLISHED_GATED_FFN_LAYOUT`] is:
-/// changing the head count changes `head_dim`, which changes the attention scale *and* the
-/// adaptive pool's window layout, while every tensor shape stays identical — and, unlike a shape
-/// mismatch, produces a runnable model with a wrong soundtrack conditioning.
-///
-/// **Bound to a published document, not to itself.**
-/// [`MiniMaxH3AudioVaeConfig::cross_check_diffusers_json`] reads `audio_vae/config.json`'s
-/// `num_attention_heads`, compares it to this constant, and refuses a checkpoint that disagrees —
-/// including one that OMITS the key, which is refused rather than defaulted. That check runs
-/// weights-free over the published config text in `crate::audio_config`'s
-/// `diffusers_root_config_cross_checks`, which asserts the refusal in both directions (4 and 16),
-/// so a comparison hardcoded to 8 on either side fails one of them; and against the real
-/// snapshot's own `audio_vae/config.json` in `tests/real_weights.rs`.
-///
-/// Before that it was pinned only by `assert_eq!(ATTN_PROJ_HEADS, 8)` — a literal restating itself
-/// — while every executed test built the encoder at the fixture's 2 heads. An earlier revision of
-/// THIS doc claimed the cross-check already compared the key. It did not: `cross_check_diffusers_json`
-/// never read `num_attention_heads`, and `audio_config.rs` was not in that commit. The comparison
-/// exists now; this paragraph stays as the reason not to describe a binding before writing it.
-pub const ATTN_PROJ_HEADS: usize = 8;
+/// Heads in the `pre_block` causal attention — the shared, cross-checked constant (see
+/// [`crate::audio_config::ATTN_PROJ_HEADS`]).
+pub use crate::audio_config::ATTN_PROJ_HEADS;
 
 /// **The dtype the encode half is always built at**, whatever the provider's own store dtype is.
 ///

@@ -1682,7 +1682,8 @@ impl MiniMaxH3 {
                 &read("config.json")?,
                 &read("config.yaml")?,
                 &read("metadata.json")?,
-            ),
+            )
+            .map_err(CandleError::from),
             "candle-gen-minimax-h3::model::MiniMaxH3::audio_vae_config/configuration",
             Configuration,
             &[
