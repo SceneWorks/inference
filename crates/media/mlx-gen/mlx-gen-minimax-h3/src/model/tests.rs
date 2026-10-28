@@ -1115,7 +1115,7 @@ fn frames_are_exact_and_duration_is_aligned() {
             .unwrap()
             .joint
             .num_frames,
-        SMALLEST_LEGAL_FRAMES
+        crate::pipeline::SMALLEST_LEGAL_FRAMES
     );
 }
 

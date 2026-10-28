@@ -24,6 +24,13 @@ fn vendored_build_rs() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vendor/candle-kernels/build.rs")
 }
 
+/// `vendor/candle-flash-attn/build.rs` — the FlashAttention-2 fatbin's ladder (sc-26691). Read the
+/// same way, and consumed by the fused-attention dispatch guard rather than a warning: a kernel the
+/// ladder does not cover is never launched.
+fn vendored_flash_build_rs() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vendor/candle-flash-attn/build.rs")
+}
+
 /// `(native SASS rungs, PTX floors)` from the `.arg("-gencode=…")` calls the file actually makes.
 ///
 /// Anchored on the `.arg("…")` call rather than the bare `-gencode` text: the same file quotes the
@@ -78,6 +85,22 @@ fn main() {
     let baseline = std::env::var("CUDA_COMPUTE_CAP")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok());
+
+    let flash = vendored_flash_build_rs();
+    println!("cargo::rerun-if-changed={}", flash.display());
+    let (flash_sass, flash_ptx) = match std::fs::read_to_string(&flash) {
+        Ok(source) => parse_gencodes(&source),
+        // Absent: an empty flash ladder, which the dispatch guard treats as "never launch".
+        Err(_) => (Vec::new(), Vec::new()),
+    };
+    println!(
+        "cargo::rustc-env=CANDLE_GEN_FLASH_FATBIN_SASS={}",
+        csv(&flash_sass)
+    );
+    println!(
+        "cargo::rustc-env=CANDLE_GEN_FLASH_FATBIN_PTX={}",
+        csv(&flash_ptx)
+    );
 
     println!("cargo::rustc-env=CANDLE_GEN_FATBIN_SASS={}", csv(&sass));
     println!("cargo::rustc-env=CANDLE_GEN_FATBIN_PTX={}", csv(&ptx));

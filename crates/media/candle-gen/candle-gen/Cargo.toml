@@ -15,6 +15,10 @@ autotests = false
 sceneworks-gen-core = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+# Fused FlashAttention-2 CUDA kernels behind the `flash-attn` feature (sc-26691): the shared
+# `attention::sdpa_dispatch_bhsd` seam takes them for unmasked bf16/f16 attention on CUDA. Optional
+# — it compiles a large CUDA/CUTLASS kernel set — and pinned to the SAME candle rev candle-llm uses.
+candle-flash-attn = { workspace = true, optional = true }
 thiserror = { workspace = true }
 # Training harness (epic 5164 / sc-5165). `safetensors` is candle's own version (0.7) so the `View`
 # impl candle-core provides for `Tensor` applies — used to write PEFT/LoKr adapters *with metadata*
@@ -25,6 +29,8 @@ safetensors = "0.7"
 # `block_q4_1` stores its per-block scale/min as f16 and candle-core does not re-export `half`.
 # Same version candle-core itself resolves (Cargo.lock), so no duplicate-crate risk.
 half = "2"
+# Row-parallel Q4 repack (sc-26691); already in the lockfile via candle-gen-seedvr2.
+rayon = "1"
 # The NVFP4 codec + cuBLASLt fp8/int8/NVFP4 wrapper, lifted into a shared crate so candle-llm can
 # serve the same implementation (sc-24135). Re-exported at `candle_gen::quant::{nvfp4, cublaslt,
 # nvfp4_linear, nvfp4_outlier}` so media callers are unchanged.
@@ -56,9 +62,11 @@ metal = ["candle-core/metal", "candle-nn/metal"]
 # NVIDIA CUDA backend (Windows target). MUST NOT be in `default` — it needs the CUDA toolkit and
 # will not build on Mac. All cuda-only code is gated behind `#[cfg(feature = "cuda")]`.
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-quant-kernels/cuda"]
-# NOTE: a `flash-attn` feature was removed in sc-9032 — it was a pure no-op (`flash-attn = ["cuda"]`,
-# forwarded crate-to-crate) that wired no fused kernels. When the `candle-flash-attn` slice is
-# scheduled, reintroduce it here (and its forwards) behind real gated code, not as a bare alias.
+# FlashAttention-2 (sc-26691). Implies `cuda` and pulls in `candle-flash-attn`, which
+# `attention::sdpa_dispatch_bhsd` dispatches unmasked bf16/f16 CUDA attention to instead of the
+# materialized, query-chunked `sdpa_planned_bhsd`. Same crate and rev as `candle-llm/flash-attn`.
+# (sc-9032 removed an earlier no-op alias of this name; this one gates real code.)
+flash-attn = ["cuda", "dep:candle-flash-attn"]
 
 [dev-dependencies]
 # Self-removing fixture roots for the training-driver tests (sc-17704).

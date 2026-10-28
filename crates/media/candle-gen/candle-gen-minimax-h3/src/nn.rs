@@ -3,13 +3,18 @@
 //!
 //! Kept composable (no fused-kernel dispatch) so the numerics match the MLX lane on CPU and CUDA
 //! alike. Every norm computes in **f32** and casts back, mirroring the reference's f32 norm islands.
+//! The one exception is attention ([`sdpa_planned`]): a `flash-attn` CUDA build takes the fused
+//! FlashAttention-2 kernel for bf16/f16, the way MLX's fused SDPA already streams the scores
+//! (sc-26691).
 //!
 //! The one place this crate deliberately does *not* reach for a candle built-in is
 //! `alias_free::transposed_conv1d`: see that function for why every transposed convolution
 //! in the audio decoder runs as zero-insert + forward `conv1d` on both backends.
 
+use candle_gen::attention::AttentionPlan;
 use candle_gen::candle_core::{DType, Tensor, D};
 use candle_gen::candle_nn::ops::sigmoid;
+use candle_gen::gen_core::CancelFlag;
 use candle_gen::Result;
 
 /// SiLU / swish: `x · sigmoid(x)`, in the input dtype.
@@ -84,29 +89,113 @@ pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f64) -> Resul
         .to_dtype(dtype)?)
 }
 
-/// Scaled-dot-product attention over `[B, H, S, D]` q/k/v, routed through the shared
-/// i32-overflow-safe budgeted helper (sc-9116) with the fused `softmax_last_dim`.
+/// Scaled-dot-product attention over `[B, H, S, D]` q/k/v, with no request cancel flag.
 ///
 /// The video VAE decoder's attention is dense and unmasked (`causal_decoder: false`), so no mask is
-/// taken. The budget matters here even though the fixture is tiny: a real decode carries
-/// `T·H·W + 5` tokens for a 16×-downsampled canvas, and `candle`'s attention materializes the whole
-/// `[B, H, Sq, Sk]` scores tensor.
+/// taken. Routed through [`sdpa_planned`] with an un-flagged plan — see that function for the kernel
+/// choice and the i32 budget.
 pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
-    Ok(candle_gen::sdpa_budgeted_bhsd(
+    sdpa_planned(q, k, v, scale, None)
+}
+
+/// Unmasked scaled-dot-product attention over `[B, H, S, D]` q/k/v (sc-26691).
+///
+/// * **CUDA + `flash-attn` build + bf16/f16** — the fused FlashAttention-2 kernel
+///   ([`candle_gen::sdpa_dispatch_bhsd`]). No `[B, H, Sq, Sk]` scores tensor exists, so the i32
+///   hazard below does not arise; the cancel flag is checked once per call (one call = one layer).
+/// * **everything else** (CPU, Metal, a non-flash build, f32) — the shared i32-overflow-safe
+///   budgeted helper (sc-9116) with the fused `softmax_last_dim`, now the **cancel-aware**
+///   `sdpa_planned_bhsd`: with `cancel` attached a tripped flag stops the next query-chunk launch
+///   and surfaces as [`CandleError::Canceled`](candle_gen::CandleError::Canceled). On CUDA that
+///   check runs at enqueue time; the DiT's per-layer synchronize (`dit::model`) is what keeps the
+///   host from queueing more than one layer ahead of the device.
+///
+/// The budget matters on the fallback even at modest geometries: a real decode carries `T·H·W + 5`
+/// tokens for a 16×-downsampled canvas, and that path materializes `[B, H, block, Sk]`.
+pub fn sdpa_planned(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    cancel: Option<&CancelFlag>,
+) -> Result<Tensor> {
+    let plan = attention_plan(cancel);
+    candle_gen::sdpa_dispatch_bhsd(
         q,
         k,
         v,
         scale,
         None,
         candle_gen::candle_nn::ops::softmax_last_dim,
+        plan,
+    )
+}
+
+/// The plan [`sdpa_planned`] runs the fallback under: the 1e9 i32 guard, with `cancel` attached.
+fn attention_plan(cancel: Option<&CancelFlag>) -> AttentionPlan<'_> {
+    let plan = AttentionPlan::budgeted(candle_gen::attention::attention_budget_from_usize(
         candle_gen::ATTN_SCORES_BUDGET,
-    )?)
+    ));
+    match cancel {
+        Some(c) => plan.with_cancel(c),
+        None => plan,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+
+    /// The request flag reaches the plan the budgeted fallback checks between query chunks.
+    #[test]
+    fn the_attention_plan_carries_the_request_cancel_flag() {
+        let cancel = CancelFlag::new();
+        assert!(!attention_plan(Some(&cancel)).is_cancelled());
+        cancel.cancel();
+        assert!(attention_plan(Some(&cancel)).is_cancelled());
+        assert!(!attention_plan(None).is_cancelled());
+    }
+
+    /// On the CPU the dispatcher refuses the fused kernel, so `sdpa_planned` is the budgeted path
+    /// verbatim — strided `[B, H, S, D]` views included (the DiT now passes transposes, not copies).
+    #[test]
+    fn sdpa_planned_on_cpu_is_the_budgeted_path_for_strided_views() {
+        let dev = Device::Cpu;
+        let bshd = |seed: f32| {
+            Tensor::arange(0f32, 2.0 * 6.0 * 8.0, &dev)
+                .unwrap()
+                .affine(0.01, f64::from(seed))
+                .unwrap()
+                .sin()
+                .unwrap()
+                .reshape((1, 6, 2, 8))
+                .unwrap()
+        };
+        let (q, k, v) = (bshd(0.1), bshd(0.7), bshd(1.3));
+        let (qh, kh, vh) = (
+            q.transpose(1, 2).unwrap(),
+            k.transpose(1, 2).unwrap(),
+            v.transpose(1, 2).unwrap(),
+        );
+        assert!(!qh.is_contiguous());
+        assert!(matches!(
+            candle_gen::fused_attention::select_attention_kernel(&qh, &kh, &vh, None),
+            candle_gen::AttentionKernel::Budgeted(_)
+        ));
+        let got = sdpa_planned(&qh, &kh, &vh, 0.35, None).unwrap();
+        let want = candle_gen::sdpa_budgeted_bhsd(
+            &qh.contiguous().unwrap(),
+            &kh.contiguous().unwrap(),
+            &vh.contiguous().unwrap(),
+            0.35,
+            None,
+            candle_gen::candle_nn::ops::softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )
+        .unwrap();
+        assert_eq!(flat(&got), flat(&want));
+    }
 
     fn flat(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()

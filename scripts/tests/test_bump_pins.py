@@ -28,7 +28,6 @@ mlx-sys = {{ package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry
 candle-core = {{ git = "https://github.com/huggingface/candle", rev = "{B}" }}
 candle-nn = {{ git = "https://github.com/huggingface/candle", rev = "{B}" }}
 candle-transformers = {{ git = "https://github.com/huggingface/candle", rev = "{B}" }}
-candle-flash-attn = {{ git = "https://github.com/huggingface/candle", rev = "{B}" }}
 """
 
 GATE = f"""PINNED_WORKSPACE_DEPENDENCIES = {{
@@ -37,7 +36,6 @@ GATE = f"""PINNED_WORKSPACE_DEPENDENCIES = {{
     "candle-core": ("candle-core", "{B}"),
     "candle-nn": ("candle-nn", "{B}"),
     "candle-transformers": ("candle-transformers", "{B}"),
-    "candle-flash-attn": ("candle-flash-attn", "{B}"),
 }}
 """
 
@@ -60,8 +58,7 @@ class ManifestRewriteTests(unittest.TestCase):
         updated = rewrite(MANIFEST, PIN_GROUPS["candle"], B, C, patterns=_dep_rev_pattern)
         self.assertEqual(read_group_rev(updated, PIN_GROUPS["candle"], patterns=_dep_rev_pattern), C)
         self.assertEqual(read_group_rev(updated, PIN_GROUPS["mlx"], patterns=_dep_rev_pattern), A)
-        # candle-flash-attn (CUDA-only, absent from the default graph) still bumps in the manifest.
-        self.assertEqual(updated.count(C), 4)
+        self.assertEqual(updated.count(C), 3)
 
     def test_mlx_bump_moves_both_alias_lines(self) -> None:
         updated = rewrite(MANIFEST, PIN_GROUPS["mlx"], A, C, patterns=_dep_rev_pattern)
@@ -143,7 +140,11 @@ class VendoredGroupTests(unittest.TestCase):
     def test_the_gate_and_the_tool_agree_on_the_vendored_copies(self) -> None:
         gate = load_gate_module()
         tool = {path for group in PIN_GROUPS.values() for path in group.vendored}
-        self.assertEqual(tool, {v["path"] for v in gate.VENDORED_PACKAGES.values()})
+        self.assertEqual(
+            tool,
+            {v["path"] for v in gate.VENDORED_PACKAGES.values()}
+            | {v["path"] for v in gate.PATH_VENDORED_PACKAGES.values()},
+        )
         for name, vendored in gate.VENDORED_PACKAGES.items():
             path, revision = vendored["path"], vendored["upstream_rev"]
             # A vendored crate that is not itself a workspace dependency is pinned through the

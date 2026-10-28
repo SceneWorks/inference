@@ -244,7 +244,10 @@ pub fn lin(
         let (out, groups) = scales.dims2()?;
         let in_features = groups * GROUP_SIZE;
         let bias_bytes = dense_bias.as_ref().map(dense_bytes).unwrap_or(0);
-        let device = wq.device().clone();
+        let device = w
+            .host_packed_target()
+            .cloned()
+            .unwrap_or_else(|| wq.device().clone());
         let packed =
             QLinear::from_packed_gs(&wq, &scales, &biases, dense_bias, GROUP_SIZE, &device)?;
         let quant_dtype = packed.quant_dtype().ok_or_else(|| {
@@ -324,7 +327,10 @@ pub fn embed(w: &Weights, base: &str, dtype: DType) -> Result<TieredEmbedding> {
         let biases = w.require(&format!("{base}.biases"))?;
         let (_vocab, groups) = scales.dims2()?;
         let hidden = groups * GROUP_SIZE;
-        let device = wq.device().clone();
+        let device = w
+            .host_packed_target()
+            .cloned()
+            .unwrap_or_else(|| wq.device().clone());
         let embedding =
             QEmbedding::from_packed_dtype_gs(&wq, &scales, &biases, &device, dtype, GROUP_SIZE)?;
         let base_bytes = embedding
