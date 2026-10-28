@@ -185,11 +185,10 @@ mod tests {
         let x = Array::from_slice(&(0..10).map(|v| v as f32).collect::<Vec<_>>(), &[2, 5]);
         let mid = slice_range(&x, 1, 1, 4).unwrap();
         assert_eq!(mid.shape(), &[2, 3]);
-        assert_eq!(mid.as_slice::<f32>(), &[1.0, 2.0, 3.0, 6.0, 7.0, 8.0]);
-        assert_eq!(
-            slice_range(&x, -1, 4, 5).unwrap().as_slice::<f32>(),
-            &[4.0, 9.0]
-        );
+        // `take_axis` may return a strided view: read logical order through `contiguous`.
+        let read = |a: &Array| contiguous(a).unwrap().as_slice::<f32>().to_vec();
+        assert_eq!(read(&mid), [1.0, 2.0, 3.0, 6.0, 7.0, 8.0]);
+        assert_eq!(read(&slice_range(&x, -1, 4, 5).unwrap()), [4.0, 9.0]);
         assert_eq!(slice_range(&x, 0, 0, 2).unwrap().shape(), &[2, 5]);
         assert_eq!(slice_range(&x, 1, 2, 2).unwrap().shape(), &[2, 0]);
         assert!(slice_range(&x, 1, 0, 9).is_err());
