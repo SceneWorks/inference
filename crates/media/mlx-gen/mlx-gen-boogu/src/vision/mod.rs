@@ -40,7 +40,7 @@ use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, softmax_axis, split};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::nn::{gelu_exact, gelu_tanh};
+use mlx_gen::nn::{gelu_exact, gelu_tanh, rotate_half};
 use mlx_gen::quant::lin;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -101,13 +101,6 @@ impl VisionConfig {
 /// LayerNorm in the model dtype (matches the reference's bf16 `nn.LayerNorm`).
 fn ln(x: &Array, w: &Array, b: &Array, eps: f32) -> Result<Array> {
     Ok(layer_norm(x, Some(w), Some(b), eps)?)
-}
-
-/// HF half-split rotary `rotate_half`: `cat(-x[d/2:], x[:d/2])` on the last axis.
-fn rotate_half(x: &Array) -> Result<Array> {
-    let ax = x.ndim() as i32 - 1;
-    let parts = split(x, 2, ax)?;
-    Ok(concatenate_axis(&[&parts[1].negative()?, &parts[0]], ax)?)
 }
 
 /// One vision block: pre-LayerNorm full attention + pre-LayerNorm GELU-tanh MLP, both residual.

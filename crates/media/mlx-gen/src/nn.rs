@@ -1173,6 +1173,34 @@ pub fn apply_text_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     Ok(add(&multiply(x, &cos)?, &multiply(&rot, &sin)?)?)
 }
 
+/// HF **half-split** (NeoX) `rotate_half` on the **last** axis: `cat(-x[d/2:], x[:d/2])`, i.e.
+/// `[x1, x2] → [-x2, x1]`. Rank-agnostic. NOT the interleaved-pair rotation (seedvr2's DiT, PuLID's
+/// EVA-CLIP `rotate_half_interleaved`) — those are a different op. Shared by the bernini / boogu /
+/// pid / Qwen-style vision RoPEs that open-coded the identical `split` + `negative` + `concatenate`
+/// sequence (sc-27441).
+pub fn rotate_half(x: &Array) -> Result<Array> {
+    let ax = x.ndim() as i32 - 1;
+    let parts = mlx_rs::ops::split(x, 2, ax)?;
+    Ok(mlx_rs::ops::concatenate_axis(
+        &[&parts[1].negative()?, &parts[0]],
+        ax,
+    )?)
+}
+
+/// Vision-tower half-split RoPE computed **in f32** and cast back to `x`'s dtype:
+/// `x·cos + rotate_half(x)·sin`. `x` is `[heads, seq, head_dim]`; `cos`/`sin` are `[seq, head_dim]`
+/// and broadcast over the head axis. The exact op sequence of the Qwen2.5-VL (qwen-image) and
+/// Pixtral (flux2) vision attentions, which each carried a private copy (sc-27431).
+pub fn apply_rope_rotate_half_f32(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
+    let orig = x.dtype();
+    let xf = x.as_dtype(Dtype::Float32)?;
+    let cos = cos.expand_dims(0)?.as_dtype(Dtype::Float32)?; // [1, seq, hd]
+    let sin = sin.expand_dims(0)?.as_dtype(Dtype::Float32)?;
+    let rotated = rotate_half(&xf)?;
+    let out = add(&multiply(&xf, &cos)?, &multiply(&rotated, &sin)?)?;
+    Ok(out.as_dtype(orig)?)
+}
+
 /// Grouped-query-attention key/value expansion: `[b, s, hkv, hd]` → `[b, s, hkv·groups, hd]`,
 /// repeating each kv head `groups` times consecutively (`repeat_interleave` over the head axis,
 /// matching `mx.repeat(x, groups, axis=2)` / torch `enable_gqa`). `groups == 1` is the identity.

@@ -24,7 +24,7 @@ use mlx_rs::ops::{
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::nn::silu;
+use mlx_gen::nn::{rotate_half, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -231,13 +231,6 @@ impl Layer {
         self.attn.quantize(bits)?;
         self.mlp.quantize(bits)
     }
-}
-
-/// HF half-split rotary `rotate_half`: `cat(-x[d/2:], x[:d/2])` on the last axis.
-fn rotate_half(x: &Array) -> Result<Array> {
-    let ax = x.ndim() as i32 - 1;
-    let parts = split(x, 2, ax)?;
-    Ok(concatenate_axis(&[&parts[1].negative()?, &parts[0]], ax)?)
 }
 
 /// The native Qwen2.5-VL-7B text decoder, run as a stateless penultimate-hidden-state extractor.

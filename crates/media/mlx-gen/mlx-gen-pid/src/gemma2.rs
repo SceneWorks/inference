@@ -13,14 +13,12 @@
 //! the local/global distinction collapses and a single causal (+ optional padding) mask suffices.
 
 use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, matmul, multiply, negative, softmax_axis, split, tanh,
-};
+use mlx_rs::ops::{add, broadcast_to, matmul, multiply, softmax_axis, tanh};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
-use mlx_gen::nn::{gelu_tanh, TokenEmbedding};
+use mlx_gen::nn::{gelu_tanh, rotate_half, TokenEmbedding};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -100,12 +98,6 @@ fn rope_tables(head_dim: i32, seq: i32, theta: f32) -> (Array, Array) {
         Array::from_slice(&cos, &[seq, head_dim]),
         Array::from_slice(&sin, &[seq, head_dim]),
     )
-}
-
-/// `rotate_half(x) = cat(-x[..,h:], x[..,:h])` for `[B,H,L,D]`.
-fn rotate_half(x: &Array) -> Result<Array> {
-    let p = split(x, 2, 3)?; // [x1, x2] halves along the head-dim axis
-    Ok(concatenate_axis(&[&negative(&p[1])?, &p[0]], 3)?)
 }
 
 /// `q·cos + rotate_half(q)·sin` with `cos`/`sin` `[L, D]` broadcast over `[B,H,L,D]`.
