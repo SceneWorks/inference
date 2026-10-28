@@ -1,0 +1,22 @@
+name: Set up the pinned Rust toolchain
+description: >-
+  Install the workspace's pinned Rust toolchain through dtolnay/rust-toolchain at one reviewed
+  SHA, so real-weight jobs share a single toolchain/action pin (sc-27273). The wrapped action's
+  steps run `shell: bash`: on a self-hosted Windows runner, select Git Bash on GITHUB_PATH
+  before this step (sc-24446). Needs the repository checked out at the workspace root.
+inputs:
+  toolchain:
+    description: Rust toolchain to install; keep in step with rust-toolchain.toml
+    required: false
+    default: '1.96.0'
+  components:
+    description: Comma-separated additional components, for example "rustfmt, clippy"
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}

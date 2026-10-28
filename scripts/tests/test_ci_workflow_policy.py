@@ -402,6 +402,11 @@ def minimax_h3_vram_policy_errors(workflow: str, manifest: str) -> list[str]:
 GIT_BASH_BIN = "C:\\Program Files\\Git\\bin"
 
 
+# Steps that install Rust through `dtolnay/rust-toolchain` (directly, or via the sc-27273 local
+# composite wrapping it), whose steps all run `shell: bash`.
+RUST_TOOLCHAIN_ACTIONS = ("dtolnay/rust-toolchain@", "./.github/actions/setup-rust")
+
+
 def windows_bash_selection_errors(name: str, job: dict) -> list[str]:
     """On a self-hosted Windows runner a bare `bash` resolves to WSL's
     `C:\\Windows\\System32\\bash.exe`, which has no distribution there and fails every step
@@ -420,7 +425,7 @@ def windows_bash_selection_errors(name: str, job: dict) -> list[str]:
             selected = True
             continue
         runs_bash = step.get("shell") == "bash" or str(step.get("uses", "")).startswith(
-            "dtolnay/rust-toolchain@"
+            RUST_TOOLCHAIN_ACTIONS
         )
         if runs_bash and not selected:
             errors.append(
@@ -1723,8 +1728,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 "hash lock dropped": ("--require-hashes", ""),
                 "failure no longer aborts": ("throw ", "Write-Host "),
                 "registry setup-python reintroduced": (
-                    "- uses: dtolnay/rust-toolchain@",
-                    "- uses: actions/setup-python@v5\n      - uses: dtolnay/rust-toolchain@",
+                    "- uses: ./.github/actions/setup-rust",
+                    "- uses: actions/setup-python@v5\n      - uses: ./.github/actions/setup-rust",
                 ),
             }
             for mutation, (needle, replacement) in mutations.items():
@@ -3171,7 +3176,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("models--SceneWorks--scail2-mlx", job)
         git_bash = job.index("Select Git Bash")
         validate_python = job.index("Validate runner-provisioned CPython 3.14 x64")
-        toolchain = job.index("uses: dtolnay/rust-toolchain@")
+        toolchain = job.index("uses: ./.github/actions/setup-rust")
         initialize_evidence = job.index("Initialize exact SCAIL CUDA evidence")
         provision = job.index("Provision the exact public shared bf16 package")
         self.assertLess(git_bash, toolchain)
@@ -5724,6 +5729,58 @@ class ActionPinConsistencyTests(unittest.TestCase):
                 )
             )
         self.assertEqual(len(pins), 1, f"actions/upload-artifact pinned to {sorted(pins)}")
+
+    def test_setup_rust_composite_keeps_one_toolchain_pin(self) -> None:
+        """sc-27273: real-weight jobs install Rust through `.github/actions/setup-rust`."""
+        root = WORKFLOW.parents[2]
+        action_text = (root / ".github/actions/setup-rust/action.yml").read_text(encoding="utf-8")
+        action = yaml.safe_load(action_text)
+        channel = tomllib.loads((root / "rust-toolchain.toml").read_text(encoding="utf-8"))[
+            "toolchain"
+        ]["channel"]
+        self.assertEqual(action["inputs"]["toolchain"]["default"], channel)
+        self.assertEqual(action["runs"]["using"], "composite")
+        pins = set(re.findall(r"dtolnay/rust-toolchain@([0-9a-f]{40})", action_text))
+        for workflow in sorted(WORKFLOW.parent.glob("*.yml")):
+            pins.update(
+                re.findall(
+                    r"uses:\s*dtolnay/rust-toolchain@([0-9a-f]{40})",
+                    workflow.read_text(encoding="utf-8"),
+                )
+            )
+        self.assertEqual(len(pins), 1, f"dtolnay/rust-toolchain pinned to {sorted(pins)}")
+
+        users = 0
+        for name, job in yaml.safe_load(real_weights_inline_text())["jobs"].items():
+            steps = job.get("steps", [])
+            for index, step in enumerate(steps):
+                if step.get("uses") != "./.github/actions/setup-rust":
+                    continue
+                users += 1
+                with self.subTest(job=name):
+                    # A local action resolves from the workspace root checkout of this commit.
+                    checkouts = [
+                        s for s in steps[:index]
+                        if str(s.get("uses", "")).startswith("actions/checkout@")
+                    ]
+                    self.assertTrue(checkouts, f"{name} uses setup-rust before checkout")
+                    self.assertTrue(
+                        all(not (s.get("with") or {}).get("path") for s in checkouts)
+                        and all(not (s.get("with") or {}).get("ref") for s in checkouts),
+                        f"{name} must check out this commit at the workspace root",
+                    )
+                    self.assertNotIn("toolchain", step.get("with") or {})
+        self.assertGreater(users, 0)
+
+    def test_windows_bash_selection_sees_the_setup_rust_composite(self) -> None:
+        job = {
+            "runs-on": ["self-hosted", "windows", "cuda"],
+            "steps": [
+                {"uses": "actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd"},
+                {"uses": "./.github/actions/setup-rust"},
+            ],
+        }
+        self.assertTrue(windows_bash_selection_errors("probe", job))
 
 
 if __name__ == "__main__":
