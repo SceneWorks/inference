@@ -68,6 +68,10 @@ impl fmt::Debug for GenerationView<'_> {
             .field("trim_first_frames", &r.trim_first_frames)
             .field("num_generated_keyframes", &r.num_generated_keyframes)
             .field("reference_image_short_edge", &r.reference_image_short_edge)
+            .field(
+                "reference_image_resize_mode",
+                &r.reference_image_resize_mode,
+            )
             .field("temporal_upsample_rounds", &r.temporal_upsample_rounds)
             .field("auto_duration", &r.auto_duration)
             .field("motion_bucket_id", &r.motion_bucket_id)
@@ -316,6 +320,13 @@ pub(crate) mod tests {
         request.flux3_layout = Some(Layout::parse(r#"{"version":1,"boxes":[]}"#).unwrap());
         check(&request);
         request.flux3_layout_bindings = vec![ReferenceBinding::oriented("reference-1", (64, 64))];
+        check(&request);
+        // sc-26691: the H3 reference resize policy changes the rendered work, so it is bound.
+        request.reference_image_resize_mode =
+            Some(mlx_gen::gen_core::ReferenceImageResizeMode::Match);
+        check(&request);
+        request.reference_image_resize_mode =
+            Some(mlx_gen::gen_core::ReferenceImageResizeMode::Max);
         check(&request);
     }
 

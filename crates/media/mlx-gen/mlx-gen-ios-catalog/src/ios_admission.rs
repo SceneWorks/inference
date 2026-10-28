@@ -1768,31 +1768,47 @@ fn anchored_demand_using_source_capacity(
                     "an exact measured key requires the actual SDK BeforeModelLoad process baseline".into()))?;
                 if baseline.domain != IosMemoryDomain::ProcessGrowth
                     || baseline.coordinate != IosMemoryCoordinate::BeforeModelLoad
-                    || baseline.bytes == 0 || baseline.source.is_empty()
+                    || baseline.bytes == 0
+                    || baseline.source.is_empty()
                 {
-                    return Err(no_evidence("exact measured key has an unspecified/incompatible request baseline".into()));
+                    return Err(no_evidence(
+                        "exact measured key has an unspecified/incompatible request baseline"
+                            .into(),
+                    ));
                 }
                 // Same complete key only: this is direct PROCESS evidence, not a Native-to-
                 // Process transfer. A masked lifetime upper cannot claim accurate attained demand
                 // or measured repeat variability. Retain the original pre-request ledger separately.
-                let (demand, margin) = row.exact_growth_and_margin_at(IosMemoryCoordinate::BeforeModelLoad)
-                    .map_err(|error| no_evidence(format!("exact measured key lacks accurate SDK-coordinate peaks: {error}")))?;
-                Ok((demand, margin, AdmissionBasis::Measured(row.anchor_kind), row.quantum_calibration(), Vec::new()))
-            },
-            evidence::AnchorOutcome::Refused { refused_quantum, .. } => {
-                Err(AdmissionError::refused(
-                    RefusalKind::Capacity,
-                    format!(
-                        "measured on {}: this {:?} anchor refused before allocation at quantum                          {} ({} B + {} B reserve, {:?} B live)",
-                        key.machine,
-                        row.anchor_kind,
-                        refused_quantum.label,
-                        refused_quantum.scratch_bytes,
-                        refused_quantum.reserve_bytes,
-                        refused_quantum.available_bytes
-                    ),
+                let (demand, margin) = row
+                    .exact_growth_and_margin_at(IosMemoryCoordinate::BeforeModelLoad)
+                    .map_err(|error| {
+                        no_evidence(format!(
+                            "exact measured key lacks accurate SDK-coordinate peaks: {error}"
+                        ))
+                    })?;
+                Ok((
+                    demand,
+                    margin,
+                    AdmissionBasis::Measured(row.anchor_kind),
+                    row.quantum_calibration(),
+                    Vec::new(),
                 ))
             }
+            evidence::AnchorOutcome::Refused {
+                refused_quantum, ..
+            } => Err(AdmissionError::refused(
+                RefusalKind::Capacity,
+                format!(
+                    "measured on {}: this {:?} anchor refused before allocation at quantum \
+                         {} ({} B + {} B reserve, {:?} B live)",
+                    key.machine,
+                    row.anchor_kind,
+                    refused_quantum.label,
+                    refused_quantum.scratch_bytes,
+                    refused_quantum.reserve_bytes,
+                    refused_quantum.available_bytes
+                ),
+            )),
         };
     }
     let family = key.family().map_err(no_evidence)?;

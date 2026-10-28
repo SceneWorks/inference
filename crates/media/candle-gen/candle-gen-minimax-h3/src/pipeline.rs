@@ -57,8 +57,8 @@ use crate::audio_config::{AUDIO_LATENT_CHANNELS, AUDIO_OUTPUT_CHANNELS, AUDIO_SA
 const AUDIO_CHANNELS: usize = AUDIO_OUTPUT_CHANNELS as usize;
 use crate::config::{LATENT_CHANNELS, VAE_RATIO};
 use crate::denoise::{
-    adaln_schedule, align_num_frames, JointGeometry, JointSchedule, JointVelocity, PackedLayout,
-    LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS, TEXT_TAG,
+    adaln_schedule, JointGeometry, JointSchedule, JointVelocity, PackedLayout, LEGAL_FRAME_COUNTS,
+    MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS, TEXT_TAG,
 };
 use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
 
@@ -193,23 +193,9 @@ pub fn resolve_geometry(width: u32, height: u32, num_frames: usize) -> Result<Re
 /// never leave it, so no ceiling clamp is needed and there is no duration in range that silently
 /// renders shorter than it asked for.
 pub fn align_frames_for_duration(seconds: f32) -> Result<usize> {
-    if !seconds.is_finite() {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: duration must be finite, got {seconds}"
-        )));
-    }
-    let seconds = f64::from(seconds);
-    if !(MIN_DURATION_SECONDS - 1e-6..=MAX_DURATION_SECONDS + 1e-6).contains(&seconds) {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: duration {seconds} s is outside the model's \
-             {MIN_DURATION_SECONDS}-{MAX_DURATION_SECONDS} s range (the {} legal frame counts \
-             124-345 at {MINIMAX_H3_FPS} fps; the reference pipeline advertises 5-15 s but its own \
-             17n+5 lattice tops out at 14.375 s)",
-            LEGAL_FRAME_COUNTS.len()
-        )));
-    }
-    let requested = (seconds * MINIMAX_H3_FPS).round().max(1.0) as usize;
-    let aligned = align_num_frames(requested);
+    // One definition, shared with allocation admission (`gen_core::veda::workspace`), so pricing
+    // and rendering can never resolve the same duration to different rungs (sc-26691).
+    let aligned = candle_gen::gen_core::h3_memory::align_frames_for_duration(seconds)? as usize;
     debug_assert!(
         LEGAL_FRAME_COUNTS.contains(&aligned),
         "an in-range duration must align onto a lattice rung, got {aligned}"
@@ -999,6 +985,24 @@ mod tests {
             let secs = f as f32 / MINIMAX_H3_FPS as f32;
             assert_eq!(align_frames_for_duration(secs).unwrap(), f);
         }
+        // The shared gen-core resolver admission prices with is this lattice, not a copy of it.
+        use candle_gen::gen_core::h3_memory as shared;
+        assert_eq!(shared::FPS, MINIMAX_H3_FPS);
+        assert_eq!(shared::MIN_FRAMES as usize, LEGAL_FRAME_COUNTS[0]);
+        assert_eq!(
+            shared::MAX_FRAMES as usize,
+            LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1]
+        );
+        assert_eq!(shared::resolve_request_frames(None, None).unwrap(), 124);
+        // ...and its upward alignment is this crate's `align_num_frames` at every in-range request.
+        for requested in LEGAL_FRAME_COUNTS[0]..=LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1] {
+            let secs = requested as f32 / MINIMAX_H3_FPS as f32;
+            assert_eq!(
+                align_frames_for_duration(secs).unwrap(),
+                crate::denoise::align_num_frames(requested),
+                "{requested} frames"
+            );
+        }
     }
 
     /// Patchify and unpatchify are exact inverses, and the permutation is the load-bearing part:
@@ -1254,5 +1258,90 @@ mod tests {
 
         assert!(t2va_layout(&g, 0, PATCH_SIZE, &d).is_err());
         assert!(fl2va_layout(&g, &[], &[], PATCH_SIZE, &d).is_err());
+    }
+
+    /// sc-26691 — the `match` resize mode and the upstream soundtrack bound, measured on the packed
+    /// sequence the DiT actually attends over (no weights: the layout is pure geometry).
+    ///
+    /// Case: a 1088x544x124 render with two 576x320 image references, two video references on a
+    /// 1376x768 canvas each carrying a 30 s stereo soundtrack, and two 30 s stereo audio references.
+    /// Before: the plates upscaled to a 2048 short edge (`diffusers`) and every soundtrack encoded
+    /// whole. After: the plates stay 576x320 (`match`, area below the canvas) and every soundtrack
+    /// is cut to `124 / 24` s.
+    #[test]
+    fn match_resize_and_audio_truncation_shrink_the_ref2va_sequence() {
+        use crate::reference::ReferenceKind;
+        use candle_gen::gen_core::{
+            h3_reference::{reference_audio_max_samples_per_channel, REFERENCE_IMAGE_MULTIPLE},
+            resolve_reference_image_size, ReferenceImageResizeMode,
+        };
+        let d = Device::Cpu;
+        let g = resolve_geometry(1088, 544, 124).unwrap();
+        let hop = 800; // 32 kHz / 40 latent tokens per second
+        let source_samples = 30 * 32_000;
+        let rows = |mode: ReferenceImageResizeMode, truncate: bool| {
+            let (w, h) = resolve_reference_image_size(
+                576,
+                320,
+                g.width,
+                g.height,
+                mode,
+                2048,
+                REFERENCE_IMAGE_MULTIPLE,
+            )
+            .unwrap();
+            let samples = if truncate {
+                source_samples.min(reference_audio_max_samples_per_channel(
+                    124,
+                    MINIMAX_H3_FPS,
+                    32_000,
+                ))
+            } else {
+                source_samples
+            };
+            let audio_latents = samples.div_ceil(hop);
+            let image = ReferenceLatentGeometry {
+                kind: ReferenceKind::Image,
+                num_latent_frames: 1,
+                latent_height: h as usize / 16,
+                latent_width: w as usize / 16,
+                num_audio_latents: 0,
+            };
+            let video = ReferenceLatentGeometry {
+                kind: ReferenceKind::Video,
+                num_latent_frames: g.joint.num_latent_frames,
+                latent_height: 768 / 16,
+                latent_width: 1376 / 16,
+                num_audio_latents: audio_latents,
+            };
+            let audio = ReferenceLatentGeometry {
+                kind: ReferenceKind::Audio,
+                num_latent_frames: 0,
+                latent_height: 0,
+                latent_width: 0,
+                num_audio_latents: audio_latents,
+            };
+            let refs = [image, image, video, video, audio, audio];
+            let channels = [0, 0, 2, 2, 2, 2];
+            let layout = ref2va_layout_with_audio_channels(
+                &g,
+                &[TEXT_TAG; 512],
+                &refs,
+                &channels,
+                PATCH_SIZE,
+                &d,
+            )
+            .unwrap();
+            ((w, h), audio_latents, layout.seq_len())
+        };
+        let (before_plate, before_audio, before) = rows(ReferenceImageResizeMode::Diffusers, false);
+        let (after_plate, after_audio, after) = rows(ReferenceImageResizeMode::Match, true);
+        assert_eq!(before_plate, (3680, 2048));
+        assert_eq!(after_plate, (576, 320));
+        assert_eq!((before_audio, after_audio), (1200, 207));
+        // Images: 2 x (115 x 64 - 18 x 10) = 14_360 rows. Audio: 4 refs x 2 channels x (1200 - 207)
+        // = 7_944 rows.
+        assert_eq!(before - after, 14_360 + 7_944);
+        assert_eq!((before, after), (123_000, 100_696));
     }
 }
