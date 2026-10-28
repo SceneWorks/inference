@@ -6864,7 +6864,6 @@ mod tests {
 
     /// The fused reader against the independent fp32 oracle: decode over two K groups plus a
     /// residual tail, a causal prefill chunk, and a split-KV history, at the campaign tolerance.
-    #[cfg(feature = "campaign")]
     #[cfg(target_os = "macos")]
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
@@ -6883,7 +6882,7 @@ mod tests {
                 assert_eq!(errors.len(), 4 * 128 + 4 * 5 * 128 + 4 * 128);
                 let max = errors.iter().copied().fold(0.0, f64::max);
                 assert!(
-                    max <= crate::campaign::COMPRESSED_PARITY_MAX_ERROR,
+                    max <= crate::decode::observe::COMPRESSED_PARITY_MAX_ERROR,
                     "{family:?}: max parity error {max}"
                 );
                 eprintln!("campaign parity {bits:?} {family:?} D=128: max abs {max}");
@@ -6893,7 +6892,7 @@ mod tests {
                     assert_eq!(errors.len(), (4 + 4 * 5 + 4) * width);
                     let max = errors.iter().copied().fold(0.0, f64::max);
                     assert!(
-                        max <= crate::campaign::COMPRESSED_PARITY_MAX_ERROR,
+                        max <= crate::decode::observe::COMPRESSED_PARITY_MAX_ERROR,
                         "{family:?} at {width}: max parity error {max}"
                     );
                 }

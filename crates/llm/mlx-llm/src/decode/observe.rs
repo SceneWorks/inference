@@ -9,6 +9,12 @@
 
 use std::path::PathBuf;
 
+/// Frozen compressed-domain parity contract: the largest absolute error a fused compressed-KV
+/// reader may show against the independent fp32 oracle. The SC-20671 / SC-20676 campaigns gate on
+/// it (re-exported as `campaign::COMPRESSED_PARITY_MAX_ERROR`), and the reader's own kernel tests
+/// hold to it in every build (sc-27303).
+pub const COMPRESSED_PARITY_MAX_ERROR: f64 = 0.0001;
+
 /// The narrow observation seam used by a real campaign runner.  The runner owns platform probes
 /// (`footprint` and `mlx_rs::memory`); the product path owns the phase boundaries and generation.
 /// Teacher forcing for the campaign's greedy-agreement measurement: the decode loop feeds the

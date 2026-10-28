@@ -129,7 +129,8 @@ pub const TIMING_REPEATS: usize = 5;
 pub const TIMING_WARMUPS: usize = 2;
 
 /// Frozen compressed-domain parity contract, shared by SC-20671 and the SC-20676 product proof.
-pub const COMPRESSED_PARITY_MAX_ERROR: f64 = 0.0001;
+/// Engine-owned (the fused reader's own kernel tests hold to it), re-exported here.
+pub use crate::decode::observe::COMPRESSED_PARITY_MAX_ERROR;
 
 pub const COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN: f64 = 0.999;
 
