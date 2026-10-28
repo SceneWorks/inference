@@ -7,8 +7,8 @@
 //! - [`decoded_to_image`] — the VAE-decoded-tensor → [`Image`] denormalize/quantize step — operates
 //!   on an `mlx_rs::Array` and stays here.
 
-use mlx_rs::ops::{add, maximum, minimum, multiply, round};
-use mlx_rs::Array;
+use mlx_rs::ops::{add, divide, maximum, minimum, multiply, round};
+use mlx_rs::{Array, Dtype};
 
 use crate::array::scalar;
 use crate::media::{Image, RgbaImage};
@@ -116,6 +116,92 @@ fn decoded_to_interleaved_u8(decoded: &Array, who: &str) -> Result<(u32, u32, us
     Ok((w as u32, h as u32, c, pixels))
 }
 
+/// Split an `(F, H, W, 3)` uint8 video tensor into one RGB8 [`Image`] per frame — the shared
+/// splitter behind the Mochi / LTX / Wan / MiniMax-H3 video emissions (sc-27319 / sc-27340), which
+/// each carried a copy with divergent shape and overflow handling.
+///
+/// - **Shape-checked.** Anything but rank 4 with 3 trailing channels is an error, not an
+///   out-of-bounds index; the host slice is length-checked against `F·H·W·3` before splitting.
+/// - **Logical order.** `as_slice` returns the *physical* buffer, so a transpose-strided view would
+///   read scrambled. The tensor is first forced row-major through the int64-safe
+///   [`crate::array::contiguous`], then viewed frame-major as `[F, H·W·3]` (sc-12748): the full
+///   `F·H·W·3` product is never a single MLX dimension, so a clip past `i32::MAX` total elements
+///   (1920×1088@349f ≈ 2.19e9) still splits, while one frame's `H·W·3` must fit `i32` (≤ ~1e8 even at
+///   8K) and is checked.
+/// - A non-uint8 tensor is cast to uint8 first (a no-op for the uint8 frames every caller passes).
+pub fn u8_frames_to_images(frames: &Array) -> Result<Vec<Image>> {
+    let sh = frames.shape();
+    if sh.len() != 4 || sh[3] != 3 {
+        return Err(Error::Msg(format!(
+            "u8_frames_to_images: expected (F, H, W, 3) frames, got {sh:?}"
+        )));
+    }
+    let (f, h, w) = (sh[0], sh[1], sh[2]);
+    let per_frame = h
+        .checked_mul(w)
+        .and_then(|hw| hw.checked_mul(3))
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "u8_frames_to_images: one {w}x{h} frame exceeds the i32 element range"
+            ))
+        })?;
+    let owned = crate::array::contiguous(&frames.as_dtype(Dtype::Uint8)?)?;
+    let flat = owned.reshape(&[f, per_frame])?;
+    let data = flat
+        .try_as_slice::<u8>()
+        .map_err(|e| Error::Msg(format!("u8_frames_to_images: unreadable frame buffer: {e}")))?;
+    let per = per_frame as usize;
+    let frame_count = f as usize;
+    if Some(data.len()) != frame_count.checked_mul(per) {
+        return Err(Error::Msg(format!(
+            "u8_frames_to_images: frame buffer holds {} bytes, expected {frame_count}×{per}",
+            data.len()
+        )));
+    }
+    Ok((0..frame_count)
+        .map(|i| Image {
+            width: w as u32,
+            height: h as u32,
+            pixels: data[i * per..(i + 1) * per].to_vec(),
+        })
+        .collect())
+}
+
+/// A decoded `(1, 3, F, H, W)` video in ~`[-1, 1]` → `(F, H, W, 3)` uint8 (row-major), mirroring the
+/// reference `((x + 1) / 2).clamp(0, 1)·255` + round, computed in the video's own dtype. The
+/// Mochi and LTX `to_uint8_frames` bodies, which were identical apart from the error prefix `who`
+/// (sc-27319). Batch must be 1: the reshape drops the batch axis, so B>1 would interleave frames
+/// across batch items (F-051).
+pub fn video_bcfhw_to_u8_frames(video: &Array, who: &str) -> Result<Array> {
+    let sh = video.shape(); // (1, 3, F, H, W)
+    if sh.len() != 5 {
+        return Err(Error::Msg(format!(
+            "{who}: expected a (1, 3, F, H, W) video, got {sh:?}"
+        )));
+    }
+    if sh[0] != 1 {
+        return Err(Error::Msg(format!(
+            "{who}: batch size must be 1, got {}",
+            sh[0]
+        )));
+    }
+    let (c, f, h, w) = (sh[1], sh[2], sh[3], sh[4]);
+    let dt = video.dtype();
+    let chw = video
+        .reshape(&[c, f, h, w])?
+        .transpose_axes(&[1, 2, 3, 0])?; // (F, H, W, 3)
+    let half = divide(
+        &add(&chw, &scalar(1.0).as_dtype(dt)?)?,
+        &scalar(2.0).as_dtype(dt)?,
+    )?;
+    let clipped = minimum(
+        &maximum(&half, &scalar(0.0).as_dtype(dt)?)?,
+        &scalar(1.0).as_dtype(dt)?,
+    )?;
+    let scaled = multiply(&clipped, &scalar(255.0).as_dtype(dt)?)?;
+    crate::array::contiguous(&round(&scaled, None)?.as_dtype(Dtype::Uint8)?)
+}
+
 /// Reject pipeline dimensions that aren't multiples of `multiple` — the latent-pack requirement
 /// shared by the mlx image pipelines that pack an /8 VAE latent with a 2×2 patchify (FLUX.1 / FLUX.2
 /// / Boogu / Krea). `family` names the model in the error message so the single shared check reads
@@ -138,6 +224,63 @@ pub fn validate_multiple_of(width: u32, height: u32, multiple: u32, family: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-27319: `(F, H, W, 3)` splits into per-frame RGB8 images (moved from the mochi/ltx copies).
+    #[test]
+    fn u8_frames_to_images_splits_per_frame() {
+        // (F=2, H=1, W=2, 3): each frame = 6 bytes.
+        let data: Vec<u8> = (0..12).collect();
+        let frames = Array::from_slice(&data, &[2, 1, 2, 3]);
+        let imgs = u8_frames_to_images(&frames).unwrap();
+        assert_eq!(imgs.len(), 2);
+        assert_eq!((imgs[0].width, imgs[0].height), (2, 1));
+        assert_eq!(imgs[0].pixels, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(imgs[1].pixels, vec![6, 7, 8, 9, 10, 11]);
+    }
+
+    /// sc-27319: a permuted (non-row-contiguous) `(F, H, W, 3)` view is split in LOGICAL order, not
+    /// the physical buffer order a raw `as_slice` would return.
+    #[test]
+    fn u8_frames_to_images_reads_a_strided_view_logically() {
+        // Physical (3, F=2, H=1, W=2) planes → logical (F, H, W, 3) through a transpose view.
+        let planes: Vec<u8> = (0..12).collect();
+        let frames = Array::from_slice(&planes, &[3, 2, 1, 2])
+            .transpose_axes(&[1, 2, 3, 0])
+            .unwrap();
+        frames.eval().unwrap();
+        let imgs = u8_frames_to_images(&frames).unwrap();
+        // Frame 0 pixel (0,0) = channels (0, 4, 8), pixel (0,1) = (1, 5, 9); frame 1 offsets by 2.
+        assert_eq!(imgs[0].pixels, vec![0, 4, 8, 1, 5, 9]);
+        assert_eq!(imgs[1].pixels, vec![2, 6, 10, 3, 7, 11]);
+    }
+
+    /// sc-27340: a wrong rank or channel count is an error, not an out-of-bounds index.
+    #[test]
+    fn u8_frames_to_images_rejects_bad_shapes() {
+        let rank3 = Array::from_slice(&[0u8; 6], &[1, 2, 3]);
+        assert!(u8_frames_to_images(&rank3).is_err());
+        let four_channel = Array::from_slice(&[0u8; 8], &[1, 1, 2, 4]);
+        assert!(u8_frames_to_images(&four_channel).is_err());
+    }
+
+    /// sc-27319: the shared Mochi/LTX `(1, 3, F, H, W)` → uint8 frames conversion clips to
+    /// [0, 255], rounds half-to-even, and lays frames out row-major `(F, H, W, 3)`.
+    #[test]
+    fn video_bcfhw_to_u8_frames_clips_and_scales() {
+        // (1,3,1,1,2): channels at w=0 are x=[-2,0.2,0.6]; at w=1 x=[-1,1,2].
+        // (x+1)/2 clip[0,1] ·255: -2→0, 0.2→153, 0.6→204, -1→0, 1→255, 2→255.
+        let video = Array::from_slice(&[-2.0f32, -1.0, 0.2, 1.0, 0.6, 2.0], &[1, 3, 1, 1, 2]);
+        let frames = video_bcfhw_to_u8_frames(&video, "test").unwrap();
+        assert_eq!(frames.shape(), &[1, 1, 2, 3]);
+        assert_eq!(frames.dtype(), Dtype::Uint8);
+        assert_eq!(frames.as_slice::<u8>(), &[0, 153, 204, 0, 255, 255]);
+
+        let batch2 = Array::from_slice(&[0.0f32; 6], &[2, 3, 1, 1, 1]);
+        let err = video_bcfhw_to_u8_frames(&batch2, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("test: batch size must be 1"), "{err}");
+    }
 
     #[test]
     fn decoded_rgb8_policy_rounds_midpoints_to_even() {

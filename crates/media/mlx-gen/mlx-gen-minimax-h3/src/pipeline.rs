@@ -416,24 +416,16 @@ pub fn frames_to_images(video: &Array) -> Result<Vec<Image>> {
         )));
     }
     let (t, h, w) = (s[2], s[3], s[4]);
-    // NCTHW -> NTHWC, then the frame-major `[T, H·W·3]` flatten. The collapse is what forces the
-    // transpose-strided tensor into logical C-order: `as_slice` returns the PHYSICAL buffer, so a
-    // raw read of the transposed array would interleave the channels wrongly. Never forms the whole
-    // `t·h·w·3` product as a single dimension.
-    let bytes = multiply(&video.as_dtype(Dtype::Float32)?, Array::from_f32(255.0))?
+    // NCTHW -> NTHWC `[T, H, W, 3]` u8, then the shared shape-checked splitter (sc-27319), which
+    // forces logical C-order (`as_slice` returns the PHYSICAL buffer, so a raw read of the
+    // transposed array would interleave the channels wrongly) and splits frame-major `[T, H·W·3]`,
+    // never forming the whole `t·h·w·3` product as a single dimension.
+    let frames = multiply(&video.as_dtype(Dtype::Float32)?, Array::from_f32(255.0))?
         .round(None)?
         .as_dtype(Dtype::Uint8)?
         .transpose_axes(&[0, 2, 3, 4, 1])?
-        .reshape(&[t, h * w * 3])?;
-    let flat = bytes.as_slice::<u8>();
-    let per = (h as usize) * (w as usize) * 3;
-    Ok((0..t as usize)
-        .map(|i| Image {
-            width: w as u32,
-            height: h as u32,
-            pixels: flat[i * per..(i + 1) * per].to_vec(),
-        })
-        .collect())
+        .reshape(&[t, h, w, 3])?;
+    mlx_gen::image::u8_frames_to_images(&frames)
 }
 
 /// How the delivered soundtrack is reconciled with the delivered picture.

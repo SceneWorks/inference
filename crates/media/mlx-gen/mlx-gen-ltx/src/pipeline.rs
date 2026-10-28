@@ -21,7 +21,7 @@
 //! gap (per-stage latents + decoded frames) rather than writing it off.
 
 use mlx_rs::memory::get_memory_limit;
-use mlx_rs::ops::{add, broadcast_to, divide, maximum, minimum, multiply, subtract};
+use mlx_rs::ops::{add, broadcast_to, divide, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
@@ -204,31 +204,10 @@ pub(crate) fn decode_to_frames_with_tiling(
 
 /// `(B=1, 3, F, H, W)` video in ~[-1, 1] → `(F, H, W, 3)` uint8. The reference clips `(x+1)/2` to
 /// `[0, 1]` *before* scaling by 255, so the result saturates at 255 (truncating cast).
+/// The body is the shared [`mlx_gen::image::video_bcfhw_to_u8_frames`] (identical to Mochi's;
+/// sc-27319).
 pub fn to_uint8_frames(video: &Array) -> Result<Array> {
-    let sh = video.shape(); // (1, 3, F, H, W)
-                            // The reshape below drops the batch axis; B>1 would interleave frames across batch items (or
-                            // shape-error). Production decode is B==1 — reject anything else with a clear message (F-051).
-    if sh[0] != 1 {
-        return Err(Error::Msg(format!(
-            "ltx to_uint8_frames: batch size must be 1, got {}",
-            sh[0]
-        )));
-    }
-    let (c, f, h, w) = (sh[1], sh[2], sh[3], sh[4]);
-    let dt = video.dtype();
-    let chw = video
-        .reshape(&[c, f, h, w])?
-        .transpose_axes(&[1, 2, 3, 0])?; // (F, H, W, 3)
-    let half = divide(
-        &add(&chw, &scalar(1.0).as_dtype(dt)?)?,
-        &scalar(2.0).as_dtype(dt)?,
-    )?;
-    let clipped = minimum(
-        &maximum(&half, &scalar(0.0).as_dtype(dt)?)?,
-        &scalar(1.0).as_dtype(dt)?,
-    )?;
-    let scaled = multiply(&clipped, &scalar(255.0).as_dtype(dt)?)?;
-    contiguous(&mlx_rs::ops::round(&scaled, None)?.as_dtype(Dtype::Uint8)?)
+    mlx_gen::image::video_bcfhw_to_u8_frames(video, "ltx to_uint8_frames")
 }
 
 // --- sc-6894 F-004: LTX VAE decode budgeting ------------------------------------------------------
