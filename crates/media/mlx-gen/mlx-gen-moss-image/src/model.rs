@@ -27,13 +27,32 @@ fn incremental_peak(peak: u64, owned: u64, committed: u64) -> u64 {
 struct AttemptState<R, P> {
     renderer: Option<(MossImageAcceleration, R)>,
     report: Option<P>,
+    apply_reports: Vec<gen_core::AdapterApplyReport>,
 }
 impl<R, P> AttemptState<R, P> {
-    fn begin(&mut self) {
+    fn begin_request<E>(
+        &mut self,
+        pins: &[gen_core::PinnedWeightsFile],
+        edit_report: &mut Option<E>,
+    ) -> Result<()> {
+        // Pin authentication can fail before execution enters its cleanup scope.
+        *edit_report = None;
+        self.begin(pins)
+    }
+    fn begin(&mut self, pins: &[gen_core::PinnedWeightsFile]) -> Result<()> {
         self.report = None;
+        self.apply_reports.clear();
+        for pin in pins {
+            if let Err(error) = pin.verify_unchanged() {
+                self.renderer = None;
+                return Err(error.into());
+            }
+        }
+        Ok(())
     }
     fn failed(&mut self) {
         self.report = None;
+        self.apply_reports.clear();
         self.renderer = None;
     }
     fn release_for_request(&mut self, mode: MossImageAcceleration, edit: bool) -> bool {
@@ -70,6 +89,8 @@ type State = AttemptState<Transformer, MossImageExecutionReport>;
 /// One lifecycle lock owns validation, mode selection, execution and completed-report publication.
 pub struct MossImage {
     variant: MossImageVariant,
+    custom_adapter_bytes: u64,
+    custom_pins: Vec<gen_core::PinnedWeightsFile>,
     descriptor: ModelDescriptor,
     spec: LoadSpec,
     sources: Sources,
@@ -94,6 +115,8 @@ fn descriptor(variant: MossImageVariant) -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
+            supports_lora: true,
+            supports_lokr: true,
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_prompt_batch: true,
@@ -141,13 +164,31 @@ impl MossImage {
     pub fn load(variant: MossImageVariant, spec: &LoadSpec) -> Result<Self> {
         Self::validate_load_spec(spec)?;
         let sources = Sources::prepare(variant, spec)?;
+        Self::from_sources(variant, spec, sources)
+    }
+    pub(crate) fn from_sources(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        sources: Sources,
+    ) -> Result<Self> {
         let facts = memory_strategy::facts(&sources)?;
-        let memory = memory_strategy::contract_with_facts(variant, facts);
-        let load_peak = facts
-            .base_bytes
-            .saturating_add(facts.overlay_bytes)
-            .saturating_add(5_362_224_248);
-        if mlx_gen::memory::recommended_working_set_bytes().is_some_and(|cap| load_peak > cap) {
+        let custom_adapter_bytes =
+            crate::adapters::estimated_bytes(&spec.adapters, &sources.config)?;
+        let (memory, load_peak) = memory_strategy::loaded_admission(
+            variant,
+            facts,
+            custom_adapter_bytes,
+            sources.load_staging_bytes()?,
+        )?;
+        let custom_pins = spec
+            .adapters
+            .iter()
+            .map(|adapter| spec.file_pin_for(&adapter.path))
+            .collect::<gen_core::Result<Vec<_>>>()?;
+        if sources
+            .working_set_budget()?
+            .is_some_and(|cap| load_peak > cap)
+        {
             return Err(Error::Unsupported(format!("MOSS resident load requires approximately {load_peak} bytes including source staging, beyond the admitted MLX working set")));
         }
         let cancel = CancelFlag::new();
@@ -168,7 +209,11 @@ impl MossImage {
         let vae = Flux2Vae::from_weights_decode_only(
             &vae_weights,
             &Flux2VaeDecoderConfig {
-                block_out_channels: [96, 192, 384, 384],
+                block_out_channels: if sources.is_fixture() {
+                    [32; 4]
+                } else {
+                    [96, 192, 384, 384]
+                },
             },
         )?;
         vae_weights.materialize_accessed()?;
@@ -181,6 +226,8 @@ impl MossImage {
         sources.ensure_unchanged()?;
         Ok(Self {
             variant,
+            custom_adapter_bytes,
+            custom_pins,
             descriptor: descriptor(variant),
             spec: spec.clone(),
             sources,
@@ -191,10 +238,20 @@ impl MossImage {
             state: Mutex::new(State {
                 renderer: None,
                 report: None,
+                apply_reports: vec![],
             }),
         })
     }
     fn selected_sources(&self, mode: MossImageAcceleration) -> Result<Sources> {
+        if self.sources.is_fixture() {
+            if mode != MossImageAcceleration::Off {
+                return Err(Error::Unsupported(
+                    "synthetic test profile has no published DMD assets".into(),
+                ));
+            }
+            self.sources.ensure_unchanged()?;
+            return Ok(self.sources.clone());
+        }
         Sources::selected(self.variant, &self.spec, mode)
     }
     fn validate_inputs(
@@ -202,11 +259,42 @@ impl MossImage {
         request: &GenerationRequest,
         inputs: MossImageAdvancedInputs<'_>,
     ) -> Result<(MossImageResolved, usize)> {
-        Self::validate_request_inputs(self.variant, &self.spec, request, inputs)
+        let (resolved, count) =
+            Self::resolve_request_inputs(self.variant, &self.spec, request, inputs)?;
+        // Fixture loads keep their already-prepared sources (a synthetic profile has no published
+        // DMD selection); real loads re-select the requested acceleration closure.
+        let selected = self.selected_sources(resolved.acceleration)?;
+        selected.mode_assets(resolved.acceleration)?;
+        let _ = selected.request_workspace_bytes(
+            request.width,
+            request.height,
+            count,
+            resolved.max_sequence_length,
+            request_branches(&resolved),
+        )?;
+        Ok((resolved, count))
     }
     pub(crate) fn validate_request_inputs(
         variant: MossImageVariant,
         spec: &LoadSpec,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+    ) -> Result<(MossImageResolved, usize)> {
+        let (resolved, count) = Self::resolve_request_inputs(variant, spec, request, inputs)?;
+        let selected = Sources::selected(variant, spec, resolved.acceleration)?;
+        selected.mode_assets(resolved.acceleration)?;
+        let _ = selected.request_workspace_bytes(
+            request.width,
+            request.height,
+            count,
+            resolved.max_sequence_length,
+            request_branches(&resolved),
+        )?;
+        Ok((resolved, count))
+    }
+    fn resolve_request_inputs(
+        variant: MossImageVariant,
+        _spec: &LoadSpec,
         request: &GenerationRequest,
         inputs: MossImageAdvancedInputs<'_>,
     ) -> Result<(MossImageResolved, usize)> {
@@ -225,26 +313,6 @@ impl MossImage {
         {
             return Err(Error::Unsupported("MOSS currently implements resident execution; staging, tiling, chunking, windows and alternate execution policies are unavailable".into()));
         }
-        Sources::selected(variant, spec, resolved.acceleration)?
-            .mode_assets(resolved.acceleration)?;
-        let branches = if matches!(resolved.acceleration, MossImageAcceleration::Off) {
-            1 + u32::from(resolved.guidance != 1.0)
-                + u32::from(
-                    resolved
-                        .slg
-                        .as_ref()
-                        .is_some_and(|s| s.scale > 0.0 && !s.layers.is_empty()),
-                )
-        } else {
-            1
-        };
-        let _ = memory_strategy::request_workspace_bytes(
-            request.width,
-            request.height,
-            count,
-            resolved.max_sequence_length,
-            branches,
-        )?;
         Ok((resolved, count))
     }
     /// Structural request peak for admission, including expanded batches, context, precision assets
@@ -269,16 +337,18 @@ impl MossImage {
             &self.selected_sources(r.acceleration)?,
             r.acceleration,
         )?;
-        memory_strategy::request_workspace_bytes(
-            request.width,
-            request.height,
-            count,
-            r.max_sequence_length,
-            branches,
-        )?
-        .checked_add(assets.base_bytes)
-        .and_then(|n| n.checked_add(assets.overlay_bytes))
-        .ok_or_else(|| Error::Unsupported("MOSS peak overflow".into()))
+        self.sources
+            .request_workspace_bytes(
+                request.width,
+                request.height,
+                count,
+                r.max_sequence_length,
+                branches,
+            )?
+            .checked_add(assets.base_bytes)
+            .and_then(|n| n.checked_add(assets.overlay_bytes))
+            .and_then(|n| n.checked_add(self.custom_adapter_bytes))
+            .ok_or_else(|| Error::Unsupported("MOSS peak overflow".into()))
     }
     /// Incremental live demand above a caller's committed snapshot. Credit is bounded by this
     /// provider's retained materialized buffers and by that snapshot; foreign models earn no credit.
@@ -323,12 +393,11 @@ impl MossImage {
             .state
             .lock()
             .map_err(|_| Error::Msg("MOSS lifecycle lock poisoned".into()))?;
-        state.begin();
         let mut edit_report = self
             .edit_report
             .lock()
             .map_err(|_| Error::Msg("MOSS edit receipt lock poisoned".into()))?;
-        *edit_report = None;
+        state.begin_request(&self.custom_pins, &mut edit_report)?;
         let result = (|| {
             check(&request.cancel)?;
             self.sources.ensure_unchanged()?;
@@ -346,14 +415,14 @@ impl MossImage {
             let edit_assets = edit
                 .map(|_| crate::edit::EditAssets::prepare(&self.spec))
                 .transpose()?;
-            if let Some(cap) = mlx_gen::memory::recommended_working_set_bytes() {
+            if let Some(cap) = self.sources.working_set_budget()? {
                 if peak > cap {
                     return Err(Error::Unsupported(format!("MOSS structural resident peak {peak} exceeds admitted MLX working set {cap}; choose a supported geometry/batch or a larger admitted device")));
                 }
             }
             // Only the selected immutable renderer may overlap conditioning activations.
             if state.release_for_request(resolved.acceleration, edit.is_some()) {
-                mlx_gen::residency::drain_allocator_cache();
+                self.sources.drain_cache()?;
             }
             let batch = inputs
                 .positive
@@ -406,6 +475,13 @@ impl MossImage {
             let mut edit_references = None;
             if let (Some(edit), Some(assets)) = (edit, edit_assets.as_ref()) {
                 let mut renderer = sources.transformer(resolved.acceleration, &request.cancel)?;
+                let custom_reports = crate::adapters::apply_pinned(
+                    &mut renderer,
+                    self.variant,
+                    &self.spec.adapters,
+                    &self.custom_pins,
+                )?;
+                renderer.custom_reports = custom_reports;
                 assets.install(&mut renderer, &request.cancel)?;
                 edit_references = Some(crate::edit::encode_references(
                     &sources,
@@ -417,8 +493,17 @@ impl MossImage {
                 check(&request.cancel)?;
             } else {
                 state.select(resolved.acceleration, || {
-                    mlx_gen::residency::drain_allocator_cache();
-                    sources.transformer(resolved.acceleration, &request.cancel)
+                    self.sources.drain_cache()?;
+                    let mut transformer =
+                        sources.transformer(resolved.acceleration, &request.cancel)?;
+                    let custom_reports = crate::adapters::apply_pinned(
+                        &mut transformer,
+                        self.variant,
+                        &self.spec.adapters,
+                        &self.custom_pins,
+                    )?;
+                    transformer.custom_reports = custom_reports;
+                    Ok(transformer)
                 })?;
             }
             let shape = [
@@ -584,6 +669,8 @@ impl MossImage {
             .into_iter()
             .map(|(k, v)| (k.into(), v))
             .collect();
+            let mut apply_reports = renderer.custom_reports.clone();
+            // This sealed source receipt records the published DMD installation only.
             let mut adapter_reports = Vec::new();
             if resolved.acceleration != MossImageAcceleration::Off {
                 for key in [
@@ -613,6 +700,15 @@ impl MossImage {
             }
             sources.ensure_unchanged()?;
             check(&request.cancel)?;
+            apply_reports.extend(adapter_reports.iter().cloned());
+            #[cfg(feature = "test-support")]
+            if self.sources.is_fixture() {
+                check(&request.cancel)?;
+                // No sealed author receipt is manufactured for generated synthetic source bytes.
+                state.report = None;
+                state.apply_reports = apply_reports;
+                return Ok(output);
+            }
             let report = MossImageExecutionReport::new(MossImageExecutionData {
                 execution_device: MossImageExecutionDevice::Mlx,
                 resolved,
@@ -654,9 +750,16 @@ impl MossImage {
                     .as_ref()
                     .expect("just published edit receipt")
                     .validate()?;
+                let receipt = edit_report.as_ref().expect("just validated edit receipt");
+                apply_reports.push(gen_core::AdapterApplyReport {
+                    adapter_path: receipt.adapter_path.clone(),
+                    applied: receipt.applied_projections,
+                    skipped: vec![],
+                });
             } else {
                 state.report = Some(report);
             }
+            state.apply_reports = apply_reports;
             Ok(output)
         })();
         if result.is_err() {
@@ -664,7 +767,7 @@ impl MossImage {
             state.failed();
         }
         if result.is_err() || edit.is_some() {
-            mlx_gen::residency::drain_allocator_cache();
+            self.sources.drain_cache()?;
         }
         result
     }
@@ -693,10 +796,12 @@ impl Generator for MossImage {
                 .state
                 .lock()
                 .map_err(|_| gen_core::Error::Unsupported("MOSS lifecycle lock poisoned".into()))?;
-            state.begin();
-            *self.edit_report.lock().map_err(|_| {
+            let mut edit_report = self.edit_report.lock().map_err(|_| {
                 gen_core::Error::Unsupported("MOSS edit receipt lock poisoned".into())
-            })? = None;
+            })?;
+            state
+                .begin_request(&self.custom_pins, &mut edit_report)
+                .map_err(gen_core::Error::from)?;
         }
         inputs.validate()?;
         let request = edit_request(request)?;
@@ -757,16 +862,22 @@ impl Generator for MossImage {
             .map(|state| self.cached_owned_weight_bytes(&state))
     }
     fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
-        if let Some(edit) = self.moss_image_edit_execution_report() {
-            vec![gen_core::AdapterApplyReport {
-                adapter_path: edit.adapter_path,
-                applied: edit.applied_projections,
-                skipped: vec![],
-            }]
-        } else {
-            self.moss_image_execution_report()
-                .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
-        }
+        self.state
+            .lock()
+            .map_or_else(|_| Vec::new(), |state| state.apply_reports.clone())
+    }
+}
+fn request_branches(resolved: &MossImageResolved) -> u32 {
+    if matches!(resolved.acceleration, MossImageAcceleration::Off) {
+        1 + u32::from(resolved.guidance != 1.0)
+            + u32::from(
+                resolved
+                    .slg
+                    .as_ref()
+                    .is_some_and(|s| s.scale > 0.0 && !s.layers.is_empty()),
+            )
+    } else {
+        1
     }
 }
 fn footprint(variant: MossImageVariant, spec: &LoadSpec) -> gen_core::Result<PerComponentBytes> {
@@ -774,7 +885,9 @@ fn footprint(variant: MossImageVariant, spec: &LoadSpec) -> gen_core::Result<Per
     let f = memory_strategy::facts(&s)?;
     Ok(PerComponentBytes {
         text_encoder: f.conditioning_bytes,
-        dit: f.transformer_bytes + f.overlay_bytes,
+        dit: f.transformer_bytes
+            + f.overlay_bytes
+            + crate::adapters::estimated_bytes(&spec.adapters, &s.config)?,
         vae: f.decoder_bytes,
     })
 }
@@ -806,6 +919,7 @@ pub(crate) fn verify_numerical_renderer_transitions(
     let mut state: AttemptState<Transformer, ()> = AttemptState {
         renderer: None,
         report: None,
+        apply_reports: vec![],
     };
     let expected_edit = edit();
     // The same release/select boundary used by generate_inner: ordinary -> edit ->
@@ -816,7 +930,7 @@ pub(crate) fn verify_numerical_renderer_transitions(
         MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32),
         MossImageAcceleration::Off,
     ] {
-        state.begin();
+        state.begin(&[]).unwrap();
         state.release_for_request(mode, false);
         let actual = predict(state.select(mode, || Ok(build(mode))).unwrap());
         assert_eq!(actual, predict(&build(mode)));
@@ -843,6 +957,29 @@ pub(crate) fn verify_numerical_renderer_transitions(
 mod cpu_tests {
     use super::*;
     #[test]
+    fn pin_failure_clears_ordinary_and_edit_receipts_before_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("custom-adapter");
+        std::fs::write(&path, b"original").unwrap();
+        let pin = gen_core::PinnedWeightsFile::pin(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mut state = AttemptState {
+            renderer: Some((MossImageAcceleration::Off, ())),
+            report: Some("completed ordinary"),
+            apply_reports: vec![gen_core::AdapterApplyReport {
+                adapter_path: "custom".into(),
+                applied: 1,
+                skipped: vec![],
+            }],
+        };
+        let mut edit_report = Some("completed edit");
+        assert!(state.begin_request(&[pin], &mut edit_report).is_err());
+        assert!(state.report.is_none());
+        assert!(state.renderer.is_none());
+        assert!(state.apply_reports.is_empty());
+        assert!(edit_report.is_none());
+    }
+    #[test]
     fn warm_admission_only_credits_owned_committed_buffers() {
         assert_eq!(incremental_peak(1000, 400, 0), 1000);
         assert_eq!(incremental_peak(1000, 400, 300), 700);
@@ -854,6 +991,7 @@ mod cpu_tests {
         let mut state: AttemptState<(u32, u32), &str> = AttemptState {
             renderer: None,
             report: None,
+            apply_reports: vec![],
         };
         let off = MossImageAcceleration::Off;
         let on = MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16);
@@ -868,7 +1006,7 @@ mod cpu_tests {
             (0, 0)
         );
         state.report = Some("completed");
-        state.begin();
+        state.begin(&[]).unwrap();
         assert!(state.report.is_none());
         assert_eq!(
             *state
@@ -890,7 +1028,7 @@ mod cpu_tests {
         );
         assert_eq!(loads, 3);
         state.report = Some("prior completion");
-        state.begin();
+        state.begin(&[]).unwrap();
         assert!(matches!(
             state.select(on, || Err(Error::Canceled)),
             Err(Error::Canceled)
@@ -901,13 +1039,14 @@ mod cpu_tests {
         assert_eq!(*state.select(off, || Ok((0, 0))).unwrap(), (0, 0));
     }
     #[test]
-    fn descriptors_keep_full_native_batch_and_cfg_but_no_reference_or_generic_lora_surface() {
+    fn descriptors_keep_native_batch_cfg_and_transformer_adapters_without_references() {
         for descriptor in [descriptor_base(), descriptor_sft()] {
             assert!(descriptor.capabilities.supports_prompt_batch);
             assert!(descriptor.capabilities.supports_guidance);
             assert!(descriptor.capabilities.supports_negative_prompt);
             assert!(descriptor.capabilities.conditioning.is_empty());
-            assert!(!descriptor.capabilities.supports_lora);
+            assert!(descriptor.capabilities.supports_lora);
+            assert!(descriptor.capabilities.supports_lokr);
             assert!(descriptor
                 .capabilities
                 .validate_request(
@@ -931,5 +1070,45 @@ mod cpu_tests {
                 .acceleration,
             MossImageAcceleration::Off
         );
+    }
+}
+
+#[cfg(test)]
+mod review_lifecycle_tests {
+    use super::*;
+    #[test]
+    fn cached_renderer_request_boundary_rejects_replaced_or_removed_adapter() {
+        for remove in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("adapter.safetensors");
+            std::fs::write(&path, b"original adapter source").unwrap();
+            let pins = [gen_core::PinnedWeightsFile::pin(&path).unwrap()];
+            let mut state: AttemptState<u8, ()> = AttemptState {
+                renderer: Some((MossImageAcceleration::Off, 7)),
+                report: Some(()),
+                apply_reports: vec![],
+            };
+            state.begin(&pins).unwrap();
+            assert_eq!(
+                *state
+                    .select(MossImageAcceleration::Off, || panic!(
+                        "warm mode must reuse its renderer"
+                    ))
+                    .unwrap(),
+                7
+            );
+            state.report = Some(());
+            if remove {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"replaced adapter source").unwrap();
+            }
+            assert!(
+                state.begin(&pins).is_err(),
+                "cached renderer accepted changed adapter, remove={remove}"
+            );
+            assert!(state.report.is_none());
+            assert!(state.renderer.is_none());
+        }
     }
 }

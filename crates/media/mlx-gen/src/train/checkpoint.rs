@@ -164,7 +164,8 @@ fn load_resume_inner(
     opt: &mut TrainOptimizer,
     identity: Option<ResumeIdentity<'_>>,
 ) -> Result<(LoraParams, ResumeMeta)> {
-    let (tensors, meta) = Array::load_safetensors_with_metadata(snapshot)?;
+    let (tensors, meta) = crate::weights::load_safetensors_on_cpu(snapshot)?;
+    mlx_rs::transforms::eval_pending_loads(tensors.values())?;
     if let Some(identity) = identity {
         check_resume_fingerprints(&meta, identity.config, identity.request_fingerprint)?;
     }

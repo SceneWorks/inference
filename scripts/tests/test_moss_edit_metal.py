@@ -137,10 +137,12 @@ class WorkflowTests(unittest.TestCase):
     def test_only_selected_numerical_lane_runs_without_operator_inputs(self):
         workflow = yaml.safe_load((gate.ROOT/'.github/workflows/ci.yml').read_text(encoding='utf-8'))
         inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-        self.assertEqual(set(inputs), {'lanes', 'synthetic_w4a8'})
+        self.assertEqual(set(inputs), {'lanes', 'synthetic_w4a8', 'test_suite'})
         self.assertEqual(inputs['lanes']['default'], 'all')
         self.assertEqual(inputs['synthetic_w4a8']['default'], 'none')
         self.assertEqual(inputs['synthetic_w4a8']['options'], ['none', 'cuda', 'mlx', 'both'])
+        self.assertEqual(inputs['test_suite']['default'], 'routine')
+        self.assertEqual(inputs['test_suite']['options'], ['routine', 'exhaustive'])
         self.assertTrue(all(not spec.get('required', False) for spec in inputs.values()))
         self.assertNotIn('moss-edit-metal-lease', workflow['jobs'])
         for lane in ('moss-edit-metal', 'moss-edit-cuda'):

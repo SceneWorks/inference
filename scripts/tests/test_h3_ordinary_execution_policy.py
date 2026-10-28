@@ -615,9 +615,9 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
     def test_h3_and_moss_manual_queue_keys_both_preserve_each_run(self) -> None:
         workflow = CI.read_text(encoding="utf-8")
         expression = re.search(r"^  group: inference-ci-\$\{\{ (.+) \}\}$", workflow, re.M).group(1)
-        def key(event, synthetic, lane, run):
+        def key(event, synthetic, lane, run, suite="routine"):
             values = {"github.event_name": event, "github.event.inputs.synthetic_w4a8": synthetic,
-                      "inputs.lanes": lane, "github.run_id": run, "github.ref": "refs/pull/7/merge", "github.sha": "source-sha"}
+                      "inputs.lanes": lane, "inputs.test_suite": suite, "github.run_id": run, "github.ref": "refs/pull/7/merge", "github.sha": "source-sha"}
             rendered = expression
             for name in sorted(values, key=len, reverse=True):
                 rendered = rendered.replace(name, repr(values[name]))
@@ -630,6 +630,7 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
         self.assertEqual(key("pull_request", "none", "all", 1), "refs/pull/7/merge")
         self.assertEqual(key("push", "none", "all", 1), "source-sha")
         self.assertEqual(key("workflow_dispatch", "none", "all", 1), "source-sha")
+        self.assertNotEqual(key("workflow_dispatch", "none", "all", 1, "exhaustive"), key("workflow_dispatch", "none", "all", 2, "exhaustive"))
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", workflow)
         library = (ROOT / "crates/contracts/gen-core/src/lib.rs").read_text(encoding="utf-8")
         for module in ("moss_image_edit", "pruned_adaln", "h3_adapter_memory", "h3_conditioning_memory", "h3_memory"):
@@ -767,30 +768,29 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                 body = _strip_comment_lines(step)
                 if "minimax-h3" not in body or "--ignored" not in body:
                     continue
-                step_conditions = "\n".join(line for line in step.splitlines()
-                    if line.startswith("        if:"))
                 with self.subTest(job=job, step=step.splitlines()[0]):
-                    self.assertTrue(manual_job or "github.event_name == 'workflow_dispatch'" in step_conditions,
-                        "an H3 model step needs a positive workflow_dispatch gate; ordinary PR/main must never execute it")
+                    self.assertTrue(manual_job,
+                        "an H3 model step belongs in a dedicated workflow_dispatch job, outside ordinary PR/main jobs")
 
-    def test_hosted_pruned_precision_step_is_explicit_and_positive(self) -> None:
-        block = jobs(CI.read_text(encoding="utf-8"))["macos-metal"]
+    def test_pruned_precision_proof_stays_in_dedicated_manual_route(self) -> None:
+        blocks = jobs(CI.read_text(encoding="utf-8"))
+        self.assertNotIn("--ignored", blocks["macos-metal"])
+        block = blocks["synthetic-w4a8-mlx"]
+        self.assertIn("github.event_name == 'workflow_dispatch'", block)
+        self.assertIn("inputs.synthetic_w4a8 == 'mlx'", block)
+        self.assertIn("inputs.synthetic_w4a8 == 'both'", block)
         matching = [step for step in steps(block)
-            if "- name: Check H3 precise pruned projection on hosted Metal (manual)" in step]
+            if "- name: Prove H3 pruned AdaLN complete model on Metal" in step]
         self.assertEqual(len(matching), 1)
         step = matching[0]
-        self.assertIn("if: github.event_name == 'workflow_dispatch'", step)
-        self.assertIn("inputs.synthetic_w4a8 == 'mlx'", step)
-        self.assertIn("inputs.synthetic_w4a8 == 'both'", step)
         self.assertIn("set -euo pipefail", step)
-        self.assertIn("--ignored --exact --nocapture", step)
-        self.assertIn("test result: ok. 1 passed; 0 failed; 0 ignored", step)
+        self.assertIn("--ignored --nocapture", step)
+        self.assertIn("test result: ok. 4 passed; 0 failed; 0 ignored", step)
         self.assertIn("test pruned_adaln::native_pruned_adaln_matches_pinned_reference ...", step)
         self.assertIn("H3_PRUNED_ORACLE_DEVICE", step)
         self.assertIn("H3_PRUNED_ORACLE block 0 modulation: max_abs=", step)
         self.assertNotIn("continue-on-error", step)
         self.assertNotIn("|| true", step)
-        self.assertIn('MACOSX_DEPLOYMENT_TARGET: "15.0"', block)
 
     def test_manual_h3_routes_pin_exact_counts_and_names(self) -> None:
         blocks = jobs(CI.read_text(encoding="utf-8"))

@@ -188,11 +188,74 @@ impl TrainOptimizer {
     /// kind (checked via [`kind_tag`](Self::kind_tag) in the resume metadata).
     pub fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
         match self {
-            TrainOptimizer::AdamW { opt, .. } => opt.state_mut().load_safetensors(path)?,
+            TrainOptimizer::AdamW { opt, .. } => {
+                let (arrays, _) = crate::weights::load_safetensors_on_cpu(path)?;
+                mlx_rs::transforms::eval_pending_loads(arrays.values())?;
+                *opt.state_mut() = <_ as OptimizerState>::unflatten(arrays)
+                    .map_err(mlx_rs::error::IoError::from)?;
+            }
             TrainOptimizer::Rose(_) => {} // stateless — nothing to restore
             TrainOptimizer::Prodigy(p) => p.load_state(path)?,
         }
         Ok(())
+    }
+    /// Complete-state restore used by MOSS: an intact but incomplete moment map must not
+    /// silently initialize omitted parameters on the next update. Legacy readers stay unchanged.
+    pub fn load_state_checked(
+        &mut self,
+        path: impl AsRef<Path>,
+        params: &LoraParams,
+        updates: u32,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let (arrays, _) = crate::weights::load_safetensors_on_cpu(path)?;
+        let mut expected = std::collections::BTreeMap::<String, Vec<i32>>::new();
+        match self {
+            Self::AdamW { .. } => {
+                if updates > 0 {
+                    for (key, value) in params {
+                        for slot in [0, 1] {
+                            expected.insert(format!("{key}.{slot}"), value.shape().to_vec());
+                        }
+                    }
+                }
+            }
+            Self::Rose(_) => {
+                expected.insert("__stateless".into(), vec![1]);
+            }
+            Self::Prodigy(_) => {
+                for key in ["__d", "__d_max", "__d_numerator"] {
+                    expected.insert(key.into(), vec![1]);
+                }
+                if updates > 0 {
+                    for (key, value) in params {
+                        for slot in ["exp_avg", "exp_avg_sq", "s", "p0"] {
+                            expected.insert(format!("{key}::{slot}"), value.shape().to_vec());
+                        }
+                    }
+                }
+            }
+        }
+        if arrays.len() != expected.len() {
+            return Err(crate::Error::Msg(
+                "resume optimizer state population differs".into(),
+            ));
+        }
+        mlx_rs::transforms::eval_pending_loads(arrays.values())?;
+        for (key, shape) in expected {
+            let value = arrays.get(&key).ok_or_else(|| {
+                crate::Error::Msg(format!("resume optimizer state missing {key}"))
+            })?;
+            if value.shape() != shape.as_slice()
+                || value.dtype() != mlx_rs::Dtype::Float32
+                || !value.is_finite()?.all(None)?.item::<bool>()
+            {
+                return Err(crate::Error::Msg(format!(
+                    "resume optimizer state invalid {key}"
+                )));
+            }
+        }
+        self.load_state(path)
     }
 }
 
@@ -354,7 +417,10 @@ impl Prodigy {
         // order is unchanged, so the folded sums are bit-identical to the prior per-term host `+=`.
         let mut delta_numerator = c(0.0);
         let mut d_denom = c(0.0);
-        for (k, g) in grads.iter() {
+        // Coupled sums must not depend on a fresh HashMap seed after checkpoint restore.
+        let mut ordered: Vec<_> = grads.iter().collect();
+        ordered.sort_unstable_by_key(|(a, _)| *a);
+        for (k, g) in ordered {
             let Some(p) = params.get(k) else { continue };
             // `Array::zeros` is fallible, so build the initial state with `?` rather than `.unwrap()`
             // in an `or_insert_with` closure — an allocation failure mid-training surfaces as a typed
@@ -487,7 +553,8 @@ impl Prodigy {
     /// Rebuilds the per-parameter buffer map and the global scalars; the `{k}::exp_avg` keys carry the
     /// parameter identity (a `k` never ends in `::exp_avg`, so the base key is unambiguous).
     fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let (tensors, _meta) = Array::load_safetensors_with_metadata(path.as_ref())?;
+        let (tensors, _meta) = crate::weights::load_safetensors_on_cpu(path)?;
+        mlx_rs::transforms::eval_pending_loads(tensors.values())?;
         let scalar = |name: &str| -> Result<f32> {
             let a = tensors.get(name).ok_or_else(|| {
                 crate::Error::Msg(format!("prodigy resume: snapshot missing global '{name}'"))
@@ -531,6 +598,63 @@ impl Prodigy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn optimizer_state_io_uses_cpu_file_reads_without_running_updates() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            let root = tempfile::tempdir().unwrap();
+            let parameters = LoraParams::from([(
+                Rc::from("weight"),
+                Array::from_slice(&[1.0f32, 2.0], &[1, 2]),
+            )]);
+            for name in ["adamw", "rose", "prodigy"] {
+                let mut source = TrainOptimizer::from_config(name, 0.1, 0.0).unwrap();
+                let value = || Array::from_slice(&[0.25f32, 0.5], &[1, 2]);
+                match &mut source {
+                    TrainOptimizer::AdamW { opt, .. } => {
+                        opt.state_mut()
+                            .insert(Rc::from("weight"), (value(), value()));
+                    }
+                    TrainOptimizer::Prodigy(opt) => {
+                        opt.state.insert(
+                            Rc::from("weight"),
+                            ProdigyState {
+                                exp_avg: value(),
+                                exp_avg_sq: value(),
+                                s: value(),
+                                p0: value(),
+                            },
+                        );
+                    }
+                    TrainOptimizer::Rose(_) => {}
+                }
+                let path = root.path().join(format!("{name}.safetensors"));
+                source.save_state(&path).unwrap();
+                let mut restored = TrainOptimizer::from_config(name, 0.1, 0.0).unwrap();
+                restored.load_state_checked(&path, &parameters, 1).unwrap();
+                assert_eq!(restored.kind_tag(), source.kind_tag());
+                if let (TrainOptimizer::Prodigy(source), TrainOptimizer::Prodigy(restored)) =
+                    (&source, &restored)
+                {
+                    assert_eq!(source.d.to_bits(), restored.d.to_bits());
+                    assert_eq!(source.d_max.to_bits(), restored.d_max.to_bits());
+                    assert_eq!(source.d_numerator.to_bits(), restored.d_numerator.to_bits());
+                }
+                let restored_path = root.path().join(format!("{name}-restored.safetensors"));
+                restored.save_state(&restored_path).unwrap();
+                let (before, _) = crate::weights::load_safetensors_on_cpu(&path).unwrap();
+                let (after, _) = crate::weights::load_safetensors_on_cpu(&restored_path).unwrap();
+                mlx_rs::transforms::eval_pending_loads(before.values().chain(after.values()))
+                    .unwrap();
+                assert_eq!(before.len(), after.len());
+                for (key, value) in before {
+                    assert_eq!(
+                        value.try_as_slice::<f32>().unwrap(),
+                        after[&key].try_as_slice::<f32>().unwrap()
+                    );
+                }
+            }
+        });
+    }
 
     fn params(pairs: &[(&str, &[f32], &[i32])]) -> LoraParams {
         let mut m = LoraParams::new();

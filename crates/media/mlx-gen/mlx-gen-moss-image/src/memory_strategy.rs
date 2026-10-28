@@ -4,15 +4,41 @@ use mlx_gen::gen_core::moss_image::MossImageVariant;
 use mlx_gen::gen_core::*;
 
 /// Asset residency for the explicitly selected policy. Optional cached files do not imply a
-/// loaded renderer. Header parsing authenticates the same owned bytes and caches by content pin;
-/// this function does not construct tensors or execute Metal work.
+/// loaded renderer. Bounded header parsing uses unchanged authenticated content pins;
+/// materialization authenticates full consumed bytes. No tensors or Metal work are constructed.
 pub fn selected_asset_facts(
     variant: MossImageVariant,
     spec: &LoadSpec,
     mode: moss_image::MossImageAcceleration,
 ) -> Result<MemoryAssetFacts> {
-    let sources = Sources::selected(variant, spec, mode).map_err(Error::from)?;
-    selected_facts(&sources, mode)
+    selected_asset_facts_with_check(variant, spec, mode, &mut || Ok(()))
+}
+
+/// Cooperative metadata admission. The caller owns cancellation/deadline policy; checks also run
+/// on identity/cache hits, during source authentication and between bounded header reads.
+pub fn selected_asset_facts_with_check(
+    variant: MossImageVariant,
+    spec: &LoadSpec,
+    mode: moss_image::MossImageAcceleration,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<MemoryAssetFacts> {
+    let sources = Sources::selected_with_check(variant, spec, mode, check).map_err(Error::from)?;
+    let mut facts = selected_facts_with(&sources, mode, |asset| {
+        asset.headers_with_check(check).map_err(Error::from)
+    })?;
+    for adapter in &spec.adapters {
+        check()?;
+        let bytes =
+            crate::adapters::estimated_bytes(std::slice::from_ref(adapter), &sources.config)
+                .map_err(Error::from)?;
+        check()?;
+        facts.overlay_bytes = facts
+            .overlay_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Unsupported("MOSS adapter residency overflow".into()))?;
+    }
+    check()?;
+    Ok(facts)
 }
 
 /// Cold typed edit admission before loading a generator or constructing MLX tensors.
@@ -77,6 +103,24 @@ fn selected_facts_with(
     sum_selected_headers(mode, &headers)
 }
 
+fn frozen_hf_norm(name: &str) -> bool {
+    if name == "language_model.norm.weight" {
+        return true;
+    }
+    name.strip_prefix("language_model.layers.")
+        .and_then(|name| name.split_once('.'))
+        .is_some_and(|(layer, tail)| {
+            layer.parse::<usize>().is_ok()
+                && matches!(
+                    tail,
+                    "input_layernorm.weight"
+                        | "post_attention_layernorm.weight"
+                        | "self_attn.q_norm.weight"
+                        | "self_attn.k_norm.weight"
+                )
+        })
+}
+
 fn sum_selected_headers(
     mode: moss_image::MossImageAcceleration,
     selected: &[(
@@ -108,8 +152,11 @@ fn sum_selected_headers(
                 // delta is priced below; charging their full payload again would double count.
                 _ => continue,
             };
-            // The shared small VAE decoder is explicitly materialized in FP32.
-            let bytes = if *role == MossImageAssetRole::Vae {
+            // The VAE and MOSS-only zero-centered Qwen norm multipliers are F32 resident
+            // arrays. Price the derived arrays, not just their BF16 checkpoint payloads.
+            let bytes = if *role == MossImageAssetRole::Vae
+                || (*role == MossImageAssetRole::TextEncoder && frozen_hf_norm(&h.name))
+            {
                 h.materialized_bytes(4)?
             } else {
                 h.data_bytes
@@ -143,6 +190,26 @@ fn sum_selected_headers(
         .ok_or_else(|| Error::Unsupported("MOSS base bytes overflow".into()))?;
     Ok(f)
 }
+/// One adapter-inclusive fact set supplies both the stored safety contract and the load peak.
+/// Request peaks select their own raw mode facts and add the custom stack once, not this peak.
+pub(crate) fn loaded_admission(
+    v: MossImageVariant,
+    mut facts: MemoryAssetFacts,
+    custom: u64,
+    staging: u64,
+) -> Result<(MemoryProviderContract, u64)> {
+    facts.overlay_bytes = facts
+        .overlay_bytes
+        .checked_add(custom)
+        .ok_or_else(|| Error::Unsupported("MOSS adapter residency overflow".into()))?;
+    let peak = facts
+        .base_bytes
+        .checked_add(facts.overlay_bytes)
+        .and_then(|v| v.checked_add(staging))
+        .ok_or_else(|| Error::Unsupported("MOSS load peak overflow".into()))?;
+    Ok((contract_with_facts(v, facts), peak))
+}
+
 pub(crate) fn contract_with_facts(
     v: MossImageVariant,
     f: MemoryAssetFacts,
@@ -172,7 +239,14 @@ pub(crate) fn contract_with_facts(
 }
 pub(crate) fn contract(v: MossImageVariant, spec: &LoadSpec) -> Result<MemoryProviderContract> {
     let s = Sources::prepare(v, spec).map_err(Error::from)?;
-    Ok(contract_with_facts(v, facts(&s)?))
+    let mut facts = facts(&s)?;
+    facts.overlay_bytes = facts
+        .overlay_bytes
+        .checked_add(
+            crate::adapters::estimated_bytes(&spec.adapters, &s.config).map_err(Error::from)?,
+        )
+        .ok_or_else(|| Error::Unsupported("MOSS adapter residency overflow".into()))?;
+    Ok(contract_with_facts(v, facts))
 }
 pub(crate) fn fixture(v: MossImageVariant, _: &LoadSpec) -> Result<MemoryProviderContract> {
     // The frozen Base/SFT geometry is known without a snapshot; only byte facts are absent.
@@ -186,6 +260,18 @@ pub fn request_workspace_bytes(
     expanded: usize,
     context: u32,
     branches: u32,
+) -> Result<u64> {
+    request_workspace_bytes_with_staging(width, height, expanded, context, branches, 5_362_224_248)
+}
+/// Internal source-staging adjunction. The public released-model estimate remains byte-for-byte
+/// equivalent; only a verified private fixture supplies its existing header-derived staging bound.
+pub(crate) fn request_workspace_bytes_with_staging(
+    width: u32,
+    height: u32,
+    expanded: usize,
+    context: u32,
+    branches: u32,
+    source_staging: u64,
 ) -> Result<u64> {
     if width == 0
         || height == 0
@@ -233,7 +319,7 @@ pub fn request_workspace_bytes(
         .and_then(|n| n.checked_add(outputs))
         .and_then(|n| n.checked_add(embeddings))
         .and_then(|n| n.checked_add(decode))
-        .and_then(|n| n.checked_add(5_362_224_248))
+        .and_then(|n| n.checked_add(source_staging))
         .ok_or_else(|| Error::Unsupported("MOSS peak overflow".into()))
 }
 pub(crate) fn safety(
@@ -428,6 +514,8 @@ mod cpu_tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let pin = PinnedWeightsFile::pin(tmp.path()).unwrap();
         let asset = |role, relative: &str| Asset {
+            #[cfg(feature = "test-support")]
+            fixture_digest: None,
             role,
             relative: relative.into(),
             pin: pin.clone(),
@@ -519,6 +607,52 @@ mod cpu_tests {
         assert_eq!(full.overlay_bytes, 8); // Q/codes; no second LoRA or time replacement.
     }
     #[test]
+    fn frozen_hf_text_norm_storage_is_priced_without_widening_other_tensors() {
+        use moss_image::{MossImageAcceleration, MossImageAssetRole};
+        use weightsmeta::{Dtype, SafetensorsTensorHeader};
+        let header = |name: String, elements: usize| SafetensorsTensorHeader {
+            name,
+            dtype: Dtype::BF16,
+            shape: vec![elements],
+            data_bytes: elements as u64 * 2,
+        };
+        // Actual frozen MOSS text geometry:32 blocks,4096 hidden, full attention every4,
+        // head width256. Gated RMSNorm and projections retain their BF16 storage.
+        let mut headers = vec![header("language_model.norm.weight".into(), 4096)];
+        for i in 0..32 {
+            for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+                headers.push(header(format!("language_model.layers.{i}.{name}"), 4096));
+            }
+            if i % 4 == 3 {
+                for name in ["q_norm.weight", "k_norm.weight"] {
+                    headers.push(header(
+                        format!("language_model.layers.{i}.self_attn.{name}"),
+                        256,
+                    ));
+                }
+            }
+        }
+        let norm_source_bytes: u64 = headers.iter().map(|h| h.data_bytes).sum();
+        assert_eq!(norm_source_bytes, 540_672);
+        for name in [
+            "language_model.layers.0.linear_attn.norm.weight",
+            "language_model.layers.3.self_attn.q_proj.weight",
+            "language_model.embed_tokens.weight",
+        ] {
+            headers.push(header(name.into(), 128));
+        }
+        headers.push(header("visual.norm.weight".into(), 128));
+        let f = sum_selected_headers(
+            MossImageAcceleration::Off,
+            &[(MossImageAssetRole::TextEncoder, headers)],
+        )
+        .unwrap();
+        assert_eq!(f.conditioning_bytes, norm_source_bytes * 2 + 3 * 128 * 2);
+        assert_eq!(f.base_bytes, f.conditioning_bytes);
+        assert_eq!(f.overlay_bytes, 0);
+    }
+
+    #[test]
     fn expanded_batch_context_branch_work_and_overflow_are_priced() {
         let a = request_workspace_bytes(256, 256, 1, 8, 1).unwrap();
         assert!(request_workspace_bytes(256, 256, 2, 8, 1).unwrap() > a);
@@ -527,5 +661,54 @@ mod cpu_tests {
         assert!(
             request_workspace_bytes(u32::MAX - 15, u32::MAX - 15, usize::MAX, 4096, 3).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod review_loaded_memory_tests {
+    use super::*;
+    #[test]
+    fn loaded_contract_and_peak_include_adapter_stack_once() {
+        let source = MemoryAssetFacts {
+            base_bytes: 2 * 3 * 4,
+            overlay_bytes: 5 * 4,
+            ..Default::default()
+        };
+        let (custom, staging) = (7 * 4, 11 * 4);
+        let (contract, peak) =
+            loaded_admission(MossImageVariant::Base, source, custom, staging).unwrap();
+        assert_eq!(
+            contract.asset_facts.overlay_bytes,
+            source.overlay_bytes + custom
+        );
+        assert_eq!(contract.asset_facts.base_bytes, source.base_bytes);
+        assert_eq!(
+            peak,
+            source.base_bytes + source.overlay_bytes + custom + staging
+        );
+        let (plain, plain_peak) =
+            loaded_admission(MossImageVariant::Base, source, 0, staging).unwrap();
+        assert_eq!(plain.asset_facts, source);
+        assert_eq!(peak - plain_peak, custom);
+        assert!(loaded_admission(
+            MossImageVariant::Base,
+            MemoryAssetFacts {
+                overlay_bytes: u64::MAX,
+                ..source
+            },
+            1,
+            0
+        )
+        .is_err());
+        assert!(loaded_admission(
+            MossImageVariant::Base,
+            MemoryAssetFacts {
+                base_bytes: u64::MAX,
+                ..source
+            },
+            0,
+            0
+        )
+        .is_err());
     }
 }

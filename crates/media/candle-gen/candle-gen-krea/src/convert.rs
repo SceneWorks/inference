@@ -161,20 +161,24 @@ pub fn validate_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
     validate_shapes(w, cfg)
 }
 
-/// Validate a **dense-bf16, plain-int8, or Kitchen-NVFP4 native-keyed single file** — the candle
-/// sibling of the MLX `remap_native_dit_to_diffusers` + `validate_transformer` fail-closed pair.
-/// Stricter than the ConvRot branch of [`validate_transformer`]: every model tensor must form a
-/// bijection onto the module tree. A descriptor-validated plain-int8 projection additionally carries
-/// its `.weight_scale` and `.comfy_quant` companions; a validated NVFP4 projection carries
-/// `.weight_scale` and `.weight_scale_2`. Those are the only allowed surplus tensors.
+/// Validate a **dense-bf16, plain-int8, scalar-fp8, MXFP8, or Kitchen-NVFP4 native-keyed single
+/// file** — the candle sibling of the MLX `remap_native_dit_to_diffusers` + `validate_transformer`
+/// fail-closed pair. Stricter than the ConvRot branch of [`validate_transformer`]: every model tensor
+/// must form a bijection onto the module tree. A quantized projection additionally carries its
+/// companions — a plain-int8 or scalar-fp8 projection carries `.weight_scale` and `.comfy_quant`, a
+/// Kitchen-NVFP4 projection carries `.weight_scale` and `.weight_scale_2`, an MXFP8 projection carries
+/// only `.weight_scale`. Those are the only allowed surplus tensors.
 ///
 /// Fails closed (typed error) — never a silent gap:
 /// 1. **coverage** — any expected diffusers key that does not resolve to a present native tensor (a
 ///    truncated download, wrong family, or a bad prefix) is reported by name; then
-/// 2. **no foreign/extra** — the on-disk tensor count must equal the expected model count plus two
-///    companions per validated plain-int8 projection. With the remap pinned injective
-///    (`loader::tests::convrot_remap_pins_the_key_map` + the sc-14022 coverage test) and full coverage
-///    from step 1, count-equality proves there is no foreign or duplicate tensor; then
+/// 2. **no foreign/extra** — the file's on-disk key set must equal the **compiled plan's** physical
+///    key set (the model tensors plus every companion the plan accounts for). The plan is the
+///    classifier, so a new quantization convention needs no arithmetic here and cannot drift from
+///    it; the comparison also names the offending keys instead of only their count. With the remap
+///    pinned injective (`loader::tests::convrot_remap_pins_the_key_map` + the sc-14022 coverage test)
+///    and full coverage from step 1, set-equality proves there is no foreign or duplicate tensor;
+///    then
 /// 3. the shared `validate_shapes` (resolving, flat-`scale_shift_table` aware).
 ///
 /// The ConvRot file is validated by [`validate_transformer`]'s coverage-only native branch instead — it
@@ -204,42 +208,50 @@ fn validate_native_key_surface(w: &Weights, cfg: &Krea2Config) -> Result<()> {
             missing.len(),
         )));
     }
-    // (2) No foreign/extra: dense has exactly one on-disk tensor per expected model tensor. Plain int8
-    // has exactly two already-validated companions for each quantized projection. `from_native_file`
-    // proves each descriptor/triplet and its 1:1 relationship before constructing `Weights`.
-    let keys = w.keys();
-    let plain_int8_projections = if w.is_plain_int8() {
-        keys.iter()
-            .filter(|key| key.ends_with(".comfy_quant"))
-            .count()
-    } else {
-        0
+    // (2) No foreign/extra: the compiled plan enumerates every physical key the file may carry —
+    // the model tensors plus each quantized projection's companions — and the reader re-verifies
+    // the file's surface against exactly that set. Compare the two as SETS.
+    //
+    // This used to be a count: `expected + int8_projections * 2 + nvfp4_projections * 2`. Every new
+    // quantization convention had to re-derive its companion count by hand, and the count was only
+    // ever right for the two conventions that existed when it was written: fp8-scalar carries TWO
+    // companions (a scale and a descriptor) and MXFP8 carries ONE (the block scale), so both real
+    // Krea 2 exports died here with "942 on-disk DiT tensor(s), expected exactly 430 model
+    // tensor(s)" (sc-27092). A set comparison cannot drift with the next convention, and it can
+    // NAME what is wrong instead of only how many.
+    let Some(plan) = w.logical_plan() else {
+        return Err(candle_gen::candle_core::Error::Msg(
+            "krea native single-file: this checkpoint was opened without a compiled plan, so its \
+             tensor surface cannot be proven against the architecture — refusing rather than \
+             guessing"
+                .to_owned(),
+        ));
     };
-    let native_nvfp4_projections = w.native_nvfp4_projection_count();
-    let expected_on_disk =
-        expected.len() + plain_int8_projections * 2 + native_nvfp4_projections * 2;
-    let on_disk = keys.len();
-    if on_disk != expected_on_disk {
-        let mut quant_notes = Vec::new();
-        if w.is_plain_int8() {
-            quant_notes.push(format!(
-                "two companions for each of {plain_int8_projections} validated plain-int8 projection(s)"
+    let planned: BTreeSet<&str> = plan.all_physical_keys().collect();
+    let keys = w.keys();
+    let on_disk: BTreeSet<&str> = keys.iter().map(|key| key.as_str()).collect();
+    let absent: Vec<&str> = planned.difference(&on_disk).copied().take(8).collect();
+    let unaccounted: Vec<&str> = on_disk.difference(&planned).copied().take(8).collect();
+    if !absent.is_empty() || !unaccounted.is_empty() {
+        let mut notes = Vec::new();
+        if !absent.is_empty() {
+            notes.push(format!(
+                "{} key(s) the plan expects are absent [{}]",
+                planned.difference(&on_disk).count(),
+                absent.join(", ")
             ));
         }
-        if w.is_native_nvfp4() {
-            quant_notes.push(format!(
-                "two companions for each of {native_nvfp4_projections} validated NVFP4 projection(s)"
+        if !unaccounted.is_empty() {
+            notes.push(format!(
+                "{} key(s) the plan does not account for [{}]",
+                on_disk.difference(&planned).count(),
+                unaccounted.join(", ")
             ));
         }
-        let quant_note = if quant_notes.is_empty() {
-            String::new()
-        } else {
-            format!(" plus {}", quant_notes.join(" and "))
-        };
         return Err(candle_gen::candle_core::Error::Msg(format!(
-            "krea native single-file: {on_disk} on-disk DiT tensor(s), expected exactly {} model \
-             tensor(s){quant_note} — the file carries an unmapped/foreign or duplicate tensor",
-            expected.len()
+            "krea native single-file: the file's tensor surface does not match the compiled plan \
+             — {} — the file carries an unmapped/foreign or duplicate tensor",
+            notes.join(" and ")
         )));
     }
     Ok(())

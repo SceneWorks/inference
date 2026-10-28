@@ -228,3 +228,101 @@ fn perceptual_masks_follow_the_item_major_cache_and_crop() {
     let e = PerceptualSubjectMasks::load("t", &bad, &cfg, 2, CropBox::center_square).unwrap_err();
     assert!(e.to_string().contains("img.png"), "{e}");
 }
+
+#[test]
+fn area_average_preserves_nonbinary_constants_and_convex_range() {
+    for (width, height, grid_w, grid_h) in [
+        (80, 40, 4, 2),
+        (40, 80, 2, 4),
+        (48, 48, 2, 2),
+        (7, 5, 3, 2),
+        (3, 2, 8, 7),
+    ] {
+        for value in [0.0_f32, 1.0, 0.25, 0.75, 0.1, 0.9] {
+            let source = mask(width, height, |_, _| value);
+            let actual = source.area_resample(CropBox::full(width, height), grid_w, grid_h);
+            assert!(
+                actual.iter().all(|x| x.to_bits() == value.to_bits()),
+                "constant field changed: {width}x{height} -> {grid_w}x{grid_h}: {actual:?}"
+            );
+        }
+        let source = mask(width, height, |x, y| {
+            ((x * 17 + y * 11) % 101) as f32 / 100.0
+        });
+        let actual = source.area_resample(CropBox::full(width, height), grid_w, grid_h);
+        assert!(
+            actual
+                .iter()
+                .all(|x| x.is_finite() && (0.0..=1.0).contains(x)),
+            "coverage left convex range: {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn area_average_partial_crop_matches_independent_integer_overlap_oracle() {
+    // Integer overlap lengths in grid-scaled coordinates, independent of floating coverage().
+    fn oracle(source: &SubjectMask, crop: CropBox, gw: usize, gh: usize) -> Vec<f32> {
+        let mut output = Vec::new();
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let mut sum = 0.0_f64;
+                for sy in 0..crop.height {
+                    for sx in 0..crop.width {
+                        let lo_x =
+                            (u64::from(sx) * gw as u64).max(gx as u64 * u64::from(crop.width));
+                        let hi_x = ((u64::from(sx) + 1) * gw as u64)
+                            .min((gx as u64 + 1) * u64::from(crop.width));
+                        let lo_y =
+                            (u64::from(sy) * gh as u64).max(gy as u64 * u64::from(crop.height));
+                        let hi_y = ((u64::from(sy) + 1) * gh as u64)
+                            .min((gy as u64 + 1) * u64::from(crop.height));
+                        let area = hi_x.saturating_sub(lo_x) * hi_y.saturating_sub(lo_y);
+                        sum += f64::from(
+                            source.values[((crop.y + sy) * source.width + crop.x + sx) as usize],
+                        ) * area as f64;
+                    }
+                }
+                output.push((sum / f64::from(crop.width) / f64::from(crop.height)) as f32);
+            }
+        }
+        output
+    }
+    let source = mask(11, 9, |x, y| ((x * 7 + y * 3) % 17) as f32 / 16.0);
+    let crop = CropBox {
+        x: 2,
+        y: 1,
+        width: 7,
+        height: 5,
+    };
+    for (gw, gh) in [(3, 2), (9, 8), (2, 7)] {
+        let actual = source.area_resample(crop, gw, gh);
+        let expected = oracle(&source, crop, gw, gh);
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(expected) {
+            // Only the two F32 storage-roundings; exact endpoint tests above have NO tolerance.
+            assert!(
+                (a - b).abs() <= 2.0 * f32::EPSILON,
+                "integer-overlap mean differs: {a} vs {b}"
+            );
+        }
+    }
+    let binary = mask(5, 1, |x, _| if x >= 2 { 1.0 } else { 0.0 });
+    assert_eq!(
+        binary.area_resample(CropBox::full(5, 1), 2, 1),
+        vec![0.2, 1.0]
+    );
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn area_average_f64_taps_keep_supported_host_scratch_layout() {
+    assert_eq!(
+        std::mem::size_of::<(usize, f64)>(),
+        std::mem::size_of::<(usize, f32)>()
+    );
+    // The horizontal and output allocations are still Vec<f32>; no added full-image buffer.
+    let source = mask(80, 40, |_, _| 1.0);
+    let result: Vec<f32> = source.area_resample(CropBox::full(80, 40), 4, 2);
+    assert_eq!(result.len(), 8);
+}

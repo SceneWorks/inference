@@ -864,6 +864,25 @@ pub fn causal_depthwise_conv_traced(
     weight: &Array,
     conv_state: &Array,
 ) -> Result<(Array, ConvTrace)> {
+    causal_depthwise_conv_traced_impl(x, weight, conv_state, false)
+}
+
+/// Frozen HF Conv1d precision: accumulate taps in F32, narrow the convolution
+/// result before SiLU, and retain the original input-dtype cache trace.
+pub fn causal_depthwise_conv_traced_f32_accum(
+    x: &Array,
+    weight: &Array,
+    conv_state: &Array,
+) -> Result<(Array, ConvTrace)> {
+    causal_depthwise_conv_traced_impl(x, weight, conv_state, true)
+}
+
+fn causal_depthwise_conv_traced_impl(
+    x: &Array,
+    weight: &Array,
+    conv_state: &Array,
+    accumulate_f32: bool,
+) -> Result<(Array, ConvTrace)> {
     let xs = x.shape();
     let (s, c) = (xs[1], xs[2]);
     let kk = weight.shape()[1]; // kernel size K (weight is [C, K])
@@ -874,13 +893,32 @@ pub fn causal_depthwise_conv_traced(
         let wj = weight
             .take_axis(Array::from_slice(&[j], &[1]), 1)? // weight[:, j] → [C,1]
             .reshape(&[1, 1, c])?; // → [1,1,C] (broadcast over B,S)
-        let term = multiply(&window, &wj)?;
+        let term = if accumulate_f32 {
+            multiply(
+                &window.as_dtype(Dtype::Float32)?,
+                &wj.as_dtype(Dtype::Float32)?,
+            )?
+        } else {
+            multiply(&window, &wj)?
+        };
         acc = Some(match acc {
             None => term,
             Some(a) => add(&a, &term)?,
         });
     }
-    let out = silu(acc.expect("conv kernel size must be >= 1"))?; // [B,S,C]
+    let acc = acc.expect("conv kernel size must be >= 1");
+    let acc = if accumulate_f32 {
+        acc.as_dtype(x.dtype())?
+    } else {
+        acc
+    };
+    let out = if accumulate_f32 {
+        // HF's fused SiLU computes from the narrowed Conv1d output in F32.
+        // MLX's BF16 sigmoid/multiply expression has an extra sigmoid rounding.
+        silu(&acc.as_dtype(Dtype::Float32)?)?.as_dtype(x.dtype())?
+    } else {
+        silu(acc)?
+    }; // [B,S,C]
     Ok((
         out,
         ConvTrace {

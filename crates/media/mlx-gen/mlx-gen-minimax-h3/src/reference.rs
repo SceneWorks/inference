@@ -218,6 +218,20 @@ pub fn sample_video_condition_frames(
     Ok((indices, block_timestamps))
 }
 
+/// The vision-tower inputs for a clip's sampled frames: one `(first, last)` frame pair per merged
+/// group of `temporal_patch`, chunked exactly as [`sample_video_condition_frames`] chunks its block
+/// timestamps — the trailing partial group repeats its last frame, as its timestamp does. One pair
+/// per presented block, so the tower's grids and the tokenizer's blocks always agree.
+pub fn condition_frame_groups(indices: &[usize], temporal_patch: usize) -> Vec<(usize, usize)> {
+    if temporal_patch == 0 {
+        return Vec::new();
+    }
+    indices
+        .chunks(temporal_patch)
+        .map(|group| (group[0], group[group.len() - 1]))
+        .collect()
+}
+
 /// Resize an **image** reference onto `short_edge`, on the stride-32 lattice.
 ///
 /// **No area cap and upscaling included** — an image reference is encoded at high detail, unlike a
@@ -685,6 +699,23 @@ pub enum ReferencePresentation {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_clip_presents_one_frame_pair_per_block_timestamp() {
+        // 11 sampled frames at 2 fps in pairs: 6 blocks, the last repeating frame 120.
+        let (indices, timestamps) = sample_video_condition_frames(121, 24.0, 2.0, 2).unwrap();
+        assert_eq!(indices.len(), 11);
+        let groups = condition_frame_groups(&indices, 2);
+        assert_eq!(groups.len(), timestamps.len());
+        assert_eq!(groups[0], (indices[0], indices[1]));
+        assert_eq!(groups[5], (indices[10], indices[10]));
+        // An even count has no repeated frame.
+        let (indices, timestamps) = sample_video_condition_frames(13, 24.0, 2.0, 2).unwrap();
+        let groups = condition_frame_groups(&indices, 2);
+        assert_eq!(groups.len(), timestamps.len());
+        assert!(groups.iter().all(|(first, second)| first < second));
+    }
+
     use super::*;
 
     fn image(w: u32, h: u32) -> Image {

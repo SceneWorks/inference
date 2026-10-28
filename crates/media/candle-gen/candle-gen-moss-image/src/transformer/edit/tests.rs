@@ -743,7 +743,9 @@ fn frozen_edit_oracle_cuda() {
     // Do not mutate process-global precision flags shared by other GPU tests.
     assert!(!candle_gen::candle_core::cuda_backend::gemm_reduced_precision_f32());
     assert!(!candle_gen::candle_core::cuda_backend::gemm_reduced_precision_bf16());
-    run(&Device::new_cuda(0).expect("admitted CUDA lane logical device 0"));
+    let device = Device::new_cuda(0).expect("admitted CUDA lane logical device 0");
+    crate::tests::ordinary_author_time_silu(&device);
+    run(&device);
 }
 
 #[test]

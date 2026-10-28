@@ -1,7 +1,9 @@
 //! Exact caller-provisioned assets, authenticated before graph construction.
 use crate::transformer::{Geometry, Transformer};
 use mlx_gen::gen_core::moss_image::*;
-use mlx_gen::gen_core::weightsmeta::{CheckpointMeta, SafetensorsTensorHeader};
+use mlx_gen::gen_core::weightsmeta::{
+    safetensors_reader_tensor_locations, CheckpointMeta, SafetensorsTensorHeader,
+};
 use mlx_gen::gen_core::PinnedWeightsFile;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LoadSpec, Result, WeightsSource};
@@ -9,6 +11,7 @@ use mlx_rs::{Array, Dtype};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
+    io::Read,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
@@ -20,8 +23,11 @@ pub(crate) struct Asset {
     pub revision: &'static str,
     pub relative: String,
     pub pin: PinnedWeightsFile,
+    #[cfg(feature = "test-support")]
+    pub fixture_digest: Option<[u8; 32]>,
 }
 impl Asset {
+    #[cfg(test)]
     fn capture(
         spec: &LoadSpec,
         path: PathBuf,
@@ -30,6 +36,18 @@ impl Asset {
         relative: &str,
         role: MossImageAssetRole,
     ) -> Result<Self> {
+        Self::capture_with_check(spec, path, repo, revision, relative, role, &mut || Ok(()))
+    }
+    fn capture_with_check(
+        spec: &LoadSpec,
+        path: PathBuf,
+        repo: &'static str,
+        revision: &'static str,
+        relative: &str,
+        role: MossImageAssetRole,
+        check: &mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
+    ) -> Result<Self> {
+        check()?;
         let absolute = std::path::absolute(path)?;
         let pin = if spec.prepared_file_pins().is_prepared() {
             spec.prepared_file_pins()
@@ -42,15 +60,32 @@ impl Asset {
                     ))
                 })?
         } else {
-            PinnedWeightsFile::pin(&absolute)?
+            PinnedWeightsFile::pin_with_check(&absolute, &mut *check)?
         };
         if pin.loader_path() != absolute {
             return Err(Error::Unsupported(
                 "MOSS prepared token path mismatch".into(),
             ));
         }
-        verify_moss_image_asset(&pin, repo, revision, relative)?;
+        // Refuse identity drift without a callbackless full-file drift audit. The seal already
+        // authenticates content; metadata admission checks its frozen digest and exact size.
+        check_pin(&pin, check)?;
+        let expected = moss_image_asset(repo, revision, relative)
+            .ok_or_else(|| Error::Unsupported("unknown frozen MOSS asset".into()))?;
+        let digest = pin
+            .content_sha256()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        if pin.target_fingerprint().size != expected.bytes || digest != expected.sha256 {
+            return Err(Error::Unsupported(format!(
+                "MOSS asset content mismatch for {repo}@{revision}/{relative}; provision the exact frozen file"
+            )));
+        }
+        check_pin(&pin, check)?;
         Ok(Self {
+            #[cfg(feature = "test-support")]
+            fixture_digest: None,
             role,
             repo,
             revision,
@@ -61,6 +96,16 @@ impl Asset {
     pub(crate) fn bytes(&self) -> Result<Vec<u8>> {
         self.pin.read_unchanged(|path| {
             let bytes = std::fs::read(path)?;
+            #[cfg(feature = "test-support")]
+            if let Some(expected) = self.fixture_digest {
+                let actual = Sha256::digest(&bytes);
+                if actual[..] != expected[..] || actual[..] != self.pin.content_sha256()[..] {
+                    return Err(Error::Unsupported(
+                        "synthetic fixture consumed bytes changed".into(),
+                    ));
+                }
+                return Ok(bytes);
+            }
             // Authenticate the same owned buffer used by parsers/tensor copies, closing reopen
             // swap/restore ambiguity. No parser silently reopens the pathname after this check.
             let expected = moss_image_asset(self.repo, self.revision, &self.relative)
@@ -76,35 +121,30 @@ impl Asset {
             Ok(bytes)
         })
     }
-    /// Header facts come from the same authenticated owned bytes as materialization. Only the
-    /// small immutable headers are cached, keyed by the complete consumed-content digest.
+    /// Metadata admission reads only the bounded header of an unchanged authenticated seal.
+    /// Materialization separately authenticates the complete consumed buffer in `bytes`.
     pub(crate) fn headers(&self) -> Result<Vec<SafetensorsTensorHeader>> {
+        self.headers_with_check(&mut || Ok(()))
+    }
+    pub(crate) fn headers_with_check(
+        &self,
+        check: &mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
+    ) -> Result<Vec<SafetensorsTensorHeader>> {
         static CACHE: OnceLock<Mutex<HashMap<[u8; 32], Vec<SafetensorsTensorHeader>>>> =
             OnceLock::new();
-        self.pin.verify_unchanged()?;
+        check_pin(&self.pin, check)?;
         let key = *self.pin.content_sha256();
         let cache = CACHE.get_or_init(Mutex::default);
-        if let Some(headers) = cache
+        let cached = cache
             .lock()
             .map_err(|_| Error::Msg("MOSS header cache poisoned".into()))?
             .get(&key)
-            .cloned()
-        {
+            .cloned();
+        if let Some(headers) = cached {
+            check_pin(&self.pin, check)?;
             return Ok(headers);
         }
-        let meta = CheckpointMeta::from_bytes(self.bytes()?)?;
-        let headers = meta
-            .keys()
-            .map(|name| {
-                let tensor = meta.tensor(name).expect("indexed checkpoint tensor");
-                SafetensorsTensorHeader {
-                    name: name.into(),
-                    dtype: tensor.dtype,
-                    shape: tensor.shape.to_vec(),
-                    data_bytes: tensor.data.len() as u64,
-                }
-            })
-            .collect::<Vec<_>>();
+        let headers = pinned_headers_with_check(&self.pin, check)?;
         cache
             .lock()
             .map_err(|_| Error::Msg("MOSS header cache poisoned".into()))?
@@ -132,6 +172,75 @@ impl Asset {
                 .collect(),
         })
     }
+}
+// Keep callback errors typed: `read_exact` retries Interrupted and an IO wrapper would otherwise
+// erase Canceled. Each actual read is capped, including the parser's large header buffer read.
+const HEADER_READ_BYTES: usize = 64 * 1024;
+fn checked_headers(
+    reader: impl Read,
+    file_len: u64,
+    source: &Path,
+    check: &mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
+) -> mlx_gen::gen_core::Result<Vec<SafetensorsTensorHeader>> {
+    struct CheckedReader<'a, R> {
+        reader: R,
+        check: &'a mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
+        failure: Option<mlx_gen::gen_core::Error>,
+    }
+    impl<R: Read> Read for CheckedReader<'_, R> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if let Err(error) = (self.check)() {
+                self.failure = Some(error);
+                return Err(std::io::Error::other("MOSS header check failed"));
+            }
+            let len = out.len().min(HEADER_READ_BYTES);
+            let result = self.reader.read(&mut out[..len]);
+            if let Err(error) = (self.check)() {
+                self.failure = Some(error);
+                return Err(std::io::Error::other("MOSS header check failed"));
+            }
+            result
+        }
+    }
+    check()?;
+    let mut reader = CheckedReader {
+        reader,
+        check,
+        failure: None,
+    };
+    let parsed = safetensors_reader_tensor_locations(&mut reader, file_len, source);
+    if let Some(error) = reader.failure {
+        return Err(error);
+    }
+    (reader.check)()?;
+    Ok(parsed?
+        .tensors
+        .into_iter()
+        .map(|tensor| tensor.header)
+        .collect())
+}
+fn check_pin(
+    pin: &PinnedWeightsFile,
+    check: &mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
+) -> mlx_gen::gen_core::Result<()> {
+    check()?;
+    pin.ensure_unchanged()?;
+    check()
+}
+fn pinned_headers_with_check(
+    pin: &PinnedWeightsFile,
+    check: &mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
+) -> mlx_gen::gen_core::Result<Vec<SafetensorsTensorHeader>> {
+    check_pin(pin, check)?;
+    let file = std::fs::File::open(pin.loader_path())?;
+    let parsed = checked_headers(
+        file,
+        pin.target_fingerprint().size,
+        pin.loader_path(),
+        check,
+    );
+    check_pin(pin, check)?;
+    parsed
 }
 #[derive(Clone)]
 pub(crate) struct Sources {
@@ -192,21 +301,130 @@ fn transformer_config(
     .map_err(Into::into)
 }
 impl Sources {
+    pub(crate) fn clear_cache(&self) -> Result<()> {
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            crate::test_support::ensure_cpu()?;
+            return Ok(());
+        }
+        mlx_rs::memory::clear_cache();
+        Ok(())
+    }
+    pub(crate) fn drain_cache(&self) -> Result<()> {
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            crate::test_support::ensure_cpu()?;
+            return Ok(());
+        }
+        mlx_gen::residency::drain_allocator_cache();
+        Ok(())
+    }
+    pub(crate) fn request_workspace_bytes(
+        &self,
+        width: u32,
+        height: u32,
+        expanded: usize,
+        context: u32,
+        branches: u32,
+    ) -> Result<u64> {
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            return Ok(
+                crate::memory_strategy::request_workspace_bytes_with_staging(
+                    width,
+                    height,
+                    expanded,
+                    context,
+                    branches,
+                    self.load_staging_bytes()?,
+                )?,
+            );
+        }
+        Ok(crate::memory_strategy::request_workspace_bytes(
+            width, height, expanded, context, branches,
+        )?)
+    }
+    pub(crate) fn load_staging_bytes(&self) -> Result<u64> {
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            let facts = crate::training_memory::FootprintFacts::from_sources(self)
+                .map_err(|e| Error::Unsupported(e.to_string()))?;
+            let encoder = crate::training_memory::encoder_work(&facts.encoder_config, 4096)
+                .map_err(|e| Error::Unsupported(e.to_string()))?;
+            return encoder
+                .checked_add(facts.largest_source_shard)
+                .ok_or_else(|| Error::Unsupported("fixture load workspace overflow".into()));
+        }
+        Ok(5_362_224_248)
+    }
+    pub(crate) fn working_set_budget(&self) -> Result<Option<u64>> {
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            crate::test_support::ensure_cpu()?;
+            return Ok(Some(crate::test_support::HOST_CAP_BYTES));
+        }
+        Ok(mlx_gen::memory::recommended_working_set_bytes())
+    }
+    pub(crate) fn is_fixture(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        {
+            !self.ordinary.is_empty()
+                && self
+                    .ordinary
+                    .iter()
+                    .all(|asset| asset.fixture_digest.is_some())
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            false
+        }
+    }
+    pub(crate) fn source_identity(&self, variant: MossImageVariant) -> String {
+        if self.is_fixture() {
+            let mut hash = Sha256::new();
+            for asset in &self.ordinary {
+                hash.update(asset.relative.as_bytes());
+                hash.update(asset.pin.content_sha256());
+            }
+            format!(
+                "synthetic-moss-full-pipeline-v1:{}:{:x}",
+                variant.provider_id(),
+                hash.finalize()
+            )
+        } else {
+            format!(
+                "{}@{};shared@{}",
+                variant.repository(),
+                variant.revision(),
+                SFT_REVISION
+            )
+        }
+    }
     pub(crate) fn prepare(variant: MossImageVariant, spec: &LoadSpec) -> Result<Self> {
-        Self::prepare_inner(variant, spec, None)
+        Self::prepare_inner(variant, spec, None, &mut || Ok(()))
     }
     pub(crate) fn selected(
         variant: MossImageVariant,
         spec: &LoadSpec,
         mode: MossImageAcceleration,
     ) -> Result<Self> {
-        Self::prepare_inner(variant, spec, Some(mode))
+        Self::selected_with_check(variant, spec, mode, &mut || Ok(()))
+    }
+    pub(crate) fn selected_with_check(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        mode: MossImageAcceleration,
+        check: &mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
+    ) -> Result<Self> {
+        Self::prepare_inner(variant, spec, Some(mode), check)
     }
     fn prepare_inner(
         variant: MossImageVariant,
         spec: &LoadSpec,
         selection: Option<MossImageAcceleration>,
+        check: &mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
     ) -> Result<Self> {
+        check()?;
         let mode = selection.unwrap_or(MossImageAcceleration::Off);
         let full = mode == MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32);
         if variant == MossImageVariant::Base && mode != MossImageAcceleration::Off {
@@ -233,7 +451,6 @@ impl Sources {
             return Err(Error::Unsupported("MOSS supports the resident/eager official BF16 load surface; full-FP32 DMD is selected explicitly through MOSS request controls".into()));
         }
         if spec.quantize.is_some()
-            || !spec.adapters.is_empty()
             || spec.control.is_some()
             || !spec.extra_controls.is_empty()
             || spec.ip_adapter.is_some()
@@ -283,32 +500,35 @@ impl Sources {
             } else {
                 (shared, SFT_REPO, SFT_REVISION)
             };
-            ordinary.push(Asset::capture(
+            ordinary.push(Asset::capture_with_check(
                 spec,
                 base.join(relative),
                 repo,
                 rev,
                 relative,
                 role(relative),
+                check,
             )?);
         }
         // Licence identity is independently verified without inventing a receipt tensor role.
-        Asset::capture(
+        Asset::capture_with_check(
             spec,
             root.join("LICENSE"),
             variant.repository(),
             variant.revision(),
             "LICENSE",
             MossImageAssetRole::Transformer,
+            check,
         )?;
         if variant == MossImageVariant::Base {
-            Asset::capture(
+            Asset::capture_with_check(
                 spec,
                 shared.join("LICENSE"),
                 SFT_REPO,
                 SFT_REVISION,
                 "LICENSE",
                 MossImageAssetRole::Vae,
+                check,
             )?;
         }
         let mut optional = Vec::new();
@@ -338,13 +558,14 @@ impl Sources {
                     WeightsSource::File(p) => p.clone(),
                     WeightsSource::Dir(p) => p.join(file),
                 };
-                optional.push(Asset::capture(
+                optional.push(Asset::capture_with_check(
                     spec,
                     path,
                     DMD_REPO,
                     DMD_REVISION,
                     file,
                     role,
+                    check,
                 )?);
             }
         }
@@ -364,16 +585,18 @@ impl Sources {
                 .iter()
                 .filter(|a| a.repository == DMD_REPO && a.relative_path.starts_with("transformer/"))
             {
-                optional.push(Asset::capture(
+                optional.push(Asset::capture_with_check(
                     spec,
                     root.join(asset.relative_path),
                     DMD_REPO,
                     DMD_REVISION,
                     asset.relative_path,
                     MossImageAssetRole::Transformer,
+                    check,
                 )?);
             }
         }
+        check()?;
         let sources = Self {
             selection,
             config: transformer_config(selection, &ordinary, &optional)?,
@@ -410,6 +633,7 @@ impl Sources {
                 "MOSS small VAE configuration mismatch".into(),
             ));
         }
+        check()?;
         Ok(sources)
     }
     fn verify_index(&self, optional: bool, relative: &str) -> Result<()> {
@@ -679,6 +903,188 @@ pub(crate) fn fp32_map(w: &Weights) -> Result<BTreeMap<String, Vec<f32>>> {
 
 #[cfg(test)]
 mod cpu_tests {
+    fn header_fixture() -> Vec<u8> {
+        let header = serde_json::json!({
+            "__metadata__": { "padding": "x".repeat(HEADER_READ_BYTES * 2 + 17) },
+            "weight": { "dtype": "F32", "shape": [2], "data_offsets": [0, 8] }
+        })
+        .to_string();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0, 0, 128, 63, 0, 0, 0, 128]);
+        bytes
+    }
+
+    #[test]
+    fn metadata_reader_is_bounded_header_only_and_matches_owned_parser() {
+        struct HeaderOnly<'a> {
+            bytes: &'a [u8],
+            position: usize,
+            largest: usize,
+        }
+        impl Read for HeaderOnly<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    self.position < self.bytes.len(),
+                    "tensor payload was requested"
+                );
+                self.largest = self.largest.max(out.len());
+                let n = out.len().min(self.bytes.len() - self.position);
+                out[..n].copy_from_slice(&self.bytes[self.position..self.position + n]);
+                self.position += n;
+                Ok(n)
+            }
+        }
+        let bytes = header_fixture();
+        let mut reader = HeaderOnly {
+            bytes: &bytes[..bytes.len() - 8],
+            position: 0,
+            largest: 0,
+        };
+        let headers = checked_headers(
+            &mut reader,
+            bytes.len() as u64,
+            Path::new("literal"),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(reader.position, bytes.len() - 8);
+        assert_eq!(reader.largest, HEADER_READ_BYTES);
+        let owned = CheckpointMeta::from_bytes(bytes).unwrap();
+        let tensor = owned.tensor("weight").unwrap();
+        assert_eq!(
+            headers,
+            vec![SafetensorsTensorHeader {
+                name: "weight".into(),
+                dtype: tensor.dtype,
+                shape: tensor.shape.to_vec(),
+                data_bytes: tensor.data.len() as u64
+            }]
+        );
+    }
+
+    #[test]
+    fn metadata_reader_cancellation_is_typed_before_and_between_reads() {
+        use std::cell::Cell;
+        struct Observed<'a> {
+            bytes: std::io::Cursor<&'a [u8]>,
+            reads: &'a Cell<usize>,
+        }
+        impl Read for Observed<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.set(self.reads.get() + 1);
+                self.bytes.read(out)
+            }
+        }
+        let bytes = header_fixture();
+        let reads = Cell::new(0);
+        let mut reader = Observed {
+            bytes: std::io::Cursor::new(&bytes),
+            reads: &reads,
+        };
+        assert!(matches!(
+            checked_headers(
+                &mut reader,
+                bytes.len() as u64,
+                Path::new("literal"),
+                &mut || Err(mlx_gen::gen_core::Error::Canceled)
+            ),
+            Err(mlx_gen::gen_core::Error::Canceled)
+        ));
+        assert_eq!(reads.get(), 0);
+        assert!(matches!(
+            checked_headers(
+                &mut reader,
+                bytes.len() as u64,
+                Path::new("literal"),
+                &mut || if reads.get() >= 2 {
+                    Err(mlx_gen::gen_core::Error::Canceled)
+                } else {
+                    Ok(())
+                }
+            ),
+            Err(mlx_gen::gen_core::Error::Canceled)
+        ));
+        assert_eq!(reads.get(), 2);
+        assert_eq!(reader.bytes.position(), 8 + HEADER_READ_BYTES as u64);
+        let spec = LoadSpec::new(WeightsSource::Dir("must-not-be-opened".into()));
+        assert!(matches!(
+            crate::memory_strategy::selected_asset_facts_with_check(
+                MossImageVariant::Sft,
+                &spec,
+                MossImageAcceleration::Off,
+                &mut || Err(mlx_gen::gen_core::Error::Canceled)
+            ),
+            Err(mlx_gen::gen_core::Error::Canceled)
+        ));
+    }
+
+    #[test]
+    fn metadata_reader_refuses_malformed_truncated_and_out_of_bounds_headers() {
+        let valid = header_fixture();
+        let mut invalid = vec![
+            100_000_001_u64.to_le_bytes().to_vec(),
+            vec![0; 7],
+            valid[..12].to_vec(),
+        ];
+        for header in [
+            "not json",
+            r#"{"weight":{"dtype":"F32","shape":[2],"data_offsets":[0,12]}}"#,
+            r#"{"weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#,
+        ] {
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            invalid.push(bytes);
+        }
+        for bytes in invalid {
+            assert!(checked_headers(
+                bytes.as_slice(),
+                bytes.len() as u64,
+                Path::new("invalid"),
+                &mut || Ok(())
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_cache_checks_cancellation_and_pinned_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("literal.safetensors");
+        let bytes = header_fixture();
+        std::fs::write(&path, &bytes).unwrap();
+        let asset = Asset {
+            role: MossImageAssetRole::Transformer,
+            repo: SFT_REPO,
+            revision: SFT_REVISION,
+            relative: "literal.safetensors".into(),
+            pin: PinnedWeightsFile::pin(&path).unwrap(),
+            #[cfg(feature = "test-support")]
+            fixture_digest: None,
+        };
+        let first = asset.headers().unwrap();
+        assert_eq!(asset.headers().unwrap(), first);
+        assert!(matches!(
+            asset.headers_with_check(&mut || Err(mlx_gen::gen_core::Error::Canceled)),
+            Err(Error::Canceled)
+        ));
+        // A cache hit never permits a changed path token, even with the original digest key.
+        std::fs::write(&path, b"changed").unwrap();
+        assert!(asset.headers().is_err());
+        // Mutation after opening/reading is also refused before returning parsed descriptors.
+        std::fs::write(&path, &bytes).unwrap();
+        let pin = PinnedWeightsFile::pin(&path).unwrap();
+        let mut calls = 0;
+        assert!(pinned_headers_with_check(&pin, &mut || {
+            calls += 1;
+            if calls == 5 {
+                std::fs::write(&path, b"changed during header read")?;
+            }
+            Ok(())
+        })
+        .is_err());
+    }
+
     #[test]
     fn full_prepared_closure_and_default_constructor_skip_ordinary_dit_sc26325() {
         let tmp = tempfile::tempdir().unwrap();
@@ -723,6 +1129,8 @@ mod cpu_tests {
         let bad = tmp.path().join("ordinary-config");
         std::fs::write(&bad, b"unselected ordinary config must not be consumed").unwrap();
         let ordinary = vec![Asset {
+            #[cfg(feature = "test-support")]
+            fixture_digest: None,
             pin: PinnedWeightsFile::pin(bad).unwrap(),
             role: MossImageAssetRole::Transformer,
             repo: SFT_REPO,

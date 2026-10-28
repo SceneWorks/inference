@@ -28,10 +28,15 @@ on:
   workflow_dispatch:
     inputs:
       lanes:
-        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; windows-gpu-diagnostic = read-only GPU1 metadata only; moss-edit-cuda = synthetic MOSS GPU1 tests only; moss-edit-metal = exact synthetic Metal oracle"
+        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; windows-gpu-diagnostic = read-only GPU1 metadata only; moss-edit-cuda = synthetic MOSS GPU1 tests only; moss-edit-metal = exact synthetic Metal oracle; moss-cuda-unit = only the one-test MOSS CUDA unit job (no weights); moss-cpu-fixture = hosted CPU model proofs and recovery assertion mutations; moss-metal-fixture = only the two original Metal author proofs; llm-decoder-fixture = only three shared decoder CPU proofs (manual model profiles are not ordinary CI)"
         type: choice
-        options: [all, windows-cuda, windows-gpu-diagnostic, moss-edit-cuda, moss-edit-metal]
+        options: [all, windows-cuda, windows-gpu-diagnostic, moss-edit-cuda, moss-edit-metal, moss-cuda-unit, moss-cpu-fixture, moss-metal-fixture, llm-decoder-fixture]
         default: all
+      test_suite:
+        description: "routine = bounded regressions; exhaustive = every registered synthetic training/numerical case (real weights and dedicated H3/MOSS lanes stay separate)"
+        type: choice
+        options: [routine, exhaustive]
+        default: routine
       # sc-26685: explicit operator route for the synthetic H3 native suites (the W4A8
       # external-fixture cases plus the pruned-AdaLN / adapter-topology complete-model cases). A
       # bare dispatch (`lanes: all`) does not run them, and `lanes: windows-cuda` would drag in the
@@ -72,11 +77,12 @@ permissions:
 concurrency:
   # Preserve every explicit numerical run's queue entry for BOTH H3 and MOSS edit.
   # Ordinary PR/main/tag groups and cancellation policy remain unchanged.
-  group: inference-ci-${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.synthetic_w4a8 == 'cuda' || github.event.inputs.synthetic_w4a8 == 'mlx' || github.event.inputs.synthetic_w4a8 == 'both') && format('w4a8-{0}', github.run_id) || github.event_name == 'workflow_dispatch' && (inputs.lanes == 'moss-edit-metal' || inputs.lanes == 'moss-edit-cuda') && format('moss-{0}', github.run_id) || (github.event_name == 'pull_request' && github.ref || github.sha) }}
+  group: inference-ci-${{ github.event_name == 'workflow_dispatch' && inputs.test_suite == 'exhaustive' && format('exhaustive-{0}', github.run_id) || github.event_name == 'workflow_dispatch' && (github.event.inputs.synthetic_w4a8 == 'cuda' || github.event.inputs.synthetic_w4a8 == 'mlx' || github.event.inputs.synthetic_w4a8 == 'both') && format('w4a8-{0}', github.run_id) || github.event_name == 'workflow_dispatch' && (inputs.lanes == 'moss-edit-metal' || inputs.lanes == 'moss-edit-cuda') && format('moss-{0}', github.run_id) || (github.event_name == 'pull_request' && github.ref || github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
+    timeout-minutes: 10
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: select affected lanes
     runs-on: ubuntu-latest
@@ -86,6 +92,7 @@ jobs:
       candle_cpu: ${{ steps.select.outputs.candle_cpu }}
       macos_metal: ${{ steps.select.outputs.macos_metal }}
       windows_cuda: ${{ steps.select.outputs.windows_cuda }}
+      moss_cuda_unit: ${{ steps.select.outputs.moss_cuda_unit }}
       docs: ${{ steps.select.outputs.docs }}
       release: ${{ steps.select.outputs.release }}
       # Informational only: ordinary CI has no job that consumes this output because privileged
@@ -98,6 +105,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+      - name: Validate explicit dispatch selectors before affected runtime lanes
+        if: github.event_name == 'workflow_dispatch'
+        run: python3 scripts/ci/llm_decoder_fixture.py preflight
       # Feature-epic refs form a protected branch train. Keep this in `changes`, which is
       # unconditional for every verification event and is required by the aggregate `CI gate`.
       # Only the explicit metadata-only diagnostic dispatch skips both jobs.
@@ -128,6 +138,14 @@ jobs:
         run: |
           if [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "windows-cuda" ]]; then
             python3 scripts/ci/select_lanes.py --only windows_cuda --github-output "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cuda-unit" ]]; then
+            python3 scripts/ci/select_lanes.py --moss-cuda-unit --github-output "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cpu-fixture" ]]; then
+            python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-metal-fixture" ]]; then
+            python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "llm-decoder-fixture" ]]; then
+            python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"
           elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
             python3 scripts/ci/select_lanes.py --all --github-output "$GITHUB_OUTPUT"
           else
@@ -169,6 +187,7 @@ jobs:
   # --all` all failed hard on main until it was found by hand. `--no-deps` keeps this to a
   # fast manifest parse (no dependency resolution, no compile).
   resolve:
+    timeout-minutes: 10
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: workspace manifest resolution
     runs-on: ubuntu-latest
@@ -189,6 +208,7 @@ jobs:
   # formatting can drift in any .rs file. `cargo fmt --all` also invokes `cargo metadata`, so
   # this doubles as a second resolution tripwire — no compile, so it stays fast.
   format:
+    timeout-minutes: 10
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: workspace formatting
     runs-on: ubuntu-latest
@@ -202,6 +222,7 @@ jobs:
         run: cargo fmt --all --check
 
   workspace:
+    timeout-minutes: 20
     name: workspace graph invariants
     needs: changes
     if: >-
@@ -262,6 +283,7 @@ jobs:
         run: python3 scripts/release/provision_mage_oracles.py --self-test
 
   contracts:
+    timeout-minutes: 30
     name: contracts + conformance testkits (Linux)
     needs: changes
     if: >-
@@ -308,6 +330,7 @@ jobs:
   # Keep it that way: moving this to a self-hosted label would cost a whole lane on the scarcest
   # resource in this repo to run a test that needs nothing but a filesystem.
   contracts-windows:
+    timeout-minutes: 30
     name: contracts testkit (Windows)
     needs: changes
     if: >-
@@ -333,8 +356,8 @@ jobs:
   # `changes.outputs.candle_cpu` and listed in the `gate` job's `needs:`.
   #
   # (sc-19447 later split `candle-cpu-test`'s single invocation in two and gave the `candle-gen*`
-  # half `--tests`, so that job now carries two steps rather than one. Nothing was dropped there
-  # either; see the notes on those steps.)
+  # half `--tests`. sc-27011 runs those unchanged groups in separate matrix members;
+  # nothing was dropped in either split. See the notes on those steps.)
   #
   # Why split rather than trim: the serial ordering was never a correctness requirement. Measured
   # over nine successful PR runs on 2026-08-15, the steps were independent and the job was bounded
@@ -352,12 +375,13 @@ jobs:
   # second policy test caps that step's comment block at four lines — so the note explaining the
   # move lives here rather than on the step.
   #
-  # Cache note: rust-cache derives its key from the job, so these four save four separate baselines
-  # instead of one. That is affordable only because `save-if` below restricts saving to `main` —
-  # without it, four jobs would write four PR-scoped caches per open PR. See the `save-if` note on
-  # the `workspace` job's cache step.
+  # Cache note: rust-cache derives its key from the job, plus the explicit matrix group for
+  # package tests, so these lanes save five separate baselines instead of one. This is affordable
+  # because `save-if` below restricts saving to `main`; PRs only restore these baselines.
+  # See the `save-if` note on the `workspace` job's cache step.
 
   candle-cpu-lint:
+    timeout-minutes: 60
     name: Candle CPU lint + docs (Linux)
     needs: changes
     if: >-
@@ -382,6 +406,8 @@ jobs:
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
           --features candle-audio/testkit
           --all-targets -- -D warnings
+      - name: Compile and lint opt-in MOSS model tests without execution
+        run: cargo clippy --locked --all-targets -j 1 -p candle-gen-moss-image --features test-support -- -D warnings
       - name: Reclaim Clippy artifacts before linking tests
         # RETAINED, and still between Clippy and rustdoc where it has always sat. The package tests
         # that used to follow now run on their own runners, so this no longer protects them — but
@@ -414,11 +440,20 @@ jobs:
         run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh candle-gen
 
   candle-cpu-test:
-    name: Candle CPU package tests (Linux)
+    timeout-minutes: ${{ inputs.test_suite == 'exhaustive' && 150 || 90 }}
+    name: Candle CPU package tests (Linux, ${{ matrix.group }})
     needs: changes
     if: >-
       (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [base, gen]
+    env:
+      # Cold gen took ~55m29s in run 40329999413. Allow a 75m invocation
+      # budget plus setup/cache time; see docs/ci-test-suites.md.
+      TEST_SUITE_DEADLINE_SECONDS: ${{ inputs.test_suite == 'exhaustive' && '7200' || '4500' }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install pinned Rust toolchain
@@ -426,8 +461,12 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          # rust-cache includes this in both save and restore prefixes: a fast base
+          # member cannot occupy gen's immutable main cache key with fewer dependencies.
+          key: ${{ matrix.group }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test Candle packages
+        if: matrix.group == 'base'
         # All-target Clippy in `candle-cpu-lint` checks every integration and real-weight target.
         # Execute the package unit/catalog suites one linker at a time: concurrently linking several
         # provider test binaries exceeds the hosted runner's memory-backed linker capacity and
@@ -446,6 +485,7 @@ jobs:
         # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
         # tests"); push: main, tags and dispatches run the whole set.
         env:
+          TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
           args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu)
@@ -455,7 +495,7 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
-          cargo test --locked --lib -j 1 "${packages[@]}"
+          python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test --locked --lib -j 1 "${packages[@]}"
       # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
       # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
       # under all-target Clippy without running them, `windows-cuda-check` compiles them
@@ -535,9 +575,11 @@ jobs:
       #     That is the real price, it is paid per push, and it is the first thing to re-measure
       #     (or to split across runners) if the candle lane's cost is ever questioned.
       - name: Test Candle gen packages and integration targets
+        if: matrix.group == 'gen'
         # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
         # tests"); push: main, tags and dispatches run the whole set.
         env:
+          TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
           args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p 'candle-gen*')
@@ -547,9 +589,193 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
-          cargo test --locked --lib --tests -j 1 "${packages[@]}"
+          python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test --locked --lib --tests -j 1 "${packages[@]}"
+
+  # Independent hosted CPU evidence; this does not replace ordinary PR/CUDA CI. Keep the
+  # existing push filters: publishing story/sc-26588-moss-recovery without a PR starts no jobs.
+  # The profile checks the source trigger assumption and refuses changes requiring re-admission.
+  moss-cpu-fixture:
+    name: MOSS CPU fixture (${{ matrix.backend }}, hosted)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cpu-fixture'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: candle
+            runner: ubuntu-latest
+          - backend: mlx
+            runner: macos-15
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Ensure existing hosted Metal build toolchain
+        if: matrix.backend == 'mlx'
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+      - name: Fetch pinned prebuilt MLX
+        if: matrix.backend == 'mlx'
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::building the pinned libmlx from source"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      - name: Cache Cargo and pinned native dependencies
+        id: cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: moss-cpu-fixture-${{ matrix.backend }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run actual CPU fixture and assertion mutations
+        env:
+          MOSS_CPU_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: python3 scripts/ci/moss_fixture_cpu_profile.py ${{ matrix.backend }}
+      - name: Upload exact-head CPU evidence (not a pass by artifact existence)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moss-cpu-${{ matrix.backend }}-${{ github.sha }}
+          path: ${{ runner.temp }}/moss-cpu-${{ matrix.backend }}-evidence
+          if-no-files-found: error
+
+  # Narrow explicit Metal author proof route. No CUDA, NAX, weights or other model jobs.
+  moss-metal-fixture:
+    name: MOSS Metal author proofs (hosted)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-metal-fixture'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Ensure existing hosted Metal build toolchain
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+      - name: Fetch pinned prebuilt MLX
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::building the pinned libmlx from source"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      - name: Cache Cargo and pinned native dependencies
+        id: cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: moss-metal-fixture
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run only original Metal author model proofs
+        env:
+          MOSS_CPU_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: python3 scripts/ci/moss_fixture_cpu_profile.py mlx --metal-only
+      - name: Upload exact-head Metal evidence (not a pass by artifact existence)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moss-metal-${{ github.sha }}
+          path: ${{ runner.temp }}/moss-metal-evidence
+          if-no-files-found: error
+
+  # Shared-LLM model proofs are separate from the MOSS 42-body roster.
+  llm-decoder-fixture:
+    name: Shared LLM decoder fixture (${{ matrix.backend }}, hosted)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'llm-decoder-fixture'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: candle
+            runner: ubuntu-latest
+          - backend: mlx
+            runner: macos-15
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Reject conflicting decoder selectors before toolchain setup
+        run: python3 scripts/ci/llm_decoder_fixture.py preflight
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Ensure existing hosted Metal build toolchain
+        if: matrix.backend == 'mlx'
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+      - name: Fetch pinned prebuilt MLX
+        if: matrix.backend == 'mlx'
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::building the pinned libmlx from source"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      - name: Cache Cargo and pinned native dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: llm-decoder-fixture-${{ matrix.backend }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Execute only registered shared decoder model cases
+        run: python3 scripts/ci/llm_decoder_fixture.py run ${{ matrix.backend }}
+      - name: Upload exact-head shared decoder evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llm-decoder-${{ matrix.backend }}-${{ github.sha }}
+          path: ${{ runner.temp }}/llm-decoder-${{ matrix.backend }}-evidence
+          if-no-files-found: error
 
   candle-cpu-conformance:
+    timeout-minutes: 45
     name: Candle CPU conformance + SA3 gates (Linux)
     needs: changes
     if: >-
@@ -580,6 +806,7 @@ jobs:
           -- --nocapture
 
   candle-cpu-bundles:
+    timeout-minutes: 45
     name: Candle CPU bundle profiles (Linux)
     needs: changes
     if: >-
@@ -609,6 +836,7 @@ jobs:
         run: cargo test --locked --no-default-features --features media --lib -p runtime-cpu
 
   macos-metal:
+    timeout-minutes: ${{ inputs.test_suite == 'exhaustive' && 180 || 75 }}
     name: MLX + Candle Metal packages (macOS)
     needs: changes
     if: >-
@@ -749,6 +977,8 @@ jobs:
           cargo clippy --locked
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
           --all-targets -- -D warnings
+      - name: Compile and lint opt-in MOSS model tests without execution
+        run: cargo clippy --locked --all-targets -j 1 -p mlx-gen-moss-image --features test-support -- -D warnings
       - name: Rustdoc macOS MLX packages
         # This is the complete macOS/MLX package set the lane already builds. Keep its public
         # intra-doc graph under the same warnings-as-errors policy as the Linux and CUDA package
@@ -795,6 +1025,9 @@ jobs:
         # On a PR this runs only the affected packages of this set (`changes` job, "Scope package
         # tests"); push: main, tags and dispatches run the whole set.
         env:
+          TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
+          # The native full graph took 41m07s in job 121596995674; retain headroom.
+          TEST_SUITE_DEADLINE_SECONDS: ${{ inputs.test_suite == 'exhaustive' && '7200' || '3600' }}
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
           args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos)
@@ -804,27 +1037,9 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
-          cargo test --locked --lib --tests "${packages[@]}"
-      - name: Check H3 precise pruned projection on hosted Metal (manual)
-        if: github.event_name == 'workflow_dispatch' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both')
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-pruned-hosted-metal.log"
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 1
-          grep -Fxq "pruned_adaln::native_pruned_adaln_matches_pinned_reference: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test pruned_adaln::native_pruned_adaln_matches_pinned_reference ..." "$log"
-          grep -Fq "H3_PRUNED_ORACLE_DEVICE" "$log"
-          grep -Fq "H3_PRUNED_ORACLE block 0 modulation: max_abs=" "$log"
-      # H3 complete-model/model-stack tests are `#[ignore]`d on both backends: ordinary PR/main
-      # CI compiles them but never executes a complete DiT, block stack, or native projection.
-      # Device suites and the hosted precision margin above run only on explicit workflow_dispatch.
-      # Every such step has positive exact count/name guards; no ignored H3 model step may run
-      # on an ordinary PR/main event.
+          python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test --locked --lib --tests "${packages[@]}"
+      # H3 learned projection/model proofs run only in the dedicated manual
+      # synthetic-w4a8-mlx job below; ordinary CI only compiles ignored cases.
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -893,6 +1108,7 @@ jobs:
           --test integration -- metal_strided_reduce:: metal_reference_latents::
 
   macos-nax:
+    timeout-minutes: 180
     name: runtime-macos NAX (macOS 26.2, manual)
     needs: changes
     # A `synthetic_w4a8` dispatch replaces the heavy manual lanes with the synthetic suite; see
@@ -941,7 +1157,9 @@ jobs:
           # until something reinstalls rustup. Harmless on ephemeral runners; not here.
           cache-bin: "false"
       - name: Exercise MLX engine and complete runtime catalog on NAX
-        run: cargo test --locked --lib -p mlx-llm -p runtime-macos
+        env:
+          TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
+        run: python3 scripts/ci/test_suites.py "$TEST_SUITE" -- cargo test --locked --lib -p mlx-llm -p runtime-macos
       # SC-18318 acceptance is correctness-only: exercise the focused synthetic
       # request-scoped exact-epilogue equality/receipt suite on a live Metal
       # device. The p3_ filter is intentionally narrow and invokes no timing,
@@ -970,6 +1188,7 @@ jobs:
   # plus each printed test-name prefix. A renamed, deleted, or filtered-away case changes the
   # count and reds the route, so a "0 tests ran" run can never pass.
   synthetic-w4a8-mlx:
+    timeout-minutes: 180
     name: Synthetic H3 native suites (MLX/Metal, manual)
     needs: changes
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both'))
@@ -1215,6 +1434,8 @@ jobs:
           grep -Fq "test pruned_adaln::full_model_live_coordinates_match_cache_and_refuse_foreign_basis ..." "$log"
           grep -Fq "test pruned_adaln::full_model_detects_pruned_and_checks_pruning_identity ..." "$log"
           grep -Fq "test pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control ..." "$log"
+          grep -Fq "H3_PRUNED_ORACLE_DEVICE" "$log"
+          grep -Fq "H3_PRUNED_ORACLE block 0 modulation: max_abs=" "$log"
           grep -Fq "H3_GEOMETRY_AUDIO_FULL_FORWARD backend=metal cases=11" "$log"
       - name: Prove H3 turbo adapter fold complete model on Metal
         env:
@@ -1335,6 +1556,7 @@ jobs:
   # below because it needs the CUDA-gated registration graph but never touches a device; executing the
   # rest of the CUDA tests stays in the manual `windows-cuda` lane.
   windows-cuda-check:
+    timeout-minutes: 90
     name: Candle CUDA compile check (Windows)
     needs: changes
     # This persistent runner may execute repository build scripts, so a public-fork PR must never
@@ -1387,6 +1609,11 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # Register before rust-cache so its cache upload finishes before target removal.
+      - uses: ./.github/actions/cleanup-runner-storage
+      - name: Test runner storage cleanup guards
+        shell: powershell
+        run: node --test scripts/runner-storage-cleanup.test.mjs
       # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in the repo's
       # CI config); its daemon resets mid-build on heavy Candle/CUDA graphs ("An existing connection
       # was forcibly closed by the remote host (os error 10054)" with zero rustc diagnostics). Clear
@@ -1476,6 +1703,7 @@ jobs:
           cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
 
   windows-cuda:
+    timeout-minutes: 180
     name: Candle CUDA packages (Windows, manual)
     needs: changes
     # A `synthetic_w4a8` dispatch replaces the heavy manual lanes with the synthetic suite; see
@@ -1491,6 +1719,11 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # Register before rust-cache so its cache upload finishes before target removal.
+      - uses: ./.github/actions/cleanup-runner-storage
+      - name: Test runner storage cleanup guards
+        shell: powershell
+        run: node --test scripts/runner-storage-cleanup.test.mjs
       - name: Isolate persistent-runner HF caches
         shell: cmd
         run: |
@@ -1565,13 +1798,14 @@ jobs:
         # The runner is sm_120: an sm_120 test (NVFP4, the indexed NVFP4 MoE kernel) must run
         # here, so `skip_without_sm120` fails instead of skipping silently (sc-24440 review).
         env:
+          TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
           REQUIRE_SM120: "1"
           # Iris' multi-process fixtures explicitly opt into sharing this lane's one visible card.
           # Without it rank 1 asks for cuda:1, exits InvalidMesh, and peers time out in rendezvous.
           IRIS_DIST_SHARE_DEVICE: "1"
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
+          python scripts/ci/test_suites.py "%TEST_SUITE%" -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
       - name: Test LLM-only CUDA bundle
         shell: cmd
         run: |
@@ -1585,12 +1819,96 @@ jobs:
           call "%VCVARS%"
           cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
 
+  # Manual, one-test CUDA execution of the MOSS production graph (sc-26586). Compiling is not GPU
+  # execution; the single test below is, and it loads no model weights (tiny-author fixture).
+  # Dispatch-only and profile-exclusive: `all`, `windows-cuda`, PRs and tags never schedule it, and a
+  # dispatched run that skips it fails the `CI gate`. The 60 minute job limit covers a cold CUDA
+  # build of unknown duration; the 300 s / 6 GiB execution bounds are enforced by the supervisor
+  # (scripts/ci/moss_cuda_unit.py), which owns and kills only its own process tree. They are safety
+  # limits for a unit process, not calibration, and there is no retry.
+  moss-cuda-unit:
+    name: MOSS CUDA unit test (Windows, manual)
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.lanes == 'moss-cuda-unit' &&
+      needs.changes.outputs.moss_cuda_unit == 'true' &&
+      github.repository == 'SceneWorks/inference' &&
+      github.ref_type == 'branch' &&
+      startsWith(github.ref, 'refs/heads/')
+    runs-on: [self-hosted, windows, cuda]
+    timeout-minutes: 60
+    # Job-level, so the workflow's per-sha group is untouched. Serializes only against workflows that
+    # use this group; other repositories and unrelated jobs are not covered.
+    concurrency:
+      group: inference-real-weights-physical-host
+      cancel-in-progress: false
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      RUST_TEST_THREADS: "1"
+      CI: "true"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/cleanup-runner-storage
+      # Same runner-global sccache hazard as the other heavy Candle lanes (native-12219): clear the
+      # wrapper for THIS job only, in a step, never as a job-level env override.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Install pinned uv for the MOSS unit supervisor
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12 for the MOSS unit supervisor
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd
+      # The unit runs only inside a Windows Job Object. Prove that ownership (fake Python children,
+      # no CUDA/Cargo/weights) before any GPU step; the smoke fails if it is unavailable or skipped.
+      - name: Verify Windows Job Object ownership (no GPU)
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit smoke'
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      # No `save-if: main`, for the reason given on `windows-cuda`; cache-bin is off for the same
+      # persistent-runner rustup.exe reason.
+      - name: Cache Cargo and CUDA objects
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Compile the MOSS lib test binary (no GPU execution)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          "%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit compile
+      - name: Execute the one MOSS CUDA production-graph test
+        shell: cmd
+        timeout-minutes: 6
+        run: '"%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit run'
+
   # Explicit H3 native proofs on physical GPU0; main's broad manual CUDA lane retains GPU1.
   # Includes the committed W4A8 external oracle and every ignored H3 model/block suite below.
   # No pretrained weights or Hub fetches. Ordinary CI compiles these tests but never runs them.
   # Exact positive counts/names and backend completion markers prevent filtered or CPU evidence
   # from masquerading as current CUDA execution.
   synthetic-w4a8-cuda:
+    timeout-minutes: 180
     name: Synthetic H3 native suites (CUDA, manual)
     needs: changes
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true' && (inputs.synthetic_w4a8 == 'cuda' || inputs.synthetic_w4a8 == 'both'))
@@ -1602,6 +1920,7 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: ./.github/actions/cleanup-runner-storage
       # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in the repo's
       # CI config); its daemon resets mid-build on heavy Candle/CUDA graphs ("os error 10054" with
       # zero rustc diagnostics). Clear the wrapper for THIS job only; sibling jobs keep sccache and
@@ -1981,6 +2300,7 @@ jobs:
           findstr /C:"test dit_parity::weight_mapping_is_exhaustive_over_the_block_stack ..." "%LOG%" >nul || exit /b 1
 
   supply-chain:
+    timeout-minutes: 20
     if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: dependency policy + advisories
     runs-on: ubuntu-latest
@@ -2005,6 +2325,7 @@ jobs:
         run: cargo deny --locked check advisories bans licenses sources
 
   docs:
+    timeout-minutes: 30
     name: repository documentation
     needs: changes
     if: >-
@@ -2016,6 +2337,7 @@ jobs:
         run: python3 scripts/check_docs.py
 
   release-metadata:
+    timeout-minutes: 20
     name: runtime manifest + SPDX SBOM
     needs: changes
     if: >-
@@ -2036,6 +2358,7 @@ jobs:
         run: python3 scripts/release/verify_release.py dist/release --skip-smoke
 
   release-artifacts:
+    timeout-minutes: 30
     name: tagged source archive + external smoke
     needs: [changes, release-metadata]
     if: >-
@@ -2078,6 +2401,7 @@ jobs:
   # dispatch- and tag-only lanes are included deliberately, since `skipped` is tolerated and that
   # keeps them covered on the events where they do run. Add new jobs here, or they go ungated.
   gate:
+    timeout-minutes: 10
     name: CI gate
     needs:
       - changes
@@ -2099,6 +2423,10 @@ jobs:
       - windows-gpu-diagnostic
       - moss-edit-cuda
       - moss-edit-metal
+      - moss-cuda-unit
+      - moss-cpu-fixture
+      - moss-metal-fixture
+      - llm-decoder-fixture
       - supply-chain
       - docs
       - release-metadata
@@ -2110,8 +2438,33 @@ jobs:
       - name: Require every lane to have succeeded or been skipped
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          # A requested profile that was skipped is not a pass (a skip normally reads green below).
+          REQUIRE_MOSS_CUDA_UNIT: ${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cuda-unit' }}
+          MOSS_CUDA_UNIT_RESULT: ${{ needs.moss-cuda-unit.result }}
+          REQUIRE_MOSS_CPU_FIXTURE: ${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cpu-fixture' }}
+          MOSS_CPU_FIXTURE_RESULT: ${{ needs.moss-cpu-fixture.result }}
+          REQUIRE_MOSS_METAL_FIXTURE: ${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-metal-fixture' }}
+          MOSS_METAL_FIXTURE_RESULT: ${{ needs.moss-metal-fixture.result }}
+          REQUIRE_LLM_DECODER_FIXTURE: ${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'llm-decoder-fixture' }}
+          LLM_DECODER_FIXTURE_RESULT: ${{ needs.llm-decoder-fixture.result }}
         run: |
           echo "lane results: $RESULTS"
+          if [[ "$REQUIRE_MOSS_CUDA_UNIT" == "true" && "$MOSS_CUDA_UNIT_RESULT" != "success" ]]; then
+            echo "::error::the requested moss-cuda-unit profile reported '$MOSS_CUDA_UNIT_RESULT', not success"
+            exit 1
+          fi
+          if [[ "$REQUIRE_MOSS_CPU_FIXTURE" == "true" && "$MOSS_CPU_FIXTURE_RESULT" != "success" ]]; then
+            echo "::error::the requested two-row moss-cpu-fixture profile did not succeed"
+            exit 1
+          fi
+          if [[ "$REQUIRE_MOSS_METAL_FIXTURE" == "true" && "$MOSS_METAL_FIXTURE_RESULT" != "success" ]]; then
+            echo "::error::the requested original Metal proof profile did not succeed"
+            exit 1
+          fi
+          if [[ "$REQUIRE_LLM_DECODER_FIXTURE" == "true" && "$LLM_DECODER_FIXTURE_RESULT" != "success" ]]; then
+            echo "::error::the requested shared decoder proof matrix did not succeed"
+            exit 1
+          fi
           for result in $RESULTS; do
             case "$result" in
               success|skipped) ;;
@@ -2158,6 +2511,7 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: ./.github/actions/cleanup-runner-storage
       - name: Select Git Bash
         shell: cmd
         run: |

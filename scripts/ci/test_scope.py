@@ -53,6 +53,8 @@ FORCE_ALL = (
     ".cargo",
     ".github/workflows/ci.yml",
     "scripts/ci/test_scope.py",
+    "scripts/ci/test_suites.py",
+    "scripts/ci/test_suites.json",
     "scripts/ci/select_lanes.py",
 )
 # A literal that climbs out of its file or crate, wherever the climb starts: "../x",
