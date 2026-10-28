@@ -475,7 +475,7 @@ impl DitBlock {
         rope: &MmRope,
         tables: &MmRopeTables,
     ) -> Result<Tensor> {
-        self.forward_veda(x, modulation, adaln_indices, rope, tables, None)
+        self.forward_veda(x, modulation, adaln_indices, rope, tables, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -487,6 +487,7 @@ impl DitBlock {
         rope: &MmRope,
         tables: &MmRopeTables,
         veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
+        cancel: Option<&candle_gen::gen_core::CancelFlag>,
     ) -> Result<Tensor> {
         let s = x.dims();
         if s.len() != 3 {
@@ -515,7 +516,7 @@ impl DitBlock {
         )?;
         let attn = self
             .attn
-            .forward_veda(&normed, Some((rope, tables)), veda)?;
+            .forward_veda(&normed, Some((rope, tables)), veda, cancel)?;
         let gate = gate_rows(&modulation.gate_msa, &idx, rows, x.dtype())?;
         let x = x.add(&gate.broadcast_mul(&attn)?)?;
 

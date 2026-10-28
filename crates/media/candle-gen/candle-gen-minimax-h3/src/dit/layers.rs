@@ -9,11 +9,14 @@
 //! # The attention transient is a genuine cross-backend difference (sc-17152)
 //!
 //! MLX's fused `scaled_dot_product_attention` **streams the scores**: sc-17152 measured its peak
-//! tracking `4·B·H·S·D` exactly, i.e. there is no `[B, H, Sq, Sk]` tensor in memory at all. candle
-//! has no fused kernel here, so [`DitAttention::forward`] routes through
-//! `candle_gen::sdpa_budgeted_bhsd`, which **does** materialize scores — in bounded row blocks
+//! tracking `4·B·H·S·D` exactly, i.e. there is no `[B, H, Sq, Sk]` tensor in memory at all. On a
+//! `flash-attn` CUDA build candle now does the same: [`DitAttention::forward`] dispatches bf16/f16
+//! attention to FlashAttention-2 (`candle_gen::sdpa_dispatch_bhsd`, sc-26691), which streams the
+//! scores. Every other build (CPU, Metal, CUDA without `flash-attn`, f32) routes through
+//! `candle_gen::sdpa_planned_bhsd`, which **does** materialize scores — in bounded row blocks
 //! rather than all at once (`ATTN_SCORES_BUDGET`, the shared i32-overflow-safe helper from
-//! sc-9116).
+//! sc-9116) — and checks the request's cancel flag before each block. The paragraphs below
+//! describe that fallback.
 //!
 //! The consequence is stated rather than glossed: at the shipped 1344×768 canvas the 345-frame
 //! lattice ceiling (14.375 s — 15 s has no legal frame count) packs ~104k rows — 102 latent frames
@@ -56,13 +59,14 @@
 
 use candle_gen::attention::AttentionBudget;
 use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::gen_core::CancelFlag;
 use candle_gen::quant::{AdaptLinear, LokrFactors};
 use candle_gen::{CandleError, Result, Weights};
 
 use crate::dit::config::MiniMaxH3DitConfig;
 use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::layout::split_gate_value;
-use crate::nn::{rms_weighted, sdpa, silu};
+use crate::nn::{rms_weighted, sdpa_planned, silu};
 
 /// A **forward-time additive LoRA residual** attached to a [`LinearNoBias`] (sc-18728).
 ///
@@ -451,14 +455,19 @@ impl DitAttention {
 
     /// `rope` is `None` for the token refiner, which runs **without** any positional embedding.
     pub fn forward(&self, x: &Tensor, rope: Option<(&MmRope, &MmRopeTables)>) -> Result<Tensor> {
-        self.forward_veda(x, rope, None)
+        self.forward_veda(x, rope, None, None)
     }
 
+    /// [`Self::forward`] with the Veda sparse-attention runtime and the request's cancel flag.
+    ///
+    /// `cancel` reaches the attention kernel: the fused path checks it once per call (one call =
+    /// one layer), the budgeted fallback before every query chunk (sc-26691).
     pub(crate) fn forward_veda(
         &self,
         x: &Tensor,
         rope: Option<(&MmRope, &MmRopeTables)>,
         veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
+        cancel: Option<&CancelFlag>,
     ) -> Result<Tensor> {
         let s = x.dims();
         if s.len() != 3 {
@@ -484,14 +493,29 @@ impl DitAttention {
             None => (q, k),
         };
 
-        // MiniMax-H3 packs one request into a single attention document: no mask, not causal.
-        let qh = q.transpose(1, 2)?.contiguous()?;
-        let kh = k.transpose(1, 2)?.contiguous()?;
-        let vh = v.transpose(1, 2)?.contiguous()?;
+        // MiniMax-H3 packs one request into a single attention document: no mask, not causal —
+        // the joint self-attention over text + condition + audio + video rows is fully dense (there
+        // is no separate cross-attention; the text rows are part of the same sequence). That is
+        // exactly the shape the fused kernel serves, so on a `flash-attn` CUDA build this takes
+        // FlashAttention-2 (`crate::nn::sdpa_planned`, sc-26691).
+        //
+        // `[B, S, H, D] -> [B, H, S, D]` stays a strided VIEW for the dispatcher: the fused path
+        // hands the kernel the `[B, S, H, D]` layout back for free, and the budgeted fallback makes
+        // its own contiguous copies. Only the Veda runtime takes contiguous tensors.
+        let qh = q.transpose(1, 2)?;
+        let kh = k.transpose(1, 2)?;
+        let vh = v.transpose(1, 2)?;
         let scale = 1.0 / (d as f64).sqrt();
         let out = match veda {
-            Some((runtime, layer, step)) => runtime.attention(layer, step, &qh, &kh, &vh, scale)?,
-            None => sdpa(&qh, &kh, &vh, scale)?,
+            Some((runtime, layer, step)) => runtime.attention(
+                layer,
+                step,
+                &qh.contiguous()?,
+                &kh.contiguous()?,
+                &vh.contiguous()?,
+                scale,
+            )?,
+            None => sdpa_planned(&qh, &kh, &vh, scale, cancel)?,
         };
 
         let out = out

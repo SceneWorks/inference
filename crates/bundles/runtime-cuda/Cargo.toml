@@ -22,6 +22,11 @@ media = ["dep:candle-gen-catalog"]
 # text + TTS via `--no-default-features --features audio` without the image/video provider graph.
 audio = ["dep:candle-audio-catalog"]
 flash-attn = ["candle-llm/flash-attn"]
+# FlashAttention-2 for the media lane (sc-26691) — separate from the LLM `flash-attn` above because
+# a candle-llm flash build refuses the CUDA-graph runner (`flash_attn_stream`), and the media lane
+# should not impose that. Long-sequence MiniMax-H3 renders need it: without it their attention runs
+# the materialized, query-chunked fallback.
+media-flash-attn = ["media", "candle-gen-catalog?/flash-attn"]
 
 [dev-dependencies]
 # The registry-wide memory-contract facts walk (sc-22661): the bundle's own acceptance test for

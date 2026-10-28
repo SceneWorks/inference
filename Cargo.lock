@@ -490,6 +490,7 @@ name = "candle-gen"
 version = "0.0.0"
 dependencies = [
  "candle-core",
+ "candle-flash-attn",
  "candle-nn",
  "candle-quant-kernels",
  "float8",
@@ -890,6 +891,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.22.2",
+ "tracing",
 ]
 
 [[package]]

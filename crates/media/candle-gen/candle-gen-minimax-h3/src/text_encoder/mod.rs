@@ -357,6 +357,11 @@ pub fn minimax_h3_vision_config() -> VisionConfig {
 /// throughout): the tower is 0.9 GB, so widening it is a rounding error against the 53 GB
 /// conditioning stage.
 pub fn load_vision_tower(te_dir: impl AsRef<Path>, device: &Device) -> Result<VisionTower> {
+    // The tower is loaded and run in **f32** (boogu's parity-grade ViT), so its attention keeps the
+    // shared budgeted path rather than FlashAttention-2 (sc-26691): the fused kernel has no f32
+    // variant, and casting the tower to bf16 would move the grounding numerics for no measurable
+    // gain — each source is its own forward over one image's patches (a few thousand tokens), which
+    // is a single un-chunked attention pass, not the long-sequence chunk storm the DiT had.
     let dir = te_dir.as_ref();
     let w = candle_gen_boogu::loader::Weights::from_dir(dir, device, DType::F32)?;
     Ok(VisionTower::load(
