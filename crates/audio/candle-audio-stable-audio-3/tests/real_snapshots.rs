@@ -2,7 +2,7 @@
 //!
 //! The test takes explicit immutable snapshot paths and never scans or derives a cache location.
 
-use std::path::PathBuf;
+mod common;
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device};
 use candle_audio_stable_audio_3::config::{
@@ -129,11 +129,7 @@ const CASES: &[Case] = &[
     },
 ];
 
-fn path(name: &str) -> PathBuf {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("{name} must point to its pinned immutable snapshot"))
-}
+use common::snapshot_dir as path;
 
 #[test]
 #[ignore = "requires all eight explicitly provisioned sc-14534 snapshots"]

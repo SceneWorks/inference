@@ -32,6 +32,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -2214,16 +2215,16 @@ fn native_metadata_declarations_are_required_not_defaulted() {
     //
     // This row asserts the refusal *message*, not merely that a refusal happened, because the two
     // are not the same thing here. Reading the non-object as empty metadata does not make the file
-    // load: `read_safetensors_metadata` runs *before* `MmapedSafetensors::new` (`adapters.rs:947`
-    // then `:950`), and safetensors deserializes `__metadata__` as a map, so the neutered form dies
-    // at the header parse — `invalid JSON in header: invalid type: integer 7, expected a map` — and
+    // load: `read_safetensors_metadata` runs *before* the adapter file is opened as safetensors
+    // (`load_native`; `read_adapter_safetensors` since sc-27352 replaced the mmap), and
+    // safetensors deserializes `__metadata__` as a map, so the neutered form dies at the header parse — `invalid JSON in header: invalid type: integer 7, expected a map` — and
     // never reaches the `adapter_type` check at all. Either way an `is_err()` row would hold and
     // this site would stay dark. The message is what separates the rule under test from the one
     // standing behind it.
     //
     // An earlier revision of this comment, of `b3976a26`'s commit message and of the PR body all
-    // named that downstream refusal as the missing `adapter_type`. It is not — the mmap open sits
-    // between. Same defect class as the completeness claim this branch already corrected: a
+    // named that downstream refusal as the missing `adapter_type`. It is not — the safetensors open
+    // sits between. Same defect class as the completeness claim this branch already corrected: a
     // measured-sounding step that does not reproduce. The conclusion is unchanged.
     {
         let odd = dir.join("non-object-metadata.safetensors");
@@ -2856,11 +2857,7 @@ const REAL_CASES: &[RealCase] = &[
     },
 ];
 
-fn snapshot_root(env: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var(env).unwrap_or_else(|_| panic!("set {env} to the pinned immutable snapshot")),
-    )
-}
+use common::snapshot_dir as snapshot_root;
 
 /// Pick real adapter targets out of a real checkpoint header: the conditioner Linear plus the two
 /// smallest DiT Linears, so the synthetic adapter is genuinely spread across **both** target
