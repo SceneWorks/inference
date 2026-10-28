@@ -72,8 +72,8 @@
 //! | module | port of |
 //! | --- | --- |
 //! | [`rope`] | `Qwen3VLTextRotaryEmbedding` — interleaved 3-axis M-RoPE |
-//! | [`attention`] | `Qwen3VLTextAttention` (as re-bound by `qwen3_patch_forward`) |
-//! | [`mlp`] | `Qwen3VLTextMLP` — SwiGLU |
+//! | [`Qwen3VlAttention`] (core `text_decoder`) | `Qwen3VLTextAttention` (as re-bound by `qwen3_patch_forward`) |
+//! | [`Qwen3VlMlp`] (core `SwiGluMlp`) | `Qwen3VLTextMLP` — SwiGLU |
 //! | [`layer`] | `Qwen3VLTextDecoderLayer` |
 //! | [`encoder`] | `Qwen3VLTextModel.forward` (patched, `cu_seqlens`-packed) |
 //! | [`prompt`] | `PROMPT_TEMPLATE` + the truncation/`drop_idx` policy |

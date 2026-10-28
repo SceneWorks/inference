@@ -1,5 +1,5 @@
 //! Offline pre-quantization: read the dense FLUX.1 snapshot and write a packed Q4/Q8 snapshot that
-//! [`crate::quant`] (+ the crate-local `TokenEmbedding` packed-detect + the shared Z-Image VAE) loads
+//! [`mlx_gen::quant`] (+ the crate-local `TokenEmbedding` packed-detect + the shared Z-Image VAE) loads
 //! with no dense transient. Mirrors `mlx_gen_z_image::convert` / `mlx_gen_qwen_image::convert` (same
 //! `mlx_rs::ops::quantize`, byte-equal to the load-time `.quantize` seams), differing only in the
 //! FLUX key layout and that it packs **four** components.

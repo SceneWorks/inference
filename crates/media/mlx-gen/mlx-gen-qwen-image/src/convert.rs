@@ -1,5 +1,5 @@
 //! Offline pre-quantization: read the dense Qwen-Image snapshot and write a packed Q4/Q8 snapshot
-//! that [`crate::quant`] loads with no dense transient. Mirrors `mlx_gen_z_image::convert` /
+//! that [`mlx_gen::quant`] loads with no dense transient. Mirrors `mlx_gen_z_image::convert` /
 //! `mlx_gen_flux2::convert` (same `mlx_rs::ops::quantize`, byte-equal to the load-time
 //! `AdaptableLinear::quantize`), differing only in the Qwen-Image key layout and that **only the
 //! transformer is packed**.
@@ -9,7 +9,7 @@
 //! ("Quantization causes significant semantic degradation") and the VAE is all-conv (no quantizable
 //! leaves). So the converter packs `transformer/` and copies `text_encoder/`, `vae/`, `tokenizer/`,
 //! `processor/`, `scheduler/`, and the configs through **dense** (bf16). The result loads via the
-//! standard [`crate::model::load`] path — the packed transformer auto-detects ([`crate::quant`])
+//! standard [`crate::model::load`] path — the packed transformer auto-detects ([`mlx_gen::quant`])
 //! with no dense bf16 transient (sc-8670). This is the Group-B per-crate converter template
 //! (sc-8669); the dense-TE shape matches FLUX.2-klein (sc-8711).
 
