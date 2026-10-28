@@ -64,6 +64,7 @@ use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::flow::{normalize_cfg, validate_shared_floors, LOSS_TYPES, TIMESTEP_BIASES};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -151,20 +152,6 @@ const TIMESTEP_TYPES: [&str; 6] = [
     "uniform",
     "weighted",
 ];
-/// Recognized `timestep_bias` values [`sample_sigma`] branches on (plus the neutral default).
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` → MAE, `mse`/`l2` → the MSE default.
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
 
 /// `(x_t, target)` for a single sample at flow-match `t`: `x_t = (1−t)·x0 + t·noise`,
 /// `target = noise − x0` (the velocity the **raw** SD3 MMDiT output is regressed onto — NO sign flip;
@@ -344,12 +331,6 @@ mlx_gen::register_trainer! {
     pub(crate) const MEDIUM_TRAINER_REGISTRATION = medium_trainer_descriptor => load_trainer_medium
 }
 
-/// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,
-/// `-`/space → `_`) so validation accepts exactly the spellings the run would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
 /// Capability-free training-request validation, factored out so it can be unit-tested without a loaded
 /// trainer. Rejects an empty dataset, zero rank/steps, an unsupported optimizer, and an unrecognized
 /// `timestep_type`/`timestep_bias`/`loss_type`. An EMPTY `timestep_type` is accepted (→ the SD3
@@ -403,16 +384,7 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-    // request (typed `Unsupported`) rather than silently training a plain adapter.
-    gen_core::train::validate_control_request(descriptor, req)?;
-    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-    gen_core::train::validate_full_finetune_request(descriptor, req)?;
-    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-    gen_core::train::validate_training_techniques(descriptor, req)?;
-    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_shared_floors(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }

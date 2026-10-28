@@ -5,6 +5,7 @@
 
 pub mod checkpoint;
 pub mod dataset;
+pub mod flow;
 pub mod formula;
 pub mod latent_lpips;
 pub mod lazy;

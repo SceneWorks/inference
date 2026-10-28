@@ -34,6 +34,7 @@ use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::flow::{validate_flow_match_request, validate_shared_floors};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -202,33 +203,6 @@ mlx_gen::register_trainer! {
     pub(crate) const REGISTRATION = trainer_descriptor => load_trainer
 }
 
-/// Recognized `timestep_type` values — the noise-schedule samplers [`sample_sigma`] branches on
-/// (`linear`/`uniform`/`weighted`) plus the `sigmoid` default it falls back to. Any other string
-/// would silently sample sigmoid (F-041).
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values — the high/low-noise tilts [`sample_sigma`] branches on plus
-/// the neutral default (`balanced`/`none`/`neutral`) it falls back to.
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` select MAE, `mse`/`l2` the MSE default; any other
-/// string would silently train MSE (F-041).
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
-
-/// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,
-/// `-`/space → `_`) so validation accepts exactly the spellings the run would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
 /// Capability-free training-request validation, factored out of [`Trainer::validate`] so it can be
 /// unit-tested without a loaded trainer (mirrors the inference-side `validate_request`). Rejects an
 /// empty dataset, zero rank, **zero steps** (F-040 — a 0-step run would otherwise fall straight
@@ -237,62 +211,12 @@ fn normalize_cfg(s: &str) -> String {
 /// `timestep_type` / `timestep_bias` / `loss_type`. The non-empty target-module resolution (also
 /// F-041) is checked in [`Trainer::validate`], which has the loaded DiT to match suffixes against.
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    if req.items.is_empty() {
-        return Err("z_image_turbo trainer: dataset is empty".into());
-    }
-    if req.config.rank == 0 {
-        return Err("z_image_turbo trainer: rank must be > 0".into());
-    }
-    if req.config.steps == 0 {
-        return Err("z_image_turbo trainer: steps must be > 0".into());
-    }
-    if !TrainOptimizer::is_supported(&req.config.optimizer) {
-        return Err(format!(
-            "z_image_turbo trainer: optimizer '{}' is not available on MLX training (supported: \
-             adamw, adam, rose, prodigy)",
-            req.config.optimizer
-        )
-        .into());
-    }
-    if !TIMESTEP_TYPES.contains(&normalize_cfg(&req.config.timestep_type).as_str()) {
-        return Err(format!(
-            "z_image_turbo trainer: timestep_type '{}' is not recognized (supported: {})",
-            req.config.timestep_type,
-            TIMESTEP_TYPES.join(", ")
-        )
-        .into());
-    }
-    if !TIMESTEP_BIASES.contains(&normalize_cfg(&req.config.timestep_bias).as_str()) {
-        return Err(format!(
-            "z_image_turbo trainer: timestep_bias '{}' is not recognized (supported: {})",
-            req.config.timestep_bias,
-            TIMESTEP_BIASES.join(", ")
-        )
-        .into());
-    }
-    if !LOSS_TYPES.contains(&normalize_cfg(&req.config.loss_type).as_str()) {
-        return Err(format!(
-            "z_image_turbo trainer: loss_type '{}' is not recognized (supported: {})",
-            req.config.loss_type,
-            LOSS_TYPES.join(", ")
-        )
-        .into());
-    }
-    Ok(())
+    validate_flow_match_request(req, "z_image_turbo trainer")
 }
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-    // request (typed `Unsupported`) rather than silently training a plain adapter.
-    gen_core::train::validate_control_request(descriptor, req)?;
-    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-    gen_core::train::validate_full_finetune_request(descriptor, req)?;
-    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-    gen_core::train::validate_training_techniques(descriptor, req)?;
-    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_shared_floors(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }

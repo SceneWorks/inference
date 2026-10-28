@@ -63,6 +63,9 @@ use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::flow::{
+    sample_unit_timestep as sample_sigma, validate_flow_match_request, validate_shared_floors,
+};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -111,23 +114,6 @@ const TRAINER_ENCODER_QUANT: Option<Quant> = Some(Quant::Q8);
 /// dual-stream joint-attention projections. `to_out` is an `nn.ModuleList([Linear, Identity])`, so the
 /// trainable Linear is `to_out.0` (sc-2218); `img_qkv`/`txt_qkv` are the fused per-stream QKV.
 const DEFAULT_TARGET_MODULES: [&str; 4] = ["img_qkv", "txt_qkv", "to_out.0", "to_add_out"];
-
-/// Recognized `timestep_type` values [`sample_sigma`] branches on (plus the `sigmoid` default).
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values [`sample_sigma`] branches on (plus the neutral default).
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` → MAE, `mse`/`l2` → the MSE default.
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
 
 /// `(x_t, target)` for a single sample at flow-match `t`: `x_t = (1−t)·x0 + t·noise`,
 /// `target = noise − x0` (the velocity the **raw** Lens DiT output is regressed onto; the transformer
@@ -266,12 +252,6 @@ mlx_gen::register_trainer! {
     pub(crate) const TRAINER_REGISTRATION = trainer_descriptor => load_trainer
 }
 
-/// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,
-/// `-`/space → `_`) so validation accepts exactly the spellings the run would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
 /// Capability-free training-request validation, factored out so it can be unit-tested without a loaded
 /// trainer. Rejects an empty dataset, zero rank, **zero steps** (a 0-step run would write a no-op
 /// `B = 0` identity adapter), an unsupported optimizer, and an unrecognized
@@ -279,63 +259,12 @@ fn normalize_cfg(s: &str) -> String {
 /// `gradient_checkpointing` is now a supported toggle (sc-5170) — the checkpointed DiT forward + the
 /// fail-fast OOM preflight guard are wired in [`LensTrainer::train_impl`].
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    let cfg = &req.config;
-    if req.items.is_empty() {
-        return Err("lens trainer: dataset is empty".into());
-    }
-    if cfg.rank == 0 {
-        return Err("lens trainer: rank must be > 0".into());
-    }
-    if cfg.steps == 0 {
-        return Err("lens trainer: steps must be > 0".into());
-    }
-    if !TrainOptimizer::is_supported(&cfg.optimizer) {
-        return Err(format!(
-            "lens trainer: optimizer '{}' is not available on MLX training (supported: adamw, adam, \
-             rose, prodigy)",
-            cfg.optimizer
-        )
-        .into());
-    }
-    if !TIMESTEP_TYPES.contains(&normalize_cfg(&cfg.timestep_type).as_str()) {
-        return Err(format!(
-            "lens trainer: timestep_type '{}' is not recognized (supported: {})",
-            cfg.timestep_type,
-            TIMESTEP_TYPES.join(", ")
-        )
-        .into());
-    }
-    if !TIMESTEP_BIASES.contains(&normalize_cfg(&cfg.timestep_bias).as_str()) {
-        return Err(format!(
-            "lens trainer: timestep_bias '{}' is not recognized (supported: {})",
-            cfg.timestep_bias,
-            TIMESTEP_BIASES.join(", ")
-        )
-        .into());
-    }
-    if !LOSS_TYPES.contains(&normalize_cfg(&cfg.loss_type).as_str()) {
-        return Err(format!(
-            "lens trainer: loss_type '{}' is not recognized (supported: {})",
-            cfg.loss_type,
-            LOSS_TYPES.join(", ")
-        )
-        .into());
-    }
-    Ok(())
+    validate_flow_match_request(req, "lens trainer")
 }
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-    // request (typed `Unsupported`) rather than silently training a plain adapter.
-    gen_core::train::validate_control_request(descriptor, req)?;
-    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-    gen_core::train::validate_full_finetune_request(descriptor, req)?;
-    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-    gen_core::train::validate_training_techniques(descriptor, req)?;
-    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_shared_floors(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }
@@ -1068,38 +997,6 @@ fn encode_caption(
         .collect::<Result<Vec<_>>>()?;
     let mask = ones::<f32>(&[1, l - offset])?;
     Ok((features, mask))
-}
-
-/// Sample a normalized flow-match timestep (interpolation coefficient) `t ∈ [1e-3, 1−1e-3]` — a
-/// faithful port of the SceneWorks `sample_training_timestep` (identical to the Z-Image trainer):
-/// `sigmoid(randn)` by default, `uniform` for linear, `(uniform + sigmoid(randn))/2` for weighted;
-/// bias `high` → `√t`, `low` → `t²`. Deterministic in `seed`.
-fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let ttype = timestep_type.trim().to_ascii_lowercase().replace('-', "_");
-    let t = match ttype.as_str() {
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            let k2 = random::key(seed ^ 0x9E37_79B9)?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
-    };
-    let bias = timestep_bias
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '-'], "_");
-    let t = match bias.as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    Ok(t.clamp(1e-3, 1.0 - 1e-3))
 }
 
 /// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr), run the

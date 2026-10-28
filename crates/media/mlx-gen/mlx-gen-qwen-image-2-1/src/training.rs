@@ -74,6 +74,7 @@ use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::flow::{normalize_cfg, validate_flow_match_request};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, factorization, LoraParams, TrainAdapter,
@@ -160,23 +161,6 @@ pub const ADAPTER_PROVENANCE: [(&str, &str); 6] = [
 /// adapters do not carry the key at all (their metadata is unchanged by sc-24161). The adapter
 /// itself is the same PEFT/LyCORIS file either way and loads through the same host.
 pub const EDIT_ADAPTER_MARKER: (&str, &str) = ("trainingMode", "edit");
-
-/// Recognized `timestep_type` values [`sample_sigma`] branches on (plus the `sigmoid` default).
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values [`sample_sigma`] branches on (plus the neutral default).
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` → MAE, `mse`/`l2` → the MSE default.
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
 
 /// The refusal every quantized-base path raises (typed [`Error::Unsupported`]). QLoRA is a
 /// non-goal: the trainer runs over the dense bf16 base only.
@@ -916,60 +900,13 @@ impl QwenImage21Trainer {
     }
 }
 
-/// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,
-/// `-`/space → `_`) so validation accepts exactly the spellings the run would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
 /// Capability-free training-request validation, unit-testable without loaded weights. Rejects an
 /// empty dataset, zero rank, zero steps (a 0-step run would write a no-op identity adapter), an
 /// unsupported optimizer, an unrecognized `timestep_type`/`timestep_bias`/`loss_type`, a control
 /// image on any item, and `model_options` that select reference / control conditioning — the same
 /// inputs, with the same messages, the candle twin refuses (sc-24163).
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    let cfg = &req.config;
-    if req.items.is_empty() {
-        return Err(format!("{TRAINER_ID} trainer: dataset is empty").into());
-    }
-    if cfg.rank == 0 {
-        return Err(format!("{TRAINER_ID} trainer: rank must be > 0").into());
-    }
-    if cfg.steps == 0 {
-        return Err(format!("{TRAINER_ID} trainer: steps must be > 0").into());
-    }
-    if !TrainOptimizer::is_supported(&cfg.optimizer) {
-        return Err(format!(
-            "{TRAINER_ID} trainer: optimizer '{}' is not available on MLX training (supported: \
-             adamw, adam, rose, prodigy)",
-            cfg.optimizer
-        )
-        .into());
-    }
-    if !TIMESTEP_TYPES.contains(&normalize_cfg(&cfg.timestep_type).as_str()) {
-        return Err(format!(
-            "{TRAINER_ID} trainer: timestep_type '{}' is not recognized (supported: {})",
-            cfg.timestep_type,
-            TIMESTEP_TYPES.join(", ")
-        )
-        .into());
-    }
-    if !TIMESTEP_BIASES.contains(&normalize_cfg(&cfg.timestep_bias).as_str()) {
-        return Err(format!(
-            "{TRAINER_ID} trainer: timestep_bias '{}' is not recognized (supported: {})",
-            cfg.timestep_bias,
-            TIMESTEP_BIASES.join(", ")
-        )
-        .into());
-    }
-    if !LOSS_TYPES.contains(&normalize_cfg(&cfg.loss_type).as_str()) {
-        return Err(format!(
-            "{TRAINER_ID} trainer: loss_type '{}' is not recognized (supported: {})",
-            cfg.loss_type,
-            LOSS_TYPES.join(", ")
-        )
-        .into());
-    }
+    validate_flow_match_request(req, &format!("{TRAINER_ID} trainer"))?;
     if req
         .items
         .iter()

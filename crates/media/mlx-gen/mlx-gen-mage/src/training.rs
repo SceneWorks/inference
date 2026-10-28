@@ -58,6 +58,7 @@ use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::flow::{normalize_cfg, LOSS_TYPES, TIMESTEP_BIASES, TIMESTEP_TYPES};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -486,30 +487,6 @@ fn load_weights(spec: &LoadSpec) -> Result<MageFlowTrainer> {
 // `gen_core::Result`.
 mlx_gen::register_trainer! {
     pub(crate) const REGISTRATION = trainer_descriptor => load_trainer
-}
-
-/// Recognized `timestep_type` values [`sample_sigma`] branches on plus the `sigmoid` default it
-/// falls back to. Any other string would silently sample sigmoid — rejected in [`validate_request`].
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values plus the neutral default.
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` select MAE, `mse`/`l2` the MSE default.
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
-
-/// Normalize a free-form config string the way the trainer's parsers do (trim, lowercase,
-/// `-`/space → `_`) so validation accepts exactly the spellings the run would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
 }
 
 /// Capability-free training-request validation, factored out so it can be unit-tested without loaded
