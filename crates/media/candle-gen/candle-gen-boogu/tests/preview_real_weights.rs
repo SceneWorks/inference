@@ -23,12 +23,13 @@ const _: fn() = || {
         __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
 };
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 
 use candle_gen::gen_core::{
-    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink,
-    Progress, WeightsSource,
+    Conditioning, GenerationRequest, Image, LoadSpec, PreviewFrame, Progress, WeightsSource,
+};
+use candle_gen::testkit::{
+    collecting_sink, correlation, env_u32, mean_abs_delta, one_image, required_path,
 };
 use image::{imageops, RgbImage};
 
@@ -64,34 +65,6 @@ struct Metrics {
     correlations: Vec<f64>,
     distances: Vec<f64>,
     movement: Vec<f64>,
-}
-
-fn required_path(name: &str) -> PathBuf {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {name} for the one-time sc-17218 CUDA acceptance run"))
-}
-
-fn env_u32(name: &str, default: u32) -> u32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn one_image(output: GenerationOutput) -> Image {
-    let GenerationOutput::Images(mut images) = output else {
-        panic!("Boogu must return images")
-    };
-    assert_eq!(images.len(), 1);
-    images.pop().unwrap()
-}
-
-fn collecting_sink() -> (PreviewSink, Arc<Mutex<Vec<PreviewFrame>>>) {
-    let frames = Arc::new(Mutex::new(Vec::new()));
-    let captured = Arc::clone(&frames);
-    let sink = PreviewSink::new(move |frame| candle_gen::lock_recover(&captured).push(frame));
-    (sink, frames)
 }
 
 fn read_reference(path: &Path) -> Image {
@@ -137,31 +110,6 @@ fn rgb(image: &Image) -> RgbImage {
 
 fn resized_pixels(image: &Image, width: u32, height: u32) -> Vec<u8> {
     imageops::resize(&rgb(image), width, height, imageops::FilterType::Triangle).into_raw()
-}
-
-fn mean_abs_delta(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b)
-        .map(|(&x, &y)| (f64::from(x) - f64::from(y)).abs())
-        .sum::<f64>()
-        / a.len() as f64
-}
-
-fn correlation(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len());
-    let n = a.len() as f64;
-    let mean_a = a.iter().map(|&x| f64::from(x)).sum::<f64>() / n;
-    let mean_b = b.iter().map(|&x| f64::from(x)).sum::<f64>() / n;
-    let (mut covariance, mut variance_a, mut variance_b) = (0.0, 0.0, 0.0);
-    for (&x, &y) in a.iter().zip(b) {
-        let x = f64::from(x) - mean_a;
-        let y = f64::from(y) - mean_b;
-        covariance += x * y;
-        variance_a += x * x;
-        variance_b += y * y;
-    }
-    covariance / (variance_a * variance_b).sqrt()
 }
 
 fn analyze(label: &str, frames: &[PreviewFrame], final_image: &Image, steps: u32) -> Metrics {

@@ -25,6 +25,7 @@ use candle_gen::gen_core::{
 use candle_gen::testkit::{probe_gpu, used_mib, VramProbe};
 
 use crate::common::{fixture, host_f32, Fixture};
+use candle_gen::testkit::save_image_png;
 
 fn env_dir(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
@@ -61,10 +62,7 @@ fn rgb8_distance(a: &[u8], b: &[u8]) -> (u8, f64, f64) {
 
 fn save_png(image: &Image, name: &str) {
     let path = env_dir("IRIS_OUT").join(name);
-    image::RgbImage::from_raw(image.width, image.height, image.pixels.clone())
-        .unwrap()
-        .save(&path)
-        .unwrap();
+    save_image_png(&path, image);
     eprintln!("[[IRIS_RESTORE_CANDLE]] wrote {}", path.display());
 }
 

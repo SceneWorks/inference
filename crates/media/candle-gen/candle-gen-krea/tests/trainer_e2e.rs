@@ -42,6 +42,7 @@ use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, CancelFlag, GenerationOutput, GenerationRequest, Image, LoadSpec,
     NetworkType, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
 };
+use candle_gen::testkit::save_image_png;
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::{merge_into_weights, Krea2Config};
 
@@ -580,17 +581,10 @@ fn render_turbo(root: &Path, prompt: &str, adapters: Vec<AdapterSpec>) -> Image 
 }
 
 fn save_png(img: &Image, name: &str) {
-    let dir = artifact_root().join("krea_roundtrip");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{name}.png"));
-    image::save_buffer(
-        &path,
-        &img.pixels,
-        img.width,
-        img.height,
-        image::ExtendedColorType::Rgb8,
-    )
-    .unwrap();
+    let path = artifact_root()
+        .join("krea_roundtrip")
+        .join(format!("{name}.png"));
+    save_image_png(&path, img);
     println!("  saved {}", path.display());
 }
 

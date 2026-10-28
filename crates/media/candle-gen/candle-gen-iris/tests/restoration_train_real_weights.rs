@@ -36,6 +36,7 @@ use candle_gen_iris::train::lpips::Lpips;
 use candle_gen_iris::IrisRestorer;
 
 use crate::common::{fixture, host_f32};
+use candle_gen::testkit::save_image_png;
 
 fn env_path(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
@@ -118,13 +119,6 @@ fn real_lpips_and_critic_trunk_match_the_reference() {
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_real_weights::real_lpips_and_critic_trunk_match_the_reference");
-}
-
-fn save_png(img: &Image, path: &Path) {
-    image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
-        .unwrap()
-        .save(path)
-        .unwrap();
 }
 
 /// Three crops of the repository photo (the trainer re-crops each to 256² and degrades it).
@@ -243,7 +237,7 @@ fn train_export_and_restore(case: &str, mut config: TrainingConfig) {
     let (input, gt) = restore_case();
     let base = env_path("IRIS_UPSCALER_DIR");
     let before = restore(&base, &input);
-    save_png(&before, &out.join("restore_base_x4.png"));
+    save_image_png(&out.join("restore_base_x4.png"), &before);
 
     let probe_vram =
         std::env::var("IRIS_VRAM_PROBE").is_ok_and(|v| v == "1") && used_mib(probe_gpu()).is_some();
@@ -313,7 +307,7 @@ fn train_export_and_restore(case: &str, mut config: TrainingConfig) {
     assert_eq!(res.steps, 4);
     let export = res.adapter_path.parent().unwrap().to_path_buf();
     let after = restore(&export, &input);
-    save_png(&after, &out.join("restore_trained_x4.png"));
+    save_image_png(&out.join("restore_trained_x4.png"), &after);
     let moved = before
         .pixels
         .iter()

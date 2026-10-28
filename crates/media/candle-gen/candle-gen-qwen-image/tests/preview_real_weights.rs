@@ -29,11 +29,15 @@
 //! proved something. Asking for `--ignored` is already the opt-in.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, PreviewFrame, PreviewSink,
-    WeightsSource,
+    GenerationRequest, Image, LoadSpec, OffloadPolicy, PreviewFrame, WeightsSource,
+};
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
+use candle_gen::testkit::{
+    collecting_sink, correlation, downsample_box, downsample_box_raw, env_path_opt, env_u32,
+    mean_abs_delta, one_image, preview_strip_sheet, required_path,
 };
 use candle_gen_qwen_image::{
     QwenEdit, QwenEditPaths, QwenEditRequest, QwenFunControl, QwenFunControlPaths,
@@ -75,41 +79,12 @@ const LATENTS_STD: [f64; 16] = [
     1.6382, 1.1253, 2.8251, 1.916,
 ];
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var(name).ok().map(PathBuf::from)
-}
-
-/// An input a row cannot run without. Missing means **fail**, not skip.
-fn required_path(name: &str) -> PathBuf {
-    env_path(name).unwrap_or_else(|| {
-        panic!(
-            "{name} must be set for this row — skipping it would report success while proving \
-             nothing"
-        )
-    })
-}
-
-fn env_u32(name: &str, fallback: u32) -> u32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(fallback)
-}
-
 fn artifact_dir() -> PathBuf {
-    env_path("QWEN_PREVIEW_ARTIFACT_DIR")
+    env_path_opt("QWEN_PREVIEW_ARTIFACT_DIR")
         .unwrap_or_else(|| std::env::temp_dir().join("qwen_preview_sc16952"))
 }
 
 // ── Provenance: the reuse is grounded in tensor bytes ─────────────────────────────────────────────
-
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
-}
 
 /// The single `.safetensors` under a snapshot's `vae/` dir — the file
 /// `crate::vae::QwenVae::new` is handed, on every lane.
@@ -144,8 +119,8 @@ fn read_latent_stats(root: &Path) -> (Vec<f64>, Vec<f64>) {
 /// defining the same normalized latent space the fit was measured in.
 fn assert_is_the_fit_donor_vae(label: &str, root: &Path) {
     let shard = vae_file(root);
-    let shard_sha = sha256_of(&shard);
-    let config_sha = sha256_of(&root.join("vae").join("config.json"));
+    let shard_sha = sha256_file(&shard);
+    let config_sha = sha256_file(&root.join("vae").join("config.json"));
     eprintln!("{label} vae/         {shard_sha}  {}", shard.display());
     eprintln!("{label} vae/config   {config_sha}");
     assert_eq!(
@@ -179,91 +154,17 @@ fn edit_vae_is_the_pinned_fit_donor() {
 
 // ── Runtime: the frames actually develop ──────────────────────────────────────────────────────────
 
-/// Mean absolute per-channel distance between two equal-length RGB8 buffers.
-fn mean_abs_delta(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs() as f64)
-        .sum::<f64>()
-        / a.len() as f64
-}
-
-/// Pearson correlation between two equal-length RGB8 buffers, over all channels.
-fn correlation(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len());
-    let n = a.len() as f64;
-    let (mean_a, mean_b) = (
-        a.iter().map(|&v| v as f64).sum::<f64>() / n,
-        b.iter().map(|&v| v as f64).sum::<f64>() / n,
-    );
-    let (mut cov, mut var_a, mut var_b) = (0.0, 0.0, 0.0);
-    for (&x, &y) in a.iter().zip(b) {
-        let (dx, dy) = (x as f64 - mean_a, y as f64 - mean_b);
-        cov += dx * dy;
-        var_a += dx * dx;
-        var_b += dy * dy;
-    }
-    let denominator = (var_a * var_b).sqrt();
-    if denominator == 0.0 {
-        return 0.0;
-    }
-    cov / denominator
-}
-
-/// Box-downsample a raw RGB8 buffer to `(w, h)`.
-fn downsample_raw(pixels: &[u8], src_w: u32, src_h: u32, w: u32, h: u32) -> Vec<u8> {
-    let (sw, sh) = (src_w as usize, src_h as usize);
-    let (tw, th) = (w as usize, h as usize);
-    let mut out = vec![0u8; tw * th * 3];
-    for ty in 0..th {
-        for tx in 0..tw {
-            let (x0, x1) = (tx * sw / tw, ((tx + 1) * sw / tw).max(tx * sw / tw + 1));
-            let (y0, y1) = (ty * sh / th, ((ty + 1) * sh / th).max(ty * sh / th + 1));
-            for c in 0..3 {
-                let mut sum = 0u32;
-                let mut n = 0u32;
-                for y in y0..y1.min(sh) {
-                    for x in x0..x1.min(sw) {
-                        sum += pixels[(y * sw + x) * 3 + c] as u32;
-                        n += 1;
-                    }
-                }
-                out[(ty * tw + tx) * 3 + c] = (sum / n.max(1)) as u8;
-            }
-        }
-    }
-    out
-}
-
-fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
-    downsample_raw(&img.pixels, img.width, img.height, w, h)
-}
-
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(format!("{name}.png"));
-    image::save_buffer(&path, pixels, width, height, image::ExtendedColorType::Rgb8)
-        .expect("save a PNG");
+    let path = artifact_dir().join(format!("{name}.png"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  saved {}", path.display());
 }
 
 /// Write the frames side by side as one strip, plus each frame individually — the artifact the epic
 /// asks to be reviewed directly.
 fn save_strip(frames: &[PreviewFrame], name: &str) {
-    let (w, h) = (
-        frames[0].image.width as usize,
-        frames[0].image.height as usize,
-    );
-    let strip_w = w * frames.len();
-    let mut strip = vec![0u8; strip_w * h * 3];
-    for (i, frame) in frames.iter().enumerate() {
-        for y in 0..h {
-            let src = &frame.image.pixels[y * w * 3..(y + 1) * w * 3];
-            let x0 = (y * strip_w + i * w) * 3;
-            strip[x0..x0 + w * 3].copy_from_slice(src);
-        }
+    let (strip, width, height) = preview_strip_sheet(frames);
+    for frame in frames {
         save_png(
             &frame.image.pixels,
             frame.image.width,
@@ -271,22 +172,7 @@ fn save_strip(frames: &[PreviewFrame], name: &str) {
             &format!("{name}_frame{:02}", frame.current),
         );
     }
-    save_png(&strip, strip_w as u32, h as u32, &format!("{name}_strip"));
-}
-
-fn one_image(out: GenerationOutput) -> Image {
-    let GenerationOutput::Images(mut images) = out else {
-        panic!("expected GenerationOutput::Images");
-    };
-    assert_eq!(images.len(), 1);
-    images.pop().expect("one image")
-}
-
-fn collecting_sink() -> (PreviewSink, Arc<Mutex<Vec<PreviewFrame>>>) {
-    let frames = Arc::new(Mutex::new(Vec::new()));
-    let captured = Arc::clone(&frames);
-    let sink = PreviewSink::new(move |frame| candle_gen::lock_recover(&captured).push(frame));
-    (sink, frames)
+    save_png(&strip, width, height, &format!("{name}_strip"));
 }
 
 /// The shared strip analysis: numbering, latent resolution, per-frame movement, falling distance to
@@ -338,7 +224,7 @@ fn assert_the_strip_converges(
     }
 
     let (lw, lh) = (width / 8, height / 8);
-    let target = downsample(final_image, lw, lh);
+    let target = downsample_box(final_image, lw, lh);
     let distances: Vec<f64> = frames
         .iter()
         .map(|f| mean_abs_delta(&f.image.pixels, &target))
@@ -366,12 +252,12 @@ fn assert_the_strip_converges(
     // averages the residual noise away and leaves subject placement and colour masses — is what "the
     // preview looks like the image" actually means for a decorative frame.
     let coarse = 16u32;
-    let coarse_target = downsample(final_image, coarse, coarse);
+    let coarse_target = downsample_box(final_image, coarse, coarse);
     let correlations: Vec<f64> = frames
         .iter()
         .map(|f| {
             correlation(
-                &downsample_raw(
+                &downsample_box_raw(
                     &f.image.pixels,
                     f.image.width,
                     f.image.height,
@@ -588,24 +474,24 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
     // preview that had projected reference tokens would invert this.
     let coarse = 16u32;
     let to_final = correlation(
-        &downsample_raw(
+        &downsample_box_raw(
             &frames[frames.len() - 1].image.pixels,
             frames[frames.len() - 1].image.width,
             frames[frames.len() - 1].image.height,
             coarse,
             coarse,
         ),
-        &downsample(&active, coarse, coarse),
+        &downsample_box(&active, coarse, coarse),
     );
     let to_reference = correlation(
-        &downsample_raw(
+        &downsample_box_raw(
             &frames[frames.len() - 1].image.pixels,
             frames[frames.len() - 1].image.width,
             frames[frames.len() - 1].image.height,
             coarse,
             coarse,
         ),
-        &downsample(&reference, coarse, coarse),
+        &downsample_box(&reference, coarse, coarse),
     );
     eprintln!("  edit last frame: r(edited) {to_final:+.3}  r(reference) {to_reference:+.3}");
     assert!(
@@ -658,7 +544,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
     let hint = Image {
         width: size,
         height: size,
-        pixels: downsample_raw(&decoded.into_raw(), source_w, source_h, size, size),
+        pixels: downsample_box_raw(&decoded.into_raw(), source_w, source_h, size, size),
     };
     eprintln!("control hint {source_w}x{source_h} → resampled to {size}x{size}");
 
