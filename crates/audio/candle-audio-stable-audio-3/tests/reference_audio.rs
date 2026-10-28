@@ -38,7 +38,7 @@
 //!    of `reference_audio_for` straight into the extracted `pipeline::sampler_strength_for`, so
 //!    (2) and (3) together are one continuous request → sampler-strength assertion.
 //!
-//! Past that `strength` argument the value goes into `Pipeline::synthesize_with_reference`'s own
+//! Past that `strength` argument the value goes into `Pipeline::synthesize_conditioned`'s own
 //! sampling, which needs weights; that span is covered by
 //! `real_reference_restyle_is_bounded_and_ordered_on_all_six_variants`, which requires the measured
 //! source correlation at contract `1.0` to exceed the one at contract `0.0` by a wide margin.
@@ -67,7 +67,7 @@ use candle_audio_stable_audio_3::gen_core::{
 };
 use candle_audio_stable_audio_3::pipeline::{
     prepare_reference_pcm, reference_halves_agree, sampler_strength_for, ReferenceAudio,
-    SAMPLE_RATE,
+    SynthesisHooks, SynthesisRequest, SAMPLE_RATE,
 };
 use candle_audio_stable_audio_3::sampler::{
     adapt_sample_size_for_max, build_schedule, initialized_start, DistributionShift, Schedule,
@@ -299,7 +299,7 @@ fn the_request_surface_hands_the_pipeline_the_converted_noise_level() {
             "{strength:?}: the sampler-facing init noise level is the complement"
         );
 
-        // The struct `generate` hands `Pipeline::synthesize_with_reference`, field for field. The
+        // The struct `generate` hands `Pipeline::synthesize_conditioned`, field for field. The
         // scalar fields are asserted individually first so a failure names the wrong value instead
         // of dumping the whole source buffer; the struct equality after them is what would catch a
         // *new* field being added unconverted.
@@ -528,7 +528,7 @@ fn prepared_reference_pcm_is_resampled_channel_conformed_and_target_sized() {
 /// `target_frames * CHANNELS` unconditionally, so sweeping the *source* length proved nothing about
 /// source extent. The seam that could actually get this wrong is upstream of it — the resolution of
 /// `SynthesisParameters::duration_secs`, which is the single number
-/// `Pipeline::synthesize_with_reference` turns into the adapted sample size, the length
+/// `Pipeline::synthesize_conditioned` turns into the adapted sample size, the length
 /// `prepare_reference_pcm` conforms to, and the attention mask. A source-extent leak *there* would
 /// be completely invisible in `prepare_reference_pcm`'s own output. So that is what is asserted,
 /// plus the geometry arithmetic behind it, two-sided.
@@ -967,18 +967,22 @@ fn real_initial_sampler_noise_precedes_the_source_encode() {
         };
         let (samples, order) = pipeline
             .synthesize_with_reference_traced(
-                "restyle this clip",
-                None,
-                parameters,
+                SynthesisRequest {
+                    prompt: "restyle this clip",
+                    negative_prompt: None,
+                    parameters,
+                },
                 Some(ReferenceAudio {
                     samples: &source.samples,
                     sample_rate: SAMPLE_RATE,
                     channels: 2,
                     noise_level: reference_noise_level(Some(0.5)),
                 }),
-                &mut |_, _| {},
-                &mut || {},
-                &|| false,
+                SynthesisHooks {
+                    on_progress: &mut |_, _| {},
+                    on_decoding: &mut || {},
+                    is_canceled: &|| false,
+                },
             )
             .unwrap_or_else(|error| panic!("{id}: {error}"));
         assert_eq!(samples.len(), frames * CHANNELS);

@@ -52,6 +52,7 @@ use std::f32::consts::PI;
 use std::path::Path;
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor, D};
+use candle_audio::dsp::DirectRdft;
 use candle_audio::{AudioError, Result};
 use candle_nn::ops::sigmoid;
 use candle_nn::{
@@ -152,29 +153,18 @@ fn mel_filterbank() -> Vec<f32> {
 /// Precomputed fbank tables reused across frames and clips.
 struct Fbank {
     window: Vec<f32>,
-    mel_fb: Vec<f32>,  // `[FEAT_DIM][N_BINS]`
-    cos_tab: Vec<f32>, // `[N_BINS][FRAME_LEN]`, angle over N_FFT
-    sin_tab: Vec<f32>,
+    mel_fb: Vec<f32>, // `[FEAT_DIM][N_BINS]`
+    /// The 512-point real DFT. Only the first `FRAME_LEN` samples are non-zero after windowing
+    /// (the rest is the zero pad), so its table only spans `FRAME_LEN` columns.
+    dft: DirectRdft,
 }
 
 impl Fbank {
     fn new() -> Self {
-        // DFT twiddles for a 512-pt transform, but only the first FRAME_LEN samples are non-zero
-        // after windowing (the rest is the zero pad), so the tables only span FRAME_LEN columns.
-        let mut cos_tab = vec![0f32; N_BINS * FRAME_LEN];
-        let mut sin_tab = vec![0f32; N_BINS * FRAME_LEN];
-        for k in 0..N_BINS {
-            for t in 0..FRAME_LEN {
-                let ang = -2.0 * PI * k as f32 * t as f32 / N_FFT as f32;
-                cos_tab[k * FRAME_LEN + t] = ang.cos();
-                sin_tab[k * FRAME_LEN + t] = ang.sin();
-            }
-        }
         Self {
             window: povey_window(FRAME_LEN),
             mel_fb: mel_filterbank(),
-            cos_tab,
-            sin_tab,
+            dft: DirectRdft::zero_padded(N_FFT, FRAME_LEN),
         }
     }
 
@@ -206,19 +196,7 @@ impl Fbank {
             }
             frame[0] *= self.window[0];
             // Power spectrum via a direct real-DFT over the 512-pt (zero-padded) windowed frame.
-            for (k, p) in power.iter_mut().enumerate() {
-                let (cos_k, sin_k) = (
-                    &self.cos_tab[k * FRAME_LEN..],
-                    &self.sin_tab[k * FRAME_LEN..],
-                );
-                let mut re = 0f32;
-                let mut im = 0f32;
-                for (t, &x) in frame.iter().enumerate() {
-                    re += x * cos_k[t];
-                    im += x * sin_k[t];
-                }
-                *p = re * re + im * im;
-            }
+            self.dft.power_into(&frame, &mut power);
             // Mel projection + log(max(·, eps)).
             for b in 0..FEAT_DIM {
                 let filt = &self.mel_fb[b * N_BINS..(b + 1) * N_BINS];

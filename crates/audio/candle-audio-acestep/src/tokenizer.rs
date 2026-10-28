@@ -37,6 +37,7 @@
 use std::path::Path;
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor};
+use candle_audio::ops::{repeat_kv, rope_tables};
 use candle_audio::{AudioError, Result};
 use candle_nn::{linear, linear_b, rms_norm, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
@@ -120,42 +121,6 @@ fn from_heads(x: &Tensor) -> CandleResult<Tensor> {
     x.transpose(1, 2)?.reshape((b, l, h * d))
 }
 
-fn repeat_kv(x: &Tensor, groups: usize) -> CandleResult<Tensor> {
-    if groups == 1 {
-        return x.contiguous();
-    }
-    let (b, h, l, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, h, groups, l, d))?
-        .reshape((b, h * groups, l, d))?
-        .contiguous()
-}
-
-/// Half-split RoPE tables `[len, head_dim/2]` — the same convention as [`crate::dit`] /
-/// [`crate::condition`] (candle `rope`, the `use_real_unbind_dim=-2` branch).
-fn rope_tables(
-    head_dim: usize,
-    len: usize,
-    theta: f64,
-    device: &Device,
-) -> CandleResult<(Tensor, Tensor)> {
-    let half = head_dim / 2;
-    let mut cos = Vec::with_capacity(len * half);
-    let mut sin = Vec::with_capacity(len * half);
-    for pos in 0..len {
-        for j in 0..half {
-            let inv = 1.0 / theta.powf(2.0 * j as f64 / head_dim as f64);
-            let a = pos as f64 * inv;
-            cos.push(a.cos() as f32);
-            sin.push(a.sin() as f32);
-        }
-    }
-    Ok((
-        Tensor::from_vec(cos, (len, half), device)?,
-        Tensor::from_vec(sin, (len, half), device)?,
-    ))
-}
-
 /// One `AceStepEncoderLayer` (pre-LN, GQA + per-head q/k RMSNorm, RoPE, SwiGLU MLP) — the same
 /// block the DiT self-attention and the condition encoder use, over full bidirectional attention
 /// (the pooler/detokenizer sequences are shorter than the sliding window, so no mask applies).
@@ -229,7 +194,7 @@ impl EncoderLayer {
             self.num_kv_heads,
             self.head_dim,
         )?;
-        let (cos, sin) = rope_tables(self.head_dim, len, self.theta, device)?;
+        let (cos, sin) = rope_tables(device, len, self.head_dim, self.theta)?;
         let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         let groups = self.num_heads / self.num_kv_heads;

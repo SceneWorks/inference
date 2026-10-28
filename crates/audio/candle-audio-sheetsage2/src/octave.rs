@@ -9,6 +9,8 @@
 //! Accompaniment can also put energy at f0/2, so this is evidence for a reviewer, never a
 //! correction: the model's pitches are left untouched.
 
+use candle_audio::dsp::FftPlan;
+
 /// Evidence for one vocal note.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NoteEvidence {
@@ -50,64 +52,24 @@ impl OctaveEvidence {
 
 const SIZE: usize = 1 << 16;
 
-struct Fft64 {
-    twiddles: Vec<(f64, f64)>,
-    bitrev: Vec<usize>,
-}
-
-impl Fft64 {
-    fn new() -> Self {
-        let bits = SIZE.trailing_zeros();
-        Self {
-            twiddles: (0..SIZE / 2)
-                .map(|k| {
-                    let a = -2.0 * std::f64::consts::PI * k as f64 / SIZE as f64;
-                    (a.cos(), a.sin())
-                })
-                .collect(),
-            bitrev: (0..SIZE)
-                .map(|i| i.reverse_bits() >> (usize::BITS - bits))
-                .collect(),
-        }
+/// The `SIZE`-point f64 FFT magnitudes of the real input (zero-padded / truncated) — the first
+/// `SIZE / 2 + 1` bins, on the audio commons' radix-2 plan (bit-identical to the private f64 plan
+/// this check carried, sc-27261).
+fn magnitudes(plan: &FftPlan<f64>, input: &[f64]) -> Vec<f64> {
+    let mut data = vec![(0.0f64, 0.0f64); SIZE];
+    for (slot, &x) in data.iter_mut().zip(input) {
+        slot.0 = x;
     }
-
-    /// Magnitudes of the first `SIZE / 2 + 1` bins of the real input (zero-padded / truncated).
-    fn magnitudes(&self, input: &[f64]) -> Vec<f64> {
-        let mut data = vec![(0.0f64, 0.0f64); SIZE];
-        for (slot, &x) in data.iter_mut().zip(input) {
-            slot.0 = x;
-        }
-        for i in 0..SIZE {
-            let j = self.bitrev[i];
-            if i < j {
-                data.swap(i, j);
-            }
-        }
-        let mut len = 2;
-        while len <= SIZE {
-            let stride = SIZE / len;
-            for start in (0..SIZE).step_by(len) {
-                for k in 0..len / 2 {
-                    let (wr, wi) = self.twiddles[k * stride];
-                    let (ar, ai) = data[start + k];
-                    let (br, bi) = data[start + k + len / 2];
-                    let (tr, ti) = (br * wr - bi * wi, br * wi + bi * wr);
-                    data[start + k] = (ar + tr, ai + ti);
-                    data[start + k + len / 2] = (ar - tr, ai - ti);
-                }
-            }
-            len <<= 1;
-        }
-        data[..SIZE / 2 + 1]
-            .iter()
-            .map(|(r, i)| r.hypot(*i))
-            .collect()
-    }
+    plan.forward_in_place(&mut data);
+    data[..SIZE / 2 + 1]
+        .iter()
+        .map(|(r, i)| r.hypot(*i))
+        .collect()
 }
 
 /// Run the check on mono `audio` at `rate` Hz for the vocal notes `(start, end, midi)`.
 pub fn octave_evidence(audio: &[f32], rate: u32, notes: &[(f64, f64, i64)]) -> OctaveEvidence {
-    let fft = Fft64::new();
+    let fft = FftPlan::<f64>::new(SIZE).expect("SIZE is a power of two");
     let rate_f = f64::from(rate);
     let bin_hz = rate_f / SIZE as f64;
     let mut checked = Vec::new();
@@ -130,7 +92,7 @@ pub fn octave_evidence(audio: &[f32], rate: u32, notes: &[(f64, f64, i64)]) -> O
                 f64::from(x) * w
             })
             .collect();
-        let spectrum = fft.magnitudes(&windowed);
+        let spectrum = magnitudes(&fft, &windowed);
         let peak = |hz: f64| {
             let (lo, hi) = (hz * 0.97, hz * 1.03);
             spectrum

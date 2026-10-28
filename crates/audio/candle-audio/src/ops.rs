@@ -10,7 +10,7 @@
 //! with `unsqueeze` + `broadcast_as` + `reshape`, which every backend (cpu/cuda/metal)
 //! implements, closing both gaps with one shared op. See [`nearest_upsample1d`].
 
-use candle_core::{Result, Tensor};
+use candle_core::{Device, Result, Tensor, D};
 
 /// Nearest-neighbour upsample of the time axis of a `[B, C, T]` tensor by an **exact integer
 /// factor** `k` → `[B, C, T*k]`, repeating each frame `k` times.
@@ -78,10 +78,92 @@ pub fn nearest_downsample1d(x: &Tensor, k: usize) -> Result<Tensor> {
         .reshape((b, c, t / k))
 }
 
+/// Grouped-query attention key/value head expansion: `[B, H_kv, L, D]` → `[B, H_kv·groups, L, D]`,
+/// repeating each KV head `groups` times consecutively (the `repeat_interleave(groups, dim=1)`
+/// layout HF's `repeat_kv` produces), always returning a contiguous tensor.
+///
+/// The single audio-family copy of the helper every GQA attention block in the candle audio
+/// providers used to carry privately (sc-27260). It is pure data movement (`unsqueeze` +
+/// `expand` + `reshape` + `contiguous`), so sharing it changes no numerics. `groups == 1` is a
+/// contiguous copy of the input, which the attention matmuls downstream rely on.
+///
+/// Deliberately not candle-llm's `repeat_kv`: that one also feeds an LLM-only KV
+/// materialization counter, which the audio family must not depend on.
+pub fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
+    if groups == 1 {
+        return x.contiguous();
+    }
+    let (b, h, l, d) = x.dims4()?;
+    x.unsqueeze(2)?
+        .expand((b, h, groups, l, d))?
+        .reshape((b, h * groups, l, d))?
+        .contiguous()
+}
+
+/// Half-split (NeoX) RoPE cos/sin tables for positions `0..len` at `theta` — `[len, head_dim/2]`,
+/// the shape [`candle_nn::rotary_emb::rope`] consumes. See [`rope_tables_at`].
+pub fn rope_tables(
+    device: &Device,
+    len: usize,
+    head_dim: usize,
+    theta: f64,
+) -> Result<(Tensor, Tensor)> {
+    rope_tables_at(device, 0, len, head_dim, theta)
+}
+
+/// Half-split (NeoX) RoPE cos/sin tables for the absolute positions `start..start+len` at `theta` —
+/// `[len, head_dim/2]` f32, every angle `pos · (1 / theta^(2i/head_dim))` evaluated in **f64** and
+/// cast once (sc-27260).
+///
+/// This is the one spelling the Qwen3 blocks ([`crate::qwen3`]), the ACE-Step encoders/DiT and the
+/// MOSS-SFX text encoder/DiT each carried privately; sharing it changes no bits. The per-position
+/// angle depends only on `pos`, so a row generated alone (a KV-cache step at `start = offset`,
+/// `len = 1`) matches its row in the full table bit-for-bit.
+///
+/// Ports whose reference builds the table differently keep their own on purpose, since moving them
+/// here would change their parity-pinned output: f32 angles (Chatterbox S3 tokenizer, Sheet Sage
+/// MERT), an F32 tensor outer product cast to the model dtype (Stable Audio 3 T5Gemma),
+/// `theta.powf(-2i/d)` instead of `1 / theta.powf(2i/d)` (MOSS-TTS-Realtime codec), and YuE 2's
+/// cached `cos_sin` tables.
+pub fn rope_tables_at(
+    device: &Device,
+    start: usize,
+    len: usize,
+    head_dim: usize,
+    theta: f64,
+) -> Result<(Tensor, Tensor)> {
+    let half = head_dim / 2;
+    let mut cos = Vec::with_capacity(len * half);
+    let mut sin = Vec::with_capacity(len * half);
+    for pos in start..start + len {
+        for i in 0..half {
+            let inv = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
+            let angle = pos as f64 * inv;
+            cos.push(angle.cos() as f32);
+            sin.push(angle.sin() as f32);
+        }
+    }
+    Ok((
+        Tensor::from_vec(cos, (len, half), device)?,
+        Tensor::from_vec(sin, (len, half), device)?,
+    ))
+}
+
+/// The half-split RoPE rotation `cat(−x[.., d/2..], x[.., ..d/2])` over the last dim — the
+/// `rotate_half` of the HF / torch reference stacks, for ports that apply RoPE as
+/// `x·cos + rotate_half(x)·sin` with explicit full-width tables instead of the fused
+/// [`candle_nn::rotary_emb::rope`] kernel (Sheet Sage MERT, Stable Audio 3's DiT and T5Gemma,
+/// sc-27260). Pure data movement plus an exact negation, so sharing it changes no bits.
+pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
+    let d = x.dim(D::Minus1)?;
+    let first = x.narrow(D::Minus1, 0, d / 2)?;
+    let second = x.narrow(D::Minus1, d / 2, d / 2)?;
+    Tensor::cat(&[&second.neg()?, &first], D::Minus1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, Tensor};
 
     /// The replacement must be **bit-identical** to candle's own CPU `upsample_nearest1d` for
     /// every exact integer factor — that identity is what preserves the macOS regression hash.
@@ -222,5 +304,56 @@ mod tests {
         let x = Tensor::zeros((1usize, 1usize, 7usize), candle_core::DType::F32, &dev).unwrap();
         assert!(nearest_downsample1d(&x, 3).is_err());
         assert!(nearest_downsample1d(&x, 0).is_err());
+    }
+
+    /// Each KV head repeats `groups` times consecutively (`[h0, h0, h1, h1]`), and `groups == 1`
+    /// is the identity (mutation guard: an interleaved `[h0, h1, h0, h1]` layout turns this red).
+    #[test]
+    fn repeat_kv_repeats_each_head_consecutively() {
+        let dev = Device::Cpu;
+        // [1, 2, 1, 2]: head0 = [1, 2], head1 = [3, 4].
+        let x = Tensor::from_vec(
+            vec![1f32, 2.0, 3.0, 4.0],
+            (1usize, 2usize, 1usize, 2usize),
+            &dev,
+        )
+        .unwrap();
+        let rep = repeat_kv(&x, 2).unwrap();
+        assert_eq!(rep.dims(), &[1, 4, 1, 2]);
+        assert!(rep.is_contiguous());
+        assert_eq!(
+            rep.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0],
+        );
+        let same = repeat_kv(&x.transpose(1, 3).unwrap(), 1).unwrap();
+        assert!(same.is_contiguous());
+        assert_eq!(same.dims(), &[1, 2, 1, 2]);
+    }
+    /// sc-27260: the shared RoPE table is the f64 `pos · theta^(-2i/d)` spelling, a KV-cache row
+    /// generated alone equals its row in the full table bit-for-bit, and `rotate_half` is the
+    /// half-split `[-x2, x1]` rotation.
+    #[test]
+    fn rope_tables_and_rotate_half() {
+        let dev = Device::Cpu;
+        let (cos, sin) = rope_tables(&dev, 6, 8, 10_000.0).unwrap();
+        assert_eq!(cos.dims(), &[6, 4]);
+        let cos = cos.to_vec2::<f32>().unwrap();
+        let sin = sin.to_vec2::<f32>().unwrap();
+        for (pos, (crow, srow)) in cos.iter().zip(&sin).enumerate() {
+            for i in 0..4 {
+                let angle = pos as f64 * (1.0 / 10_000f64.powf(2.0 * i as f64 / 8.0));
+                assert_eq!(crow[i].to_bits(), (angle.cos() as f32).to_bits());
+                assert_eq!(srow[i].to_bits(), (angle.sin() as f32).to_bits());
+            }
+        }
+        let (c4, s4) = rope_tables_at(&dev, 4, 1, 8, 10_000.0).unwrap();
+        assert_eq!(c4.to_vec2::<f32>().unwrap()[0], cos[4]);
+        assert_eq!(s4.to_vec2::<f32>().unwrap()[0], sin[4]);
+
+        let x = Tensor::new(&[[1f32, 2., 3., 4.]], &dev).unwrap();
+        assert_eq!(
+            rotate_half(&x).unwrap().to_vec2::<f32>().unwrap(),
+            vec![vec![-3.0, -4.0, 1.0, 2.0]]
+        );
     }
 }

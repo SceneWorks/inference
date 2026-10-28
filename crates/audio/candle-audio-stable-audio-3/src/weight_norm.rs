@@ -1,6 +1,6 @@
 //! Weight-normalized Conv1d checkpoint compatibility.
 
-use candle_audio::candle_core::{Result, Tensor};
+use candle_audio::candle_core::Result;
 use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
 
 /// Materialize a `weight_norm(dim=0)` Conv1d from any layout emitted by PyTorch.
@@ -40,17 +40,15 @@ pub fn wn_conv1d(
     Ok(Conv1d::new(weight, bias, config))
 }
 
-/// Fold `w = g * v / ||v||`, where the norm spans every non-output dimension.
-pub fn fold_weight_norm(v: &Tensor, g: &Tensor) -> Result<Tensor> {
-    let dims: Vec<usize> = (1..v.rank()).collect();
-    let norm = v.sqr()?.sum_keepdim(dims)?.sqrt()?;
-    v.broadcast_mul(g)?.broadcast_div(&norm)
-}
+/// Fold `w = g * v / ||v||`, where the norm spans every non-output dimension — the commons
+/// [`fold_weight_norm_gv`](candle_audio::neural_codec::fold_weight_norm_gv) order this port is
+/// pinned to, re-exported under its historical name (sc-27263).
+pub use candle_audio::neural_codec::fold_weight_norm_gv as fold_weight_norm;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_audio::candle_core::{DType, Device};
+    use candle_audio::candle_core::{DType, Device, Tensor};
     use candle_nn::{Module, VarBuilder};
     use std::collections::HashMap;
 

@@ -50,6 +50,7 @@ use crate::s3gen::S3Gen;
 use crate::s3tokenizer::S3Tokenizer;
 use crate::t3::{strip_special_speech_tokens, T3Cond, T3};
 use crate::text::EnTokenizer;
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes `payload.model` to this exact id).
 pub const MODEL_ID: &str = "chatterbox_tts";
@@ -90,11 +91,9 @@ fn prepare_reference_audio(audio: &AudioTrack) -> gen_core::Result<Cow<'_, Audio
         return Ok(Cow::Borrowed(audio));
     }
 
-    let samples = audio
-        .samples
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32)
-        .collect();
+    // Whole frames were validated above, so the shared down-mix (sc-27357) averages exactly
+    // `channels` samples per frame.
+    let samples = candle_audio::dsp::to_mono(&audio.samples, audio.channels);
     Ok(Cow::Owned(AudioTrack {
         samples,
         sample_rate: audio.sample_rate,
@@ -251,13 +250,6 @@ pub struct ChatterboxGenerator {
     /// The PerTh provenance watermarker (sc-13240/sc-13239), loaded lazily from the staged
     /// `perth_weights` component path.
     perth: Mutex<Option<PerthWatermarker>>,
-}
-
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
 }
 
 /// The `perth_implicit.safetensors` file from the staged [`COMPONENT_PERTH`] source: a

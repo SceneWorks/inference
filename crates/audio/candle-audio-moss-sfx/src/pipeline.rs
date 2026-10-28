@@ -156,7 +156,7 @@ impl MossSfxPipeline {
 
         let shards = text_encoder_shards(&root.join("text_encoder"))?;
         let vb = mmap_text_encoder_shards(&shards, device)?;
-        let text_encoder = Qwen3Encoder::new(&config.text_encoder, vb)
+        let text_encoder = crate::qwen3::load(&config.text_encoder, vb)
             .map_err(|e| AudioError::Msg(format!("build qwen3 text encoder: {e}")))?;
 
         let dit_path = root.join("transformer/diffusion_pytorch_model.safetensors");

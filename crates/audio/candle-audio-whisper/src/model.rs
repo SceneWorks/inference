@@ -46,6 +46,7 @@ use tokenizers::Tokenizer;
 
 use crate::decode::{WhisperDecoder, LANGUAGES};
 use crate::mel;
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes a transcription request to this exact id).
 pub const MODEL_ID: &str = "whisper_base";
@@ -107,14 +108,6 @@ pub fn descriptor() -> TranscriberDescriptor {
             max_new_tokens: 448,
             mac_only: false,
         },
-    }
-}
-
-/// Recover a poisoned mutex — the audio twin of `candle_gen::lock_recover`.
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 

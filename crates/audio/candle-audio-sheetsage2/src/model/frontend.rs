@@ -3,64 +3,15 @@
 //! filterbank, `AmplitudeToDB(top_db=None)`, the last frame dropped, then per-bin normalization with
 //! the checkpoint's `mel_mean` / `mel_std`. Always float32, as upstream forces it.
 //!
-//! The STFT runs on the host with precomputed twiddles, split across threads; the filterbank
-//! product and everything after it run on the model's device.
+//! The STFT runs on the host with the audio commons' precomputed-twiddle radix-2
+//! [`candle_audio::dsp::FftPlan`] (bit-identical to the private plan this front end carried,
+//! sc-27261), split across threads; the filterbank product and everything after it run on the
+//! model's device.
 
 use candle_audio::candle_core::{DType, Device, Tensor, D};
+use candle_audio::dsp::{reflect_pad, FftPlan};
 
 use crate::Error;
-
-/// A radix-2 complex FFT plan with precomputed twiddles.
-struct FftPlan {
-    n: usize,
-    twiddles: Vec<(f32, f32)>,
-    bitrev: Vec<usize>,
-}
-
-impl FftPlan {
-    fn new(n: usize) -> Self {
-        let bits = n.trailing_zeros();
-        let bitrev = (0..n)
-            .map(|i| i.reverse_bits() >> (usize::BITS - bits))
-            .collect();
-        let twiddles = (0..n / 2)
-            .map(|k| {
-                let angle = -2.0 * std::f64::consts::PI * k as f64 / n as f64;
-                (angle.cos() as f32, angle.sin() as f32)
-            })
-            .collect();
-        Self {
-            n,
-            twiddles,
-            bitrev,
-        }
-    }
-
-    fn forward(&self, data: &mut [(f32, f32)]) {
-        let n = self.n;
-        for i in 0..n {
-            let j = self.bitrev[i];
-            if i < j {
-                data.swap(i, j);
-            }
-        }
-        let mut len = 2;
-        while len <= n {
-            let stride = n / len;
-            for start in (0..n).step_by(len) {
-                for k in 0..len / 2 {
-                    let (wr, wi) = self.twiddles[k * stride];
-                    let (ar, ai) = data[start + k];
-                    let (br, bi) = data[start + k + len / 2];
-                    let (tr, ti) = (br * wr - bi * wi, br * wi + bi * wr);
-                    data[start + k] = (ar + tr, ai + ti);
-                    data[start + k + len / 2] = (ar - tr, ai - ti);
-                }
-            }
-            len <<= 1;
-        }
-    }
-}
 
 /// `torch.stft(center=True, pad_mode="reflect", onesided=True).abs().pow(2)` → power spectrogram,
 /// frame-major `[n_frames][n_fft/2 + 1]`.
@@ -91,13 +42,10 @@ pub fn power_spectrogram(
     let mut full_window = vec![0.0f32; n_fft];
     let left = (n_fft - window.len()) / 2;
     full_window[left..left + window.len()].copy_from_slice(window);
-    let mut padded = Vec::with_capacity(samples.len() + 2 * pad);
-    padded.extend((1..=pad).rev().map(|i| samples[i]));
-    padded.extend_from_slice(samples);
-    padded.extend((0..pad).map(|i| samples[samples.len() - 2 - i]));
+    let padded = reflect_pad(samples, pad);
     let n_frames = 1 + (padded.len() - n_fft) / hop;
     let n_bins = n_fft / 2 + 1;
-    let plan = FftPlan::new(n_fft);
+    let plan = FftPlan::<f32>::new(n_fft).map_err(|e| Error::Config(e.to_string()))?;
     let mut out = vec![0.0f32; n_frames * n_bins];
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -117,7 +65,7 @@ pub fn power_spectrogram(
                     {
                         *slot = (x * w, 0.0);
                     }
-                    plan.forward(&mut buffer);
+                    plan.forward_in_place(&mut buffer);
                     for (value, &(re, im)) in row.iter_mut().zip(&buffer[..n_bins]) {
                         let magnitude = re.hypot(im);
                         *value = magnitude * magnitude;

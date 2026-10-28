@@ -6,58 +6,13 @@
 //! the shared [`candle_audio::dsp::stft`] implements — it reflect-pads the waveform by
 //! `(n_fft - hop) / 2` on each side and then runs `torch.stft(..., center=False)`, taking
 //! `sqrt(re² + im² + 1e-6)` (note the in-sqrt epsilon). Matching this framing exactly is what makes
-//! the real weights produce a faithful conversion, so the spectrogram is reproduced here as
-//! self-contained DSP with a small radix-2 FFT (`n_fft = 1024` is a power of two), unit-testable
+//! the real weights produce a faithful conversion, so the framing is reproduced here as host DSP
+//! over the shared radix-2 [`FftPlan`] (`n_fft = 1024` is a power of two; sc-27261), unit-testable
 //! without weights and numerically identical across CPU/Metal/CUDA.
 
+use candle_audio::dsp::{hann_window_torch_f32, FftPlan};
+
 use crate::config;
-
-/// A periodic Hann window of length `n` (`torch.hann_window(n)`): `0.5 - 0.5·cos(2πk/n)`.
-fn hann_window(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|k| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / n as f32).cos())
-        .collect()
-}
-
-/// In-place iterative radix-2 Cooley–Tukey FFT over interleaved `(re, im)` pairs (forward, no
-/// scaling — the `torch.stft(normalized=False)` convention). `data.len()` must be a power of two.
-fn fft_forward(re: &mut [f32], im: &mut [f32]) {
-    let n = re.len();
-    // Bit-reversal permutation.
-    let mut j = 0usize;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j |= bit;
-        if i < j {
-            re.swap(i, j);
-            im.swap(i, j);
-        }
-    }
-    let mut len = 2;
-    while len <= n {
-        // f64 twiddles keep error flat over the 1024-point window.
-        let ang = -2.0 * std::f64::consts::PI / len as f64;
-        for start in (0..n).step_by(len) {
-            for k in 0..len / 2 {
-                let wr = (ang * k as f64).cos() as f32;
-                let wi = (ang * k as f64).sin() as f32;
-                let a = start + k;
-                let b = start + k + len / 2;
-                let tr = re[b] * wr - im[b] * wi;
-                let ti = re[b] * wi + im[b] * wr;
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
-            }
-        }
-        len <<= 1;
-    }
-}
 
 /// A linear spectrogram in the `[spec_channels, n_frames]` bin-major layout OpenVoice's tensor
 /// carries (`index = bin · n_frames + frame`).
@@ -110,20 +65,17 @@ pub fn spectrogram(samples: &[f32]) -> Option<LinearSpectrogram> {
     }
     let n_bins = n_fft / 2 + 1;
     let n_frames = 1 + (padded.len() - n_fft) / hop;
-    let window = hann_window(config::WIN_LENGTH);
+    let window = hann_window_torch_f32(config::WIN_LENGTH);
+    let plan = FftPlan::new(n_fft).expect("FILTER_LENGTH is a power of two");
     let mut mag = vec![0.0f32; n_bins * n_frames];
-    let mut re = vec![0.0f32; n_fft];
-    let mut im = vec![0.0f32; n_fft];
+    let mut buf = vec![(0.0f32, 0.0f32); n_fft];
     for t in 0..n_frames {
         let start = t * hop;
-        for k in 0..n_fft {
-            re[k] = padded[start + k] * window[k];
-            im[k] = 0.0;
+        for (k, slot) in buf.iter_mut().enumerate() {
+            *slot = (padded[start + k] * window[k], 0.0);
         }
-        fft_forward(&mut re, &mut im);
-        for bin in 0..n_bins {
-            let r = re[bin];
-            let i = im[bin];
+        plan.forward_in_place(&mut buf);
+        for (bin, &(r, i)) in buf[..n_bins].iter().enumerate() {
             mag[bin * n_frames + t] = (r * r + i * i + 1e-6).sqrt();
         }
     }
@@ -142,11 +94,16 @@ mod tests {
     fn fft_matches_known_single_tone() {
         // A pure cosine at bin 1 of a 16-point frame: energy lands in bin 1 with re = n/2.
         let n = 16;
-        let mut re: Vec<f32> = (0..n)
-            .map(|i| (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
+        let mut buf: Vec<(f32, f32)> = (0..n)
+            .map(|i| {
+                (
+                    (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos(),
+                    0.0,
+                )
+            })
             .collect();
-        let mut im = vec![0.0f32; n];
-        fft_forward(&mut re, &mut im);
+        FftPlan::new(n).unwrap().forward_in_place(&mut buf);
+        let (re, im): (Vec<f32>, Vec<f32>) = buf.into_iter().unzip();
         assert!((re[1] - 8.0).abs() < 1e-3, "re[1] = n/2, got {}", re[1]);
         for k in 2..n / 2 {
             assert!(

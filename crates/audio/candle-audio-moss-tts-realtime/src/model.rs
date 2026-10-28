@@ -32,6 +32,7 @@ use crate::config::MossTtsRealtimeConfig;
 use crate::conversation::{self, ConvState, PreparedTurn, Role};
 use crate::decode::{build_prompt_frames, Decoder};
 use crate::local::LocalTransformer;
+use candle_audio::lock_recover;
 
 /// Registry id — the id the catalog's ordered-generator surface carries.
 pub const MODEL_ID: &str = "moss_tts_realtime";
@@ -236,24 +237,12 @@ pub struct MossTtsRealtimeGenerator {
     codec: Mutex<Option<Arc<MossAudioCodec>>>,
 }
 
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 /// Downmix an interleaved [`AudioTrack`] to mono for codec analysis (the voice-clone reference input).
+///
+/// The shared [`candle_audio::dsp::to_mono`] (sc-27357): identical for whole frames; a ragged
+/// trailing partial frame is averaged over the samples it has rather than over `channels`.
 fn mono_samples(track: &AudioTrack) -> Vec<f32> {
-    let ch = (track.channels as usize).max(1);
-    if ch == 1 {
-        return track.samples.clone();
-    }
-    track
-        .samples
-        .chunks(ch)
-        .map(|frame| frame.iter().sum::<f32>() / ch as f32)
-        .collect()
+    candle_audio::dsp::to_mono(&track.samples, track.channels)
 }
 
 fn contextual_audio_error(context: String, error: candle_audio::AudioError) -> gen_core::Error {

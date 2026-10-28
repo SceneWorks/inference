@@ -77,7 +77,7 @@ use candle_audio_stable_audio_3::pipeline::{
     edit_local_conditioning, edit_local_conditioning_is_present, edit_region_latents,
     edit_region_samples, edit_retained_latent_count, merge_edit_regions, prepare_reference_pcm,
     resampled_frame_count, stitch_outside_region, tensor_has_nonzero, AudioEdit, EditGeometry,
-    EditRegionSecs, EditSpan, SAMPLE_RATE,
+    EditRegionSecs, EditSpan, SynthesisHooks, SynthesisRequest, SAMPLE_RATE,
 };
 use candle_audio_stable_audio_3::sampler::{
     adapt_sample_size_for_max, SampleGeometry, DEFAULT_DURATION_PADDING, LATENT_DOWNSAMPLING,
@@ -1799,9 +1799,11 @@ fn real_edit_initial_sampler_noise_precedes_the_source_encode() {
         };
         let (samples, order) = pipeline
             .synthesize_with_edit_traced(
-                "fill this region",
-                None,
-                parameters,
+                SynthesisRequest {
+                    prompt: "fill this region",
+                    negative_prompt: None,
+                    parameters,
+                },
                 AudioEdit {
                     samples: &source.samples,
                     sample_rate: SAMPLE_RATE,
@@ -1811,9 +1813,11 @@ fn real_edit_initial_sampler_noise_precedes_the_source_encode() {
                         end_secs: 2.0,
                     }],
                 },
-                &mut |_, _| {},
-                &mut || {},
-                &|| false,
+                SynthesisHooks {
+                    on_progress: &mut |_, _| {},
+                    on_decoding: &mut || {},
+                    is_canceled: &|| false,
+                },
             )
             .unwrap_or_else(|error| panic!("{id}: {error}"));
         assert_eq!(

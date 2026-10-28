@@ -20,7 +20,7 @@ use candle_audio_stable_audio_3::candle_audio::candle_core::{
     DType, Device, Result as CandleResult, Shape, Tensor,
 };
 use candle_audio_stable_audio_3::config::ModelConfig;
-use candle_audio_stable_audio_3::dit::{DitInputs, Guidance, StableAudio3Dit};
+use candle_audio_stable_audio_3::dit::{DitConditioning, DitInputs, Guidance, StableAudio3Dit};
 use candle_audio_stable_audio_3::weights::{
     map_weight_key, safetensors_keys, SnapshotLayout, StableAudioVarBuilders, WeightSection,
 };
@@ -331,12 +331,14 @@ fn real_weights_detect_conditioning_mutations_and_exercise_cfg_apg() {
         .forward_guided(
             &noise,
             &timestep,
-            &prompt,
-            None,
-            None,
-            &seconds,
-            &zero_local,
-            None,
+            &DitConditioning {
+                positive_prompt: &prompt,
+                negative_prompt: None,
+                negative_prompt_mask: None,
+                seconds_total: &seconds,
+                local_conditioning: &zero_local,
+                padding: None,
+            },
             Guidance {
                 cfg_scale: 2.0,
                 apg_scale: 0.0,
@@ -348,12 +350,14 @@ fn real_weights_detect_conditioning_mutations_and_exercise_cfg_apg() {
         .forward_guided(
             &noise,
             &timestep,
-            &prompt,
-            None,
-            None,
-            &seconds,
-            &zero_local,
-            None,
+            &DitConditioning {
+                positive_prompt: &prompt,
+                negative_prompt: None,
+                negative_prompt_mask: None,
+                seconds_total: &seconds,
+                local_conditioning: &zero_local,
+                padding: None,
+            },
             Guidance {
                 cfg_scale: 2.0,
                 apg_scale: 1.0,
@@ -377,12 +381,14 @@ fn real_weights_detect_conditioning_mutations_and_exercise_cfg_apg() {
         .forward_guided(
             &noise,
             &timestep,
-            &prompt,
-            Some(&prompt),
-            Some(&all_invalid),
-            &seconds,
-            &zero_local,
-            None,
+            &DitConditioning {
+                positive_prompt: &prompt,
+                negative_prompt: Some(&prompt),
+                negative_prompt_mask: Some(&all_invalid),
+                seconds_total: &seconds,
+                local_conditioning: &zero_local,
+                padding: None,
+            },
             Guidance {
                 cfg_scale: 2.0,
                 apg_scale: 0.0,

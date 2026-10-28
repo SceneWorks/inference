@@ -25,6 +25,7 @@
 //! bit-faithful (see the crate docs and the real-weight conformance test).
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor, D};
+use candle_audio::ops::{repeat_kv, rope_tables};
 use candle_nn::{
     conv1d, conv_transpose1d, linear, linear_b, rms_norm, Conv1d, Conv1dConfig, ConvTranspose1d,
     ConvTranspose1dConfig, Linear, Module, RmsNorm, VarBuilder,
@@ -51,30 +52,6 @@ fn sinusoidal(dim: usize, t: f64, device: &Device) -> CandleResult<Tensor> {
     Tensor::from_vec(out, (1, dim), device)
 }
 
-/// Half-split RoPE tables `[len, head_dim/2]` (candle `rope`, the `use_real_unbind_dim=-2` branch).
-fn rope_tables(
-    head_dim: usize,
-    len: usize,
-    theta: f64,
-    device: &Device,
-) -> CandleResult<(Tensor, Tensor)> {
-    let half = head_dim / 2;
-    let mut cos = Vec::with_capacity(len * half);
-    let mut sin = Vec::with_capacity(len * half);
-    for pos in 0..len {
-        for j in 0..half {
-            let inv = 1.0 / theta.powf(2.0 * j as f64 / head_dim as f64);
-            let angle = pos as f64 * inv;
-            cos.push(angle.cos() as f32);
-            sin.push(angle.sin() as f32);
-        }
-    }
-    Ok((
-        Tensor::from_vec(cos, (len, half), device)?,
-        Tensor::from_vec(sin, (len, half), device)?,
-    ))
-}
-
 fn to_heads(x: &Tensor, num_heads: usize, head_dim: usize) -> CandleResult<Tensor> {
     let (b, l, _) = x.dims3()?;
     x.reshape((b, l, num_heads, head_dim))?
@@ -85,17 +62,6 @@ fn to_heads(x: &Tensor, num_heads: usize, head_dim: usize) -> CandleResult<Tenso
 fn from_heads(x: &Tensor) -> CandleResult<Tensor> {
     let (b, h, l, d) = x.dims4()?;
     x.transpose(1, 2)?.reshape((b, l, h * d))
-}
-
-fn repeat_kv(x: &Tensor, groups: usize) -> CandleResult<Tensor> {
-    if groups == 1 {
-        return x.contiguous();
-    }
-    let (b, h, l, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, h, groups, l, d))?
-        .reshape((b, h * groups, l, d))?
-        .contiguous()
 }
 
 /// The `AceStepAttention` module (self- or cross-attention). GQA with per-head q/k RMSNorm.
@@ -109,11 +75,10 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    is_cross: bool,
 }
 
 impl Attention {
-    fn new(cfg: &TransformerConfig, is_cross: bool, vb: VarBuilder) -> CandleResult<Self> {
+    fn new(cfg: &TransformerConfig, vb: VarBuilder) -> CandleResult<Self> {
         let d = cfg.head_dim;
         let hidden = cfg.hidden_size;
         Ok(Self {
@@ -146,7 +111,6 @@ impl Attention {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: d,
-            is_cross,
         })
     }
 
@@ -190,7 +154,6 @@ impl Attention {
         }
         let att = candle_nn::ops::softmax_last_dim(&att)?;
         let out = att.matmul(&v.contiguous()?)?;
-        let _ = self.is_cross;
         __model_proof_output!(self.to_out.forward(&from_heads(&out)?))
     }
 }
@@ -213,9 +176,9 @@ impl Block {
         let d = cfg.hidden_size;
         Ok(Self {
             self_attn_norm: rms_norm(d, cfg.rms_norm_eps, vb.pp("self_attn_norm"))?,
-            self_attn: Attention::new(cfg, false, vb.pp("self_attn"))?,
+            self_attn: Attention::new(cfg, vb.pp("self_attn"))?,
             cross_attn_norm: rms_norm(d, cfg.rms_norm_eps, vb.pp("cross_attn_norm"))?,
-            cross_attn: Attention::new(cfg, true, vb.pp("cross_attn"))?,
+            cross_attn: Attention::new(cfg, vb.pp("cross_attn"))?,
             mlp_norm: rms_norm(d, cfg.rms_norm_eps, vb.pp("mlp_norm"))?,
             gate_proj: linear_b(d, cfg.intermediate_size, false, vb.pp("mlp.gate_proj"))?,
             up_proj: linear_b(d, cfg.intermediate_size, false, vb.pp("mlp.up_proj"))?,
@@ -446,7 +409,7 @@ impl DiT {
         let temb = (temb_t + temb_r)?; // [1, dim]
         let tproj = (tproj_t + tproj_r)?.reshape((1, 6, self.time_embed.dim()))?;
 
-        let (cos, sin) = rope_tables(self.cfg.head_dim, patched_len, self.cfg.rope_theta, device)?;
+        let (cos, sin) = rope_tables(device, patched_len, self.cfg.head_dim, self.cfg.rope_theta)?;
         let full_mask: Option<Tensor> = None;
         let sliding_mask = if self
             .cfg
@@ -459,11 +422,10 @@ impl DiT {
             None
         };
 
-        for (i, block) in self.blocks.iter().enumerate() {
+        for block in &self.blocks {
             if cancel() {
                 return Ok(None);
             }
-            let _ = i;
             x = block.forward(
                 &x,
                 &tproj,
@@ -520,7 +482,7 @@ mod tests {
     #[test]
     fn rope_tables_start_at_identity() {
         let dev = Device::Cpu;
-        let (cos, sin) = rope_tables(4, 3, 1_000_000.0, &dev).unwrap();
+        let (cos, sin) = rope_tables(&dev, 3, 4, 1_000_000.0).unwrap();
         assert_eq!(cos.dims(), &[3, 2]);
         let c = cos.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let s = sin.flatten_all().unwrap().to_vec1::<f32>().unwrap();
