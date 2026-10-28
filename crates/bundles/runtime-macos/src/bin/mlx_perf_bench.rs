@@ -2120,6 +2120,11 @@ mod tests {
                 }
             }
         }
+        // `mlx_gen::nn::DitCompileGlue::new` is one source constructor per handle *kind*, instantiated
+        // once per family that declares a `DitGlue` (sc-27339): count its handles per instantiation.
+        let dit_glue_families = source.matches("DitGlue::new(").count();
+        let per_family = runtime_macos::media::nn::DIT_GLUE_RETAINED_HANDLES;
+        let constructor_count = constructor_count - per_family + dit_glue_families * per_family;
         assert_eq!(
             constructor_count,
             RETAINED_COMPILE_HANDLES.len(),

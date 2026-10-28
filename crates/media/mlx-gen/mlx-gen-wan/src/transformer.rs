@@ -35,7 +35,6 @@ use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, cos, multiply, sin, split};
 use mlx_rs::transforms::checkpoint;
-use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{WanModelConfig, WanQuant};
@@ -67,14 +66,12 @@ pub trait CausalPackedAttention {
 // so the tiny reference-parity gates run the eager form and `compile_parity.rs` can A/B both.
 //
 // The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
-// request/thread-local setting is shared with the FLUX family.
-pub(crate) use mlx_gen::nn::compile_glue;
+// request/thread-local setting is shared with the FLUX family. The glue dispatch (and the RoPE
+// rotation) are core's (`mlx_gen::nn::DitGlue` / `rope_rotate`, sc-27339 / sc-27453), which read
+// the toggle directly.
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
-use mlx_gen::nn::{
-    gated_residual_impl, gelu_tanh_ffn_impl, retained_compilation_requested, RetainedTernary,
-    RetainedUnary,
-};
+use mlx_gen::nn::{DitCompileGlue, DitGlue};
 
 const SITE_MODULATE: &str = "wan::transformer::modulate";
 const SITE_GATED: &str = "wan::transformer::gated";
@@ -86,119 +83,39 @@ fn modulate_impl(
     add(&multiply(m, &add(scale, scalar(1.0))?)?, shift)
 }
 
-struct WanRetainedCompileGlue {
-    modulate: RetainedTernary,
-    gated: RetainedTernary,
-    gelu_ffn: RetainedUnary,
-}
-
-impl WanRetainedCompileGlue {
-    fn new() -> Self {
-        Self {
-            modulate: RetainedTernary::new(compile_retained(modulate_impl, true)),
-            gated: RetainedTernary::new(compile_retained(gated_residual_impl, true)),
-            gelu_ffn: RetainedUnary::new(compile_retained(gelu_tanh_ffn_impl, true)),
-        }
-    }
-}
-
 thread_local! {
-    static RETAINED_COMPILE_GLUE: std::cell::RefCell<Option<WanRetainedCompileGlue>> =
+    static RETAINED_COMPILE_GLUE: std::cell::RefCell<Option<DitCompileGlue>> =
         const { std::cell::RefCell::new(None) };
 }
 
-fn with_retained_compile_glue<T>(
-    f: impl FnOnce(&mut WanRetainedCompileGlue) -> std::result::Result<T, Exception>,
-) -> std::result::Result<T, Exception> {
-    mlx_gen::nn::prepare_retained_compilation_thread();
-    RETAINED_COMPILE_GLUE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        f(slot.get_or_insert_with(WanRetainedCompileGlue::new))
-    })
-}
+/// The Wan DiT's compiled glue — adaLN affine `m·(1+e_scale)+e_shift`, gated residual `x + y·gate`
+/// and the gated-GELU FFN activation — through the shared retained/one-shot/eager dispatch
+/// (sc-27339). Each is one fused kernel when compiled, else the eager ops; the `mx.compile` graph is
+/// bit-exact to the eager form (proven `max|Δ|=0`, `tests/compile_micro.rs`). The gelu body mirrors
+/// [`mlx_gen::nn::gelu_tanh`] exactly; when compiled it is the single biggest per-step glue cost
+/// fused (~600 MB bf16 tensor × 40 layers, sc-2957).
+static GLUE: DitGlue = DitGlue::new(
+    [SITE_MODULATE, SITE_GATED, SITE_GELU_FFN],
+    modulate_impl,
+    &RETAINED_COMPILE_GLUE,
+);
 
 /// Exercise every retained handle owned by the Wan transformer once for the release memory audit.
 #[doc(hidden)]
 pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
-    let output = with_retained_compile_glue(|compiled| {
-        compiled.modulate.call(SITE_MODULATE, (input, input, input))
-    })?;
-    output.eval()?;
-    drop(output);
-
-    let output = with_retained_compile_glue(|compiled| {
-        compiled.gated.call(SITE_GATED, (input, input, input))
-    })?;
-    output.eval()?;
-    drop(output);
-
-    let output =
-        with_retained_compile_glue(|compiled| compiled.gelu_ffn.call(SITE_GELU_FFN, input))?;
-    output.eval()?;
-    drop(output);
-    Ok(())
+    GLUE.exercise_retained_compile_inventory(input)
 }
 
-/// adaLN affine `m·(1+e_scale)+e_shift` — one fused kernel when compiled, else 2 eager ops. The
-/// `mx.compile` graph is bit-exact to the eager form (proven `max|Δ|=0`, `tests/compile_micro.rs`).
 fn modulate(m: &Array, e_scale: &Array, e_shift: &Array) -> Result<Array> {
-    if compile_glue() {
-        if retained_compilation_requested() {
-            Ok(with_retained_compile_glue(|compiled| {
-                compiled.modulate.call(SITE_MODULATE, (m, e_scale, e_shift))
-            })?)
-        } else {
-            mlx_gen::diagnostics::record_compile(
-                SITE_MODULATE,
-                mlx_gen::diagnostics::CompileDisposition::OneShot,
-            );
-            Ok(compile(modulate_impl, true)((m, e_scale, e_shift))?)
-        }
-    } else {
-        mlx_gen::diagnostics::record_fallback(SITE_MODULATE, "compiled_glue_disabled");
-        Ok(modulate_impl((m, e_scale, e_shift))?)
-    }
+    GLUE.modulate(m, e_scale, e_shift)
 }
 
-/// Gated residual `x + y·gate` — one fused kernel when compiled.
 fn gated(x: &Array, y: &Array, gate: &Array) -> Result<Array> {
-    if compile_glue() {
-        if retained_compilation_requested() {
-            Ok(with_retained_compile_glue(|compiled| {
-                compiled.gated.call(SITE_GATED, (x, y, gate))
-            })?)
-        } else {
-            mlx_gen::diagnostics::record_compile(
-                SITE_GATED,
-                mlx_gen::diagnostics::CompileDisposition::OneShot,
-            );
-            Ok(compile(gated_residual_impl, true)((x, y, gate))?)
-        }
-    } else {
-        mlx_gen::diagnostics::record_fallback(SITE_GATED, "compiled_glue_disabled");
-        Ok(gated_residual_impl((x, y, gate))?)
-    }
+    GLUE.gated(x, y, gate)
 }
 
-/// Gated-GELU FFN activation. Body mirrors [`mlx_gen::nn::gelu_tanh`] exactly (bit-exact, dtype-
-/// preserving); when compiled, MLX fuses its ~8 elementwise ops into one kernel (the single biggest
-/// per-step glue cost — ~600 MB bf16 tensor × 40 layers, sc-2957). Off ⇒ defers to core `gelu_tanh`.
 fn gelu_ffn(x: &Array) -> Result<Array> {
-    if !compile_glue() {
-        mlx_gen::diagnostics::record_fallback(SITE_GELU_FFN, "compiled_glue_disabled");
-        return gelu_tanh(x);
-    }
-    if retained_compilation_requested() {
-        Ok(with_retained_compile_glue(|compiled| {
-            compiled.gelu_ffn.call(SITE_GELU_FFN, x)
-        })?)
-    } else {
-        mlx_gen::diagnostics::record_compile(
-            SITE_GELU_FFN,
-            mlx_gen::diagnostics::CompileDisposition::OneShot,
-        );
-        Ok(compile(gelu_tanh_ffn_impl, true)(x)?)
-    }
+    GLUE.gelu_ffn(x)
 }
 
 /// Zero-pad one prompt's trimmed T5 embedding `[L_text, text_dim]` to `[text_len, text_dim]` — the

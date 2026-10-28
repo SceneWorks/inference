@@ -393,6 +393,164 @@ pub fn gelu_tanh_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
     multiply(&multiply(x, &s(0.5)?)?, &gate)
 }
 
+/// A provider's three-input compiled-glue body (its adaLN `modulate`), the shape
+/// [`DitCompileGlue`] retains alongside the shared [`gated_residual_impl`] / [`gelu_tanh_ffn_impl`].
+pub type TernaryGlueFn = fn((&Array, &Array, &Array)) -> std::result::Result<Array, Exception>;
+
+/// Retained compiled handles a [`DitGlue`] owns — one per site, per thread.
+#[doc(hidden)]
+pub const DIT_GLUE_RETAINED_HANDLES: usize = 3;
+
+/// The retained handles of one family's adaLN-DiT glue trio: its own `modulate`, plus the shared
+/// gated residual and tanh-GELU FFN bodies.
+#[doc(hidden)]
+pub struct DitCompileGlue {
+    modulate: RetainedTernary,
+    gated: RetainedTernary,
+    gelu_ffn: RetainedUnary,
+}
+
+impl DitCompileGlue {
+    fn new(modulate_impl: TernaryGlueFn) -> Self {
+        Self {
+            modulate: RetainedTernary::new(compile_retained(modulate_impl, true)),
+            gated: RetainedTernary::new(compile_retained(gated_residual_impl, true)),
+            gelu_ffn: RetainedUnary::new(compile_retained(gelu_tanh_ffn_impl, true)),
+        }
+    }
+}
+
+/// The adaLN-DiT compiled-glue trio — `modulate`, gated residual, tanh-GELU FFN activation — with
+/// the retained / one-shot / eager dispatch the LTX and Wan transformers each carried a private copy
+/// of (sc-27339). Each family declares one `static` with its own diagnostic site names, its own
+/// `modulate` body (the one part that genuinely differs: Wan's `m·(1+e_scale)+e_shift` adds an f32
+/// `1`, LTX casts it to `scale`'s dtype) and its own thread-local slot, so the retained handles stay
+/// per family and per thread exactly as before. The compiled bodies, toggles and diagnostics are
+/// unchanged, so every dispatch arm is bit-identical to the per-crate copies.
+pub struct DitGlue {
+    modulate_site: &'static str,
+    gated_site: &'static str,
+    gelu_ffn_site: &'static str,
+    modulate_impl: TernaryGlueFn,
+    slot: &'static std::thread::LocalKey<RefCell<Option<DitCompileGlue>>>,
+}
+
+impl DitGlue {
+    /// `slot` is the family's own `thread_local!` (initially `None`), which owns its retained
+    /// handles.
+    pub const fn new(
+        sites: [&'static str; DIT_GLUE_RETAINED_HANDLES],
+        modulate_impl: TernaryGlueFn,
+        slot: &'static std::thread::LocalKey<RefCell<Option<DitCompileGlue>>>,
+    ) -> Self {
+        let [modulate_site, gated_site, gelu_ffn_site] = sites;
+        Self {
+            modulate_site,
+            gated_site,
+            gelu_ffn_site,
+            modulate_impl,
+            slot,
+        }
+    }
+
+    fn with_retained<T>(
+        &self,
+        f: impl FnOnce(&mut DitCompileGlue) -> std::result::Result<T, Exception>,
+    ) -> std::result::Result<T, Exception> {
+        prepare_retained_compilation_thread();
+        self.slot.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            f(slot.get_or_insert_with(|| DitCompileGlue::new(self.modulate_impl)))
+        })
+    }
+
+    fn ternary(
+        &self,
+        site: &'static str,
+        body: TernaryGlueFn,
+        retained: impl FnOnce(&mut DitCompileGlue) -> &mut RetainedTernary,
+        args: (&Array, &Array, &Array),
+    ) -> Result<Array> {
+        if compile_glue() {
+            if retained_compilation_requested() {
+                Ok(self.with_retained(|compiled| retained(compiled).call(site, args))?)
+            } else {
+                crate::diagnostics::record_compile(
+                    site,
+                    crate::diagnostics::CompileDisposition::OneShot,
+                );
+                Ok(compile(body, true)(args)?)
+            }
+        } else {
+            crate::diagnostics::record_fallback(site, "compiled_glue_disabled");
+            Ok(body(args)?)
+        }
+    }
+
+    /// The family's adaLN `modulate(x, scale, shift)`: one fused kernel when [`compile_glue`] is on.
+    pub fn modulate(&self, x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
+        self.ternary(
+            self.modulate_site,
+            self.modulate_impl,
+            |c| &mut c.modulate,
+            (x, scale, shift),
+        )
+    }
+
+    /// Gated residual `x + y·gate` ([`gated_residual_impl`]): one fused kernel when
+    /// [`compile_glue`] is on.
+    pub fn gated(&self, x: &Array, y: &Array, gate: &Array) -> Result<Array> {
+        self.ternary(
+            self.gated_site,
+            gated_residual_impl,
+            |c| &mut c.gated,
+            (x, y, gate),
+        )
+    }
+
+    /// The tanh-GELU FFN activation ([`gelu_tanh_ffn_impl`]): its ~8 elementwise ops fused into one
+    /// kernel when [`compile_glue`] is on; off ⇒ the eager [`gelu_tanh`], byte-for-byte the same.
+    pub fn gelu_ffn(&self, x: &Array) -> Result<Array> {
+        if !compile_glue() {
+            crate::diagnostics::record_fallback(self.gelu_ffn_site, "compiled_glue_disabled");
+            return gelu_tanh(x);
+        }
+        if retained_compilation_requested() {
+            Ok(self.with_retained(|compiled| compiled.gelu_ffn.call(self.gelu_ffn_site, x))?)
+        } else {
+            crate::diagnostics::record_compile(
+                self.gelu_ffn_site,
+                crate::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(gelu_tanh_ffn_impl, true)(x)?)
+        }
+    }
+
+    /// Exercise each of this family's retained handles once for the release memory audit.
+    #[doc(hidden)]
+    pub fn exercise_retained_compile_inventory(&self, input: &Array) -> Result<()> {
+        let output = self.with_retained(|compiled| {
+            compiled
+                .modulate
+                .call(self.modulate_site, (input, input, input))
+        })?;
+        output.eval()?;
+        drop(output);
+
+        let output = self.with_retained(|compiled| {
+            compiled.gated.call(self.gated_site, (input, input, input))
+        })?;
+        output.eval()?;
+        drop(output);
+
+        let output =
+            self.with_retained(|compiled| compiled.gelu_ffn.call(self.gelu_ffn_site, input))?;
+        output.eval()?;
+        drop(output);
+        Ok(())
+    }
+}
+
 fn rope_rotate_impl(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
     let (real, imag, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
     let out_real = subtract(&multiply(real, cos)?, &multiply(imag, sin)?)?;
