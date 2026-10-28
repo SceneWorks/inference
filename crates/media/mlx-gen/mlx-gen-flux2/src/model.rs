@@ -1063,9 +1063,7 @@ impl Generator for Flux2 {
 }
 
 fn request_stages_residency(default: bool, req: &GenerationRequest) -> bool {
-    req.memory
-        .as_ref()
-        .map_or(default, |memory| memory.stage_residency)
+    mlx_gen::request_scope::requested_stage_residency(req.memory, default)
 }
 
 /// Bind the requested block execution to the admitted load shape before any component work.

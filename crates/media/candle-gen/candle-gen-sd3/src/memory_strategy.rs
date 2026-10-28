@@ -1245,14 +1245,10 @@ pub fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match registered_tier_and_contract(spec, contract)
-        .and_then(|(route, tier)| validate_context(route, contract, context, tier))
-    {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(
+        registered_tier_and_contract(spec, contract)
+            .and_then(|(route, tier)| validate_context(route, contract, context, tier)),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1520,30 +1516,7 @@ impl MemoryRequestScope for Scope {
         self.admission.configure(self.token, request)
     }
 
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.enter_phase(phase)
-    }
-
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.leave_phase(phase)
-    }
-
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.core.configure_decode(edge, overlap, geometry)
-    }
-
-    fn configure_attention(&mut self, size: u32) -> gen_core::Result<()> {
-        self.core.configure_attention(size)
-    }
-
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
-        self.core.materialize_transformer_window(first, count)
-    }
+    candle_gen::gen_core::delegate_memory_request_scope!(core);
 
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         self.core.finish(outcome)?;

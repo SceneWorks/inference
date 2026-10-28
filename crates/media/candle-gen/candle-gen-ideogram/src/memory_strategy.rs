@@ -1538,14 +1538,10 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match registered_tier_and_contract(spec, contract)
-        .and_then(|tier| validate_context(&contract.provider_id, contract, context, tier))
-    {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(
+        registered_tier_and_contract(spec, contract)
+            .and_then(|tier| validate_context(&contract.provider_id, contract, context, tier)),
+    )
 }
 
 /// The calibration ABI a context must claim to satisfy `contract` — `0` when the contract publishes
@@ -1908,31 +1904,8 @@ impl MemoryRequestScope for IdeogramMemoryScope {
         self.core.configure_request(request)?;
         self.admission.configure(self.token, request)
     }
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.enter_phase(phase)
-    }
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.leave_phase(phase)
-    }
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.core.configure_decode(tile_edge, overlap, geometry)
-    }
-    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
-        self.core.configure_attention(chunk_size)
-    }
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> gen_core::Result<()> {
-        self.core
-            .materialize_transformer_window(first_block, block_count)
-    }
+
+    candle_gen::gen_core::delegate_memory_request_scope!(core);
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         self.core.finish(outcome)?;
         self.admission.finish(self.token)?;

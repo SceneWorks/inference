@@ -289,10 +289,7 @@ pub fn validate_context(
     identity: &InstantIdMemoryIdentity,
     context: &MemoryRunContext,
 ) -> gen_core::Result<()> {
-    match safety_check(contract, identity, context) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    candle_gen::request_scope::admit(safety_check(contract, identity, context))
 }
 
 #[cfg(test)]

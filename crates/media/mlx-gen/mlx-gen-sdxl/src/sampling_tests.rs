@@ -20,8 +20,8 @@ fn request(sampler: &str) -> GenerationRequest {
 fn metadata_recipe_pricing_regime_matches_live_controls_and_rejects_conflicting_context() {
     use crate::ios_pricing::{ios_pricing_with_recipe, Regime};
     use mlx_gen::gen_core::{
-        GenerationMemory, LoadSpec, MemoryGeometry, MemoryMode, MemoryNumericTier, MemorySelection,
-        MemoryStrategy, WeightsSource,
+        GenerationMemory, LoadSpec, MemoryGeometry, MemoryMode, MemorySelection, MemoryStrategy,
+        WeightsSource,
     };
     use mlx_gen::ios_pricing::IosPricingRequest;
 
@@ -30,11 +30,7 @@ fn metadata_recipe_pricing_regime_matches_live_controls_and_rejects_conflicting_
     let selection = MemorySelection {
         strategy: MemoryStrategy::Resident,
         parameters: Default::default(),
-        tier: MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        },
+        tier: mlx_gen::request_scope::loaded_tier(&spec),
     };
     for recipe in representative_recipes() {
         let mut generation = recipe.to_request();
@@ -266,8 +262,8 @@ fn bounded_hyper_repeats_and_max_metadata_preserve_actual_step_domain() {
 fn metadata_roles_follow_actual_configured_ip_and_control_factory() {
     use crate::ios_pricing::{Regime, Route};
     use mlx_gen::gen_core::{
-        GenerationMemory, LoadSpec, MemoryGeometry, MemoryMode, MemoryNumericTier, MemorySelection,
-        MemoryStrategy, WeightsSource,
+        GenerationMemory, LoadSpec, MemoryGeometry, MemoryMode, MemorySelection, MemoryStrategy,
+        WeightsSource,
     };
     use mlx_gen::ios_pricing::IosPricingRequest;
     let recipe = SamplingRecipe::from_request(&request("euler_ancestral")).unwrap();
@@ -275,11 +271,7 @@ fn metadata_roles_follow_actual_configured_ip_and_control_factory() {
         let selection = MemorySelection {
             strategy: MemoryStrategy::Resident,
             parameters: Default::default(),
-            tier: MemoryNumericTier {
-                precision: spec.precision,
-                quant: spec.quantize,
-                component_precision_floors: &[],
-            },
+            tier: mlx_gen::request_scope::loaded_tier(spec),
         };
         let execution = GenerationMemory::default();
         Regime::from_recipe(

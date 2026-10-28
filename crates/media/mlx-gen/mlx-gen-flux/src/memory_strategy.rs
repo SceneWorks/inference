@@ -48,12 +48,10 @@
 //! the request boundary. Building `Unsupported` inside the closure too doubled the prefix into
 //! `unsupported: unsupported: …` — the same secondary defect SC-20569 fixed in mlx-gen-sensenova.
 
-use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
     adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
-    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryOptimizationAuthority,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryOptimizationAuthority,
     MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope,
     MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyPrerequisite, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
@@ -101,6 +99,14 @@ pub fn vae_spatial_scale() -> Option<u32> {
             .filter(|(_, upsamples)| *upsamples)
             .count(),
     )
+}
+
+/// The DiT depth the shared request scope bounds a rung-4 window against: the joint plus single
+/// stacks (19 + 38), read off the loader's config rather than restated as a literal (sc-27325).
+fn transformer_blocks() -> usize {
+    let dit =
+        crate::transformer::FluxTransformerConfig::for_variant(crate::config::FluxVariant::Dev);
+    dit.num_layers.saturating_add(dit.num_single_layers)
 }
 
 /// Architecture axes shared by all three registered FLUX.1 routes (epic SC-22657, E2).
@@ -275,7 +281,7 @@ fn resident_overlay_components(
     if let Some(mlx_gen::WeightsSource::Dir(dir)) = &spec.ip_adapter {
         let adapter = mlx_gen::safetensors_path_bytes(dir.join("ip_adapter.safetensors"));
         let encoder = mlx_gen::safetensors_path_bytes(dir.join("image_encoder/model.safetensors"));
-        push_overlay(
+        mlx_gen::request_scope::push_unbounded_overlay(
             &mut components,
             IP_ADAPTER_COMPONENT_ID,
             MemoryComponentKind::IpAdapter,
@@ -317,7 +323,7 @@ fn resident_overlay_components(
                     }
                     _ => mlx_gen::asset_facts::ResidentProjection::Stored,
                 };
-            push_overlay(
+            mlx_gen::request_scope::push_unbounded_overlay(
                 &mut components,
                 CONTROL_COMPONENT_ID,
                 MemoryComponentKind::ControlBranch,
@@ -341,7 +347,7 @@ fn resident_overlay_components(
             };
             let student = mlx_gen::safetensors_path_bytes(checkpoint);
             let caption = mlx_gen::safetensors_path_bytes(&gemma_source);
-            push_overlay(
+            mlx_gen::request_scope::push_unbounded_overlay(
                 &mut components,
                 PID_COMPONENT_ID,
                 // `AdapterStack` is the closest existing kind for an auxiliary network installed
@@ -363,7 +369,7 @@ fn resident_overlay_components(
                 )
             },
         )?;
-    push_overlay(
+    mlx_gen::request_scope::push_unbounded_overlay(
         &mut components,
         ADAPTER_COMPONENT_ID,
         MemoryComponentKind::AdapterStack,
@@ -371,27 +377,6 @@ fn resident_overlay_components(
     );
 
     Ok(components)
-}
-
-/// Record one overlay, skipping a zero: the shared validator refuses a declared component with zero
-/// bytes, and a component that measured zero is not evidence of residency anyway.
-fn push_overlay(
-    into: &mut Vec<MemoryResidentComponent>,
-    id: &str,
-    kind: MemoryComponentKind,
-    resident_bytes: u64,
-) {
-    if resident_bytes == 0 {
-        return;
-    }
-    into.push(MemoryResidentComponent {
-        id: id.to_owned(),
-        kind,
-        resident_bytes,
-        // No published rung bounds an overlay here: rung 4's window covers the DiT alone.
-        bounded_by: None,
-        residency: MemoryComponentResidency::WholeRender,
-    });
 }
 
 fn build_contract(
@@ -908,11 +893,7 @@ pub(crate) fn safety_check(
     mlx_gen::gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(mlx_gen::request_scope::loaded_tier(spec)),
         Some(&route_gate),
     )
 }
@@ -937,11 +918,7 @@ pub(crate) fn registered_valid_fixture(
     let context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        },
+        mlx_gen::request_scope::loaded_tier(spec),
         mlx_gen::gen_core::MemoryBehaviorRoute {
             mode,
             reference_count,
@@ -1014,61 +991,47 @@ fn begin_request_with_cleanup(
     // The one place a refused route becomes a TYPED error. `MemorySafetyDecision::Reject` carries an
     // already-rendered string, so the route gate deliberately hands back plain reasons (see
     // `safety_check`) and the `unsupported: ` prefix is applied exactly once, here.
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let routes = decode_routes(provider_id)?;
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        57,
-        move |use_pid, edge, overlap| {
-            routes
-                .validate(use_pid, Some(edge), Some(overlap))
-                .map_err(CoreError::Unsupported)
-        },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
+        let routes = decode_routes(provider_id)?;
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider_id,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            context.use_pid,
+            transformer_blocks(),
+            move |use_pid, edge, overlap| {
+                routes
+                    .validate(use_pid, Some(edge), Some(overlap))
+                    .map_err(CoreError::Unsupported)
+            },
+        )?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
-/// Resolve the clean-base request's attention plan. An unselected request returns the exact
-/// historical unbounded/uncancellable plan; the shared request scope supplies the only accepted
-/// bounded score budget when rung 3 is selected.
-pub(crate) fn attention_plan(req: &GenerationRequest) -> AttentionPlan<'_> {
-    match req.memory {
-        Some(memory) if memory.chunk_attention => {
-            AttentionPlan::budgeted(AttentionBudget::CONSTRAINED).with_cancel(&req.cancel)
-        }
-        _ => AttentionPlan::UNBOUNDED,
-    }
-}
+/// Rung 3: the shared constrained-budget plan (an unselected request keeps the exact historical
+/// unbounded, uncancellable plan).
+pub(crate) use mlx_gen::request_scope::constrained_attention_plan as attention_plan;
 
 /// Resolve an explicitly selected native VAE tile plan. Unselected requests return `None`, keeping
 /// the historical one-pass decode exactly intact. PiD is deliberately handled before this plan at
 /// the decode call site and therefore never inherits native VAE geometry.
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<TilingConfig>> {
-    let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
-        return Ok(None);
-    };
-    if req.cancel.is_cancelled() {
-        return Err(mlx_gen::Error::Canceled);
-    }
-    Ok(Some(TilingConfig::spatial_only(
-        memory.decode_tile_edge.unwrap_or(DECODE_TILE_EDGE) as i32,
-        memory.decode_overlap.unwrap_or(DECODE_OVERLAP) as i32,
-    )))
+    mlx_gen::request_scope::requested_decode_tiling(
+        req.memory,
+        DECODE_TILE_EDGE,
+        DECODE_OVERLAP,
+        |_, _| {
+            if req.cancel.is_cancelled() {
+                Err(mlx_gen::Error::Canceled)
+            } else {
+                Ok(())
+            }
+        },
+    )
 }
 
 /// Request-local conformance fault at a completed physical phase boundary. The shared request floor
@@ -1094,6 +1057,8 @@ pub(crate) fn calibration_fault(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::attention::AttentionBudget;
+    use mlx_gen::gen_core::MemoryNumericTier;
     use mlx_gen::WeightsSource;
 
     fn sequential_spec() -> LoadSpec {
@@ -1707,11 +1672,7 @@ mod tests {
                 contract.calibration.as_ref().unwrap().fingerprint,
                 MEMORY_CALIBRATION_FINGERPRINT
             );
-            let tier = MemoryNumericTier {
-                precision: spec.precision,
-                quant: spec.quantize,
-                component_precision_floors: &[],
-            };
+            let tier = mlx_gen::request_scope::loaded_tier(&spec);
             let mut context = route_context(&contract, MemoryStrategy::BoundedAttention, tier);
             context.optimization_authority = MemoryOptimizationAuthority::Calibrated;
             assert_eq!(
@@ -1897,11 +1858,7 @@ mod tests {
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
             .with_quant(mlx_gen::Quant::Q4);
         let contract = calibrated_q4_contract(&spec);
-        let tier = MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        };
+        let tier = mlx_gen::request_scope::loaded_tier(&spec);
 
         let mut admitted = 0;
         for (width, height) in MANIFEST_RESOLUTIONS {
@@ -1960,11 +1917,7 @@ mod tests {
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
             .with_quant(mlx_gen::Quant::Q4);
         let contract = calibrated_q4_contract(&spec);
-        let tier = MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        };
+        let tier = mlx_gen::request_scope::loaded_tier(&spec);
         let mut legacy = route_context(&contract, MemoryStrategy::BoundedAttention, tier);
         legacy.optimization_authority = MemoryOptimizationAuthority::Estimated;
         // The unmutated legacy context is admitted, so each rejection below is attributable to the
@@ -2031,11 +1984,7 @@ mod tests {
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
             .with_quant(mlx_gen::Quant::Q4);
         let contract = calibrated_q4_contract(&spec);
-        let tier = MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        };
+        let tier = mlx_gen::request_scope::loaded_tier(&spec);
         let mut context = route_context(&contract, MemoryStrategy::BoundedAttention, tier);
         context.geometry.width = 768;
         context.geometry.height = 768;

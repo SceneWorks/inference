@@ -50,14 +50,12 @@
 //! registry conformance keeps its own [`STATIC_BEHAVIOR_FINGERPRINT`] family, which never equals a
 //! production string.
 
-use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    TransformerComponent,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy};
@@ -449,11 +447,7 @@ pub(crate) fn safety_check(
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(mlx_gen::request_scope::loaded_tier(spec)),
         Some(&route_gate),
     )
 }
@@ -472,11 +466,7 @@ pub(crate) fn registered_fixture(
     {
         return Ok(Vec::new());
     }
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let tier = mlx_gen::request_scope::loaded_tier(spec);
     [(MemoryMode::TextToImage, 0), (MemoryMode::ImageToImage, 1)]
         .into_iter()
         .map(|(mode, reference_count)| {
@@ -503,41 +493,33 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let provider = provider_static(&contract.provider_id)?;
-    let blocks = match variant_for(provider)? {
-        Sd3Variant::Large | Sd3Variant::LargeTurbo => LARGE_NUM_LAYERS,
-        Sd3Variant::Medium => MEDIUM_NUM_LAYERS,
-    };
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        false,
-        blocks,
-        |_use_pid, edge, overlap| {
-            if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
-                Ok(())
-            } else {
-                Err(CoreError::Unsupported(
-                    "sd3 decode tile geometry is outside the calibrated domain".to_owned(),
-                ))
-            }
-        },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
+        let provider = provider_static(&contract.provider_id)?;
+        let blocks = match variant_for(provider)? {
+            Sd3Variant::Large | Sd3Variant::LargeTurbo => LARGE_NUM_LAYERS,
+            Sd3Variant::Medium => MEDIUM_NUM_LAYERS,
+        };
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            false,
+            blocks,
+            |_use_pid, edge, overlap| {
+                if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
+                    Ok(())
+                } else {
+                    Err(CoreError::Unsupported(
+                        "sd3 decode tile geometry is outside the calibrated domain".to_owned(),
+                    ))
+                }
+            },
+        )?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 pub(crate) fn registered_begin_request(
@@ -566,48 +548,34 @@ pub(crate) fn begin_request(
     )
 }
 
-pub(crate) fn attention_plan(req: &GenerationRequest) -> AttentionPlan<'_> {
-    match req.memory {
-        Some(memory) if memory.chunk_attention => {
-            AttentionPlan::budgeted(AttentionBudget::CONSTRAINED).with_cancel(&req.cancel)
-        }
-        _ => AttentionPlan::UNBOUNDED,
-    }
-}
+/// Rung 3: the shared constrained-budget plan (an unselected request keeps the exact historical
+/// unbounded, uncancellable plan).
+pub(crate) use mlx_gen::request_scope::constrained_attention_plan as attention_plan;
 
 pub(crate) fn transformer_window(req: &GenerationRequest) -> mlx_gen::Result<Option<usize>> {
-    let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
-        return Ok(None);
-    };
-    if memory
-        .transformer_window_component
-        .unwrap_or(TransformerComponent::Dit)
-        != TransformerComponent::Dit
-    {
-        return Err(mlx_gen::Error::Unsupported(
-            "sd3 supports only the DiT transformer window component".to_owned(),
-        ));
-    }
-    Ok(Some(
-        memory
-            .transformer_window_size
-            .unwrap_or(TRANSFORMER_WINDOW_SIZE) as usize,
-    ))
+    mlx_gen::request_scope::requested_transformer_window(
+        "sd3",
+        req.memory,
+        TransformerComponent::Dit,
+        &[TransformerComponent::Dit],
+        TRANSFORMER_WINDOW_SIZE,
+        |_| Ok(()),
+    )
 }
 
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<TilingConfig>> {
-    let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
-        return Ok(None);
-    };
-    Ok(Some(TilingConfig::spatial_only(
-        memory.decode_tile_edge.unwrap_or(DECODE_TILE_EDGE) as i32,
-        memory.decode_overlap.unwrap_or(DECODE_OVERLAP) as i32,
-    )))
+    mlx_gen::request_scope::requested_decode_tiling(
+        req.memory,
+        DECODE_TILE_EDGE,
+        DECODE_OVERLAP,
+        |_, _| Ok(()),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::attention::AttentionBudget;
     use mlx_gen::gen_core::{MemoryOptimizationAuthority, MemoryStrategySupport};
 
     /// Every registered SD3.5 route, so no test can silently cover only the calibrated variant.

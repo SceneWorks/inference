@@ -180,13 +180,11 @@ fn checked_sum(
     model_id: &str,
     parts: impl Iterator<Item = gen_core::Result<u64>>,
 ) -> gen_core::Result<u64> {
-    let mut sum = 0_u64;
-    for part in parts {
-        sum = sum.checked_add(part?).ok_or_else(|| {
-            gen_core::Error::Msg(format!("{model_id}: component byte sum overflow"))
-        })?;
-    }
-    Ok(sum)
+    gen_core::checked_byte_total(
+        model_id,
+        "component",
+        parts.collect::<gen_core::Result<Vec<_>>>()?,
+    )
 }
 
 /// Candle's CUDA `MATRIX_ROW_PADDING` (elements): every GGML tensor candle quantizes onto a CUDA
@@ -904,30 +902,7 @@ impl MemoryRequestScope for GenerationRequestScope {
         self.core.configure_request(request)
     }
 
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.enter_phase(phase)
-    }
-
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.leave_phase(phase)
-    }
-
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.core.configure_decode(edge, overlap, geometry)
-    }
-
-    fn configure_attention(&mut self, size: u32) -> gen_core::Result<()> {
-        self.core.configure_attention(size)
-    }
-
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
-        self.core.materialize_transformer_window(first, count)
-    }
+    candle_gen::gen_core::delegate_memory_request_scope!(core);
 
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         self.core.finish(outcome)

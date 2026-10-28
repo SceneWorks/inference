@@ -92,11 +92,7 @@ pub fn tier_label(spec: &LoadSpec) -> String {
 }
 
 fn numeric_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    }
+    mlx_gen::request_scope::loaded_tier(spec)
 }
 
 fn generation_batch(req: &GenerationRequest) -> AdmissionResult<u32> {

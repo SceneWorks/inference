@@ -1280,15 +1280,12 @@ pub fn validate_context(
             "kolors: memory evidence is bound only to base T2I or one-reference edit".into(),
         )),
     };
-    match gen_core::standard_memory_strategy_safety_check(
+    candle_gen::request_scope::admit(gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
         Some(tier),
         Some(&route),
-    ) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    ))
 }
 
 pub fn validate_bespoke_context(
@@ -1362,10 +1359,12 @@ fn validate_bespoke_context_with_tier(
             contract.provider_id
         )));
     }
-    match gen_core::standard_memory_strategy_safety_check(contract, context, Some(tier), None) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    candle_gen::request_scope::admit(gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(tier),
+        None,
+    ))
 }
 
 pub fn request_memory(
@@ -1504,12 +1503,7 @@ pub fn registered_safety_check(
         }
         None => validate_context(contract, context, weights_free_tier(spec)),
     });
-    match result {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(result)
 }
 
 pub fn registered_valid_fixtures(
@@ -1675,12 +1669,7 @@ pub fn composed_safety_check(
             contract_carries_pid(contract),
         )
     });
-    match result {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(result)
 }
 
 pub fn composed_valid_fixtures(
@@ -2001,35 +1990,7 @@ impl MemoryRequestScope for KolorsMemoryScope {
         self.admission.configure(self.token, request)
     }
 
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.enter_phase(phase)
-    }
-
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.leave_phase(phase)
-    }
-
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.core.configure_decode(tile_edge, overlap, geometry)
-    }
-
-    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
-        self.core.configure_attention(chunk_size)
-    }
-
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> gen_core::Result<()> {
-        self.core
-            .materialize_transformer_window(first_block, block_count)
-    }
+    candle_gen::gen_core::delegate_memory_request_scope!(core);
 
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         self.core.finish(outcome)?;

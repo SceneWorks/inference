@@ -256,9 +256,7 @@ impl Generator for BoundGenerator {
         });
         match decision {
             Ok(decision) => decision,
-            Err(error) => MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            },
+            Err(error) => MemorySafetyDecision::rejected(error),
         }
     }
     fn begin_memory_strategy_request(

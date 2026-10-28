@@ -41,10 +41,10 @@ use mlx_gen::gen_core::{
     self, Error as CoreError, LoadShape, MemoryArchitectureFacts, MemoryAssetFacts,
     MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
     MemoryCalibrationIdentity, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Precision, Quant,
-    ResidentRequestMemory, Result as CoreResult,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategySupport, Precision, Quant, ResidentRequestMemory,
+    Result as CoreResult,
 };
 use mlx_gen::LoadSpec;
 
@@ -72,16 +72,6 @@ pub const ATTENTION_NOT_ENABLED: &str =
 pub const TRANSFORMER_WINDOW_NOT_ENABLED: &str =
     "the FLUX 3 loader materializes and evaluates the whole DiT at load; there is no \
      deferred-materialization load shape or block-window inference loader";
-
-/// The numeric tier a spec loads: the precision it names and no quantization (the loader refuses
-/// `LoadSpec::quantize`). No component is resident above the selected width.
-fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    }
-}
 
 /// Refuse a deferred-materialization load shape: the loader has none and would otherwise accept
 /// the spec and silently load eagerly.
@@ -567,7 +557,7 @@ pub fn safety_check(
     gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(loaded_tier(spec)),
+        Some(mlx_gen::request_scope::loaded_tier(spec)),
         Some(&route_gate),
     )
 }
@@ -589,7 +579,7 @@ pub(crate) fn registered_valid_fixture(
     let context = gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        loaded_tier(spec),
+        mlx_gen::request_scope::loaded_tier(spec),
         MemoryBehaviorRoute {
             mode: MemoryMode::TextToImage,
             reference_count: 0,
@@ -609,9 +599,7 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
+    mlx_gen::request_scope::admit(safety_check(spec, contract, context))?;
     let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         if contract.provider_id == gen_core::flux3::BASE_MODEL_ID {
             gen_core::flux3::BASE_MODEL_ID
@@ -1330,7 +1318,7 @@ mod tests {
         let mut context = gen_core::standard_memory_behavior_context(
             &contract,
             MemoryStrategy::StagedResidency,
-            loaded_tier(&sentinel()),
+            mlx_gen::request_scope::loaded_tier(&sentinel()),
             MemoryBehaviorRoute {
                 mode: MemoryMode::TextToImage,
                 reference_count: 0,

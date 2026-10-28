@@ -169,13 +169,7 @@ fn optional_component_bytes(path: &Path, float_width: u64, label: &str) -> gen_c
 }
 
 fn checked_sum(label: &str, values: impl IntoIterator<Item = u64>) -> gen_core::Result<u64> {
-    values.into_iter().try_fold(0_u64, |sum, value| {
-        sum.checked_add(value).ok_or_else(|| {
-            gen_core::Error::Msg(format!(
-                "{LTX_2_5_DISTILLED_MODEL_ID}: {label} byte total overflows u64"
-            ))
-        })
-    })
+    gen_core::checked_byte_total(LTX_2_5_DISTILLED_MODEL_ID, label, values)
 }
 
 fn exact_load_receipt(
@@ -589,18 +583,14 @@ fn registered_safety_check(
                 gen_core::adapter_stack_identity(&spec.adapters).as_deref(),
                 context,
             ),
-            Err(error) => MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            },
+            Err(error) => MemorySafetyDecision::rejected(error),
         },
         Ok(_) => MemorySafetyDecision::Reject {
             reason: format!(
                 "{LTX_2_5_DISTILLED_MODEL_ID}: caller contract differs from the exact registered load contract"
             ),
         },
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 

@@ -943,9 +943,7 @@ pub(crate) fn registered_safety_check(
 ) -> MemorySafetyDecision {
     match loaded_tier(spec, &contract.provider_id) {
         Ok(tier) => safety_check(contract, tier, context),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 
@@ -1031,30 +1029,29 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, loaded_tier, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let routes = decode_routes(provider_id)?;
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        crate::transformer::ZImageTransformerConfig::turbo().n_layers,
-        move |use_pid, tile_edge, overlap| {
-            routes
-                .validate(use_pid, Some(tile_edge), Some(overlap))
-                .map_err(CoreError::Unsupported)
+    mlx_gen::request_scope::begin_scope(
+        safety_check(contract, loaded_tier, context),
+        cleanup,
+        move || {
+            let routes = decode_routes(provider_id)?;
+            let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                provider_id,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                crate::transformer::ZImageTransformerConfig::turbo().n_layers,
+                move |use_pid, tile_edge, overlap| {
+                    routes
+                        .validate(use_pid, Some(tile_edge), Some(overlap))
+                        .map_err(CoreError::Unsupported)
+                },
+            )?;
+            config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+            config.transformer_window =
+                mlx_gen::request_scope::selected_transformer_window(contract, context);
+            Ok(config)
         },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = (context.selection.strategy
-        == MemoryStrategy::BoundedTransformerResidency)
-        .then_some(())
-        .and(context.selection.parameters.transformer_window_size);
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    )
 }
 
 #[cfg(test)]

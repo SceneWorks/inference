@@ -35,9 +35,9 @@ use std::path::{Path, PathBuf};
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, MemoryBehaviorFixture,
     MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency,
-    MemoryFormulaKind, MemoryMode, MemoryNumericTier, MemoryOptimizationAuthority,
-    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, Result as CoreResult,
+    MemoryFormulaKind, MemoryMode, MemoryOptimizationAuthority, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, Result as CoreResult,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
 use sha2::{Digest, Sha256};
@@ -390,11 +390,7 @@ pub fn safety_check(
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(mlx_gen::request_scope::loaded_tier(spec)),
         Some(&route),
     )
 }
@@ -410,11 +406,7 @@ pub fn registered_fixture(
     let context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        },
+        mlx_gen::request_scope::loaded_tier(spec),
         MemoryBehaviorRoute {
             mode: MemoryMode::ImageToImage,
             reference_count: 1,
@@ -463,36 +455,28 @@ fn begin_with(
     // The one place a refused route becomes a TYPED error. `MemorySafetyDecision::Reject` carries an
     // already-rendered string, so the route gate deliberately hands back plain reasons (see
     // `safety_check`) and the `unsupported: ` prefix is applied exactly once, here.
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        crate::pulid_flux::MODEL_ID,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        false,
-        57,
-        |_pid, edge, overlap| {
-            if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
-                Ok(())
-            } else {
-                Err(CoreError::Unsupported(format!(
-                    "pulid_flux: decode tile {edge}/{overlap} is outside the production domain"
-                )))
-            }
-        },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            crate::pulid_flux::MODEL_ID,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            false,
+            57,
+            |_pid, edge, overlap| {
+                if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
+                    Ok(())
+                } else {
+                    Err(CoreError::Unsupported(format!(
+                        "pulid_flux: decode tile {edge}/{overlap} is outside the production domain"
+                    )))
+                }
+            },
+        )?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 #[cfg(test)]
@@ -651,11 +635,7 @@ mod tests {
         mlx_gen::gen_core::standard_memory_behavior_context(
             contract,
             strategy,
-            MemoryNumericTier {
-                precision: spec.precision,
-                quant: spec.quantize,
-                component_precision_floors: &[],
-            },
+            mlx_gen::request_scope::loaded_tier(spec),
             identity_route(),
         )
         .unwrap()

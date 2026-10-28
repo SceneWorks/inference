@@ -6,6 +6,10 @@ use crate::gen_core::{
     MemoryRunOutcome, Result,
 };
 
+/// The one place a provider's refused safety decision becomes a typed error, shared with every
+/// backend (sc-27341). Call it before any other fallible admission step.
+pub use crate::gen_core::admit_memory_safety as admit;
+
 type DecodeValidator = Box<dyn Fn(bool, u32, u32) -> Result<()> + 'static>;
 type CleanupAction = Box<dyn FnMut() -> Result<()> + 'static>;
 
