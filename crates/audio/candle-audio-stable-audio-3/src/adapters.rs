@@ -71,7 +71,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use candle_audio::candle_core::safetensors::MmapedSafetensors;
+use candle_audio::candle_core::safetensors::BufferedSafetensors;
 use candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio::gen_core::{AdapterKind, AdapterSpec};
 use candle_audio::{AudioError, Result};
@@ -981,11 +981,36 @@ pub fn validate_spec_shape(spec: &AdapterSpec) -> Result<()> {
 /// `magnitude_r`, `magnitude_c`.
 pub const NATIVE_FACTORS: &[&str] = &["lora_A", "lora_B", "lora_M", "magnitude_r", "magnitude_c"];
 
+/// Largest adapter file [`read_adapter_safetensors`] will buffer. LoRA/DoRA factors are small; a
+/// file past this is almost certainly a base checkpoint passed by mistake, and should fail cleanly
+/// rather than allocate its full size.
+const MAX_ADAPTER_FILE_BYTES: u64 = 2 << 30;
+
+/// Read a request-supplied adapter file into owned memory (sc-27352).
+///
+/// Adapters arrive per request from arbitrary caller paths and every tensor is copied out before
+/// the load returns, so there is nothing to gain from a memory map and real risk in one: a file
+/// truncated or rewritten while mapped can `SIGBUS` the process. Base weights keep the mmap path
+/// (`candle_audio::weights`).
+fn read_adapter_safetensors(path: &Path) -> Result<BufferedSafetensors> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| AudioError::Msg(format!("adapter {}: {e}", path.display())))?
+        .len();
+    if len > MAX_ADAPTER_FILE_BYTES {
+        return Err(AudioError::Msg(format!(
+            "adapter {} is {len} bytes, past the {MAX_ADAPTER_FILE_BYTES}-byte adapter ceiling; \
+             is this a base checkpoint?",
+            path.display()
+        )));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| AudioError::Msg(format!("read adapter {}: {e}", path.display())))?;
+    Ok(BufferedSafetensors::new(bytes)?)
+}
+
 fn load_native(path: &Path, scale: f32, device: &Device) -> Result<LoadedAdapter> {
     let metadata = read_safetensors_metadata(path)?;
-    // Safety: the adapter file must remain immutable while it is being read; every tensor is copied
-    // into owned storage before this function returns.
-    let file = unsafe { MmapedSafetensors::new(path)? };
+    let file = read_adapter_safetensors(path)?;
     let names: Vec<String> = file.tensors().into_iter().map(|(name, _)| name).collect();
     let (modules, has_row, has_col) = collect_native_modules(path, &file, &names, device)?;
 
@@ -1019,7 +1044,7 @@ type NativeModules = (BTreeMap<String, AdapterModule>, bool, bool);
 
 fn collect_native_modules(
     path: &Path,
-    file: &MmapedSafetensors,
+    file: &BufferedSafetensors,
     names: &[String],
     device: &Device,
 ) -> Result<NativeModules> {
@@ -1154,8 +1179,7 @@ fn load_peft(path: &Path, scale: f32, device: &Device) -> Result<LoadedAdapter> 
     let exclude = json_filter(config.get("exclude_modules"))?;
 
     let weights_path = path.join(PEFT_WEIGHTS_FILE);
-    // Safety: as `load_native`.
-    let file = unsafe { MmapedSafetensors::new(&weights_path)? };
+    let file = read_adapter_safetensors(&weights_path)?;
     let names: Vec<String> = file.tensors().into_iter().map(|(name, _)| name).collect();
 
     let mut staged: BTreeMap<String, BTreeMap<String, Tensor>> = BTreeMap::new();

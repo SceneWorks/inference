@@ -133,12 +133,8 @@ fn text_encoder_shards(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn mmap_text_encoder_shards(shards: &[PathBuf], device: &Device) -> Result<VarBuilder<'static>> {
-    // Safety: mmap of files that the pinned-SHA snapshot contract guarantees are not
-    // mutated concurrently — the same invariant every provider family relies on.
-    unsafe {
-        VarBuilder::from_mmaped_safetensors(shards, DType::F32, device)
-            .map_err(|e| AudioError::Msg(format!("mmap text encoder shards: {e}")))
-    }
+    candle_audio::weights::mmap_var_builder(shards, DType::F32, device)
+        .map_err(|e| AudioError::Msg(format!("mmap text encoder shards: {e}")))
 }
 
 impl MossSfxPipeline {
@@ -160,14 +156,16 @@ impl MossSfxPipeline {
 
         let shards = text_encoder_shards(&root.join("text_encoder"))?;
         let vb = mmap_text_encoder_shards(&shards, device)?;
-        let text_encoder = Qwen3Encoder::new(&config.text_encoder, vb)
+        let text_encoder = crate::qwen3::load(&config.text_encoder, vb)
             .map_err(|e| AudioError::Msg(format!("build qwen3 text encoder: {e}")))?;
 
         let dit_path = root.join("transformer/diffusion_pytorch_model.safetensors");
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&dit_path), DType::F32, device)
-                .map_err(|e| AudioError::Msg(format!("mmap {}: {e}", dit_path.display())))?
-        };
+        let vb = candle_audio::weights::mmap_var_builder(
+            std::slice::from_ref(&dit_path),
+            DType::F32,
+            device,
+        )
+        .map_err(|e| AudioError::Msg(format!("mmap {}: {e}", dit_path.display())))?;
         let dit = DiT::new(&config.dit, vb)
             .map_err(|e| AudioError::Msg(format!("build audio DiT: {e}")))?;
         if config.dit.in_dim != crate::vae::LATENT_DIM {

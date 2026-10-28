@@ -127,10 +127,7 @@ fn stft_small(samples: &[f32], n_fft: usize, hop: usize) -> Result<(Vec<f32>, Ve
     let window = hann_window(n_fft);
     let rdft = SmallRdft::new(n_fft);
     let pad = n_fft / 2;
-    let mut padded = Vec::with_capacity(samples.len() + 2 * pad);
-    padded.extend((1..=pad).rev().map(|i| samples[i]));
-    padded.extend_from_slice(samples);
-    padded.extend((0..pad).map(|i| samples[samples.len() - 2 - i]));
+    let padded = candle_audio::dsp::reflect_pad(samples, pad);
 
     let n_bins = n_fft / 2 + 1;
     let n_frames = 1 + (padded.len() - n_fft) / hop;

@@ -25,11 +25,11 @@ use candle_audio::gen_core::{
     self, AudioTrack, LoadSpec, VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding,
     WeightsSource,
 };
-use candle_nn::VarBuilder;
 
 use crate::config;
 use crate::encoder::SpeakerEncoder;
 use crate::frontend::wav_to_mel_frames;
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes a voice-embed request to this exact id).
 pub const MODEL_ID: &str = "chatterbox_ve";
@@ -83,30 +83,18 @@ impl ChatterboxVoiceEmbedder {
             )));
         }
         let device = candle_audio::default_device()?;
-        // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the same idiom every
-        // candle provider uses for its checkpoint.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                std::slice::from_ref(&self.weights),
-                DType::F32,
-                &device,
-            )
-            .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: loading {WEIGHTS_FILE}: {e}")))?
-        };
+        let vb = candle_audio::weights::mmap_var_builder(
+            std::slice::from_ref(&self.weights),
+            DType::F32,
+            &device,
+        )
+        .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: loading {WEIGHTS_FILE}: {e}")))?;
         let built = Arc::new(
             SpeakerEncoder::new(vb, device)
                 .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: building encoder: {e}")))?,
         );
         *guard = Some(built.clone());
         Ok(built)
-    }
-}
-
-/// Recover a poisoned mutex — the audio twin of `candle_gen::lock_recover`.
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -158,13 +146,7 @@ fn to_mono(samples: &[f32], channels: u16) -> Cow<'_, [f32]> {
     if channels <= 1 {
         return Cow::Borrowed(samples);
     }
-    let ch = channels as usize;
-    Cow::Owned(
-        samples
-            .chunks(ch)
-            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-            .collect(),
-    )
+    Cow::Owned(candle_audio::dsp::to_mono(samples, channels))
 }
 
 /// Construct the (lazy) Chatterbox voice embedder from a [`LoadSpec`]. `spec.weights` must be the

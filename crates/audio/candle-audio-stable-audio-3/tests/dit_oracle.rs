@@ -4,6 +4,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -11,7 +12,7 @@ const _: fn() = || {
 };
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,7 +20,7 @@ use candle_audio_stable_audio_3::candle_audio::candle_core::{
     DType, Device, Result as CandleResult, Shape, Tensor,
 };
 use candle_audio_stable_audio_3::config::ModelConfig;
-use candle_audio_stable_audio_3::dit::{DitInputs, Guidance, StableAudio3Dit};
+use candle_audio_stable_audio_3::dit::{DitConditioning, DitInputs, Guidance, StableAudio3Dit};
 use candle_audio_stable_audio_3::weights::{
     map_weight_key, safetensors_keys, SnapshotLayout, StableAudioVarBuilders, WeightSection,
 };
@@ -58,48 +59,26 @@ const CASES: &[Case] = &[
     },
 ];
 
-fn path(name: &str) -> PathBuf {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("{name} must point to its pinned immutable snapshot"))
-}
+use common::snapshot_dir as path;
 
-/// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
-/// `chunked_oracle.rs`.
-///
-/// Branching on `SA3_TEST_METAL` alone would run every case that calls this on `Device::Cpu` inside
-/// the CUDA lanes, which set `SA3_TEST_CUDA`. A requested backend that is unavailable is a hard
-/// failure, never a fallback.
-///
-/// Two of this file's six cases deliberately do not use it. `all_six_cpu_f32_predictions_match_p0`
-/// pins `Device::Cpu` by name: it is the canonical-precision leg of a pair whose twin,
-/// `selected_real_device_prediction_matches_p0`, runs one selected checkpoint against the same
-/// frozen P0 artifact through this selector — moving the sweep here would delete the CPU-f32 leg
-/// rather than add coverage. `all_six_consume_every_dit_and_number_conditioner_tensor_exactly` pins
-/// `Device::Cpu` because it asserts set equality over consumed tensor *names* and no numerics at
-/// all, so the device is unobservable in its result and CPU is the cheapest.
-fn device() -> Device {
-    if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
-        #[cfg(feature = "cuda")]
-        {
-            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            panic!("SA3_TEST_CUDA requires --features cuda")
-        }
-    } else {
-        Device::Cpu
-    }
-}
+// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
+// `chunked_oracle.rs`.
+//
+// Branching on `SA3_TEST_METAL` alone would run every case that calls this on `Device::Cpu` inside
+// the CUDA lanes, which set `SA3_TEST_CUDA`. A requested backend that is unavailable is a hard
+// failure, never a fallback.
+//
+// Two of this file's six cases deliberately do not use it. `all_six_cpu_f32_predictions_match_p0`
+// pins `Device::Cpu` by name: it is the canonical-precision leg of a pair whose twin,
+// `selected_real_device_prediction_matches_p0`, runs one selected checkpoint against the same
+// frozen P0 artifact through this selector — moving the sweep here would delete the CPU-f32 leg
+// rather than add coverage. `all_six_consume_every_dit_and_number_conditioner_tensor_exactly` pins
+// `Device::Cpu` because it asserts set equality over consumed tensor *names* and no numerics at
+// all, so the device is unobservable in its result and CPU is the cheapest.
+use common::test_device as device;
 
 fn mmap(path: &Path, device: &Device) -> VarBuilder<'static> {
-    // Safety: test inputs are committed or pinned immutable artifacts.
-    unsafe {
-        VarBuilder::from_mmaped_safetensors(&[path.to_path_buf()], DType::F32, device).unwrap()
-    }
+    common::mmap_f32(&[path], device)
 }
 
 fn oracle(case: &Case, device: &Device) -> VarBuilder<'static> {
@@ -352,12 +331,14 @@ fn real_weights_detect_conditioning_mutations_and_exercise_cfg_apg() {
         .forward_guided(
             &noise,
             &timestep,
-            &prompt,
-            None,
-            None,
-            &seconds,
-            &zero_local,
-            None,
+            &DitConditioning {
+                positive_prompt: &prompt,
+                negative_prompt: None,
+                negative_prompt_mask: None,
+                seconds_total: &seconds,
+                local_conditioning: &zero_local,
+                padding: None,
+            },
             Guidance {
                 cfg_scale: 2.0,
                 apg_scale: 0.0,
@@ -369,12 +350,14 @@ fn real_weights_detect_conditioning_mutations_and_exercise_cfg_apg() {
         .forward_guided(
             &noise,
             &timestep,
-            &prompt,
-            None,
-            None,
-            &seconds,
-            &zero_local,
-            None,
+            &DitConditioning {
+                positive_prompt: &prompt,
+                negative_prompt: None,
+                negative_prompt_mask: None,
+                seconds_total: &seconds,
+                local_conditioning: &zero_local,
+                padding: None,
+            },
             Guidance {
                 cfg_scale: 2.0,
                 apg_scale: 1.0,
@@ -398,12 +381,14 @@ fn real_weights_detect_conditioning_mutations_and_exercise_cfg_apg() {
         .forward_guided(
             &noise,
             &timestep,
-            &prompt,
-            Some(&prompt),
-            Some(&all_invalid),
-            &seconds,
-            &zero_local,
-            None,
+            &DitConditioning {
+                positive_prompt: &prompt,
+                negative_prompt: Some(&prompt),
+                negative_prompt_mask: Some(&all_invalid),
+                seconds_total: &seconds,
+                local_conditioning: &zero_local,
+                padding: None,
+            },
             Guidance {
                 cfg_scale: 2.0,
                 apg_scale: 0.0,

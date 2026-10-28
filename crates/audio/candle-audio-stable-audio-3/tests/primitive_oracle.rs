@@ -4,13 +4,14 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
     );
 };
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio_stable_audio_3::config::{FeedForwardConfig, NormConfig, NormType, QkNorm};
@@ -23,18 +24,10 @@ use candle_audio_stable_audio_3::transformer::{
 use candle_audio_stable_audio_3::weight_norm::wn_conv1d;
 use candle_nn::{Conv1dConfig, Module, VarBuilder};
 
-fn snapshot(name: &str) -> PathBuf {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("{name} must point to the pinned snapshot"))
-}
+use common::snapshot_dir as snapshot;
 
 fn mmap(path: &Path) -> VarBuilder<'static> {
-    // Safety: these tests require immutable pinned snapshots for their entire process lifetime.
-    unsafe {
-        VarBuilder::from_mmaped_safetensors(&[path.to_path_buf()], DType::F32, &Device::Cpu)
-            .unwrap()
-    }
+    common::mmap_f32(&[path], &Device::Cpu)
 }
 
 fn oracle() -> VarBuilder<'static> {

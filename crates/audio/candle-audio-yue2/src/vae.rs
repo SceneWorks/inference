@@ -1082,9 +1082,8 @@ config_path,
                 identity.release()
             )));
         }
-        // SAFETY: memory-mapping is sound as long as the file is not mutated while mapped; the
-        // production path passes a just-verified snapshot file that is only read.
-        let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(weights_path) }
+        // The production path passes a just-verified snapshot file that is only read.
+        let st = candle_audio::weights::mmap_safetensors(weights_path)
             .map_err(|e| VaeError::Weights(format!("{}: {e}", weights_path.display())))?;
         let load_prefix = |prefix: &str| -> Result<Weights> {
             let mut map = BTreeMap::new();

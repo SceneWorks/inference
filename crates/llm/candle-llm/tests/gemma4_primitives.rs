@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, Tensor};
 use serde_json::{json, Value};
 
-use candle_llm::config::{LayerAttentionType, ModelConfig, RopeType};
+use candle_llm::config::{LayerAttentionType, LayerRope, ModelConfig, RopeType};
 use candle_llm::models::CausalLm;
 use candle_llm::primitives::nn::{linear, rms_norm, rms_norm_unscaled};
 use candle_llm::primitives::projection::{KvProjection, Projection};

@@ -44,6 +44,7 @@ use crate::pipeline::{
 };
 use crate::scheduler::DEFAULT_SHIFT;
 use crate::text::Metadata;
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes `payload.model` to this exact id).
 pub const MODEL_ID: &str = "acestep_v15_turbo";
@@ -393,13 +394,6 @@ impl AceStepGenerator {
                  inference does not self-fetch it"
             ))
         })
-    }
-}
-
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 

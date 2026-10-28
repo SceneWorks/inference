@@ -19,7 +19,11 @@
 //!   vocoder head needs (Kokoro / StyleTTS2, sc-12836; resampling, sc-14561).
 //! - [`ops`] — tensor ops the providers share but candle's GPU backends leave
 //!   unimplemented, expressed in backend-portable primitives (nearest ×k upsample,
-//!   sc-13886 / sc-13691).
+//!   sc-13886 / sc-13691), plus the GQA `repeat_kv` head expansion (sc-27260).
+//! - [`qwen3`] — the Qwen3 decoder block (GQA + q/k RMSNorm + NeoX RoPE + SwiGLU, with the
+//!   KV-cache form) the MOSS-TTS backbones share (sc-27270).
+//! - [`sampling`] — the seeded repetition-penalty / temperature / top-k / top-p token sampler the
+//!   MOSS-TTS AR loops share (sc-27272).
 //! - [`mel`] — HTK mel filterbank construction and application for mel-spectrogram
 //!   front-ends (reference-audio conditioning, model preprocessing parity).
 //! - [`neural_codec`] — neural-codec building blocks several providers' decoders share
@@ -31,6 +35,11 @@
 //!   meters reused from `gen_core::audio_dsp`, never reimplemented), the PCM
 //!   repeatability hash, and the [`harness::MetricEnvelope`] the per-model regression
 //!   fixtures assert against.
+//! - [`weights`] — the lane's one audited `unsafe` safetensors mmap surface and its
+//!   caller-provisioned-file contract, the F32 tensor loaders, and the bounded raw-header reader
+//!   (sc-27259 / sc-27358 / sc-27343).
+//! - [`prepare`] — the snapshot preparers' shared probe, passthrough-report and header-only
+//!   tensor-counting skeleton (sc-27264 / sc-27265).
 //!
 //! Scope discipline (sc-12835): these modules are exactly what the first shipped
 //! provider (Kokoro, sc-12836) needs — no speculative surface. Grow this crate
@@ -63,8 +72,12 @@ pub mod harness;
 pub mod mel;
 pub mod neural_codec;
 pub mod ops;
+pub mod prepare;
+pub mod qwen3;
+pub mod sampling;
 pub mod vocos;
 pub mod wav;
+pub mod weights;
 
 // Test-support helpers shared across the candle audio provider crates. Feature-gated so it never
 // compiles into a production build — provider crates enable `candle-audio/testkit` under
@@ -72,9 +85,22 @@ pub mod wav;
 // `--features candle-audio/testkit` (ci.yml) so the module never sits behind an unexercised cfg
 // (the sc-11990 cfg-hole guard). The HF-cache snapshot scanners this module once held were removed
 // under epic 13657 — inference never self-fetches or derives an HF-cache location; tests take a
-// passed-in snapshot dir via env instead.
-#[cfg(feature = "testkit")]
+// passed-in snapshot dir via env instead. Also compiled for this crate's own unit tests.
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
+
+/// Lock a mutex, recovering the guard if a previous holder panicked (a poisoned lock).
+///
+/// The candle audio providers keep lazily-built model state behind `Mutex<Option<…>>`; a panic
+/// mid-build leaves `None` or stale state, which their lazy builders tolerate, so poisoning is not
+/// worth propagating. The audio twin of `candle_gen::lock_recover` — one shared copy instead of the
+/// per-provider ones (sc-27357).
+pub fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 /// The candle-backed audio-crate error. gen-core cannot name candle types, so device/tensor
 /// failures arrive boxed in [`gen_core::Error::Backend`] via the [`From`] bridge below —

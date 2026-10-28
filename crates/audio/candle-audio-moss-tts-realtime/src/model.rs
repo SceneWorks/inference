@@ -24,7 +24,6 @@ use candle_audio::gen_core::{
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress,
     WeightsSource,
 };
-use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 use crate::backbone::Backbone;
@@ -33,6 +32,7 @@ use crate::config::MossTtsRealtimeConfig;
 use crate::conversation::{self, ConvState, PreparedTurn, Role};
 use crate::decode::{build_prompt_frames, Decoder};
 use crate::local::LocalTransformer;
+use candle_audio::lock_recover;
 
 /// Registry id — the id the catalog's ordered-generator surface carries.
 pub const MODEL_ID: &str = "moss_tts_realtime";
@@ -194,14 +194,16 @@ impl Loaded {
             )));
         }
         let device = candle_audio::default_device()?;
-        // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the shared idiom. The
-        // BF16 checkpoint is loaded as F32 (CPU-friendly, and the reference runs the AR head in f32).
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights), DType::F32, &device)
-                .map_err(|e| {
-                    gen_core::Error::Msg(format!("{MODEL_ID}: mmap {}: {e}", weights.display()))
-                })?
-        };
+        // The BF16 checkpoint is loaded as F32 (CPU-friendly, and the reference runs the AR head in
+        // f32).
+        let vb = candle_audio::weights::mmap_var_builder(
+            std::slice::from_ref(&weights),
+            DType::F32,
+            &device,
+        )
+        .map_err(|e| {
+            gen_core::Error::Msg(format!("{MODEL_ID}: mmap {}: {e}", weights.display()))
+        })?;
         let backbone = Backbone::new(
             &cfg.language_config,
             cfg.rvq,
@@ -235,24 +237,12 @@ pub struct MossTtsRealtimeGenerator {
     codec: Mutex<Option<Arc<MossAudioCodec>>>,
 }
 
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 /// Downmix an interleaved [`AudioTrack`] to mono for codec analysis (the voice-clone reference input).
+///
+/// The shared [`candle_audio::dsp::to_mono`] (sc-27357): identical for whole frames; a ragged
+/// trailing partial frame is averaged over the samples it has rather than over `channels`.
 fn mono_samples(track: &AudioTrack) -> Vec<f32> {
-    let ch = (track.channels as usize).max(1);
-    if ch == 1 {
-        return track.samples.clone();
-    }
-    track
-        .samples
-        .chunks(ch)
-        .map(|frame| frame.iter().sum::<f32>() / ch as f32)
-        .collect()
+    candle_audio::dsp::to_mono(&track.samples, track.channels)
 }
 
 fn contextual_audio_error(context: String, error: candle_audio::AudioError) -> gen_core::Error {

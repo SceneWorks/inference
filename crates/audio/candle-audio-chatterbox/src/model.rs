@@ -39,7 +39,6 @@ use candle_audio::gen_core::{
     ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Progress, VoiceEmbedder, WeightsSource,
 };
-use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -51,6 +50,7 @@ use crate::s3gen::S3Gen;
 use crate::s3tokenizer::S3Tokenizer;
 use crate::t3::{strip_special_speech_tokens, T3Cond, T3};
 use crate::text::EnTokenizer;
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes `payload.model` to this exact id).
 pub const MODEL_ID: &str = "chatterbox_tts";
@@ -91,11 +91,9 @@ fn prepare_reference_audio(audio: &AudioTrack) -> gen_core::Result<Cow<'_, Audio
         return Ok(Cow::Borrowed(audio));
     }
 
-    let samples = audio
-        .samples
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32)
-        .collect();
+    // Whole frames were validated above, so the shared down-mix (sc-27357) averages exactly
+    // `channels` samples per frame.
+    let samples = candle_audio::dsp::to_mono(&audio.samples, audio.channels);
     Ok(Cow::Owned(AudioTrack {
         samples,
         sample_rate: audio.sample_rate,
@@ -254,13 +252,6 @@ pub struct ChatterboxGenerator {
     perth: Mutex<Option<PerthWatermarker>>,
 }
 
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 /// The `perth_implicit.safetensors` file from the staged [`COMPONENT_PERTH`] source: a
 /// [`WeightsSource::File`] used directly, or `<dir>/perth_implicit.safetensors` for a
 /// [`WeightsSource::Dir`]. ([`PerthWatermarker::from_safetensors`] itself turns a missing file into a
@@ -398,17 +389,14 @@ impl ChatterboxGenerator {
                 )));
             }
             let device = candle_audio::default_device()?;
-            // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the shared idiom.
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    std::slice::from_ref(&path),
-                    DType::F32,
-                    &device,
-                )
-                .map_err(|e| {
-                    gen_core::Error::Msg(format!("{MODEL_ID}: load {T3_WEIGHTS_FILE}: {e}"))
-                })?
-            };
+            let vb = candle_audio::weights::mmap_var_builder(
+                std::slice::from_ref(&path),
+                DType::F32,
+                &device,
+            )
+            .map_err(|e| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: load {T3_WEIGHTS_FILE}: {e}"))
+            })?;
             let t3 = T3::new(&self.t3_config, vb)
                 .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: build T3: {e}")))?;
             *guard = Some(t3);

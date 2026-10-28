@@ -5,6 +5,7 @@ use core_llm::{
     Result as CoreResult,
 };
 
+use crate::error::to_core;
 use crate::gguf::{convert_file, ConvertOptions};
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::Weights;
@@ -24,17 +25,6 @@ fn to_quant_spec(q: Quantize) -> CoreResult<QuantSpec> {
              snapshot preparation; the MLX backend has no NVFP4 GEMM"
                 .into(),
         )),
-    }
-}
-
-fn to_core(e: crate::Error) -> CoreError {
-    match e {
-        crate::Error::Canceled => CoreError::Canceled,
-        crate::Error::Unsupported(m) => CoreError::Unsupported(m),
-        crate::Error::MissingTensor(m) => CoreError::Load(format!("missing tensor: {m}")),
-        crate::Error::Config(m) => CoreError::Load(m),
-        crate::Error::Io(e) => CoreError::Io(e),
-        other => CoreError::backend(other),
     }
 }
 

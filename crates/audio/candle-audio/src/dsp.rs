@@ -20,11 +20,85 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A periodic Hann window of length `len` — `0.5 * (1 - cos(2π n / N))`, the analysis and
 /// synthesis window the reference STFT stacks (torch.hann_window / librosa) default to.
+///
+/// # The three periodic Hann spellings (sc-27357)
+///
+/// The ports reproduce three ULP-distinct spellings of the same window, each pinned by its
+/// provider's reference parity, so they are deliberately **not** merged into one:
+///
+/// | function | formula | cosine |
+/// |---|---|---|
+/// | [`hann_window`] | `0.5 · (1 − cos(2πi/n))` | f32 |
+/// | [`hann_window_torch_f32`] | `0.5 − 0.5 · cos(2πi/n)` | f32 |
+/// | [`hann_window_torch_f64`] | `0.5 − 0.5 · cos(2πi/n)` | f64, then cast |
+///
+/// Pick the one the reference stack's arithmetic matches; switching a parity-pinned port between
+/// them changes its output bits.
 pub fn hann_window(len: usize) -> Vec<f32> {
     let n = len as f32;
     (0..len)
         .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n).cos()))
         .collect()
+}
+
+/// A periodic Hann window of length `n` spelled `0.5 − 0.5 · cos(2πi/n)` with an **f32** cosine —
+/// the form the Chatterbox (S3 tokenizer, 24 kHz mel, voice encoder) and OpenVoice front-ends
+/// port from `torch.hann_window(n)`. ULP-distinct from [`hann_window`]; see its table.
+pub fn hann_window_torch_f32(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
+        .collect()
+}
+
+/// A periodic Hann window of length `n` spelled `0.5 − 0.5 · cos(2πi/n)` with the cosine evaluated
+/// in **f64** and cast — torch's default `hann_window`, the Vocos heads' window
+/// ([`crate::vocos::hann_window`]). ULP-distinct from [`hann_window`]; see its table.
+pub fn hann_window_torch_f64(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos() as f32)
+        .collect()
+}
+
+/// Reflect-pad `samples` by `pad` on both ends (numpy/torch `mode="reflect"`, the edge sample
+/// excluded) — the `center=True` framing librosa and `torch.stft` use.
+///
+/// For `pad < samples.len()` (the only range the reflection is defined on, and the only one the
+/// callers use) this is exact; beyond it the indices clamp instead of panicking. An empty input
+/// yields an empty output.
+pub fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
+    let n = samples.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(n + 2 * pad);
+    out.extend((1..=pad).rev().map(|i| samples[i.min(n - 1)]));
+    out.extend_from_slice(samples);
+    out.extend((0..pad).map(|i| samples[n.saturating_sub(2 + i)]));
+    out
+}
+
+/// Down-mix interleaved `channels`-channel PCM to mono by averaging each frame (a copy for mono
+/// or `channels == 0` input).
+pub fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
+    if channels <= 1 {
+        return samples.to_vec();
+    }
+    samples
+        .chunks(channels as usize)
+        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+        .collect()
+}
+
+/// Planar `[channels][frames]` PCM (channel-major, as a `[1, C, T]` decoder tensor flattens) →
+/// interleaved `[t0c0, t0c1, t1c0, …]` (sc-27357). Pure data movement. Panics if `channels == 0`;
+/// a trailing remainder of fewer than `channels` samples is dropped.
+pub fn planar_to_interleaved(planar: &[f32], channels: usize) -> Vec<f32> {
+    let frames = planar.len() / channels;
+    let mut out = Vec::with_capacity(frames * channels);
+    for t in 0..frames {
+        out.extend((0..channels).map(|c| planar[c * frames + t]));
+    }
+    out
 }
 
 // An odd tap count makes the zero phase exactly sample-centered. With β=8.6, 197
@@ -552,41 +626,140 @@ impl Spectrogram {
     }
 }
 
-/// In-place iterative radix-2 Cooley–Tukey FFT over `(re, im)` pairs. `invert` runs the
-/// inverse transform (without the `1/n` scale — callers apply it). `data.len()` must be a
-/// power of two (checked by the public entry points).
-fn fft_in_place(data: &mut [(f32, f32)], invert: bool) {
-    let n = data.len();
-    // Bit-reversal permutation.
-    let mut j = 0usize;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j |= bit;
-        if i < j {
-            data.swap(i, j);
-        }
+/// The sample type of an [`FftPlan`]: `f32` (the STFT front-ends) or `f64` (long analysis FFTs such
+/// as Sheet Sage's octave check). Sealed — only those two.
+pub trait FftScalar:
+    Copy
+    + std::fmt::Debug
+    + std::ops::Add<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Mul<Output = Self>
+    + sealed::Sealed
+{
+    /// Round an f64 twiddle to this precision (the identity for `f64`).
+    fn from_f64(x: f64) -> Self;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+}
+
+impl FftScalar for f32 {
+    fn from_f64(x: f64) -> Self {
+        x as f32
     }
-    let sign = if invert { 1.0f64 } else { -1.0f64 };
-    let mut len = 2;
-    while len <= n {
-        // f64 twiddles: the recurrence-free per-butterfly angle keeps error flat over
-        // long windows (n_fft up to 2048 for the mel front-ends).
-        let ang = sign * 2.0 * std::f64::consts::PI / len as f64;
-        for start in (0..n).step_by(len) {
-            for k in 0..len / 2 {
-                let (wr, wi) = ((ang * k as f64).cos() as f32, (ang * k as f64).sin() as f32);
-                let (ar, ai) = data[start + k];
-                let (br, bi) = data[start + k + len / 2];
-                let (tr, ti) = (br * wr - bi * wi, br * wi + bi * wr);
-                data[start + k] = (ar + tr, ai + ti);
-                data[start + k + len / 2] = (ar - tr, ai - ti);
+}
+
+impl FftScalar for f64 {
+    fn from_f64(x: f64) -> Self {
+        x
+    }
+}
+
+/// A radix-2 complex FFT plan: the size and its precomputed twiddle tables (sc-27356), shared by
+/// [`stft`] / [`istft`] and by providers whose framing differs from theirs (sc-27261).
+///
+/// The transform is the in-place iterative Cooley–Tukey FFT over `(re, im)` pairs of `T` (`f32` by
+/// default, or `f64`). Its twiddles are computed once per plan in f64 and rounded to `T`:
+/// `tw[j] = (cos, sin)(±2π/n · j)`. The stage of span `len` reads `tw[k · n/len]`, and because
+/// `n/len` is a power of two, `±2π/n · (k · n/len)` is the same real number as the per-stage angle
+/// `±2π/len · k` and rounds to the same f64 — so the plan is **bit-identical** to evaluating each
+/// butterfly's twiddle on the fly (the pre-sc-27356 code, pinned by
+/// `fft_plan_matches_per_butterfly_twiddles_bit_for_bit`), at `n/2` trig pairs per plan instead of
+/// `n/2 · log2 n` per frame. For the same reason (division by a power of two is exact) it is also
+/// bit-identical to a table spelled `−2π·j / n`, the form Sheet Sage's front-end and octave check
+/// carried (`fft_plan_matches_the_table_spellings_it_replaced`).
+#[derive(Clone, Debug)]
+pub struct FftPlan<T: FftScalar = f32> {
+    n: usize,
+    /// Forward (`e^{-iθ}`) twiddles, `n / 2` entries.
+    forward: Vec<(T, T)>,
+    /// Inverse (`e^{+iθ}`) twiddles, `n / 2` entries.
+    inverse: Vec<(T, T)>,
+}
+
+impl<T: FftScalar> FftPlan<T> {
+    /// Plan an `n`-point transform. `n` must be a power of two `>= 2`.
+    pub fn new(n: usize) -> Result<Self> {
+        require_power_of_two(n)?;
+        let table = |sign: f64| -> Vec<(T, T)> {
+            let ang = sign * 2.0 * std::f64::consts::PI / n as f64;
+            (0..n / 2)
+                .map(|j| {
+                    (
+                        T::from_f64((ang * j as f64).cos()),
+                        T::from_f64((ang * j as f64).sin()),
+                    )
+                })
+                .collect()
+        };
+        Ok(Self {
+            n,
+            forward: table(-1.0),
+            inverse: table(1.0),
+        })
+    }
+
+    /// The transform size `n`.
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    /// Always `false` — a plan has at least two points.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Forward FFT of `data` in place (no scaling — the `torch.stft(normalized=False)` / numpy
+    /// convention). Panics if `data.len() != self.len()`.
+    pub fn forward_in_place(&self, data: &mut [(T, T)]) {
+        self.transform(data, &self.forward);
+    }
+
+    /// Inverse FFT of `data` in place **without** the `1/n` scale (callers apply it). Panics if
+    /// `data.len() != self.len()`.
+    pub fn inverse_in_place(&self, data: &mut [(T, T)]) {
+        self.transform(data, &self.inverse);
+    }
+
+    fn transform(&self, data: &mut [(T, T)], twiddles: &[(T, T)]) {
+        let n = self.n;
+        assert_eq!(
+            data.len(),
+            n,
+            "FftPlan of size {n} given {} points",
+            data.len()
+        );
+        // Bit-reversal permutation.
+        let mut j = 0usize;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j |= bit;
+            if i < j {
+                data.swap(i, j);
             }
         }
-        len <<= 1;
+        let mut len = 2;
+        while len <= n {
+            let stride = n / len;
+            for start in (0..n).step_by(len) {
+                for k in 0..len / 2 {
+                    let (wr, wi) = twiddles[k * stride];
+                    let (ar, ai) = data[start + k];
+                    let (br, bi) = data[start + k + len / 2];
+                    let (tr, ti) = (br * wr - bi * wi, br * wi + bi * wr);
+                    data[start + k] = (ar + tr, ai + ti);
+                    data[start + k + len / 2] = (ar - tr, ai - ti);
+                }
+            }
+            len <<= 1;
+        }
     }
 }
 
@@ -609,27 +782,26 @@ fn require_window(window: &[f32], n_fft: usize) -> Result<()> {
     Ok(())
 }
 
-/// Real FFT of one `n_fft`-long frame → the `n_fft / 2 + 1` one-sided bins.
-fn rfft(frame: &[f32]) -> Vec<(f32, f32)> {
-    let n = frame.len();
-    let mut data: Vec<(f32, f32)> = frame.iter().map(|&x| (x, 0.0)).collect();
-    fft_in_place(&mut data, false);
-    data.truncate(n / 2 + 1);
-    data
+/// Real FFT of one `n_fft`-long frame into `scratch` (resized to `n_fft`); the first
+/// `n_fft / 2 + 1` entries of `scratch` are then the one-sided bins.
+fn rfft_into(plan: &FftPlan, frame: &[f32], scratch: &mut Vec<(f32, f32)>) {
+    scratch.clear();
+    scratch.extend(frame.iter().map(|&x| (x, 0.0)));
+    plan.forward_in_place(scratch);
 }
 
-/// Inverse real FFT of `n / 2 + 1` one-sided bins → an `n`-long real frame (with the
-/// `1/n` scale applied), reconstructing the negative frequencies by conjugate symmetry.
-fn irfft(bins: &[(f32, f32)], n: usize) -> Vec<f32> {
-    let mut data: Vec<(f32, f32)> = Vec::with_capacity(n);
-    data.extend_from_slice(bins);
+/// Inverse real FFT of `n / 2 + 1` one-sided bins → an `n`-long real frame in `scratch`'s real
+/// parts (the `1/n` scale is left to the caller), reconstructing the negative frequencies by
+/// conjugate symmetry.
+fn irfft_into(plan: &FftPlan, bins: &[(f32, f32)], scratch: &mut Vec<(f32, f32)>) {
+    let n = plan.len();
+    scratch.clear();
+    scratch.extend_from_slice(bins);
     for k in (1..n / 2).rev() {
         let (r, i) = bins[k];
-        data.push((r, -i));
+        scratch.push((r, -i));
     }
-    fft_in_place(&mut data, true);
-    let scale = 1.0 / n as f32;
-    data.into_iter().map(|(r, _)| r * scale).collect()
+    plan.inverse_in_place(scratch);
 }
 
 /// Forward STFT with `center=True` reflect padding — the analysis half of the pair. The
@@ -654,11 +826,10 @@ pub fn stft(samples: &[f32], n_fft: usize, hop: usize, window: &[f32]) -> Result
         )));
     }
     // Reflect-pad by n_fft/2 on both ends (librosa `pad_mode="reflect"`).
-    let mut padded = Vec::with_capacity(samples.len() + 2 * pad);
-    padded.extend((1..=pad).rev().map(|i| samples[i]));
-    padded.extend_from_slice(samples);
-    padded.extend((0..pad).map(|i| samples[samples.len() - 2 - i]));
+    let padded = reflect_pad(samples, pad);
 
+    let plan = FftPlan::new(n_fft)?;
+    let mut scratch = Vec::with_capacity(n_fft);
     let n_bins = n_fft / 2 + 1;
     let n_frames = 1 + (padded.len() - n_fft) / hop;
     let mut re = vec![0.0f32; n_bins * n_frames];
@@ -672,7 +843,8 @@ pub fn stft(samples: &[f32], n_fft: usize, hop: usize, window: &[f32]) -> Result
         {
             *dst = x * w;
         }
-        for (bin, (r, i)) in rfft(&frame).into_iter().enumerate() {
+        rfft_into(&plan, &frame, &mut scratch);
+        for (bin, &(r, i)) in scratch[..n_bins].iter().enumerate() {
             re[bin * n_frames + t] = r;
             im[bin * n_frames + t] = i;
         }
@@ -719,15 +891,19 @@ pub fn istft(
     let mut out = vec![0.0f32; out_len];
     let mut wsum = vec![0.0f32; out_len];
     let mut bins = vec![(0.0f32, 0.0f32); n_bins];
+    let plan = FftPlan::new(n_fft)?;
+    let mut scratch = Vec::with_capacity(n_fft);
+    let scale = 1.0 / n_fft as f32;
     for t in 0..n_frames {
         for (bin, dst) in bins.iter_mut().enumerate() {
             let m = magnitude[bin * n_frames + t];
             let p = phase[bin * n_frames + t];
             *dst = (m * p.cos(), m * p.sin());
         }
-        let frame = irfft(&bins, n_fft);
+        irfft_into(&plan, &bins, &mut scratch);
         let start = t * hop;
-        for (i, (x, w)) in frame.iter().zip(window).enumerate() {
+        for (i, (&(x, _), w)) in scratch.iter().zip(window).enumerate() {
+            let x = x * scale;
             out[start + i] += x * w;
             wsum[start + i] += w * w;
         }
@@ -742,6 +918,114 @@ pub fn istft(
     let pad = n_fft / 2;
     let end = out_len.saturating_sub(pad);
     Ok(out[pad.min(end)..end].to_vec())
+}
+
+/// A direct (O(n²)) one-sided real DFT for transform sizes the radix-2 [`FftPlan`] cannot serve
+/// (`n_fft = 400` / `1920`, or a zero-padded 512-point Kaldi frame) — the shared form of the
+/// table-driven DFTs the Chatterbox front-ends each carried (sc-27268).
+///
+/// The `[n_bins, frame_len]` cos/sin table is built once per instance with the angle
+/// `-2π · k · t / n_fft` evaluated in **f32**, exactly as those ports did, so every consumer's power
+/// spectrum is bit-identical to its previous private copy. (An exactly-reduced f64 angle,
+/// `((k·t) mod n_fft) · 2π / n_fft`, would shrink the ~1e-4 rad twiddle error at large `k·t`; it is
+/// deliberately not done here because it moves parity-pinned outputs — it needs per-provider parity
+/// reruns first.)
+#[derive(Clone, Debug)]
+pub struct DirectRdft {
+    n_fft: usize,
+    frame_len: usize,
+    n_bins: usize,
+    /// `[n_bins][frame_len]`.
+    cos: Vec<f32>,
+    /// `[n_bins][frame_len]`.
+    sin: Vec<f32>,
+}
+
+impl DirectRdft {
+    /// An `n_fft`-point real DFT over `n_fft`-sample frames. Panics if `n_fft == 0`.
+    pub fn new(n_fft: usize) -> Self {
+        Self::zero_padded(n_fft, n_fft)
+    }
+
+    /// An `n_fft`-point real DFT over frames of `frame_len <= n_fft` samples, the remaining
+    /// `n_fft - frame_len` being implicit zero padding (the table only spans the non-zero
+    /// columns). Panics if `n_fft == 0` or `frame_len > n_fft`.
+    pub fn zero_padded(n_fft: usize, frame_len: usize) -> Self {
+        assert!(n_fft > 0, "DirectRdft needs n_fft >= 1");
+        assert!(
+            frame_len <= n_fft,
+            "DirectRdft frame_len {frame_len} exceeds n_fft {n_fft}"
+        );
+        let n_bins = n_fft / 2 + 1;
+        let mut cos = vec![0f32; n_bins * frame_len];
+        let mut sin = vec![0f32; n_bins * frame_len];
+        for k in 0..n_bins {
+            for t in 0..frame_len {
+                let ang = -2.0 * std::f32::consts::PI * k as f32 * t as f32 / n_fft as f32;
+                cos[k * frame_len + t] = ang.cos();
+                sin[k * frame_len + t] = ang.sin();
+            }
+        }
+        Self {
+            n_fft,
+            frame_len,
+            n_bins,
+            cos,
+            sin,
+        }
+    }
+
+    /// The transform size `n_fft`.
+    pub fn n_fft(&self) -> usize {
+        self.n_fft
+    }
+
+    /// The number of one-sided bins, `n_fft / 2 + 1`.
+    pub fn n_bins(&self) -> usize {
+        self.n_bins
+    }
+
+    /// Power spectrum `re² + im²` of one (already windowed) `frame_len`-sample frame into `out`
+    /// (`n_bins` long). Panics on a length mismatch.
+    pub fn power_into(&self, frame: &[f32], out: &mut [f32]) {
+        assert_eq!(frame.len(), self.frame_len, "DirectRdft frame length");
+        assert_eq!(out.len(), self.n_bins, "DirectRdft output length");
+        for (k, slot) in out.iter_mut().enumerate() {
+            let cos_k = &self.cos[k * self.frame_len..(k + 1) * self.frame_len];
+            let sin_k = &self.sin[k * self.frame_len..(k + 1) * self.frame_len];
+            let mut re = 0f32;
+            let mut im = 0f32;
+            for (t, &x) in frame.iter().enumerate() {
+                re += x * cos_k[t];
+                im += x * sin_k[t];
+            }
+            *slot = re * re + im * im;
+        }
+    }
+
+    /// Frame-major power STFT `[n_frames][n_bins]` of an already padded signal: frames of
+    /// `frame_len` samples every `hop`, each multiplied by `window` (`frame_len` long) before the
+    /// DFT. A signal shorter than one frame yields no frames. Panics if `hop == 0`.
+    pub fn power_frames(&self, padded: &[f32], hop: usize, window: &[f32]) -> Vec<Vec<f32>> {
+        assert!(hop > 0, "DirectRdft hop must be >= 1");
+        assert_eq!(window.len(), self.frame_len, "DirectRdft window length");
+        if padded.len() < self.frame_len {
+            return Vec::new();
+        }
+        let n_frames = 1 + (padded.len() - self.frame_len) / hop;
+        let mut windowed = vec![0f32; self.frame_len];
+        (0..n_frames)
+            .map(|f| {
+                let start = f * hop;
+                for (i, w) in windowed.iter_mut().enumerate() {
+                    *w = padded[start + i] * window[i];
+                }
+                let mut row = vec![0f32; self.n_bins];
+                self.power_into(&windowed, &mut row);
+                row
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1057,7 +1341,10 @@ mod tests {
         let frame: Vec<f32> = (0..n)
             .map(|i| (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
             .collect();
-        let bins = rfft(&frame);
+        let plan = FftPlan::new(n).unwrap();
+        let mut scratch = Vec::new();
+        rfft_into(&plan, &frame, &mut scratch);
+        let bins = &scratch[..n / 2 + 1];
         assert_eq!(bins.len(), 5);
         assert!((bins[1].0 - 4.0).abs() < 1e-4, "re[1] = n/2");
         for (k, (r, i)) in bins.iter().enumerate() {
@@ -1070,10 +1357,263 @@ mod tests {
     #[test]
     fn irfft_round_trips_rfft() {
         let frame: Vec<f32> = (0..64).map(|i| ((i * 7 % 13) as f32 - 6.0) / 6.0).collect();
-        let back = irfft(&rfft(&frame), 64);
-        for (a, b) in frame.iter().zip(&back) {
+        let plan = FftPlan::new(64).unwrap();
+        let (mut spec, mut back) = (Vec::new(), Vec::new());
+        rfft_into(&plan, &frame, &mut spec);
+        irfft_into(&plan, &spec[..33], &mut back);
+        for (a, &(b, _)) in frame.iter().zip(&back) {
+            let b = b / 64.0;
             assert!((a - b).abs() < 1e-5, "{a} vs {b}");
         }
+    }
+
+    /// The pre-sc-27356 transform, verbatim: f64 twiddles re-evaluated for every butterfly.
+    fn reference_fft_in_place(data: &mut [(f32, f32)], invert: bool) {
+        let n = data.len();
+        let mut j = 0usize;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j |= bit;
+            if i < j {
+                data.swap(i, j);
+            }
+        }
+        let sign = if invert { 1.0f64 } else { -1.0f64 };
+        let mut len = 2;
+        while len <= n {
+            let ang = sign * 2.0 * std::f64::consts::PI / len as f64;
+            for start in (0..n).step_by(len) {
+                for k in 0..len / 2 {
+                    let (wr, wi) = ((ang * k as f64).cos() as f32, (ang * k as f64).sin() as f32);
+                    let (ar, ai) = data[start + k];
+                    let (br, bi) = data[start + k + len / 2];
+                    let (tr, ti) = (br * wr - bi * wi, br * wi + bi * wr);
+                    data[start + k] = (ar + tr, ai + ti);
+                    data[start + k + len / 2] = (ar - tr, ai - ti);
+                }
+            }
+            len <<= 1;
+        }
+    }
+
+    /// sc-27356: the plan's precomputed twiddle table reproduces the per-butterfly f64 twiddles
+    /// exactly, so forward and inverse transforms are bit-identical to the old code for every
+    /// power-of-two size the STFT accepts (2..=4096).
+    #[test]
+    fn fft_plan_matches_per_butterfly_twiddles_bit_for_bit() {
+        let bits = |v: &[(f32, f32)]| {
+            v.iter()
+                .flat_map(|&(r, i)| [r.to_bits(), i.to_bits()])
+                .collect::<Vec<_>>()
+        };
+        let mut n = 2usize;
+        while n <= 4096 {
+            let plan = FftPlan::new(n).unwrap();
+            let input: Vec<(f32, f32)> = (0..n)
+                .map(|i| {
+                    let x = i as f32;
+                    ((x * 0.37).sin() + 0.1 * x / n as f32, (x * 1.3).cos() * 0.5)
+                })
+                .collect();
+            for invert in [false, true] {
+                let mut want = input.clone();
+                reference_fft_in_place(&mut want, invert);
+                let mut got = input.clone();
+                if invert {
+                    plan.inverse_in_place(&mut got);
+                } else {
+                    plan.forward_in_place(&mut got);
+                }
+                assert_eq!(bits(&got), bits(&want), "n={n} invert={invert}");
+            }
+            n <<= 1;
+        }
+        assert!(
+            FftPlan::<f32>::new(12).is_err(),
+            "non-power-of-two sizes are rejected"
+        );
+        assert!(FftPlan::<f64>::new(1).is_err());
+    }
+
+    /// The table-driven radix-2 FFTs Sheet Sage carried (an f32 front-end plan and the f64 octave
+    /// check), verbatim: twiddles spelled `−2π·k / n` and a precomputed bit-reversal table.
+    fn sheetsage_reference_fft<T: FftScalar>(data: &mut [(T, T)]) {
+        let n = data.len();
+        let bits = n.trailing_zeros();
+        let twiddles: Vec<(T, T)> = (0..n / 2)
+            .map(|k| {
+                let angle = -2.0 * std::f64::consts::PI * k as f64 / n as f64;
+                (T::from_f64(angle.cos()), T::from_f64(angle.sin()))
+            })
+            .collect();
+        for i in 0..n {
+            let j = i.reverse_bits() >> (usize::BITS - bits);
+            if i < j {
+                data.swap(i, j);
+            }
+        }
+        let mut len = 2;
+        while len <= n {
+            let stride = n / len;
+            for start in (0..n).step_by(len) {
+                for k in 0..len / 2 {
+                    let (wr, wi) = twiddles[k * stride];
+                    let (ar, ai) = data[start + k];
+                    let (br, bi) = data[start + k + len / 2];
+                    let (tr, ti) = (br * wr - bi * wi, br * wi + bi * wr);
+                    data[start + k] = (ar + tr, ai + ti);
+                    data[start + k + len / 2] = (ar - tr, ai - ti);
+                }
+            }
+            len <<= 1;
+        }
+    }
+
+    /// sc-27261: the shared plan reproduces both Sheet Sage FFTs bit-for-bit — f32 up to the
+    /// front-end's sizes and f64 up to the octave check's 2^16 points.
+    #[test]
+    fn fft_plan_matches_the_table_spellings_it_replaced() {
+        let mut n = 2usize;
+        while n <= 1 << 16 {
+            let input = |i: usize| {
+                let x = i as f64;
+                ((x * 0.37).sin() + 0.1 * x / n as f64, (x * 1.3).cos() * 0.5)
+            };
+            if n <= 4096 {
+                let src: Vec<(f32, f32)> = (0..n)
+                    .map(|i| (input(i).0 as f32, input(i).1 as f32))
+                    .collect();
+                let (mut want, mut got) = (src.clone(), src);
+                sheetsage_reference_fft(&mut want);
+                FftPlan::<f32>::new(n).unwrap().forward_in_place(&mut got);
+                let bits = |v: &[(f32, f32)]| {
+                    v.iter()
+                        .flat_map(|&(r, i)| [r.to_bits(), i.to_bits()])
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&got), bits(&want), "f32 n={n}");
+            }
+            let src: Vec<(f64, f64)> = (0..n).map(input).collect();
+            let (mut want, mut got) = (src.clone(), src);
+            sheetsage_reference_fft(&mut want);
+            FftPlan::<f64>::new(n).unwrap().forward_in_place(&mut got);
+            let bits = |v: &[(f64, f64)]| {
+                v.iter()
+                    .flat_map(|&(r, i)| [r.to_bits(), i.to_bits()])
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&got), bits(&want), "f64 n={n}");
+            n <<= 1;
+        }
+    }
+
+    /// The direct DFT agrees with the radix-2 FFT where both apply, a zero-padded instance equals
+    /// the full transform of the explicitly padded frame, and `power_frames` frames like `stft`.
+    #[test]
+    fn direct_rdft_matches_the_fft_and_frames_like_stft() {
+        let n = 64;
+        let frame: Vec<f32> = (0..n).map(|i| ((i * 5 % 11) as f32 - 5.0) / 5.0).collect();
+        let dft = DirectRdft::new(n);
+        assert_eq!((dft.n_fft(), dft.n_bins()), (64, 33));
+        let mut power = vec![0f32; 33];
+        dft.power_into(&frame, &mut power);
+        let plan = FftPlan::new(n).unwrap();
+        let mut spec = Vec::new();
+        rfft_into(&plan, &frame, &mut spec);
+        for (k, (&p, &(r, i))) in power.iter().zip(&spec).enumerate() {
+            assert!((p - (r * r + i * i)).abs() < 1e-3, "bin {k}: {p}");
+        }
+
+        let short = &frame[..40];
+        let mut padded_power = vec![0f32; 33];
+        DirectRdft::zero_padded(n, 40).power_into(short, &mut padded_power);
+        let mut explicit = short.to_vec();
+        explicit.resize(n, 0.0);
+        let mut explicit_power = vec![0f32; 33];
+        dft.power_into(&explicit, &mut explicit_power);
+        for (a, b) in padded_power.iter().zip(&explicit_power) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+
+        let signal: Vec<f32> = (0..300).map(|i| (i as f32 * 0.1).sin()).collect();
+        let frames = dft.power_frames(&signal, 16, &hann_window_torch_f32(n));
+        assert_eq!(frames.len(), 1 + (300 - 64) / 16);
+        assert!(frames.iter().all(|row| row.len() == 33));
+        assert!(dft
+            .power_frames(&signal[..63], 16, &hann_window_torch_f32(n))
+            .is_empty());
+    }
+
+    /// sc-27268: `DirectRdft` is bit-identical to the table-driven DFT the Chatterbox front-ends
+    /// carried (f32 angle `−2π·k·t / n_fft`, row-wise re/im accumulation), for a full frame
+    /// (S3 tokenizer `n_fft = 400`) and a zero-padded one (CAM++ 400 → 512).
+    #[test]
+    fn direct_rdft_matches_the_private_copies_bit_for_bit() {
+        for (n_fft, frame_len) in [(400usize, 400usize), (512, 400)] {
+            let frame: Vec<f32> = (0..frame_len)
+                .map(|i| ((i as f32) * 0.173).sin() * 0.7 + ((i * 7 % 13) as f32 - 6.0) * 0.01)
+                .collect();
+            let n_bins = n_fft / 2 + 1;
+            let mut want = vec![0f32; n_bins];
+            for (k, slot) in want.iter_mut().enumerate() {
+                let (mut re, mut im) = (0f32, 0f32);
+                for (t, &x) in frame.iter().enumerate() {
+                    let ang = -2.0 * std::f32::consts::PI * k as f32 * t as f32 / n_fft as f32;
+                    re += x * ang.cos();
+                    im += x * ang.sin();
+                }
+                *slot = re * re + im * im;
+            }
+            let mut got = vec![0f32; n_bins];
+            DirectRdft::zero_padded(n_fft, frame_len).power_into(&frame, &mut got);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&got),
+                bits(&want),
+                "n_fft={n_fft} frame_len={frame_len}"
+            );
+        }
+    }
+
+    /// The Hann spellings agree to a few ULP but are not bit-identical — the reason they stay
+    /// separate (sc-27357) — and the shared padding/down-mix helpers keep their exact semantics.
+    #[test]
+    fn hann_spellings_reflect_pad_and_to_mono() {
+        let (a, b, c) = (
+            hann_window(400),
+            hann_window_torch_f32(400),
+            hann_window_torch_f64(400),
+        );
+        for ((x, y), z) in a.iter().zip(&b).zip(&c) {
+            assert!((x - y).abs() < 1e-6 && (x - z).abs() < 1e-6);
+        }
+        assert!(
+            a != b || b != c,
+            "the spellings differ in at least one ULP somewhere"
+        );
+        assert_eq!(b[0], 0.0);
+
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        assert_eq!(
+            reflect_pad(&x, 2),
+            vec![3.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 2.0],
+            "edge sample excluded on both ends"
+        );
+        assert!(reflect_pad(&[], 3).is_empty());
+
+        assert_eq!(to_mono(&[1.0, 3.0, 2.0, 4.0], 2), vec![2.0, 3.0]);
+        assert_eq!(to_mono(&[1.0, 2.0], 1), vec![1.0, 2.0]);
+        assert_eq!(to_mono(&[1.0, 2.0], 0), vec![1.0, 2.0]);
+
+        assert_eq!(
+            planar_to_interleaved(&[1.0, 2.0, 3.0, 10.0, 20.0, 30.0], 2),
+            vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0]
+        );
+        assert_eq!(planar_to_interleaved(&[1.0, 2.0], 1), vec![1.0, 2.0]);
     }
 
     #[test]

@@ -47,18 +47,17 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
     );
 };
 
-use std::path::PathBuf;
-
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device};
 use candle_audio_stable_audio_3::gen_core::WeightsSource;
 use candle_audio_stable_audio_3::pipeline::{
-    ComputeDTypes, StableAudio3Pipeline, SynthesisParameters,
+    ComputeDTypes, StableAudio3Pipeline, SynthesisHooks, SynthesisParameters, SynthesisRequest,
 };
 use candle_audio_stable_audio_3::sampler::SamplerKind;
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
@@ -156,11 +155,7 @@ const COMMITTED_F16_ENVELOPE: [Character; 2] = [
     },
 ];
 
-fn snapshot(env: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var(env).unwrap_or_else(|_| panic!("set {env} to the pinned immutable snapshot")),
-    )
-}
+use common::snapshot_dir as snapshot;
 
 fn device() -> Device {
     #[cfg(feature = "metal")]
@@ -268,12 +263,16 @@ fn render_all(variant: Variant, env: &str, device: &Device, root: DType) -> Vec<
         .map(|&seed| {
             pipeline
                 .synthesize(
-                    PROMPT,
-                    None,
-                    parameters(seed),
-                    &mut |_, _| {},
-                    &mut || {},
-                    &|| false,
+                    SynthesisRequest {
+                        prompt: PROMPT,
+                        negative_prompt: None,
+                        parameters: parameters(seed),
+                    },
+                    SynthesisHooks {
+                        on_progress: &mut |_, _| {},
+                        on_decoding: &mut || {},
+                        is_canceled: &|| false,
+                    },
                 )
                 .unwrap_or_else(|error| panic!("synthesize at root {root:?}: {error}"))
         })

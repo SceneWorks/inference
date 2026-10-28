@@ -71,6 +71,46 @@ pub enum Error {
 /// Crate result alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Bridge an engine error into the contract error, preserving the typed cancellation / capability /
+/// load variants (do not stringify those). The one bridge every Candle provider uses (sc-27300), so a
+/// capability refusal or a capacity bound surfaces as the same contract error from every provider.
+pub(crate) fn to_core(e: crate::Error) -> core_llm::Error {
+    match e {
+        crate::Error::Canceled => core_llm::Error::Canceled,
+        crate::Error::Unsupported(m) => core_llm::Error::Unsupported(m),
+        // The typed capability refusal (sc-24135) is the contract's `Unsupported`, verbatim.
+        crate::Error::Nvfp4Refused(r) => core_llm::Error::Unsupported(r.to_string()),
+        crate::Error::MissingTensor(m) => core_llm::Error::Load(format!("missing tensor: {m}")),
+        crate::Error::Config(m) => core_llm::Error::Load(m),
+        crate::Error::Io(e) => core_llm::Error::Io(e),
+        // A static KV cache's capacity bound is a request-level refusal, never an opaque backend
+        // failure. A request's decode maps it with the request's geometry
+        // (`LlamaProvider::request_error`: `RequestResourceExhausted`); without one it is still
+        // the request's fault.
+        e @ crate::Error::KvCapacityExceeded { .. } => {
+            core_llm::Error::InvalidRequest(e.to_string())
+        }
+        other => core_llm::Error::backend(other),
+    }
+}
+
+/// The shared tensor-free config parser's two refusals keep their typed variants (sc-27255).
+impl From<core_llm::model_config::ModelConfigError> for Error {
+    fn from(e: core_llm::model_config::ModelConfigError) -> Self {
+        match e {
+            core_llm::model_config::ModelConfigError::Config(m) => Error::Config(m),
+            core_llm::model_config::ModelConfigError::Unsupported(m) => Error::Unsupported(m),
+        }
+    }
+}
+
+/// A host image-preprocessing refusal (sc-27255) keeps its message.
+impl From<core_llm::vision_preprocess::PreprocessError> for Error {
+    fn from(e: core_llm::vision_preprocess::PreprocessError) -> Self {
+        Error::Msg(e.0)
+    }
+}
+
 impl From<String> for Error {
     fn from(s: String) -> Self {
         Error::Msg(s)
@@ -80,5 +120,33 @@ impl From<String> for Error {
 impl From<&str> for Error {
     fn from(s: &str) -> Self {
         Error::Msg(s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// sc-27300: every provider's errors cross into the contract through this one bridge, so a
+    /// capacity bound is a request refusal and a missing tensor names itself, whichever provider
+    /// (LLaVA, StarVector, the Llama provider) raised it.
+    #[test]
+    fn the_shared_bridge_keeps_typed_refusals() {
+        let capacity = to_core(Error::KvCapacityExceeded {
+            requested: 9,
+            capacity: 8,
+        });
+        assert!(
+            matches!(capacity, core_llm::Error::InvalidRequest(_)),
+            "{capacity:?}"
+        );
+        match to_core(Error::MissingTensor("lm_head.weight".into())) {
+            core_llm::Error::Load(message) => assert_eq!(message, "missing tensor: lm_head.weight"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            to_core(Error::Canceled),
+            core_llm::Error::Canceled
+        ));
     }
 }

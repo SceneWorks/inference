@@ -26,13 +26,13 @@ use candle_audio::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     Modality, ModelDescriptor, Progress, SpeechSegment, WeightsSource,
 };
-use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 use crate::backbone::Backbone;
 use crate::codec::XyTokenizerCodec;
 use crate::config::MossTtsdConfig;
 use crate::decode::{build_prompt_grid, DecodeResult, Decoder, DEFAULT_SYSTEM_PROMPT};
+use candle_audio::lock_recover;
 
 /// Registry id — the id the catalog would carry once the codec lands and the provider ships.
 pub const MODEL_ID: &str = "moss_ttsd_v05";
@@ -233,14 +233,15 @@ impl Loaded {
             )));
         }
         let device = candle_audio::default_device()?;
-        // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the shared idiom. The
-        // BF16 checkpoint is loaded as F32 (CPU-friendly; the reference runs the AR head in f32).
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights), DType::F32, &device)
-                .map_err(|e| {
-                    gen_core::Error::Msg(format!("{MODEL_ID}: mmap {}: {e}", weights.display()))
-                })?
-        };
+        // The BF16 checkpoint is loaded as F32 (CPU-friendly; the reference runs the AR head in f32).
+        let vb = candle_audio::weights::mmap_var_builder(
+            std::slice::from_ref(&weights),
+            DType::F32,
+            &device,
+        )
+        .map_err(|e| {
+            gen_core::Error::Msg(format!("{MODEL_ID}: mmap {}: {e}", weights.display()))
+        })?;
         let backbone = Backbone::new(&cfg, vb)
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: build backbone: {e}")))?;
         Ok(Self {
@@ -260,13 +261,6 @@ pub struct MossTtsdGenerator {
     codec_ckpt: PathBuf,
     loaded: Mutex<Option<Arc<Loaded>>>,
     codec: Mutex<Option<Arc<XyTokenizerCodec>>>,
-}
-
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
 }
 
 impl MossTtsdGenerator {

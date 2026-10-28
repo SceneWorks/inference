@@ -21,7 +21,7 @@ use tokenizers::Tokenizer;
 
 use crate::backbone::{Backbone, Frame};
 use crate::config::MossTtsdConfig;
-use crate::sampling::{sample, Rng, SamplingParams};
+use crate::sampling::{sample, Rng, DEFAULT_PARAMS};
 
 /// The default MOSS-TTSD dialogue system prompt (the tokenizer `chat_template` default).
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a speech synthesizer that generates natural, \
@@ -138,7 +138,7 @@ impl Decoder {
         let cfg = &self.cfg;
         let ch = cfg.channels;
         let strip = ch - 1;
-        let params = SamplingParams::default();
+        let params = DEFAULT_PARAMS;
         let mut rng = Rng::seed(seed);
 
         // Delay-shifted grid; strip the last `channels - 1` positions to get the prefill prompt.
