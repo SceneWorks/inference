@@ -17,10 +17,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class WorkspaceFormatScopeTests(unittest.TestCase):
     def test_format_job_checks_the_virtual_workspace_without_dependency_recursion(self):
-        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
         self.assertIn("workspace", manifest)
         self.assertNotIn("package", manifest)
-        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
         steps = workflow["jobs"]["format"]["steps"]
         self.assertEqual(
             [step["run"] for step in steps if step.get("name") == "Check whole-workspace formatting"],
@@ -37,7 +37,7 @@ class WorkspaceFormatScopeTests(unittest.TestCase):
             def write(relative, text):
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(text)
+                path.write_text(text, encoding="utf-8")
                 return path
 
             write("Cargo.toml", '[workspace]\nresolver="2"\nmembers=["first","second"]\n'
@@ -55,18 +55,18 @@ class WorkspaceFormatScopeTests(unittest.TestCase):
             write("vendor/src/lib.rs", "pub fn vendor( )->u8{1}\n")
             vendor_before = {p.relative_to(root): hashlib.sha256(p.read_bytes()).hexdigest()
                              for p in (root / "vendor").rglob("*") if p.is_file()}
-            toolchain = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+            toolchain = tomllib.loads((ROOT / "rust-toolchain.toml").read_text(encoding="utf-8"))["toolchain"]["channel"]
             env = dict(os.environ, CARGO_NET_OFFLINE="true", RUSTUP_AUTO_INSTALL="0",
                        RUSTUP_TOOLCHAIN=toolchain)
 
             def run(*arguments):
                 return subprocess.run([cargo, *arguments],
-                                      cwd=root, env=env, capture_output=True, text=True, timeout=30)
+                                      cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", timeout=30)
 
             red = run("fmt", "--check")
             self.assertNotEqual(red.returncode, 0)
             self.assertIn("second/src/nested.rs", (red.stdout + red.stderr).replace("\\", "/"))
-            nested.write_text("pub fn nested() -> u8 {\n    1\n}\n")
+            nested.write_text("pub fn nested() -> u8 {\n    1\n}\n", encoding="utf-8")
             green = run("fmt", "--check", "--verbose")
             self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
             metadata = run("metadata", "--offline", "--no-deps", "--format-version", "1")
