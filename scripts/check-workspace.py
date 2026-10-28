@@ -2440,6 +2440,59 @@ def check_test_temp_dir_guards(root: Path) -> None:
         )
 
 
+# sc-27279: raw `MmapedSafetensors::new/multi` / `VarBuilder::from_mmaped_safetensors` sites in
+# candle-gen production sources that bypass the audited seam in `candle-gen/src/loader.rs`
+# (`mmap_var_builder` / `mmap_safetensors` / `mmap_safetensors_multi`). A ratchet, not a ban: the
+# provider families migrate in follow-up PRs, so this baseline may only go DOWN. Lower it in the same
+# change that migrates sites; never raise it — route a new mmap through the loader helpers instead.
+CANDLE_GEN_RAW_MMAP_ROOT = Path("crates/media/candle-gen")
+CANDLE_GEN_RAW_MMAP_SEAM = Path("crates/media/candle-gen/candle-gen/src/loader.rs")
+CANDLE_GEN_RAW_MMAP_BASELINE = 24
+RAW_MMAP_SITE = re.compile(
+    r"\bMmapedSafetensors\s*::\s*(?:new|multi)\s*\(|\bfrom_mmaped_safetensors\s*\("
+)
+
+
+def candle_gen_raw_mmap_sites(root: Path) -> list[str]:
+    """Production (non-test) raw mmap call sites under candle-gen, outside the loader seam."""
+    base = root / CANDLE_GEN_RAW_MMAP_ROOT
+    if not base.is_dir():
+        return []
+    test_only = _test_only_files(base)
+    sites: list[str] = []
+    for path in sorted(base.rglob("*.rs")):
+        relative = path.relative_to(root)
+        parts = path.relative_to(base).parts
+        if (
+            relative == CANDLE_GEN_RAW_MMAP_SEAM
+            or path in test_only
+            or "src" not in parts
+            or not SOURCE_LINT_IGNORED_PARTS.isdisjoint(parts)
+            or not TEST_TARGET_DIRS.isdisjoint(parts)
+        ):
+            continue
+        raw = path.read_text(encoding="utf-8")
+        text = strip_rust_comments(_blank_spans(raw, _cfg_test_spans(raw)), strip_literals=True)
+        for match in RAW_MMAP_SITE.finditer(text):
+            sites.append(f"{relative}:{_line_of(text, match.start())}")
+    return sites
+
+
+def check_candle_gen_raw_mmap_ratchet(root: Path) -> None:
+    """Fail when candle-gen grows a raw mmap site outside the audited loader seam (sc-27279)."""
+    sites = candle_gen_raw_mmap_sites(root)
+    if len(sites) > CANDLE_GEN_RAW_MMAP_BASELINE:
+        joined = "\n  ".join(sites)
+        fail(
+            f"candle-gen has {len(sites)} raw `MmapedSafetensors::new/multi` / "
+            f"`from_mmaped_safetensors` production sites, above the ratchet baseline of "
+            f"{CANDLE_GEN_RAW_MMAP_BASELINE} (sc-27279). Map weights through "
+            "`candle_gen::loader::{mmap_var_builder, mmap_safetensors, mmap_safetensors_multi}` "
+            "(or read headers with `gen_core::safetensors_path_tensor_headers`) instead of a new "
+            "`unsafe` site. Current sites:\n  " + joined
+        )
+
+
 def _rust_const_declarations(source: str) -> dict[str, str]:
     """Map every visibility-carrying ``const`` in a Rust source to its value text.
 
@@ -3316,6 +3369,7 @@ def main() -> int:
         check_pid_decode_route_adoption(metadata, ROOT)
         check_snapshot_path_derivation(ROOT)
         check_test_temp_dir_guards(ROOT)
+        check_candle_gen_raw_mmap_ratchet(ROOT)
         check_cross_backend_geometry(metadata, ROOT)
     except (AssertionError, json.JSONDecodeError) as error:
         print(f"workspace gate: FAIL: {error}", file=sys.stderr)
@@ -3327,6 +3381,7 @@ def main() -> int:
         "intentional tokenizer split, no network clients, no trainers in the iOS graph, "
         "no HF-cache references, "
         "no $HOME-derived snapshot paths, no unguarded test temp roots, "
+        "no new raw candle-gen mmap sites, "
         "no cross-backend geometry drift)"
     )
     return 0

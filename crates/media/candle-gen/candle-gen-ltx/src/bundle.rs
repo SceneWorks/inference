@@ -17,13 +17,11 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::gen_core::ltx_checkpoint::{
     GemmaEncoderIdentity, GemmaVersionCheck, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
     LtxComponent,
 };
 use candle_gen::gen_core::{self, LoadSpec, WeightsSource};
-use safetensors::Dtype as SafetensorDtype;
 
 /// The `model_version` a checkpoint location declares — the `split_model.json` manifest of a packed
 /// MLX tier first, then any component file's `__metadata__`. `None` when nothing declares one.
@@ -187,14 +185,12 @@ pub fn assert_bf16_text_encoder(bundle: &LtxBundle) -> gen_core::Result<()> {
             path.display()
         )));
     }
-    // SAFETY: read-only safetensors header inspection; no tensor/device allocation occurs.
-    let safetensors = unsafe { MmapedSafetensors::new(path) }
-        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
-    let tensors = safetensors.tensors();
+    // Capped header-only read (no mmap); no tensor/device allocation occurs.
+    let tensors = gen_core::safetensors_path_tensor_headers(path)?;
     if tensors.is_empty()
         || tensors
             .iter()
-            .any(|(_, tensor)| tensor.dtype() != SafetensorDtype::BF16)
+            .any(|tensor| tensor.dtype != gen_core::weightsmeta::Dtype::BF16)
     {
         return Err(gen_core::Error::Unsupported(format!(
             "LTX-2.5 advanced text encoder {} is not an all-BF16 upstream Gemma source; Comfy/I8 or mixed sources are forbidden",

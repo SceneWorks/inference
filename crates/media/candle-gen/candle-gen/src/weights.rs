@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{safetensors as cst, DType, Tensor};
 
 use crate::candle_core::Device;
@@ -139,9 +138,7 @@ impl Weights {
         dtype: DType,
         prefixes: &[&str],
     ) -> Result<Self> {
-        // SAFETY: read-only, process-owned weight file, mapped only for this load and not mutated
-        // behind the mapping — the standard candle weight-loading invariant.
-        let st = unsafe { MmapedSafetensors::new(path)? };
+        let st = crate::loader::mmap_safetensors(path)?;
         let mut map = HashMap::new();
         for (k, _view) in st.tensors() {
             if !prefixes.iter().any(|p| k.starts_with(p)) {
@@ -182,9 +179,7 @@ impl Weights {
             let path = path.as_ref();
             #[cfg(feature = "model-inference-proof")]
             __input_paths.push(path);
-            // SAFETY: read-only, process-owned weight file, mapped only for this load and not mutated
-            // behind the mapping — the standard candle weight-loading invariant.
-            let st = unsafe { MmapedSafetensors::new(path)? };
+            let st = crate::loader::mmap_safetensors(path)?;
             for (k, _view) in st.tensors() {
                 if !prefixes.iter().any(|p| k.starts_with(p)) {
                     continue;
@@ -251,8 +246,7 @@ impl Weights {
         let mut stores = Vec::with_capacity(files.len());
         let mut headers = HashMap::new();
         for (index, path) in files.iter().enumerate() {
-            // SAFETY: caller-provisioned read-only checkpoint, identical to from_files_filtered.
-            let st = unsafe { MmapedSafetensors::new(path.as_ref())? };
+            let st = crate::loader::mmap_safetensors(path.as_ref())?;
             for (key, view) in st.tensors() {
                 if key.ends_with(".comfy_quant")
                     && (view.dtype() != safetensors::Dtype::U8

@@ -2,11 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
+use candle_gen::gen_core::snapshot_inventory::{
+    collect_regular_files, sha256_file, update_framed, InventoryPolicy,
+};
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
@@ -425,11 +427,6 @@ fn digest_identity(prefix: &str, write_parts: impl FnOnce(&mut Sha256)) -> Strin
     encoded
 }
 
-fn update_framed(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update((bytes.len() as u64).to_le_bytes());
-    digest.update(bytes);
-}
-
 fn prepared_or_current_pin(
     spec: &LoadSpec,
     path: &Path,
@@ -450,92 +447,36 @@ fn prepared_or_current_pin(
     }
 }
 
-fn sha256_file(path: &Path) -> gen_core::Result<[u8; 32]> {
-    let mut file = std::fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(digest.finalize().into())
-}
-
 fn recursive_loader_inventory(root: &Path, turbo: bool) -> gen_core::Result<Vec<PathBuf>> {
-    fn visit(
-        root: &Path,
-        tier_root: &Path,
-        turbo: bool,
-        files: &mut Vec<PathBuf>,
-    ) -> gen_core::Result<()> {
-        for entry in std::fs::read_dir(root)? {
-            let path = entry?.path();
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() {
-                let target = std::fs::metadata(&path)?;
-                if !target.is_file() {
-                    return Err(gen_core::Error::Unsupported(format!(
-                        "ideogram: symlink must resolve directly to a file: {}",
-                        path.display()
-                    )));
-                }
-            } else if metadata.is_dir() {
-                visit(&path, tier_root, turbo, files)?;
-                continue;
-            } else if !metadata.is_file() {
-                continue;
-            }
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            if name.starts_with('.')
-                || [".part", ".tmp", ".lock", ".incomplete"]
-                    .iter()
-                    .any(|suffix| name.ends_with(suffix))
-            {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "ideogram: incomplete/hidden artifact marker is forbidden: {}",
-                    path.display()
-                )));
-            }
-            let relative = path.strip_prefix(tier_root).unwrap_or(&path);
-            // The turbo loader (`pipeline::load_components_turbo`) never opens the co-located
-            // `unconditional_transformer/`; only the quality route reads it.
-            let uncond = relative.starts_with("unconditional_transformer");
-            if turbo && uncond {
-                continue;
-            }
-            let direct_component = relative.components().count() == 2
-                && matches!(
-                    relative
-                        .components()
-                        .next()
-                        .and_then(|part| part.as_os_str().to_str()),
-                    Some("transformer" | "unconditional_transformer" | "text_encoder" | "vae")
-                );
-            let exact_root = turbo && relative == Path::new(TURBO_LORA_FILE);
-            let exact_tokenizer = relative == Path::new("tokenizer/tokenizer.json");
-            let exact_config = relative == Path::new("transformer/config.json")
-                || relative == Path::new("unconditional_transformer/config.json");
-            if (direct_component
-                && path.extension().and_then(|ext| ext.to_str()) == Some("safetensors"))
-                || exact_root
-                || exact_tokenizer
-                || exact_config
-            {
-                files.push(std::path::absolute(path)?);
-            }
-        }
-        Ok(())
-    }
+    // The whole tree is walked under the shared policy (sc-27253) — markers anywhere are refused,
+    // including inside the turbo-unused `unconditional_transformer/` — then narrowed to the files
+    // the selected loader actually opens.
     let root = std::path::absolute(root)?;
-    let mut files = Vec::new();
-    visit(&root, &root, turbo, &mut files)?;
-    files.sort();
+    let mut files = collect_regular_files("ideogram", &root, InventoryPolicy::REJECT_MARKERS)?;
+    files.retain(|path| {
+        let relative = path.strip_prefix(&root).unwrap_or(path);
+        // The turbo loader (`pipeline::load_components_turbo`) never opens the co-located
+        // `unconditional_transformer/`; only the quality route reads it.
+        if turbo && relative.starts_with("unconditional_transformer") {
+            return false;
+        }
+        let direct_component = relative.components().count() == 2
+            && matches!(
+                relative
+                    .components()
+                    .next()
+                    .and_then(|part| part.as_os_str().to_str()),
+                Some("transformer" | "unconditional_transformer" | "text_encoder" | "vae")
+            );
+        let exact_root = turbo && relative == Path::new(TURBO_LORA_FILE);
+        let exact_tokenizer = relative == Path::new("tokenizer/tokenizer.json");
+        let exact_config = relative == Path::new("transformer/config.json")
+            || relative == Path::new("unconditional_transformer/config.json");
+        (direct_component && path.extension().and_then(|ext| ext.to_str()) == Some("safetensors"))
+            || exact_root
+            || exact_tokenizer
+            || exact_config
+    });
     if files.is_empty() {
         return Err(gen_core::Error::Unsupported(
             "ideogram: empty loader inventory".into(),

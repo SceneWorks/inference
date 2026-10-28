@@ -585,38 +585,13 @@ fn projected_component(
 }
 
 fn recursive_files(root: &Path) -> gen_core::Result<Vec<PathBuf>> {
-    fn visit(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-        let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let path = entry.path();
-            let ty = entry.file_type()?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.')
-                || name.ends_with(".part")
-                || name.ends_with(".partial")
-                || name.ends_with(".incomplete")
-                || name.ends_with(".tmp")
-                || name.ends_with(".lock")
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("partial-download marker {}", path.display()),
-                ));
-            }
-            if ty.is_dir() {
-                visit(&path, out)?;
-            } else if ty.is_file() || ty.is_symlink() {
-                out.push(std::path::absolute(path)?);
-            }
-        }
-        Ok(())
-    }
-    let mut files = Vec::new();
-    visit(root, &mut files)?;
-    files.sort();
-    files.dedup();
+    // Shared policy (sc-27253): sorted, de-duplicated absolute paths; symlinks must resolve to
+    // regular files and special files are refused.
+    let files = gen_core::snapshot_inventory::collect_regular_files(
+        "boogu",
+        root,
+        gen_core::snapshot_inventory::InventoryPolicy::REJECT_MARKERS,
+    )?;
     if files.is_empty() {
         return Err(gen_core::Error::Unsupported("boogu: empty artifact".into()));
     }

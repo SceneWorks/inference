@@ -1,11 +1,11 @@
 //! Exact request-scoped Candle/CUDA memory contract for the three shipped SD3.5 routes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
+use candle_gen::gen_core::snapshot_inventory::{hex_lower, update_framed};
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
@@ -349,7 +349,10 @@ impl Sd35LoadReceipt {
             );
             update_framed(&mut digest, adapter.file.pin.content_sha256());
         }
-        Some(format_digest(ADAPTER_RECEIPT_PREFIX, digest.finalize()))
+        Some(format!(
+            "{ADAPTER_RECEIPT_PREFIX}{}",
+            hex_lower(&digest.finalize())
+        ))
     }
 }
 
@@ -471,25 +474,14 @@ fn expected_inventory(route: Sd35Route, tier: &str) -> Vec<String> {
     files
 }
 
+/// The shared snapshot-inventory policy (sc-27253). No marker refusal: the exact-inventory set
+/// comparison already fails a stray partial-download file as an extra entry.
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>) -> gen_core::Result<()> {
-    for entry in std::fs::read_dir(root)? {
-        let path = entry?.path();
-        let metadata = std::fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            if std::fs::metadata(&path)?.is_file() {
-                out.push(std::path::absolute(path)?);
-            } else {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "SD3.5 non-file symlink in snapshot: {}",
-                    path.display()
-                )));
-            }
-        } else if metadata.is_dir() {
-            collect_files(&path, out)?;
-        } else if metadata.is_file() {
-            out.push(std::path::absolute(path)?);
-        }
-    }
+    out.extend(gen_core::snapshot_inventory::collect_regular_files(
+        "SD3.5",
+        root,
+        gen_core::snapshot_inventory::InventoryPolicy::STRUCTURAL,
+    )?);
     Ok(())
 }
 
@@ -811,19 +803,6 @@ fn capture_adapters(spec: &LoadSpec) -> gen_core::Result<Vec<AdapterReceipt>> {
         .collect()
 }
 
-fn update_framed(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update((bytes.len() as u64).to_le_bytes());
-    digest.update(bytes);
-}
-
-fn format_digest(prefix: &str, bytes: impl IntoIterator<Item = u8>) -> String {
-    let mut output = prefix.to_owned();
-    for byte in bytes {
-        write!(&mut output, "{byte:02x}").expect("hex formatting into String cannot fail");
-    }
-    output
-}
-
 fn physical_identity(
     route: Sd35Route,
     tier: Option<Quant>,
@@ -848,7 +827,7 @@ fn physical_identity(
         update_framed(&mut digest, &adapter.scale_bits.to_le_bytes());
         update_framed(&mut digest, &adapter.realized_bytes.to_le_bytes());
     }
-    format_digest(PHYSICAL_RECEIPT_PREFIX, digest.finalize())
+    format!("{PHYSICAL_RECEIPT_PREFIX}{}", hex_lower(&digest.finalize()))
 }
 
 pub fn provider_contract(

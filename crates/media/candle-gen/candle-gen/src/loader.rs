@@ -5,9 +5,11 @@
 //! message if none are found, then `unsafe { VarBuilder::from_mmaped_safetensors(..) }` them into a
 //! [`VarBuilder`]. It was duplicated ~34 times, with error-string drift and one behavioral drift
 //! (flux2's single-file control checkpoint skipped the "no .safetensors" check — a missing file
-//! surfaced as a raw mmap error instead of the crafted message). Consolidating gives the workspace a
-//! *single* audited `unsafe` mmap surface (also aids F-062): shard handling, error text, and the
-//! SAFETY invariant now live in one place.
+//! surfaced as a raw mmap error instead of the crafted message). Consolidating gives the workspace one
+//! audited `unsafe` mmap seam (also aids F-062): shard handling, error text, and the SAFETY invariant
+//! live here ([`mmap_var_builder`], [`mmap_safetensors`], [`mmap_safetensors_multi`]). It is not yet
+//! the *only* surface: provider crates keep direct `MmapedSafetensors` sites that are migrated family
+//! by family under a `scripts/check-workspace.py` ratchet (sc-27279).
 //!
 //! Two entry shapes cover every call site:
 //! - Directory of shards ([`sorted_safetensors`] / [`load_sorted_mmap`] / [`component_vb`]) — a
@@ -26,6 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
+use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 
@@ -148,9 +151,20 @@ pub fn load_one_tensor(
     device: &Device,
     label: &str,
 ) -> Result<candle_core::Tensor> {
-    // SAFETY: same invariant as `mmap_var_builder` — a read-only, process-owned weight file, mapped
-    // only for the duration of this call and not mutated behind the mapping.
-    let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(file)? };
+    let st = mmap_safetensors(file)?;
+    load_from(&st, file, name, dtype, device, label)
+}
+
+/// Shared body of [`load_one_tensor`] / [`load_one_tensor_sharded`]: materialize `name` from the
+/// already-mapped `st` (backed by `file`, used only for the error text), cast to `dtype`.
+fn load_from(
+    st: &MmapedSafetensors,
+    file: &Path,
+    name: &str,
+    dtype: DType,
+    device: &Device,
+    label: &str,
+) -> Result<candle_core::Tensor> {
     // Craft the label-prefixed missing-key message rather than surfacing candle's raw error, matching
     // the F-019 loader style and the messages the pre-consolidation call sites produced.
     if st.get(name).is_err() {
@@ -173,7 +187,8 @@ pub fn load_one_tensor(
 /// The single-file [`load_one_tensor`] is the F-010 fast path for the common snapshot that ships the
 /// whole checkpoint in one file. When a snapshot is resharded across several `*.safetensors` (the
 /// F-037 / sc-9021 fallback), the head tensor lives in exactly one of them; this scans the shard list
-/// in order and reads it from the first shard that has it, preserving the header-only footprint.
+/// in order and reads it from the first shard that has it, preserving the header-only footprint. The
+/// probing mapping is reused for the load (sc-27375), so each shard is mapped at most once.
 pub fn load_one_tensor_sharded(
     files: &[PathBuf],
     name: &str,
@@ -182,11 +197,9 @@ pub fn load_one_tensor_sharded(
     label: &str,
 ) -> Result<candle_core::Tensor> {
     for file in files {
-        // SAFETY: same invariant as `load_one_tensor` — read-only, process-owned weight file mapped
-        // only to probe the header, not mutated behind the mapping.
-        let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(file)? };
+        let st = mmap_safetensors(file)?;
         if st.get(name).is_ok() {
-            return load_one_tensor(file, name, dtype, device, label);
+            return load_from(&st, file, name, dtype, device, label);
         }
     }
     Err(CandleError::Msg(format!(
@@ -195,22 +208,52 @@ pub fn load_one_tensor_sharded(
     )))
 }
 
-/// The one audited `unsafe` mmap surface: build a `'static` [`VarBuilder`] over the already-resolved
-/// shard `files` at `dtype`/`device`.
+/// Memory-map one `.safetensors` `file` as a raw [`MmapedSafetensors`] (header parsed, no tensor
+/// bytes read) for callers that need per-tensor access rather than a [`VarBuilder`]. Returns candle's
+/// own `Result` so both candle-`Result` and [`CandleError`] callers can `?` it.
+///
+/// This and [`mmap_safetensors_multi`] are the raw-mapping halves of the audited mmap surface; see
+/// [`mmap_var_builder`] for the safety invariant they share.
+pub fn mmap_safetensors(file: &Path) -> candle_core::Result<MmapedSafetensors> {
+    // SAFETY: see `mmap_var_builder` — the mapped weight file must not be truncated or modified by
+    // any process while the mapping is live; that residual risk is accepted, not prevented.
+    unsafe { MmapedSafetensors::new(file) }
+}
+
+/// Memory-map a set of `.safetensors` shards as one [`MmapedSafetensors`] (later shards win on a
+/// duplicated key, as in [`mmap_var_builder`]). Same safety invariant as [`mmap_safetensors`].
+pub fn mmap_safetensors_multi<P: AsRef<Path>>(
+    files: &[P],
+) -> candle_core::Result<MmapedSafetensors> {
+    // SAFETY: see `mmap_var_builder` — the mapped weight files must not be truncated or modified by
+    // any process while the mapping is live; that residual risk is accepted, not prevented.
+    unsafe { MmapedSafetensors::multi(files) }
+}
+
+/// The audited `unsafe` mmap seam for [`VarBuilder`]s: build a `'static` [`VarBuilder`] over the
+/// already-resolved shard `files` at `dtype`/`device`.
 ///
 /// # SAFETY
 /// `VarBuilder::from_mmaped_safetensors` memory-maps each file and hands out tensors that borrow the
-/// mapping for the process lifetime. This is sound because these are the model's own weight files:
-/// read-only, owned by (and trusted for) this process, and not mutated or truncated by us while the
-/// mapping is live. This is the standard candle weight-loading path; concentrating it here means the
-/// invariant is documented and audited once instead of at ~34 scattered call sites (F-019 / F-062).
+/// mapping for the process lifetime. The invariant this relies on is that **no process truncates or
+/// modifies a mapped file while the mapping is live**. Weight files are caller-provisioned (models at
+/// arbitrary user paths must load), so this process neither owns nor can enforce that: an external
+/// writer that truncates a mapped file makes the next page fault raise `SIGBUS`. That residual risk
+/// is accepted, exactly as candle and `safetensors` accept it on every mmap load; integrity checks
+/// such as `gen_core`'s `ArtifactSeal::ensure_unchanged` narrow the window but cannot close it. We
+/// never write to or truncate a file we have mapped.
+///
+/// Together with [`mmap_safetensors`] / [`mmap_safetensors_multi`] this is where the invariant is
+/// documented. Provider crates still hold ~100 direct `MmapedSafetensors` / `from_mmaped_safetensors`
+/// sites that predate these helpers; `scripts/check-workspace.py` ratchets that count so it can only
+/// go down as families migrate (sc-27279).
 pub fn mmap_var_builder(
     files: &[PathBuf],
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
-    // SAFETY: see the function-level doc — mmap of read-only, process-owned weight files, live for
-    // the process lifetime and not mutated behind the mapping. Standard candle loading path.
+    // SAFETY: see the function-level doc — no process may truncate or modify the mapped files while
+    // the mapping is live (accepted residual risk). Standard candle loading path.
     __model_proof_inspect!(
         Ok(unsafe { VarBuilder::from_mmaped_safetensors(files, dtype, device)? }),
         |_| {

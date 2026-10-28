@@ -72,12 +72,14 @@ pub fn round_rgb8(scaled: &candle_core::Tensor) -> candle_core::Result<candle_co
 
 // Shared sorted-`.safetensors` → unsafe-mmap loader (sc-8999 / F-019): the single audited home for
 // the `list a snapshot component dir, sort deterministically, error-if-empty, unsafe-mmap into a
-// VarBuilder` idiom that was hand-copied ~34 times across the provider crates. Concentrates the
-// `unsafe` mmap surface (also aids F-062) and the SAFETY invariant in one place.
+// VarBuilder` idiom that was hand-copied ~34 times across the provider crates. Holds the audited
+// `unsafe` mmap seam (also aids F-062) and its SAFETY invariant; the provider sites that still map
+// directly are ratcheted down by `scripts/check-workspace.py` (sc-27279).
 pub mod loader;
 pub use loader::{
     component_vb, load_one_tensor, load_one_tensor_sharded, load_path_mmap, load_sorted_mmap,
-    mmap_var_builder, resolve_weight_files, sorted_safetensors,
+    mmap_safetensors, mmap_safetensors_multi, mmap_var_builder, resolve_weight_files,
+    sorted_safetensors,
 };
 
 // Shared i32-overflow-safe scaled-dot-product attention (sc-9116 / epic 8979): the F-003 query-row

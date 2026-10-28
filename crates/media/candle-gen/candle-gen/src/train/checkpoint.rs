@@ -123,11 +123,12 @@ pub fn load_resume(
     cfg: &TrainingConfig,
     request_fingerprint: &str,
 ) -> Result<ResumeMeta> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| CandleError::Msg(format!("resume: read {}: {e}", path.display())))?;
-    let (_, header) = safetensors::SafeTensors::read_metadata(&bytes)
-        .map_err(|e| CandleError::Msg(format!("resume: parse {}: {e}", path.display())))?;
-    let meta = header.metadata().clone().unwrap_or_default();
+    // Header-only (capped) metadata read, so the full file is read exactly once — by the tensor load
+    // below — instead of once into a transient buffer and again by `load` (sc-27376).
+    let meta: HashMap<String, String> = crate::gen_core::safetensors_file_metadata(path)
+        .map_err(|e| CandleError::Msg(format!("resume: read header {}: {e}", path.display())))?
+        .into_iter()
+        .collect();
     let parse = |key: &str| -> Result<u32> {
         meta.get(key)
             .ok_or_else(|| CandleError::Msg(format!("resume: missing metadata {key:?}")))?

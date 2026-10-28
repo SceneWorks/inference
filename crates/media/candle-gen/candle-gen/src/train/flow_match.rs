@@ -381,8 +381,8 @@ pub fn component_files(root: &Path, sub: &str, label: &str) -> Result<Vec<PathBu
 }
 
 /// Build a [`VarBuilder`] over the snapshot component subdir `sub` at `dtype`. `label` prefixes the
-/// error text. Delegates to the shared [`crate::loader::component_vb`] (the single audited unsafe-mmap
-/// surface, sc-8999 / F-019); the `(device, dtype)` arg order is kept for this trainer's existing
+/// error text. Delegates to the shared [`crate::loader::component_vb`] (the audited unsafe-mmap
+/// seam, sc-8999 / F-019); the `(device, dtype)` arg order is kept for this trainer's existing
 /// callers.
 pub fn component_vb(
     root: &Path,

@@ -458,7 +458,9 @@ impl CappedPool {
     /// installed is `candle_gen::cuda_mempool`'s trap 1: it reports ~0 while every allocation lands
     /// here, which makes "the peak stayed within budget" trivially true.
     pub fn counters(&self) -> Pool {
-        Pool::wrap(candle_gen::cuda_mempool::MemPool::from_raw(self.pool))
+        // SAFETY: `self.pool` is the live capped pool this guard created; it is destroyed only in
+        // `Drop`, and the counters are read while the guard (and so the pool) is alive.
+        Pool::wrap(unsafe { candle_gen::cuda_mempool::MemPool::from_raw(self.pool) })
     }
 }
 
