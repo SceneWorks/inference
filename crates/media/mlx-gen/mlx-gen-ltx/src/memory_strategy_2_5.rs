@@ -840,7 +840,7 @@ fn begin_with_cleanup(
     mlx_gen::request_scope::begin_scope(
         safety_check(contract, loaded_tier, context),
         cleanup,
-        || {
+        move || {
             let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
                 LTX_2_5_MODEL_ID,
                 context.geometry,

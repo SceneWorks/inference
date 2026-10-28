@@ -2050,7 +2050,7 @@ pub(crate) fn begin_request_for(
     mlx_gen::request_scope::begin_scope(
         safety_check(spec, contract, context),
         mlx_gen::request_scope::MlxScopeCleanup::Device,
-        || {
+        move || {
             mlx_gen::request_scope::MlxRequestScopeConfig::new(
                 provider_id,
                 context.geometry,

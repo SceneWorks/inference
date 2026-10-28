@@ -503,7 +503,7 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, || {
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
         let provider = provider_static(&contract.provider_id)?;
         let blocks = match variant_for(provider)? {
             Sd3Variant::Large | Sd3Variant::LargeTurbo => LARGE_NUM_LAYERS,

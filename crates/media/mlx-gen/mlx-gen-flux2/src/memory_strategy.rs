@@ -1421,7 +1421,7 @@ fn begin_klein_request_with_cleanup(
     mlx_gen::request_scope::begin_scope(
         klein_safety_check(spec, contract, context, expected_tier),
         cleanup,
-        || {
+        move || {
             let routes = klein_decode_routes(&contract.provider_id)?;
             let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
                 klein_provider_static(&contract.provider_id)?,

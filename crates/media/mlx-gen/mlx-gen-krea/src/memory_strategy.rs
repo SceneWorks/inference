@@ -806,7 +806,7 @@ fn begin_request_with_cleanup(
     mlx_gen::request_scope::begin_scope(
         safety_check(contract, precision, quant, context),
         cleanup,
-        || {
+        move || {
             let routes = decode_routes(provider_id)?;
             let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
                 provider_id,

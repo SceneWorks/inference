@@ -1536,24 +1536,28 @@ pub(crate) fn begin_request(
     // The one place a refused route becomes a TYPED error. `MemorySafetyDecision::Reject` carries an
     // already-rendered string, so the route gate deliberately hands back plain reasons (see
     // `safety_check`) and the `unsupported: ` prefix is applied exactly once, here.
-    mlx_gen::request_scope::begin_scope(safety_check(contract, quant, context), cleanup, || {
-        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-            provider_id,
-            context.geometry,
-            contract.generation_memory(&context.selection),
-            context.use_pid,
-            42,
-            move |_use_pid, _edge, _overlap| {
-                Err(CoreError::Unsupported(format!(
-                    "{provider_id}: bounded decode is structurally not applicable"
-                )))
-            },
-        )?;
-        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-        config.transformer_window =
-            mlx_gen::request_scope::selected_transformer_window(contract, context);
-        Ok(config)
-    })
+    mlx_gen::request_scope::begin_scope(
+        safety_check(contract, quant, context),
+        cleanup,
+        move || {
+            let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                provider_id,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                42,
+                move |_use_pid, _edge, _overlap| {
+                    Err(CoreError::Unsupported(format!(
+                        "{provider_id}: bounded decode is structurally not applicable"
+                    )))
+                },
+            )?;
+            config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+            config.transformer_window =
+                mlx_gen::request_scope::selected_transformer_window(contract, context);
+            Ok(config)
+        },
+    )
 }
 
 pub(crate) fn registered_valid_fixture(

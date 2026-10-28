@@ -718,7 +718,7 @@ fn begin_request_with_cleanup(
     mlx_gen::request_scope::begin_scope(
         safety_check(contract, precision, quant, context),
         cleanup,
-        || {
+        move || {
             let component = context.selection.parameters.window_component();
             let routes = decode_routes(provider_id)?;
             let transformer_blocks = match component {

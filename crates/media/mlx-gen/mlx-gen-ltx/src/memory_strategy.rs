@@ -1386,7 +1386,7 @@ fn begin_with_cleanup(
     let inner = mlx_gen::request_scope::MlxRequestScopeCore::begin(
         safety_check(contract, loaded_tier, expected_overlay, context),
         cleanup,
-        || {
+        move || {
             mlx_gen::request_scope::MlxRequestScopeConfig::new(
                 crate::MODEL_ID,
                 context.geometry,

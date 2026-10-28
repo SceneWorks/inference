@@ -463,7 +463,7 @@ fn begin_with(
     // The one place a refused route becomes a TYPED error. `MemorySafetyDecision::Reject` carries an
     // already-rendered string, so the route gate deliberately hands back plain reasons (see
     // `safety_check`) and the `unsupported: ` prefix is applied exactly once, here.
-    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, || {
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
         let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
             crate::pulid_flux::MODEL_ID,
             context.geometry,

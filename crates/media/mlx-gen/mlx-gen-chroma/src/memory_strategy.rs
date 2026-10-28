@@ -983,7 +983,7 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, || {
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
         let provider = provider_static(&contract.provider_id)?;
         let routes = decode_routes(provider)?;
         let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
