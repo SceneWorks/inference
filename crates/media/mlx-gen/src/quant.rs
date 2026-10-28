@@ -573,12 +573,12 @@ ArtifactInput,
 
 /// Recursively copy a directory's files, resolving symlinks (HF snapshots symlink into
 /// `../../blobs/…`) to real bytes so the assembled tier is self-contained and HF-uploadable. This is
-/// the symlink-resolving copy the sibling converters share (the F-045 unification point where
+/// the symlink-resolving copy the sibling converters share (the sc-9108 unification point where
 /// krea's non-deref'ing copy is brought into line).
 ///
 /// A symlinked subdirectory is followed, but a directory symlink that leads back to one of the
 /// directories being copied (a cycle) is a typed error rather than unbounded recursion → stack
-/// overflow (F-080, the hardening bernini's private copy carried).
+/// overflow (sc-5330, the hardening bernini's private copy carried).
 pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     copy_dir_guarded(src, dst, &mut Vec::new())
 }
@@ -657,7 +657,7 @@ pub fn copy_turnkey_assets(src_root: &Path, dst_root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// F-080: a directory symlink back to an ancestor is refused instead of recursing forever,
+    /// sc-5330: a directory symlink back to an ancestor is refused instead of recursing forever,
     /// while a file symlink is still copied as its target's bytes and a non-cyclic directory
     /// symlink is still followed.
     #[cfg(unix)]

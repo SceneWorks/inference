@@ -42,7 +42,7 @@ pub fn validate_lokr_metadata_scale(alpha: f32, rank: f32) -> Result<()> {
 }
 
 /// Read a LoRA `.alpha` scalar tensor. Adapter files are external input, so this never panics: an
-/// unreadable or empty tensor (a truncated file, F-059) and a NaN/inf value (which would turn the
+/// unreadable or empty tensor (a truncated file, sc-11129) and a NaN/inf value (which would turn the
 /// `alpha / rank · scale` fold into a NaN residual) are typed errors naming `label` (the tensor key
 /// or adapter path). The one shared reader for every provider's LoRA installer.
 pub fn read_scalar_alpha(a: &Array, label: &str) -> Result<f32> {
@@ -1412,7 +1412,7 @@ mod tests {
 
     #[test]
     fn read_scalar_alpha_errors_on_empty_or_non_finite_and_reads_bf16() {
-        // F-059 (sc-11129): a size-0 `.alpha` from a malformed/truncated adapter file must produce
+        // sc-11129: a size-0 `.alpha` from a malformed/truncated adapter file must produce
         // a TYPED error, not the `as_slice()[0]` panic that would abort the worker. (safetensors
         // cannot serialize an empty array, so exercise the reader on the in-memory empty tensor —
         // the exact value a truncated file would deserialize to.)
