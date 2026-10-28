@@ -758,6 +758,10 @@ mod tests {
 
     use super::*;
 
+    /// MiniMax-H3's output clock (`modular_pipeline.py:31`). Each engine declares it as
+    /// `denoise::MINIMAX_H3_FPS`, which `check-workspace.py` pins against the released reference.
+    const MINIMAX_H3_FPS: f64 = 24.0;
+
     fn image(w: u32, h: u32) -> Image {
         Image {
             width: w,
@@ -802,7 +806,7 @@ mod tests {
             crate::h3_memory::SPATIAL_STRIDE as i32,
             crate::h3_memory::CANVAS_SHORT_EDGE as i32,
             i64::from(crate::h3_memory::CANVAS_MAX_PIXELS),
-            crate::h3_memory::MINIMAX_H3_FPS,
+            MINIMAX_H3_FPS,
         )
         .expect("a well-formed clip normalizes")
     }
@@ -871,12 +875,12 @@ mod tests {
             let frames: Vec<Image> = (0..short as u8).map(tagged).collect();
             let e = normalize_reference_clip(
                 &frames,
-                crate::h3_memory::MINIMAX_H3_FPS,
+                MINIMAX_H3_FPS,
                 64,
                 crate::h3_memory::SPATIAL_STRIDE as i32,
                 crate::h3_memory::CANVAS_SHORT_EDGE as i32,
                 i64::from(crate::h3_memory::CANVAS_MAX_PIXELS),
-                crate::h3_memory::MINIMAX_H3_FPS,
+                MINIMAX_H3_FPS,
             )
             .unwrap_err()
             .to_string();

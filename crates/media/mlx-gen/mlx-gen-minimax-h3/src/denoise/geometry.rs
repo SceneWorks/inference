@@ -74,7 +74,7 @@ use crate::audio_config::{AUDIO_SAMPLE_RATE, AUDIO_TOKEN_RATE_HZ};
 use crate::dit::positions::{ROPE_FRAMES_PER_LATENT, ROPE_FRAME_RESCALE};
 
 /// Frame rate every MiniMax-H3 duration is expressed at. `MINIMAX_H3_FPS`.
-pub const MINIMAX_H3_FPS: f64 = mlx_gen::gen_core::h3_memory::MINIMAX_H3_FPS;
+pub const MINIMAX_H3_FPS: f64 = 24.0;
 
 /// Audio latent tokens per second. `MINIMAX_H3_AUDIO_LATENTS_PER_SECOND`, and the same 40 Hz
 /// [`AUDIO_TOKEN_RATE_HZ`] the audio VAE's 800-sample hop at 32 kHz implies.
