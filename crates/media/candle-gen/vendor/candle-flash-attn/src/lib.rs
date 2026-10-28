@@ -17,6 +17,20 @@ fn round_multiple(x: usize, m: usize) -> usize {
     (x + m - 1) / m * m
 }
 
+// sc-26691 (vendored delta 3): the kernel's parameter ABI carries every stride and extent as a
+// `u32`; upstream casts with `as`, which silently truncates a >= 2^32 stride into an out-of-bounds
+// read. The dense `FlashAttn` path converts checked instead, so an oversized call fails loudly
+// rather than corrupting memory. (candle-gen's `fused_attention::flash_eligibility` refuses such
+// calls before they reach this crate; this is the backstop for any other caller.)
+fn checked_u32(what: &str, value: usize) -> Result<u32> {
+    match u32::try_from(value) {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            candle::bail!("flash-attn: {what} = {value} exceeds the kernel's u32 parameter range")
+        }
+    }
+}
+
 impl FlashAttn {
     fn cuda_fwd_t<
         T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
@@ -160,6 +174,28 @@ impl FlashAttn {
             window_size_right = seqlen_k as i32;
         }
 
+        let u_q_batch_stride = checked_u32("q_batch_stride", q_stride[0])?;
+        let u_k_batch_stride = checked_u32("k_batch_stride", k_stride[0])?;
+        let u_v_batch_stride = checked_u32("v_batch_stride", v_stride[0])?;
+        let u_o_batch_stride = checked_u32("o_batch_stride", o_stride[0])?;
+        let u_q_row_stride = checked_u32("q_row_stride", q_stride[q_rank - 3])?;
+        let u_k_row_stride = checked_u32("k_row_stride", k_stride[k_rank - 3])?;
+        let u_v_row_stride = checked_u32("v_row_stride", v_stride[v_rank - 3])?;
+        let u_o_row_stride = checked_u32("o_row_stride", o_stride[o_rank - 3])?;
+        let u_q_head_stride = checked_u32("q_head_stride", q_stride[q_rank - 2])?;
+        let u_k_head_stride = checked_u32("k_head_stride", k_stride[k_rank - 2])?;
+        let u_v_head_stride = checked_u32("v_head_stride", v_stride[v_rank - 2])?;
+        let u_o_head_stride = checked_u32("o_head_stride", o_stride[o_rank - 2])?;
+        let u_b = checked_u32("b", b_sz)?;
+        let u_h = checked_u32("h", num_heads)?;
+        let u_h_k = checked_u32("h_k", num_heads_k)?;
+        let u_d = checked_u32("d", head_size)?;
+        let u_d_rounded = checked_u32("d_rounded", head_size_rounded)?;
+        let u_seqlen_q = checked_u32("seqlen_q", seqlen_q)?;
+        let u_seqlen_k = checked_u32("seqlen_k", seqlen_k)?;
+        let u_seqlen_q_rounded = checked_u32("seqlen_q_rounded", seqlen_q_rounded)?;
+        let u_seqlen_k_rounded = checked_u32("seqlen_k_rounded", seqlen_k_rounded)?;
+
         unsafe {
             let (q_ptr, _guard) = q.device_ptr(&stream);
             let (k_ptr, _guard) = k.device_ptr(&stream);
@@ -175,29 +211,29 @@ impl FlashAttn {
                 /* alibi_slopes_ptr */ alibi_slopes_ptr,
                 /* cu_seqlens_q_ptr */ std::ptr::null(),
                 /* cu_seqlens_k_ptr */ std::ptr::null(),
-                /* q_batch_stride */ q_stride[0] as u32,
-                /* k_batch_stride */ k_stride[0] as u32,
-                /* v_batch_stride */ v_stride[0] as u32,
-                /* o_batch_stride */ o_stride[0] as u32,
+                /* q_batch_stride */ u_q_batch_stride,
+                /* k_batch_stride */ u_k_batch_stride,
+                /* v_batch_stride */ u_v_batch_stride,
+                /* o_batch_stride */ u_o_batch_stride,
                 /* alibi_slopes_batch_stride */ 0,
-                /* q_row_stride   */ q_stride[q_rank - 3] as u32,
-                /* k_row_stride   */ k_stride[k_rank - 3] as u32,
-                /* v_row_stride   */ v_stride[v_rank - 3] as u32,
-                /* o_row_stride   */ o_stride[o_rank - 3] as u32,
-                /* q_head_stride  */ q_stride[q_rank - 2] as u32,
-                /* k_head_stride  */ k_stride[k_rank - 2] as u32,
-                /* v_head_stride  */ v_stride[v_rank - 2] as u32,
-                /* o_head_stride  */ o_stride[o_rank - 2] as u32,
-                /* b */ b_sz as u32,
-                /* h */ num_heads as u32,
-                /* h_k */ num_heads_k as u32,
-                /* d */ head_size as u32,
-                /* d_rounded */ head_size_rounded as u32,
+                /* q_row_stride */ u_q_row_stride,
+                /* k_row_stride */ u_k_row_stride,
+                /* v_row_stride */ u_v_row_stride,
+                /* o_row_stride */ u_o_row_stride,
+                /* q_head_stride */ u_q_head_stride,
+                /* k_head_stride */ u_k_head_stride,
+                /* v_head_stride */ u_v_head_stride,
+                /* o_head_stride */ u_o_head_stride,
+                /* b */ u_b,
+                /* h */ u_h,
+                /* h_k */ u_h_k,
+                /* d */ u_d,
+                /* d_rounded */ u_d_rounded,
                 /* softmax_scale*/ self.softmax_scale,
-                /* seqlen_q */ seqlen_q as u32,
-                /* seqlen_k */ seqlen_k as u32,
-                /* seqlen_q_rounded */ seqlen_q_rounded as u32,
-                /* seqlen_k_rounded */ seqlen_k_rounded as u32,
+                /* seqlen_q */ u_seqlen_q,
+                /* seqlen_k */ u_seqlen_k,
+                /* seqlen_q_rounded */ u_seqlen_q_rounded,
+                /* seqlen_k_rounded */ u_seqlen_k_rounded,
                 /* is_bf16 */ is_bf16,
                 /* is_causal */ is_causal,
                 /* upadded_lse */ 0,

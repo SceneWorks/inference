@@ -25,12 +25,19 @@
 //!   kernel with no image for the device would not error — it would leave the output unwritten —
 //!   so an uncovered device always takes the budgeted path. The capability is read once per GPU
 //!   ordinal and cached;
-//! - the dtype is bf16 or f16 (the kernel has no f32 path — f32 callers keep their numerics);
+//! - the dtype is bf16 or f16 (the kernel has no f32 path — f32 callers keep their numerics), and
+//!   q, k and v share it and share one device (the kernel reads all three as one element type);
 //! - there is **no additive mask** — the wrapper exposes only dense / causal, and an arbitrary
 //!   additive bias cannot be expressed, so a masked call keeps the budgeted path;
 //! - q/k/v are rank 4, share the batch, K and V share their shape, the query heads are a multiple of
 //!   the KV heads, and the common `head_dim` is a multiple of 8 and at most
-//!   [`FLASH_MAX_HEAD_DIM`].
+//!   [`FLASH_MAX_HEAD_DIM`];
+//! - every stride and extent the kernel receives fits its `u32` parameter ABI: the batch / row /
+//!   head strides of the `[B, S, H, D]` views `flash_bhsd` actually hands it (the operand's own
+//!   strides when its last dim is unit-stride, else those of the contiguous copy), and the
+//!   contiguous output's `Sq·H·D` batch stride. candle-flash-attn's dense path converts these
+//!   checked too, but refusing here keeps an oversized call on the budgeted path instead of
+//!   failing it.
 //!
 //! # Stream ordering
 //!
@@ -78,6 +85,75 @@ pub enum FlashRefusal {
     HeadDim(usize),
     /// Rank, batch, K/V shape or head-group mismatch.
     Shape,
+    /// q, k and v do not share one dtype.
+    MixedDtype,
+    /// q, k and v do not live on one device.
+    MixedDevice,
+    /// A stride or extent the kernel would receive exceeds `u32::MAX` (its parameter ABI).
+    IndexOverflow,
+}
+
+/// One attention operand as [`flash_eligibility`] sees it: dtype, `[B, H, S, D]` dims and element
+/// strides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashOperand<'a> {
+    /// The element type.
+    pub dtype: DType,
+    /// The `[B, H, S, D]` dims.
+    pub dims: &'a [usize],
+    /// The element strides, one per dim.
+    pub strides: &'a [usize],
+}
+
+impl<'a> FlashOperand<'a> {
+    /// The operand view of a real tensor.
+    pub fn of(t: &'a Tensor) -> Self {
+        Self {
+            dtype: t.dtype(),
+            dims: t.dims(),
+            strides: t.stride(),
+        }
+    }
+}
+
+/// The `(batch, row, head)` element strides `flash_bhsd` hands the kernel for one `[B, H, S, D]`
+/// operand: the `[B, S, H, D]` transpose's own strides when the last dim is unit-stride, else
+/// those of the contiguous copy it makes. `None` when the copy's strides overflow `usize`.
+fn kernel_strides(dims: [usize; 4], strides: &[usize]) -> Option<[usize; 3]> {
+    let [_, h, s, d] = dims;
+    match *strides {
+        [sb, sh, ss, 1] => Some([sb, ss, sh]),
+        _ => {
+            let hd = h.checked_mul(d)?;
+            Some([s.checked_mul(hd)?, hd, d])
+        }
+    }
+}
+
+/// Whether every value the kernel's `u32` parameter ABI would carry for this call fits.
+fn fits_kernel_abi(
+    q: [usize; 4],
+    k: [usize; 4],
+    q_strides: &[usize],
+    k_strides: &[usize],
+    v_strides: &[usize],
+) -> bool {
+    let fits = |x: usize| u32::try_from(x).is_ok();
+    let strides_fit =
+        |dims, strides| kernel_strides(dims, strides).is_some_and(|s| s.into_iter().all(fits));
+    let [b, h, sq, d] = q;
+    let [_, kh, sk, _] = k;
+    // The output is a fresh contiguous `[B, Sq, H, D]`: batch stride `Sq·H·D`, row `H·D`.
+    let out_batch = h.checked_mul(d).and_then(|hd| hd.checked_mul(sq));
+    // The kernel also takes the 128-rounded sequence lengths.
+    let rounded = |x: usize| x.checked_next_multiple_of(128);
+    strides_fit(q, q_strides)
+        && strides_fit(k, k_strides)
+        && strides_fit(k, v_strides)
+        && out_batch.is_some_and(fits)
+        && rounded(sq).is_some_and(fits)
+        && rounded(sk).is_some_and(fits)
+        && [b, h, kh, d].into_iter().all(fits)
 }
 
 /// The kernel one call takes.
@@ -129,14 +205,15 @@ pub fn flash_arch_supported(
     }
 }
 
-/// The pure selection rule (see the module docs). `q`/`k`/`v` are the `[B, H, S, D]` dims.
+/// The pure selection rule (see the module docs). `q`/`k`/`v` carry the `[B, H, S, D]` dims and
+/// strides; `device` classifies q's device and `same_device` says whether k and v share it.
 pub fn flash_eligibility(
     compiled: bool,
     device: FlashDevice,
-    dtype: DType,
-    q: &[usize],
-    k: &[usize],
-    v: &[usize],
+    same_device: bool,
+    q: FlashOperand<'_>,
+    k: FlashOperand<'_>,
+    v: FlashOperand<'_>,
     masked: bool,
 ) -> AttentionKernel {
     use AttentionKernel::Budgeted;
@@ -151,21 +228,38 @@ pub fn flash_eligibility(
         } => return Budgeted(FlashRefusal::UnsupportedArch(compute_cap)),
         FlashDevice::Cuda { .. } => {}
     }
-    if !matches!(dtype, DType::BF16 | DType::F16) {
-        return Budgeted(FlashRefusal::Dtype(dtype));
+    if !matches!(q.dtype, DType::BF16 | DType::F16) {
+        return Budgeted(FlashRefusal::Dtype(q.dtype));
+    }
+    if k.dtype != q.dtype || v.dtype != q.dtype {
+        return Budgeted(FlashRefusal::MixedDtype);
+    }
+    if !same_device {
+        return Budgeted(FlashRefusal::MixedDevice);
     }
     if masked {
         return Budgeted(FlashRefusal::Masked);
     }
-    let ([qb, qh, qs, qd], [kb, kh, ks, kd]) = match (q, k) {
+    let (qdims @ [qb, qh, qs, qd], kdims @ [kb, kh, ks, kd]) = match (q.dims, k.dims) {
         (&[a, b, c, d], &[e, f, g, h]) => ([a, b, c, d], [e, f, g, h]),
         _ => return Budgeted(FlashRefusal::Shape),
     };
-    if v.len() != 4 || qb != kb || k != v || qs == 0 || ks == 0 || kh == 0 || qh % kh != 0 {
+    if v.dims.len() != 4
+        || qb != kb
+        || k.dims != v.dims
+        || qs == 0
+        || ks == 0
+        || kh == 0
+        || qh % kh != 0
+        || [q.strides.len(), k.strides.len(), v.strides.len()] != [4; 3]
+    {
         return Budgeted(FlashRefusal::Shape);
     }
     if qd != kd || qd % 8 != 0 || qd == 0 || qd > FLASH_MAX_HEAD_DIM {
         return Budgeted(FlashRefusal::HeadDim(qd));
+    }
+    if !fits_kernel_abi(qdims, kdims, q.strides, k.strides, v.strides) {
+        return Budgeted(FlashRefusal::IndexOverflow);
     }
     AttentionKernel::Flash
 }
@@ -180,10 +274,10 @@ pub fn select_attention_kernel(
     flash_eligibility(
         FLASH_ATTN_COMPILED,
         flash_device(q.device()),
-        q.dtype(),
-        q.dims(),
-        k.dims(),
-        v.dims(),
+        q.device().same_device(k.device()) && q.device().same_device(v.device()),
+        FlashOperand::of(q),
+        FlashOperand::of(k),
+        FlashOperand::of(v),
         mask.is_some(),
     )
 }
@@ -281,8 +375,44 @@ mod tests {
         supported: true,
     };
 
+    /// Row-major strides of `dims`.
+    fn contiguous(dims: &[usize]) -> Vec<usize> {
+        let mut strides = vec![1; dims.len()];
+        for i in (0..dims.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * dims[i + 1];
+        }
+        strides
+    }
+
+    /// The eligibility of contiguous operands of one dtype on one device.
+    fn elig(
+        compiled: bool,
+        device: FlashDevice,
+        dtype: DType,
+        q: &[usize],
+        k: &[usize],
+        v: &[usize],
+        masked: bool,
+    ) -> AttentionKernel {
+        let (qs, ks, vs) = (contiguous(q), contiguous(k), contiguous(v));
+        let op = |dims, strides| FlashOperand {
+            dtype,
+            dims,
+            strides,
+        };
+        flash_eligibility(
+            compiled,
+            device,
+            true,
+            op(q, &qs),
+            op(k, &ks),
+            op(v, &vs),
+            masked,
+        )
+    }
+
     fn pick(dtype: DType, q: &[usize], k: &[usize], masked: bool) -> AttentionKernel {
-        flash_eligibility(true, SM120, dtype, q, k, k, masked)
+        elig(true, SM120, dtype, q, k, k, masked)
     }
 
     fn shipped_ladder() -> crate::cuda_arch::FatbinLadder {
@@ -318,7 +448,7 @@ mod tests {
             supported: false,
         };
         assert_eq!(
-            flash_eligibility(true, old, DType::BF16, &H3, &H3, &H3, false),
+            elig(true, old, DType::BF16, &H3, &H3, &H3, false),
             AttentionKernel::Budgeted(FlashRefusal::UnsupportedArch(Some(75)))
         );
     }
@@ -347,7 +477,7 @@ mod tests {
         use AttentionKernel::Budgeted;
         let f = |compiled, cuda: bool, dtype| {
             let device = if cuda { SM120 } else { FlashDevice::NotCuda };
-            flash_eligibility(compiled, device, dtype, &H3, &H3, &H3, false)
+            elig(compiled, device, dtype, &H3, &H3, &H3, false)
         };
         assert_eq!(
             f(false, true, DType::BF16),
@@ -376,7 +506,7 @@ mod tests {
         assert_eq!(pick(DType::BF16, &H3, &[1, 5, 4096, 128], false), shape);
         // K and V disagreeing.
         assert_eq!(
-            flash_eligibility(
+            elig(
                 true,
                 SM120,
                 DType::BF16,
@@ -402,6 +532,94 @@ mod tests {
         assert_eq!(
             pick(DType::BF16, &[1, 56, 64, 128], &[1, 56, 64, 64], false),
             hd(128)
+        );
+    }
+
+    #[test]
+    fn q_k_v_must_share_one_dtype_and_one_device() {
+        use AttentionKernel::Budgeted;
+        let st = contiguous(&H3);
+        let op = |dtype| FlashOperand {
+            dtype,
+            dims: &H3,
+            strides: &st,
+        };
+        let (bf, f16) = (op(DType::BF16), op(DType::F16));
+        assert_eq!(
+            flash_eligibility(true, SM120, true, bf, bf, bf, false),
+            AttentionKernel::Flash
+        );
+        for (k, v) in [(f16, bf), (bf, f16), (op(DType::F32), bf)] {
+            assert_eq!(
+                flash_eligibility(true, SM120, true, bf, k, v, false),
+                Budgeted(FlashRefusal::MixedDtype)
+            );
+        }
+        assert_eq!(
+            flash_eligibility(true, SM120, false, bf, bf, bf, false),
+            Budgeted(FlashRefusal::MixedDevice)
+        );
+    }
+
+    #[test]
+    fn strides_and_extents_beyond_the_kernels_u32_abi_refuse() {
+        use AttentionKernel::Budgeted;
+        let overflow = Budgeted(FlashRefusal::IndexOverflow);
+        let max = u32::MAX as usize;
+        let call = |q: &[usize], qs: &[usize], k: &[usize], ks: &[usize], vs: &[usize]| {
+            let op = |dims, strides| FlashOperand {
+                dtype: DType::BF16,
+                dims,
+                strides,
+            };
+            flash_eligibility(true, SM120, true, op(q, qs), op(k, ks), op(k, vs), false)
+        };
+        // The longest contiguous `[1, H, S, D]` whose `S·H·D` (the batch stride of q and of the
+        // output) fits u32 takes the kernel; one more row does not.
+        let (h, d) = (8usize, 128usize);
+        let rows = max / (h * d);
+        let fit = [1, h, rows, d];
+        let st = contiguous(&fit);
+        assert_eq!(call(&fit, &st, &fit, &st, &st), AttentionKernel::Flash);
+        let over = [1, h, rows + 1, d];
+        let so = contiguous(&over);
+        assert_eq!(
+            call(&over, &so, &fit, &st, &st),
+            overflow,
+            "q batch / output"
+        );
+        assert_eq!(
+            call(&fit, &st, &over, &so, &so),
+            overflow,
+            "k/v batch stride"
+        );
+        // A small strided view: each oversized stride alone refuses — batch, head and sequence
+        // (the `[B, S, H, D]` kernel view's row stride).
+        let small = [2, 4, 16, 64];
+        let ok = contiguous(&small);
+        assert_eq!(call(&small, &ok, &small, &ok, &ok), AttentionKernel::Flash);
+        for big in [
+            [max + 1, 1024, 64, 1],
+            [4096, max + 1, 64, 1],
+            [4096, 1024, max + 1, 1],
+        ] {
+            assert_eq!(call(&small, &big, &small, &ok, &ok), overflow, "q {big:?}");
+            assert_eq!(call(&small, &ok, &small, &big, &ok), overflow, "k {big:?}");
+            assert_eq!(call(&small, &ok, &small, &ok, &big), overflow, "v {big:?}");
+        }
+        // A non-unit last stride is judged by the contiguous copy `flash_bhsd` makes, so huge
+        // strides that the copy discards are fine...
+        let gather = [1 << 40, 1 << 36, 1 << 33, 2];
+        assert_eq!(
+            call(&small, &gather, &small, &ok, &ok),
+            AttentionKernel::Flash
+        );
+        // ...while the copy's own `S·H·D` still has to fit.
+        assert_eq!(call(&over, &gather, &fit, &st, &st), overflow);
+        // Strides whose rank disagrees with the dims are a shape error, not a launch.
+        assert_eq!(
+            call(&small, &ok[..3], &small, &ok, &ok),
+            Budgeted(FlashRefusal::Shape)
         );
     }
 
