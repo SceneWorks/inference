@@ -39,7 +39,9 @@ rand = { workspace = true }
 # Parses `vae/config.json` and the audio VAE's `config.json` + `config.yaml` + `metadata.json`
 # source triple (the three documents the Apache-2.0 reference's `from_pretrained` reads).
 serde_json = { workspace = true }
-# Load-phase timing events (sc-26691), the same `tracing` the sdxl / candle-llm crates use.
+# Load-phase timing events, render-phase and per-step progress at `info` (sc-26691): the packed
+# sequence breakdown, each staged phase's wall time, and every denoise step's start/finish.
+# Same `tracing` the sdxl / candle-llm crates log through.
 tracing = "0.1"
 
 [features]
@@ -47,6 +49,10 @@ model-inference-proof = ["candle-gen-boogu/model-inference-proof", "candle-gen/m
 default = []
 metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]
+# FlashAttention-2 for the DiT joint attention and the video VAE decoder's attention (sc-26691):
+# forwards `candle-gen/flash-attn`, whose `sdpa_dispatch_bhsd` takes the fused kernel for unmasked
+# bf16/f16 CUDA attention. Implies `cuda`; needs the CUDA toolkit and `CUDA_COMPUTE_CAP`.
+flash-attn = ["cuda", "candle-gen/flash-attn"]
 
 [dev-dependencies]
 # RAII fixture roots for the real-weight helpers (sc-17791). A `TempDir` guard removes the tree on

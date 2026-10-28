@@ -478,7 +478,6 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -491,6 +490,7 @@ name = "candle-gen"
 version = "0.0.0"
 dependencies = [
  "candle-core",
+ "candle-flash-attn",
  "candle-nn",
  "candle-quant-kernels",
  "float8",

@@ -47,6 +47,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError, Result, Weights};
 
 use crate::denoise::{JointStep, JointVelocity, PackedLayout};
@@ -446,15 +447,26 @@ impl MiniMaxH3Dit {
         blocks: BlockModulation<'_>,
         norm_out: &NormOutModulation,
     ) -> Result<(Tensor, Tensor)> {
-        self.forward_packed_veda(packed, blocks, norm_out, None)
+        self.forward_packed_veda(packed, blocks, norm_out, None, None)
     }
 
+    /// [`Self::forward_packed`] with the Veda runtime and the request's cancel flag.
+    ///
+    /// With `cancel` attached the flag is honored **between layers** as well as inside the
+    /// attention (sc-26691): before each block the loop checks it, and on a sequence of at least
+    /// [`LAYER_CANCEL_SYNC_ROWS`] rows it first synchronizes the device so the check reflects the
+    /// GPU's progress rather than how far ahead the CPU has queued — candle's CUDA launches are
+    /// stream-async, and without the synchronize all 50 layers would already be enqueued by the
+    /// time the first check ran. At those lengths one layer costs seconds, so the per-layer
+    /// synchronize is noise; below them the per-step synchronize in the denoise loop already
+    /// bounds the latency.
     fn forward_packed_veda(
         &self,
         packed: &PackedForward<'_>,
         blocks: BlockModulation<'_>,
         norm_out: &NormOutModulation,
         veda: Option<(&crate::veda::VedaRuntime, usize)>,
+        cancel: Option<&CancelFlag>,
     ) -> Result<(Tensor, Tensor)> {
         if let BlockModulation::Cached(cache) = blocks {
             if cache.pruning_identity() != self.pruning_identity() {
@@ -499,7 +511,16 @@ impl MiniMaxH3Dit {
             }
         };
         crate::dit::block::check_adaln_indices(packed.adaln_indices, modulation_rows)?;
+        let sync_between_layers = layer_cancel_needs_sync(x.dims()[1]);
         for (layer, block) in self.blocks.iter().enumerate() {
+            if let Some(cancel) = cancel {
+                if sync_between_layers {
+                    self.device.synchronize()?;
+                }
+                if cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+            }
             x = match blocks {
                 BlockModulation::Cached(cache) => block.forward_veda(
                     &x,
@@ -508,6 +529,7 @@ impl MiniMaxH3Dit {
                     &self.rope,
                     packed.tables,
                     veda.map(|(runtime, step)| (runtime, layer, step)),
+                    cancel,
                 )?,
                 BlockModulation::Temb(temb) => block.forward_veda(
                     &x,
@@ -516,6 +538,7 @@ impl MiniMaxH3Dit {
                     &self.rope,
                     packed.tables,
                     veda.map(|(runtime, step)| (runtime, layer, step)),
+                    cancel,
                 )?,
                 BlockModulation::CurveCoords(coords) => block.forward_veda(
                     &x,
@@ -524,6 +547,7 @@ impl MiniMaxH3Dit {
                     &self.rope,
                     packed.tables,
                     veda.map(|(runtime, step)| (runtime, layer, step)),
+                    cancel,
                 )?,
             };
         }
@@ -696,6 +720,9 @@ pub struct JointDit {
     released_bytes: usize,
     forwards: usize,
     veda: Option<crate::veda::VedaRuntime>,
+    /// The request's cancel flag, observed between layers and inside the attention
+    /// ([`Self::set_cancel`], sc-26691). `None` keeps the step-boundary check only.
+    cancel: Option<CancelFlag>,
 }
 
 impl JointDit {
@@ -822,7 +849,14 @@ impl JointDit {
             released_bytes,
             forwards: 0,
             veda: None,
+            cancel: None,
         })
+    }
+
+    /// Attach the request's cancel flag so a cancel or stall stop lands within one layer (or one
+    /// attention chunk on the budgeted fallback) instead of at the end of a minutes-long forward.
+    pub fn set_cancel(&mut self, cancel: &CancelFlag) {
+        self.cancel = Some(cancel.clone());
     }
 
     pub fn prepare_veda(
@@ -958,8 +992,21 @@ impl JointVelocity for JointDit {
             blocks,
             &norm_out,
             self.veda.as_ref().map(|v| (v, step.index)),
+            self.cancel.as_ref(),
         )
     }
+}
+
+/// Packed-sequence length from which [`MiniMaxH3Dit`]'s per-layer cancel check synchronizes the
+/// device first. Below it a whole forward is short enough that the denoise loop's per-step
+/// synchronize already bounds cancel latency; at and above it (every multi-second canvas, and the
+/// ~141k-row reference renders sc-26691 diagnosed) one layer costs far more than a synchronize, so
+/// cancels are observed per layer. Unit-sized fixtures never pay a synchronize.
+pub const LAYER_CANCEL_SYNC_ROWS: usize = 16_384;
+
+/// Whether the per-layer cancel check must synchronize first (see [`LAYER_CANCEL_SYNC_ROWS`]).
+pub fn layer_cancel_needs_sync(seq_len: usize) -> bool {
+    seq_len >= LAYER_CANCEL_SYNC_ROWS
 }
 
 #[cfg(test)]
@@ -1238,6 +1285,59 @@ mod veda_controls_tests {
         }
         (bits, calls, observed)
     }
+    /// sc-26691: an attached cancel flag is observed **inside** the forward, before the first
+    /// block — not only at the denoise loop's step boundary. Called through `JointVelocity`
+    /// directly, so the loop's own check cannot be what answers. No block executes.
+    #[test]
+    fn an_attached_cancel_stops_the_forward_before_the_first_block() {
+        let device = Device::Cpu;
+        let w = weights(None);
+        let dit = MiniMaxH3Dit::from_weights(&w, &config(), &device, DType::F32).unwrap();
+        let layout = layout(0, 1);
+        let schedule = JointSchedule::with_shifts(3, 12.0, 3.0).unwrap();
+        let adaln = adaln_schedule(&schedule).unwrap();
+        let context = w.require("in.refiner.context").unwrap();
+        let mut model = JointDit::new(
+            dit,
+            layout.clone(),
+            &context,
+            adaln.clone(),
+            AdaLnResidency::PrecomputeAndEvict,
+        )
+        .unwrap();
+        let cancel = CancelFlag::new();
+        model.set_cancel(&cancel);
+        cancel.cancel();
+        let video = Tensor::full(0.02f32, (1, layout.video_indices().len(), 96), &device).unwrap();
+        let audio = Tensor::full(0.03f32, (1, layout.audio_indices().len(), 32), &device).unwrap();
+        let indices = adaln
+            .adaln_indices(0, layout.row_classes(), layout.token_tags(), &device)
+            .unwrap();
+        let err = model
+            .forward(&JointStep {
+                index: 0,
+                layout: &layout,
+                video_rows: &video,
+                audio_rows: &audio,
+                adaln_indices: &indices,
+                row_timesteps: PackedLayout::row_timesteps(
+                    schedule.video().timesteps()[0],
+                    schedule.audio().timesteps()[0],
+                ),
+            })
+            .unwrap_err();
+        assert!(matches!(err, CandleError::Canceled), "{err:?}");
+    }
+
+    #[test]
+    fn only_long_sequences_synchronize_before_the_per_layer_cancel_check() {
+        assert!(!layer_cancel_needs_sync(0));
+        assert!(!layer_cancel_needs_sync(LAYER_CANCEL_SYNC_ROWS - 1));
+        assert!(layer_cancel_needs_sync(LAYER_CANCEL_SYNC_ROWS));
+        // The diagnosed sc-26691 reference render.
+        assert!(layer_cancel_needs_sync(141_000));
+    }
+
     #[test]
     #[ignore = "complete synthetic DiT/JointDit forward; dispatched only by the manual H3 native suite"]
     fn native_controls_capture_every_mode_packed_tier_and_adapter_stack() {

@@ -68,7 +68,10 @@ runtime-cpu = { git = "https://github.com/SceneWorks/inference", tag = "runtime-
 ```
 
 `runtime-cuda` additionally offers a `flash-attn` feature that forwards to
-`candle-llm/flash-attn`.
+`candle-llm/flash-attn`. Its default features include `media-flash-attn`, which compiles the
+vendored multi-arch FlashAttention-2 fatbin (`vendor/candle-flash-attn`) for the media lane; the
+build needs the CUDA toolkit and adds roughly 20 minutes of nvcc on a cold build (cache the objects
+with `CANDLE_FLASH_ATTN_BUILD_DIR`). At run time the kernel is used only on a GPU the fatbin covers.
 
 > This repository is private; a consumer needs credentialed git access to resolve the
 > dependency.

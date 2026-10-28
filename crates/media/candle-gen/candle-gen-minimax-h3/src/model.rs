@@ -161,6 +161,83 @@ use crate::text_encoder::{
 use crate::vae::MiniMaxH3VideoVae;
 use crate::MODEL_ID;
 
+/// One render phase's start/finish log pair at `info` (sc-26691): the campaign's only window into
+/// where a multi-minute render is spending its time. Dropped without [`Self::done`] (an early `?`
+/// return) it logs nothing further — the error carries the story from there.
+struct PhaseLog {
+    phase: &'static str,
+    started: std::time::Instant,
+}
+
+impl PhaseLog {
+    fn start(phase: &'static str) -> Self {
+        tracing::info!(phase, "minimax-h3: phase start");
+        Self {
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn done(self) {
+        tracing::info!(
+            phase = self.phase,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            "minimax-h3: phase done"
+        );
+    }
+}
+
+/// The packed DiT sequence's row breakdown — once per render, before the first denoise step.
+///
+/// `text` is the whole text stream; `text_vision` the rows of it the vision tower supplied (tagged
+/// video, see `encode_prompt_grounded`). `condition_video` is the leading video rows that are
+/// conditioning rather than denoised — `fl2va` keyframe anchors or `ref2va` reference latents —
+/// and `reference_audio` the leading `ref2va` reference-audio rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedBreakdown {
+    pub seq_len: usize,
+    pub text: usize,
+    pub text_vision: usize,
+    pub condition_video: usize,
+    pub video: usize,
+    pub reference_audio: usize,
+    pub audio: usize,
+}
+
+impl PackedBreakdown {
+    /// Derive the breakdown from a built layout and the text stream's modality tags.
+    pub fn of(layout: &crate::denoise::PackedLayout, text_tags: &[u32]) -> Self {
+        let condition_video = layout.num_condition_video_rows();
+        let reference_audio = layout.num_condition_audio_rows();
+        Self {
+            seq_len: layout.seq_len(),
+            text: layout.num_text_tokens(),
+            text_vision: text_tags
+                .iter()
+                .filter(|&&t| t != crate::denoise::TEXT_TAG)
+                .count(),
+            condition_video,
+            video: layout.video_indices().len().saturating_sub(condition_video),
+            reference_audio,
+            audio: layout.audio_indices().len().saturating_sub(reference_audio),
+        }
+    }
+
+    fn log(&self, task: MiniMaxH3Task) {
+        tracing::info!(
+            task = task.partition(),
+            seq_len = self.seq_len,
+            text = self.text,
+            text_vision = self.text_vision,
+            condition_video = self.condition_video,
+            video = self.video,
+            reference_audio = self.reference_audio,
+            audio = self.audio,
+            "minimax-h3: packed DiT sequence"
+        );
+    }
+}
+
 /// Model evaluations a request runs when it names no step count.
 ///
 /// The reference declares no default; 50 is what the sc-17242 spike rendered at and what the model
@@ -851,6 +928,7 @@ impl MiniMaxH3 {
     /// `embed_tokens` and layers `0..50`, so the header-only mmap never materializes layers 50-63,
     /// the final norm or `lm_head`.
     fn encode_prompt(&self, prompt: &str) -> Result<candle_gen::candle_core::Tensor> {
+        let phase = PhaseLog::start("text_encoder");
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask) = tok.encode_prompt(prompt, &self.device)?;
         let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
@@ -871,6 +949,7 @@ impl MiniMaxH3 {
         // genuinely frees its weights — there is no lazy graph holding them alive.
         drop(te);
         crate::dit::release_device_memory(&self.device)?;
+        phase.done();
         Ok(context)
     }
 
@@ -893,11 +972,14 @@ impl MiniMaxH3 {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
 
+        let phase = PhaseLog::start("vision_tower");
         let vision = load_vision_tower(&self.tiers.text_encoder_dir, &self.device)?;
         let grounded = crate::text_encoder::run_vision(&vision, keyframes, &self.device)?;
         drop(vision);
         crate::dit::release_device_memory(&self.device)?;
+        phase.done();
 
+        let phase = PhaseLog::start("text_encoder");
         let (ids, mask, tags) = tok.encode_fl2va(prompt, &grounded.counts, &self.device)?;
         let shards =
             candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
@@ -921,6 +1003,7 @@ impl MiniMaxH3 {
         drop(te);
         drop(grounded);
         crate::dit::release_device_memory(&self.device)?;
+        phase.done();
 
         // The tags describe the presentation row for row; a mismatch would mis-tag every row after
         // the divergence and is silent, because both lengths build a runnable sequence.
@@ -1008,6 +1091,7 @@ impl MiniMaxH3 {
         let condition_rows = if anchors.is_empty() {
             None
         } else {
+            let phase = PhaseLog::start("keyframe_vae_encode");
             let pixels = fitted
                 .iter()
                 .map(|f| crate::keyframe::keyframe_to_vae_pixels(f, &self.device))
@@ -1023,6 +1107,7 @@ impl MiniMaxH3 {
             )?;
             drop(vae);
             crate::dit::release_device_memory(&self.device)?;
+            phase.done();
             rows
         };
         if req.cancel.is_cancelled() {
@@ -1034,13 +1119,16 @@ impl MiniMaxH3 {
         // gets the staged LoRA folded onto `transformer_ref` exactly as `t2va` / `fl2va` get it on
         // `transformer`. A bare `MiniMaxH3Dit::load` here would render a reference job with the
         // adapter silently dropped.
+        let phase = PhaseLog::start("dit_load");
         let dit = self.load_task_dit(task.partition())?;
+        phase.done();
         debug_assert_eq!(patch, dit.config().patch_size);
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.dims()[1], patch, &self.device)?
         } else {
             fl2va_layout(&geometry, &text_tags, &anchors, patch, &self.device)?
         };
+        PackedBreakdown::of(&layout, &text_tags).log(task);
         let (video_rows, audio_rows) = initial_latents(&geometry, patch, seed, &self.device)?;
         // The anchors LEAD the video row stream; the scheduler then writes only the tail.
         let video_rows = prepend_condition_rows(&layout, condition_rows.as_ref(), &video_rows)?;
@@ -1054,6 +1142,9 @@ impl MiniMaxH3 {
             adaln,
             AdaLnResidency::PrecomputeAndEvict,
         )?;
+        // Per-layer (and, on the budgeted fallback, per-attention-chunk) cancellation: a forward
+        // over a long packed sequence is minutes, far too coarse for a step-boundary check alone.
+        model.set_cancel(&req.cancel);
         if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
             model.prepare_veda(
                 request,
@@ -1078,6 +1169,7 @@ impl MiniMaxH3 {
                 probe.record(index, elapsed, terminal_device_sample(&self.device));
             }
         };
+        let phase = PhaseLog::start("denoise");
         let rendered = render_latents_with_observer(
             &mut model,
             &layout,
@@ -1091,6 +1183,7 @@ impl MiniMaxH3 {
             req.h3_terminal_telemetry
                 .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
+        phase.done();
         if let Some(probe) = terminal_probe {
             self.veda_report.borrow_mut().terminal_telemetry =
                 Some(probe.finish(if self.device.is_cuda() {
@@ -1110,6 +1203,7 @@ impl MiniMaxH3 {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        let phase = PhaseLog::start("video_vae_decode");
         let frames = {
             let vae = MiniMaxH3VideoVae::load_decode_only(&self.root, &self.device, self.dtype)?;
             let video = vae.decode(&rendered.video)?;
@@ -1117,6 +1211,8 @@ impl MiniMaxH3 {
             crate::dit::release_device_memory(&self.device)?;
             frames_to_images(&revert_pixel_normalization(&video)?)?
         };
+        phase.done();
+        let phase = PhaseLog::start("audio_vae_decode");
         let audio = {
             let (cfg, w) = self.load_audio_vae()?;
             let vae = crate::audio_vae::MiniMaxH3AudioVae::from_weights(
@@ -1131,6 +1227,7 @@ impl MiniMaxH3 {
             crate::dit::release_device_memory(&self.device)?;
             track
         };
+        phase.done();
         let audio = finish_audio(audio, &geometry)?;
         if frames.len() != geometry.joint.num_frames {
             return Err(CandleError::Msg(format!(
@@ -1272,6 +1369,7 @@ impl MiniMaxH3 {
         let mut geometries: Vec<ReferenceLatentGeometry> = Vec::new();
         let mut reference_audio_channels = Vec::new();
         {
+            let phase = PhaseLog::start("reference_vae_audio_encode");
             let vae = MiniMaxH3VideoVae::load(&self.root, &self.device, self.dtype)?;
             let audio_enc = self.load_audio_encoder()?;
             for (i, r) in normalized.iter().enumerate() {
@@ -1369,6 +1467,7 @@ impl MiniMaxH3 {
             drop(vae);
             drop(audio_enc);
             crate::dit::release_device_memory(&self.device)?;
+            phase.done();
         }
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -1390,7 +1489,9 @@ impl MiniMaxH3 {
         // comment names — a denoise path that maps its own DiT would render a `ref2va` job with the
         // caller's staged LoRA silently dropped, `Ok` and with no error. `tests/turbo_lora.rs`
         // covers the seam; the staging table below tracks this anchor.
+        let phase = PhaseLog::start("dit_load");
         let dit = self.load_task_dit(task.partition())?;
+        phase.done();
         debug_assert_eq!(patch, dit.config().patch_size);
         let layout = ref2va_layout_with_audio_channels(
             geometry,
@@ -1400,6 +1501,7 @@ impl MiniMaxH3 {
             patch,
             &self.device,
         )?;
+        PackedBreakdown::of(&layout, &text_tags).log(task);
         let (video_rows, audio_rows) = initial_latents(geometry, patch, seed, &self.device)?;
         let video_rows = prepend_condition_rows(&layout, condition_video.as_ref(), &video_rows)?;
         let audio_rows =
@@ -1412,6 +1514,9 @@ impl MiniMaxH3 {
             adaln,
             AdaLnResidency::PrecomputeAndEvict,
         )?;
+        // Per-layer (and, on the budgeted fallback, per-attention-chunk) cancellation: a forward
+        // over a long packed sequence is minutes, far too coarse for a step-boundary check alone.
+        model.set_cancel(&req.cancel);
         if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
             model.prepare_veda(
                 request,
@@ -1436,6 +1541,7 @@ impl MiniMaxH3 {
                 probe.record(index, elapsed, terminal_device_sample(&self.device));
             }
         };
+        let phase = PhaseLog::start("denoise");
         let rendered = render_latents_with_observer(
             &mut model,
             &layout,
@@ -1449,6 +1555,7 @@ impl MiniMaxH3 {
             req.h3_terminal_telemetry
                 .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
+        phase.done();
         if let Some(probe) = terminal_probe {
             self.veda_report.borrow_mut().terminal_telemetry =
                 Some(probe.finish(if self.device.is_cuda() {
@@ -1468,6 +1575,7 @@ impl MiniMaxH3 {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        let phase = PhaseLog::start("video_vae_decode");
         let frames = {
             let vae = MiniMaxH3VideoVae::load_decode_only(&self.root, &self.device, self.dtype)?;
             let video = vae.decode(&rendered.video)?;
@@ -1475,6 +1583,8 @@ impl MiniMaxH3 {
             crate::dit::release_device_memory(&self.device)?;
             frames_to_images(&revert_pixel_normalization(&video)?)?
         };
+        phase.done();
+        let phase = PhaseLog::start("audio_vae_decode");
         let audio = {
             let (cfg, w) = self.load_audio_vae()?;
             let vae = crate::audio_vae::MiniMaxH3AudioVae::from_weights(
@@ -1489,6 +1599,7 @@ impl MiniMaxH3 {
             crate::dit::release_device_memory(&self.device)?;
             track
         };
+        phase.done();
         let audio = finish_audio(audio, geometry)?;
         if frames.len() != geometry.joint.num_frames {
             return Err(CandleError::Msg(format!(
@@ -1572,10 +1683,12 @@ impl MiniMaxH3 {
             )));
         }
 
+        let phase = PhaseLog::start("vision_tower");
         let vision = load_vision_tower(&self.tiers.text_encoder_dir, &self.device)?;
         let grounded = crate::text_encoder::run_vision_sources(&vision, &sources, &self.device)?;
         drop(vision);
         crate::dit::release_device_memory(&self.device)?;
+        phase.done();
 
         // The presentation, from the tower's per-source counts.
         let mut cursor = 0usize;
@@ -1602,6 +1715,7 @@ impl MiniMaxH3 {
             }
         }
 
+        let phase = PhaseLog::start("text_encoder");
         let (ids, mask, tags) = tok.encode_ref2va(prompt, &presentation, &self.device)?;
         let shards =
             candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
@@ -1625,6 +1739,7 @@ impl MiniMaxH3 {
         drop(te);
         drop(grounded);
         crate::dit::release_device_memory(&self.device)?;
+        phase.done();
 
         if context.dims()[1] != tags.len() {
             return Err(CandleError::Msg(format!(
@@ -2160,6 +2275,47 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use crate::pipeline::PATCH_SIZE;
+
+    /// sc-26691: the logged breakdown partitions the packed sequence exactly — every row is text,
+    /// condition video, generated video, reference audio or generated audio — and separates the
+    /// vision-tower rows of the text stream and the conditioning rows from the denoised ones.
+    #[test]
+    fn the_packed_breakdown_partitions_the_sequence() {
+        use super::PackedBreakdown;
+        use crate::denoise::{JointGeometry, PackedLayout, TEXT_TAG};
+        use candle_gen::candle_core::Device;
+        let dev = Device::Cpu;
+        let geometry = JointGeometry::new(5, 2, 2).unwrap();
+        // fl2va with a first-frame anchor and two vision-tagged rows inside the text stream.
+        let tags = [TEXT_TAG, TEXT_TAG + 1, TEXT_TAG + 1, TEXT_TAG, TEXT_TAG];
+        let layout = PackedLayout::build(
+            geometry,
+            [1, 2, 2],
+            &tags,
+            1,
+            &[crate::dit::positions::KeyframeAnchor::First],
+            &dev,
+        )
+        .unwrap();
+        let b = PackedBreakdown::of(&layout, &tags);
+        assert_eq!(b.text, 5);
+        assert_eq!(b.text_vision, 2);
+        assert!(b.condition_video > 0, "{b:?}");
+        assert_eq!(b.reference_audio, 0);
+        assert_eq!(
+            b.text + b.condition_video + b.video + b.reference_audio + b.audio,
+            b.seq_len,
+            "{b:?}"
+        );
+        // t2va: nothing is conditioning.
+        let plain = PackedLayout::build(geometry, [1, 2, 2], &[TEXT_TAG; 5], 1, &[], &dev).unwrap();
+        let b = PackedBreakdown::of(&plain, &[TEXT_TAG; 5]);
+        assert_eq!(
+            (b.text_vision, b.condition_video, b.reference_audio),
+            (0, 0, 0)
+        );
+        assert_eq!(b.text + b.video + b.audio, b.seq_len, "{b:?}");
+    }
     /// Complements the real header/packing math tests: a stock literal at the render call site
     /// must not survive merely because a helper can express the selected geometry.
     #[test]
