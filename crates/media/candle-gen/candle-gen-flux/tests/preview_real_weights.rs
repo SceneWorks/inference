@@ -59,6 +59,8 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress,
     WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 
 const PROMPT: &str =
     "A weathered lighthouse on a rocky headland at golden hour, warm sunlight, dramatic clouds, \
@@ -144,14 +146,6 @@ fn artifact_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("flux1_preview_sc16956"))
 }
 
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
-}
-
 /// Load a `.safetensors` file's tensors, keyed and ordered by name.
 fn tensors_of(path: &Path) -> BTreeMap<String, Tensor> {
     candle_gen::candle_core::safetensors::load(path, &Device::Cpu)
@@ -210,7 +204,7 @@ fn the_flux1_family_ships_one_learned_vae_in_three_containers() {
         ),
         ("BFL f32", &bfl_path, BFL_VAE_SHA256, 335_304_388),
     ] {
-        let sha = sha256_of(path);
+        let sha = sha256_file(path);
         eprintln!("  {label:<15}: {sha}  {}", path.display());
         assert_eq!(
             sha, expected,
@@ -408,10 +402,10 @@ fn the_chroma_vaes_are_byte_identical_to_the_flux1_one() {
         "Chroma ships three variants (hd / base / flash); all three must be measured"
     );
 
-    let reference = sha256_of(&required_path("FLUX1_DIFFUSERS_VAE"));
+    let reference = sha256_file(&required_path("FLUX1_DIFFUSERS_VAE"));
     assert_eq!(reference, DIFFUSERS_VAE_SHA256);
     for path in &paths {
-        let sha = sha256_of(path);
+        let sha = sha256_file(path);
         eprintln!("  chroma vae: {sha}  {}", path.display());
         assert_eq!(
             sha,
@@ -443,7 +437,7 @@ fn the_chroma_vaes_are_byte_identical_to_the_flux1_one() {
 fn the_boogu_vae_is_the_flux1_one() {
     let boogu_path = required_path("FLUX1_BOOGU_VAE");
     let diffusers_path = required_path("FLUX1_DIFFUSERS_VAE");
-    let sha = sha256_of(&boogu_path);
+    let sha = sha256_file(&boogu_path);
     eprintln!("  boogu vae: {sha}  {}", boogu_path.display());
     assert_eq!(sha, BOOGU_VAE_SHA256, "the staged Boogu VAE moved");
     assert_ne!(
@@ -537,12 +531,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(dir: &Path, pixels: &[u8], width: u32, height: u32, name: &str) {
-    std::fs::create_dir_all(dir).expect("create the artifact dir");
     let path = dir.join(name);
-    let buf: image::RgbImage = image::ImageBuffer::from_raw(width, height, pixels.to_vec())
-        .expect("frame buffer matches its dimensions");
-    buf.save(&path)
-        .unwrap_or_else(|e| panic!("save {path:?}: {e}"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  wrote {}", path.display());
 }
 

@@ -897,12 +897,7 @@ pub(crate) fn safety_check(
     numeric: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match validate_route(provider, contract, numeric, context) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_result(validate_route(provider, contract, numeric, context))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -673,8 +673,9 @@ pub struct ZImageTransformer2DModel {
     cap_embedder_linear: QLinear,
     x_embedder: QLinear,
     final_layer: FinalLayer,
-    #[allow(dead_code)]
+    // Read by `device()`.
     x_pad_token: Tensor,
+    // Never read: loaded only so `vb.get` enforces the key is present on load.
     #[allow(dead_code)]
     cap_pad_token: Tensor,
     noise_refiner: Vec<ZImageTransformerBlock>,

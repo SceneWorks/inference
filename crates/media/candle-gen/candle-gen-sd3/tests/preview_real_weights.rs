@@ -61,6 +61,8 @@ use candle_gen::gen_core::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink,
     Progress, WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 use safetensors::{Dtype, SafeTensors};
 
 const PROMPT: &str =
@@ -129,14 +131,6 @@ fn artifact_dir() -> PathBuf {
 
 // ── Provenance: the reuse is grounded in tensor bytes ─────────────────────────────────────────────
 
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
-}
-
 /// The `vae/diffusion_pytorch_model.safetensors` under a diffusers snapshot — the file
 /// `crate::vae::load_vae` is handed, for every variant.
 fn snapshot_vae(root: &Path) -> PathBuf {
@@ -167,7 +161,7 @@ fn the_three_sd3_snapshots_ship_one_identical_vae() {
     for (id, var) in SNAPSHOT_VARS {
         let root = required_path(var);
         let vae = snapshot_vae(&root);
-        let sha = sha256_of(&vae);
+        let sha = sha256_file(&vae);
         let size = std::fs::metadata(&vae).expect("stat the VAE").len();
         eprintln!("  {id:<18} vae/  {sha}  {size} bytes");
         assert_eq!(
@@ -180,7 +174,7 @@ fn the_three_sd3_snapshots_ship_one_identical_vae() {
         // a snapshot that kept the weights but re-scaled them would project wrong while passing a
         // weights-only check.
         let config = root.join("vae").join("config.json");
-        let config_sha = sha256_of(&config);
+        let config_sha = sha256_file(&config);
         eprintln!("  {id:<18} vae/config.json  {config_sha}");
         assert_eq!(
             config_sha, SD3_VAE_CONFIG_SHA256,
@@ -222,7 +216,7 @@ fn the_sd3_vae_is_not_the_flux1_latent_space() {
 
     // Re-pinned here rather than borrowed from the row above: this row must establish for itself that
     // the files it compared are the two it names.
-    let (sd3_sha, flux_sha) = (sha256_of(&sd3_vae), sha256_of(&flux_vae));
+    let (sd3_sha, flux_sha) = (sha256_file(&sd3_vae), sha256_file(&flux_vae));
     eprintln!("  sd3.5     vae/  {sd3_sha}");
     eprintln!("  flux1-dev vae/  {flux_sha}");
     assert_eq!(sd3_sha, SD3_VAE_SHA256, "not the SD3.5 VAE");
@@ -369,11 +363,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(format!("{name}.png"));
-    image::save_buffer(&path, pixels, width, height, image::ExtendedColorType::Rgb8)
-        .expect("save a PNG");
+    let path = artifact_dir().join(format!("{name}.png"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  saved {}", path.display());
 }
 

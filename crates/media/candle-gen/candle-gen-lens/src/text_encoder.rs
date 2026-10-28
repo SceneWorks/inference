@@ -36,6 +36,7 @@
 //! Blackwell sm_120 at our pin (sc-7702). The quant is lossy (Q4 "coherent", Q8 near-lossless); both
 //! are parity-gated against the bf16 floor.
 
+use candle_gen::attention::repeat_kv;
 use candle_gen::candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_gen::candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_gen::candle_nn::{
@@ -309,8 +310,8 @@ impl Attention {
             .transpose(1, 2)?;
 
         let (q, k) = rotary.apply(&q, &k)?;
-        let k = repeat_kv(k, self.num_heads / self.num_kv_heads)?;
-        let v = repeat_kv(v, self.num_heads / self.num_kv_heads)?;
+        let k = repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
+        let v = repeat_kv(&v, self.num_heads / self.num_kv_heads)?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
@@ -373,8 +374,8 @@ impl Attention {
             }
         }
         let n_rep = self.num_heads / self.num_kv_heads;
-        let k_all = repeat_kv(cache.k.clone().unwrap(), n_rep)?;
-        let v_all = repeat_kv(cache.v.clone().unwrap(), n_rep)?;
+        let k_all = repeat_kv(cache.k.as_ref().unwrap(), n_rep)?;
+        let v_all = repeat_kv(cache.v.as_ref().unwrap(), n_rep)?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let scores = (q
@@ -405,16 +406,6 @@ impl Attention {
         }
         __model_proof_output!(self.o_proj.forward(&out))
     }
-}
-
-fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        return Ok(x);
-    }
-    let (b, n_kv, s, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, n_kv, n_rep, s, d))?
-        .reshape((b, n_kv * n_rep, s, d))
 }
 
 // Additive causal mask, optionally sliding-window-limited, for an encoder pass (absolute offset 0).

@@ -53,6 +53,7 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress,
     WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
 use candle_gen_sensenova::preview::project_running_image;
 
 const PROMPT: &str =
@@ -103,11 +104,8 @@ enum Event {
 }
 
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(format!("{name}.png"));
-    image::save_buffer(&path, pixels, width, height, image::ExtendedColorType::Rgb8)
-        .expect("save a PNG");
+    let path = artifact_dir().join(format!("{name}.png"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  saved {}", path.display());
 }
 

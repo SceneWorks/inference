@@ -256,6 +256,27 @@ pub fn mlx_packed_qtensor_resident_bytes(
         })
 }
 
+/// The numeric tier a packed component declares (sc-27285: the shared tail of the flux /
+/// qwen-image / z-image `snapshot_quant_tier` copies). `None` (no `quantization` block) is the dense
+/// tier; a declared width of 4 / 8 bits is [`Quant::Q4`] / [`Quant::Q8`]; any other width is an
+/// [`gen_core::Error::Unsupported`] naming `provider_id` and `component`. Each provider keeps its own
+/// `WeightsSource` match and config read, so a single-file source stays a per-provider decision.
+pub fn packed_quant_tier(
+    packed: Option<PackedConfig>,
+    provider_id: &str,
+    component: &str,
+) -> gen_core::Result<Option<Quant>> {
+    packed
+        .map(|packed| match packed.bits {
+            4 => Ok(Quant::Q4),
+            8 => Ok(Quant::Q8),
+            bits => Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: {component} declares unsupported packed quantization width {bits}"
+            ))),
+        })
+        .transpose()
+}
+
 /// A component's `quantization` manifest block — the candle twin of `mlx_gen_flux2::config::Flux2Quant`
 /// (generalized out of the dormant per-crate `Flux2Quant`, sc-9086). An install-time convert job
 /// writes `quantization: { "bits", "group_size" }` into a packed component's `config.json`; its

@@ -179,7 +179,7 @@ impl DiT {
             )),
         }
     }
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn forward(
         &self,
         x: &Tensor,
@@ -212,7 +212,7 @@ impl DiT {
         )
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn forward_with_memory(
         &self,
         x: &Tensor,

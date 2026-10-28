@@ -55,6 +55,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{Image, PreviewFrame, PreviewSink, Progress};
 
+use candle_gen::testkit::save_rgb8_png;
 use candle_gen_pulid::{PulidFlux, PulidFluxPaths, PulidFluxRequest};
 
 const PROMPT: &str =
@@ -133,12 +134,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(dir: &Path, pixels: &[u8], width: u32, height: u32, name: &str) {
-    std::fs::create_dir_all(dir).expect("create the artifact dir");
     let path = dir.join(name);
-    let buf: image::RgbImage = image::ImageBuffer::from_raw(width, height, pixels.to_vec())
-        .expect("frame buffer matches its dimensions");
-    buf.save(&path)
-        .unwrap_or_else(|e| panic!("save {path:?}: {e}"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  wrote {}", path.display());
 }
 

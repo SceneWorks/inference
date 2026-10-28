@@ -49,6 +49,8 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress,
     WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 
 const PROMPT: &str =
     "A weathered lighthouse on a rocky headland at golden hour, warm sunlight, dramatic clouds, \
@@ -115,14 +117,6 @@ fn env_u32(name: &str, fallback: u32) -> u32 {
         .unwrap_or(fallback)
 }
 
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
-}
-
 fn tensors_of(path: &Path) -> BTreeMap<String, Tensor> {
     candle_gen::candle_core::safetensors::load(path, &Device::Cpu)
         .unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
@@ -161,7 +155,7 @@ fn the_ideogram_vae_is_the_flux2_fit_donor_tensor_for_tensor() {
     let ideogram_path = required_path("IDEOGRAM_PREVIEW_VAE");
     let donor_path = required_path("IDEOGRAM_FLUX2_FIT_VAE");
 
-    let (ideogram_sha, donor_sha) = (sha256_of(&ideogram_path), sha256_of(&donor_path));
+    let (ideogram_sha, donor_sha) = (sha256_file(&ideogram_path), sha256_file(&donor_path));
     eprintln!(
         "  ideogram vae/ {ideogram_sha}  {}",
         ideogram_path.display()
@@ -273,13 +267,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(name);
-    let buf: image::RgbImage = image::ImageBuffer::from_raw(width, height, pixels.to_vec())
-        .expect("frame buffer matches its dimensions");
-    buf.save(&path)
-        .unwrap_or_else(|e| panic!("save {path:?}: {e}"));
+    let path = artifact_dir().join(name);
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  wrote {}", path.display());
 }
 

@@ -563,7 +563,7 @@ impl FluxControlNet {
         }
         // The same FLUX RoPE the base uses (axes_dim + theta from the base config), so the control
         // residuals share the base image-token positions.
-        let pe_embedder = EmbedNd::new(d.head_dim, base_cfg.theta, base_cfg.axes_dim.clone());
+        let pe_embedder = EmbedNd::new(base_cfg.theta, base_cfg.axes_dim.clone());
         Ok(Self {
             x_embedder,
             context_embedder,

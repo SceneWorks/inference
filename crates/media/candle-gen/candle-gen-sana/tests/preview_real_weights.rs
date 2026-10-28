@@ -56,6 +56,8 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress,
     WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 use safetensors::{Dtype, SafeTensors};
 
 const PROMPT: &str =
@@ -121,14 +123,6 @@ fn artifact_dir() -> PathBuf {
 
 // ── Provenance: each reuse is grounded in tensor bytes, per route ─────────────────────────────────
 
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
-}
-
 /// The `vae/diffusion_pytorch_model.safetensors` under a diffusers snapshot — the file
 /// `pipeline::resolve_component_files` selects and `DcAeDecoder::from_weights` is handed.
 ///
@@ -168,7 +162,7 @@ fn each_route_loads_the_vae_its_fit_was_measured_on() {
     let mut seen = Vec::new();
     for (id, var, expected) in SNAPSHOT_VARS {
         let vae = snapshot_vae(&required_path(var));
-        let sha = sha256_of(&vae);
+        let sha = sha256_file(&vae);
         let size = std::fs::metadata(&vae).expect("stat the VAE").len();
         eprintln!("  {id:<18} {}  {sha}  {size} bytes", vae.display());
         assert_eq!(
@@ -227,7 +221,7 @@ fn the_two_dc_aes_share_one_encoder_and_differ_only_in_the_decoder_tail() {
 
     // Re-pinned here rather than borrowed from the row above: this row must establish for itself that
     // the files it compared are the two it names.
-    let (base_sha, sprint_sha) = (sha256_of(&base_vae), sha256_of(&sprint_vae));
+    let (base_sha, sprint_sha) = (sha256_file(&base_vae), sha256_file(&sprint_vae));
     eprintln!("  base   vae/  {base_sha}");
     eprintln!("  sprint vae/  {sprint_sha}");
     assert_eq!(base_sha, BASE_VAE_SHA256, "not the base SANA DC-AE");
@@ -433,11 +427,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(format!("{name}.png"));
-    image::save_buffer(&path, pixels, width, height, image::ExtendedColorType::Rgb8)
-        .expect("save a PNG");
+    let path = artifact_dir().join(format!("{name}.png"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  saved {}", path.display());
 }
 

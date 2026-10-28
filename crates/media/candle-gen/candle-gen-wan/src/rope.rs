@@ -7,8 +7,7 @@
 //! `out[2k] = x[2k]·cos_k − x[2k+1]·sin_k`, `out[2k+1] = x[2k]·sin_k + x[2k+1]·cos_k` — exactly
 //! candle's interleaved `rope_i` over the de-duplicated half tables `cos_k`/`sin_k`.
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::candle_nn::rotary_emb::rope_i;
+use candle_gen::candle_core::{Device, Result, Tensor};
 
 use crate::config::TransformerConfig;
 
@@ -82,11 +81,7 @@ impl WanRope {
 
 /// Apply interleaved RoPE to `x` `[B, H, S, head_dim]` with `cos`/`sin` `[S, head_dim/2]`. Computed
 /// in f32 (cos/sin are f32), cast back to `x`'s dtype.
-pub fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let dtype = x.dtype();
-    let xf = x.to_dtype(DType::F32)?.contiguous()?;
-    rope_i(&xf, cos, sin)?.to_dtype(dtype)
-}
+pub use candle_gen::rope::apply_interleaved_rope as apply_rope;
 
 /// Wan RoPE base (matches [`WanRope::new`]'s `rope_theta` for the shipped configs). Used by the
 /// source-id phase, which reads `head_dim` directly rather than a `TransformerConfig`.

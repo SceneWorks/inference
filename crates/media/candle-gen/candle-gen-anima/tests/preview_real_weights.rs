@@ -42,6 +42,8 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 use candle_gen_anima::Variant;
 
 const PROMPT: &str =
@@ -96,14 +98,6 @@ fn artifact_dir() -> PathBuf {
 
 // ── Provenance: the reuse is grounded in tensor bytes ─────────────────────────────────────────────
 
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
-}
-
 /// The single `.safetensors` under an Anima snapshot's `split_files/vae/` — the file
 /// `crate::vae::load_vae` is handed, for every variant.
 fn anima_vae_file(root: &Path) -> PathBuf {
@@ -128,7 +122,7 @@ fn anima_vae_file(root: &Path) -> PathBuf {
 fn anima_vae_bytes_are_the_pinned_snapshot() {
     let root = required_path("ANIMA_PREVIEW_DIR");
     let vae = anima_vae_file(&root);
-    let sha = sha256_of(&vae);
+    let sha = sha256_file(&vae);
     let size = std::fs::metadata(&vae).expect("stat the VAE").len();
     eprintln!("anima vae/  {sha}  {size} bytes  {}", vae.display());
     assert_eq!(
@@ -169,8 +163,8 @@ fn anima_vae_matches_the_qwen_fit_vae_tensor_for_tensor() {
     // Re-pinned here rather than borrowed from the row above: this row must establish for itself that
     // the file it compared is the file Anima loads.
     let anima_vae = anima_vae_file(&root);
-    let anima_sha = sha256_of(&anima_vae);
-    let qwen_sha = sha256_of(&qwen_vae);
+    let anima_sha = sha256_file(&anima_vae);
+    let qwen_sha = sha256_file(&qwen_vae);
     eprintln!("anima     vae/  {anima_sha}  {}", anima_vae.display());
     eprintln!("qwen-fit  vae/  {qwen_sha}  {}", qwen_vae.display());
     assert_eq!(
@@ -313,11 +307,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(format!("{name}.png"));
-    image::save_buffer(&path, pixels, width, height, image::ExtendedColorType::Rgb8)
-        .expect("save a PNG");
+    let path = artifact_dir().join(format!("{name}.png"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  saved {}", path.display());
 }
 

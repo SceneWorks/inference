@@ -48,6 +48,8 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress,
     WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 
 const PROMPT: &str =
     "A weathered lighthouse on a rocky headland at golden hour, warm sunlight, dramatic clouds, \
@@ -94,14 +96,6 @@ fn artifact_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("sdxl_preview_sc16954"))
 }
 
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
-}
-
 // ── Provenance: the reuse is grounded in tensor bytes ─────────────────────────────────────────────
 
 /// The reuse gate. SDXL and Kolors are one latent space because they ship **one VAE file**, and it is
@@ -118,7 +112,7 @@ fn the_sdxl_family_ships_one_vae_file() {
         let size = std::fs::metadata(path)
             .unwrap_or_else(|e| panic!("stat {path:?}: {e}"))
             .len();
-        let digest = sha256_of(path);
+        let digest = sha256_file(path);
         eprintln!("  {label}: {digest}  {size} bytes  {}", path.display());
         assert_eq!(
             size, 167_335_342,
@@ -161,7 +155,7 @@ fn the_sdxl_family_ships_one_vae_file() {
 #[ignore = "needs SDXL_VAE_FP16_FIX_DIR; run with --ignored"]
 fn the_decode_vae_is_a_different_checkpoint_and_that_is_recorded() {
     let fix = required_path("SDXL_VAE_FP16_FIX_DIR").join("diffusion_pytorch_model.safetensors");
-    let digest = sha256_of(&fix);
+    let digest = sha256_file(&fix);
     eprintln!("  vae_fp16_fix: {digest}  {}", fix.display());
     assert_eq!(
         digest, SDXL_VAE_FP16_FIX_SHA256,
@@ -228,13 +222,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(name);
-    let buf: image::RgbImage = image::ImageBuffer::from_raw(width, height, pixels.to_vec())
-        .expect("frame buffer matches its dimensions");
-    buf.save(&path)
-        .unwrap_or_else(|e| panic!("save {path:?}: {e}"));
+    let path = artifact_dir().join(name);
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  wrote {}", path.display());
 }
 

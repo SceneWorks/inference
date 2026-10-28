@@ -547,7 +547,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_guidance: true,
             conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
             // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
-            samplers: vec!["uni_pc", "euler", "unipc"],
+            samplers: vec!["uni_pc", "euler", "dpmpp_2m", "unipc", "dpmpp2m"],
             min_size: 16,
             max_size: 1280,
             max_count: 1,

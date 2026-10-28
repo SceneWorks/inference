@@ -5,15 +5,14 @@
 //! (`axes_dims_rope = (8, 28, 28)`, Σ = 64 = `head_dim`, Σ/2 = 32 complex pairs vs Qwen's 16/56/56).
 //! θ = 10000, `scale_rope = True` (height/width positions are centered). Frequencies and angles are
 //! computed **host-side** in f32; application is **interleaved** (lanes `2i`/`2i+1` are the real/imag
-//! pair) via candle's [`rope_i`], reproducing the reference's complex `view_as_complex · freqs_cis`.
+//! pair) via candle's `rope_i`, reproducing the reference's complex `view_as_complex · freqs_cis`.
 //!
 //! - **Image tokens** at grid `(f, h, w)`: the frame axis uses position `f`, height/width use
 //!   **centered** positions `h − (lat_h − lat_h/2)` / `w − (lat_w − lat_w/2)`.
 //! - **Text tokens** at index `t`: a single scalar position `txt_base + t`
 //!   (`txt_base = max(lat_h/2, lat_w/2)`) applied across **all 32** pair-frequencies.
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::candle_nn::rotary_emb::rope_i;
+use candle_gen::candle_core::{Device, Result, Tensor};
 
 /// Lens 3-axis RoPE table builder. `θ = 10000`, `axes_dim = (8, 28, 28)`.
 pub struct LensRope {
@@ -122,15 +121,12 @@ impl LensRope {
 
 /// Apply interleaved complex RoPE to `x` `[B, H, S, head_dim]` with `cos`/`sin` `[S, head_dim/2]`.
 /// The rotation is computed in f32 and cast back to `x`'s dtype.
-pub fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let dtype = x.dtype();
-    let xf = x.to_dtype(DType::F32)?.contiguous()?;
-    rope_i(&xf, cos, sin)?.to_dtype(dtype)
-}
+pub use candle_gen::rope::apply_interleaved_rope as apply_rope;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::DType;
 
     #[test]
     fn omega_is_32_wide_with_band_layout() {

@@ -14,9 +14,7 @@
 //! addition — gated by `te_qk_norm` (klein on, dev off).
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::{
-    ops::softmax_last_dim, rms_norm, rotary_emb::rope, Module, RmsNorm, VarBuilder,
-};
+use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Module, RmsNorm, VarBuilder};
 use candle_gen::gen_core::Quant;
 use candle_llm::decode::{
     generate_speculative_with, FinishReason, GenerationConfig, LogitsScope, NoProposer,
@@ -28,59 +26,8 @@ use candle_llm::primitives::{
 
 use crate::config::Flux2Config;
 use crate::quant::{rms_norm_to, QEmbedding, QLinear};
-
-/// HF half-split RoPE table (θ over `head_dim`), built once for the max sequence length.
-struct Rotary {
-    cos: Tensor,
-    sin: Tensor,
-}
-
-impl Rotary {
-    fn new(head_dim: usize, theta: f32, max_seq: usize, device: &Device) -> Result<Self> {
-        let inv_freq: Vec<f32> = (0..head_dim)
-            .step_by(2)
-            .map(|i| 1f32 / theta.powf(i as f32 / head_dim as f32))
-            .collect();
-        let n = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, n), device)?;
-        let t = Tensor::arange(0u32, max_seq as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq, 1))?;
-        let freqs = t.matmul(&inv_freq)?; // (max_seq, head_dim/2)
-        Ok(Self {
-            cos: freqs.cos()?,
-            sin: freqs.sin()?,
-        })
-    }
-
-    /// Rows of the precomputed cos/sin tables — the max sequence length this Rotary was sized for.
-    /// A `narrow(0, 0, seq)` beyond this fails opaquely, so [`Flux2PromptEncoder::prompt_embeds`]
-    /// validates `seq` against it up front (sc-9386, F-077 sibling).
-    fn max_seq(&self) -> Result<usize> {
-        self.cos.dim(0)
-    }
-
-    fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        self.apply_at(q, k, 0)
-    }
-
-    fn apply_at(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
-        let (_, _, seq, _) = q.dims4()?;
-        let cos = self.cos.narrow(0, offset, seq)?;
-        let sin = self.sin.narrow(0, offset, seq)?;
-        let q = rope(&q.contiguous()?, &cos, &sin)?;
-        let k = rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q, k))
-    }
-
-    /// Move the precomputed RoPE tables to `device` (CPU-staged dev quant path).
-    fn to_device(&self, device: &Device) -> Result<Self> {
-        Ok(Self {
-            cos: self.cos.to_device(device)?,
-            sin: self.sin.to_device(device)?,
-        })
-    }
-}
+use candle_gen::attention::repeat_kv;
+use candle_gen::grounding::Rotary;
 
 struct Attention {
     q_proj: QLinear,
@@ -226,17 +173,6 @@ impl Attention {
         self.o_proj
             .forward(&o.transpose(1, 2)?.reshape((b, q_len, nh * hd))?)
     }
-}
-
-/// Repeat each kv head `groups` times along the head axis ([B, nkv, S, D] → [B, nkv·groups, S, D]).
-fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let (b, nkv, s, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, nkv, groups, s, d))?
-        .reshape((b, nkv * groups, s, d))
 }
 
 struct Mlp {
@@ -490,7 +426,7 @@ impl Flux2PromptEncoder {
     }
 
     pub(crate) fn device(&self) -> &Device {
-        self.rotary.cos.device()
+        self.rotary.device()
     }
 
     fn decode_logits_from_embeds(

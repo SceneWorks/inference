@@ -25,6 +25,7 @@ use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, CancelFlag, Image, LoadSpec, TrainingConfig, TrainingItem,
     TrainingProgress, TrainingRequest, WeightsSource,
 };
+use candle_gen::testkit::save_image_png;
 use candle_gen::testkit::{probe_gpu, used_mib, VramProbe};
 use candle_gen_iris::train::render_preview_with;
 use candle_gen_iris::{load_backbone_with_adapters, IrisTextEncoder};
@@ -36,13 +37,6 @@ const SEED: u64 = 3;
 
 fn env_dir(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
-}
-
-fn save_png(img: &Image, path: &Path) {
-    image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
-        .unwrap()
-        .save(path)
-        .unwrap();
 }
 
 /// `IRIS_TRAIN_DATA`'s PNGs, or four crops / flips of the repository photo written under `out`.
@@ -160,7 +154,7 @@ fn real_lora_trains_exports_and_renders() {
                 last = std::time::Instant::now();
             }
             TrainingProgress::Sample { step, image, .. } => {
-                save_png(&image, &out.join(format!("train_preview_step{step}.png")));
+                save_image_png(&out.join(format!("train_preview_step{step}.png")), &image);
                 eprintln!(
                     "[[IRIS_CANDLE_TRAIN]] preview at step {step} ({:.1}s)",
                     last.elapsed().as_secs_f32()
@@ -243,13 +237,13 @@ fn real_lora_trains_exports_and_renders() {
     };
     let t = std::time::Instant::now();
     let before = render(&[]);
-    save_png(&before, &out.join("base_256.png"));
+    save_image_png(&out.join("base_256.png"), &before);
     let after = render(&[AdapterSpec::new(
         res.adapter_path.clone(),
         1.0,
         AdapterKind::Lora,
     )]);
-    save_png(&after, &out.join("lora_adapted_256.png"));
+    save_image_png(&out.join("lora_adapted_256.png"), &after);
     if let (Some(p), Some(phase)) = (probe.as_mut(), render_phase) {
         p.end_gen(phase);
     }

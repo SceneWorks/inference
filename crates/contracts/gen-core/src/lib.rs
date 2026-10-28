@@ -47,6 +47,7 @@ pub mod control;
 pub mod convrot_int8;
 pub mod duration_head;
 pub mod encoder_contract;
+pub mod env_flag;
 pub mod error;
 pub mod execution_domains;
 pub mod exr_io;
@@ -163,6 +164,7 @@ pub use encoder_contract::{
     TextEncoderPlanningFacts, TextEncoderSourceLayout, ValidatedEncoderSource,
     ValidatedTokenizerSource,
 };
+pub use env_flag::env_flag;
 pub use error::{Error, Result};
 pub use execution_domains::{
     CfgBatching, CfgBatchingDomain, ExecutionSurface, ExecutionValueDomain, FfnChunk,
@@ -221,10 +223,10 @@ pub use memory_strategy::{
     adapter_stack_identity, adapter_stack_resident_bytes, adapter_stack_upcast_resident_bytes,
     default_memory_strategy_safety_check, default_registered_memory_strategy_safety_check,
     standard_memory_behavior_context, standard_memory_strategy_safety_check,
-    validate_calibration_fingerprint, AdapterResidencyMode, LokrKroneckerDims,
-    MemoryArchitectureFacts, MemoryAssetFacts, MemoryBackend, MemoryBackendRealization,
-    MemoryBehaviorRoute, MemoryBudget, MemoryCacheSemantics, MemoryCacheState,
-    MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
+    validate_bounded_decode_params, validate_calibration_fingerprint, AdapterResidencyMode,
+    LokrKroneckerDims, MemoryArchitectureFacts, MemoryAssetFacts, MemoryBackend,
+    MemoryBackendRealization, MemoryBehaviorRoute, MemoryBudget, MemoryCacheSemantics,
+    MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
     MemoryComponentResidency, MemoryConformanceState, MemoryDecodeArtifactIdentity,
     MemoryDecodeGeometryPolicy, MemoryDecodePolicyQuery, MemoryDecodeQualityDisposition,
     MemoryDecodeQualityFixture, MemoryDecodeQualityRuntimeIdentity, MemoryDecodeRouteDomain,

@@ -145,12 +145,11 @@ impl QLinear {
 
     /// Whether this projection loaded directly from the MLX-packed tier (the packed path) — used by the
     /// tests to assert a packed tier fired the packed path (not a silent dense fallback).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_packed(&self) -> bool {
         matches!(&self.base, QLinearBase::Adapt(linear) if linear.is_packed())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn operator_kind(&self) -> AdvancedOperatorKind {
         match &self.base {
             QLinearBase::Adapt(linear) if linear.is_packed() => AdvancedOperatorKind::MlxAffine,
@@ -418,6 +417,8 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
 pub struct QEmbedding {
     /// The resolved `[vocab, hidden]` table at the vb dtype (dequantized once if the tier packs it).
     table: Tensor,
+    /// Whether the table loaded from the packed tier — observed only by the tests.
+    #[cfg(test)]
     packed: bool,
 }
 
@@ -435,7 +436,7 @@ impl QEmbedding {
     }
 
     /// Whether the table loaded from the MLX-packed tier (vs a dense `{key}.weight`).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_packed(&self) -> bool {
         self.packed
     }
@@ -455,6 +456,7 @@ pub fn qembedding(vb: &VarBuilder, key: &str, vocab: usize, hidden: usize) -> Re
         let table = e.forward(&idx)?;
         return Ok(QEmbedding {
             table,
+            #[cfg(test)]
             packed: true,
         });
     }
@@ -463,6 +465,7 @@ pub fn qembedding(vb: &VarBuilder, key: &str, vocab: usize, hidden: usize) -> Re
         .to_dtype(vb.dtype())?;
     Ok(QEmbedding {
         table,
+        #[cfg(test)]
         packed: false,
     })
 }

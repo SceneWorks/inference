@@ -192,7 +192,7 @@ impl ZImageAttention {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn forward(
         &self,
         hidden_states: &Tensor,
@@ -460,6 +460,7 @@ pub struct ZImageTransformer2DModel {
     pub(crate) cap_embedder_linear: candle_nn::Linear,
     pub(crate) x_embedder: candle_nn::Linear,
     pub(crate) final_layer: FinalLayer,
+    // Never read: loaded only so `vb.get` enforces the key is present on load.
     #[allow(dead_code)]
     x_pad_token: Tensor,
     #[allow(dead_code)]

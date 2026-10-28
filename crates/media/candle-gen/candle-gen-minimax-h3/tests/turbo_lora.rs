@@ -45,6 +45,7 @@ use candle_gen_minimax_h3::adapters::{
 use candle_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig};
 use sha2::{Digest, Sha256};
 
+use candle_gen::testkit::sha256_file;
 use common::{dit_fixture_config, weights, Golden, DIT_FIXTURE};
 
 /// The published rank — every one of the seven turbo files is rank 128. Used verbatim in the tiny
@@ -2207,15 +2208,6 @@ fn trainer_lora_path() -> PathBuf {
     path
 }
 
-fn sha256_of(path: &Path) -> String {
-    let mut file =
-        File::open(path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
-    let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut hasher)
-        .unwrap_or_else(|error| panic!("hash {}: {error}", path.display()));
-    format!("{:x}", hasher.finalize())
-}
-
 fn assert_optional_trainer_artifact_identity(path: &Path, bytes: u64, sha256: &str) {
     if let Ok(expected) = std::env::var(TRAINER_LORA_BYTES_ENV) {
         let expected = expected.parse::<u64>().unwrap_or_else(|error| {
@@ -2411,7 +2403,7 @@ fn exact_h3_trainer_file_receipt() {
     let bytes = std::fs::metadata(&path)
         .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
         .len();
-    let sha256 = sha256_of(&path);
+    let sha256 = sha256_file(&path);
     assert_optional_trainer_artifact_identity(&path, bytes, &sha256);
 
     let adapter = candle_gen::train::merge::read_adapter(&path)
@@ -2492,7 +2484,7 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
     let bytes = std::fs::metadata(&lora)
         .unwrap_or_else(|error| panic!("stat {}: {error}", lora.display()))
         .len();
-    let sha256 = sha256_of(&lora);
+    let sha256 = sha256_file(&lora);
     assert_sc21028_trainer_artifact_identity(&lora, bytes, &sha256);
 
     let dit_dir = trainer_dit_path();
@@ -2507,7 +2499,7 @@ Configuration,
 origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
 )
         .unwrap_or_else(|error| panic!("read {}: {error}", config_path.display()));
-    let config_sha256 = sha256_of(&config_path);
+    let config_sha256 = sha256_file(&config_path);
     let config_json: serde_json::Value =
         serde_json::from_str(&config_text).expect("parse transformer config JSON");
     let tier = config_json

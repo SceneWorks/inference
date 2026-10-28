@@ -869,23 +869,13 @@ fn validate_decode(
     edge: Option<u32>,
     overlap: Option<u32>,
 ) -> gen_core::Result<()> {
-    let edge = edge.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!(
-            "{provider_id}: bounded decode requires an explicit tile edge"
-        ))
-    })?;
-    let overlap = overlap.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!(
-            "{provider_id}: bounded decode requires an explicit overlap"
-        ))
-    })?;
-    if !DECODE_TILE_EDGES.contains(&edge) || overlap != DECODE_OVERLAP {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id}: decode geometry {edge}/{overlap} is outside the published domain \
-             {DECODE_TILE_EDGES:?} at overlap {DECODE_OVERLAP}"
-        )));
-    }
-    Ok(())
+    gen_core::validate_bounded_decode_params(
+        provider_id,
+        DECODE_TILE_EDGES,
+        DECODE_OVERLAP,
+        edge,
+        overlap,
+    )
 }
 
 /// The provider safety check: the shared handshake, then this route's own gate.

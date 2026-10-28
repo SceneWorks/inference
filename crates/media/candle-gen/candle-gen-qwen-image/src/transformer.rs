@@ -135,20 +135,8 @@ fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
 
 /// Sinusoidal timestep embedding `[1, dim]` from the raw sigma — the ×1000 scale is applied inside
 /// the argument (diffusers `timestep · 1000`); `[cos | sin]`, base 10000.
-fn timestep_embedding(sigma: f32, dim: usize, device: &Device) -> Result<Tensor> {
-    let half = dim / 2;
-    let ln = 10000f32.ln();
-    let mut cos = vec![0f32; half];
-    let mut sin = vec![0f32; half];
-    for k in 0..half {
-        let freq = (-ln * k as f32 / half as f32).exp();
-        let arg = sigma * 1000.0 * freq;
-        cos[k] = arg.cos();
-        sin[k] = arg.sin();
-    }
-    let cos = Tensor::from_vec(cos, (1, half), device)?;
-    let sin = Tensor::from_vec(sin, (1, half), device)?;
-    Tensor::cat(&[&cos, &sin], D::Minus1)
+fn timestep_embedding(t: f32, dim: usize, device: &Device) -> Result<Tensor> {
+    candle_gen::rope::sinusoidal_timestep_embedding(t, dim, 1000.0, device)
 }
 
 /// SDPA over `[B,H,S,D]` q/k/v → `[B, S, H·D]`. scale = `head_dim^-0.5`. Delegates to the shared

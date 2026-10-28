@@ -12,25 +12,10 @@
 
 use std::path::Path;
 
+use crate::support::iou;
 use candle_gen::candle_core::Tensor;
 use candle_gen::default_device;
 use candle_gen_sam3::{Sam3ImageSegmenter, Weights};
-
-/// IoU of two binary `[h, w]` masks (any dtype with 0/1 values).
-fn iou(a: &Tensor, b: &Tensor) -> f32 {
-    let af = a.to_dtype(candle_gen::candle_core::DType::F32).unwrap();
-    let bf = b.to_dtype(candle_gen::candle_core::DType::F32).unwrap();
-    let scalar = |t: Tensor| t.sum_all().unwrap().to_scalar::<f32>().unwrap();
-    let inter = scalar((&af * &bf).unwrap());
-    let sa = scalar(af);
-    let sb = scalar(bf);
-    let union = sa + sb - inter;
-    if union <= 0.0 {
-        1.0
-    } else {
-        inter / union
-    }
-}
 
 #[test]
 #[ignore = "needs staged facebook/sam3 weights (SAM3_WEIGHTS) + SAM3_E2E_FIXTURE — sc-6248"]

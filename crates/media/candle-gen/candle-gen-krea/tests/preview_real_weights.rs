@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, WeightsSource,
 };
+use candle_gen::testkit::sha256_file;
 
 const PROMPT: &str =
     "A medium-shot photograph of a red fox sitting in a snowy forest at golden hour.";
@@ -71,14 +72,6 @@ fn artifact_dir() -> PathBuf {
 }
 
 // ── Provenance: the reuse is grounded in tensor bytes ─────────────────────────────────────────────
-
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the VAE file");
-    format!("{:x}", hasher.finalize())
-}
 
 /// The single `.safetensors` under a snapshot's `vae/` dir.
 fn vae_file(root: &Path) -> PathBuf {
@@ -153,7 +146,7 @@ fn krea_vae_bytes_are_the_pinned_shared_snapshot() {
     let turbo = required_path("KREA_TURBO_DIR");
 
     let turbo_vae = vae_file(&turbo);
-    let turbo_sha = sha256_of(&turbo_vae);
+    let turbo_sha = sha256_file(&turbo_vae);
     eprintln!("Krea Turbo vae/  {turbo_sha}  {}", turbo_vae.display());
     assert_eq!(
         turbo_sha, KREA_VAE_SHA256,
@@ -165,7 +158,7 @@ fn krea_vae_bytes_are_the_pinned_shared_snapshot() {
     // alone already carries the file every route loads.
     if let Some(raw) = env_path("KREA_RAW_DIR") {
         let raw_vae = vae_file(&raw);
-        let raw_sha = sha256_of(&raw_vae);
+        let raw_sha = sha256_file(&raw_vae);
         eprintln!("Krea Raw   vae/  {raw_sha}  {}", raw_vae.display());
         assert_eq!(
             raw_sha, KREA_VAE_SHA256,
@@ -195,14 +188,14 @@ fn krea_vae_matches_the_qwen_fit_vae_tensor_for_tensor() {
     // Re-pinned here rather than borrowed from the row above: this row must establish for itself that
     // the file it compared is the file Krea loads.
     let turbo_vae = vae_file(&turbo);
-    let turbo_sha = sha256_of(&turbo_vae);
+    let turbo_sha = sha256_file(&turbo_vae);
     eprintln!("Krea Turbo vae/  {turbo_sha}  {}", turbo_vae.display());
     assert_eq!(
         turbo_sha, KREA_VAE_SHA256,
         "the Krea Turbo VAE is not the file the reused fit was grounded against"
     );
 
-    let qwen_sha = sha256_of(&qwen_vae);
+    let qwen_sha = sha256_file(&qwen_vae);
     eprintln!("Qwen-Image vae/  {qwen_sha}  {}", qwen_vae.display());
     if qwen_sha != QWEN_IMAGE_MLX_VAE_SHA256 {
         // Not a failure: the comparison below is dtype-agnostic by design, so a different container

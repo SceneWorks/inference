@@ -35,6 +35,8 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress,
     WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 
 const PROMPT: &str =
     "A quiet teahouse courtyard at dusk with paper lanterns and a stone path, warm light, highly \
@@ -71,14 +73,6 @@ fn artifact_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("kolors_preview_sc16954"))
 }
 
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
-}
-
 // ── Provenance ────────────────────────────────────────────────────────────────────────────────────
 
 /// The reuse gate: Kolors' VAE **is** the SDXL fit VAE, byte for byte.
@@ -101,7 +95,7 @@ fn the_kolors_vae_is_the_sdxl_fit_vae() {
 
     let path = &files[0];
     let size = std::fs::metadata(path).expect("stat the vae").len();
-    let digest = sha256_of(path);
+    let digest = sha256_file(path);
     eprintln!("  kolors vae: {digest}  {size} bytes  {}", path.display());
     assert_eq!(size, 167_335_342, "kolors VAE size moved");
     assert_eq!(
@@ -169,13 +163,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(name);
-    let buf: image::RgbImage = image::ImageBuffer::from_raw(width, height, pixels.to_vec())
-        .expect("frame buffer matches its dimensions");
-    buf.save(&path)
-        .unwrap_or_else(|e| panic!("save {path:?}: {e}"));
+    let path = artifact_dir().join(name);
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  wrote {}", path.display());
 }
 

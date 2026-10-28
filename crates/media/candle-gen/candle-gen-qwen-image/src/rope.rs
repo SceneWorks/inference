@@ -10,8 +10,7 @@
 //!
 //! Application is **interleaved** (lanes `2i`/`2i+1` are the real/imag pair), via candle's `rope_i`.
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::candle_nn::rotary_emb::rope_i;
+use candle_gen::candle_core::{Device, Result, Tensor};
 
 use crate::config::TransformerConfig;
 
@@ -212,15 +211,12 @@ impl Default for RopeCache {
 }
 
 /// Apply interleaved RoPE to `x` `[B, H, S, head_dim]` with `cos`/`sin` `[S, head_dim/2]`.
-pub fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let dtype = x.dtype();
-    let xf = x.to_dtype(DType::F32)?.contiguous()?;
-    rope_i(&xf, cos, sin)?.to_dtype(dtype)
-}
+pub use candle_gen::rope::apply_interleaved_rope as apply_rope;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::DType;
 
     #[test]
     fn omega_is_64_wide_with_band_layout() {

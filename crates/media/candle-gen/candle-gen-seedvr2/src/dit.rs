@@ -708,7 +708,6 @@ impl MMAttention {
         let txt_mean = (txt_acc * (1.0 / nwin as f64))?.reshape((lt, h * hd))?;
         let txt_out = self.out_txt.forward(&txt_mean)?.reshape((1, lt, txt_dim))?;
 
-        let _ = self.window; // window used via cache; kept for parity with the reference config
         Ok((vid_out, txt_out))
     }
 

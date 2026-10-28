@@ -21,8 +21,6 @@
 //! dev-dependency feature: `candle-gen = { path = "...", features = ["testkit"] }` under
 //! `[dev-dependencies]`, or `candle-gen/testkit` in a test-only feature.
 
-#![allow(dead_code)]
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -339,6 +337,34 @@ pub fn write_ppm(path: &Path, img: &Image) {
     let mut out = format!("P6\n{} {}\n255\n", img.width, img.height).into_bytes();
     out.extend_from_slice(&img.pixels);
     std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+}
+
+/// SHA-256 of a file's bytes as lowercase hex, streamed (sc-27389: the real-weight tests' former
+/// per-file `sha256_of` copies).
+pub fn sha256_file(path: &Path) -> String {
+    let mut file =
+        std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .unwrap_or_else(|e| panic!("hash {}: {e}", path.display()));
+    format!("{:x}", hasher.finalize())
+}
+
+/// Write packed RGB8 `pixels` (`width×height`) as a PNG at `path`, creating its parent directory
+/// (sc-27389: the shared body of the real-weight tests' `save_png` helpers).
+pub fn save_rgb8_png(path: &Path, pixels: &[u8], width: u32, height: u32) {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    }
+    let buf: image::RgbImage = image::ImageBuffer::from_raw(width, height, pixels.to_vec())
+        .expect("frame buffer matches its dimensions");
+    buf.save(path)
+        .unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+}
+
+/// [`save_rgb8_png`] for an RGB8 [`Image`].
+pub fn save_image_png(path: &Path, img: &Image) {
+    save_rgb8_png(path, &img.pixels, img.width, img.height);
 }
 
 /// Mean absolute per-byte difference between two equal-size RGB renders (the

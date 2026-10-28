@@ -17,6 +17,7 @@
 //!   * **7B** — loads with zero missing tensors (the pixel-mode-RoPE config + key renames match the
 //!     real 7B checkpoint) and produces a faithful, sharper-than-bicubic upscale.
 
+use crate::support::pearson;
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{imageops, Image, Quant};
 use candle_gen_seedvr2::config::DitConfig;
@@ -45,23 +46,6 @@ fn synth_lr(side: usize) -> Image {
         height: side as u32,
         pixels,
     }
-}
-
-/// Pearson correlation over two equal-length sequences.
-fn pearson(a: &[f32], b: &[f32]) -> f64 {
-    let n = a.len() as f64;
-    let (ma, mb) = (
-        a.iter().map(|&v| v as f64).sum::<f64>() / n,
-        b.iter().map(|&v| v as f64).sum::<f64>() / n,
-    );
-    let (mut cov, mut va, mut vb) = (0f64, 0f64, 0f64);
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let (dx, dy) = (x as f64 - ma, y as f64 - mb);
-        cov += dx * dy;
-        va += dx * dx;
-        vb += dy * dy;
-    }
-    cov / (va.sqrt() * vb.sqrt()).max(1e-12)
 }
 
 /// Mean |gradient| (a crude sharpness proxy) of an interleaved RGB8-as-f32 buffer.

@@ -35,6 +35,8 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, PreviewFrame, PreviewSink,
     WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 use candle_gen_qwen_image::{
     QwenEdit, QwenEditPaths, QwenEditRequest, QwenFunControl, QwenFunControlPaths,
     QwenFunControlRequest,
@@ -103,14 +105,6 @@ fn artifact_dir() -> PathBuf {
 
 // ── Provenance: the reuse is grounded in tensor bytes ─────────────────────────────────────────────
 
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
-}
-
 /// The single `.safetensors` under a snapshot's `vae/` dir — the file
 /// `crate::vae::QwenVae::new` is handed, on every lane.
 fn vae_file(root: &Path) -> PathBuf {
@@ -144,8 +138,8 @@ fn read_latent_stats(root: &Path) -> (Vec<f64>, Vec<f64>) {
 /// defining the same normalized latent space the fit was measured in.
 fn assert_is_the_fit_donor_vae(label: &str, root: &Path) {
     let shard = vae_file(root);
-    let shard_sha = sha256_of(&shard);
-    let config_sha = sha256_of(&root.join("vae").join("config.json"));
+    let shard_sha = sha256_file(&shard);
+    let config_sha = sha256_file(&root.join("vae").join("config.json"));
     eprintln!("{label} vae/         {shard_sha}  {}", shard.display());
     eprintln!("{label} vae/config   {config_sha}");
     assert_eq!(
@@ -241,11 +235,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(format!("{name}.png"));
-    image::save_buffer(&path, pixels, width, height, image::ExtendedColorType::Rgb8)
-        .expect("save a PNG");
+    let path = artifact_dir().join(format!("{name}.png"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  saved {}", path.display());
 }
 

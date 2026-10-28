@@ -91,6 +91,10 @@ pub use attention::{
     ATTN_SCORES_BUDGET,
 };
 
+// Shared interleaved-RoPE application + sinusoidal timestep embedding (sc-27286), hoisted from the
+// byte-identical lens / qwen-image / flux2 / wan copies.
+pub mod rope;
+
 // Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count
 // to u32, so a full-resolution VAE conv at 2048² silently fills only its first ~430 output rows. The
 // guard chunks over output rows past `CONV_IM2COL_BUDGET`; below it the call is the plain `Conv2d`.

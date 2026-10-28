@@ -1379,12 +1379,7 @@ pub(crate) fn safety_check(
             reason: "sdxl: optimized context has no exact artifact seal".into(),
         };
     };
-    match validate_context(contract, context, seal) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_result(validate_context(contract, context, seal))
 }
 
 pub(crate) fn request_scope(
@@ -1457,12 +1452,7 @@ pub(crate) fn registered_safety_check(
     } else {
         SdxlArtifactSeal::capture(spec).and_then(|seal| validate_context(contract, context, &seal))
     };
-    match result {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_result(result)
 }
 
 /// Every route/mode the registered SDXL surface advertises, as executable behavior witnesses.

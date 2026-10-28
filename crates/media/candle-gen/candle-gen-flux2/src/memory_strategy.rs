@@ -993,12 +993,7 @@ pub fn admission_safety_check(
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    match validate_context(contract, context, loaded_quant) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_result(validate_context(contract, context, loaded_quant))
 }
 
 pub(crate) fn validate_registered_generator_context(

@@ -40,6 +40,8 @@ use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress,
     WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 
 const PROMPT: &str =
     "A weathered lighthouse on a rocky headland at golden hour, warm sunlight, dramatic clouds, \
@@ -81,14 +83,6 @@ fn artifact_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("chroma_preview_sc16956"))
 }
 
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
-}
-
 /// **The reuse gate**, taken from the very snapshot the render below loads rather than from a list of
 /// paths: the file this Chroma tier decodes through is the FLUX.1 VAE, byte for byte.
 #[test]
@@ -102,7 +96,7 @@ fn the_chroma_snapshot_ships_the_flux1_vae() {
         "{} is missing — the snapshot under test does not carry the VAE this row measures",
         vae.display()
     );
-    let sha = sha256_of(&vae);
+    let sha = sha256_file(&vae);
     eprintln!("  chroma vae: {sha}  {}", vae.display());
     assert_eq!(
         sha, FLUX1_VAE_SHA256,
@@ -169,12 +163,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(dir: &Path, pixels: &[u8], width: u32, height: u32, name: &str) {
-    std::fs::create_dir_all(dir).expect("create the artifact dir");
     let path = dir.join(name);
-    let buf: image::RgbImage = image::ImageBuffer::from_raw(width, height, pixels.to_vec())
-        .expect("frame buffer matches its dimensions");
-    buf.save(&path)
-        .unwrap_or_else(|e| panic!("save {path:?}: {e}"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  wrote {}", path.display());
 }
 

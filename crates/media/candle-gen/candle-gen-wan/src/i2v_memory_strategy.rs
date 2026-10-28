@@ -137,12 +137,9 @@ pub fn safety_check(
     prepared: &PreparedWanI2vMemory,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match gen_core::wan_i2v_memory::validate_context(prepared, context) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_result(gen_core::wan_i2v_memory::validate_context(
+        prepared, context,
+    ))
 }
 
 struct WanI2vRequestScope {
@@ -381,12 +378,7 @@ fn a14b_safety_check(
         prepare(spec, provider_id)
             .and_then(|prepared| gen_core::wan_i2v_memory::validate_context(&prepared, context))
     };
-    match decision {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_result(decision)
 }
 
 fn a14b_valid_fixtures(

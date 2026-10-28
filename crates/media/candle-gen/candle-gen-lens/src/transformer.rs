@@ -181,20 +181,8 @@ fn attention(
 
 /// Sinusoidal timestep embedding `[1, dim]` from the raw sigma (diffusers `Timesteps(dim,
 /// flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)`): arg `= σ·1000·freq`, `[cos | sin]`.
-fn timestep_embedding(sigma: f32, dim: usize, device: &Device) -> Result<Tensor> {
-    let half = dim / 2;
-    let ln = 10000f32.ln();
-    let mut cos = vec![0f32; half];
-    let mut sin = vec![0f32; half];
-    for k in 0..half {
-        let freq = (-ln * k as f32 / half as f32).exp();
-        let arg = sigma * 1000.0 * freq;
-        cos[k] = arg.cos();
-        sin[k] = arg.sin();
-    }
-    let cos = Tensor::from_vec(cos, (1, half), device)?;
-    let sin = Tensor::from_vec(sin, (1, half), device)?;
-    Tensor::cat(&[&cos, &sin], D::Minus1)
+fn timestep_embedding(t: f32, dim: usize, device: &Device) -> Result<Tensor> {
+    candle_gen::rope::sinusoidal_timestep_embedding(t, dim, 1000.0, device)
 }
 
 /// `temb = linear_2(silu(linear_1(proj(t))))`, `[1] → [1, inner]`. Frozen + composable, so the

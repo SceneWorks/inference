@@ -157,9 +157,9 @@ impl Components {
 /// Read by BOTH the load path and [`component_footprint`], so the footprint sizes the file the loader
 /// will actually pick — including under the env escapes (sc-12397).
 fn dense_dtype() -> DType {
-    if std::env::var("SVD_FORCE_F16").is_ok() {
+    if candle_gen::gen_core::env_flag("SVD_FORCE_F16") {
         DType::F16
-    } else if std::env::var("SVD_FORCE_BF16").is_ok() {
+    } else if candle_gen::gen_core::env_flag("SVD_FORCE_BF16") {
         DType::BF16
     } else {
         DType::F32

@@ -60,6 +60,8 @@ use candle_gen::gen_core::{
     GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame,
     PreviewSink, Progress, WeightsSource,
 };
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 
 const PROMPT: &str =
     "A weathered lighthouse on a rocky headland at golden hour, warm sunlight, dramatic clouds, \
@@ -112,14 +114,6 @@ fn env_u32(name: &str, fallback: u32) -> u32 {
 fn artifact_dir() -> PathBuf {
     env_path("ZIMAGE_PREVIEW_ARTIFACT_DIR")
         .unwrap_or_else(|| std::env::temp_dir().join("z_image_preview_sc16957"))
-}
-
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
 }
 
 /// Load a `.safetensors` file's tensors, keyed and ordered by name.
@@ -211,7 +205,7 @@ fn the_committed_fit_donor_is_the_shipped_z_image_vae() {
             167_666_902,
         ),
     ] {
-        let sha = sha256_of(path);
+        let sha = sha256_file(path);
         eprintln!("  {label:<25}: {sha}  {}", path.display());
         assert_eq!(
             sha, expected,
@@ -262,7 +256,7 @@ fn the_z_image_vae_is_the_flux1_one() {
     let z_path = required_path("ZIMAGE_DIFFUSERS_VAE");
     let flux_path = required_path("ZIMAGE_FLUX1_VAE");
 
-    let (z_sha, flux_sha) = (sha256_of(&z_path), sha256_of(&flux_path));
+    let (z_sha, flux_sha) = (sha256_file(&z_path), sha256_file(&flux_path));
     eprintln!("  z-image vae: {z_sha}  {}", z_path.display());
     eprintln!("  flux1   vae: {flux_sha}  {}", flux_path.display());
     assert_eq!(z_sha, DIFFUSERS_VAE_SHA256, "the staged Z-Image VAE moved");
@@ -353,12 +347,8 @@ fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn save_png(dir: &Path, pixels: &[u8], width: u32, height: u32, name: &str) {
-    std::fs::create_dir_all(dir).expect("create the artifact dir");
     let path = dir.join(name);
-    let buf: image::RgbImage = image::ImageBuffer::from_raw(width, height, pixels.to_vec())
-        .expect("frame buffer matches its dimensions");
-    buf.save(&path)
-        .unwrap_or_else(|e| panic!("save {path:?}: {e}"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  wrote {}", path.display());
 }
 
@@ -841,7 +831,7 @@ fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
 /// * **Base** (`control::generate_base`) drives `run_flow_sampler` with a hook, under real CFG.
 ///
 /// Both project the target latent only: the 33-channel control context is injected inside
-/// `forward_control` and never becomes part of the tensor the loop integrates. A strip at latent
+/// `forward_control_prepared` and never becomes part of the tensor the loop integrates. A strip at latent
 /// resolution with 16-channel-fit colours is what that looks like from outside — a leaked context
 /// would fail the layout gate and produce no frames at all.
 #[test]

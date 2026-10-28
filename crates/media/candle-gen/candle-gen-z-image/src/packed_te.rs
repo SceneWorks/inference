@@ -23,6 +23,7 @@ use candle_gen::candle_nn::{Activation, RmsNorm, VarBuilder};
 use candle_transformers::models::z_image::text_encoder::TextEncoderConfig;
 
 use crate::quant::{QEmbedding, QLinear};
+use candle_gen::attention::repeat_kv;
 
 // ==================== Rotary Embedding (copied verbatim — no weights) ====================
 
@@ -108,16 +109,6 @@ impl Mlp {
 
 // ==================== Attention (packed seam) ====================
 
-fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        Ok(x)
-    } else {
-        let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
-        x.unsqueeze(2)?
-            .broadcast_as((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
-            .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
-    }
-}
 struct Attention {
     q_proj: QLinear,
     k_proj: QLinear,
@@ -213,8 +204,8 @@ impl Attention {
 
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
 
-        let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
+        let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
