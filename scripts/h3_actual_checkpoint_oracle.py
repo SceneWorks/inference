@@ -916,17 +916,22 @@ def run(args: argparse.Namespace) -> int:
         tensors = read_selected_safetensors(args.selected_tensors)
         receipt["producer_provenance"] = frozen_provenance()
         config = spec.get("dit")
-        w4 = load_frozen(FROZEN_W4A8)
-        pruned = None
-        pruned_ns = None
-        oracle_cases = []
+        backend = spec.get("backend", "both")
+        # Bind every case's selection before importing a frozen producer: an input refusal
+        # (missing or mismatched selection) must not depend on whether torch can load.
+        bound = []
         for case in spec["cases"]:
-            backend = spec.get("backend", "both")
             if case["kind"] in (KIND_INTERPOLATION, KIND_REDUCED) and not isinstance(config, dict):
                 raise Refusal("spec_malformed", "pruned cases require spec.dit config")
             names = selected_raw_names(case, backend, config or {})
             entries = selected_entries(names, tensors)
             validate_selection_binding(entries, artifact_header, case["id"])
+            bound.append((case, entries))
+        w4 = load_frozen(FROZEN_W4A8)
+        pruned = None
+        pruned_ns = None
+        oracle_cases = []
+        for case, entries in bound:
             kind = case["kind"]
             if kind == KIND_W4A8:
                 rows = w4a8_rows(case, tensors, w4)

@@ -16,6 +16,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# The W4A8/ConvRot replay authority is the frozen producer, which imports torch at module load;
+# it cannot be edited (hash-pinned), so tests that drive it need torch. Input-refusal tests do not:
+# the bridge binds every selection before importing a producer.
+TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
+
 BRIDGE = Path(__file__).resolve().parents[1] / "h3_actual_checkpoint_oracle.py"
 SPEC = importlib.util.spec_from_file_location("h3_actual_checkpoint_oracle", BRIDGE)
 BRIDGE_MODULE = importlib.util.module_from_spec(SPEC)
@@ -88,7 +93,7 @@ def make_manifest(root: Path, cases: list[dict], artifact_tensors=None) -> tuple
         "parent_receipt_sha256": hashlib.sha256(parent.read_bytes()).hexdigest(),
     }
     staging_path = root / "staging-projection.json"
-    staging_path.write_text(json.dumps(staging))
+    staging_path.write_text(json.dumps(staging), encoding="utf-8")
     manifest = {
         "schema": BRIDGE_MODULE.MANIFEST_SCHEMA,
         "schema_version": 1,
@@ -102,7 +107,7 @@ def make_manifest(root: Path, cases: list[dict], artifact_tensors=None) -> tuple
         "cases": cases,
     }
     manifest_path = root / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest))
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return manifest_path, artifact
 
 
@@ -147,6 +152,7 @@ class ActualCheckpointBridgeTests(unittest.TestCase):
             BRIDGE_MODULE.validate_case(case, 0)
         self.assertEqual(caught.exception.code, "input_dtype")
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "the frozen W4A8 replay producer requires torch")
     def test_w4a8_wiring_calls_the_frozen_replay_functions(self) -> None:
         w4 = BRIDGE_MODULE.load_frozen(BRIDGE_MODULE.FROZEN_W4A8)
         tensors = tiny_w4_tensors()
@@ -169,6 +175,7 @@ class ActualCheckpointBridgeTests(unittest.TestCase):
         self.assertEqual(rows, expected)
         self.assertTrue(all(value == value for row in rows for value in row))
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "the frozen W4A8 replay producer requires torch")
     def test_convrot_refuses_non_256_group(self) -> None:
         w4 = BRIDGE_MODULE.load_frozen(BRIDGE_MODULE.FROZEN_W4A8)
         tensors = {
@@ -220,7 +227,7 @@ class ActualCheckpointBridgeTests(unittest.TestCase):
             )
             self.assertEqual(code, 2)
             self.assertFalse(output.exists())
-            written = json.loads(receipt.read_text())
+            written = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(written["status"], "refused")
             self.assertEqual(written["code"], "selection_missing")
             self.assertFalse(written["network_used"])
@@ -231,12 +238,12 @@ class ActualCheckpointBridgeTests(unittest.TestCase):
             root = Path(directory)
             manifest, _ = make_manifest(root, [tiny_w4_case()])
             staging_path = root / "staging-projection.json"
-            staging = json.loads(staging_path.read_text())
+            staging = json.loads(staging_path.read_text(encoding="utf-8"))
             staging["artifact_sha256"] = "cd" * 32
-            staging_path.write_text(json.dumps(staging))
-            manifest_json = json.loads(manifest.read_text())
+            staging_path.write_text(json.dumps(staging), encoding="utf-8")
+            manifest_json = json.loads(manifest.read_text(encoding="utf-8"))
             manifest_json["staging"]["receipt_sha256"] = hashlib.sha256(staging_path.read_bytes()).hexdigest()
-            manifest.write_text(json.dumps(manifest_json))
+            manifest.write_text(json.dumps(manifest_json), encoding="utf-8")
             selected = root / "selected.safetensors"
             write_safetensors(selected, tiny_w4_tensor_list())
             receipt = root / "receipt.json"
@@ -245,7 +252,7 @@ class ActualCheckpointBridgeTests(unittest.TestCase):
                  "--output", str(root / "oracle.json"), "--receipt", str(receipt)]
             )
             self.assertEqual(code, 2)
-            self.assertEqual(json.loads(receipt.read_text())["code"], "staging_binding_mismatch")
+            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["code"], "staging_binding_mismatch")
 
     def test_selected_tensor_must_match_actual_artifact_header(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -261,15 +268,15 @@ class ActualCheckpointBridgeTests(unittest.TestCase):
                  "--output", str(root / "oracle.json"), "--receipt", str(receipt)]
             )
             self.assertEqual(code, 2)
-            self.assertEqual(json.loads(receipt.read_text())["code"], "selection_binding_mismatch")
+            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["code"], "selection_binding_mismatch")
 
     def test_artifact_size_mismatch_refuses_before_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest, _ = make_manifest(root, [tiny_w4_case()])
-            manifest_json = json.loads(manifest.read_text())
+            manifest_json = json.loads(manifest.read_text(encoding="utf-8"))
             manifest_json["artifact"]["bytes"] += 1
-            manifest.write_text(json.dumps(manifest_json))
+            manifest.write_text(json.dumps(manifest_json), encoding="utf-8")
             selected = root / "selected.safetensors"
             write_safetensors(selected, tiny_w4_tensor_list())
             receipt = root / "receipt.json"
@@ -278,37 +285,37 @@ class ActualCheckpointBridgeTests(unittest.TestCase):
                  "--output", str(root / "oracle.json"), "--receipt", str(receipt)]
             )
             self.assertEqual(code, 2)
-            self.assertEqual(json.loads(receipt.read_text())["code"], "artifact_size_mismatch")
+            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["code"], "artifact_size_mismatch")
 
     def test_manifest_rejects_non_hex_sha_and_invalid_axes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest, _ = make_manifest(root, [tiny_w4_case()])
-            broken = json.loads(manifest.read_text())
+            broken = json.loads(manifest.read_text(encoding="utf-8"))
             broken["artifact"]["sha256"] = "z" * 64
-            manifest.write_text(json.dumps(broken))
+            manifest.write_text(json.dumps(broken), encoding="utf-8")
             with self.assertRaises(BRIDGE_MODULE.Refusal):
                 BRIDGE_MODULE.parse_spec(manifest)
 
             manifest, _ = make_manifest(root, [tiny_w4_case()])
-            broken = json.loads(manifest.read_text())
+            broken = json.loads(manifest.read_text(encoding="utf-8"))
             broken["cases"][0]["input"]["shape"] = [1, 0]
-            manifest.write_text(json.dumps(broken))
+            manifest.write_text(json.dumps(broken), encoding="utf-8")
             with self.assertRaises(BRIDGE_MODULE.Refusal) as caught:
                 BRIDGE_MODULE.parse_spec(manifest)
             self.assertEqual(caught.exception.code, "spec_malformed")
 
             manifest, _ = make_manifest(root, [tiny_w4_case()])
-            broken = json.loads(manifest.read_text())
+            broken = json.loads(manifest.read_text(encoding="utf-8"))
             broken["cases"][0]["input"]["shape"] = [1, True]
-            manifest.write_text(json.dumps(broken))
+            manifest.write_text(json.dumps(broken), encoding="utf-8")
             with self.assertRaises(BRIDGE_MODULE.Refusal):
                 BRIDGE_MODULE.parse_spec(manifest)
 
             manifest, _ = make_manifest(root, [tiny_w4_case()])
-            broken = json.loads(manifest.read_text())
+            broken = json.loads(manifest.read_text(encoding="utf-8"))
             broken["cases"][0]["input"]["values"][0] = float("nan")
-            manifest.write_text(json.dumps(broken))
+            manifest.write_text(json.dumps(broken), encoding="utf-8")
             with self.assertRaises(BRIDGE_MODULE.Refusal):
                 BRIDGE_MODULE.parse_spec(manifest)
 
@@ -488,7 +495,7 @@ class ActualCheckpointBridgeTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "selected_dtype")
 
     def test_bridge_has_no_network_or_gpu_imports(self) -> None:
-        source = BRIDGE.read_text()
+        source = BRIDGE.read_text(encoding="utf-8")
         for forbidden in (
             "import urllib",
             "import requests",
