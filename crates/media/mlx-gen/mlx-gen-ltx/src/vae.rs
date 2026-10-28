@@ -33,6 +33,7 @@ use std::sync::Mutex;
 use mlx_rs::ops::{add, concatenate_axis, divide, mean_axes, multiply, pad, subtract, sum_axes};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv3d, silu};
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{CancelFlag, Error, Result};
@@ -45,10 +46,6 @@ use mlx_gen::tiling::{TilingConfig, VaeTiling};
 const DEC_NORM_EPS: f32 = 1e-8;
 /// Encoder `PixelNorm` epsilon (`get_norm_layer(..., eps=1e-6)`).
 const ENC_NORM_EPS: f32 = 1e-6;
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// Load a conv weight+bias (`{prefix}.weight`, `{prefix}.bias`) cast to f32. The on-disk tensors are
 /// already MLX conv layout `[O, kt, kh, kw, I]`, so no transpose is needed.

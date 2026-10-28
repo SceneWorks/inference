@@ -331,14 +331,8 @@ pub(crate) fn embedding(w: &Weights, base: &str) -> Result<TokenEmbedding> {
     crate::quant::embedding(w, base)
 }
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix.
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;
 
 #[cfg(test)]
 mod vision_contract_tests {

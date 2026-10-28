@@ -4,6 +4,7 @@
 
 use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::array::scalar;
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::{join, Weights};
@@ -1432,10 +1433,6 @@ fn time_proj(time_steps: &Array) -> Result<Array> {
 /// here, so this one edit covers the whole DiT.
 pub(crate) fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLinear> {
     crate::quant::lin(w, prefix, has_bias)
-}
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
 }
 
 /// ControlNet residual injection interval (diffusers `FluxTransformer2DModel`):

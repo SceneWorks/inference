@@ -26,7 +26,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
-use mlx_gen::nn::silu;
+use mlx_gen::nn::{repeat_kv, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Quant, Result};
 
@@ -330,18 +330,6 @@ fn rope_cos_sin(positions: &[i32], dim: usize, theta: f32) -> Result<(Array, Arr
 /// half-split branch — identical to the prior hand-rolled `cat(-x2, x1)` rotation.
 fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     mll_apply_rope(x, cos, sin, false).map_err(mll)
-}
-
-/// Expand `[B,S,Hkv,D]` → `[B,S,Hkv*groups,D]` (GQA), repeating each kv head `groups` times.
-fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let sh = x.shape();
-    let (b, s, hkv, d) = (sh[0], sh[1], sh[2], sh[3]);
-    let x = x.expand_dims(3)?;
-    let x = broadcast_to(&x, &[b, s, hkv, groups, d])?;
-    Ok(x.reshape(&[b, s, hkv * groups, d])?)
 }
 
 /// The dense dual-path Qwen3 backbone: embeddings, the decoder stack, the dual final norm, and the

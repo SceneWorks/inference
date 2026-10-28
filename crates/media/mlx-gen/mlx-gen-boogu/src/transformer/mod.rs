@@ -472,14 +472,8 @@ impl BooguTransformer {
 
 // ── Shared helpers ──────────────────────────────────────────────────────────────────────────
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix.
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;
 
 /// Slice `[b, L, ...]` along the sequence axis (axis 1) to `[start, end)`.
 pub(crate) fn slice_axis1(x: &Array, start: i32, end: i32) -> Result<Array> {

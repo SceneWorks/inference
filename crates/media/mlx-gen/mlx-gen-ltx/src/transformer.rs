@@ -36,6 +36,7 @@ use mlx_rs::transforms::checkpoint;
 use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::block_residency::BlockPlan;
 
@@ -139,10 +140,6 @@ impl Precision {
         };
         Self { mode, ..self }
     }
-}
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
 }
 
 const SITE_MODULATE: &str = "ltx::transformer::modulate";

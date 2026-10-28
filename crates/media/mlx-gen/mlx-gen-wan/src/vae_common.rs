@@ -10,11 +10,7 @@ use mlx_gen::tiling::{
 use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::Array;
 
-/// A length-1 `f32` array, used as a broadcastable scalar operand in MLX ops.
-pub(crate) fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
-
+pub(crate) use mlx_gen::array::scalar;
 /// Force a logically-contiguous copy at the host-read boundary (the public decode/encode output) —
 /// mlx-rs `as_slice` returns the *physical* buffer, so a `transpose`-strided array reads scrambled.
 /// sc-12748: delegates to the shared [`mlx_gen::array::contiguous`], which is int64-safe (an over-
