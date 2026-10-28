@@ -61,6 +61,46 @@ impl FatbinLadder {
         )
     }
 
+    /// The **FlashAttention-2** fatbin's ladder (sc-26691): the vendored
+    /// `vendor/candle-flash-attn/build.rs` `-gencode` rungs, plus the cudaforge `CUDA_COMPUTE_CAP`
+    /// baseline when it is known.
+    ///
+    /// Unlike [`Self::from_build`], an unknown baseline does NOT empty the ladder: the explicit rungs
+    /// are compiled unconditionally, so they are a guaranteed floor and an unknown baseline can only
+    /// add coverage this process cannot name. The dispatch guard needs exactly that conservative
+    /// answer — never claim a rung that might be absent.
+    pub fn flash_from_build() -> Self {
+        Self::explicit_plus_baseline(
+            env!("CANDLE_GEN_FLASH_FATBIN_SASS"),
+            env!("CANDLE_GEN_FLASH_FATBIN_PTX"),
+            env!("CANDLE_GEN_FATBIN_BASELINE"),
+        )
+    }
+
+    /// [`Self::flash_from_build`]'s assembly, separated so it is testable without `env!`.
+    pub fn explicit_plus_baseline(sass_csv: &str, ptx_csv: &str, baseline_csv: &str) -> Self {
+        fn csv(raw: &str) -> Vec<u32> {
+            raw.split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect()
+        }
+        let mut sass = csv(sass_csv);
+        if let Ok(baseline) = baseline_csv.trim().parse::<u32>() {
+            sass.push(baseline);
+        }
+        sass.sort_unstable();
+        sass.dedup();
+        let mut ptx = csv(ptx_csv);
+        ptx.sort_unstable();
+        ptx.dedup();
+        Self { sass, ptx }
+    }
+
+    /// `true` when the ladder names no architecture at all.
+    pub fn is_empty(&self) -> bool {
+        self.sass.is_empty() && self.ptx.is_empty()
+    }
+
     /// Assemble a ladder from the three build-script strings.
     ///
     /// Separate from [`from_build`] because those are `env!` values fixed at compile time, so the
@@ -219,9 +259,72 @@ pub fn warn_if_device_uncovered(device: &candle_core::Device) {
     }
 }
 
+/// The device's packed compute capability (`120` for sm_12.0), or `None` for a non-CUDA device or
+/// one whose attributes cannot be read. Cached per GPU ordinal: the dispatch guard asks on every
+/// attention call, and the answer cannot change for the life of the process.
+#[cfg(feature = "cuda")]
+pub fn device_compute_cap(device: &candle_core::Device) -> Option<u32> {
+    use candle_core::cuda::cudarc::driver::sys::CUdevice_attribute as Attr;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<usize, Option<u32>>>> = OnceLock::new();
+    let candle_core::Device::Cuda(cuda) = device else {
+        return None;
+    };
+    let stream = cuda.cuda_stream();
+    let ctx = stream.context();
+    let ordinal = ctx.ordinal();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cap) = cache.lock().ok().and_then(|c| c.get(&ordinal).copied()) {
+        return cap;
+    }
+    let cap = match (
+        ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
+        ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR),
+    ) {
+        (Ok(major), Ok(minor)) if major >= 0 && minor >= 0 => {
+            Some(major as u32 * 10 + minor as u32)
+        }
+        _ => None,
+    };
+    if let Ok(mut c) = cache.lock() {
+        c.insert(ordinal, cap);
+    }
+    cap
+}
+
+/// Non-CUDA builds have no CUDA device.
+#[cfg(not(feature = "cuda"))]
+pub fn device_compute_cap(_device: &candle_core::Device) -> Option<u32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flash ladder keeps its explicit rungs whether or not the baseline is known, and folds
+    /// the baseline in when it is.
+    #[test]
+    fn the_flash_ladder_never_drops_its_explicit_rungs() {
+        let unknown = FatbinLadder::explicit_plus_baseline("90,120", "120", "");
+        assert_eq!(unknown.sass, vec![90, 120]);
+        assert_eq!(unknown.ptx, vec![120]);
+        let shipped = FatbinLadder::explicit_plus_baseline("90,120", "120", "80");
+        assert_eq!(shipped.sass, vec![80, 90, 120]);
+        assert!(FatbinLadder::explicit_plus_baseline("", "", "").is_empty());
+    }
+
+    /// The baked flash ladder is the vendored build.rs's: sm_90 + sm_120 SASS and compute_120 PTX
+    /// at minimum.
+    #[test]
+    fn the_baked_flash_ladder_reads_the_vendored_gencodes() {
+        let ladder = FatbinLadder::flash_from_build();
+        for rung in [90, 120] {
+            assert!(ladder.sass.contains(&rung), "{ladder:?}");
+        }
+        assert!(ladder.ptx.contains(&120), "{ladder:?}");
+    }
 
     /// The shipped ladder as of sc-7544: sm_80 baseline + sm_90 + sm_120 SASS, compute_120 PTX.
     fn shipped() -> FatbinLadder {

@@ -20,6 +20,9 @@ pub fn available_bytes() -> Result<u64> {
 pub fn total_bytes() -> Result<u64> {
     let mut total = 0_u64;
     let mut size = std::mem::size_of::<u64>();
+    // SAFETY: the name is a NUL-terminated C-string literal; `total` and `size` are live locals,
+    // `size` holding the 8-byte capacity of `total`, so the kernel writes at most that many bytes;
+    // the new-value pointer is null with length 0 (read-only query).
     let status = unsafe {
         libc::sysctlbyname(
             c"hw.memsize".as_ptr(),

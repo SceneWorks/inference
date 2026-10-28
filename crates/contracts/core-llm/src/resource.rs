@@ -430,6 +430,9 @@ mod host_memory {
 mod host_memory {
     // libc 0.2.186 exposes the Mach types and host query, but not this System symbol.
     // Release the send right returned by mach_host_self.
+    // SAFETY: the declaration matches `kern_return_t mach_port_deallocate(ipc_space_t task,
+    // mach_port_name_t name)` from <mach/mach_port.h> (both port types are `mach_port_t`-sized
+    // u32).
     unsafe extern "C" {
         fn mach_port_deallocate(
             task: libc::mach_port_t,

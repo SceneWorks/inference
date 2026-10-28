@@ -67,7 +67,10 @@ mod constraint;
 mod descriptor;
 mod generate;
 mod snapshot_headers;
+pub(crate) use admission::read_safetensors_header;
 pub use admission::LoadMemoryEstimate;
+#[cfg(test)]
+pub(crate) use admission::MAX_SAFETENSORS_HEADER_BYTES;
 use admission::*;
 use chat_template::*;
 use constraint::*;
