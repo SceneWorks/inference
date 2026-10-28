@@ -1,4 +1,3 @@
-
 use super::*;
 use gen_core::{
     standard_memory_strategy_safety_check, MemoryBackendRealization, MemoryBehaviorBeginRequest,
