@@ -1829,10 +1829,13 @@ mod tests {
         );
     }
 
-    /// Pricing reads the adapter's header and nothing else: a file cut off right after its header
-    /// prices exactly like the whole file, though the loader cannot read it.
+    /// Pricing reads the adapter's header and nothing else: a file whose payload bytes are all
+    /// overwritten prices exactly like the original. A file cut off right after its header is
+    /// refused at the header stage (sc-27387): the shared reader proves every tensor's offsets fit
+    /// the file, so a truncated adapter fails admission instead of only failing later in the loader.
     ///
-    /// *Mutation that reds this:* pricing through `merge_adapters` (it reads the tensors).
+    /// *Mutation that reds this:* dropping the offset validation from the header reader (the cut
+    /// file would price).
     #[test]
     fn adapter_pricing_reads_only_the_safetensors_header() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1840,6 +1843,10 @@ mod tests {
         let bytes = std::fs::read(&whole).unwrap();
         let header = 8 + u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
         assert!(header < bytes.len());
+        let scrambled = tmp.path().join("scrambled-payload.safetensors");
+        let mut scrambled_bytes = bytes.clone();
+        scrambled_bytes[header..].fill(0x5a);
+        std::fs::write(&scrambled, &scrambled_bytes).unwrap();
         let cut = tmp.path().join("header-only.safetensors");
         std::fs::write(&cut, &bytes[..header]).unwrap();
 
@@ -1850,9 +1857,11 @@ mod tests {
                 1.0,
                 AdapterKind::Lokr,
             )]);
-            adapter_overlay(&spec, &backbone).unwrap()
+            adapter_overlay(&spec, &backbone)
         };
-        assert_eq!(priced(cut.clone()), priced(whole));
+        assert_eq!(priced(scrambled).unwrap(), priced(whole).unwrap());
+        let refused = priced(cut.clone()).unwrap_err().to_string();
+        assert!(refused.contains("invalid offsets"), "{refused}");
         let shapes = safetensors_shapes(&backbone.join(BACKBONE_WEIGHTS_FILE)).unwrap();
         assert!(crate::adapters::merge_adapters(
             &shapes,
