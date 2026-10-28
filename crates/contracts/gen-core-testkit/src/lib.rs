@@ -1571,17 +1571,13 @@ pub fn check_cfg_off_render(g: &dyn Generator, profile: &Profile) -> Result<(), 
 const CFG_OFF_NEGATIVE_A: &str = "a red circle on a plain white background";
 const CFG_OFF_NEGATIVE_B: &str = "a dense city street at night, neon signs, heavy rain";
 
-/// **Registry round-trip.** The provider's descriptor `id` is present in the explicit registry
-/// supplied by the caller (a missing catalog entry is the runtime "engine not found" trap).
-pub fn check_registry_roundtrip(
-    registry: &gen_core::ProviderRegistry,
-    g: &dyn Generator,
+/// The registry round-trip body every provider kind shares (sc-27315): `id` must be one of the
+/// descriptor ids the caller's registry publishes for that kind.
+pub(crate) fn check_registry_ids(
+    ids: impl IntoIterator<Item = &'static str>,
+    id: &str,
 ) -> Result<(), String> {
-    let id = g.descriptor().id;
-    if registry
-        .generators()
-        .any(|registration| (registration.descriptor)().id == id)
-    {
+    if ids.into_iter().any(|candidate| candidate == id) {
         Ok(())
     } else {
         Err(format!(
@@ -1589,6 +1585,37 @@ pub fn check_registry_roundtrip(
             gen_core::VERSION
         ))
     }
+}
+
+/// The aggregate-and-panic tail every `*_conformance` suite shares (sc-27315): no-op when
+/// `failures` is empty, otherwise one panic naming the suite, provider (and backend) and every
+/// failure.
+pub(crate) fn panic_on_failures(suite: &str, id: &str, backend: Option<&str>, failures: &[String]) {
+    if failures.is_empty() {
+        return;
+    }
+    let backend = backend
+        .map(|b| format!("{b} backend, "))
+        .unwrap_or_default();
+    panic!(
+        "{suite} FAILED for `{id}` ({backend}gen-core {}):\n  - {}",
+        gen_core::VERSION,
+        failures.join("\n  - ")
+    );
+}
+
+/// **Registry round-trip.** The provider's descriptor `id` is present in the explicit registry
+/// supplied by the caller (a missing catalog entry is the runtime "engine not found" trap).
+pub fn check_registry_roundtrip(
+    registry: &gen_core::ProviderRegistry,
+    g: &dyn Generator,
+) -> Result<(), String> {
+    crate::check_registry_ids(
+        registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id),
+        g.descriptor().id,
+    )
 }
 
 /// **Descriptor sweep (weights-free).** Run the registry-wide descriptor-level conformance sweep
@@ -1713,15 +1740,12 @@ pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
         .into_iter()
         .filter_map(|f| f(g, profile).err())
         .collect();
-    if !failures.is_empty() {
-        panic!(
-            "gen-core conformance FAILED for `{}` ({} backend, gen-core {}):\n  - {}",
-            g.descriptor().id,
-            g.descriptor().backend,
-            gen_core::VERSION,
-            failures.join("\n  - ")
-        );
-    }
+    crate::panic_on_failures(
+        "gen-core conformance",
+        g.descriptor().id,
+        Some(g.descriptor().backend),
+        &failures,
+    );
 }
 
 /// Check one teacher-forced greedy step without turning an exact or narrow logit tie into a

@@ -199,29 +199,26 @@ pub fn is_hidden_dir(path: &Path) -> bool {
     is_hidden_file(path)
 }
 
-/// Read one `.safetensors` file's `__metadata__` map **from the header alone** — no tensor data and
-/// no whole-file buffer.
-///
-/// [`CheckpointMeta::from_file`] also exposes `__metadata__` (via
-/// [`CheckpointMeta::metadata`]), but it reads the entire file into memory first, which is fine for
-/// adapter-sized checkpoints and catastrophic for a 22B transformer. Component resolution keyed on
-/// `__metadata__["model_version"]` (sc-18757) must inspect exactly those multi-gigabyte files, so it
-/// uses this reader instead. An absent `__metadata__` block yields an empty map, not an error — a
-/// safetensors file is allowed to carry none.
-pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<String, String>> {
-    /// Same ceiling `safetensors_path_tensor_headers` applies, for the same reason: refuse to
-    /// allocate an arbitrary buffer from an untrusted 8-byte length prefix.
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
+/// Ceiling on a safetensors JSON header shared by every hand-rolled header reader in this crate
+/// (sc-27314): refuse to allocate an arbitrary buffer from an untrusted 8-byte length prefix. A
+/// header past it is a corrupt or mis-detected file (e.g. an AppleDouble `._` sidecar), not a real
+/// checkpoint. Readers may apply a tighter bound of their own first (`flux3::checkpoint`'s 16 MiB).
+pub(crate) const MAX_SAFETENSORS_HEADER: u64 = 100_000_000;
 
-    let path = path.as_ref();
-    let mut file = std::fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
+/// Read and validate a safetensors 8-byte length prefix: bounded by [`MAX_SAFETENSORS_HEADER`],
+/// and the header must end inside a `file_len`-byte file. Returns the header length and the
+/// absolute offset where the tensor data begins; the reader is left at the start of the header.
+pub(crate) fn read_safetensors_header_len(
+    reader: &mut impl Read,
+    file_len: u64,
+    path: &Path,
+) -> Result<(usize, u64)> {
     let mut prefix = [0_u8; 8];
-    file.read_exact(&mut prefix)?;
+    reader.read_exact(&mut prefix)?;
     let header_len = u64::from_le_bytes(prefix);
-    if header_len > MAX_HEADER_SIZE {
+    if header_len > MAX_SAFETENSORS_HEADER {
         return Err(Error::Msg(format!(
-            "safetensors header in {} exceeds the {MAX_HEADER_SIZE}-byte maximum",
+            "safetensors header in {} exceeds the {MAX_SAFETENSORS_HEADER}-byte maximum",
             path.display()
         )));
     }
@@ -243,8 +240,36 @@ pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<Stri
             path.display()
         ))
     })?;
+    Ok((header_len, data_start))
+}
+
+/// [`read_safetensors_header_len`] followed by the header bytes themselves. Returns the raw JSON
+/// header and the data start; the reader is left immediately after the header.
+pub(crate) fn read_safetensors_header(
+    reader: &mut impl Read,
+    file_len: u64,
+    path: &Path,
+) -> Result<(Vec<u8>, u64)> {
+    let (header_len, data_start) = read_safetensors_header_len(reader, file_len, path)?;
     let mut header = vec![0_u8; header_len];
-    file.read_exact(&mut header)?;
+    reader.read_exact(&mut header)?;
+    Ok((header, data_start))
+}
+
+/// Read one `.safetensors` file's `__metadata__` map **from the header alone** — no tensor data and
+/// no whole-file buffer.
+///
+/// [`CheckpointMeta::from_file`] also exposes `__metadata__` (via
+/// [`CheckpointMeta::metadata`]), but it reads the entire file into memory first, which is fine for
+/// adapter-sized checkpoints and catastrophic for a 22B transformer. Component resolution keyed on
+/// `__metadata__["model_version"]` (sc-18757) must inspect exactly those multi-gigabyte files, so it
+/// uses this reader instead. An absent `__metadata__` block yields an empty map, not an error — a
+/// safetensors file is allowed to carry none.
+pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<String, String>> {
+    let path = path.as_ref();
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let (header, _data_start) = read_safetensors_header(&mut file, file_len, path)?;
     crate::__model_input_result!(
         safetensors_metadata_from_json(path, &header),
         "gen-core::weightsmeta::safetensors_file_metadata",
@@ -648,35 +673,8 @@ fn reader_tensor_locations_impl(
     source: &Path,
     mut observer: Option<&mut SourceMetadataObserver<'_>>,
 ) -> Result<SafetensorsFileLayout> {
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
     let path = source;
-    let mut prefix = [0_u8; 8];
-    reader.read_exact(&mut prefix)?;
-    let header_len = u64::from_le_bytes(prefix);
-    if header_len > MAX_HEADER_SIZE {
-        return Err(Error::Msg(format!(
-            "safetensors header in {} exceeds the {MAX_HEADER_SIZE}-byte maximum",
-            path.display()
-        )));
-    }
-    let data_start = 8_u64.checked_add(header_len).ok_or_else(|| {
-        Error::Msg(format!(
-            "safetensors header too large in {}",
-            path.display()
-        ))
-    })?;
-    if data_start > file_len {
-        return Err(Error::Msg(format!(
-            "safetensors header in {} extends past the file",
-            path.display()
-        )));
-    }
-    let header_len = usize::try_from(header_len).map_err(|_| {
-        Error::Msg(format!(
-            "safetensors header too large in {}",
-            path.display()
-        ))
-    })?;
+    let (header_len, data_start) = read_safetensors_header_len(&mut reader, file_len, path)?;
     if let Some(observe) = observer.as_deref_mut() {
         observe(SourceMetadataRead::Input(header_len as u64))?;
     }
@@ -2591,6 +2589,46 @@ mod tests {
             materialized_path_bytes(bf16.parent().unwrap(), 4).unwrap(),
             8
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_header_read_tests {
+    use super::*;
+
+    fn prefixed(header_len: u64, body: &[u8]) -> Vec<u8> {
+        let mut bytes = header_len.to_le_bytes().to_vec();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    #[test]
+    fn shared_reader_returns_header_and_data_start() {
+        let bytes = prefixed(2, b"{}");
+        let (header, data_start) =
+            read_safetensors_header(&mut bytes.as_slice(), bytes.len() as u64, Path::new("x"))
+                .unwrap();
+        assert_eq!(header, b"{}");
+        assert_eq!(data_start, 10);
+    }
+
+    #[test]
+    fn shared_reader_refuses_oversized_and_overrunning_headers() {
+        let too_big = prefixed(MAX_SAFETENSORS_HEADER + 1, b"");
+        let error = read_safetensors_header(&mut too_big.as_slice(), u64::MAX, Path::new("x"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("100000000-byte maximum"), "{error}");
+
+        let overrun = prefixed(64, b"{}");
+        let error = read_safetensors_header(
+            &mut overrun.as_slice(),
+            overrun.len() as u64,
+            Path::new("x"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("extends past the file"), "{error}");
     }
 }
 
