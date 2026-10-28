@@ -47,19 +47,15 @@
 //! its resident cost (F-048). LoRA/LoKr are sibling slices.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::io::{BufReader, Read};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Mutex, OnceLock};
 
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::gen_core::ltx_checkpoint::{
     layout_for_declared_version, LtxBundle, LtxCheckpointLayout, LtxComponent,
 };
-use mlx_gen::gen_core::reject_unknown_components;
+use mlx_gen::gen_core::{reject_unknown_components, ArtifactSeal};
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::{to_dtype, Weights};
@@ -2338,75 +2334,6 @@ fn ltx25_packed_chat_template(assets: &GemmaAssets) -> Result<JinjaChatTemplate>
     ))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct EnhancerFileIdentity {
-    canonical: PathBuf,
-    device: u64,
-    inode: u64,
-    size: u64,
-    mtime: i64,
-    mtime_ns: i64,
-    ctime: i64,
-    ctime_ns: i64,
-}
-
-fn enhancer_file_identity(path: &Path) -> Result<EnhancerFileIdentity> {
-    let canonical = std::fs::canonicalize(path)?;
-    let metadata = std::fs::metadata(&canonical)?;
-    Ok(EnhancerFileIdentity {
-        canonical,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        size: metadata.size(),
-        mtime: metadata.mtime(),
-        mtime_ns: metadata.mtime_nsec(),
-        ctime: metadata.ctime(),
-        ctime_ns: metadata.ctime_nsec(),
-    })
-}
-
-fn enhancer_digest_cache() -> &'static Mutex<HashMap<EnhancerFileIdentity, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<EnhancerFileIdentity, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// SHA-256 a staged asset once per immutable filesystem identity. The stock model is ~22 GiB, so
-/// recomputing it on every enhanced request would erase the reusable-prefix win; device/inode,
-/// size, mtime and ctime invalidate the cache whenever the staged file is replaced or rewritten.
-fn enhancer_file_sha256(path: &Path, identity: &EnhancerFileIdentity) -> Result<String> {
-    if let Some(value) = enhancer_digest_cache()
-        .lock()
-        .map_err(|_| Error::Msg("ltx_2_5: enhancer digest cache poisoned".into()))?
-        .get(identity)
-        .cloned()
-    {
-        return Ok(value);
-    }
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-    let mut digest = Sha256::new();
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    let value = format!("{:x}", digest.finalize());
-    if enhancer_file_identity(path).ok().as_ref() != Some(identity) {
-        return Err(Error::Msg(format!(
-            "ltx_2_5: enhancer asset {} changed while its identity was verified",
-            path.display()
-        )));
-    }
-    enhancer_digest_cache()
-        .lock()
-        .map_err(|_| Error::Msg("ltx_2_5: enhancer digest cache poisoned".into()))?
-        .insert(identity.clone(), value.clone());
-    Ok(value)
-}
-
 fn manifest_string<'a>(manifest: &'a serde_json::Value, key: &str) -> Result<&'a str> {
     manifest
         .get(key)
@@ -2542,15 +2469,17 @@ fn validate_ltx25_enhancer_file(
             enhancer.display()
         )));
     }
-    let identity = enhancer_file_identity(&path)?;
-    if identity.size != expected_bytes {
+    // Size first, so a wrong-size file is refused without reading its ~22 GiB.
+    let size = std::fs::metadata(&path)?.len();
+    if size != expected_bytes {
         return Err(Error::Msg(format!(
-            "ltx_2_5: enhancer asset `{name}` is {} bytes, expected {expected_bytes} for \
-             {LTX25_ENHANCER_REPOSITORY}@{LTX25_ENHANCER_REVISION}",
-            identity.size
+            "ltx_2_5: enhancer asset `{name}` is {size} bytes, expected {expected_bytes} for \
+             {LTX25_ENHANCER_REPOSITORY}@{LTX25_ENHANCER_REVISION}"
         )));
     }
-    let actual = enhancer_file_sha256(&path, &identity)?;
+    // SHA-256 once per immutable file identity (shared, single-flight `ArtifactSeal` memo), so
+    // repeated enhanced requests do not re-read the stock model.
+    let actual = ArtifactSeal::pin(&path)?.content_sha256_hex();
     if actual != expected_sha256 {
         return Err(Error::Msg(format!(
             "ltx_2_5: enhancer asset `{name}` digest mismatch (got {actual}, expected \
