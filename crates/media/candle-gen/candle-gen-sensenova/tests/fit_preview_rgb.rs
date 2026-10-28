@@ -50,16 +50,14 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::gen_core::{CancelFlag, Image, PreviewFrame, PreviewSink, Progress};
+use candle_gen::gen_core::{CancelFlag, Image, PreviewSink, Progress};
 use candle_gen::preview::PreviewHook;
 use candle_gen::testkit::collecting_sink;
 use candle_gen::testkit::save_rgb8_png;
 use candle_gen::testkit::sha256_file;
 use candle_gen_sensenova::{load_understanding_for_diagnostics, tensor_to_image, T2iOptions};
-use sha2::{Digest, Sha256};
 
 /// Four diverse prompt/seed renders whose pooled pixels determine the coefficients.
 const FIT_CORPUS: [(&str, u64); 4] = [
