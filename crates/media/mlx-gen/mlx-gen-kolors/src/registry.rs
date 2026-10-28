@@ -619,6 +619,19 @@ impl KolorsGenerator {
             // loop. Identical body for both residencies.
             |heavy_owned: &KolorsHeavyOwned, (pos, neg), on_progress: &mut dyn FnMut(Progress)| {
                 let heavy = &heavy_owned.heavy;
+                // sc-27336: pair the Control conditioning with the loaded ControlNet once, as a
+                // typed error rather than three `expect("validated above")`s held by distance.
+                let control_net = match (control, heavy_owned.control.as_ref()) {
+                    (Some((image, scale)), Some(net)) => Some((net, image, scale)),
+                    (Some(_), None) => {
+                        return Err(Error::Msg(
+                            "kolors: a Control conditioning needs the ControlNet loaded \
+                             (`spec.control`)"
+                                .into(),
+                        ))
+                    }
+                    (None, _) => None,
+                };
 
                 // IP-Adapter image tokens are seed-independent — encode the reference once (the
                 // `denoise_ip_latents` method CFG-batches them per image). Carries the resolved scale.
@@ -773,13 +786,7 @@ impl KolorsGenerator {
                     // `curated_init` is `Some` exactly when `use_curated` (sc-27336: bind it here
                     // instead of re-`expect`ing that invariant).
                     if let Some((init_opt, strength)) = curated_init.clone() {
-                        let control_arg = control.map(|(image, scale)| {
-                            (
-                                heavy_owned.control.as_ref().expect("validated above"),
-                                image,
-                                scale,
-                            )
-                        });
+                        let control_arg = control_net;
                         let ip_arg = ip.as_ref().map(|(tokens, scale)| (tokens, *scale));
 
                         let latents = heavy.denoise_curated_latents_with_preview(
@@ -825,16 +832,16 @@ impl KolorsGenerator {
                     // (`legacy_pose_init` / `legacy_img2img_init` are `Some` exactly for the arm
                     // that reads them on this non-curated path) instead of `expect`ing it.
                     let latents = if let (
-                        Some((skeleton, control_scale)),
+                        Some((net, skeleton, control_scale)),
                         Some((tokens, ip_scale)),
                         Some(init_latents),
-                    ) = (control, &ip, legacy_pose_init.as_ref())
+                    ) = (control_net, &ip, legacy_pose_init.as_ref())
                     {
                         // Combined strict-pose tier (sc-5012): pose ControlNet + IP-Adapter identity,
                         // on an img2img init from the SAME reference (the IP image).
                         let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
                         heavy.denoise_controlnet_ip_latents_with_preview(
-                            heavy_owned.control.as_ref().expect("validated above"),
+                            net,
                             tokens,
                             init_latents,
                             &noise,
@@ -855,9 +862,9 @@ impl KolorsGenerator {
                             forward_plan,
                             cfg_batching,
                         )?
-                    } else if let Some((image, scale)) = control {
+                    } else if let Some((net, image, scale)) = control_net {
                         heavy.denoise_controlnet_latents_with_preview(
-                            heavy_owned.control.as_ref().expect("validated above"),
+                            net,
                             &noise,
                             image,
                             &pos,
