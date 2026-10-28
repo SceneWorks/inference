@@ -213,8 +213,9 @@ fn apply_rope_qwen(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
 
 #[cfg(test)]
 mod sc2963 {
-    use crate::transformer::compile_test_util::{max_abs, rnd};
+    use crate::transformer::compile_test_util::rnd;
     use crate::transformer::set_compile_glue;
+    use mlx_gen::testing::max_abs_diff;
     use mlx_rs::Dtype::Float32;
 
     // sc-2963: the compiled RoPE rotation this crate routes through is bit-identical to eager
@@ -231,7 +232,7 @@ mod sc2963 {
         set_compile_glue(true);
         let (cr, ci) = mlx_gen::nn::rope_rotate(&xr, &xi, &cos, &sin).unwrap();
         set_compile_glue(false);
-        assert_eq!(max_abs(&cr, &er), 0.0, "rope_rotate real");
-        assert_eq!(max_abs(&ci, &ei), 0.0, "rope_rotate imag");
+        assert_eq!(max_abs_diff(&cr, &er), 0.0, "rope_rotate real");
+        assert_eq!(max_abs_diff(&ci, &ei), 0.0, "rope_rotate imag");
     }
 }

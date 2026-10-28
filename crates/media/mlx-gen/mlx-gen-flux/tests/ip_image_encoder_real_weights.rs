@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::cosine;
 use mlx_gen::weights::Weights;
 use mlx_gen::Image;
 use mlx_gen_flux::FluxIpImageEncoder;
@@ -63,15 +64,6 @@ fn gradient(w: u32, h: u32) -> Image {
         height: h,
         pixels,
     }
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let dot = sum(multiply(a, b).unwrap(), None).unwrap();
-    let na = sqrt(sum(multiply(a, a).unwrap(), None).unwrap()).unwrap();
-    let nb = sqrt(sum(multiply(b, b).unwrap(), None).unwrap()).unwrap();
-    mlx_rs::ops::divide(&dot, multiply(&na, &nb).unwrap())
-        .unwrap()
-        .item::<f32>()
 }
 
 #[test]

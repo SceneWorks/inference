@@ -45,6 +45,8 @@ training = ["dep:cc", "dep:image", "dep:mlx-sys"]
 cc = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }
 # Pin CPU native streams in inference-only test builds too (training's binding is optional).
 mlx-sys = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }

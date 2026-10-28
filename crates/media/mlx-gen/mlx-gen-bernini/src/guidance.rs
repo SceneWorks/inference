@@ -118,13 +118,8 @@ pub fn apg_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::testing::max_abs_diff;
     use mlx_rs::ops::{add, divide, maximum, minimum, multiply, sqrt, subtract};
-
-    fn max_abs(a: &Array, b: &Array) -> f32 {
-        mlx_rs::ops::max(subtract(a, b).unwrap().abs().unwrap(), None)
-            .unwrap()
-            .item::<f32>()
-    }
 
     /// L2 norm over Bernini's per-frame `APG_DIMS`, keepdims (test helper / clamp inspector).
     fn l2_norm(a: &Array) -> Array {
@@ -282,7 +277,7 @@ mod tests {
         for &(eta, nt) in &[(1.0f32, 0.0f32), (0.5, 0.0), (1.0, 2.0), (0.7, 1.5)] {
             let got = normalized_guidance(&cond, &uncond, 4.0, None, eta, nt).unwrap();
             let want = legacy_normalized_guidance(&cond, &uncond, 4.0, None, eta, nt);
-            assert_eq!(max_abs(&got, &want), 0.0, "single eta={eta} nt={nt}");
+            assert_eq!(max_abs_diff(&got, &want), 0.0, "single eta={eta} nt={nt}");
         }
         // Momentum carry across steps (buffer reused).
         let mut mb = MomentumBuffer::new(-0.5);
@@ -291,7 +286,7 @@ mod tests {
             let c = randish(10 + s);
             let got = normalized_guidance(&c, &uncond, 3.0, Some(&mut mb), 0.8, 0.0).unwrap();
             let want = legacy_normalized_guidance(&c, &uncond, 3.0, Some(&mut lb), 0.8, 0.0);
-            assert_eq!(max_abs(&got, &want), 0.0, "momentum step {s}");
+            assert_eq!(max_abs_diff(&got, &want), 0.0, "momentum step {s}");
         }
         // Chained (r2v_apg over [x_I, x_TI]).
         let preds = [randish(3), randish(4)];
@@ -301,13 +296,13 @@ mod tests {
             normalized_guidance_chain(&uncond, &preds, &[2.0, 5.0], &mut mbufs, 0.6, &[1.0, 0.0])
                 .unwrap();
         let want = legacy_chain(&uncond, &preds, &[2.0, 5.0], &mut lbufs, 0.6, &[1.0, 0.0]);
-        assert_eq!(max_abs(&got, &want), 0.0, "chain");
+        assert_eq!(max_abs_diff(&got, &want), 0.0, "chain");
         // v-space apg_delta (∥0.2 / ⊥1.0) on a [1, n, C] packed-token shape.
         let delta = randish(5).reshape(&[1, 8, 4]).unwrap();
         let reference = randish(6).reshape(&[1, 8, 4]).unwrap();
         let got = apg_delta(&delta, &reference, 0.2, 1.0).unwrap();
         let want = legacy_apg_delta(&delta, &reference, 0.2, 1.0);
-        assert_eq!(max_abs(&got, &want), 0.0, "apg_delta");
+        assert_eq!(max_abs_diff(&got, &want), 0.0, "apg_delta");
         // base2 keeps the helper honest (unused-var guard) — exercises a non-cond base direction.
         let _ = &base2;
     }
@@ -328,7 +323,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            max_abs(&got, &want) < 1e-4,
+            max_abs_diff(&got, &want) < 1e-4,
             "eta=1/nt=0 must equal plain CFG"
         );
     }
@@ -345,7 +340,10 @@ mod tests {
             .sum_axes(APG_DIMS, true)
             .unwrap();
         let zeros = Array::zeros::<f32>(dot.shape()).unwrap();
-        assert!(max_abs(&dot, &zeros) < 1e-3, "eta=0 orthogonal residual");
+        assert!(
+            max_abs_diff(&dot, &zeros) < 1e-3,
+            "eta=0 orthogonal residual"
+        );
     }
 
     #[test]
@@ -364,11 +362,11 @@ mod tests {
         let mut buf = MomentumBuffer::new(-0.5);
         let d1 = randish(6);
         let r1 = buf.update(&MlxLatentOps, &d1).unwrap();
-        assert!(max_abs(&r1, &d1) < 1e-6, "first update returns diff");
+        assert!(max_abs_diff(&r1, &d1) < 1e-6, "first update returns diff");
         let d2 = randish(7);
         let r2 = buf.update(&MlxLatentOps, &d2).unwrap();
         // running = d2 + (-0.5)·d1
         let want = add(&d2, multiply(&d1, Array::from_f32(-0.5)).unwrap()).unwrap();
-        assert!(max_abs(&r2, &want) < 1e-5, "second update accumulates");
+        assert!(max_abs_diff(&r2, &want) < 1e-5, "second update accumulates");
     }
 }

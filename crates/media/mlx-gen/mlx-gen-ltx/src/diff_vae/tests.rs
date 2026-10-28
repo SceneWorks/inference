@@ -9,7 +9,7 @@
 //! approximately.
 
 use super::*;
-use mlx_rs::ops::{abs, max as max_op, softmax_axes, sum_axes};
+use mlx_rs::ops::{abs, softmax_axes, sum_axes};
 use std::collections::HashMap;
 
 /// The released `vae` block, verbatim from `vae/ltx-2.5-video-vae-bf16.safetensors`
@@ -41,10 +41,6 @@ const RELEASED_VAE: &str = r#"{
 fn released() -> NaDiffusionDecoderConfig {
     NaDiffusionDecoderConfig::from_embedded_vae(&serde_json::from_str(RELEASED_VAE).unwrap())
         .expect("the released vae block must parse")
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max_op(abs(a).unwrap(), None).unwrap().item::<f32>()
 }
 
 fn mean_abs(a: &Array) -> f32 {
@@ -1487,6 +1483,7 @@ use super::budget::{
     estimated_diffvae_decode_peak_bytes, plan_diffvae_tiling, DecodeGeometry, DecodePlan,
     DiffVaeMode, HostNaSupport, NaKind, ResolvedDiffVaeMode,
 };
+use mlx_gen::testing::max_abs;
 
 /// The resolved mode every plan on this host runs under.
 fn eager() -> ResolvedDiffVaeMode {

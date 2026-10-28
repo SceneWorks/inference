@@ -13,11 +13,12 @@
 //!       *differs* from the base forward (the hints flow into the base image stream) and stays finite
 //!       — proving the control branch is a real contribution, not a silent no-op.
 
+use mlx_gen::testing::max_abs_diff;
 use mlx_gen::weights::Weights;
 use mlx_gen_flux2::{
     Flux2Config, Flux2ControlBranch, Flux2ControlTransformer, Flux2Transformer, CONTROL_IN_DIM,
 };
-use mlx_rs::ops::{abs, array_eq, max, subtract};
+use mlx_rs::ops::{abs, array_eq, max};
 use mlx_rs::Array;
 
 const FIXTURE: &str = concat!(
@@ -200,11 +201,6 @@ impl Fixture {
 
 fn exact_eq(a: &Array, b: &Array) -> bool {
     a.shape() == b.shape() && array_eq(a, b, false).unwrap().item::<bool>()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let diff = subtract(a, b).unwrap();
-    max(abs(diff).unwrap(), None).unwrap().item::<f32>()
 }
 
 #[test]

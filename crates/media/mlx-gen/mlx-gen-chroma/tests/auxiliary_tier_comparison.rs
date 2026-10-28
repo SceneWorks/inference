@@ -27,6 +27,7 @@
 //!     cargo test -p mlx-gen-chroma --release --test integration \
 //!       -- --ignored --nocapture auxiliary_tier_comparison::compare_auxiliary_widths
 
+use mlx_gen::testing::save_png;
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use std::path::{Path, PathBuf};
 
@@ -56,17 +57,6 @@ fn steps() -> u32 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(20)
-}
-
-fn save_png(img: &Image, path: &Path) {
-    image::save_buffer(
-        path,
-        &img.pixels,
-        img.width,
-        img.height,
-        image::ColorType::Rgb8,
-    )
-    .expect("write png");
 }
 
 /// Sum of every tensor byte under a component dir — the isolated on-disk residency the ledger's
@@ -162,7 +152,7 @@ fn compare_auxiliary_widths() {
 
     let reference = render_all(&baseline, &id);
     for (i, img) in reference.iter().enumerate() {
-        save_png(img, &out.join(format!("aux-bf16-prompt{i}.png")));
+        save_png(img, out.join(format!("aux-bf16-prompt{i}.png")));
     }
 
     let transformer_rel = Path::new("transformer").join("diffusion_pytorch_model.safetensors");
@@ -191,7 +181,7 @@ fn compare_auxiliary_widths() {
         for (i, img) in images.iter().enumerate() {
             save_png(
                 img,
-                &out.join(format!("aux-q{auxiliary_bits}-prompt{i}.png")),
+                out.join(format!("aux-q{auxiliary_bits}-prompt{i}.png")),
             );
         }
 

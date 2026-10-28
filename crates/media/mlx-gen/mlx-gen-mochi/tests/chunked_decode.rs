@@ -18,6 +18,7 @@
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Array;
 
+use mlx_gen::testing::max_abs;
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
 use mlx_gen_mochi::{MochiVaeConfig, MochiVaeDecoder};
@@ -32,10 +33,6 @@ fn rnd(shape: &[i32], seed: u64) -> Array {
         })
         .collect();
     Array::from_slice(&data, shape)
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
 }
 
 /// The real AsymmVAE temporal geometry (resnet counts + expansions) at 32 channels — GroupNorm(32)

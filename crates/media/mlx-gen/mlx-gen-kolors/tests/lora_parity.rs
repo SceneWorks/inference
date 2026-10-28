@@ -23,9 +23,10 @@ use mlx_gen::{
     TrainingProgress, TrainingRequest, WeightsSource,
 };
 use mlx_gen_sdxl::{apply_sdxl_adapters_with, load_unet_kolors_dtype, LoraCoverage};
-use mlx_rs::{ops, random, Array, Dtype};
+use mlx_rs::{random, Array, Dtype};
 
 use common::snapshot;
+use mlx_gen::testing::max_abs_diff;
 
 /// Train a tiny real LoRA (the sc-4568 path) and return its adapter file.
 fn train_lora(tmp: &Path) -> PathBuf {
@@ -91,15 +92,6 @@ fn forward(unet: &mlx_gen_sdxl::UNet2DConditionModel) -> Array {
     let row = [64.0f32, 64.0, 0.0, 0.0, 64.0, 64.0];
     let time_ids = Array::from_slice(&row, &[1, 6]);
     unet.forward(&x, 500.0, &cond, &pooled, &time_ids).unwrap()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let d = ops::abs(ops::subtract(a, b).unwrap()).unwrap();
-    ops::max(&d, None)
-        .unwrap()
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .item::<f32>()
 }
 
 #[test]

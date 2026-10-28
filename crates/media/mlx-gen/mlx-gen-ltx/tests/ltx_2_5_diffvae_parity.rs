@@ -34,9 +34,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
-use mlx_rs::ops::{abs, max as max_op, mean, multiply, subtract};
+use mlx_rs::ops::{abs, mean, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::max_abs;
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen_ltx::config::LtxVaeConfig;
 use mlx_gen_ltx::convert::convert_vae_components;
@@ -72,10 +73,6 @@ const DECODE_TOL: f32 = 6e-3;
 
 fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max_op(abs(a).unwrap(), None).unwrap().item::<f32>()
 }
 
 /// `max |got - want|`, in the units of the signal itself.

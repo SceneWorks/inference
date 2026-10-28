@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::require_env_path;
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::{load_text_encoder, load_transformer};
 use mlx_rs::ops::{multiply, sqrt, sum};
@@ -23,10 +24,6 @@ fn cosine(a: &Array, b: &Array) -> f32 {
     (dot / (na * nb)).item::<f32>()
 }
 
-fn snapshot_dir() -> PathBuf {
-    PathBuf::from(std::env::var("BOOGU_BASE_DIR").expect("set BOOGU_BASE_DIR to the snapshot root"))
-}
-
 fn golden_path() -> PathBuf {
     std::env::var("BOOGU_GOLDEN")
         .map(PathBuf::from)
@@ -40,7 +37,11 @@ fn golden_path() -> PathBuf {
 #[ignore = "needs real weights + golden (tools/golden_dump.py)"]
 fn te_matches_reference_last_hidden() {
     let g = Weights::from_file(golden_path()).expect("golden — run tools/golden_dump.py");
-    let te = load_text_encoder(snapshot_dir()).expect("load Qwen3-VL condition encoder");
+    let te = load_text_encoder(require_env_path(
+        "BOOGU_BASE_DIR",
+        "the Boogu snapshot root",
+    ))
+    .expect("load Qwen3-VL condition encoder");
     let out = te
         .last_hidden(
             g.require("tok_input_ids").unwrap(),
@@ -70,7 +71,11 @@ fn te_matches_reference_last_hidden() {
 #[ignore = "needs real weights + golden (tools/golden_dump.py)"]
 fn dit_matches_reference_velocity() {
     let g = Weights::from_file(golden_path()).expect("golden — run tools/golden_dump.py");
-    let dit = load_transformer(snapshot_dir()).expect("load Boogu DiT");
+    let dit = load_transformer(require_env_path(
+        "BOOGU_BASE_DIR",
+        "the Boogu snapshot root",
+    ))
+    .expect("load Boogu DiT");
 
     // The golden saves the latent / velocity already batched as [1, C, H, W].
     let out = dit

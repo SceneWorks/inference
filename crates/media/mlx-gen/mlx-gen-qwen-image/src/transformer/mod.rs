@@ -71,13 +71,4 @@ pub(crate) mod compile_test_util {
         mlx_rs::transforms::eval([&x]).unwrap();
         x
     }
-
-    pub(crate) fn max_abs(a: &Array, b: &Array) -> f32 {
-        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
-        mlx_rs::ops::max(&d, None)
-            .unwrap()
-            .as_dtype(Dtype::Float32)
-            .unwrap()
-            .item::<f32>()
-    }
 }

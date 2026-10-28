@@ -31,6 +31,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::{max_abs, max_abs_diff};
 use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
     WeightsSource,
@@ -61,24 +62,6 @@ fn control_source() -> WeightsSource {
 fn randn(shape: &[i32], seed: u64) -> Array {
     let k = random::key(seed).unwrap();
     random::normal::<f32>(shape, None, None, Some(&k)).unwrap()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
-    mlx_rs::ops::max(&d, None)
-        .unwrap()
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .item::<f32>()
-}
-
-fn max_abs(a: &Array) -> f32 {
-    let abs = mlx_rs::ops::abs(a).unwrap();
-    mlx_rs::ops::max(&abs, None)
-        .unwrap()
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .item::<f32>()
 }
 
 /// The latent grid + packed-token sequence for the test geometry.

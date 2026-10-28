@@ -1799,6 +1799,7 @@ mod tests {
     use super::*;
     use mlx_gen::adapters::{install_adapter, Adapter};
     use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+    use mlx_gen::testing::max_abs_diff;
     use mlx_rs::ops::array_eq;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1851,15 +1852,6 @@ mod tests {
         x
     }
 
-    fn max_abs(a: &Array, b: &Array) -> f32 {
-        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
-        mlx_rs::ops::max(&d, None)
-            .unwrap()
-            .as_dtype(mlx_rs::Dtype::Float32)
-            .unwrap()
-            .item::<f32>()
-    }
-
     #[test]
     fn compiled_glue_bit_identical_to_eager() {
         use mlx_rs::Dtype::{Bfloat16, Float32};
@@ -1875,7 +1867,7 @@ mod tests {
         set_compile_glue(true);
         let c = modulate(&normed, &scale, &shift).unwrap();
         set_compile_glue(false);
-        assert_eq!(max_abs(&c, &e), 0.0, "modulate compiled vs eager");
+        assert_eq!(max_abs_diff(&c, &e), 0.0, "modulate compiled vs eager");
 
         // gated: f32 x + (bf16 gate · f32 y).
         let x = rnd(&[b, s, d], Float32);
@@ -1886,7 +1878,7 @@ mod tests {
         set_compile_glue(true);
         let c = gated(&x, &gate, &y).unwrap();
         set_compile_glue(false);
-        assert_eq!(max_abs(&c, &e), 0.0, "gated compiled vs eager");
+        assert_eq!(max_abs_diff(&c, &e), 0.0, "gated compiled vs eager");
 
         // gelu_ffn: f32 FFN activation (the FLUX main-stream dtype). Eager branch defers to the core
         // `gelu_tanh`, so this also proves the compiled body matches the core op exactly.
@@ -1917,8 +1909,16 @@ mod tests {
         set_compile_glue(true);
         let (c0, c1) = rope_rotate(&real, &imag, &cos, &sin).unwrap();
         set_compile_glue(false);
-        assert_eq!(max_abs(&c0, &e0), 0.0, "rope_rotate real compiled vs eager");
-        assert_eq!(max_abs(&c1, &e1), 0.0, "rope_rotate imag compiled vs eager");
+        assert_eq!(
+            max_abs_diff(&c0, &e0),
+            0.0,
+            "rope_rotate real compiled vs eager"
+        );
+        assert_eq!(
+            max_abs_diff(&c1, &e1),
+            0.0,
+            "rope_rotate imag compiled vs eager"
+        );
     }
 
     // ---- sc-2657 adapter routing (FluxLoRAMapping → field translation) ------------------------

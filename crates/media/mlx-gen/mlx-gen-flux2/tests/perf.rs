@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use mlx_gen::testing::{max_abs, max_abs_diff};
 use mlx_gen_flux2::config::Flux2Config;
 use mlx_gen_flux2::loader::load_transformer;
 use mlx_gen_flux2::pipeline::{create_noise, prepare_grid_ids, prepare_text_ids};
@@ -50,17 +51,6 @@ fn timed(eval: &[&Array], start: Instant) -> f64 {
 fn median(mut xs: Vec<f64>) -> f64 {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     xs[xs.len() / 2]
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
-    mlx_rs::ops::max(&d, None).unwrap().item::<f32>()
-}
-
-fn max_abs(a: &Array) -> f32 {
-    mlx_rs::ops::max(mlx_rs::ops::abs(a).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
 }
 
 #[test]

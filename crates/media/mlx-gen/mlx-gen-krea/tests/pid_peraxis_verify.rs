@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::save_png;
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_krea::load;
 
@@ -37,17 +38,6 @@ fn band_greenness(img: &Image, r0: u32, r1: u32) -> f64 {
         }
     }
     sum / n.max(1) as f64
-}
-
-fn save_png(img: &Image, path: &str) {
-    image::save_buffer(
-        path,
-        &img.pixels,
-        img.width,
-        img.height,
-        image::ColorType::Rgb8,
-    )
-    .unwrap();
 }
 
 fn render(width: u32, height: u32) -> Image {
@@ -92,7 +82,7 @@ fn check(label: &str, width: u32, height: u32) -> f64 {
     );
     let out = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/golden/pid");
     let _ = std::fs::create_dir_all(out);
-    save_png(&img, &format!("{out}/krea_peraxis_{label}.png"));
+    save_png(&img, format!("{out}/krea_peraxis_{label}.png"));
     excess
 }
 

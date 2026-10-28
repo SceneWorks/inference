@@ -14,9 +14,10 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration dit_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max, multiply, subtract, sum};
+use mlx_rs::ops::{multiply, sum};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::dit::rope::LensRope3d;
 use mlx_gen_lens::dit::{LensDitConfig, LensTransformer, LensTransformerBlock};
@@ -37,14 +38,6 @@ fn transformer_dir() -> std::path::PathBuf {
         .max()
         .expect("a snapshot");
     snap.join("transformer")
-}
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let got = got.as_dtype(Dtype::Float32).unwrap();
-    let want = want.as_dtype(Dtype::Float32).unwrap();
-    let diff = abs(subtract(&got, &want).unwrap()).unwrap();
-    let denom = max(abs(&want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 
 fn cosine(got: &Array, want: &Array) -> f32 {

@@ -1516,6 +1516,7 @@ fn encode_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::testing::max_abs_diff;
     use mlx_gen::{TrainingItem, TrainingRequest};
     use std::path::PathBuf;
 
@@ -2396,17 +2397,6 @@ mod tests {
     // ======================================================================================
     // sc-10641 — in-training preview sampling
     // ======================================================================================
-
-    /// Max abs element-wise diff between two same-shape latents.
-    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-        a.subtract(b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item::<f32>()
-    }
 
     /// The interval contract, deterministically (no weights): previews are enabled only with a positive
     /// cadence + at least one prompt + not cancelled, and fire on EXACTLY the cadence multiples — nowhere

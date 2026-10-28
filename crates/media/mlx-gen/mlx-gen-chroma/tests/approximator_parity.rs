@@ -4,10 +4,10 @@
 //! `pooled_temb` is the end-to-end modulation tensor (`time_text_embed → distilled_guidance_layer`),
 //! so matching it validates both the sinusoid `input_vec` build and the 5-layer SiLU residual MLP.
 
+use mlx_gen::testing::{max_abs, max_abs_diff};
 use mlx_gen::weights::Weights;
 use mlx_gen_chroma::ChromaTransformer;
 use mlx_gen_chroma::ChromaTransformerConfig;
-use mlx_rs::ops::{abs, max, subtract};
 
 /// The tiny config baked into `dump_chroma_golden.py`.
 fn tiny_cfg() -> ChromaTransformerConfig {
@@ -23,14 +23,6 @@ fn tiny_cfg() -> ChromaTransformerConfig {
         approximator_hidden_dim: 16,
         approximator_layers: 2,
     }
-}
-
-fn max_abs(a: &mlx_rs::Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
-}
-
-fn max_abs_diff(a: &mlx_rs::Array, b: &mlx_rs::Array) -> f32 {
-    max_abs(&subtract(a, b).unwrap())
 }
 
 #[ignore = "model inference; explicit model-proof workflow"]
