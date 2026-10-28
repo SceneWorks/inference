@@ -1167,7 +1167,7 @@ fn latent_shape_and_seq_len_match_reference_formulas() {
 
 #[test]
 fn latent_shape_rejects_zero_frames() {
-    // frames == 0 must be a clean error, not a usize underflow → huge t_lat (F-007).
+    // frames == 0 must be a clean error, not a usize underflow → huge t_lat (sc-5257).
     assert!(latent_shape(0, 512, 512, 16, (4, 8, 8)).is_err());
     assert!(latent_shape(1, 512, 512, 16, (4, 8, 8)).is_ok());
 }

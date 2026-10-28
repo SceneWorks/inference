@@ -42,7 +42,7 @@ pub fn normalize_cfg(s: &str) -> String {
 }
 
 /// Refuse a config `value` for `field` whose normalized spelling is not in `supported`, so a typo
-/// cannot silently fall back to a default sampler or loss (F-041). `prefix` names the trainer
+/// cannot silently fall back to a default sampler or loss (sc-4041). `prefix` names the trainer
 /// (`"<id> trainer"`).
 pub fn check_vocab(prefix: &str, field: &str, value: &str, supported: &[&str]) -> Result<()> {
     if supported.contains(&normalize_cfg(value).as_str()) {
@@ -56,7 +56,7 @@ pub fn check_vocab(prefix: &str, field: &str, value: &str, supported: &[&str]) -
 }
 
 /// The run-shape floor every adapter trainer shares: a non-empty dataset, a non-zero rank, **non-zero
-/// steps** (F-040 — a 0-step run would otherwise fall through to the save and write a no-op `B = 0`
+/// steps** (sc-4040 — a 0-step run would otherwise fall through to the save and write a no-op `B = 0`
 /// identity adapter) and an optimizer MLX training implements.
 pub fn validate_run_shape(prefix: &str, req: &TrainingRequest) -> Result<()> {
     let cfg = &req.config;
@@ -129,7 +129,7 @@ pub fn clamp_unit_timestep(t: f32) -> f32 {
 /// `seed`.
 ///
 /// The weighted branch's second key is `seed.wrapping_add(φ)` (Fibonacci-hash mixing) rather than an
-/// XOR-sibling seed, whose two draws can correlate depending on `key()`'s splat (F-058). Families that
+/// XOR-sibling seed, whose two draws can correlate depending on `key()`'s splat (sc-5308). Families that
 /// used the XOR form before sc-27324 draw a different (equally distributed) weighted stream now.
 ///
 /// Use this directly only when a family transforms the unit timestep before clamping (a schedule

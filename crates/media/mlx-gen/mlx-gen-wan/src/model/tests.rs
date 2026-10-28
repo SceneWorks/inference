@@ -570,7 +570,7 @@ fn sizing_dir(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
 /// assembled snapshots (convert.rs, the default local-dev / gated-e2e layout) and HF-hub caches
 /// store each shard as a symlink into `blobs/`. `DirEntry::metadata` does NOT traverse the link
 /// (a symlinked shard would sum as ~14 bytes → the preflight sees none of the expert weights and
-/// the load dies by SIGKILL, the original F-008 failure); `std::fs::metadata` must size the
+/// the load dies by SIGKILL, the original sc-12459 failure); `std::fs::metadata` must size the
 /// blob target instead.
 #[test]
 fn dit_resident_bytes_dir_sums_symlinked_shards_at_target_size() {

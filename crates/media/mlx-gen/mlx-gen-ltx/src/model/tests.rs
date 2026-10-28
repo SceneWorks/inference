@@ -1054,7 +1054,7 @@ fn validate_request_enforces_constraints() {
         }
     )
     .is_err());
-    // F-058: an unbounded frame count that still satisfies `% 8 == 1` is rejected by the max.
+    // sc-4053: an unbounded frame count that still satisfies `% 8 == 1` is rejected by the max.
     assert!(validate_request(
         &caps,
         &GenerationRequest {

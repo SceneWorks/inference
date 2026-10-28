@@ -114,7 +114,7 @@ fn keyframes_embedding_applies_only_to_marked_tokens() {
 
 #[test]
 fn rms_norm_noweight_matches_fresh_ones_and_caches() {
-    // F-057: the cached `(dim, dtype)` ones must give bit-identical results to a freshly built
+    // sc-4052: the cached `(dim, dtype)` ones must give bit-identical results to a freshly built
     // ones, and a second call (cache hit) must match the first.
     use mlx_rs::ops::array_eq;
     use mlx_rs::random;
@@ -140,7 +140,7 @@ fn rms_norm_noweight_matches_fresh_ones_and_caches() {
 
 #[test]
 fn rope_memo_content_path_caches_and_recomputes_on_change() {
-    // F-048: the `None` (content) path recomputes the per-stage RoPE tables only when `positions`
+    // sc-3995: the `None` (content) path recomputes the per-stage RoPE tables only when `positions`
     // changes. A constant positions (every denoise step) hits the cache; a new positions recomputes.
     let memo = RopeMemo::default();
     let calls = std::cell::Cell::new(0);
@@ -515,7 +515,7 @@ fn disabled_ltx_adapters_residual_is_never_evaluated() {
 #[ignore = "model inference; explicit model-proof workflow"]
 fn empty_pass_scale_forward_errors_not_panics() {
     // A malformed adapter with an empty pass_scale must surface a clean error from forward,
-    // not underflow `ps.len() - 1` (usize) into an OOB index and panic (F-009).
+    // not underflow `ps.len() - 1` (usize) into an OOB index and panic (sc-5259).
     let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
     let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
     let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, 0.4], &[3, 2]);

@@ -1576,7 +1576,7 @@ fn reject_loha_on_packed_errors_on_thirdparty_loha() {
 
 #[test]
 fn reject_loha_on_packed_unsupported_bridges_to_gen_core() {
-    // The typed Unsupported must survive the mlx-gen → gen-core seam 1:1 (epic 3720, F-008) so the
+    // The typed Unsupported must survive the mlx-gen → gen-core seam 1:1 (epic 3720, sc-9097) so the
     // worker's Unsupported classification (not a generic backend failure) fires with the full
     // steer-to-bf16 text intact.
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
