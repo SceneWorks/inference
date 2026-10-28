@@ -33,7 +33,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis, cos, multiply, power, sin, split, tanh};
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, cos, multiply, sin, split};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
@@ -71,7 +71,10 @@ pub trait CausalPackedAttention {
 pub(crate) use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
-use mlx_gen::nn::{retained_compilation_requested, RetainedTernary, RetainedUnary};
+use mlx_gen::nn::{
+    gated_residual_impl, gelu_tanh_ffn_impl, retained_compilation_requested, RetainedTernary,
+    RetainedUnary,
+};
 
 const SITE_MODULATE: &str = "wan::transformer::modulate";
 const SITE_GATED: &str = "wan::transformer::gated";
@@ -81,20 +84,6 @@ fn modulate_impl(
     (m, scale, shift): (&Array, &Array, &Array),
 ) -> std::result::Result<Array, Exception> {
     add(&multiply(m, &add(scale, scalar(1.0))?)?, shift)
-}
-
-fn gated_impl((x, y, gate): (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
-    add(x, &multiply(y, gate)?)
-}
-
-fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
-    let dt = x.dtype();
-    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-    let x3 = power(x, Array::from_int(3))?;
-    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-    multiply(&multiply(x, &s(0.5)?)?, &gate)
 }
 
 struct WanRetainedCompileGlue {
@@ -107,8 +96,8 @@ impl WanRetainedCompileGlue {
     fn new() -> Self {
         Self {
             modulate: RetainedTernary::new(compile_retained(modulate_impl, true)),
-            gated: RetainedTernary::new(compile_retained(gated_impl, true)),
-            gelu_ffn: RetainedUnary::new(compile_retained(gelu_ffn_impl, true)),
+            gated: RetainedTernary::new(compile_retained(gated_residual_impl, true)),
+            gelu_ffn: RetainedUnary::new(compile_retained(gelu_tanh_ffn_impl, true)),
         }
     }
 }
@@ -183,11 +172,11 @@ fn gated(x: &Array, y: &Array, gate: &Array) -> Result<Array> {
                 SITE_GATED,
                 mlx_gen::diagnostics::CompileDisposition::OneShot,
             );
-            Ok(compile(gated_impl, true)((x, y, gate))?)
+            Ok(compile(gated_residual_impl, true)((x, y, gate))?)
         }
     } else {
         mlx_gen::diagnostics::record_fallback(SITE_GATED, "compiled_glue_disabled");
-        Ok(gated_impl((x, y, gate))?)
+        Ok(gated_residual_impl((x, y, gate))?)
     }
 }
 
@@ -208,7 +197,7 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
             SITE_GELU_FFN,
             mlx_gen::diagnostics::CompileDisposition::OneShot,
         );
-        Ok(compile(gelu_ffn_impl, true)(x)?)
+        Ok(compile(gelu_tanh_ffn_impl, true)(x)?)
     }
 }
 

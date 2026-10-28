@@ -6,13 +6,13 @@ use mlx_gen::adapters::loader::{BflTarget, LoraRowSlice};
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
-use mlx_gen::nn::{gelu_tanh, silu};
+use mlx_gen::nn::{gelu_tanh, gelu_tanh_ffn_impl, silu};
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::nn::gelu;
-use mlx_rs::ops::{add, concatenate_axis, multiply, power, split, tanh};
+use mlx_rs::ops::{add, concatenate_axis, multiply, split};
 use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 use std::cell::Cell;
@@ -31,21 +31,12 @@ const RMS_EPS: f32 = 1e-5;
 // sc-2963 compiled-glue toggle + the `modulate`/`gated`/`rope_rotate` helpers are hoisted into core
 // (F-101) so FLUX.1/FLUX.2 share one implementation. Re-export the toggle as this crate's public API;
 // the per-family dtype policy (FLUX.1 casts the modulate `1` to scale's dtype, sc-2787) is the
-// `one_matches_scale = true` argument below. The tanh-GELU FFN glue (`gelu_ffn`) stays crate-specific.
+// `one_matches_scale = true` argument below. The tanh-GELU FFN glue (`gelu_ffn`) keeps its own
+// retained handle and site name; its body is the shared `mlx_gen::nn::gelu_tanh_ffn_impl`.
 use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
 const SITE_GELU_FFN: &str = "flux::transformer::gelu_ffn";
-
-fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
-    let dt = x.dtype();
-    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-    let x3 = power(x, Array::from_int(3))?;
-    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-    multiply(&multiply(x, &s(0.5)?)?, &gate)
-}
 
 thread_local! {
     static RETAINED_GELU_FFN: std::cell::RefCell<Option<mlx_gen::nn::RetainedUnary>> =
@@ -57,7 +48,7 @@ fn retained_gelu_ffn(x: &Array) -> std::result::Result<Array, Exception> {
     RETAINED_GELU_FFN.with(|slot| {
         slot.borrow_mut()
             .get_or_insert_with(|| {
-                mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_ffn_impl, true))
+                mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_tanh_ffn_impl, true))
             })
             .call(SITE_GELU_FFN, x)
     })
@@ -98,7 +89,7 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
             SITE_GELU_FFN,
             mlx_gen::diagnostics::CompileDisposition::OneShot,
         );
-        Ok(compile(gelu_ffn_impl, true)(x)?)
+        Ok(compile(gelu_tanh_ffn_impl, true)(x)?)
     }
 }
 
