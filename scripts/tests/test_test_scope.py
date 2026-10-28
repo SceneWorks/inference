@@ -288,8 +288,32 @@ class RealWorkspaceTests(unittest.TestCase):
         names = {package["name"] for package in metadata["packages"]}
         self.assertEqual(set(self.ws.members.values()), names)
         for package in metadata["packages"]:
-            expected = {dep["name"] for dep in package["dependencies"] if "path" in dep}
+            # Workspace.deps contains member-to-member edges. A dependency may name
+            # an excluded same-repository path without becoming a workspace member.
+            expected = {dep["name"] for dep in package["dependencies"]
+                        if "path" in dep and dep["name"] in names}
             self.assertEqual(self.ws.deps[package["name"]], expected, package["name"])
+
+    def test_excluded_vendor_source_edits_keep_patched_consumers_without_a_lock_change(self) -> None:
+        # CI_IMPACT: source-only scope calls on the existing cached workspace; no builds/tests
+        # of the model. Excluding a path package from workspace edges must not lose source edits.
+        from scripts.ci.select_lanes import select_lanes
+        lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+        for package in ("regex", "regex-automata", "regex-syntax"):
+            directory = f"vendor/clip-regex/{package}"
+            with self.subTest(package=package):
+                self.assertNotIn(directory, self.ws.members)
+                self.assertEqual(self.ws.patched[directory], package)
+                path = f"{directory}/src/lib.rs"
+                self.assertTrue((ROOT / path).is_file())
+                affected = affected_packages(
+                    [path], self.ws, self.test_reads, self.lib_reads,
+                    base_text=lambda _: lock, head_text=lambda _: lock,
+                )
+                self.assertIsNotNone(affected)
+                self.assertTrue({"mlx-gen", "runtime-macos", "runtime-ios", "ios-smoke"} <= affected)
+                self.assertTrue(select_lanes([path])["macos_metal"])
+                self.assertTrue(select_lanes([path])["ios_build"])
 
     def test_a_model_change_keeps_source_reader_tests_without_their_dependents(self) -> None:
         changed = "crates/media/candle-gen/candle-gen-krea/src/lib.rs"

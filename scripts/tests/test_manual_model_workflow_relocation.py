@@ -39,6 +39,17 @@ REPAIRED_H3_STEP_DIGESTS = {
     'synthetic-w4a8-cuda': '36713e1d72834a98a25671e02e949f893862d0722e8c58ea5e582a488ed1c105',
 }
 
+# Main merge d68b36d93 adds exactly {uses: ./.github/actions/cleanup-runner-storage}
+# after checkout in these two jobs. Every other complete step value equals parent
+# 8889135c4 (the H3 receipt above and original MOSS receipt); model commands,
+# assertions, source/device binding and selectors are unchanged. Retain both old
+# receipts and accept only the full reviewed new lists, never strip cleanup steps.
+REVIEWED_STORAGE_STEP_DIGESTS = {
+    'synthetic-w4a8-cuda': 'e75d9a616cdc6eeb4c291863f790dea2ec800b0a1c37490627bc52a3418f7bcc',
+    'moss-edit-cuda': '3cd52c621b7251bdbefc183df2cd535875d402b32a51afb38cab0627e1835c49',
+}
+CURRENT_STEP_DIGESTS = {**STEP_DIGESTS, **REPAIRED_H3_STEP_DIGESTS, **REVIEWED_STORAGE_STEP_DIGESTS}
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
@@ -87,7 +98,7 @@ class ManualModelWorkflowRelocationTests(unittest.TestCase):
                 # Same reviewed interpreter convention as every macOS real-weight job.
                 for step in steps:
                     if 'run' in step: step['run'] = step['run'].replace('python3.12 ', 'python3 ')
-            self.assertEqual(digest(steps), REPAIRED_H3_STEP_DIGESTS.get(name, STEP_DIGESTS[name]), name)
+            self.assertEqual(digest(steps), CURRENT_STEP_DIGESTS[name], name)
         hosted = self.manual['jobs']['h3-pruned-hosted-metal']
         step = next(step for step in hosted['steps'] if step.get('name', '').startswith('Check H3 precise'))
         self.assertEqual(digest(step), STEP_DIGESTS['h3-pruned-hosted-metal'])

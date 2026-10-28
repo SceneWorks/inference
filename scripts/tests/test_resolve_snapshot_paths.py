@@ -8,7 +8,7 @@ import yaml
 from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
 from scripts.release.resolve_snapshot_paths import resolve
 from scripts.tests.test_manual_model_workflow_relocation import (
-    STEP_DIGESTS, REPAIRED_H3_STEP_DIGESTS, digest,
+    CURRENT_STEP_DIGESTS, digest,
 )
 
 
@@ -295,11 +295,11 @@ PRESERVED_LOCAL_SNAPSHOT_MARKERS = (
 # are command contracts, independent of job names: an added snapshot reader or
 # changed controller no longer matches and must select a provisioned weight set.
 FIXTURE_ROUTES = {
-    ('macOS', STEP_DIGESTS['moss-edit-metal']):
+    ('macOS', CURRENT_STEP_DIGESTS['moss-edit-metal']):
         "github.event_name == 'workflow_dispatch' && inputs.profile == 'moss-edit-metal'",
-    ('windows', STEP_DIGESTS['moss-edit-cuda']):
+    ('windows', CURRENT_STEP_DIGESTS['moss-edit-cuda']):
         "github.event_name == 'workflow_dispatch' && inputs.profile == 'moss-edit-cuda'",
-    ('windows', REPAIRED_H3_STEP_DIGESTS['synthetic-w4a8-cuda']):
+    ('windows', CURRENT_STEP_DIGESTS['synthetic-w4a8-cuda']):
         "github.event_name == 'workflow_dispatch' && (inputs.profile == 'synthetic-w4a8-cuda' || inputs.profile == 'synthetic-w4a8-both')",
 }
 
@@ -520,13 +520,33 @@ class WeightSetLabelTests(unittest.TestCase):
         """Snapshot jobs use the provisioned pair; committed fixtures may use all four."""
         self.assertEqual(cuda_weight_route_errors(self.workflow), [])
         for name in ('moss-edit-cuda', 'synthetic-w4a8-cuda'):
-            for mutation in ('snapshot reader', 'dispatch widened', 'cuda removed', 'platform removed'):
+            # CI_IMPACT: three source-only negative cases per existing job; no execution/build.
+            for mutation in ('snapshot reader', 'dispatch widened', 'cuda removed', 'platform removed',
+                             'cleanup removed', 'cleanup changed', 'model command changed'):
                 workflow = copy.deepcopy(self.workflow)
                 job = workflow['jobs'][name]
                 if mutation == 'snapshot reader':
                     job['steps'].append({'run': 'python read_snapshot.py --root E:/huggingface/hub'})
                 elif mutation == 'dispatch widened':
                     job['if'] = "github.event_name == 'workflow_dispatch'"
+                elif mutation.startswith('cleanup '):
+                    cleanup = next(step for step in job['steps']
+                                   if step.get('uses') == './.github/actions/cleanup-runner-storage')
+                    if mutation == 'cleanup removed':
+                        job['steps'].remove(cleanup)
+                    else:
+                        cleanup['with'] = {'moss': 'true'}
+                elif mutation == 'model command changed':
+                    # Changing a model body's assertions or the controller invocation must
+                    # invalidate the committed-fixture receipt just like a new asset reader.
+                    model = next(step for step in reversed(job['steps']) if 'run' in step)
+                    if name == 'synthetic-w4a8-cuda':
+                        self.assertIn('-ExpectedCount 14', model['run'])
+                        model['run'] = model['run'].replace('-ExpectedCount 14', '-ExpectedCount 13')
+                    else:
+                        self.assertIn('-m scripts.ci.moss_edit_cuda', model['run'])
+                        model['run'] = model['run'].replace('-m scripts.ci.moss_edit_cuda',
+                                                            '-m scripts.ci.moss_edit_cuda_changed')
                 else:
                     job['runs-on'].remove('cuda' if mutation == 'cuda removed' else 'windows')
                 self.assertTrue(cuda_weight_route_errors(workflow), (name, mutation))
