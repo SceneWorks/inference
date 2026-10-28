@@ -1,7 +1,8 @@
 # iOS runtime project specification
 
-Reconciled 2026-10-26. This describes the feature branch, not a main release or a
-completed device campaign. Requirements and acceptance authority:
+Reconciled at the 2026-10-28 feature-source checkpoint, while protected main
+integrations are in progress. It describes the implementation contract, not a
+completed target-device campaign. Requirements and acceptance authority:
 [epic 16774](https://app.shortcut.com/trefry/epic/16774).
 Architecture rationale: [strategy](ios-strategy.md). Operation:
 [device runbook](../ios-device-runbook.md).
@@ -46,10 +47,13 @@ lanes remain in place; this epic does not replace them with iOS CI.
 Every registered image model and mode loads through ONE admission seam
 (`mlx_gen_ios_catalog::ios_admission`), exposed as one admitted facade per surface:
 
-- `runtime_ios::media::load_sana`, `load_sdxl`, `load_anima_turbo` and `load_iris` take ordered
+- `runtime_ios::media::load_sana`, `load_sdxl`, `load_anima_turbo`,
+  `load_z_image_turbo` and `load_iris` take ordered
   `IosCandidate`s (built with `media::build_candidate` from the provider's own contract) and return
   the admitted index plus a `BoundGenerator`. `load_iris_restore` returns a `BoundTransform`,
-  `load_iris_depth` a `BoundDepth`. Each requires `bound_mlx_to_platform_limits()` first, then
+  `load_iris_depth` a `BoundDepth`; Iris depth/restoration task-tier phone certification
+  is outside the approved generation-only closeout. Each requires
+  `bound_mlx_to_platform_limits()` first, then
   keys the request (hardware, provider, route, tier, path-free layout digest, mode, geometry,
   reference count, execution levers, token window — never prompt, seed or install path), prices
   it from the single reviewed ANCHOR table
@@ -119,9 +123,10 @@ product Swift concurrency API. Preserve fresh-build/report guards and explicit
 admitted-versus-diagnostic labels in the harness. Do not run another MLX workload
 concurrently with a device investigation's host-side measurement.
 
-The remaining terminal sequence is owned by sc-26270: finish the general model
-set, review E1–E8, integrate inference through its protected main PR, perform the
-single permanent SceneWorks pin bump, collect the target endpoint evidence and
-derived claims, then integrate SceneWorks. Supra2 iOS registration remains the
-user-approved non-blocking sc-26269 follow-up. No pin or main merge is performed
-by this docs story. Product FFI, Swift package and app provisioning remain separately scoped.
+sc-26270 owns the final E1–E8 review, protected inference main integration,
+single permanent SceneWorks pin bump and protected SceneWorks main integration,
+plus the target endpoint evidence and derived claims. Michael authorized the
+protected integrations ahead of the paused phone campaign; neither main landing
+certifies phone fit. Supra2 iOS registration remains the user-approved
+non-blocking sc-26269 follow-up. This docs story performs no pin, merge or device
+capture. Product FFI, Swift package and app provisioning remain separately scoped.

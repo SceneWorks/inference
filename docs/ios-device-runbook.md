@@ -1,16 +1,18 @@
 # iOS device runbook
 
-Reconciled 2026-10-26 against the sc-26270
+Reconciled at the 2026-10-28 feature-source checkpoint against the sc-26270
 ANCHOR campaign (two endpoint configurations per family, with two optimized
-repeats). Source repairs and terminal device evidence remain in progress. These
-are implemented harness commands, not a claim the epic
-is on main or that all models render on the phone. See [strategy](architecture/ios-strategy.md),
+repeats). Protected main integrations are in progress at this checkpoint;
+terminal device evidence remains incomplete. These are implemented harness
+commands, not a claim that all models render on the phone. See [strategy](architecture/ios-strategy.md),
 [specification](architecture/ios-project-spec.md), and [remaining work](ios-epics.md).
 
 ## Current model and evidence status
 
-Target: **iPhone 16 Pro Max, 8 GB, iOS 26.6.2**. No successful target-device image
-has been recorded. Registration is not admission or demonstrated fit.
+Target: **iPhone 16 Pro Max, 8 GB, iOS 26.6.2**. Two source-bound SANA q4
+optimized diagnostic captures produced target-device images; no admitted
+product image or complete model-set phone fit has been demonstrated.
+Registration is not admission or demonstrated fit.
 
 Michael clarified this delivery's Iris scope on 2026-10-26: generation
 (`iris_3b`), including bf16/q8/q4 on MLX and Candle. Existing depth/restoration
@@ -22,14 +24,16 @@ unchanged. See epic 16774 and sc-26266/sc-26270 for the recorded decision.
 
 | Model set | Feature status at this snapshot | Target-phone status |
 |---|---|---|
-| SANA base/sprint | Registered; source-bound admission and packed Gemma embeddings merged in #1272 (`23c7e3953`) | Admitted loader refuses without applicable capture; 1024/tile192 attempt terminated, cause unconfirmed |
+| SANA base/sprint | Registered; source-bound admission and packed Gemma embeddings merged in #1272 (`23c7e3953`) | Admitted loader refuses without applicable capture; earlier 1024/tile192 termination cause unconfirmed; later base q4 optimized diagnostic images and a different-layout resident capacity refusal are recorded in section 8 |
 | Anima Turbo | Registered without training; Base/Aesthetic excluded | No demonstrated phone fit |
 | Iris 3B | q8/q4 engine fixes merged #1275 (`2f3265c71`); iOS registration #1277 merged | No demonstrated phone fit; depth access is explicitly diagnostic |
 | SDXL, Illustrious-XL v1/v2, RealVisXL, RealVisXL Lightning | Low-memory engine fixes merged #1274 (`a54ad6c3a`); iOS registration #1278 merged | No demonstrated phone fit |
 | Supra2-IMG | Provider delivered separately; iOS registration sc-26269 is explicitly user-deferred and non-blocking for this general delivery | No iOS registration/fit claim here |
 | Z-Image Turbo (`z_image_turbo` text / img2img / LoRA+LoKr; `z_image_turbo_control` pose/canny/depth) | Registered without training at its stored q4/q8/bf16 tiers (sc-26433); every quantum bounded; host-derived reachable sizes below | No demonstrated phone fit. Michael's 8 GB **Mac** q4 run is Mac evidence, not device evidence |
 
-The legacy S3 image check drives SANA. The sc-26270 campaign protocol below now
+The approved S3 simulator check verifies build, install, launch and an explicit
+unsupported MLX runtime result; it executes no model and produces no image.
+SANA image evidence remains a physical-phone requirement. The sc-26270 campaign protocol below now
 selects every catalog provider/route/tier/geometry/mode/strategy explicitly. There
 are still no `--iris`, `--sdxl`, `--anima` or `--supra2` shortcut flags. Z-Image Turbo
 is a catalog model (sc-26433); `run_smoke.sh --zimage` is now only a shortcut for ONE
@@ -146,10 +150,11 @@ gh workflow run model-inference-proofs.yml --repo SceneWorks/inference \
   --ref "$COMPLETED_SOURCE_REF" -f backend=mlx -f request="$(cat /tmp/model-proof-request.json)"
 ```
 
-Before the new workflow exists on the default branch, dispatch through the **existing**
-`real-weights.yml` workflow identity at the exact feature ref. GitHub does not make a
-brand-new workflow dispatchable merely because its file is in a feature branch. The
-bridge uses the same canonical runner, retains the existing 25-input schema, and does
+For a feature ref whose dedicated workflow is not yet registered on the default
+branch, dispatch through the **existing** `real-weights.yml` workflow identity.
+GitHub does not make a brand-new workflow dispatchable merely because its file
+is in a feature branch. Once registered, the direct workflow can be dispatched.
+The bridge uses the same canonical runner, retains the existing 25-input schema, and does
 not alter the frozen `ios-pricing-compile-only` profile or its JSON default:
 
 ```sh
@@ -937,7 +942,8 @@ The fresh 2026-10-26 A/B measured available memory **plus current process footpr
 all three pairs per launch totaled **6144 MiB entitled / 3376 MiB off**; restored-on
 again totaled 6144 MiB on iPhone17,2, iOS 26.6.2 (23G90). The runtime ceiling now uses
 that observed entitled OS process limit. Preserve the [original e49f5345 receipts](evidence/ios-process-limit-2026-10-26/README.md).
-This source repair requires a final rebuilt SDK/harness before weighted capture, while the
+Later source-bound SANA q4 captures used a rebuilt harness; their distinct
+source/artifact identities and limits are recorded in section 8. The
 source-independent OS/entitlement A/B observations remain valid. Neither the limit nor the
 entitlement delta certifies a safe render working set. Existing live guards, margins and
 no-evidence refusals remain unchanged; MLX allocator limits are not a proven jetsam barrier.
@@ -1135,17 +1141,44 @@ Historical SANA data on the 12 GB iPhone 17 Pro Max is unbound planning data:
 its active+cache values are **not** kernel `phys_footprint`, and it is not the
 8 GB target. Do not import its old fit/no-fit verdicts into the target table.
 
-## 8. Terminal device campaign — not yet measured
+## 8. Terminal device campaign — partial diagnostic captures, admission open
 
 sc-26270 owns the ANCHOR campaign (per served provider route × tier × mode: the
 resident anchor once and the optimized anchor twice at 1024² with 2 steps, plus the
-validation cases), feature review, pin and main integration. Retain every
-registered mode; report explicit refusals, not missing cells. Add real rows here
-only after captures, with this schema:
+validation cases) and final review. Michael authorized protected main integrations
+and the single SceneWorks pin ahead of the paused phone campaign; source landing
+does not complete device acceptance. Retain every registered mode; report explicit
+refusals, not missing cells. These are the retained partial target observations:
 
 | Source SHA / artifact layout and component tiers | Phone / OS / entitlement | Provider / mode / size / strategy | Time | MLX peak | Kernel footprint | Min headroom | Completed / refused / unconfirmed termination | Image / diagnostic receipt |
 |---|---|---|---|---|---|---|---|---|
-| Not yet captured | iPhone 16 Pro Max / iOS 26.6.2 | Full required model/tier set remains outstanding | — | — | — | — | No target image success recorded | — |
+| `a3ae7a3ed6014f057ffc37a13c33d60763c80b1b`; q4 layout `6b07bad5e6c499d42039e7df1333eaf2b5a80ffc93e4c1b283f64c283c0289b4` | iPhone17,2 / iOS 26.6.2 / YES | SANA base q4 text, 1024², rung 3, tile 192, 2 steps; optimized repeat 1 | 66.691 s | 3,023,303,740 B | 3,083,078,352 B lifetime peak | 3204.044 MiB | `diagnostic_success`; `production_success=false` | 1024² PNG; local receipt `sana-q4-source-a3ae-optimized1/optimized.jsonl` |
+| `a3ae7a3ed6014f057ffc37a13c33d60763c80b1b`; q4 layout `6b07bad5e6c499d42039e7df1333eaf2b5a80ffc93e4c1b283f64c283c0289b4` | Same phone / OS / entitlement | Same case; optimized repeat 2 | 60.129 s | 3,023,303,740 B | 3,083,504,336 B lifetime peak | 3204.622 MiB | `diagnostic_success`; `production_success=false` | 1024² PNG; local receipt `sana-q4-source-a3ae-optimized2/optimized.jsonl` |
+| `ad873528c9797803b4e7407b8e9c9bc5dd20068e`; q4 layout `f0139b1ee847fcfb47654962b10533682471f62732498c18489f4d63a74ef950` | Same phone / OS / entitlement | SANA base q4 text, 1024², rung 0, 2 steps; resident | 9.160 s | No model allocation | 24,707,920 B pre-allocation peak | 6120.437 MiB | `capture_refused`, `capacity`; before construction | No PNG; local receipt `sana-q4-source-ad873-resident1/resident.jsonl` |
+| Remaining served model/tier/mode families and validation cases | iPhone 16 Pro Max / iOS 26.6.2 | Full required campaign remains open | — | — | — | — | No completed acceptance claim | — |
+
+The local receipt paths above are relative to
+`/Users/michael/.codex/epic-runs/sc-16774-20261026/phone-session/` and are
+external to the repository. Exact attempt nonces (`run_id`), raw-report SHA-256,
+and image SHA-256 are:
+
+- Optimized repeat 1: `c7196ad77f2240a6a1e4bd56612d4a4f`, report
+  `08198b1c039e70cc1dc53255297a843aeb0fee61a2f8b4fe0c7748890c6e611e`,
+  PNG `a24aa1ea2d84c2154c98d4bf9ad6828817f18d34a19e4e2ff10925532004578f`.
+- Optimized repeat 2: `5a769d7cc6ef4270bfe79debec103f9a`, report
+  `400a4b0a2f9ba45466de1fd7dedf470cc37fda093d97a847a4254fc6ce221a10`,
+  PNG `a24aa1ea2d84c2154c98d4bf9ad6828817f18d34a19e4e2ff10925532004578f`.
+- Resident refusal: `42e3a07a352f412abfae128ec3db6747`, report
+  `4e1a7d3f1bb8cc2b2a862f4bb950935c9b17a9e1b386adc6d20a6f2fbe0505f8`;
+  the guard refused 13,962,842,112 B scratch plus a 536,870,912 B engineering
+  reserve against current headroom, not a measured resident working set.
+
+The two completed optimized runs share their exact case and artifact layout,
+but are separate invocations each stored with original `repeat=0`; the labels
+above distinguish receipts, not rewritten ordinals. The later resident refusal
+has a different layout and source revision.
+They are not a validated complete anchor family. The installed admission table
+still contains no phone rows, and no capture is an admitted product success.
 
 A successful diagnostic capture does not populate an admitted-success row.
 Do not invent measurements, infer safe caps from launch headroom, or silently

@@ -1,7 +1,9 @@
 # iOS strategy — MLX on iPhone
 
-Status: implementation on `feature/sc-16774-ios-runtime`, not an announcement of
-availability on main. Reconciled 2026-10-26 for [epic 16774](https://app.shortcut.com/trefry/epic/16774).
+At the 2026-10-28 documentation checkpoint, the implementation is on
+`feature/sc-16774-ios-runtime` and the protected inference and SceneWorks main
+integrations are in progress. Source integration is separate from target-phone
+admission. Reconciled for [epic 16774](https://app.shortcut.com/trefry/epic/16774).
 See the [project specification](ios-project-spec.md), [device runbook](../ios-device-runbook.md),
 and [remaining work](../ios-epics.md).
 
@@ -86,8 +88,12 @@ are not proof against termination. Record MLX live peak, active+cache, kernel
 process `phys_footprint`, and minimum available headroom separately. Historical
 SANA observations on a 12 GB iPhone 17 Pro Max measured MLX active+cache, not the
 target's kernel process footprint, and lack an artifact-layout binding. They
-remain planning data only. The target-phone 1024/tile192 attempt terminated;
-its cause is unconfirmed, not proven jetsam. No target image success is recorded.
+remain planning data only. An earlier target-phone 1024/tile192 attempt
+terminated; its cause is unconfirmed, not proven jetsam. Later source-bound
+SANA q4 optimized *diagnostic captures* produced two 1024² images, while a
+resident q4 attempt returned a typed pre-allocation capacity refusal. These
+do not establish admitted product rendering or complete the phone campaign;
+the runbook preserves their distinct source and artifact identities.
 
 ## Delivery boundary
 
@@ -98,6 +104,8 @@ Base/Aesthetic are outside this epic. Supra2 implementation belongs to epic
 24212 and has been delivered separately. Its iOS registration remains open as
 the explicitly approved non-blocking sc-26269 follow-up, not falsely completed.
 
-Final device campaign, feature-end review, the single SceneWorks pin bump and
-feature-to-main integration remain sc-26270. Until those results exist, neither
-this strategy nor a passing build asserts a production-safe iPhone model set.
+sc-26270 owns the remaining device campaign, feature-end review and integration
+readback. Michael authorized protected inference and SceneWorks main integration
+ahead of the paused phone campaign; merging source or passing a build does not
+assert a production-safe iPhone model set. The target endpoint and derived
+admission evidence remain open.

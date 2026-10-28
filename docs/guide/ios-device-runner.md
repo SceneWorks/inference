@@ -50,9 +50,9 @@ verified build, install, launch and explicit `UNSUPPORTED_RUNTIME` response,
 with no model execution. The SANA image remains required on the target phone.
 This manual `real-weights.yml` profile selects an available iPhone simulator
 on the claiming Mac, creates and later deletes only its own device, and never
-touches the template's apps or data. Until the dedicated reusable
-workflow is on the default branch, dispatch through the registered workflow at
-the exact feature ref:
+touches the template's apps or data. For a feature ref whose dedicated workflow
+is not yet registered on the default branch, dispatch through this registered
+bridge at the exact feature ref:
 
 ```sh
 gh workflow run real-weights.yml --ref <feature-ref> \
@@ -69,6 +69,16 @@ metallib hashes, simulator UUID, PID and runtime. Its
 `packaging_runtime_boundary_accepted` field can be true while
 `model_execution`, `model_acceptance`, `image_acceptance` and
 `phone_fit_acceptance` are all false. No SANA weights are fetched or copied.
+The accepted simulator-boundary run at source
+`bf377487dd53e13749c584a92cef66bbf7c246bf` is Actions run `40589777766`:
+its nonce `5b9b1fe27ffadb2ce8cffcee22368706` and exact unsupported report
+SHA-256 `d5a446edc34f3d6f3aeb1f06e357755d1f20503bb56dd145c2d80372e3e65ae7`
+bind that source. The installed executable and simulator metallib
+hashes, owned PID/start/UUID, resource samples and owned-device cleanup were
+reviewed in the local retained receipt
+`/Users/michael/.codex/epic-runs/sc-16774-20261026/simulator-bf377-artifact-review.md`.
+It reports `packaging_runtime_boundary_accepted=true` and `accepted=false`;
+no simulator image or physical-phone fit is claimed.
 
 ## Optional tooling is not campaign evidence
 
