@@ -17,7 +17,8 @@
 use std::path::Path;
 
 use candle_audio::candle_core::pickle::read_pth_tensor_info;
-use core_llm::{Error as CoreError, ModelFormat, PrepareReport, PrepareSpec, Result as CoreResult};
+use candle_audio::prepare::{passthrough_report, probe_json_config};
+use core_llm::{Error as CoreError, PrepareReport, PrepareSpec, Result as CoreResult};
 
 use crate::pipeline::CHECKPOINT_FILE;
 use crate::weights::SECTIONS;
@@ -26,15 +27,9 @@ use crate::weights::SECTIONS;
 /// `istftnet` vocoder block + the pickle checkpoint)? Reads only `config.json` metadata,
 /// never a weight shard.
 pub fn is_kokoro_snapshot(dir: &Path) -> bool {
-    if !dir.is_dir() || !dir.join(CHECKPOINT_FILE).is_file() {
-        return false;
-    }
-    let Ok(text) = std::fs::read_to_string(dir.join("config.json")) else {
-        return false;
-    };
-    serde_json::from_str::<serde_json::Value>(&text)
-        .map(|v| v.get("istftnet").is_some() && v.get("vocab").is_some())
-        .unwrap_or(false)
+    probe_json_config(dir, CHECKPOINT_FILE, "config.json", |v| {
+        v.get("istftnet").is_some() && v.get("vocab").is_some()
+    })
 }
 
 /// [`is_kokoro_snapshot`] over a [`PrepareSpec`] — the probe the composed audio-lane
@@ -46,40 +41,22 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
 /// Prepare (verify + passthrough) a Kokoro snapshot. Counts the checkpoint's tensors from
 /// pickle metadata (no storage reads) so the report is honest about what the snapshot holds.
 pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
-    if !is_kokoro_snapshot(&spec.source) {
-        return Err(CoreError::Unsupported(format!(
-            "prepare: {} is not a Kokoro audio snapshot",
-            spec.source.display()
-        )));
-    }
-    if let Some(q) = spec.quantize {
-        return Err(CoreError::Unsupported(format!(
-            "prepare: kokoro audio snapshots have no {q:?} form — the 82M checkpoint ships \
-             dense-only"
-        )));
-    }
-    let pth = spec.source.join(CHECKPOINT_FILE);
-    let mut num_tensors = 0usize;
-    for section in SECTIONS {
-        let infos = read_pth_tensor_info(&pth, false, Some(section)).map_err(|e| {
-            CoreError::Msg(format!("prepare: {} section {section}: {e}", pth.display()))
-        })?;
-        if infos.is_empty() {
-            return Err(CoreError::Msg(format!(
-                "prepare: {} is missing checkpoint section {section:?}",
-                pth.display()
-            )));
+    passthrough_report(spec, "Kokoro", is_kokoro_snapshot, |source| {
+        let pth = source.join(CHECKPOINT_FILE);
+        let mut num_tensors = 0usize;
+        for section in SECTIONS {
+            let infos = read_pth_tensor_info(&pth, false, Some(section)).map_err(|e| {
+                CoreError::Msg(format!("prepare: {} section {section}: {e}", pth.display()))
+            })?;
+            if infos.is_empty() {
+                return Err(CoreError::Msg(format!(
+                    "prepare: {} is missing checkpoint section {section:?}",
+                    pth.display()
+                )));
+            }
+            num_tensors += infos.len();
         }
-        num_tensors += infos.len();
-    }
-    Ok(PrepareReport {
-        // core-llm's own detect_format calls a config.json-bearing snapshot dir Safetensors
-        // (the HF-snapshot shape); the pickle checkpoint rides inside that shape.
-        input_format: ModelFormat::Safetensors,
-        quantized: None,
-        out_dir: spec.source.clone(),
-        num_tensors,
-        passthrough: true,
+        Ok(num_tensors)
     })
 }
 
