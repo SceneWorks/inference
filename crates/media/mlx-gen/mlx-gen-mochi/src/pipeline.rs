@@ -13,16 +13,12 @@
 use mlx_rs::ops::{add, concatenate_axis, divide, maximum, minimum, multiply};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::{CancelFlag, Error, Image, Progress, Result};
 
 use crate::scheduler::{cfg_combine, MochiScheduler};
 use crate::transformer::MochiTransformer3DModel;
 use crate::vae::{MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
-
-/// `[v]` as a length-1 `Array` (small scalar helper for the uint8 conversion).
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// Force a logically-contiguous copy: host reads (`as_slice`) return the *physical* buffer, so an
 /// array left strided by the `(F,H,W,C)` transpose reads scrambled. sc-12748: delegates to the shared

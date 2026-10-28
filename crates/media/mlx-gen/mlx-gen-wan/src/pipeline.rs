@@ -18,6 +18,7 @@ use mlx_rs::memory::{get_active_memory, get_memory_limit};
 use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
+use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tiling::{
     budgeted_plan, SpatialTiling, TemporalOverlapPolicy, TileCandidates, TilingBudgetError,
@@ -29,10 +30,6 @@ use crate::scheduler::{compute_sigmas, make_scheduler, SolverKind, WanScheduler}
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
 use crate::vae22::Wan22Vae;
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// Align a pixel dimension **down** to a multiple of `patch · vae_stride` (the reference rounds the
 /// requested size to the nearest valid grid; sub-tile requests are rejected by `validate`).

@@ -27,6 +27,7 @@
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter, DiffPatchPart};
 use mlx_gen::array::scalar;
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+use mlx_gen::nn::silu;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -380,11 +381,6 @@ fn load_linear(w: &Weights, prefix: &str, quant: Option<WanQuant>) -> Result<Ada
         w.require(&format!("{prefix}.weight"))?.clone(),
         Some(w.require(&format!("{prefix}.bias"))?.clone()),
     ))
-}
-
-/// SiLU `x·σ(x)` (the reference `nn.SiLU`), bit-exact and dtype-preserving.
-fn silu(x: &Array) -> Result<Array> {
-    mlx_gen::nn::silu(x)
 }
 
 fn f32(x: &Array) -> Result<Array> {

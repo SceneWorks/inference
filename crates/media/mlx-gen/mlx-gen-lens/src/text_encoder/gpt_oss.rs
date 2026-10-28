@@ -29,16 +29,12 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Quant, Result};
 
 use crate::config::GptOssConfig;
 use crate::text_encoder::mxfp4::dequantize_mxfp4;
-
-/// A scalar `[1]` array for broadcasting multiplies.
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// `y = x · Wᵀ + b` for a stored `[out, in]` weight and `[out]` bias (the gpt-oss attention
 /// projections all have biases — `attention_bias: true`).

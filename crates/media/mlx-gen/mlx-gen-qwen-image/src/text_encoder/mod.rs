@@ -33,11 +33,5 @@ pub(crate) fn matmul_t(x: &Array, w: &Array) -> Result<Array> {
     Ok(matmul(x, w.t())?)
 }
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix.
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;

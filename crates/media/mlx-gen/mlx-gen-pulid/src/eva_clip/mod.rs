@@ -32,14 +32,8 @@ use rope::VisionRope;
 /// EVA LayerNorm epsilon (`model.py:123` `partial(LayerNorm, eps=1e-6)`).
 pub(crate) const EPS: f32 = 1e-6;
 
-/// Join a dotted weight-key prefix with a leaf (`"" + leaf` ⇒ `leaf`).
-pub(crate) fn join(prefix: &str, leaf: &str) -> String {
-    if prefix.is_empty() {
-        leaf.to_string()
-    } else {
-        format!("{prefix}.{leaf}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;
 
 /// EVA02-CLIP-L-14-336 visual-tower config.
 #[derive(Clone, Debug)]

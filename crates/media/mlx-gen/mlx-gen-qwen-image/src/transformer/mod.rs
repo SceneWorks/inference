@@ -50,14 +50,8 @@ pub(crate) fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<A
     crate::quant::lin(w, prefix, has_bias)
 }
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix.
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;
 
 /// sc-2963 shared helpers for the per-module compiled-glue bit-exactness tests (each submodule's
 /// private compiled chain — `modulate`/`gated` in [`block`], `gelu_ffn` in [`feed_forward`],

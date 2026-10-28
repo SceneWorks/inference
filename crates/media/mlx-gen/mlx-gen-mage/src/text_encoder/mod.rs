@@ -120,12 +120,5 @@ pub use rope::{mrope_cos_sin, MRopePositions};
 
 pub(crate) use load::{embedding, lin};
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix (so a flat test fixture and a
-/// real `model.language_model.layers.{i}` tree both resolve without a stray leading dot).
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;

@@ -24,6 +24,7 @@ use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{add, broadcast_to, divide, maximum, minimum, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::AudioTrack;
 use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
@@ -71,10 +72,6 @@ pub const TEMPORAL_SIGMAS: [f32; 5] = [0.975, 0.909_375, 0.725, 0.421_875, 0.0];
 /// actually being run. This table is byte-identical to `candle-gen-ltx`'s `STAGE1_SIGMAS`, which is
 /// what makes one lane-agnostic catalog entry legitimate rather than a papered-over difference.
 pub const NATIVE_STEPS: u32 = STAGE1_SIGMAS.len() as u32 - 1;
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// The legacy dtype-preserving Euler update (the `use_legacy_euler` branch): for `σ_next > 0`,
 /// `x' = denoised + σ_next·(x − denoised)/σ`; at the final step (`σ_next = 0`), `x' = denoised`.
