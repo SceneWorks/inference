@@ -16,7 +16,8 @@
 //! forward exactly. The Lens flow-match sampler is chaos-sensitive — `(W+δ)·x` differs from the
 //! residual `W·x + δ·x` by ~1 ULP, which cascades to a visibly different image. The delta is
 //! reconstructed with the **same** f32 math the trainer's forward uses
-//! ([`reconstruct_lora_delta`] / [`reconstruct_lokr_delta`]), so a candle-trained adapter round-trips.
+//! ([`reconstruct_lora_delta`](candle_gen::train::lora::reconstruct_lora_delta) /
+//! [`reconstruct_lokr_delta`](candle_gen::train::lora::reconstruct_lokr_delta)), so a candle-trained adapter round-trips.
 //!
 //! **Merge at the safetensors-key level.** The DiT reads its `transformer/` keys 1:1, so
 //! `transformer_blocks.{i}.attn.{img_qkv,txt_qkv,to_out.0,to_add_out}.weight` is a valid base key for
@@ -36,209 +37,21 @@ use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::quant::LokrFactors;
-use candle_gen::train::lora::{
-    parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
-};
+use candle_gen::train::lora::{parse_lokr_metadata, LoraAdapterMeta};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report primitives
 // this crate previously hand-copied. Only the DiT-specific key→module resolution stays local below.
 use candle_gen::train::merge::{
-    build_kohya_table, merge_into, no_target_matched, read_adapter, read_scalar, AdapterFile,
-    LoraTriple, Role,
+    build_kohya_table, no_target_matched, read_adapter, read_scalar, AdapterFile, LoraTriple, Role,
 };
 // Re-exported so `candle_gen_lens::MergeReport` (the crate's public surface) keeps resolving.
 pub use candle_gen::train::merge::MergeReport;
+// The shared DiT key surface + per-file folds (sc-27413).
+use candle_gen::train::merge_dit::{
+    classify_lokr_key, classify_lora_key, merge_lokr_file, merge_lora_file,
+};
 use candle_gen::{CandleError, Result};
 
 use crate::transformer::LensTransformer;
-
-/// PEFT key prefixes tolerated on read, longest-first. The candle/torch Lens trainer writes **bare**
-/// dotted paths (no prefix), but community adapters and `peft.save_pretrained()` wrap the DiT under
-/// one of these; stripping them yields the same dotted module path. A key matching none is taken
-/// as-is (bare).
-const PEFT_PREFIXES: [&str; 4] = [
-    "base_model.model.transformer.",
-    "base_model.model.",
-    "diffusion_model.",
-    "transformer.",
-];
-
-/// kohya / community flattened-module LoRA prefix (the DiT analog of SDXL's `lora_unet_`). The
-/// `_`-flattened stem is resolved against the base DiT key table (diffusers names contain `_`, so the
-/// flattening is ambiguous without it).
-const KOHYA_PREFIX: &str = "lora_transformer_";
-
-/// LoKr per-module factor suffixes, longest-first so `.lokr_w1_a` wins over `.lokr_w1`.
-const LOKR_SUFFIXES: [&str; 6] = [
-    ".lokr_w1_a",
-    ".lokr_w1_b",
-    ".lokr_w1",
-    ".lokr_w2_a",
-    ".lokr_w2_b",
-    ".lokr_w2",
-];
-
-/// Strip the longest matching PEFT prefix, or return the key unchanged (bare dotted path).
-fn strip_peft_prefix(key: &str) -> &str {
-    for p in PEFT_PREFIXES {
-        if let Some(rem) = key.strip_prefix(p) {
-            return rem;
-        }
-    }
-    key
-}
-
-/// Map one LoRA key to `(dit_dotted_path, role)`, or `None` if outside the DiT merge surface. kohya
-/// (`lora_transformer_<flat>…`) resolves the flattened stem via `table`; PEFT/bare resolve directly
-/// after the optional prefix strip.
-fn classify_lora_key(key: &str, table: &BTreeMap<String, String>) -> Option<(String, Role)> {
-    if let Some(rem) = key.strip_prefix(KOHYA_PREFIX) {
-        for (suf, role) in [
-            (".lora_down.weight", Role::Down),
-            (".lora_up.weight", Role::Up),
-            (".alpha", Role::Alpha),
-        ] {
-            if let Some(stem) = rem.strip_suffix(suf) {
-                return table.get(stem).map(|d| (d.clone(), role));
-            }
-        }
-        return None;
-    }
-    let rem = strip_peft_prefix(key);
-    for (suf, role) in [
-        (".lora_A.default.weight", Role::Down),
-        (".lora_B.default.weight", Role::Up),
-        (".lora_A.weight", Role::Down),
-        (".lora_B.weight", Role::Up),
-        (".alpha", Role::Alpha),
-    ] {
-        if let Some(path) = rem.strip_suffix(suf) {
-            return Some((path.to_string(), role));
-        }
-    }
-    None
-}
-
-/// Map one LoKr factor key to `(dit_dotted_path, factor_name)`, or `None` if out of surface.
-fn classify_lokr_key(
-    key: &str,
-    table: &BTreeMap<String, String>,
-) -> Option<(String, &'static str)> {
-    for suf in LOKR_SUFFIXES {
-        if let Some(stem) = key.strip_suffix(suf) {
-            let factor = &suf[1..]; // drop the leading '.'
-            return if let Some(flat) = stem.strip_prefix(KOHYA_PREFIX) {
-                table.get(flat).map(|d| (d.clone(), factor))
-            } else {
-                Some((strip_peft_prefix(stem).to_string(), factor))
-            };
-        }
-    }
-    None
-}
-
-/// Merge one LoRA file into `base` at `scale`: classify every key, fold complete `(down, up)` pairs
-/// into `{path}.weight`. `rank` is `A`'s leading dim; `alpha` is the per-target `.alpha` tensor when
-/// present, else the `lora_adapter_metadata` blob's `alpha_pattern`/`lora_alpha` (the diffusers / PEFT
-/// `save_lora_adapter` format ships no `.alpha` tensor — sc-5374), else `rank`. Half-pairs and
-/// conv-shaped (4-D) factors are surfaced as skipped.
-fn merge_lora_file(
-    base: &mut HashMap<String, Tensor>,
-    af: &AdapterFile,
-    scale: f32,
-    table: &BTreeMap<String, String>,
-    report: &mut MergeReport,
-) -> Result<()> {
-    let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
-    for (key, t) in &af.tensors {
-        match classify_lora_key(key, table) {
-            Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
-            Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
-            Some((path, Role::Alpha)) => {
-                triples.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", t)?)
-            }
-            None => report.skipped_keys += 1,
-        }
-    }
-
-    // sc-5374: diffusers / PEFT `save_lora_adapter` files ship no per-target `.alpha` tensor —
-    // `lora_alpha`/`r` (+ per-module overrides) live in the `lora_adapter_metadata` header blob.
-    // `None` for kohya / candle-trainer files (those carry a `.alpha` tensor, used exactly as before).
-    let cfg = LoraAdapterMeta::from_file_metadata(&af.meta);
-    for (path, t) in triples {
-        let (Some(down), Some(up)) = (t.down, t.up) else {
-            report.skipped_keys += 1; // half-pair (partner targeted a non-routable module)
-            continue;
-        };
-        if down.dims().len() != 2 || up.dims().len() != 2 {
-            report.skipped_keys += 1; // conv-shaped LoRA — out of surface
-            continue;
-        }
-        let base_key = format!("{path}.weight");
-        if !base.contains_key(&base_key) {
-            report.skipped_keys += 1;
-            continue;
-        }
-        // per-target `.alpha` tensor → `alpha_pattern`/`lora_alpha` blob → factor rank (last resort).
-        let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
-        let rank = cfg_rank.unwrap_or(down.dims()[0] as f32);
-        let alpha = t.alpha.or(cfg_alpha).unwrap_or(rank);
-        let delta = reconstruct_lora_delta(&down, &up, alpha, rank, scale)?;
-        merge_into(base, &base_key, &delta, report)?;
-    }
-    Ok(())
-}
-
-/// Merge one LoKr file into `base` at `scale`: `rank`/`alpha` from file metadata (alpha defaults to
-/// rank), per-module factors grouped, `δ = (alpha/rank)·kron(w1,w2)·scale` reconstructed and merged.
-fn merge_lokr_file(
-    base: &mut HashMap<String, Tensor>,
-    af: &AdapterFile,
-    scale: f32,
-    table: &BTreeMap<String, String>,
-    report: &mut MergeReport,
-) -> Result<()> {
-    let (rank, alpha) = parse_lokr_metadata(
-        af.meta.get("rank").map(String::as_str),
-        af.meta.get("alpha").map(String::as_str),
-    )?;
-
-    let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
-    for (key, t) in &af.tensors {
-        match classify_lokr_key(key, table) {
-            Some((path, factor)) => {
-                grouped.entry(path).or_default().insert(factor, t.clone());
-            }
-            None => report.skipped_keys += 1,
-        }
-    }
-
-    for (path, f) in grouped {
-        let base_key = format!("{path}.weight");
-        let Some(w) = base.get(&base_key) else {
-            report.skipped_keys += 1;
-            continue;
-        };
-        if w.dims().len() != 2 {
-            report.skipped_keys += 1; // conv LoKr — out of surface
-            continue;
-        }
-        let (out_f, in_f) = (w.dims()[0], w.dims()[1]);
-        let delta = reconstruct_lokr_delta(
-            f.get("lokr_w1"),
-            f.get("lokr_w1_a"),
-            f.get("lokr_w1_b"),
-            f.get("lokr_w2"),
-            f.get("lokr_w2_a"),
-            f.get("lokr_w2_b"),
-            alpha,
-            rank,
-            scale,
-            (out_f, in_f),
-        )?;
-        merge_into(base, &base_key, &delta, report)?;
-    }
-    Ok(())
-}
 
 /// Fold every adapter spec in `specs` into the base DiT tensor `map` (CPU, native dtype) at each
 /// spec's `scale` — LoRA and LoKr, merged into the dense weights (`W += δ`). Returns the
@@ -608,6 +421,7 @@ mod tests {
     use super::*;
     use crate::testfix::randn_seeded;
     use candle_gen::candle_core::{DType, Device};
+    use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta};
     use rand::{rngs::StdRng, SeedableRng};
 
     /// A tiny stand-in for the base Lens DiT tensor map: the fused `img_qkv` + the `to_out.0`
