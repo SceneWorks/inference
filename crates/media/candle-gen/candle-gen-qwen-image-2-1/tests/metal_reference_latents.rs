@@ -19,7 +19,8 @@ use candle_core::{DType, Device};
 use candle_gen::gen_core::{Image, RgbaImage};
 use candle_gen_qwen_image_2_1::{
     encode_references, load_text_encoder, load_tokenizer, load_vae,
-    prepare_conditioning_references, system_prompt_drop_count, QwenImage21Vae, VaeConfig,
+    prepare_conditioning_references, system_prompt_drop_count, ConfigFile, QwenImage21Vae,
+    VaeConfig,
 };
 
 use crate::common::{host_f32, tiny_snapshot};

@@ -37,6 +37,8 @@ use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result, WeightsSource};
 
+use crate::config::ConfigFile;
+
 use crate::config::{
     SavedSigmaSchedule, SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig,
     VisionConfig,
@@ -319,7 +321,10 @@ ArtifactInput,
     } else {
         serde_json::json!({})
     };
-    SavedSigmaSchedule::from_values(&model_index, &scheduler_config)
+    Ok(SavedSigmaSchedule::from_values(
+        &model_index,
+        &scheduler_config,
+    )?)
 }
 
 /// The base checkpoint's guard against a **distilled** snapshot: a `model_index.json` that saves

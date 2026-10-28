@@ -84,6 +84,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::config::ConfigFile;
+
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var};
 use candle_gen::gen_core::tiling::TilingConfig;

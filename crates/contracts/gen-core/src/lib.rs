@@ -85,6 +85,7 @@ pub mod moss_image_edit;
 pub mod moss_image_training;
 pub mod pruned_adaln;
 pub mod pth;
+pub mod qwen_image_2_1;
 pub mod registry;
 pub mod residency;
 pub mod runtime;

@@ -28,7 +28,7 @@ use mlx_gen::gen_core::Progress;
 use mlx_gen::sampler::run_flow_sampler;
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
-use mlx_gen_qwen_image_2_1::config::TransformerConfig;
+use mlx_gen_qwen_image_2_1::config::{ConfigFile, TransformerConfig};
 use mlx_gen_qwen_image_2_1::{
     denoise_reported, joint_images, load_scheduler_config, load_transformer, scheduler, text_rows,
     DenoiseInputs, DenoiseReport, EvaluationPath, JointLayout, KvCacheMode, KvCachePath,

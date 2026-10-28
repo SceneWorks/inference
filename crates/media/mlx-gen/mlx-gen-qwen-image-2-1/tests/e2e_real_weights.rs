@@ -57,7 +57,7 @@ use std::time::Instant;
 use mlx_gen::gen_core::{GenerationMemory, PrefixKvCacheMode, Progress};
 use mlx_gen::{GenerationOutput, GenerationRequest, Generator, LoadSpec, Quant, WeightsSource};
 use mlx_gen_qwen_image_2_1::memory_strategy::derived;
-use mlx_gen_qwen_image_2_1::{load_tokenizer, system_prompt_drop_count, Tier, PRESETS};
+use mlx_gen_qwen_image_2_1::{load_tokenizer, system_prompt_drop_count, ConfigFile, Tier, PRESETS};
 use mlx_rs::ops::indexing::IndexOp;
 
 fn snapshot() -> PathBuf {

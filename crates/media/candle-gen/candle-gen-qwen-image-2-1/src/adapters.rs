@@ -59,6 +59,7 @@ use candle_gen::quant::{AdaptLinear, LokrFactors};
 use candle_gen::train::merge::{parse_loha_thirdparty, read_adapter, read_scalar_opt, AdapterFile};
 use candle_gen::{CandleError as Error, Result};
 
+use crate::config::ConfigFile;
 use crate::config::TransformerConfig;
 use crate::quant::Tier;
 use crate::transformer::QwenImage21Transformer;
