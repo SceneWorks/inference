@@ -27,8 +27,9 @@ pub struct Request {
 }
 
 /// Read one request from `reader`. `Ok(None)` means the peer closed before sending anything (a clean
-/// idle disconnect). A malformed request line or an over-cap body is an [`io::Error`]; cap
-/// violations carry [`io::ErrorKind::FileTooLarge`] so [`error_status`] can map them to 431.
+/// idle disconnect). A malformed request or an over-cap body is an [`io::Error`]: request-line and
+/// header cap violations carry [`io::ErrorKind::FileTooLarge`] and an over-cap body carries
+/// [`BodyTooLarge`], so [`error_status`] can map them to 431 and 413 respectively.
 pub fn read_request(reader: &mut impl BufRead) -> io::Result<Option<Request>> {
     let mut line = String::new();
     if read_line_capped(reader, &mut line)? == 0 {
@@ -45,7 +46,7 @@ pub fn read_request(reader: &mut impl BufRead) -> io::Result<Option<Request>> {
 
     // Headers until a blank line; we only need Content-Length. Both the header count and each
     // line's length are capped, so a hostile peer cannot spin this loop or grow `h` unboundedly.
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
     let mut header_count = 0usize;
     loop {
         header_count += 1;
@@ -62,19 +63,37 @@ pub fn read_request(reader: &mut impl BufRead) -> io::Result<Option<Request>> {
         }
         if let Some((name, value)) = h.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = value
+                let parsed: usize = value
                     .trim()
                     .parse()
                     .map_err(|_| invalid("bad Content-Length"))?;
+                // RFC 9112 §6.3: differing repeated Content-Length values are unrecoverable framing
+                // errors; identical repeats are tolerated.
+                if content_length.is_some_and(|earlier| earlier != parsed) {
+                    return Err(invalid("conflicting Content-Length headers"));
+                }
+                content_length = Some(parsed);
             }
         }
     }
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_BODY {
-        return Err(invalid("request body too large"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, BodyTooLarge));
     }
 
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body)?;
+    // Grow the body as bytes arrive rather than pre-zeroing the declared length, so a peer that
+    // declares a large body and sends nothing does not pin `MAX_BODY` bytes.
+    let mut body = Vec::new();
+    reader
+        .by_ref()
+        .take(content_length as u64)
+        .read_to_end(&mut body)?;
+    if body.len() != content_length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "request body shorter than Content-Length",
+        ));
+    }
     Ok(Some(Request { method, path, body }))
 }
 
@@ -92,10 +111,25 @@ fn read_line_capped(reader: &mut impl BufRead, line: &mut String) -> io::Result<
     Ok(n)
 }
 
-/// The HTTP status a `read_request` error should map to: 431 (Request Header Fields Too Large) for
-/// request-line/header cap violations, 400 for everything else.
+/// Marker payload of the [`io::Error`] for a `Content-Length` above [`MAX_BODY`].
+#[derive(Debug)]
+pub struct BodyTooLarge;
+
+impl std::fmt::Display for BodyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request body too large")
+    }
+}
+
+impl std::error::Error for BodyTooLarge {}
+
+/// The HTTP status a `read_request` error should map to: 413 (Content Too Large) for an over-cap
+/// body, 431 (Request Header Fields Too Large) for request-line/header cap violations, 400 for
+/// everything else.
 pub fn error_status(e: &io::Error) -> u16 {
-    if e.kind() == io::ErrorKind::FileTooLarge {
+    if e.get_ref().is_some_and(|inner| inner.is::<BodyTooLarge>()) {
+        413
+    } else if e.kind() == io::ErrorKind::FileTooLarge {
         431
     } else {
         400
@@ -160,6 +194,32 @@ mod tests {
         );
         let mut c = Cursor::new(raw.into_bytes());
         let err = read_request(&mut c).unwrap_err();
+        assert_eq!(error_status(&err), 413);
+    }
+
+    #[test]
+    fn conflicting_content_length_rejected() {
+        let mut c = Cursor::new(
+            &b"POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nhey"[..],
+        );
+        let err = read_request(&mut c).unwrap_err();
+        assert_eq!(error_status(&err), 400);
+        assert!(err.to_string().contains("conflicting"), "{err}");
+    }
+
+    #[test]
+    fn identical_repeated_content_length_accepted() {
+        let mut c = Cursor::new(
+            &b"POST / HTTP/1.1\r\nContent-Length: 2\r\ncontent-length: 2\r\n\r\nhi"[..],
+        );
+        assert_eq!(read_request(&mut c).unwrap().unwrap().body, b"hi");
+    }
+
+    #[test]
+    fn truncated_body_rejected() {
+        let mut c = Cursor::new(&b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nshort"[..]);
+        let err = read_request(&mut c).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(error_status(&err), 400);
     }
 
