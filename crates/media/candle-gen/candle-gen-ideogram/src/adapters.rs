@@ -120,8 +120,7 @@ pub(crate) fn install_turbo_lora_additive_for_visitor(
             lora_path.display()
         )));
     }
-    // SAFETY: read-only mmap of the adapter file.
-    let lora = unsafe { MmapedSafetensors::new(lora_path)? };
+    let lora = candle_gen::mmap_safetensors(lora_path)?;
     let names: Vec<String> = lora.tensors().into_iter().map(|(n, _)| n).collect();
     let present: HashSet<&str> = names.iter().map(String::as_str).collect();
 

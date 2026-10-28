@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::gen_core::snapshot_inventory::hex_lower as hex;
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{DType, Device, Error, Result, Tensor};
@@ -363,9 +364,9 @@ impl PackedWeightSidecars {
         }
         check_cancel(cancel)?;
         let before = file_identities(source_paths)?;
-        // SAFETY: read-only mappings of the exact caller-supplied source files. The robust identity
-        // checks immediately before and after open detect replacement across this pathname seam.
-        let source = unsafe { MmapedSafetensors::multi(source_paths)? };
+        // Read-only mappings of the exact caller-supplied source files. The robust identity checks
+        // immediately before and after open detect replacement across this pathname seam.
+        let source = crate::loader::mmap_safetensors_multi(source_paths)?;
         #[cfg(test)]
         run_after_source_open_hook();
         let after_open = file_identities(source_paths)?;
@@ -643,8 +644,8 @@ impl PackedWeightSidecars {
                 self.cache_dir.display()
             ))
         })?;
-        // SAFETY: immutable, atomically-published cache file. Writers never modify a published path.
-        let mapped = unsafe { MmapedSafetensors::new(&entry.path) }.map_err(|e| {
+        // Immutable, atomically-published cache file: writers never modify a published path.
+        let mapped = crate::loader::mmap_safetensors(&entry.path).map_err(|e| {
             Error::Msg(format!(
                 "device-format sidecar: mmap {}: {e}",
                 entry.path.display()
@@ -1542,8 +1543,8 @@ fn validate_sidecar_header(path: &Path, payload_bytes: usize) -> bool {
     if !path.is_file() {
         return false;
     }
-    // SAFETY: header-only validation maps an immutable, atomically published cache artifact.
-    let Ok(mapped) = (unsafe { MmapedSafetensors::new(path) }) else {
+    // Header-only validation maps an immutable, atomically published cache artifact.
+    let Ok(mapped) = crate::loader::mmap_safetensors(path) else {
         return false;
     };
     matches!(
@@ -1565,8 +1566,8 @@ fn validate_sidecar_counted(
     if !path.is_file() {
         return Ok(false);
     }
-    // SAFETY: validation maps a read-only cache artifact and performs no concurrent mutation.
-    let mapped = match unsafe { MmapedSafetensors::new(path) } {
+    // Validation maps a read-only cache artifact and performs no concurrent mutation.
+    let mapped = match crate::loader::mmap_safetensors(path) {
         Ok(mapped) => mapped,
         Err(_) => return Ok(false),
     };
@@ -1642,16 +1643,6 @@ impl View for BytesView<'_> {
     fn data_len(&self) -> usize {
         self.data.len()
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]

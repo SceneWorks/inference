@@ -199,9 +199,9 @@ fn plan_components(bernini_dir: &Path) -> Result<RoutingPlan> {
             bernini_dir.display()
         )));
     }
-    // SAFETY: inherited from memmap2 — the shard files are only read (never mutated) for the lifetime of
-    // the returned plan, and we never expose the mapped bytes outside `st.load`.
-    let st = unsafe { cst::MmapedSafetensors::multi(&shards)? };
+    // Mapped through the audited loader seam (see `candle_gen::mmap_var_builder`'s SAFETY doc); the
+    // mapped bytes are never exposed outside `st.load`.
+    let st = candle_gen::mmap_safetensors_multi(&shards)?;
 
     let mut experts: HashMap<&'static str, Vec<(String, String)>> = HashMap::new();
     experts.insert("transformer", Vec::new());

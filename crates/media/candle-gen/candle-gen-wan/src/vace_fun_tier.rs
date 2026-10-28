@@ -8,7 +8,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::Quant;
@@ -166,20 +165,20 @@ fn read_config(root: &Path) -> Result<PackedConfig> {
 /// its dense output bias, its q4/q8 geometry agrees with the tier marker, and both experts spell the
 /// diffusers keys Candle reads. No tensor is copied or dequantized here.
 fn validate_expert(path: &Path, label: &str, bits: i32) -> Result<()> {
-    let mapped = unsafe { MmapedSafetensors::new(path) }?;
-    let headers: BTreeMap<String, TensorHeader> = mapped
-        .tensors()
-        .into_iter()
-        .map(|(name, view)| {
-            (
-                name,
-                TensorHeader {
-                    dtype: format!("{:?}", view.dtype()),
-                    shape: view.shape().to_vec(),
-                },
-            )
-        })
-        .collect();
+    // Capped header-only read (no mmap). gen-core's `Dtype` debug names match safetensors'.
+    let headers: BTreeMap<String, TensorHeader> =
+        candle_gen::gen_core::safetensors_path_tensor_headers(path)?
+            .into_iter()
+            .map(|header| {
+                (
+                    header.name,
+                    TensorHeader {
+                        dtype: format!("{:?}", header.dtype),
+                        shape: header.shape,
+                    },
+                )
+            })
+            .collect();
     let names: BTreeSet<&str> = headers.keys().map(String::as_str).collect();
     let packed: Vec<&str> = names
         .iter()
@@ -482,7 +481,10 @@ mod tests {
                 .component_vb("transformer", DType::F32, &Device::Cpu)
                 .unwrap();
             assert!(vb.contains_tensor("blocks.0.attn1.to_q.scales"));
-            let mapped = unsafe { MmapedSafetensors::new(tmp.path().join(HIGH)) }.unwrap();
+            let mapped = unsafe {
+                candle_gen::candle_core::safetensors::MmapedSafetensors::new(tmp.path().join(HIGH))
+            }
+            .unwrap();
             let weight = mapped.get("blocks.0.attn1.to_q.weight").unwrap();
             assert_eq!(weight.dtype().to_string(), "U32");
             assert_eq!(

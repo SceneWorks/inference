@@ -8,10 +8,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use candle_gen::candle_core::safetensors::{self as cst, MmapedSafetensors};
+use candle_gen::candle_core::safetensors as cst;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::{AdapterSpec, Quant, WeightsSource};
+use candle_gen::gen_core::weightsmeta::Dtype;
+use candle_gen::gen_core::{safetensors_path_tensor_headers, AdapterSpec, Quant, WeightsSource};
 use candle_gen::{CandleError, Result};
 
 use crate::adapters::{apply_anima_adapters, install_anima_residuals};
@@ -47,12 +48,10 @@ pub fn compute_dtype() -> DType {
 /// Detect the DiT root prefix (`net` or `model.diffusion_model`) from a safetensors file's keys — port
 /// of `detect_dit_prefix`. Errors (never assumes) if no anchor key is present.
 pub fn detect_dit_prefix(dit_path: &Path) -> Result<String> {
-    // Header-only mmap: reads the tensor names without materializing any weight data.
-    // SAFETY: read-only, process-owned weight file, mapped only to read the header here.
-    let st = unsafe { MmapedSafetensors::new(dit_path)? };
-    st.tensors()
+    // Header-only read (capped, no mmap): the tensor names without any weight data.
+    safetensors_path_tensor_headers(dit_path)?
         .into_iter()
-        .map(|(k, _)| k)
+        .map(|header| header.name)
         .find(|k| k.ends_with(PREFIX_ANCHOR))
         .map(|k| k[..k.len() - PREFIX_ANCHOR.len()].to_string())
         .ok_or_else(|| {
@@ -82,9 +81,11 @@ pub fn dit_quant_tier(source: &WeightsSource, variant: Variant) -> Result<Option
 /// width and match the exact U32/F32/F32 group-64 representation consumed by Anima's loader. A
 /// companion `config.json` may attest that representation, but cannot redefine it.
 fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
-    // Header-only mmap: reads tensor metadata without materializing any weight data.
-    // SAFETY: read-only, process-owned weight file, mapped only to read the header here.
-    let st = unsafe { MmapedSafetensors::new(dit_path)? };
+    // Header-only read (capped, no mmap): tensor metadata without any weight data.
+    let headers = safetensors_path_tensor_headers(dit_path)?
+        .into_iter()
+        .map(|header| (header.name.clone(), header))
+        .collect::<HashMap<_, _>>();
     let config_path = dit_path.with_file_name("config.json");
     #[cfg(feature = "model-inference-proof")]
     let mut config_consumed = false;
@@ -127,11 +128,7 @@ fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
         )));
     }
 
-    let tensor_names = st
-        .tensors()
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect::<HashSet<_>>();
+    let tensor_names = headers.keys().cloned().collect::<HashSet<_>>();
     let mut tier = None;
     for key in &tensor_names {
         let Some(base) = key.strip_suffix(".scales") else {
@@ -139,31 +136,31 @@ fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
         };
         let weight_key = format!("{base}.weight");
         let biases_key = format!("{base}.biases");
-        let weight = st.get(&weight_key).map_err(|_| {
+        let weight = headers.get(&weight_key).ok_or_else(|| {
             CandleError::Msg(format!(
                 "anima: packed scale `{key}` has no companion `{weight_key}` in {}",
                 dit_path.display()
             ))
         })?;
-        let scales = st.get(key)?;
-        let biases = st.get(&biases_key).map_err(|_| {
+        let scales = &headers[key];
+        let biases = headers.get(&biases_key).ok_or_else(|| {
             CandleError::Msg(format!(
                 "anima: packed scale `{key}` has no companion `{biases_key}` in {}",
                 dit_path.display()
             ))
         })?;
-        let weight_shape = weight.shape();
-        let scales_shape = scales.shape();
-        let biases_shape = biases.shape();
+        let weight_shape = &weight.shape;
+        let scales_shape = &scales.shape;
+        let biases_shape = &biases.shape;
         if weight_shape.len() != 2
             || scales_shape.len() != 2
             || biases_shape.len() != 2
             || weight_shape[0] != scales_shape[0]
             || biases_shape != scales_shape
             || scales_shape[1] == 0
-            || weight.dtype() != DType::U32.into()
-            || scales.dtype() != DType::F32.into()
-            || biases.dtype() != DType::F32.into()
+            || weight.dtype != Dtype::U32
+            || scales.dtype != Dtype::F32
+            || biases.dtype != Dtype::F32
         {
             return Err(CandleError::Msg(format!(
                 "anima: malformed packed affine triple `{base}` (expected U32 weight plus shape-matched F32 scales/biases) in {}",
@@ -241,7 +238,7 @@ fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
             }
         }
         if let Some(base) = key.strip_suffix(".weight") {
-            if st.get(key)?.dtype() == DType::U32.into()
+            if headers[key].dtype == Dtype::U32
                 && (!tensor_names.contains(&format!("{base}.scales"))
                     || !tensor_names.contains(&format!("{base}.biases")))
             {

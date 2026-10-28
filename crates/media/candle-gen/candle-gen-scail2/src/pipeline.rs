@@ -250,9 +250,7 @@ fn cpu_cast_mmap_var_builder(
     dtype: DType,
     device: &Device,
 ) -> CResult<VarBuilder<'static>> {
-    // SAFETY: the same invariant as `candle_gen::mmap_var_builder`: these are process-owned,
-    // read-only model files and are not mutated or truncated while the mapping is live.
-    let tensors = unsafe { cst::MmapedSafetensors::multi(files)? };
+    let tensors = candle_gen::mmap_safetensors_multi(files)?;
     Ok(VarBuilder::from_backend(
         Box::new(CpuCastMmap { tensors }),
         dtype,
@@ -264,8 +262,7 @@ fn cpu_cast_mmap_var_builder(
 /// shared VAE key remap require a mutable whole-model map, so they cannot use the bounded backend;
 /// this helper gives them the same no-bf16-on-CUDA invariant as the stock dense path.
 fn cpu_f32_tensor_map(files: &[PathBuf]) -> CResult<HashMap<String, Tensor>> {
-    // SAFETY: the same read-only, process-owned model-file invariant as the builder above.
-    let tensors = unsafe { cst::MmapedSafetensors::multi(files)? };
+    let tensors = candle_gen::mmap_safetensors_multi(files)?;
     let mut out = HashMap::new();
     for (name, view) in tensors.tensors() {
         let tensor = view.load(&Device::Cpu)?;

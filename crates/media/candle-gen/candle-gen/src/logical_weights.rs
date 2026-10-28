@@ -547,8 +547,7 @@ impl LogicalWeightReader {
         device: &Device,
         capability: NativeExecutionCapability,
     ) -> Result<Self> {
-        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-        let st = unsafe { MmapedSafetensors::new(path)? };
+        let st = crate::loader::mmap_safetensors(path)?;
         let mut on_disk: Vec<String> = st.tensors().into_iter().map(|(name, _)| name).collect();
         on_disk.sort_unstable();
         let mut planned: Vec<&str> = plan.all_physical_keys().collect();

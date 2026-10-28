@@ -2039,9 +2039,9 @@ component.join("config.json"),
     let config = serde_json::from_str::<serde_json::Value>(&json).ok()?;
     let packed = candle_gen::quant::PackedConfig::from_config(&config)?;
     let files = candle_gen::sorted_safetensors(&component, "lens").ok()?;
-    // SAFETY: read-only model artifacts, mapped only long enough to inspect the immutable headers.
-    // This makes eligibility depend on an actual packed triple, not merely a possibly stale config.
-    let source = unsafe { MmapedSafetensors::multi(&files).ok()? };
+    // Mapped only long enough to inspect the headers. This makes eligibility depend on an actual
+    // packed triple, not merely a possibly stale config.
+    let source = candle_gen::mmap_safetensors_multi(&files).ok()?;
     packed_encoder_inventory_is_exact(
         &source,
         &EncoderConfig::gpt_oss_20b(),
@@ -2120,8 +2120,8 @@ component.join("config.json"),
     let Ok(files) = candle_gen::sorted_safetensors(&component, "lens") else {
         return false;
     };
-    // SAFETY: read-only model artifacts, mapped only for immutable header inspection.
-    let Ok(source) = (unsafe { MmapedSafetensors::multi(&files) }) else {
+    // Mapped only for header inspection.
+    let Ok(source) = candle_gen::mmap_safetensors_multi(&files) else {
         return false;
     };
     let mut packed_triples = 0usize;
@@ -2248,8 +2248,8 @@ fn component_is_provably_dense(spec: &LoadSpec, component: &str) -> bool {
     if files.is_empty() {
         return false;
     }
-    // SAFETY: read-only model artifacts, mapped only long enough to inspect the immutable headers.
-    let Ok(source) = (unsafe { MmapedSafetensors::multi(&files) }) else {
+    // Mapped only long enough to inspect the headers.
+    let Ok(source) = candle_gen::mmap_safetensors_multi(&files) else {
         return false;
     };
     !source

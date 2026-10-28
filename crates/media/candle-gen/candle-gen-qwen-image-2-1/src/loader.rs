@@ -192,9 +192,7 @@ fn load_vision_tower_weights(
     let files = candle_gen::loader::sorted_safetensors(dir, LABEL)?;
     let mut tensors: HashMap<String, candle_core::Tensor> = HashMap::new();
     for file in &files {
-        // SAFETY: the same invariant `candle_gen::loader`'s mmap surface documents — a read-only,
-        // process-owned weight file, mapped only for the duration of this call.
-        let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(file)? };
+        let st = candle_gen::loader::mmap_safetensors(file)?;
         let names: Vec<String> = st
             .tensors()
             .into_iter()

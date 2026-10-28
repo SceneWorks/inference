@@ -846,19 +846,16 @@ fn fold_conv_lora_file(
 }
 
 /// Build the kohya `flattened → dotted` table from a UNet weight **file** without loading tensor data
-/// (sc-11682) — reads only the safetensors header (names + shapes) via a memory map, so the dense
+/// (sc-11682) — reads only the safetensors header (names + shapes; capped, no mmap), so the dense
 /// additive lanes can resolve community `lora_unet_<flat>` keys against an **mmap** base without first
 /// materializing the whole UNet in a host `HashMap` (which is the un-evictable state this avoids).
 pub(crate) fn build_sdxl_kohya_table_from_file(
     file: &std::path::Path,
 ) -> Result<BTreeMap<String, String>> {
-    // SAFETY: read-only, process-owned weight file; the map is dropped at the end of this function and
-    // only its header (tensor names + shapes) is read — no tensor data is dereferenced.
-    let st = unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(file)? };
     let mut table = BTreeMap::new();
-    for (name, view) in st.tensors() {
-        if let Some(dotted) = name.strip_suffix(".weight") {
-            let rank = view.shape().len();
+    for header in candle_gen::gen_core::safetensors_path_tensor_headers(file)? {
+        if let Some(dotted) = header.name.strip_suffix(".weight") {
+            let rank = header.shape.len();
             if rank == 2 || rank == 4 {
                 table.insert(dotted.replace('.', "_"), dotted.to_string());
             }

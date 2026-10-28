@@ -594,21 +594,19 @@ impl Pipeline {
     }
 
     fn vae_vb_dequantized_on(&self, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
-        use candle_gen::candle_core::safetensors::MmapedSafetensors;
         let files = self.component_files("vae")?;
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let st = unsafe { MmapedSafetensors::multi(&files)? };
+        // One mapping serves both the key enumeration and every load (the z-image sibling of
+        // sc-27386): the names are collected before the mapping is boxed into the backend.
+        let st = candle_gen::mmap_safetensors_multi(&files)?;
+        let names: Vec<String> = st.tensors().into_iter().map(|(k, _)| k).collect();
         let src = VarBuilder::from_backend(Box::new(st), dtype, device.clone());
 
-        // SAFETY: same file set; a second mapping to enumerate keys + load the dense tensors.
-        let st2 = unsafe { MmapedSafetensors::multi(&files)? };
-        let packed_bases: std::collections::HashSet<String> = st2
-            .tensors()
+        let packed_bases: std::collections::HashSet<String> = names
             .iter()
-            .filter_map(|(k, _)| k.strip_suffix(".scales").map(|b| b.to_string()))
+            .filter_map(|k| k.strip_suffix(".scales").map(|b| b.to_string()))
             .collect();
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
-        for (key, _) in st2.tensors() {
+        for key in names {
             if key.ends_with(".scales") || key.ends_with(".biases") {
                 continue; // folded into the dequantized dense `.weight`
             }
@@ -619,8 +617,9 @@ impl Pipeline {
                     continue;
                 }
             }
-            let t = st2.load(&key, device)?;
-            tensors.insert(key.clone(), t.to_dtype(dtype)?);
+            // The mmap backend's `get_unchecked` is `load(key, device)` then `to_dtype(dtype)`.
+            let t = src.get_unchecked_dtype(&key, dtype)?;
+            tensors.insert(key, t);
         }
         Ok(VarBuilder::from_tensors(tensors, dtype, device))
     }
@@ -1211,11 +1210,10 @@ impl Pipeline {
             let (num_double, num_single) = self.dit_block_counts()?;
             if stream_transformer_blocks {
                 if let Some(packed) = self.component_packed_config("transformer")? {
-                    use candle_gen::candle_core::safetensors::MmapedSafetensors;
                     use candle_gen::quant::PackedWeightSidecars;
                     let files = self.component_files("transformer")?;
-                    // SAFETY: immutable snapshot files are held by this request-scoped mapping.
-                    let source = unsafe { MmapedSafetensors::multi(&files)? };
+                    // Request-scoped mapping through the audited loader seam.
+                    let source = candle_gen::mmap_safetensors_multi(&files)?;
                     let component = self.root.join("transformer");
                     let double = PackedWeightSidecars::prepare_prefix_cancelable(
                         &source,
