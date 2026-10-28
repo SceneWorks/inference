@@ -47,19 +47,21 @@ use gen_core::iris::train::lineage::{
     agree_resume, elect_checkpoint_writer, publish_export_dir, retire_foreign_checkpoints,
 };
 use gen_core::iris::train::pipeline::DataPipeline;
-use gen_core::iris::train::repa::{RepaPlan, PROJECTOR_PREFIX, TEACHER_COMPONENT};
+use gen_core::iris::train::repa::{
+    resolve_teacher_path, RepaPlan, PROJECTOR_PREFIX, TEACHER_COMPONENT,
+};
 use gen_core::iris::train::shapes::preprocess_file_to_shape;
 use gen_core::iris::train::{
     self as contract, adapter_param_route, backbone_identity, batch_seed_rank, caption_seed,
-    check_resume, checkpoint_root, checkpoint_staging_dir, dataset_fingerprint, draw_batch,
-    export_config_yaml, file_stem, full_model_metadata, full_param_route, latest_checkpoint,
-    linear_paths_from_keys, prune_checkpoints, publish_checkpoint, read_checkpoint_state,
-    select_caption, AdapterMetadata, ArtifactPlan, CheckpointState, GradScaler, HostRng, InitMode,
-    IrisTrainPlan, MixedPrecision, ParamRoute, Prediction, ResumeDataPolicy, TextConditioningMode,
-    TrainFlowDefaults, TrainSchedule, WeightsSelect, CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE,
-    CKPT_TRAINABLE, TECHNIQUES, TRAINER_ID,
+    check_resume, checkpoint_root, checkpoint_staging_dir, dataset_fingerprint, dcp_shards,
+    draw_batch, export_config_yaml, file_stem, full_model_metadata, full_param_route, grad_group,
+    latest_checkpoint, linear_paths_from_keys, prune_checkpoints, publish_checkpoint,
+    read_checkpoint_state, select_caption, AdapterMetadata, ArtifactPlan, CheckpointState,
+    GradScaler, HostRng, InitMode, IrisTrainPlan, MixedPrecision, ParamRoute, Prediction,
+    ResumeDataPolicy, TextConditioningMode, TrainFlowDefaults, TrainSchedule, WeightsSelect,
+    CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE, CKPT_TRAINABLE, TRAINER_ID,
 };
-use gen_core::iris::{IrisConfig, TextEncoderConfig, FAMILY, TEXT_ENCODER_COMPONENT};
+use gen_core::iris::{IrisConfig, TextEncoderConfig, TEXT_ENCODER_COMPONENT};
 use gen_core::train::{
     refuse_reference_control_model_options, refuse_trainer_load_overlays, validate_control_request,
     validate_edit_request, validate_full_finetune_request, validate_training_techniques, Trainer,
@@ -67,7 +69,7 @@ use gen_core::train::{
 };
 use mlx_gen::gen_core;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, LoadSpec, Modality, Result, WeightsSource};
+use mlx_gen::{Error, LoadSpec, Result, WeightsSource};
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
@@ -92,23 +94,11 @@ use model::{
 use optim::{clip_grads, ema_update, IrisOptimizer, MuonShards, Params};
 use teacher::{spatial_normalize, Teacher};
 
-/// The REPA projector's checkpoint member.
-pub const CKPT_REPA: &str = "repa_projector.safetensors";
+pub use mlx_gen::gen_core::iris::train::CKPT_REPA;
 
 /// Identity + capabilities of the MLX Iris generation trainer.
 pub fn trainer_descriptor() -> TrainerDescriptor {
-    TrainerDescriptor {
-        id: TRAINER_ID,
-        family: FAMILY,
-        backend: "mlx",
-        modality: Modality::Image,
-        supports_lora: true,
-        supports_lokr: true,
-        supports_control: false,
-        supports_full_finetune: true,
-        max_reference_images: 0,
-        techniques: TECHNIQUES,
-    }
+    mlx_gen::gen_core::iris::train::trainer_descriptor_for("mlx")
 }
 
 /// The resolved resources of a training load: the backbone directory (its `config.yaml` always;
@@ -257,7 +247,7 @@ impl IrisTrainer {
             }
         }
         if let Some(r) = &plan.repa {
-            teacher_path(&self.teacher_dir, r)?;
+            resolve_teacher_path(&self.teacher_dir, r)?;
         }
         Ok(())
     }
@@ -265,43 +255,6 @@ impl IrisTrainer {
 
 /// The REPA teacher resource of a run: `repa.teacher_weights` when set, else the
 /// `repa_teacher` load component — refused when neither names an existing resource, never fetched.
-fn teacher_path(component: &Option<PathBuf>, repa: &RepaPlan) -> Result<PathBuf> {
-    let path = match (&repa.teacher_weights, component) {
-        (Some(w), _) if w.contains("://") => {
-            return Err(Error::Unsupported(format!(
-                "{TRAINER_ID} trainer: repa.teacher_weights {w:?} is a URL; the teacher is a \
-                 provisioned resource (nothing is downloaded during training)"
-            )))
-        }
-        (Some(w), Some(c)) if Path::new(w) != c.as_path() => {
-            return Err(Error::Msg(format!(
-                "{TRAINER_ID} trainer: repa.teacher_weights {w:?} and the '{TEACHER_COMPONENT}' \
-                 component {} name different teachers",
-                c.display()
-            )))
-        }
-        (Some(w), _) => PathBuf::from(w),
-        (None, Some(c)) => c.clone(),
-        (None, None) => {
-            return Err(Error::Msg(format!(
-                "{TRAINER_ID} trainer: repa.weight > 0 needs the frozen {} teacher — stage it as \
-                 the '{TEACHER_COMPONENT}' component (facebook/dinov2-base @ {} for the release \
-                 teacher dinov2_vitb14)",
-                repa.teacher.entrypoint,
-                gen_core::iris::train::repa::DINOV2_BASE_HF_REVISION
-            )))
-        }
-    };
-    let file = teacher::teacher_file(&path);
-    if !file.is_file() {
-        return Err(Error::Msg(format!(
-            "{TRAINER_ID} trainer: the REPA teacher resource {} is missing",
-            file.display()
-        )));
-    }
-    Ok(path)
-}
-
 impl Trainer for IrisTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
@@ -662,23 +615,6 @@ fn read_checkpoint_members(dir: &Path, saved: &CheckpointState) -> Result<CkptPa
     })
 }
 
-fn dcp_shards(dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|it| {
-            it.filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("shard_") && n.ends_with(".safetensors"))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    v.sort();
-    v
-}
-
 /// A boundary of an ended pass and the data position captured when that pass ended.
 struct Settled {
     boundary: (u32, usize, usize, usize),
@@ -959,7 +895,7 @@ impl Run {
         // ---- the REPA teacher (frozen, fp32) --------------------------------------------------
         let teacher = match &plan.repa {
             Some(r) => Some(Teacher::load(
-                &teacher_path(&trainer.teacher_dir, r)?,
+                &resolve_teacher_path(&trainer.teacher_dir, r)?,
                 r.teacher.clone(),
             )?),
             None => None,
@@ -1698,7 +1634,7 @@ impl Run {
     fn log_block_norms(&self, grads: &Params) -> Result<()> {
         let mut groups: std::collections::BTreeMap<String, f64> = Default::default();
         for (k, g) in grads {
-            let name = block_group(k);
+            let name = grad_group(k);
             let v = to_host(g)?;
             *groups.entry(name).or_insert(0.0) +=
                 v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
@@ -2159,26 +2095,6 @@ impl Run {
         }
         mlx_rs::memory::clear_cache();
         Ok(())
-    }
-}
-
-/// The gradient-norm group of a trained tensor (`_grad_groups`).
-fn block_group(key: &str) -> String {
-    if key.starts_with(PROJECTOR_PREFIX) {
-        return "repa_projector".into();
-    }
-    let mut parts = key.split('.');
-    let head = parts.next().unwrap_or(key);
-    match head {
-        "blocks" => format!(
-            "blocks.{:02}",
-            parts
-                .next()
-                .and_then(|i| i.parse::<usize>().ok())
-                .unwrap_or(0)
-        ),
-        "pixel_blocks" => format!("pixel_blocks.{}", parts.next().unwrap_or("0")),
-        other => other.to_string(),
     }
 }
 
