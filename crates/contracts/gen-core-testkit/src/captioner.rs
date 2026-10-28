@@ -173,18 +173,12 @@ pub fn check_captioner_registry(
     registry: &gen_core::ProviderRegistry,
     c: &dyn Captioner,
 ) -> Result<(), String> {
-    let id = c.descriptor().id;
-    if registry
-        .captioners()
-        .any(|registration| (registration.descriptor)().id == id)
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "registry[{id}]: descriptor id not found in the explicit provider registry (gen-core {})",
-            gen_core::VERSION
-        ))
-    }
+    crate::check_registry_ids(
+        registry
+            .captioners()
+            .map(|registration| (registration.descriptor)().id),
+        c.descriptor().id,
+    )
 }
 
 /// Run the full captioner conformance suite against a freshly-`make`d captioner. `caption` is
@@ -204,14 +198,12 @@ pub fn captioner_conformance(make: impl Fn() -> Box<dyn Captioner>, profile: &Ca
         .into_iter()
         .filter_map(|f| f(c, profile).err())
         .collect();
-    if !failures.is_empty() {
-        panic!(
-            "gen-core captioner conformance FAILED for `{}` (gen-core {}):\n  - {}",
-            c.descriptor().id,
-            gen_core::VERSION,
-            failures.join("\n  - ")
-        );
-    }
+    crate::panic_on_failures(
+        "gen-core captioner conformance",
+        c.descriptor().id,
+        None,
+        &failures,
+    );
 }
 
 #[cfg(test)]
