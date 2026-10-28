@@ -408,60 +408,34 @@ pub fn expected_tensor_count(arch: &Sd3Arch) -> usize {
     expected_transformer_tensors(arch).len()
 }
 
-/// Read a safetensors file's tensor names + shapes from the JSON header alone (no weights). The
-/// format is an 8-byte little-endian header length followed by that many UTF-8 JSON bytes mapping
-/// `name → { "shape": [...], … }`. Mirrors `mlx_gen_flux2::convert`'s header reader — never reads
-/// the (multi-GB) weight body, so validating a real checkpoint costs a few KB of I/O.
+/// Read a safetensors file's tensor names + shapes from the JSON header alone (no weights), through
+/// gen-core's shared validated header parser
+/// ([`safetensors_file_tensor_locations`](mlx_gen::gen_core::weightsmeta::safetensors_file_tensor_locations)):
+/// bounded header length, typed errors for a malformed dimension, and offsets checked against the
+/// dtype and the file length. Never reads the (multi-GB) weight body, so validating a real
+/// checkpoint costs a few KB of I/O.
 pub fn safetensors_header_shapes(path: &Path) -> Result<HashMap<String, Vec<i64>>> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
-    if file_len < 8 {
-        return Err(Error::Msg(format!(
-            "{}: too small to be a safetensors file",
-            path.display()
-        )));
-    }
-    let mut len_buf = [0u8; 8];
-    file.read_exact(&mut len_buf)?;
-    let n = u64::from_le_bytes(len_buf);
-    const MAX_HEADER: u64 = 256 << 20; // 256 MiB — far above any real header
-    if n > MAX_HEADER || 8 + n > file_len {
-        return Err(Error::Msg(format!(
-            "{}: safetensors header length out of range",
-            path.display()
-        )));
-    }
-    let mut header_bytes = vec![0u8; n as usize];
-    file.read_exact(&mut header_bytes)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes).map_err(|e| {
-        Error::Msg(format!(
-            "{}: bad safetensors header JSON: {e}",
-            path.display()
-        ))
-    })?;
-    let obj = header.as_object().ok_or_else(|| {
-        Error::Msg(format!(
-            "{}: safetensors header is not an object",
-            path.display()
-        ))
-    })?;
-    let mut shapes = HashMap::new();
-    for (k, v) in obj {
-        if k == "__metadata__" {
-            continue;
-        }
-        let shape = v
-            .get("shape")
-            .and_then(|s| s.as_array())
-            .ok_or_else(|| Error::Msg(format!("{}: tensor {k} has no shape", path.display())))?
-            .iter()
-            .map(|d| d.as_i64().unwrap_or(-1))
-            .collect();
-        shapes.insert(k.clone(), shape);
-    }
-    Ok(shapes)
+    mlx_gen::gen_core::weightsmeta::safetensors_file_tensor_locations(path)?
+        .tensors
+        .into_iter()
+        .map(|location| {
+            let header = location.header;
+            let shape = header
+                .shape
+                .iter()
+                .map(|&d| {
+                    i64::try_from(d).map_err(|_| {
+                        Error::Msg(format!(
+                            "{}: tensor {} dimension {d} exceeds i64",
+                            path.display(),
+                            header.name
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i64>>>()?;
+            Ok((header.name, shape))
+        })
+        .collect()
 }
 
 /// Validate a real on-disk SD3.5 `transformer/` directory's tensor set against [`Sd3Arch`] using
