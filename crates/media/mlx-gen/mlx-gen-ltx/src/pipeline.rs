@@ -938,12 +938,14 @@ pub fn denoise_av_curated(
         audio: audio.clone(),
     };
     let out = mlx_gen::run_av_curated_sampler(
-        Some(sampler_name),
-        sigmas,
+        mlx_gen::SamplerRun {
+            sampler_name: Some(sampler_name),
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         init,
-        seed,
-        cancel,
-        on_progress,
         |x, sigma| {
             // Flatten: video (B,C,F,H,W)→(B,Sv,C); audio (B,C,T,F)→(B,T,C·F). Uniform per-token σ.
             let vflat = x.video.reshape(&[vb, vc, -1])?.transpose_axes(&[0, 2, 1])?;

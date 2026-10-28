@@ -153,7 +153,8 @@ pub use sampler::{
     run_av_curated_sampler, run_cfgpp_sampler, run_cfgpp_sampler_with_latent_hook,
     run_curated_sampler, run_curated_sampler_with_latent_hook, run_flow_sampler,
     run_flow_sampler_with_latent_hook, AlphaSchedule, AvLatents, DiffusionSampler,
-    FlowMatchSampler, LcmSampler, LightningSampler, MlxAvLatentOps, MlxLatentOps, TcdSampler,
+    FlowMatchSampler, LcmSampler, LightningSampler, MlxAvLatentOps, MlxLatentOps, SamplerRun,
+    TcdSampler,
 };
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling, VideoDecodeMemoryProfile};

@@ -70,8 +70,9 @@ use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Error, LoadSpec, Modality, NetworkType, Precision, Progress,
-    Result, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
-    TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest, WeightsSource,
+    Result, SamplerRun, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
+    WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -1300,13 +1301,15 @@ fn render_sample(
     // F-077: honor the training request's cancel per denoise step. Previously a fresh
     // `CancelFlag::new()` here meant the preview render could never be cancelled mid-denoise.
     let lat = run_flow_sampler(
-        None,
+        SamplerRun {
+            sampler_name: None,
+            sigmas: &sigmas,
+            seed,
+            cancel,
+            on_progress: &mut |_: Progress| {},
+        },
         TimestepConvention::Sigma,
-        &sigmas,
         noise,
-        seed,
-        cancel,
-        &mut |_: Progress| {},
         |x, timestep| {
             let tt = Array::from_slice(&[timestep], &[1]);
             let v_cond = dit.forward_prepared(x, &tt, &prep_pos)?;

@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use mlx_gen::gen_core::sampling::TimestepConvention;
 use mlx_gen::gen_core::Progress;
-use mlx_gen::sampler::run_flow_sampler;
+use mlx_gen::sampler::{run_flow_sampler, SamplerRun};
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
 use mlx_gen_qwen_image_2_1::config::TransformerConfig;
@@ -734,13 +734,15 @@ fn cache_off_is_bit_identical_to_the_prefill_loop() {
         let neg = case.branches.get(1).filter(|_| case.true_cfg > 1.0);
         let cancel = CancelFlag::new();
         let want = run_flow_sampler(
-            None,
+            SamplerRun {
+                sampler_name: None,
+                sigmas: &sigmas,
+                seed: 0,
+                cancel: &cancel,
+                on_progress: &mut |_| {},
+            },
             TimestepConvention::Sigma,
-            &sigmas,
             init.clone(),
-            0,
-            &cancel,
-            &mut |_| {},
             |latents: &Array, sigma: f32| -> mlx_gen::Result<Array> {
                 let velocity = prefill(&model, &case, pos, latents, sigma);
                 match neg {

@@ -37,7 +37,7 @@ use mlx_gen::scheduler::compute_mu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, Error, Image,
-    MlxLatentOps, PreviewSink, Progress, Quant, Result, TimestepConvention,
+    MlxLatentOps, PreviewSink, Progress, Quant, Result, SamplerRun, TimestepConvention,
 };
 use mlx_gen_flux2::{load_vae, Flux2Vae};
 
@@ -836,13 +836,15 @@ impl LensHeavy {
         // `FlowMatchEuler::step` loop within the N1 parity tolerance.
         let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
         run_flow_sampler_with_latent_hook(
-            sampler_name,
+            SamplerRun {
+                sampler_name,
+                sigmas,
+                seed,
+                cancel,
+                on_progress: &mut on_progress,
+            },
             TimestepConvention::Sigma,
-            sigmas,
             init_latents.as_dtype(dtype)?,
-            seed,
-            cancel,
-            &mut on_progress,
             |latents, sigma| {
                 mlx_gen_flux2::preview::emit_flux_preview(
                     preview,

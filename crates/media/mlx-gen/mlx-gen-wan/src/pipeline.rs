@@ -1192,13 +1192,15 @@ pub fn denoise_curated(
     let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
     let nt = num_train_timesteps as f32;
     mlx_gen::run_flow_sampler(
-        Some(sampler_name),
+        mlx_gen::SamplerRun {
+            sampler_name: Some(sampler_name),
+            sigmas: &sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         mlx_gen::TimestepConvention::Sigma,
-        &sigmas,
         init_noise.clone(),
-        seed,
-        cancel,
-        on_progress,
         |x, sigma| {
             // Wan feeds the DiT the integer-valued timestep `(σ·num_train).trunc()`, not raw σ.
             let t = (sigma * nt).trunc();
@@ -1473,13 +1475,15 @@ pub fn denoise_moe_curated(
     let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
     let nt = num_train_timesteps as f32;
     mlx_gen::run_flow_sampler(
-        Some(sampler_name),
+        mlx_gen::SamplerRun {
+            sampler_name: Some(sampler_name),
+            sigmas: &sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         mlx_gen::TimestepConvention::Sigma,
-        &sigmas,
         init_noise.clone(),
-        seed,
-        cancel,
-        on_progress,
         |x, sigma| {
             let t = (sigma * nt).trunc();
             let (e, cache) = if t >= boundary_timestep {
@@ -1521,13 +1525,15 @@ pub(crate) fn denoise_moe_curated_swapped(
     let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
     let nt = num_train_timesteps as f32;
     let result = mlx_gen::run_flow_sampler(
-        Some(sampler_name),
+        mlx_gen::SamplerRun {
+            sampler_name: Some(sampler_name),
+            sigmas: &sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         mlx_gen::TimestepConvention::Sigma,
-        &sigmas,
         init_noise.clone(),
-        seed,
-        cancel,
-        on_progress,
         |x, sigma| {
             let t = (sigma * nt).trunc();
             let wants_high = t >= boundary_timestep;

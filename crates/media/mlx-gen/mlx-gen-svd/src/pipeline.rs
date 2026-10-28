@@ -194,13 +194,15 @@ impl SvdPipeline {
         let atid2 = concatenate_axis(&[added_time_ids, added_time_ids], 0)?;
         let guidance = Self::guidance_schedule(num_frames, min_g, max_g);
         mlx_gen::run_curated_sampler(
-            Some(sampler_name),
+            mlx_gen::SamplerRun {
+                sampler_name: Some(sampler_name),
+                sigmas: &sched.sigmas,
+                seed,
+                cancel,
+                on_progress,
+            },
             &ms,
-            &sched.sigmas,
             latents.clone(),
-            seed,
-            cancel,
-            on_progress,
             |x_in, t| {
                 let lat2 = concatenate_axis(&[x_in, x_in], 0)?; // [2,F,h,w,4]
                 let inp = concatenate_axis(&[&lat2, &img_lat2], -1)?; // [2,F,h,w,8]
