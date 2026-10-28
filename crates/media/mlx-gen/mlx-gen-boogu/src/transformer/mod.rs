@@ -479,10 +479,10 @@ impl BooguTransformer {
 // The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
 pub(crate) use mlx_gen::weights::join;
 
-/// Slice `[b, L, ...]` along the sequence axis (axis 1) to `[start, end)`.
+/// Slice `[b, L, ...]` along the sequence axis (axis 1) to `[start, end)` — the shared core
+/// [`mlx_gen::array::slice_range`] (sc-27448).
 pub(crate) fn slice_axis1(x: &Array, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
+    mlx_gen::array::slice_range(x, 1, start, end)
 }
 
 // The GQA `repeat_interleave` that used to live here is now `mlx_gen::qkv::repeat_kv` (SC-18319,

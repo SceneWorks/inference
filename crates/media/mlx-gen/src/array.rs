@@ -33,6 +33,42 @@ pub fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
 }
 
+/// Multiply `a` by a host `f64` rounded to f32 — the reference's `python_float * mx.array(f32)`,
+/// where the weak scalar adopts the array's dtype. The Wan and Krea-Realtime flow schedulers each
+/// carried this as a private `fscale` (sc-27448).
+pub fn fscale(a: &Array, c: f64) -> Result<Array> {
+    Ok(mlx_rs::ops::multiply(a, Array::from_f32(c as f32))?)
+}
+
+/// The half-open range `x[.., start..end, ..]` along `axis` (negative counts from the end), as an
+/// arange-index `take_axis` gather — the copy the LTX / Wan / MiniMax-H3 / SAM3 / Boogu VAE and
+/// sequence helpers each open-coded (sc-27448). The whole axis returns `x` itself (a gather of
+/// every index is an exact copy). An out-of-range axis or range is an [`Error`], never a gather
+/// past the end.
+///
+/// **`end`, not `len`:** unlike [`crate::attention::slice_axis`] (`start`, `len`, a zero-copy
+/// split), the third argument here is the exclusive end index.
+pub fn slice_range(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
+    let rank = x.ndim() as i32;
+    let ax = if axis < 0 { axis + rank } else { axis };
+    if ax < 0 || ax >= rank {
+        return Err(Error::Msg(format!(
+            "slice_range: axis {axis} out of range for rank {rank}"
+        )));
+    }
+    let len = x.shape()[ax as usize];
+    if start < 0 || end > len || start > end {
+        return Err(Error::Msg(format!(
+            "slice_range: [{start}, {end}) out of range for axis {ax} of length {len}"
+        )));
+    }
+    if start == 0 && end == len {
+        return Ok(x.clone());
+    }
+    let idx: Vec<i32> = (start..end).collect();
+    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), ax)?)
+}
+
 /// Force a **logically-contiguous** copy so a subsequent [`Array::as_slice`] reads logical (C-)order
 /// rather than the physical buffer of a transpose-strided array. A reshape round-trip materializes it.
 ///
@@ -143,6 +179,33 @@ pub fn is_materialized(a: &Array) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slice_range_takes_half_open_ranges_and_rejects_out_of_range() {
+        let x = Array::from_slice(&(0..10).map(|v| v as f32).collect::<Vec<_>>(), &[2, 5]);
+        let mid = slice_range(&x, 1, 1, 4).unwrap();
+        assert_eq!(mid.shape(), &[2, 3]);
+        assert_eq!(mid.as_slice::<f32>(), &[1.0, 2.0, 3.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            slice_range(&x, -1, 4, 5).unwrap().as_slice::<f32>(),
+            &[4.0, 9.0]
+        );
+        assert_eq!(slice_range(&x, 0, 0, 2).unwrap().shape(), &[2, 5]);
+        assert_eq!(slice_range(&x, 1, 2, 2).unwrap().shape(), &[2, 0]);
+        assert!(slice_range(&x, 1, 0, 9).is_err());
+        assert!(slice_range(&x, 1, 4, 2).is_err());
+        assert!(slice_range(&x, 1, -1, 2).is_err());
+        assert!(slice_range(&x, 2, 0, 1).is_err());
+        assert!(slice_range(&x, -3, 0, 1).is_err());
+    }
+
+    #[test]
+    fn fscale_rounds_the_host_scalar_to_f32() {
+        let x = Array::from_slice(&[2.0f32, -1.0], &[2]);
+        let y = fscale(&x, 0.1).unwrap();
+        assert_eq!(y.dtype(), Dtype::Float32);
+        assert_eq!(y.as_slice::<f32>(), &[2.0 * 0.1f32, -0.1f32]);
+    }
 
     /// sc-20676: a `b > 1` regrouping of a whole-group permutation is a pure view (the transpose of
     /// `[6, 4]` split as `[4, 6]` reshapes without a copy), so the reshape round-trip alone would

@@ -19,12 +19,10 @@ pub(crate) fn contiguous(x: &Array) -> Result<Array> {
     mlx_gen::array::contiguous(x)
 }
 
-/// Gather the contiguous range `[start, end)` along `axis` (mlx-rs has no slice op). Layout-agnostic:
-/// the z16 VAE slices the temporal/spatial axes at 2/3/4, the z48 VAE (channels-last) at 1/2/3.
-pub(crate) fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), axis)?)
-}
+/// Gather the contiguous range `[start, end)` along `axis` — the shared core
+/// [`mlx_gen::array::slice_range`] (sc-27448). Layout-agnostic: the z16 VAE slices the
+/// temporal/spatial axes at 2/3/4, the z48 VAE (channels-last) at 1/2/3.
+pub(crate) use mlx_gen::array::slice_range as slice_axis;
 
 /// Last `n` frames along the temporal axis `t_axis`: the reference `x[…, -n:, …]`. The temporal axis
 /// differs by layout — z16 (NCTHW) at 2, z48 (channels-last NTHWC) at 1 — so each VAE binds its axis.
