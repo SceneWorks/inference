@@ -309,15 +309,63 @@ impl ChatTemplate for JinjaChatTemplate {
             let tools: Vec<Json> = opts.tools.iter().map(|t| t.to_template_json()).collect();
             ctx.insert("tools", Value::from_serialize(&tools));
         }
-        tmpl.render(ctx).map_err(jinja_err)
+        // Render through a byte-capped sink (sc-27407): the fuel budget bounds instructions, the
+        // cap bounds what a hostile template can emit with them.
+        let mut out = CappedOutput::default();
+        let rendered = tmpl.render_captured_to(ctx, &mut out).map(drop);
+        if out.overflowed {
+            return Err(Error::Msg(format!(
+                "chat template render: output exceeded the {CHAT_TEMPLATE_MAX_OUTPUT_BYTES}-byte cap \
+                 (a runaway or hostile template)"
+            )));
+        }
+        rendered.map_err(jinja_err)?;
+        String::from_utf8(out.bytes)
+            .map_err(|e| Error::Msg(format!("chat template render: invalid UTF-8 output: {e}")))
     }
 }
+
+/// The largest prompt one chat-template render may produce (sc-27407). A rendered conversation is
+/// its messages plus template boilerplate — megabytes even at a million-token context — so this only
+/// stops a template that emits without bound.
+pub const CHAT_TEMPLATE_MAX_OUTPUT_BYTES: usize = 256 << 20;
+
+/// A render sink that refuses to grow past [`CHAT_TEMPLATE_MAX_OUTPUT_BYTES`].
+#[derive(Default)]
+struct CappedOutput {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+impl std::io::Write for CappedOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > CHAT_TEMPLATE_MAX_OUTPUT_BYTES - self.bytes.len() {
+            self.overflowed = true;
+            return Err(std::io::Error::other("chat template output cap exceeded"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The instruction budget of one chat-template render (sc-27407). Templates come from caller-supplied
+/// model directories, so an unbounded `{% for %}` nest could hang a render. The Qwen3.8 template
+/// spends ~75 instructions per message (measured on a 4,000-message render), so this admits
+/// conversations orders of magnitude longer than any context window while failing a runaway loop
+/// within a fraction of a second. Output size is bounded separately by
+/// [`CHAT_TEMPLATE_MAX_OUTPUT_BYTES`].
+pub const CHAT_TEMPLATE_FUEL: u64 = 50_000_000;
 
 fn jinja_environment(source: String) -> (Environment<'static>, Option<String>) {
     let mut environment = Environment::new();
     // Match transformers' Jinja environment (ImmutableSandboxedEnvironment, trim/lstrip blocks).
     environment.set_trim_blocks(true);
     environment.set_lstrip_blocks(true);
+    environment.set_fuel(Some(CHAT_TEMPLATE_FUEL));
     environment.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     environment.add_function(
         "raise_exception",
@@ -337,6 +385,12 @@ fn jinja_environment(source: String) -> (Environment<'static>, Option<String>) {
 }
 
 fn jinja_err(e: minijinja::Error) -> Error {
+    if e.kind() == minijinja::ErrorKind::OutOfFuel {
+        return Error::Msg(format!(
+            "chat template render: exceeded the {CHAT_TEMPLATE_FUEL}-instruction budget (a runaway \
+             or hostile template loop): {e}"
+        ));
+    }
     Error::Msg(format!("chat template render: {e}"))
 }
 
@@ -631,6 +685,60 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../../docs/reference/qwen38/chat_template.jinja"
     ));
+
+    /// sc-27407: a hostile BYO template's runaway loop exhausts the fuel budget and fails with a
+    /// typed error instead of hanging the render.
+    #[test]
+    fn chat_template_fuel_budget_stops_a_runaway_loop() {
+        let t = JinjaChatTemplate::new(
+            "{% for a in range(100000) %}{% for b in range(100000) %}{% for c in range(100000) %}\
+             x{% endfor %}{% endfor %}{% endfor %}",
+        );
+        let err = t.render(&[Message::user("hi")], false).unwrap_err();
+        assert!(err.to_string().contains("instruction budget"), "{err}");
+    }
+
+    /// sc-27407: a template that emits without bound in few instructions (doubling a string each
+    /// pass) fails at the output cap instead of growing the prompt until memory runs out.
+    #[test]
+    fn chat_template_output_cap_stops_a_runaway_emitter() {
+        let t = JinjaChatTemplate::new(
+            "{% set ns = namespace(s='x') %}{% for _ in range(25) %}{% set ns.s = ns.s ~ ns.s %}\
+             {% endfor %}{% for _ in range(100) %}{{ ns.s }}{% endfor %}",
+        );
+        let err = t.render(&[Message::user("hi")], false).unwrap_err();
+        assert!(err.to_string().contains("-byte cap"), "{err}");
+    }
+
+    /// sc-27407 calibration: the largest shipped template (Qwen3.8's reasoning + tools template)
+    /// renders a far-longer-than-context conversation with tools and tool calls well inside the
+    /// budget, so the cap never trips on real use.
+    #[test]
+    fn chat_template_fuel_budget_admits_a_long_real_conversation() {
+        let t = JinjaChatTemplate::with_tokens(QWEN38_FROZEN_TEMPLATE, "", "<|im_end|>");
+        let tools: Vec<_> = (0..32).map(|_| weather_tool()).collect();
+        let mut args = serde_json::Map::new();
+        args.insert("location".into(), serde_json::json!("Paris"));
+        let mut msgs = vec![Message::system("You are helpful.")];
+        for i in 0..2_000 {
+            msgs.push(Message::user(format!("question {i}")));
+            msgs.push(
+                Message::assistant(format!("answer {i}")).with_tool_calls(vec![
+                    crate::tool::ToolCall::new("get_weather", args.clone()),
+                ]),
+            );
+            msgs.push(Message {
+                role: Role::Tool,
+                content: vec![crate::message::Content::Text("sunny".into())],
+                thinking: None,
+                tool_calls: Vec::new(),
+            });
+        }
+        let out = t
+            .render_with(&msgs, &RenderOptions::generation().with_tools(&tools))
+            .unwrap();
+        assert!(out.contains("question 1999"));
+    }
 
     #[test]
     fn qwen38_frozen_template_matches_reasoning_and_tool_controls() {

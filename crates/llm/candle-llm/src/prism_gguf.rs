@@ -6,6 +6,28 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
+/// Header-declared counts only ever pre-reserve this many slots; larger tables grow as entries are
+/// actually read, so a hostile count cannot force an allocation the file does not back (sc-27299).
+const MAX_PRERESERVE: usize = 4096;
+/// The smallest encoding of one metadata entry: key length (8) + type (4) + a 1-byte value.
+const MIN_METADATA_ENTRY_BYTES: u64 = 8 + 4 + 1;
+/// The smallest encoding of one tensor-info entry: name length (8) + rank (4) + one dimension (8)
+/// + type (4) + offset (8).
+const MIN_TENSOR_ENTRY_BYTES: u64 = 8 + 4 + 8 + 4 + 8;
+/// Upper bound on one metadata string (keys, names, chat templates are kilobytes in practice).
+const MAX_STRING_BYTES: usize = 16 << 20;
+
+/// Reject a header-declared entry `count` that the remaining `file_len - pos` bytes cannot hold.
+fn check_count(count: u64, min_entry: u64, file_len: u64, pos: u64, what: &str) -> Result<usize> {
+    let remaining = file_len.saturating_sub(pos);
+    if count > remaining / min_entry {
+        return Err(Error::Config(format!(
+            "GGUF {what} count {count} exceeds what the remaining {remaining} bytes can hold"
+        )));
+    }
+    usize::try_from(count).map_err(|_| Error::Config(format!("GGUF {what} count overflow")))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum RawValue {
     U(u64),
@@ -83,11 +105,25 @@ impl RawGguf {
         if !(2..=3).contains(&version) {
             return Err(Error::Config(format!("GGUF version {version} unsupported")));
         }
-        let tensor_count = usize::try_from(u64le(&mut file)?)
-            .map_err(|_| Error::Config("GGUF tensor count overflow".into()))?;
-        let metadata_count = usize::try_from(u64le(&mut file)?)
-            .map_err(|_| Error::Config("GGUF metadata count overflow".into()))?;
-        let mut metadata = HashMap::with_capacity(metadata_count);
+        let file_len = file.metadata()?.len();
+        let tensor_count = u64le(&mut file)?;
+        let metadata_count = u64le(&mut file)?;
+        let pos = file.stream_position()?;
+        let metadata_count = check_count(
+            metadata_count,
+            MIN_METADATA_ENTRY_BYTES,
+            file_len,
+            pos,
+            "metadata",
+        )?;
+        let tensor_count = check_count(
+            tensor_count,
+            MIN_TENSOR_ENTRY_BYTES,
+            file_len,
+            pos,
+            "tensor",
+        )?;
+        let mut metadata = HashMap::with_capacity(metadata_count.min(MAX_PRERESERVE));
         for _ in 0..metadata_count {
             let key = string(&mut file)?;
             let ty = u32le(&mut file)?;
@@ -96,7 +132,7 @@ impl RawGguf {
                 return Err(Error::Config(format!("duplicate GGUF metadata {key}")));
             }
         }
-        let mut tensors = HashMap::with_capacity(tensor_count);
+        let mut tensors = HashMap::with_capacity(tensor_count.min(MAX_PRERESERVE));
         for _ in 0..tensor_count {
             let name = string(&mut file)?;
             let rank = usize::try_from(u32le(&mut file)?).unwrap();
@@ -172,11 +208,19 @@ impl RawGguf {
             }
         }
         .ok_or_else(|| Error::Config(format!("GGUF tensor {name} has invalid block geometry")))?;
-        self.file.seek(SeekFrom::Start(
-            self.data_offset
-                .checked_add(info.offset)
-                .ok_or_else(|| Error::Config("GGUF tensor offset overflow".into()))?,
-        ))?;
+        let start = self
+            .data_offset
+            .checked_add(info.offset)
+            .ok_or_else(|| Error::Config("GGUF tensor offset overflow".into()))?;
+        // The declared extent must lie inside the file *before* allocating it (sc-27299).
+        let file_len = self.file.metadata()?.len();
+        let end = u64::try_from(bytes).ok().and_then(|b| start.checked_add(b));
+        if end.is_none_or(|end| end > file_len) {
+            return Err(Error::Config(format!(
+                "GGUF tensor {name} ({bytes} bytes at {start}) extends past the {file_len}-byte file"
+            )));
+        }
+        self.file.seek(SeekFrom::Start(start))?;
         let mut data = vec![0u8; bytes];
         self.file.read_exact(&mut data)?;
         Ok(data)
@@ -209,7 +253,7 @@ fn i64le(r: &mut impl Read) -> Result<i64> {
 fn string(r: &mut impl Read) -> Result<String> {
     let len = usize::try_from(u64le(r)?)
         .map_err(|_| Error::Config("GGUF string length overflow".into()))?;
-    if len > 1 << 30 {
+    if len > MAX_STRING_BYTES {
         return Err(Error::Config("GGUF string too large".into()));
     }
     let mut b = vec![0; len];
@@ -241,7 +285,7 @@ fn value(r: &mut impl Read, ty: u32, depth: usize) -> Result<RawValue> {
             if len > 10_000_000 {
                 return Err(Error::Config("GGUF metadata array too large".into()));
             }
-            let mut out = Vec::with_capacity(len);
+            let mut out = Vec::with_capacity(len.min(MAX_PRERESERVE));
             for _ in 0..len {
                 out.push(value(r, inner, depth + 1)?);
             }
@@ -291,6 +335,80 @@ mod tests {
         );
         let signs = gguf.metadata["prism.hadamard.sign_values"].array().unwrap();
         assert!(signs.iter().all(|value| value.exact_sign().is_some()));
+    }
+
+    /// A GGUF v3 header with the given counts followed by `body`.
+    fn header(tensor_count: u64, metadata_count: u64, body: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&tensor_count.to_le_bytes());
+        b.extend_from_slice(&metadata_count.to_le_bytes());
+        b.extend_from_slice(body);
+        b
+    }
+
+    fn open_bytes(bytes: &[u8]) -> Result<RawGguf> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.gguf");
+        std::fs::write(&path, bytes).unwrap();
+        RawGguf::open(&path)
+    }
+
+    fn gguf_string(b: &mut Vec<u8>, s: &str) {
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b.extend_from_slice(s.as_bytes());
+    }
+
+    /// sc-27299: a 24-byte file declaring `u64::MAX` metadata or tensor entries is a typed error,
+    /// not a capacity-overflow panic or a huge reservation.
+    #[test]
+    fn hostile_header_counts_are_rejected_before_allocating() {
+        for (tensors, metadata) in [(0, u64::MAX), (u64::MAX, 0), (1 << 40, 1 << 40)] {
+            let err = open_bytes(&header(tensors, metadata, &[]))
+                .err()
+                .expect("hostile count rejected");
+            assert!(err.to_string().contains("count"), "{err}");
+        }
+        // A huge array length or string length inside an otherwise small file errors cleanly.
+        let mut body = Vec::new();
+        gguf_string(&mut body, "k");
+        body.extend_from_slice(&9u32.to_le_bytes()); // array
+        body.extend_from_slice(&4u32.to_le_bytes()); // of u32
+        body.extend_from_slice(&5_000_000u64.to_le_bytes()); // declared, not backed
+        assert!(open_bytes(&header(0, 1, &body)).is_err());
+        let mut body = Vec::new();
+        body.extend_from_slice(&u64::MAX.to_le_bytes()); // key length
+        assert!(open_bytes(&header(0, 1, &body)).is_err());
+    }
+
+    /// sc-27299: a tensor whose declared extent runs past the end of the file is rejected before
+    /// `read_tensor` allocates the declared byte count.
+    #[test]
+    fn read_tensor_rejects_an_extent_past_the_file() {
+        let mut body = Vec::new();
+        gguf_string(&mut body, "w");
+        body.extend_from_slice(&2u32.to_le_bytes()); // rank
+        body.extend_from_slice(&(1u64 << 20).to_le_bytes());
+        body.extend_from_slice(&(1u64 << 20).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // F32: 4 TiB declared
+        body.extend_from_slice(&0u64.to_le_bytes()); // offset
+        let mut gguf = open_bytes(&header(1, 0, &body)).unwrap();
+        let err = gguf.read_tensor("w").unwrap_err();
+        assert!(err.to_string().contains("extends past"), "{err}");
+
+        // A small in-bounds tensor still reads.
+        let mut body = Vec::new();
+        gguf_string(&mut body, "v");
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&2u64.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u64.to_le_bytes());
+        let mut bytes = header(1, 0, &body);
+        bytes.resize(bytes.len().div_ceil(32) * 32, 0);
+        bytes.extend_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0]);
+        let mut gguf = open_bytes(&bytes).unwrap();
+        assert_eq!(gguf.read_tensor("v").unwrap(), [1, 0, 0, 0, 2, 0, 0, 0]);
     }
 
     #[test]
