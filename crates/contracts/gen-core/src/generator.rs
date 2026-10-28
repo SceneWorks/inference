@@ -647,7 +647,8 @@ pub struct GenerationRequest {
     /// silently dropped).
     pub reference_image_short_edge: Option<u32>,
     /// **How an image reference is resized** before it is encoded (sc-26691) — upstream sglang's
-    /// `reference_resize_mode`. `None` ⇒ [`ReferenceImageResizeMode::Match`]; read the effective
+    /// `reference_resize_mode`. `None` ⇒
+    /// [`ReferenceImageResizeMode::Match`](crate::ReferenceImageResizeMode::Match); read the effective
     /// value with [`crate::effective_reference_image_resize_mode`] and record it in the recipe
     /// beside [`reference_image_short_edge`](Self::reference_image_short_edge).
     ///
