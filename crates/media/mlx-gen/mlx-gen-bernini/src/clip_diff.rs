@@ -129,6 +129,10 @@ fn modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array> {
 
 /// GLIDE sinusoidal timestep embedding `[N, dim]` (f32): `half = dim/2`,
 /// `freqs[k] = exp(-ln(max_period)·k/half)`, `emb = cat(cos(t·freqs), sin(t·freqs))`.
+///
+/// Deliberately NOT [`mlx_gen::nn::timestep_sincos`]: the frequencies are built on the host, and the
+/// shared helper's on-device exponent differs by ~1e-7 (enough to flip bf16 ULPs that this crate's
+/// single-host parity goldens pin), so migrating would perturb pinned numerics (sc-27334).
 fn timestep_embedding(t: &Array, dim: usize, max_period: f32) -> Result<Array> {
     let half = dim / 2;
     let ln = max_period.ln();
