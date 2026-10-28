@@ -715,48 +715,42 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } =
-        safety_check(contract, precision, quant, context)
-    {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let component = context.selection.parameters.window_component();
-    let routes = decode_routes(provider_id)?;
-    let transformer_blocks = match component {
-        TransformerComponent::TextEncoder => crate::config::GptOssConfig::lens().num_layers,
-        TransformerComponent::Dit | TransformerComponent::Both => {
-            crate::dit::LensDitConfig::lens().num_layers
-        }
-    };
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        transformer_blocks,
-        move |use_pid, edge, overlap| {
-            routes
-                .validate(use_pid, Some(edge), Some(overlap))
-                .map_err(CoreError::Unsupported)
+    mlx_gen::request_scope::begin_scope(
+        safety_check(contract, precision, quant, context),
+        cleanup,
+        || {
+            let component = context.selection.parameters.window_component();
+            let routes = decode_routes(provider_id)?;
+            let transformer_blocks = match component {
+                TransformerComponent::TextEncoder => crate::config::GptOssConfig::lens().num_layers,
+                TransformerComponent::Dit | TransformerComponent::Both => {
+                    crate::dit::LensDitConfig::lens().num_layers
+                }
+            };
+            let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                provider_id,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                transformer_blocks,
+                move |use_pid, edge, overlap| {
+                    routes
+                        .validate(use_pid, Some(edge), Some(overlap))
+                        .map_err(CoreError::Unsupported)
+                },
+            )?;
+            // The admitted chunk comes from the selection the contract just validated. Keying this on the
+            // measured fingerprint instead would leave every declared-but-unmeasured bounded-attention route
+            // with no chunk bound, so `configure_attention` would refuse the rung the contract published.
+            config.attention_chunk_size = contract
+                .engages(context.selection.strategy, MemoryStrategy::BoundedAttention)
+                .then_some(context.selection.parameters.attention_chunk_size)
+                .flatten();
+            config.transformer_window =
+                mlx_gen::request_scope::selected_transformer_window(contract, context);
+            Ok(config)
         },
-    )?;
-    // The admitted chunk comes from the selection the contract just validated. Keying this on the
-    // measured fingerprint instead would leave every declared-but-unmeasured bounded-attention route
-    // with no chunk bound, so `configure_attention` would refuse the rung the contract published.
-    config.attention_chunk_size = contract
-        .engages(context.selection.strategy, MemoryStrategy::BoundedAttention)
-        .then_some(context.selection.parameters.attention_chunk_size)
-        .flatten();
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    )
 }
 
 #[cfg(test)]

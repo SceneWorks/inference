@@ -215,13 +215,7 @@ struct AssetDeclaration {
 }
 
 fn checked_sum(label: &str, values: impl IntoIterator<Item = u64>) -> gen_core::Result<u64> {
-    values.into_iter().try_fold(0_u64, |total, value| {
-        total.checked_add(value).ok_or_else(|| {
-            gen_core::Error::Msg(format!(
-                "ltx_2_5: {label} resident-byte total overflows u64"
-            ))
-        })
-    })
+    gen_core::checked_byte_total("ltx_2_5", label, values)
 }
 
 fn required_projected_bytes(
@@ -843,31 +837,32 @@ fn begin_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, loaded_tier, context) {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        LTX_2_5_MODEL_ID,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        48,
-        |_use_pid, edge, overlap| validate_decode(Some(edge), Some(overlap)),
-    )?;
-    config.load_shape = context.load_shape;
-    config.default_frames = context.geometry.frames;
-    if contract.engages_selection(&context.selection, MemoryStrategy::BoundedAttention) {
-        config.attention_chunk_size = context.selection.parameters.attention_chunk_size;
-    }
-    if contract.engages_selection(
-        &context.selection,
-        MemoryStrategy::BoundedTransformerResidency,
-    ) {
-        config.transformer_window = context.selection.parameters.transformer_window_size;
-    }
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(
+        safety_check(contract, loaded_tier, context),
+        cleanup,
+        || {
+            let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                LTX_2_5_MODEL_ID,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                48,
+                |_use_pid, edge, overlap| validate_decode(Some(edge), Some(overlap)),
+            )?;
+            config.load_shape = context.load_shape;
+            config.default_frames = context.geometry.frames;
+            if contract.engages_selection(&context.selection, MemoryStrategy::BoundedAttention) {
+                config.attention_chunk_size = context.selection.parameters.attention_chunk_size;
+            }
+            if contract.engages_selection(
+                &context.selection,
+                MemoryStrategy::BoundedTransformerResidency,
+            ) {
+                config.transformer_window = context.selection.parameters.transformer_window_size;
+            }
+            Ok(config)
+        },
+    )
 }
 
 pub(crate) fn begin_request(

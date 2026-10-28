@@ -6,10 +6,10 @@
 //! and the finished-state guard for every lifecycle hook.
 
 use crate::gen_core::{
-    Error, GenerationMemory, GenerationRequest, LoadShape, MemoryDecodeArtifactIdentity,
+    Error, GenerationMemory, GenerationRequest, LoadShape, LoadSpec, MemoryDecodeArtifactIdentity,
     MemoryDecodeGeometryPolicy, MemoryDecodePolicyQuery, MemoryDecodeQualityDisposition,
-    MemoryGeometry, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemoryRunOutcome, MemoryStrategy, Result,
+    MemoryGeometry, MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, Result,
 };
 use std::cell::RefCell;
 
@@ -521,6 +521,139 @@ impl Drop for MlxRequestScopeCore {
             let _ = self.cleanup_pending();
         }
     }
+}
+
+/// The numeric tier a loader runs for `spec` when the provider declares no component precision
+/// floors: the spec's precision and load-time quantization, exactly as requested.
+///
+/// Shared by every provider whose tier is a pure function of the spec (sc-27257). A provider that
+/// reads packed bits off disk, or publishes component floors, keeps its own resolver.
+pub fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    }
+}
+
+/// The rung-4 window cadence this request admits: the selected `transformer_window_size` when the
+/// contract engages [`MemoryStrategy::BoundedTransformerResidency`] for the selected strategy,
+/// otherwise `None`.
+///
+/// Contract-aware `engages` rather than an ordinal or equality compare, so a provider exclusion or
+/// realization prerequisite moves the window with it (sc-27325).
+pub fn selected_transformer_window(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> Option<u32> {
+    contract
+        .engages(
+            context.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .then_some(context.selection.parameters.transformer_window_size)
+        .flatten()
+}
+
+/// The one place a provider's refused safety decision becomes a typed error.
+///
+/// [`MemorySafetyDecision::Reject`] carries an already-rendered reason, so it is wrapped in
+/// [`Error::Unsupported`] exactly once, here. Providers whose scope is not built by
+/// [`MlxRequestScopeCore::begin`] call this first, before any other fallible admission step.
+pub fn admit(safety: MemorySafetyDecision) -> Result<()> {
+    match safety {
+        MemorySafetyDecision::Accept => Ok(()),
+        MemorySafetyDecision::Reject { reason } => Err(Error::Unsupported(reason)),
+    }
+}
+
+impl MlxRequestScopeCore {
+    /// The admission skeleton every adopting provider shares (sc-27257, sc-27325, sc-27341).
+    ///
+    /// `safety` is the provider's own safety-check decision, computed by the caller. A rejection
+    /// becomes the one typed [`Error::Unsupported`] (the decision carries an already-rendered
+    /// reason), and `configure` is not run. Otherwise `configure` builds the provider's
+    /// [`MlxRequestScopeConfig`] — its decode validator, stack depth and rung parameters stay
+    /// provider-owned — and the core is wrapped with `cleanup`.
+    ///
+    /// The ordering is the historical per-provider one: safety first, then any fallible
+    /// configuration (route tables, layer counts), then construction.
+    pub fn begin(
+        safety: MemorySafetyDecision,
+        cleanup: MlxScopeCleanup,
+        configure: impl FnOnce() -> Result<MlxRequestScopeConfig>,
+    ) -> Result<Self> {
+        admit(safety)?;
+        Ok(Self::with_cleanup(configure()?, cleanup))
+    }
+}
+
+/// [`MlxRequestScopeCore::begin`] for a provider whose request scope is the shared core itself, boxed
+/// in the shape `begin_memory_strategy_request` returns.
+pub fn begin_scope(
+    safety: MemorySafetyDecision,
+    cleanup: MlxScopeCleanup,
+    configure: impl FnOnce() -> Result<MlxRequestScopeConfig>,
+) -> Result<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    Ok(Some(Box::new(MlxRequestScopeCore::begin(
+        safety, cleanup, configure,
+    )?)))
+}
+
+/// Forward the five pure pass-through
+/// [`MemoryRequestScope`](crate::gen_core::MemoryRequestScope) hooks — `enter_phase`,
+/// `leave_phase`, `configure_decode`, `configure_attention` and `materialize_transformer_window` —
+/// to a wrapped scope field (sc-27424).
+///
+/// Invoke it inside an `impl MemoryRequestScope for Wrapper { .. }` block, naming the field that
+/// holds the shared [`MlxRequestScopeCore`](crate::request_scope::MlxRequestScopeCore) (or any
+/// other `MemoryRequestScope`); the trait must be in scope at the call site, which implementing it
+/// by name already guarantees. The wrapper still writes `configure_request` and `finish` itself,
+/// since those are where wrappers add their checks.
+///
+/// It deliberately does **not** forward `configure_admitted_request`. That method has a refusing
+/// default, and forwarding it blindly would let the immutable admitted path bypass whatever the
+/// wrapper's `configure_request` checks (an evidence revision, an overlay or source receipt). A
+/// wrapper that supports the admitted path opts in by writing it.
+#[macro_export]
+macro_rules! delegate_memory_scope_core {
+    ($field:ident) => {
+        fn enter_phase(
+            &mut self,
+            phase: $crate::gen_core::MemoryPhase,
+        ) -> $crate::gen_core::Result<()> {
+            self.$field.enter_phase(phase)
+        }
+
+        fn leave_phase(
+            &mut self,
+            phase: $crate::gen_core::MemoryPhase,
+        ) -> $crate::gen_core::Result<()> {
+            self.$field.leave_phase(phase)
+        }
+
+        fn configure_decode(
+            &mut self,
+            tile_edge: u32,
+            overlap: u32,
+            geometry: $crate::gen_core::MemoryGeometry,
+        ) -> $crate::gen_core::Result<()> {
+            self.$field.configure_decode(tile_edge, overlap, geometry)
+        }
+
+        fn configure_attention(&mut self, chunk_size: u32) -> $crate::gen_core::Result<()> {
+            self.$field.configure_attention(chunk_size)
+        }
+
+        fn materialize_transformer_window(
+            &mut self,
+            first_block: u32,
+            block_count: u32,
+        ) -> $crate::gen_core::Result<()> {
+            self.$field
+                .materialize_transformer_window(first_block, block_count)
+        }
+    };
 }
 
 #[cfg(test)]
@@ -1061,5 +1194,43 @@ mod tests {
                 "{name} stopped deriving its block count from model config"
             );
         }
+    }
+
+    #[test]
+    fn begin_refuses_a_rejected_safety_decision_without_building_a_config() {
+        let built = Cell::new(false);
+        let result = MlxRequestScopeCore::begin(
+            MemorySafetyDecision::Reject {
+                reason: "fixture: refused".into(),
+            },
+            MlxScopeCleanup::None,
+            || {
+                built.set(true);
+                Ok(config(20))
+            },
+        );
+        match result {
+            Err(Error::Unsupported(reason)) => assert_eq!(reason, "fixture: refused"),
+            Err(other) => panic!("expected the typed rejection, got {other:?}"),
+            Ok(_) => panic!("a rejected safety decision must not open a scope"),
+        }
+        assert!(!built.get(), "configuration must not run after a rejection");
+    }
+
+    #[test]
+    fn begin_scope_opens_the_configured_core_on_an_accepted_decision() {
+        let mut scope = begin_scope(MemorySafetyDecision::Accept, MlxScopeCleanup::None, || {
+            Ok(config(20))
+        })
+        .unwrap()
+        .expect("an accepted decision opens a scope");
+        let mut request = GenerationRequest {
+            width: 64,
+            height: 64,
+            count: 1,
+            ..Default::default()
+        };
+        scope.configure_request(&mut request).unwrap();
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
     }
 }

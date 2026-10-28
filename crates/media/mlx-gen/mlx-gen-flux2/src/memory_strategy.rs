@@ -694,9 +694,7 @@ pub(crate) fn begin_dev_request(
             reason: format!("unknown FLUX.2 Dev memory provider {provider}"),
         },
     };
-    if let MemorySafetyDecision::Reject { reason } = decision {
-        return Err(CoreError::Unsupported(reason));
-    }
+    mlx_gen::request_scope::admit(decision)?;
     if !context.selection.strategy.is_optimized() {
         return Ok(None);
     }
@@ -1420,35 +1418,29 @@ fn begin_klein_request_with_cleanup(
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     let expected_tier = klein_expected_tier(&contract.provider_id, spec)?;
-    if let MemorySafetyDecision::Reject { reason } =
-        klein_safety_check(spec, contract, context, expected_tier)
-    {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let routes = klein_decode_routes(&contract.provider_id)?;
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        klein_provider_static(&contract.provider_id)?,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        32,
-        move |use_pid, edge, overlap| {
-            routes
-                .validate(use_pid, Some(edge), Some(overlap))
-                .map_err(CoreError::Unsupported)
+    mlx_gen::request_scope::begin_scope(
+        klein_safety_check(spec, contract, context, expected_tier),
+        cleanup,
+        || {
+            let routes = klein_decode_routes(&contract.provider_id)?;
+            let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                klein_provider_static(&contract.provider_id)?,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                32,
+                move |use_pid, edge, overlap| {
+                    routes
+                        .validate(use_pid, Some(edge), Some(overlap))
+                        .map_err(CoreError::Unsupported)
+                },
+            )?;
+            config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+            config.transformer_window =
+                mlx_gen::request_scope::selected_transformer_window(contract, context);
+            Ok(config)
         },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    )
 }
 
 pub(crate) fn attention_plan(req: &GenerationRequest) -> AttentionPlan<'_> {

@@ -103,6 +103,14 @@ pub fn vae_spatial_scale() -> Option<u32> {
     )
 }
 
+/// The DiT depth the shared request scope bounds a rung-4 window against: the joint plus single
+/// stacks (19 + 38), read off the loader's config rather than restated as a literal (sc-27325).
+fn transformer_blocks() -> usize {
+    let dit =
+        crate::transformer::FluxTransformerConfig::for_variant(crate::config::FluxVariant::Dev);
+    dit.num_layers.saturating_add(dit.num_single_layers)
+}
+
 /// Architecture axes shared by all three registered FLUX.1 routes (epic SC-22657, E2).
 ///
 /// The DiT axes are this crate's own transformer constants — `transformer::HEADS`,
@@ -1014,33 +1022,25 @@ fn begin_request_with_cleanup(
     // The one place a refused route becomes a TYPED error. `MemorySafetyDecision::Reject` carries an
     // already-rendered string, so the route gate deliberately hands back plain reasons (see
     // `safety_check`) and the `unsupported: ` prefix is applied exactly once, here.
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let routes = decode_routes(provider_id)?;
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        57,
-        move |use_pid, edge, overlap| {
-            routes
-                .validate(use_pid, Some(edge), Some(overlap))
-                .map_err(CoreError::Unsupported)
-        },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, || {
+        let routes = decode_routes(provider_id)?;
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider_id,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            context.use_pid,
+            transformer_blocks(),
+            move |use_pid, edge, overlap| {
+                routes
+                    .validate(use_pid, Some(edge), Some(overlap))
+                    .map_err(CoreError::Unsupported)
+            },
+        )?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 /// Resolve the clean-base request's attention plan. An unselected request returns the exact

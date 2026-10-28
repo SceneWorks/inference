@@ -1126,31 +1126,7 @@ impl MemoryRequestScope for GenerationRequestScope {
         }
         self.core.configure_request(request)
     }
-
-    fn enter_phase(&mut self, phase: MemoryPhase) -> CoreResult<()> {
-        self.core.enter_phase(phase)
-    }
-
-    fn leave_phase(&mut self, phase: MemoryPhase) -> CoreResult<()> {
-        self.core.leave_phase(phase)
-    }
-
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> CoreResult<()> {
-        self.core.configure_decode(edge, overlap, geometry)
-    }
-
-    fn configure_attention(&mut self, size: u32) -> CoreResult<()> {
-        self.core.configure_attention(size)
-    }
-
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> CoreResult<()> {
-        self.core.materialize_transformer_window(first, count)
-    }
+    mlx_gen::delegate_memory_scope_core!(core);
 
     fn finish(&mut self, outcome: MemoryRunOutcome) -> CoreResult<()> {
         self.core.finish(outcome)
@@ -1166,9 +1142,7 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
+    mlx_gen::request_scope::admit(safety_check(spec, contract, context))?;
     let task = task_of(&contract.provider_id)?;
     let windowed = context.selection.strategy == MemoryStrategy::BoundedTransformerResidency;
     // The encoder-free routes take no `GenerationRequest`: their only request-scoped lever is the

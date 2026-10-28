@@ -62,11 +62,12 @@ use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind,
     MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryParameterRanges, MemoryPhase,
     MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
     MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
     MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult, TransformerComponent,
 };
+use mlx_gen::request_scope::loaded_tier;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
 
@@ -1220,15 +1221,6 @@ fn validate_window(size: u32) -> CoreResult<()> {
     Ok(())
 }
 
-/// The numeric tier this generator actually runs.
-fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    }
-}
-
 /// The provider safety check: the calibration handshake and tier match, then the shared contract's
 /// own selection validation, then this provider's route gate, then the budget. Defense in depth
 /// only — it can reject, never swap in a different strategy or tier.
@@ -1406,33 +1398,25 @@ fn begin_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let id = provider_id;
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        widest_windowable_stack(),
-        move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),
-    )?;
-    config.load_shape = context.load_shape;
-    mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
-    // Rung 2 may be engaged only by the exact policy authorization above. Rung 3 remains `Missing`,
-    // so attention chunking is never set.
-    config.attention_chunk_size = None;
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, || {
+        let id = provider_id;
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider_id,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            context.use_pid,
+            widest_windowable_stack(),
+            move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),
+        )?;
+        config.load_shape = context.load_shape;
+        mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
+        // Rung 2 may be engaged only by the exact policy authorization above. Rung 3 remains `Missing`,
+        // so attention chunking is never set.
+        config.attention_chunk_size = None;
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 // ── Request-side resolution: the shared `GenerationMemory` signal → this provider's levers ────────

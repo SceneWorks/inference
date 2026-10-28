@@ -3856,6 +3856,23 @@ pub fn standard_memory_behavior_context(
     })
 }
 
+/// Sum resident-byte `values` for a memory contract, refusing `u64` overflow with a typed
+/// [`Error::Msg`] naming the `owner` (a provider id) and the `label` of the component being priced.
+///
+/// One definition for the per-provider `checked_sum` copies (sc-27341): every byte total a
+/// contract publishes must fail closed rather than wrap.
+pub fn checked_byte_total(
+    owner: &str,
+    label: &str,
+    values: impl IntoIterator<Item = u64>,
+) -> Result<u64> {
+    values.into_iter().try_fold(0_u64, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or_else(|| Error::Msg(format!("{owner}: {label} byte total overflows u64")))
+    })
+}
+
 /// Defense-in-depth result. It can accept or reject; it cannot replace the worker's selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemorySafetyDecision {
@@ -7627,5 +7644,15 @@ mod tests {
         slid.mode = "replacemen".to_owned();
         slid.carrier_shape = format!("t{}", base.carrier_shape);
         assert_ne!(scail2, evidence.evidence_revision(&slid).unwrap());
+    }
+
+    #[test]
+    fn checked_byte_total_sums_and_refuses_overflow() {
+        assert_eq!(checked_byte_total("p", "vae", [1, 2, 3]).unwrap(), 6);
+        assert_eq!(checked_byte_total("p", "vae", []).unwrap(), 0);
+        match checked_byte_total("p", "vae", [u64::MAX, 1]) {
+            Err(Error::Msg(message)) => assert_eq!(message, "p: vae byte total overflows u64"),
+            other => panic!("expected a typed overflow, got {other:?}"),
+        }
     }
 }

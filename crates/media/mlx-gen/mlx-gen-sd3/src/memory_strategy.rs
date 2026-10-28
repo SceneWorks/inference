@@ -503,41 +503,33 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let provider = provider_static(&contract.provider_id)?;
-    let blocks = match variant_for(provider)? {
-        Sd3Variant::Large | Sd3Variant::LargeTurbo => LARGE_NUM_LAYERS,
-        Sd3Variant::Medium => MEDIUM_NUM_LAYERS,
-    };
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        false,
-        blocks,
-        |_use_pid, edge, overlap| {
-            if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
-                Ok(())
-            } else {
-                Err(CoreError::Unsupported(
-                    "sd3 decode tile geometry is outside the calibrated domain".to_owned(),
-                ))
-            }
-        },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, || {
+        let provider = provider_static(&contract.provider_id)?;
+        let blocks = match variant_for(provider)? {
+            Sd3Variant::Large | Sd3Variant::LargeTurbo => LARGE_NUM_LAYERS,
+            Sd3Variant::Medium => MEDIUM_NUM_LAYERS,
+        };
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            false,
+            blocks,
+            |_use_pid, edge, overlap| {
+                if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
+                    Ok(())
+                } else {
+                    Err(CoreError::Unsupported(
+                        "sd3 decode tile geometry is outside the calibrated domain".to_owned(),
+                    ))
+                }
+            },
+        )?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 pub(crate) fn registered_begin_request(

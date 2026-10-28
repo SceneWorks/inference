@@ -219,12 +219,12 @@ pub use memory_phases::{
 };
 pub use memory_strategy::{
     adapter_stack_identity, adapter_stack_resident_bytes, adapter_stack_upcast_resident_bytes,
-    default_memory_strategy_safety_check, default_registered_memory_strategy_safety_check,
-    standard_memory_behavior_context, standard_memory_strategy_safety_check,
-    validate_calibration_fingerprint, AdapterResidencyMode, LokrKroneckerDims,
-    MemoryArchitectureFacts, MemoryAssetFacts, MemoryBackend, MemoryBackendRealization,
-    MemoryBehaviorRoute, MemoryBudget, MemoryCacheSemantics, MemoryCacheState,
-    MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
+    checked_byte_total, default_memory_strategy_safety_check,
+    default_registered_memory_strategy_safety_check, standard_memory_behavior_context,
+    standard_memory_strategy_safety_check, validate_calibration_fingerprint, AdapterResidencyMode,
+    LokrKroneckerDims, MemoryArchitectureFacts, MemoryAssetFacts, MemoryBackend,
+    MemoryBackendRealization, MemoryBehaviorRoute, MemoryBudget, MemoryCacheSemantics,
+    MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
     MemoryComponentResidency, MemoryConformanceState, MemoryDecodeArtifactIdentity,
     MemoryDecodeGeometryPolicy, MemoryDecodePolicyQuery, MemoryDecodeQualityDisposition,
     MemoryDecodeQualityFixture, MemoryDecodeQualityRuntimeIdentity, MemoryDecodeRouteDomain,

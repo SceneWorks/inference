@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use mlx_gen::gen_core::{
     self, AdapterKind, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
-    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
     MemoryStructuralResidentEvidence, Precision, Quant, ResidentOnlyMemoryContractRegistration,
     ResidentRequestMemory, WeightsSource, MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
@@ -711,26 +711,7 @@ impl MemoryRequestScope for Scail2MemoryScope<'_> {
         self.inner.configure_request(request)?;
         validate_request_identity(self.memory, &self.context, request)
     }
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.enter_phase(phase)
-    }
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.leave_phase(phase)
-    }
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.inner.configure_decode(edge, overlap, geometry)
-    }
-    fn configure_attention(&mut self, size: u32) -> gen_core::Result<()> {
-        self.inner.configure_attention(size)
-    }
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
-        self.inner.materialize_transformer_window(first, count)
-    }
+    mlx_gen::delegate_memory_scope_core!(inner);
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         let result = self.inner.finish(outcome);
         *self

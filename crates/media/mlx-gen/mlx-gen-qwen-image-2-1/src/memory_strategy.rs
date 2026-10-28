@@ -2047,30 +2047,27 @@ pub(crate) fn begin_request_for(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        crate::config::TransformerConfig::production().num_layers,
-        move |use_pid, edge, overlap| {
-            if use_pid {
-                return Err(CoreError::Unsupported(format!(
-                    "{provider_id}: there is no PiD decoder on this route"
-                )));
-            }
-            validate_decode(provider_id, Some(edge), Some(overlap))
+    mlx_gen::request_scope::begin_scope(
+        safety_check(spec, contract, context),
+        mlx_gen::request_scope::MlxScopeCleanup::Device,
+        || {
+            mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                provider_id,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                crate::config::TransformerConfig::production().num_layers,
+                move |use_pid, edge, overlap| {
+                    if use_pid {
+                        return Err(CoreError::Unsupported(format!(
+                            "{provider_id}: there is no PiD decoder on this route"
+                        )));
+                    }
+                    validate_decode(provider_id, Some(edge), Some(overlap))
+                },
+            )
         },
-    )?;
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
-            config,
-            mlx_gen::request_scope::MlxScopeCleanup::Device,
-        ),
-    )))
+    )
 }
 
 /// The shared-ladder registration pair this provider publishes.

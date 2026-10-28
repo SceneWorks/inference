@@ -609,9 +609,7 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
+    mlx_gen::request_scope::admit(safety_check(spec, contract, context))?;
     let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         if contract.provider_id == gen_core::flux3::BASE_MODEL_ID {
             gen_core::flux3::BASE_MODEL_ID

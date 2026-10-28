@@ -983,36 +983,28 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let provider = provider_static(&contract.provider_id)?;
-    let routes = decode_routes(provider)?;
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        window_stack_depth(),
-        move |use_pid, edge, overlap| {
-            routes
-                .validate(use_pid, Some(edge), Some(overlap))
-                .map_err(CoreError::Unsupported)
-        },
-    )?;
-    config.load_shape = context.load_shape;
-    mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, || {
+        let provider = provider_static(&contract.provider_id)?;
+        let routes = decode_routes(provider)?;
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            context.use_pid,
+            window_stack_depth(),
+            move |use_pid, edge, overlap| {
+                routes
+                    .validate(use_pid, Some(edge), Some(overlap))
+                    .map_err(CoreError::Unsupported)
+            },
+        )?;
+        config.load_shape = context.load_shape;
+        mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 pub(crate) fn registered_begin_request(

@@ -463,36 +463,28 @@ fn begin_with(
     // The one place a refused route becomes a TYPED error. `MemorySafetyDecision::Reject` carries an
     // already-rendered string, so the route gate deliberately hands back plain reasons (see
     // `safety_check`) and the `unsupported: ` prefix is applied exactly once, here.
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        crate::pulid_flux::MODEL_ID,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        false,
-        57,
-        |_pid, edge, overlap| {
-            if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
-                Ok(())
-            } else {
-                Err(CoreError::Unsupported(format!(
-                    "pulid_flux: decode tile {edge}/{overlap} is outside the production domain"
-                )))
-            }
-        },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, || {
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            crate::pulid_flux::MODEL_ID,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            false,
+            57,
+            |_pid, edge, overlap| {
+                if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
+                    Ok(())
+                } else {
+                    Err(CoreError::Unsupported(format!(
+                        "pulid_flux: decode tile {edge}/{overlap} is outside the production domain"
+                    )))
+                }
+            },
+        )?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 #[cfg(test)]

@@ -1983,11 +1983,13 @@ pub fn loaded_begin_request(
     context: &MemoryRunContext,
     loaded_expert_blocks: usize,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } =
-        loaded_safety_check(provider_id, spec, contract, context, loaded_expert_blocks)
-    {
-        return Err(CoreError::Unsupported(reason));
-    }
+    mlx_gen::request_scope::admit(loaded_safety_check(
+        provider_id,
+        spec,
+        contract,
+        context,
+        loaded_expert_blocks,
+    ))?;
     begin_request(provider_id, spec, contract, context)
 }
 
@@ -1998,9 +2000,7 @@ fn begin_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
+    mlx_gen::request_scope::admit(safety_check(spec, contract, context))?;
     let route = match context.mode.as_key() {
         "video_to_video" => BerniniMemoryRoute::Clip,
         "reference_to_video" => BerniniMemoryRoute::Images,
@@ -2045,13 +2045,8 @@ fn begin_with_cleanup(
         },
     )?;
     config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
+    config.transformer_window =
+        mlx_gen::request_scope::selected_transformer_window(contract, context);
     Ok(Some(Box::new(BerniniMemoryRequestScope {
         inner: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
         provider_id,

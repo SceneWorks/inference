@@ -722,35 +722,27 @@ fn begin_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        DitConfig::anima().num_layers,
-        move |use_pid, edge, overlap| {
-            if use_pid {
-                return Err(CoreError::Unsupported(format!(
-                    "{provider_id}: anima has no PiD decoder"
-                )));
-            }
-            validate_decode(Some(edge), Some(overlap))
-        },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, || {
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider_id,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            context.use_pid,
+            DitConfig::anima().num_layers,
+            move |use_pid, edge, overlap| {
+                if use_pid {
+                    return Err(CoreError::Unsupported(format!(
+                        "{provider_id}: anima has no PiD decoder"
+                    )));
+                }
+                validate_decode(Some(edge), Some(overlap))
+            },
+        )?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 // ── Request-side resolution: the shared `GenerationMemory` signal → this provider's levers ────────

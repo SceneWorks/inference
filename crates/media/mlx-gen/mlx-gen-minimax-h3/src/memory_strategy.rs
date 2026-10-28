@@ -2005,39 +2005,40 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check_at_tier(contract, tier, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        MODEL_ID,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        DIT_BLOCKS as usize,
-        // sc-18660. The same predicate the `safety_check` route gate uses, so `configure_decode`
-        // and admission cannot disagree about what is legal.
-        |_use_pid, edge, overlap| validate_decode_geometry(edge, overlap),
-    )?;
-    // sc-18662. **Declaration is not enforcement.** Publishing `transformer_window_sizes` without
-    // this leaves `materialize_transformer_window` refusing every window the contract just
-    // advertised — the registry conformance walk drives the declared parameter through the scope and
-    // caught exactly that. Guarded by contract-aware `engages` rather than an ordinal compare, so a
-    // resident load (where rung 4 is `Missing`) never admits a window.
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then(|| {
-            context
-                .selection
-                .parameters
-                .transformer_window_size
-                .unwrap_or(TRANSFORMER_WINDOW_SIZE)
-        });
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(
+        safety_check_at_tier(contract, tier, context),
+        cleanup,
+        || {
+            let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                MODEL_ID,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                DIT_BLOCKS as usize,
+                // sc-18660. The same predicate the `safety_check` route gate uses, so `configure_decode`
+                // and admission cannot disagree about what is legal.
+                |_use_pid, edge, overlap| validate_decode_geometry(edge, overlap),
+            )?;
+            // sc-18662. **Declaration is not enforcement.** Publishing `transformer_window_sizes` without
+            // this leaves `materialize_transformer_window` refusing every window the contract just
+            // advertised — the registry conformance walk drives the declared parameter through the scope and
+            // caught exactly that. Guarded by contract-aware `engages` rather than an ordinal compare, so a
+            // resident load (where rung 4 is `Missing`) never admits a window.
+            config.transformer_window = contract
+                .engages(
+                    context.selection.strategy,
+                    MemoryStrategy::BoundedTransformerResidency,
+                )
+                .then(|| {
+                    context
+                        .selection
+                        .parameters
+                        .transformer_window_size
+                        .unwrap_or(TRANSFORMER_WINDOW_SIZE)
+                });
+            Ok(config)
+        },
+    )
 }
 
 /// Registry-facing entry point: no device cleanup, because the weights-free probe never allocated.

@@ -3,8 +3,8 @@
 use std::cell::RefCell;
 
 use mlx_gen::gen_core::{
-    self, GenerationRequest, LoadSpec, MemoryGeometry, MemoryPhase, MemoryRequestScope,
-    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    self, GenerationRequest, LoadSpec, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemorySafetyDecision, MemoryStrategy,
 };
 
 pub use gen_core::wan_i2v_memory::{PreparedWanI2vMemory, WanI2vBackend};
@@ -186,27 +186,7 @@ impl MemoryRequestScope for WanI2vRequestScope {
         self.active.arm(actual)?;
         Ok(())
     }
-
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.enter_phase(phase)
-    }
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.leave_phase(phase)
-    }
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.core.configure_decode(edge, overlap, geometry)
-    }
-    fn configure_attention(&mut self, size: u32) -> gen_core::Result<()> {
-        self.core.configure_attention(size)
-    }
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
-        self.core.materialize_transformer_window(first, count)
-    }
+    mlx_gen::delegate_memory_scope_core!(core);
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         let result = self.core.finish(outcome);
         self.active.clear();
