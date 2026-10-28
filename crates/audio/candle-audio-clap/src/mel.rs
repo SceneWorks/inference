@@ -78,17 +78,9 @@ pub fn slaney_filterbank() -> Vec<f32> {
     filt
 }
 
-/// Average interleaved channels to mono (no-op for mono input).
-pub fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
-    let ch = channels.max(1) as usize;
-    if ch == 1 {
-        return samples.to_vec();
-    }
-    samples
-        .chunks(ch)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-        .collect()
-}
+/// Average interleaved channels to mono (no-op for mono input) — the shared commons helper,
+/// re-exported so this path stays stable (sc-27357).
+pub use candle_audio::dsp::to_mono;
 
 /// Fit a mono waveform to exactly `target` samples: **repeat-pad** if short (CLAP's `padding=
 /// "repeatpad"` — tile the clip to fill, matching how the feature extractor handles sub-10 s audio),

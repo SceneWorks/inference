@@ -20,6 +20,7 @@ use crate::config::{
     DiffusionConfig, DiffusionObjective, DistributionShiftConfig, DistributionShiftType,
     StableAudioConfig,
 };
+pub use crate::dit::DitConditioning;
 use crate::dit::{Guidance, StableAudio3Dit};
 
 macro_rules! bail {
@@ -657,46 +658,26 @@ fn denoised(x: &Tensor, timestep: &Tensor, velocity: &Tensor) -> Result<Tensor> 
     Ok(x.broadcast_sub(&velocity.broadcast_mul(&sigma)?)?)
 }
 
+/// The per-run options every solver entry point shares (sc-27262): the optional `[batch, time]`
+/// padding mask, whether to record the [`SampleStep`] trajectory, and the live pre-update
+/// progress/cancellation callback. The callback observes exactly the frozen callback state (`x`,
+/// current timestep, denoised estimate) and runs before the solver update or Pingpong draw;
+/// returning an error cancels immediately and propagates that error.
+#[derive(Default)]
+pub struct SampleOptions<'a, 'c> {
+    pub padding_mask: Option<&'a Tensor>,
+    pub record_trajectory: bool,
+    pub callback: Option<&'a mut ProgressCallback<'c>>,
+}
+
 /// Run one corrected RF solver. The closure is the only model seam, allowing callers to reuse
 /// [`StableAudio3Dit::forward_guided`] without duplicating guidance math.
-#[allow(clippy::too_many_arguments)]
 pub fn sample<F, N>(
     kind: SamplerKind,
     initial: &Tensor,
     schedule: &Schedule,
-    padding_mask: Option<&Tensor>,
+    options: SampleOptions<'_, '_>,
     noise: &mut N,
-    record_trajectory: bool,
-    model: F,
-) -> Result<SampleOutput>
-where
-    F: FnMut(&Tensor, &Tensor) -> Result<Tensor>,
-    N: NoiseSource,
-{
-    sample_with_callback(
-        kind,
-        initial,
-        schedule,
-        padding_mask,
-        noise,
-        record_trajectory,
-        None,
-        model,
-    )
-}
-
-/// Sampling with a live pre-update progress/cancellation callback. The callback observes exactly
-/// the frozen callback state (`x`, current timestep, denoised estimate) and runs before the solver
-/// update or Pingpong draw. Returning an error cancels immediately and propagates that error.
-#[allow(clippy::too_many_arguments)]
-pub fn sample_with_callback<F, N>(
-    kind: SamplerKind,
-    initial: &Tensor,
-    schedule: &Schedule,
-    padding_mask: Option<&Tensor>,
-    noise: &mut N,
-    record_trajectory: bool,
-    callback: Option<&mut ProgressCallback<'_>>,
     mut model: F,
 ) -> Result<SampleOutput>
 where
@@ -707,31 +688,31 @@ where
         kind,
         initial,
         schedule,
-        padding_mask,
+        options,
         noise,
-        record_trajectory,
-        callback,
         |x, timestep, _host_timestep| model(x, timestep),
     )
 }
 
-/// Advanced sampler seam retaining typed host timestep values for control decisions without
-/// device-to-host synchronization.
-#[allow(clippy::too_many_arguments)]
+/// [`sample`] whose model closure also receives the typed host timestep values, for control
+/// decisions without device-to-host synchronization.
 pub fn sample_with_host_timestep<F, N>(
     kind: SamplerKind,
     initial: &Tensor,
     schedule: &Schedule,
-    padding_mask: Option<&Tensor>,
+    options: SampleOptions<'_, '_>,
     noise: &mut N,
-    record_trajectory: bool,
-    mut callback: Option<&mut ProgressCallback<'_>>,
     mut model: F,
 ) -> Result<SampleOutput>
 where
     F: FnMut(&Tensor, &Tensor, &[f32]) -> Result<Tensor>,
     N: NoiseSource,
 {
+    let SampleOptions {
+        padding_mask,
+        record_trajectory,
+        mut callback,
+    } = options;
     let (batch, _, _) = initial.dims3()?;
     schedule.validate_for_sampling(batch)?;
     if let Some(mask) = padding_mask {
@@ -917,23 +898,20 @@ where
 
 /// Initialize and sample in one operation so `strength=0` has enforceable no-DiT semantics rather
 /// than relying on a caller convention.
-#[allow(clippy::too_many_arguments)]
 pub fn sample_initialized<F, N>(
     kind: SamplerKind,
     noise_latents: &Tensor,
-    init_latents: Option<&Tensor>,
-    strength: f32,
+    init: InitMix<'_>,
     schedule: &Schedule,
-    padding_mask: Option<&Tensor>,
+    options: SampleOptions<'_, '_>,
     noise: &mut N,
-    record_trajectory: bool,
     model: F,
 ) -> Result<SampleOutput>
 where
     F: FnMut(&Tensor, &Tensor) -> Result<Tensor>,
     N: NoiseSource,
 {
-    let start = initialized_start(noise_latents, init_latents, strength, schedule)?;
+    let start = initialized_start(noise_latents, init.init_latents, init.strength, schedule)?;
     if start.skip_model {
         return Ok(SampleOutput {
             latents: start.latents,
@@ -942,15 +920,7 @@ where
             noise_draws: noise.draws(),
         });
     }
-    sample(
-        kind,
-        &start.latents,
-        schedule,
-        padding_mask,
-        noise,
-        record_trajectory,
-        model,
-    )
+    sample(kind, &start.latents, schedule, options, noise, model)
 }
 
 /// The starting latents for an initialized sample, plus whether the DiT must be skipped entirely.
@@ -972,7 +942,7 @@ pub struct InitializedStart {
 /// Shared preamble for every initialized sampling entry point.
 ///
 /// Extracted so the raw-closure form ([`sample_initialized`]) and the connected DiT form
-/// ([`sample_dit_initialized_with_interval_and_cancel`]) cannot drift on the schedule/strength
+/// ([`sample_dit`] with [`SampleDitArgs::init`]) cannot drift on the schedule/strength
 /// agreement check, the mix, or the `strength == 0` short circuit.
 pub fn initialized_start(
     noise_latents: &Tensor,
@@ -1087,203 +1057,134 @@ pub fn validate_guidance(guidance: Guidance) -> Result<()> {
     Ok(())
 }
 
-/// Convenience seam binding the sampler to the already-audited DiT guidance implementation.
-#[allow(clippy::too_many_arguments)]
-pub fn sample_dit<N: NoiseSource>(
-    model: &StableAudio3Dit,
-    kind: SamplerKind,
-    initial: &Tensor,
-    schedule: &Schedule,
-    positive_prompt: &Tensor,
-    negative_prompt: Option<&Tensor>,
-    negative_prompt_mask: Option<&Tensor>,
-    seconds_total: &Tensor,
-    local_conditioning: &Tensor,
-    padding: Option<&Tensor>,
-    guidance: Guidance,
-    noise: &mut N,
-    record_trajectory: bool,
-) -> Result<SampleOutput> {
-    sample_dit_with_interval(
-        model,
-        kind,
-        initial,
-        schedule,
-        positive_prompt,
-        negative_prompt,
-        negative_prompt_mask,
-        seconds_total,
-        local_conditioning,
-        padding,
-        guidance,
-        GuidanceInterval::FULL,
-        None,
-        noise,
-        record_trajectory,
-    )
-}
-
-/// DiT sampler with explicit CFG interval gating. Nondefault intervals are evaluated for every
-/// solver stage, including RK4 sub-stages. A heterogeneous batch decision fails closed because
-/// splitting it would violate Stable Audio 3's mandatory single 2B CFG forward.
-#[allow(clippy::too_many_arguments)]
-pub fn sample_dit_with_interval<N: NoiseSource>(
-    model: &StableAudio3Dit,
-    kind: SamplerKind,
-    initial: &Tensor,
-    schedule: &Schedule,
-    positive_prompt: &Tensor,
-    negative_prompt: Option<&Tensor>,
-    negative_prompt_mask: Option<&Tensor>,
-    seconds_total: &Tensor,
-    local_conditioning: &Tensor,
-    padding: Option<&Tensor>,
-    guidance: Guidance,
-    guidance_interval: GuidanceInterval,
-    callback: Option<&mut ProgressCallback<'_>>,
-    noise: &mut N,
-    record_trajectory: bool,
-) -> Result<SampleOutput> {
-    guidance_interval.validate()?;
-    validate_guidance(guidance)?;
-    if model.objective() == DiffusionObjective::V {
-        bail!("Stable Audio 3 RF samplers reject the unreachable v-diffusion objective")
-    }
-    sample_with_host_timestep(
-        kind,
-        initial,
-        schedule,
-        padding,
-        noise,
-        record_trajectory,
-        callback,
-        |latents, timestep, host_timestep| {
-            let step_guidance = guidance_interval.guidance_for_values(host_timestep, guidance)?;
-            Ok(model.forward_guided(
-                latents,
-                timestep,
-                positive_prompt,
-                negative_prompt,
-                negative_prompt_mask,
-                seconds_total,
-                local_conditioning,
-                padding,
-                step_guidance,
-            )?)
-        },
-    )
-}
-
-/// Connected-provider sampler with cancellation checked inside every DiT transformer block.
-#[allow(clippy::too_many_arguments)]
-pub fn sample_dit_with_interval_and_cancel<N: NoiseSource>(
-    model: &StableAudio3Dit,
-    kind: SamplerKind,
-    initial: &Tensor,
-    schedule: &Schedule,
-    positive_prompt: &Tensor,
-    negative_prompt: Option<&Tensor>,
-    negative_prompt_mask: Option<&Tensor>,
-    seconds_total: &Tensor,
-    local_conditioning: &Tensor,
-    padding: Option<&Tensor>,
-    guidance: Guidance,
-    guidance_interval: GuidanceInterval,
-    callback: Option<&mut ProgressCallback<'_>>,
-    noise: &mut N,
-    record_trajectory: bool,
-    is_canceled: &dyn Fn() -> bool,
-) -> Result<SampleOutput> {
-    guidance_interval.validate()?;
-    validate_guidance(guidance)?;
-    if model.objective() == DiffusionObjective::V {
-        bail!("Stable Audio 3 RF samplers reject the unreachable v-diffusion objective")
-    }
-    sample_with_host_timestep(
-        kind,
-        initial,
-        schedule,
-        padding,
-        noise,
-        record_trajectory,
-        callback,
-        |latents, timestep, host_timestep| {
-            let step_guidance = guidance_interval.guidance_for_values(host_timestep, guidance)?;
-            model.forward_guided_with_cancel(
-                latents,
-                timestep,
-                positive_prompt,
-                negative_prompt,
-                negative_prompt_mask,
-                seconds_total,
-                local_conditioning,
-                padding,
-                step_guidance,
-                is_canceled,
-            )
-        },
-    )
-}
-
-/// Connected-provider sampler that mixes init latents into the initial noise first (sc-14547).
-///
-/// The audio→audio restyle path needs both halves at once: the frozen `x0 = init*(1-s) + noise*s`
-/// initialization *and* the cancellable, guidance-interval-aware DiT loop. Composing them in the
-/// provider would have put the `strength == 0` no-DiT short circuit back under a caller convention,
-/// which is exactly what [`sample_initialized`] exists to prevent, so both forms share
-/// [`initialized_start`].
+/// The init-latent mix of an audio→audio restyle run (sc-14547): the start state is
+/// `x0 = init·(1 − s) + noise·s` via [`initialized_start`], and `strength == 0` returns the
+/// prepared source latents without a single DiT forward.
 ///
 /// `strength` here is the **init noise level**: `1.0` is pure noise (the text-to-audio path) and
-/// `0.0` returns the prepared source latents without a single DiT forward. The provider-facing
-/// `Conditioning::ReferenceAudio.strength` is *retention*-oriented and is the complement of this
-/// value — see `model::reference_noise_level`.
-#[allow(clippy::too_many_arguments)]
-pub fn sample_dit_initialized_with_interval_and_cancel<N: NoiseSource>(
-    model: &StableAudio3Dit,
-    kind: SamplerKind,
-    noise_latents: &Tensor,
-    init_latents: Option<&Tensor>,
-    strength: f32,
-    schedule: &Schedule,
-    positive_prompt: &Tensor,
-    negative_prompt: Option<&Tensor>,
-    negative_prompt_mask: Option<&Tensor>,
-    seconds_total: &Tensor,
-    local_conditioning: &Tensor,
-    padding: Option<&Tensor>,
-    guidance: Guidance,
-    guidance_interval: GuidanceInterval,
-    callback: Option<&mut ProgressCallback<'_>>,
-    noise: &mut N,
-    record_trajectory: bool,
-    is_canceled: &dyn Fn() -> bool,
-) -> Result<SampleOutput> {
-    let start = initialized_start(noise_latents, init_latents, strength, schedule)?;
-    if start.skip_model {
-        return Ok(SampleOutput {
-            latents: start.latents,
-            trajectory: Vec::new(),
-            model_calls: 0,
-            noise_draws: noise.draws(),
-        });
+/// `0.0` is the source unchanged. The provider-facing `Conditioning::ReferenceAudio.strength` is
+/// *retention*-oriented and is the complement of this value — see `model::reference_noise_level`.
+#[derive(Clone, Copy)]
+pub struct InitMix<'a> {
+    pub init_latents: Option<&'a Tensor>,
+    pub strength: f32,
+}
+
+/// Everything [`sample_dit`] needs besides the model, the start latents, the noise source and the
+/// progress callback (sc-27262: one argument struct instead of the former
+/// `sample_dit` → `_with_interval` → `_with_interval_and_cancel` →
+/// `sample_dit_initialized_with_interval_and_cancel` wrapper ladder).
+#[derive(Clone, Copy)]
+pub struct SampleDitArgs<'a> {
+    pub kind: SamplerKind,
+    pub schedule: &'a Schedule,
+    pub conditioning: DitConditioning<'a>,
+    pub guidance: Guidance,
+    /// CFG interval gating. Nondefault intervals are evaluated for every solver stage, including
+    /// RK4 sub-stages. A heterogeneous batch decision fails closed because splitting it would
+    /// violate Stable Audio 3's mandatory single 2B CFG forward.
+    pub guidance_interval: GuidanceInterval,
+    /// `Some` mixes init latents into the start state first ([`InitMix`]); `None` samples from the
+    /// given start latents as-is.
+    pub init: Option<InitMix<'a>>,
+    pub record_trajectory: bool,
+    /// Cancellation checked inside every DiT transformer block (the connected-provider path);
+    /// `None` runs the uncancellable guided forward.
+    pub is_canceled: Option<&'a dyn Fn() -> bool>,
+}
+
+impl<'a> SampleDitArgs<'a> {
+    /// The plain form: full-range guidance, no init mix, no trajectory, not cancellable.
+    pub fn new(
+        kind: SamplerKind,
+        schedule: &'a Schedule,
+        conditioning: DitConditioning<'a>,
+        guidance: Guidance,
+    ) -> Self {
+        Self {
+            kind,
+            schedule,
+            conditioning,
+            guidance,
+            guidance_interval: GuidanceInterval::FULL,
+            init: None,
+            record_trajectory: false,
+            is_canceled: None,
+        }
     }
-    sample_dit_with_interval_and_cancel(
-        model,
+}
+
+/// The DiT sampler: binds the solver loop to the already-audited DiT guidance implementation.
+///
+/// `initial` is the start latents — or, with [`SampleDitArgs::init`], the noise latents the init
+/// mix starts from (both forms share [`initialized_start`], so the `strength == 0` no-DiT short
+/// circuit never moves back under a caller convention).
+pub fn sample_dit<N: NoiseSource>(
+    model: &StableAudio3Dit,
+    args: SampleDitArgs<'_>,
+    initial: &Tensor,
+    noise: &mut N,
+    callback: Option<&mut ProgressCallback<'_>>,
+) -> Result<SampleOutput> {
+    let SampleDitArgs {
         kind,
-        &start.latents,
         schedule,
-        positive_prompt,
-        negative_prompt,
-        negative_prompt_mask,
-        seconds_total,
-        local_conditioning,
-        padding,
+        conditioning,
         guidance,
         guidance_interval,
-        callback,
-        noise,
+        init,
         record_trajectory,
         is_canceled,
+    } = args;
+    let started;
+    let initial = match init {
+        Some(InitMix {
+            init_latents,
+            strength,
+        }) => {
+            started = initialized_start(initial, init_latents, strength, schedule)?;
+            if started.skip_model {
+                return Ok(SampleOutput {
+                    latents: started.latents,
+                    trajectory: Vec::new(),
+                    model_calls: 0,
+                    noise_draws: noise.draws(),
+                });
+            }
+            &started.latents
+        }
+        None => initial,
+    };
+    guidance_interval.validate()?;
+    validate_guidance(guidance)?;
+    if model.objective() == DiffusionObjective::V {
+        bail!("Stable Audio 3 RF samplers reject the unreachable v-diffusion objective")
+    }
+    sample_with_host_timestep(
+        kind,
+        initial,
+        schedule,
+        SampleOptions {
+            padding_mask: conditioning.padding,
+            record_trajectory,
+            callback,
+        },
+        noise,
+        |latents, timestep, host_timestep| {
+            let step_guidance = guidance_interval.guidance_for_values(host_timestep, guidance)?;
+            match is_canceled {
+                Some(is_canceled) => model.forward_guided_with_cancel(
+                    latents,
+                    timestep,
+                    &conditioning,
+                    step_guidance,
+                    is_canceled,
+                ),
+                None => {
+                    Ok(model.forward_guided(latents, timestep, &conditioning, step_guidance)?)
+                }
+            }
+        },
     )
 }
 

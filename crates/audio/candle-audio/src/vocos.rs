@@ -174,9 +174,12 @@ impl Vocos {
 
     /// `[1, input_channels, T]` → mono waveform of `T · hop` samples.
     pub fn forward(&self, features: &Tensor) -> Result<Vec<f32>> {
-        Ok(self
-            .forward_cancellable(features, &|| false)?
-            .unwrap_or_default())
+        // The probe never trips, so `None` is unreachable; surface it as an error rather than an
+        // empty waveform should that invariant ever break (sc-27361).
+        match self.forward_cancellable(features, &|| false)? {
+            Some(pcm) => Ok(pcm),
+            None => candle_core::bail!("vocos forward was cancelled by a never-cancelling probe"),
+        }
     }
 
     /// [`Self::forward`], polling `cancel` between the backbone blocks and before the head;
@@ -243,12 +246,9 @@ impl Vocos {
 }
 
 /// A periodic Hann window of length `n` (`0.5 − 0.5·cos(2π i / n)`, the cosine in f64 — torch's
-/// default `hann_window`).
-pub fn hann_window(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos() as f32)
-        .collect()
-}
+/// default `hann_window`). This is [`crate::dsp::hann_window_torch_f64`], re-exported under the
+/// name the Vocos callers use; it is ULP-distinct from [`crate::dsp::hann_window`] (sc-27357).
+pub use crate::dsp::hann_window_torch_f64 as hann_window;
 
 /// The backward-normalized inverse real-DFT basis `[N, n_bins]`: `cos[n,k] = a_k·cos(2πkn/N)/N`
 /// and `sin[n,k] = a_k·sin(2πkn/N)/N`, with the one-sided fold factor `a_k = 1` at DC/Nyquist and

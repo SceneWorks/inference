@@ -58,7 +58,7 @@ use std::path::PathBuf;
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device};
 use candle_audio_stable_audio_3::gen_core::WeightsSource;
 use candle_audio_stable_audio_3::pipeline::{
-    ComputeDTypes, StableAudio3Pipeline, SynthesisParameters,
+    ComputeDTypes, StableAudio3Pipeline, SynthesisHooks, SynthesisParameters, SynthesisRequest,
 };
 use candle_audio_stable_audio_3::sampler::SamplerKind;
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
@@ -268,12 +268,16 @@ fn render_all(variant: Variant, env: &str, device: &Device, root: DType) -> Vec<
         .map(|&seed| {
             pipeline
                 .synthesize(
-                    PROMPT,
-                    None,
-                    parameters(seed),
-                    &mut |_, _| {},
-                    &mut || {},
-                    &|| false,
+                    SynthesisRequest {
+                        prompt: PROMPT,
+                        negative_prompt: None,
+                        parameters: parameters(seed),
+                    },
+                    SynthesisHooks {
+                        on_progress: &mut |_, _| {},
+                        on_decoding: &mut || {},
+                        is_canceled: &|| false,
+                    },
                 )
                 .unwrap_or_else(|error| panic!("synthesize at root {root:?}: {error}"))
         })

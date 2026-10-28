@@ -13,9 +13,10 @@
 //! Kokoro stack needs); the Chatterbox encoder needs the librosa Slaney bank, so it is built here
 //! rather than reusing the HTK one — matching the trained front-end is what makes the real `ve`
 //! weights produce meaningful speaker vectors. Likewise `n_fft = 400` is not a power of two, so
-//! the power-of-two `candle_audio::dsp::stft` cannot serve it; a small direct real-DFT is used.
+//! the power-of-two `candle_audio::dsp::stft` cannot serve it; the shared direct real-DFT
+//! ([`candle_audio::dsp::DirectRdft`]) is used.
 
-use std::f32::consts::PI;
+use candle_audio::dsp;
 
 use crate::config;
 
@@ -40,68 +41,14 @@ pub fn normalize_volume(samples: &mut [f32]) {
     }
 }
 
-/// A Hann window of length `n` (`0.5 - 0.5 cos`), matching librosa's symmetric-`False` Hann.
-fn hann(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / n as f32).cos())
-        .collect()
-}
-
-/// Reflect-pad `samples` by `pad` on both ends (numpy `mode="reflect"`, edge sample excluded) —
-/// the `center=True` framing librosa uses.
-fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
-    let n = samples.len();
-    let mut out = Vec::with_capacity(n + 2 * pad);
-    out.extend((1..=pad).rev().map(|i| samples[i.min(n - 1)]));
-    out.extend_from_slice(samples);
-    out.extend((0..pad).map(|i| samples[n.saturating_sub(2 + i)]));
-    out
-}
-
 /// Power STFT of `samples`: `|X|^2` per bin, returned frame-major as `[n_frames][n_bins]`
-/// (`n_bins = N_FFT/2 + 1`). Direct real-DFT — `N_FFT = 400` is not a power of two.
+/// (`n_bins = N_FFT/2 + 1`): `center=True` reflect padding, periodic Hann (`0.5 - 0.5 cos`), and
+/// the shared direct real-DFT (`N_FFT = 400` is not a power of two).
 fn power_stft(samples: &[f32]) -> Vec<Vec<f32>> {
     let n_fft = config::N_FFT;
-    let hop = config::HOP;
-    let n_bins = n_fft / 2 + 1;
-    let window = hann(n_fft);
-    let pad = n_fft / 2;
-    let padded = reflect_pad(samples, pad);
-    if padded.len() < n_fft {
-        return Vec::new();
-    }
-    let n_frames = 1 + (padded.len() - n_fft) / hop;
-    // Precompute DFT twiddle factors: cos/sin for each (bin, sample).
-    let mut cos_tab = vec![0.0f32; n_bins * n_fft];
-    let mut sin_tab = vec![0.0f32; n_bins * n_fft];
-    for k in 0..n_bins {
-        for t in 0..n_fft {
-            let ang = -2.0 * PI * k as f32 * t as f32 / n_fft as f32;
-            cos_tab[k * n_fft + t] = ang.cos();
-            sin_tab[k * n_fft + t] = ang.sin();
-        }
-    }
-    let mut frames = Vec::with_capacity(n_frames);
-    let mut windowed = vec![0.0f32; n_fft];
-    for f in 0..n_frames {
-        let start = f * hop;
-        for (i, w) in windowed.iter_mut().enumerate() {
-            *w = padded[start + i] * window[i];
-        }
-        let mut row = vec![0.0f32; n_bins];
-        for (k, slot) in row.iter_mut().enumerate() {
-            let (cos_k, sin_k) = (&cos_tab[k * n_fft..], &sin_tab[k * n_fft..]);
-            let mut re = 0.0f32;
-            let mut im = 0.0f32;
-            for (t, &x) in windowed.iter().enumerate() {
-                re += x * cos_k[t];
-                im += x * sin_k[t];
-            }
-            *slot = re * re + im * im;
-        }
-        frames.push(row);
-    }
-    frames
+    let window = dsp::hann_window_torch_f32(n_fft);
+    let padded = dsp::reflect_pad(samples, n_fft / 2);
+    dsp::DirectRdft::new(n_fft).power_frames(&padded, config::HOP, &window)
 }
 
 /// librosa Slaney Hz→mel.
@@ -188,6 +135,7 @@ pub fn wav_to_mel_frames(samples: &[f32], src_rate: u32) -> candle_audio::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::PI;
 
     #[test]
     fn normalize_only_increases_quiet_signals() {
