@@ -41,6 +41,34 @@ pub fn validate_lokr_metadata_scale(alpha: f32, rank: f32) -> Result<()> {
     Ok(())
 }
 
+/// Read a LoRA `.alpha` scalar tensor. Adapter files are external input, so this never panics: an
+/// unreadable or empty tensor (a truncated file, F-059) and a NaN/inf value (which would turn the
+/// `alpha / rank · scale` fold into a NaN residual) are typed errors naming `label` (the tensor key
+/// or adapter path). The one shared reader for every provider's LoRA installer.
+pub fn read_scalar_alpha(a: &Array, label: &str) -> Result<f32> {
+    let alpha = a
+        .as_dtype(Dtype::Float32)?
+        .try_as_slice::<f32>()
+        .map_err(|e| {
+            crate::Error::Msg(format!(
+                "{label}: .alpha is not a readable scalar array: {e}"
+            ))
+        })?
+        .first()
+        .copied()
+        .ok_or_else(|| {
+            crate::Error::Msg(format!(
+                "{label}: empty .alpha tensor (malformed adapter file)"
+            ))
+        })?;
+    if !alpha.is_finite() {
+        return Err(crate::Error::Msg(format!(
+            "{label}: .alpha {alpha} is not finite"
+        )));
+    }
+    Ok(alpha)
+}
+
 /// Reconstruct a LoKr weight delta `ΔW = (alpha/rank) · kron(w1, w2)`, reshaped to the
 /// base weight's logical `[out, in]` and cast to `out_dtype`. Each Kronecker factor is either
 /// full (`w1` / `w2`) or a low-rank product (`w1_a @ w1_b` / `w2_a @ w2_b`). Mirrors
@@ -1375,6 +1403,33 @@ pub fn install_adapter(
 mod tests {
     use super::*;
     use mlx_rs::ops::{all_close, array_eq};
+
+    #[test]
+    fn read_scalar_alpha_errors_on_empty_or_non_finite_and_reads_bf16() {
+        // F-059 (sc-11129): a size-0 `.alpha` from a malformed/truncated adapter file must produce
+        // a TYPED error, not the `as_slice()[0]` panic that would abort the worker. (safetensors
+        // cannot serialize an empty array, so exercise the reader on the in-memory empty tensor —
+        // the exact value a truncated file would deserialize to.)
+        let empty = Array::from_slice::<f32>(&[], &[0]);
+        let err = read_scalar_alpha(&empty, "k.alpha").expect_err("an empty .alpha must error");
+        assert!(
+            matches!(&err, crate::Error::Msg(m) if m.contains("k.alpha") && m.contains("empty")),
+            "expected a typed Msg error, got {err:?}"
+        );
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = read_scalar_alpha(&Array::from_slice(&[bad], &[1]), "k.alpha")
+                .expect_err("a non-finite .alpha must error");
+            assert!(
+                matches!(&err, crate::Error::Msg(m) if m.contains("not finite")),
+                "{bad}: {err:?}"
+            );
+        }
+        // Happy path: a well-formed bf16 scalar still reads its value.
+        let good = Array::from_slice(&[8.0f32], &[1])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        assert_eq!(read_scalar_alpha(&good, "k.alpha").unwrap(), 8.0);
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum ResidualPayloadKind {

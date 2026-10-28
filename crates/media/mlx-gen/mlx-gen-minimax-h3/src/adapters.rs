@@ -873,18 +873,7 @@ struct LoraParts {
 /// Read a scalar `.alpha` tensor as f32 regardless of its on-disk dtype (real files ship it f32 or
 /// bf16; a direct `as_slice::<f32>()` would panic on a mismatch). `[]`- and `[1]`-shaped both read.
 fn read_alpha_tensor(path: &str, a: &Array) -> Result<f32> {
-    let alpha = a
-        .as_dtype(mlx_rs::Dtype::Float32)?
-        .as_slice::<f32>()
-        .first()
-        .copied()
-        .ok_or_else(|| Error::Msg(format!("minimax_h3 adapter '{path}': empty .alpha tensor")))?;
-    if !alpha.is_finite() {
-        return Err(Error::Msg(format!(
-            "minimax_h3 adapter '{path}': .alpha {alpha} is not finite"
-        )));
-    }
-    Ok(alpha)
+    mlx_gen::adapters::read_scalar_alpha(a, &format!("minimax_h3 adapter '{path}'"))
 }
 
 /// Install one diffusers-key-space LoRA file's residuals onto `host` at `spec.scale`.
