@@ -1087,203 +1087,164 @@ pub fn validate_guidance(guidance: Guidance) -> Result<()> {
     Ok(())
 }
 
-/// Convenience seam binding the sampler to the already-audited DiT guidance implementation.
-#[allow(clippy::too_many_arguments)]
-pub fn sample_dit<N: NoiseSource>(
-    model: &StableAudio3Dit,
-    kind: SamplerKind,
-    initial: &Tensor,
-    schedule: &Schedule,
-    positive_prompt: &Tensor,
-    negative_prompt: Option<&Tensor>,
-    negative_prompt_mask: Option<&Tensor>,
-    seconds_total: &Tensor,
-    local_conditioning: &Tensor,
-    padding: Option<&Tensor>,
-    guidance: Guidance,
-    noise: &mut N,
-    record_trajectory: bool,
-) -> Result<SampleOutput> {
-    sample_dit_with_interval(
-        model,
-        kind,
-        initial,
-        schedule,
-        positive_prompt,
-        negative_prompt,
-        negative_prompt_mask,
-        seconds_total,
-        local_conditioning,
-        padding,
-        guidance,
-        GuidanceInterval::FULL,
-        None,
-        noise,
-        record_trajectory,
-    )
+/// The conditioning tensors a DiT sampling run feeds every guided forward.
+#[derive(Clone, Copy)]
+pub struct DitConditioning<'a> {
+    pub positive_prompt: &'a Tensor,
+    pub negative_prompt: Option<&'a Tensor>,
+    pub negative_prompt_mask: Option<&'a Tensor>,
+    pub seconds_total: &'a Tensor,
+    pub local_conditioning: &'a Tensor,
+    pub padding: Option<&'a Tensor>,
 }
 
-/// DiT sampler with explicit CFG interval gating. Nondefault intervals are evaluated for every
-/// solver stage, including RK4 sub-stages. A heterogeneous batch decision fails closed because
-/// splitting it would violate Stable Audio 3's mandatory single 2B CFG forward.
-#[allow(clippy::too_many_arguments)]
-pub fn sample_dit_with_interval<N: NoiseSource>(
-    model: &StableAudio3Dit,
-    kind: SamplerKind,
-    initial: &Tensor,
-    schedule: &Schedule,
-    positive_prompt: &Tensor,
-    negative_prompt: Option<&Tensor>,
-    negative_prompt_mask: Option<&Tensor>,
-    seconds_total: &Tensor,
-    local_conditioning: &Tensor,
-    padding: Option<&Tensor>,
-    guidance: Guidance,
-    guidance_interval: GuidanceInterval,
-    callback: Option<&mut ProgressCallback<'_>>,
-    noise: &mut N,
-    record_trajectory: bool,
-) -> Result<SampleOutput> {
-    guidance_interval.validate()?;
-    validate_guidance(guidance)?;
-    if model.objective() == DiffusionObjective::V {
-        bail!("Stable Audio 3 RF samplers reject the unreachable v-diffusion objective")
-    }
-    sample_with_host_timestep(
-        kind,
-        initial,
-        schedule,
-        padding,
-        noise,
-        record_trajectory,
-        callback,
-        |latents, timestep, host_timestep| {
-            let step_guidance = guidance_interval.guidance_for_values(host_timestep, guidance)?;
-            Ok(model.forward_guided(
-                latents,
-                timestep,
-                positive_prompt,
-                negative_prompt,
-                negative_prompt_mask,
-                seconds_total,
-                local_conditioning,
-                padding,
-                step_guidance,
-            )?)
-        },
-    )
-}
-
-/// Connected-provider sampler with cancellation checked inside every DiT transformer block.
-#[allow(clippy::too_many_arguments)]
-pub fn sample_dit_with_interval_and_cancel<N: NoiseSource>(
-    model: &StableAudio3Dit,
-    kind: SamplerKind,
-    initial: &Tensor,
-    schedule: &Schedule,
-    positive_prompt: &Tensor,
-    negative_prompt: Option<&Tensor>,
-    negative_prompt_mask: Option<&Tensor>,
-    seconds_total: &Tensor,
-    local_conditioning: &Tensor,
-    padding: Option<&Tensor>,
-    guidance: Guidance,
-    guidance_interval: GuidanceInterval,
-    callback: Option<&mut ProgressCallback<'_>>,
-    noise: &mut N,
-    record_trajectory: bool,
-    is_canceled: &dyn Fn() -> bool,
-) -> Result<SampleOutput> {
-    guidance_interval.validate()?;
-    validate_guidance(guidance)?;
-    if model.objective() == DiffusionObjective::V {
-        bail!("Stable Audio 3 RF samplers reject the unreachable v-diffusion objective")
-    }
-    sample_with_host_timestep(
-        kind,
-        initial,
-        schedule,
-        padding,
-        noise,
-        record_trajectory,
-        callback,
-        |latents, timestep, host_timestep| {
-            let step_guidance = guidance_interval.guidance_for_values(host_timestep, guidance)?;
-            model.forward_guided_with_cancel(
-                latents,
-                timestep,
-                positive_prompt,
-                negative_prompt,
-                negative_prompt_mask,
-                seconds_total,
-                local_conditioning,
-                padding,
-                step_guidance,
-                is_canceled,
-            )
-        },
-    )
-}
-
-/// Connected-provider sampler that mixes init latents into the initial noise first (sc-14547).
-///
-/// The audio→audio restyle path needs both halves at once: the frozen `x0 = init*(1-s) + noise*s`
-/// initialization *and* the cancellable, guidance-interval-aware DiT loop. Composing them in the
-/// provider would have put the `strength == 0` no-DiT short circuit back under a caller convention,
-/// which is exactly what [`sample_initialized`] exists to prevent, so both forms share
-/// [`initialized_start`].
+/// The init-latent mix of an audio→audio restyle run (sc-14547): the start state is
+/// `x0 = init·(1 − s) + noise·s` via [`initialized_start`], and `strength == 0` returns the
+/// prepared source latents without a single DiT forward.
 ///
 /// `strength` here is the **init noise level**: `1.0` is pure noise (the text-to-audio path) and
-/// `0.0` returns the prepared source latents without a single DiT forward. The provider-facing
-/// `Conditioning::ReferenceAudio.strength` is *retention*-oriented and is the complement of this
-/// value — see `model::reference_noise_level`.
-#[allow(clippy::too_many_arguments)]
-pub fn sample_dit_initialized_with_interval_and_cancel<N: NoiseSource>(
-    model: &StableAudio3Dit,
-    kind: SamplerKind,
-    noise_latents: &Tensor,
-    init_latents: Option<&Tensor>,
-    strength: f32,
-    schedule: &Schedule,
-    positive_prompt: &Tensor,
-    negative_prompt: Option<&Tensor>,
-    negative_prompt_mask: Option<&Tensor>,
-    seconds_total: &Tensor,
-    local_conditioning: &Tensor,
-    padding: Option<&Tensor>,
-    guidance: Guidance,
-    guidance_interval: GuidanceInterval,
-    callback: Option<&mut ProgressCallback<'_>>,
-    noise: &mut N,
-    record_trajectory: bool,
-    is_canceled: &dyn Fn() -> bool,
-) -> Result<SampleOutput> {
-    let start = initialized_start(noise_latents, init_latents, strength, schedule)?;
-    if start.skip_model {
-        return Ok(SampleOutput {
-            latents: start.latents,
-            trajectory: Vec::new(),
-            model_calls: 0,
-            noise_draws: noise.draws(),
-        });
+/// `0.0` is the source unchanged. The provider-facing `Conditioning::ReferenceAudio.strength` is
+/// *retention*-oriented and is the complement of this value — see `model::reference_noise_level`.
+#[derive(Clone, Copy)]
+pub struct InitMix<'a> {
+    pub init_latents: Option<&'a Tensor>,
+    pub strength: f32,
+}
+
+/// Everything [`sample_dit`] needs besides the model, the start latents, the noise source and the
+/// progress callback (sc-27262: one argument struct instead of the former
+/// `sample_dit` → `_with_interval` → `_with_interval_and_cancel` →
+/// `sample_dit_initialized_with_interval_and_cancel` wrapper ladder).
+#[derive(Clone, Copy)]
+pub struct SampleDitArgs<'a> {
+    pub kind: SamplerKind,
+    pub schedule: &'a Schedule,
+    pub conditioning: DitConditioning<'a>,
+    pub guidance: Guidance,
+    /// CFG interval gating. Nondefault intervals are evaluated for every solver stage, including
+    /// RK4 sub-stages. A heterogeneous batch decision fails closed because splitting it would
+    /// violate Stable Audio 3's mandatory single 2B CFG forward.
+    pub guidance_interval: GuidanceInterval,
+    /// `Some` mixes init latents into the start state first ([`InitMix`]); `None` samples from the
+    /// given start latents as-is.
+    pub init: Option<InitMix<'a>>,
+    pub record_trajectory: bool,
+    /// Cancellation checked inside every DiT transformer block (the connected-provider path);
+    /// `None` runs the uncancellable guided forward.
+    pub is_canceled: Option<&'a dyn Fn() -> bool>,
+}
+
+impl<'a> SampleDitArgs<'a> {
+    /// The plain form: full-range guidance, no init mix, no trajectory, not cancellable.
+    pub fn new(
+        kind: SamplerKind,
+        schedule: &'a Schedule,
+        conditioning: DitConditioning<'a>,
+        guidance: Guidance,
+    ) -> Self {
+        Self {
+            kind,
+            schedule,
+            conditioning,
+            guidance,
+            guidance_interval: GuidanceInterval::FULL,
+            init: None,
+            record_trajectory: false,
+            is_canceled: None,
+        }
     }
-    sample_dit_with_interval_and_cancel(
-        model,
+}
+
+/// The DiT sampler: binds the solver loop to the already-audited DiT guidance implementation.
+///
+/// `initial` is the start latents — or, with [`SampleDitArgs::init`], the noise latents the init
+/// mix starts from (both forms share [`initialized_start`], so the `strength == 0` no-DiT short
+/// circuit never moves back under a caller convention).
+pub fn sample_dit<N: NoiseSource>(
+    model: &StableAudio3Dit,
+    args: SampleDitArgs<'_>,
+    initial: &Tensor,
+    noise: &mut N,
+    callback: Option<&mut ProgressCallback<'_>>,
+) -> Result<SampleOutput> {
+    let SampleDitArgs {
         kind,
-        &start.latents,
         schedule,
+        conditioning,
+        guidance,
+        guidance_interval,
+        init,
+        record_trajectory,
+        is_canceled,
+    } = args;
+    let started;
+    let initial = match init {
+        Some(InitMix {
+            init_latents,
+            strength,
+        }) => {
+            started = initialized_start(initial, init_latents, strength, schedule)?;
+            if started.skip_model {
+                return Ok(SampleOutput {
+                    latents: started.latents,
+                    trajectory: Vec::new(),
+                    model_calls: 0,
+                    noise_draws: noise.draws(),
+                });
+            }
+            &started.latents
+        }
+        None => initial,
+    };
+    guidance_interval.validate()?;
+    validate_guidance(guidance)?;
+    if model.objective() == DiffusionObjective::V {
+        bail!("Stable Audio 3 RF samplers reject the unreachable v-diffusion objective")
+    }
+    let DitConditioning {
         positive_prompt,
         negative_prompt,
         negative_prompt_mask,
         seconds_total,
         local_conditioning,
         padding,
-        guidance,
-        guidance_interval,
-        callback,
+    } = conditioning;
+    sample_with_host_timestep(
+        kind,
+        initial,
+        schedule,
+        padding,
         noise,
         record_trajectory,
-        is_canceled,
+        callback,
+        |latents, timestep, host_timestep| {
+            let step_guidance = guidance_interval.guidance_for_values(host_timestep, guidance)?;
+            match is_canceled {
+                Some(is_canceled) => model.forward_guided_with_cancel(
+                    latents,
+                    timestep,
+                    positive_prompt,
+                    negative_prompt,
+                    negative_prompt_mask,
+                    seconds_total,
+                    local_conditioning,
+                    padding,
+                    step_guidance,
+                    is_canceled,
+                ),
+                None => Ok(model.forward_guided(
+                    latents,
+                    timestep,
+                    positive_prompt,
+                    negative_prompt,
+                    negative_prompt_mask,
+                    seconds_total,
+                    local_conditioning,
+                    padding,
+                    step_guidance,
+                )?),
+            }
+        },
     )
 }
 

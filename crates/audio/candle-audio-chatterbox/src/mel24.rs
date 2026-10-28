@@ -5,8 +5,9 @@
 //! the 25 Hz speech-token rate.
 //!
 //! It supplies the flow's conditioning **prompt mel** (`prompt_feat`) of the reference voice. The
-//! non-power-of-two `n_fft = 1920` STFT is served by a direct real-DFT (the shared radix-2
-//! `candle_audio::dsp` cannot), the same idiom the s3tokenizer / chatterbox_ve mel front-ends use.
+//! non-power-of-two `n_fft = 1920` STFT is served by the shared direct real-DFT
+//! (`candle_audio::dsp::DirectRdft`; the radix-2 `FftPlan` cannot), as the s3tokenizer /
+//! chatterbox_ve mel front-ends are.
 //! The librosa **Slaney** mel bank (`htk = False`, area-normalized) is reconstructed here exactly
 //! by construction, so no librosa dependency is needed.
 //!
@@ -22,6 +23,7 @@
 //!   (`spectral_normalize` / `dynamic_range_compression`).
 
 use candle_audio::candle_core::{Device, Tensor};
+use candle_audio::dsp::{self, DirectRdft};
 use candle_audio::Result;
 
 use crate::config::{S3GenConfig, S3GEN_SR};
@@ -95,34 +97,13 @@ fn librosa_mel_bank(cfg: &S3GenConfig) -> Vec<f32> {
     bank
 }
 
-/// Periodic Hann window of length `n` (`torch.hann_window(n)`, `periodic = True`).
-fn hann_periodic(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
-        .collect()
-}
-
-/// Reflect-pad by `pad` on both ends (numpy/torch `mode="reflect"`, edge sample excluded).
-fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
-    let n = samples.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(n + 2 * pad);
-    out.extend((1..=pad).rev().map(|i| samples[i.min(n - 1)]));
-    out.extend_from_slice(samples);
-    out.extend((0..pad).map(|i| samples[n.saturating_sub(2 + i)]));
-    out
-}
-
 /// The S3Gen 24 kHz log-mel extractor: precomputed Slaney mel bank, periodic Hann window, and a
 /// direct real-DFT (`n_fft = 1920` is not a power of two).
 pub struct Mel24Extractor {
     cfg: S3GenConfig,
     mel_bank: Vec<f32>, // mel-major [n_mels][n_bins]
     window: Vec<f32>,   // periodic Hann, length win == n_fft
-    cos_tab: Vec<f32>,  // [n_bins][n_fft]
-    sin_tab: Vec<f32>,
+    dft: DirectRdft,
 }
 
 impl Default for Mel24Extractor {
@@ -134,23 +115,11 @@ impl Default for Mel24Extractor {
 impl Mel24Extractor {
     /// Build the extractor for a given [`S3GenConfig`] (uses its `mel_*` fields).
     pub fn new(cfg: &S3GenConfig) -> Self {
-        let n_fft = cfg.mel_n_fft;
-        let n_bins = n_fft / 2 + 1;
-        let mut cos_tab = vec![0f32; n_bins * n_fft];
-        let mut sin_tab = vec![0f32; n_bins * n_fft];
-        for k in 0..n_bins {
-            for t in 0..n_fft {
-                let ang = -2.0 * std::f32::consts::PI * k as f32 * t as f32 / n_fft as f32;
-                cos_tab[k * n_fft + t] = ang.cos();
-                sin_tab[k * n_fft + t] = ang.sin();
-            }
-        }
         Self {
             cfg: *cfg,
             mel_bank: librosa_mel_bank(cfg),
-            window: hann_periodic(cfg.mel_win),
-            cos_tab,
-            sin_tab,
+            window: dsp::hann_window_torch_f32(cfg.mel_win),
+            dft: DirectRdft::new(cfg.mel_n_fft),
         }
     }
 
@@ -184,7 +153,7 @@ impl Mel24Extractor {
         let (n_fft, hop, n_mels) = (cfg.mel_n_fft, cfg.mel_hop, cfg.mel_num_mels);
         let n_bins = n_fft / 2 + 1;
         let pad = (n_fft - hop) / 2;
-        let padded = reflect_pad(wav, pad);
+        let padded = dsp::reflect_pad(wav, pad);
         if padded.len() < n_fft {
             return (Vec::new(), 0);
         }
@@ -197,16 +166,10 @@ impl Mel24Extractor {
             for (i, w) in windowed.iter_mut().enumerate() {
                 *w = padded[start + i] * self.window[i];
             }
-            for (k, slot) in mag.iter_mut().enumerate() {
-                let (cos_k, sin_k) = (&self.cos_tab[k * n_fft..], &self.sin_tab[k * n_fft..]);
-                let mut re = 0f32;
-                let mut im = 0f32;
-                for (t, &x) in windowed.iter().enumerate() {
-                    re += x * cos_k[t];
-                    im += x * sin_k[t];
-                }
+            self.dft.power_into(&windowed, &mut mag);
+            for slot in mag.iter_mut() {
                 // sqrt(|.|^2 + 1e-9) — the reference's magnitude (not power).
-                *slot = (re * re + im * im + 1e-9).sqrt();
+                *slot = (*slot + 1e-9).sqrt();
             }
             for m in 0..n_mels {
                 let filt = &self.mel_bank[m * n_bins..(m + 1) * n_bins];
@@ -256,7 +219,7 @@ mod tests {
 
     #[test]
     fn hann_is_periodic_and_bounded() {
-        let w = hann_periodic(1920);
+        let w = dsp::hann_window_torch_f32(1920);
         assert_eq!(w.len(), 1920);
         assert!(w[0].abs() < 1e-6);
         assert!((w[960] - 1.0).abs() < 1e-6, "peak at N/2");

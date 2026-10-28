@@ -17,7 +17,7 @@ use tokenizers::Tokenizer;
 use crate::backbone::{Backbone, BackboneCache, Frame};
 use crate::config::MossTtsRealtimeConfig;
 use crate::local::LocalTransformer;
-use crate::sampling::{Rng, SamplingParams};
+use crate::sampling::{Rng, DEFAULT_PARAMS};
 
 /// In-codebook padding id (also the multi-channel "no audio here" fill).
 pub const AUDIO_CHANNEL_PAD: u32 = 1024;
@@ -200,19 +200,11 @@ pub(crate) fn assistant_prefill_frames(
 /// and then generated audio against `text_pad`, driving certain phrasings to an immediate EOS
 /// (silence/babble, sc-13570). With the reference delay-pattern conditioning restored
 /// ([`build_prompt_frames`]) the model reaches its natural EOS on its own, so the floor is no longer
-/// the fidelity lever and forcing frames past a real EOS only manufactures silence. The
-/// `MOSS_TTS_MIN_FRAMES` env override is retained for experiments/sweeps (the loop caps any floor at
-/// half the frame budget so a genuinely short clip still terminates).
+/// the fidelity lever and forcing frames past a real EOS only manufactures silence. The loop caps
+/// any floor at half the frame budget so a genuinely short clip still terminates. (The
+/// `MOSS_TTS_MIN_FRAMES` env override that once replaced this constant was removed with the other
+/// sc-13433 sweep knobs, sc-27267: production output no longer depends on the ambient environment.)
 pub const DEFAULT_MIN_EOS_FRAMES: usize = 0;
-
-/// Resolve the minimum-length EOS-suppression floor: `MOSS_TTS_MIN_FRAMES` if set, else
-/// [`DEFAULT_MIN_EOS_FRAMES`] (0 ⇒ disabled, reference parity).
-fn min_eos_frames() -> usize {
-    std::env::var("MOSS_TTS_MIN_FRAMES")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MIN_EOS_FRAMES)
-}
 
 /// The reference TTS system prompt (`MossTTSRealtimeProcessor` default).
 pub const TTS_SYSTEM_PROMPT: &str = "<|im_start|>system\n\
@@ -336,16 +328,17 @@ impl Decoder {
     {
         let mut out: Vec<RvqFrame> = Vec::new();
         let mut stop = StopReason::Budget;
-        // The reference sampling distribution (temp 0.8 / top-k 30 / top-p 0.6 / rep-penalty 1.1),
-        // with optional operator overrides from the environment (unset ⇒ exactly the defaults, so the
-        // determinism/streaming gates are unchanged). The override drives the sc-13433 CER-vs-temp
-        // sweep without a rebuild; see `SamplingParams::from_env_or_default`.
-        let params = SamplingParams::from_env_or_default();
-        // Optional minimum-length EOS suppression (off by default — reference parity, sc-13570): when
-        // `MOSS_TTS_MIN_FRAMES` is set, audio-EOS on codebook 0 is masked for the first `min_frames`
-        // steps (capped at half the budget). The reference applies no floor; correct delay-pattern
-        // conditioning ([`build_prompt_frames`]) — not this floor — is what keeps prompts faithful.
-        let min_frames = min_eos_frames().min(max_frames / 2);
+        // The reference sampling distribution (temp 0.8 / top-k 30 / top-p 0.6 / rep-penalty 1.1).
+        // The sc-13433 env overrides (`MOSS_TTS_TEMPERATURE` / `_TOP_P` / `_TOP_K` /
+        // `_REP_PENALTY`) were removed by sc-27267; a future sweep should add explicit fields.
+        let params = DEFAULT_PARAMS;
+        // Optional minimum-length EOS suppression (off by default — reference parity, sc-13570): with
+        // a nonzero floor, audio-EOS on codebook 0 is masked for the first `min_frames` steps (capped
+        // at half the budget). The reference applies no floor; correct delay-pattern conditioning
+        // ([`build_prompt_frames`]) — not this floor — is what keeps prompts faithful.
+        // The cap is a no-op while the constant is 0; kept so raising the floor stays bounded.
+        #[allow(clippy::unnecessary_min_or_max)]
+        let min_frames = DEFAULT_MIN_EOS_FRAMES.min(max_frames / 2);
         let mut rng = Rng::seed(seed);
         // KV-cache AR (sc-13417): prefill the block once (onto the passed cache), then feed each
         // emitted frame back as a single-token step, so per-frame backbone cost is O(1) amortized.

@@ -51,6 +51,7 @@ use crate::s3gen::S3Gen;
 use crate::s3tokenizer::S3Tokenizer;
 use crate::t3::{strip_special_speech_tokens, T3Cond, T3};
 use crate::text::EnTokenizer;
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes `payload.model` to this exact id).
 pub const MODEL_ID: &str = "chatterbox_tts";
@@ -252,13 +253,6 @@ pub struct ChatterboxGenerator {
     /// The PerTh provenance watermarker (sc-13240/sc-13239), loaded lazily from the staged
     /// `perth_weights` component path.
     perth: Mutex<Option<PerthWatermarker>>,
-}
-
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
 }
 
 /// The `perth_implicit.safetensors` file from the staged [`COMPONENT_PERTH`] source: a

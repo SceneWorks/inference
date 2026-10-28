@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use candle_audio::candle_core::{Device, Result as CandleResult, Tensor};
+use candle_audio::ops::repeat_kv;
 use candle_nn::{linear, linear_b, rms_norm, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::config::ConditionEncoderConfig;
@@ -40,17 +41,6 @@ fn to_heads(x: &Tensor, num_heads: usize, head_dim: usize) -> CandleResult<Tenso
 fn from_heads(x: &Tensor) -> CandleResult<Tensor> {
     let (b, h, l, d) = x.dims4()?;
     x.transpose(1, 2)?.reshape((b, l, h * d))
-}
-
-fn repeat_kv(x: &Tensor, groups: usize) -> CandleResult<Tensor> {
-    if groups == 1 {
-        return x.contiguous();
-    }
-    let (b, h, l, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, h, groups, l, d))?
-        .reshape((b, h * groups, l, d))?
-        .contiguous()
 }
 
 fn rope_tables(

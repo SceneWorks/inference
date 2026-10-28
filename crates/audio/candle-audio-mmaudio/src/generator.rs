@@ -45,6 +45,7 @@ use crate::clip::{self, DfnClipEncoder};
 use crate::output::{AudioDecoder16k, SAMPLE_RATE as OUT_SAMPLE_RATE};
 use crate::sync::SynchformerVisualEncoder;
 use crate::{mmdit, model, preprocess};
+pub(crate) use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes `payload.model` to this exact id). The 44.1 kHz
 /// quality-ceiling sibling is [`crate::generator_44k`]'s `mmaudio_large_44k` (sc-13441).
@@ -495,14 +496,6 @@ pub(crate) fn check_seq(t: &Tensor, batch: usize, seq: usize, name: &str) -> Aud
         )));
     }
     Ok(())
-}
-
-/// Recover a poisoned mutex (a prior panic mid-synthesis) — the audio twin of `candle_gen::lock_recover`.
-pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
 }
 
 /// The five caller-provisioned component sources resolved at [`load`] (epic 13657), held so the heavy
