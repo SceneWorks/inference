@@ -192,9 +192,9 @@ impl MmAudio44kPipeline {
         let (latent_seq_len, clip_seq_len, sync_seq_len) = seq_lengths(duration);
         let dev = &self.device;
 
-        let clip_rgb = resample_frames(frames, src_fps, CLIP_FPS, clip_seq_len);
+        let clip_rgb = resample_frames(frames, src_fps, CLIP_FPS, clip_seq_len)?;
         let sync_rgb_count = (duration * SYNC_FPS).floor() as usize;
-        let sync_rgb = resample_frames(frames, src_fps, SYNC_FPS, sync_rgb_count);
+        let sync_rgb = resample_frames(frames, src_fps, SYNC_FPS, sync_rgb_count)?;
 
         let clip_feat = self.encode_clip_visual(&clip_rgb)?; // (1, clip_seq_len, 1024)
         let text_feat = self.encode_text(prompt)?; // (1, 77, 1024)

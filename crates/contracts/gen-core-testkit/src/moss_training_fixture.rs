@@ -192,10 +192,9 @@ fn bf16_bytes(value: f32) -> Result<[u8; 2]> {
     if !value.is_finite() {
         return Err(Error::Msg("nonfinite synthetic BF16 source".into()));
     }
-    // IEEE round-to-nearest, ties-to-even. The ordinary source ABI is BF16 even when
-    // the selected trainer later casts the frozen backbone to FP32 compute.
-    let bits = value.to_bits();
-    let rounded = (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16;
+    // IEEE round-to-nearest, ties-to-even (the shared gen-core helper). The ordinary source ABI is
+    // BF16 even when the selected trainer later casts the frozen backbone to FP32 compute.
+    let rounded = gen_core::numeric::bf16_bits(value);
     if rounded & 0x7f80 == 0x7f80 {
         return Err(Error::Msg("synthetic BF16 source overflow".into()));
     }

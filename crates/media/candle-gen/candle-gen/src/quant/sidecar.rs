@@ -26,7 +26,8 @@
 //! serialized recovery. Platforms without a mutation-resistant file stamp conservatively skip memoing.
 //! Missing or corrupt entries still take the exclusive-lock path so recovery and publication remain
 //! serialized. The external root can be supplied explicitly or through
-//! `SCENEWORKS_CANDLE_DEVICE_CACHE_DIR`; otherwise the platform's per-user cache directory is used.
+//! `SCENEWORKS_CANDLE_DEVICE_CACHE_DIR`; otherwise the platform's per-user cache directory is used,
+//! and only without one an owner-only, uid-named temp-dir fallback (sc-27414).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -489,23 +490,27 @@ impl PackedWeightSidecars {
             return Ok(cache);
         }
 
+        // The external location can be unusable (a temp-dir fallback that is not a private
+        // directory of this user, sc-27414); that only matters if the adjacent cache is unusable too.
         let external_cache = external_cache_dir(component_dir, external_cache_root);
-        if cache_is_complete(
-            &external_cache,
-            &projections,
-            cancel,
-            &mut payload_bytes_hashed,
-        )? {
-            let cache = reused_cache(
-                projections,
+        if let Ok(external_cache) = &external_cache {
+            if cache_is_complete(
                 external_cache,
-                source_bytes_hashed,
-                payload_bytes_hashed,
-            );
-            if let Some(key) = memo_key.as_ref() {
-                remember_validation(key, &cache)?;
+                &projections,
+                cancel,
+                &mut payload_bytes_hashed,
+            )? {
+                let cache = reused_cache(
+                    projections,
+                    external_cache.clone(),
+                    source_bytes_hashed,
+                    payload_bytes_hashed,
+                );
+                if let Some(key) = memo_key.as_ref() {
+                    remember_validation(key, &cache)?;
+                }
+                return Ok(cache);
             }
-            return Ok(cache);
         }
 
         // Prefer the historical model-adjacent location when it is writable. A caller-provisioned
@@ -514,14 +519,22 @@ impl PackedWeightSidecars {
         // tier's converted weights in anonymous memory.
         let (cache_dir, prepare_lock) = match open_writable_cache(&adjacent_cache) {
             Ok(lock) => (adjacent_cache, lock),
-            Err(adjacent_error) => match open_writable_cache(&external_cache) {
-                Ok(lock) => (external_cache, lock),
+            Err(adjacent_error) => match external_cache.and_then(|external_cache| {
+                open_writable_cache(&external_cache)
+                    .map(|lock| (external_cache.clone(), lock))
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!("{}: {error}", external_cache.display()),
+                        )
+                    })
+            }) {
+                Ok(selected) => selected,
                 Err(external_error) => {
                     return Err(Error::Msg(format!(
                         "device-format sidecar: neither model-adjacent cache {} ({adjacent_error}) \
-                         nor external cache {} ({external_error}) is writable",
+                         nor the external cache ({external_error}) is writable",
                         adjacent_cache.display(),
-                        external_cache.display()
                     )))
                 }
             },
@@ -907,45 +920,114 @@ fn open_writable_cache(cache_dir: &Path) -> std::io::Result<fs::File> {
         .open(cache_dir.join(PREPARE_LOCK))
 }
 
-fn external_cache_dir(component_dir: &Path, explicit_root: Option<&Path>) -> PathBuf {
-    let root = explicit_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_external_cache_root);
+fn external_cache_dir(
+    component_dir: &Path,
+    explicit_root: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    let root = match explicit_root {
+        Some(root) => root.to_path_buf(),
+        None => default_external_cache_root()?,
+    };
     let identity = fs::canonicalize(component_dir).unwrap_or_else(|_| component_dir.to_path_buf());
     let mut digest = Sha256::new();
     digest.update(b"sceneworks-candle-device-format-component-v1\0");
     digest.update(identity.to_string_lossy().as_bytes());
     let namespace = hex(&digest.finalize());
-    root.join("candle-device-format-v1").join(namespace)
+    Ok(root.join("candle-device-format-v1").join(namespace))
 }
 
-fn default_external_cache_root() -> PathBuf {
-    if let Some(root) =
-        std::env::var_os("SCENEWORKS_CANDLE_DEVICE_CACHE_DIR").filter(|root| !root.is_empty())
-    {
-        return PathBuf::from(root);
+/// The external cache root without an explicit one: the override, else the per-user cache, else a
+/// private temp-dir fallback ([`private_temp_cache_root`]).
+fn default_external_cache_root() -> std::io::Result<PathBuf> {
+    match per_user_cache_root() {
+        Some(root) => Ok(root),
+        None => private_temp_cache_root(&std::env::temp_dir()),
+    }
+}
+
+/// The default root's path without creating or vetting the temp fallback (a memo identity only).
+fn default_external_cache_root_path() -> PathBuf {
+    per_user_cache_root().unwrap_or_else(|| temp_cache_root_path(&std::env::temp_dir()))
+}
+
+fn per_user_cache_root() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os(CACHE_DIR_ENV).filter(|root| !root.is_empty()) {
+        return Some(PathBuf::from(root));
     }
     #[cfg(target_os = "windows")]
     if let Some(root) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(root).join("SceneWorks");
+        return Some(PathBuf::from(root).join("SceneWorks"));
     }
     #[cfg(target_os = "macos")]
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join("Library/Caches/SceneWorks");
+        return Some(PathBuf::from(home).join("Library/Caches/SceneWorks"));
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         if let Some(root) = std::env::var_os("XDG_CACHE_HOME") {
-            return PathBuf::from(root).join("sceneworks");
+            return Some(PathBuf::from(root).join("sceneworks"));
         }
         if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(".cache/sceneworks");
+            return Some(PathBuf::from(home).join(".cache/sceneworks"));
         }
     }
-    // Temp directories are user-scoped on supported Windows/macOS hosts and commonly so in
-    // containers. This last-resort cache is content-validated before every use; deployments that
-    // need a durable or policy-controlled location should set the documented override.
-    std::env::temp_dir().join("sceneworks-candle-cache")
+    None
+}
+
+/// The documented override of the external cache root.
+const CACHE_DIR_ENV: &str = "SCENEWORKS_CANDLE_DEVICE_CACHE_DIR";
+
+/// The last-resort cache root under `tmp`. On Unix the name carries the effective uid, so users
+/// sharing `/tmp` never share (or contend for) one cache.
+fn temp_cache_root_path(tmp: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid takes no arguments, has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        tmp.join(format!("sceneworks-candle-cache-{uid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        tmp.join("sceneworks-candle-cache")
+    }
+}
+
+/// The temp-dir fallback, created owner-only (0700) if missing (sc-27414). A shared `/tmp` lets
+/// another local user pre-create a predictable name to block writes or plant a self-consistent
+/// artifact, so on Unix an existing directory is used only if it is a real directory (not a
+/// symlink) owned by the effective uid with no group/other permission bits; otherwise this is an
+/// error naming [`CACHE_DIR_ENV`]. Windows/macOS temp directories are already per-user.
+#[cfg(unix)]
+fn private_temp_cache_root(tmp: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let root = temp_cache_root_path(tmp);
+    match fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = fs::symlink_metadata(&root)?;
+    // SAFETY: geteuid takes no arguments, has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "temp-dir cache fallback {} is not a private directory of uid {uid} (owner {}, \
+                 mode {:o}); set {CACHE_DIR_ENV} (or HOME / XDG_CACHE_HOME) to a per-user cache \
+                 directory",
+                root.display(),
+                metadata.uid(),
+                metadata.mode() & 0o7777
+            ),
+        ));
+    }
+    Ok(root)
+}
+
+#[cfg(not(unix))]
+fn private_temp_cache_root(tmp: &Path) -> std::io::Result<PathBuf> {
+    Ok(temp_cache_root_path(tmp))
 }
 
 fn file_identity(path: &Path) -> std::io::Result<Option<FileIdentity>> {
@@ -1059,7 +1141,7 @@ fn validation_memo_key(
     })?;
     let cache_identity = external_cache_root
         .map(Path::to_path_buf)
-        .unwrap_or_else(default_external_cache_root);
+        .unwrap_or_else(default_external_cache_root_path);
     let cache_identity = fs::canonicalize(&cache_identity).unwrap_or(cache_identity);
     Ok(ValidationMemoKey {
         component_dir,
@@ -1671,6 +1753,38 @@ mod tests {
         fn path(&self) -> &Path {
             self.0.path()
         }
+    }
+
+    /// sc-27414: the temp-dir fallback is uid-named and created owner-only; a pre-existing
+    /// directory another user could control (wrong mode, or a symlink) is refused with an error
+    /// naming the override instead of being used.
+    #[cfg(unix)]
+    #[test]
+    fn temp_fallback_cache_root_is_private_to_the_effective_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TestDir::new("temp-fallback");
+        let root = private_temp_cache_root(tmp.path()).unwrap();
+        assert_eq!(root, temp_cache_root_path(tmp.path()));
+        // SAFETY: geteuid takes no arguments, has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        assert!(root.ends_with(format!("sceneworks-candle-cache-{uid}")));
+        let mode = fs::metadata(&root).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "created owner-only, got {mode:o}");
+        // Reusing the private directory is fine.
+        assert_eq!(private_temp_cache_root(tmp.path()).unwrap(), root);
+
+        // A pre-created world-writable directory is refused, naming the override.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = private_temp_cache_root(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains(CACHE_DIR_ENV), "{err}");
+        fs::remove_dir(&root).unwrap();
+
+        // A symlink planted at the predictable name is refused even if it points somewhere private.
+        let target = tmp.path().join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        assert!(private_temp_cache_root(tmp.path()).is_err());
     }
 
     fn write_source(dir: &Path, bits: usize, delta: f32) -> Result<PathBuf> {
