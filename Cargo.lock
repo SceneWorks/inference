@@ -497,6 +497,7 @@ dependencies = [
  "fs2",
  "half",
  "image",
+ "libc",
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
