@@ -64,6 +64,9 @@ pub mod sampler;
 pub mod sc20686;
 pub mod scheduler;
 pub mod text_sample;
+// Shared test-only comparison helpers (sc-27323); opt-in via the `test-support` feature.
+#[cfg(feature = "test-support")]
+pub mod testing;
 // Native packed W4A8 (asym_w4a8_int8) projections (sc-26685): the descriptor-driven consume side of
 // the frozen Comfy Kitchen PR#90 dialect, sharing the S4 ConvRot activation kernels.
 pub mod w4a8_int8;

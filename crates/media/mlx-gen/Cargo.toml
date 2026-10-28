@@ -187,3 +187,6 @@ path = "tests/main.rs"
 
 [features]
 model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "mlx-llm/model-inference-proof"]
+# Shared test-only comparison helpers (`mlx_gen::testing`, sc-27323) for provider tests; enabled
+# through a provider dev-dependency, never by a runtime bundle.
+test-support = []
