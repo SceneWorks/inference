@@ -155,7 +155,7 @@ fn cold_second_load_token_embedding_incidence_probe() {
     let images: Vec<Image> = reference_images()
         .iter()
         .map(|i| {
-            normalize_reference_image(i, SPATIAL_STRIDE as i32, REFERENCE_IMAGE_SHORT_EDGE)
+            normalize_reference_image(i, SPATIAL_STRIDE as i32, REFERENCE_IMAGE_SHORT_EDGE as i32)
                 .expect("normalize")
         })
         .collect();
@@ -346,9 +346,12 @@ fn reference_partition_step_cost_against_base() {
         let per_image: Vec<i32> = reference_images()
             .iter()
             .map(|i| {
-                let n =
-                    normalize_reference_image(i, SPATIAL_STRIDE as i32, REFERENCE_IMAGE_SHORT_EDGE)
-                        .unwrap();
+                let n = normalize_reference_image(
+                    i,
+                    SPATIAL_STRIDE as i32,
+                    REFERENCE_IMAGE_SHORT_EDGE as i32,
+                )
+                .unwrap();
                 ((n.width / 32) * (n.height / 32)) as i32
             })
             .collect();

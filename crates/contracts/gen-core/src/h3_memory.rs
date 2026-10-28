@@ -684,6 +684,11 @@ pub const FFN_INTERMEDIATE_BUDGET: u64 = 1_000_000_000;
 pub const AUDIO_OUTPUT_CHANNELS: u16 = 2;
 pub const SPATIAL_STRIDE: u32 = 32;
 pub const CANVAS_MAX_PIXELS: u32 = 768 * 1344;
+/// The short edge a resolved MiniMax-H3 canvas is laid at before the [`CANVAS_MAX_PIXELS`] cap.
+pub const CANVAS_SHORT_EDGE: u32 = 768;
+/// MiniMax-H3's native frame rate: the output clock, and the rate every video reference is
+/// resampled onto.
+pub const MINIMAX_H3_FPS: f64 = 24.0;
 
 /// Shared H3 request laws used by both native geometry resolvers and allocation admission.
 /// Reject rather than rounding an unrenderable request into a smaller memory estimate.

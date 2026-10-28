@@ -1846,7 +1846,7 @@ pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2V
     if refs.is_empty() {
         return Ok(None);
     }
-    Ref2VaReferences::new(refs).map(Some)
+    Ok(Some(Ref2VaReferences::new(refs)?))
 }
 
 /// The request's effective reference-image short edge, **range-checked at the read** (sc-23402).
