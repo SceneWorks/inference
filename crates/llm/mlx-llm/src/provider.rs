@@ -34,7 +34,8 @@ use crate::decode::{
     NoProposer, PrefixCache, PrefixPrefill, PrefixStats, Proposer, Qwen35MtpMultimodalPrompt,
     RewindableConstraintMask, SpeculativePrompt, SpeculativeRun, SpeculativeTarget, StreamEvent,
 };
-use crate::image::Qwen35ImageProcessor;
+use crate::error::to_core;
+use crate::image::{Qwen35ImageProcessor, Qwen35Preprocess};
 use crate::models::gemma4_mm;
 use crate::models::{
     CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Cache, Qwen35Config, Qwen35Model,
@@ -596,7 +597,7 @@ impl Qwen35Vision {
             let (h, w) = self
                 .processor
                 .smart_resize(image.height as usize, image.width as usize)
-                .map_err(to_core)?;
+                .map_err(|e| to_core(e.into()))?;
             tokens = tokens
                 .checked_add((h / patch) * (w / patch) / (merge * merge))
                 .ok_or_else(|| {
@@ -619,7 +620,7 @@ impl Qwen35Vision {
                     self.processor.video_min_pixels,
                     self.processor.video_max_pixels,
                 )
-                .map_err(to_core)?;
+                .map_err(|e| to_core(e.into()))?;
             tokens = tokens
                 .checked_add(t * (h / patch) * (w / patch) / (merge * merge))
                 .ok_or_else(|| {
@@ -1860,7 +1861,7 @@ impl LlamaProvider {
         // Read config.json once to dispatch the architecture: the hybrid Qwen3.6 (`qwen3_5`) decoder
         // has its own config/weights path (and `ModelConfig` deliberately rejects it).
         let cfg_value = read_config_value(dir)?;
-        let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
+        let arch = Architecture::from_config(&cfg_value).map_err(|e| to_core(e.into()))?;
         let text_config = cfg_value.get("text_config").unwrap_or(&cfg_value);
         let architecture_name = text_config
             .get("architectures")
@@ -2322,7 +2323,7 @@ impl LlamaProvider {
                     th,
                     tw,
                 )
-                .map_err(to_core)?;
+                .map_err(|e| to_core(e.into()))?;
                 let flat =
                     gemma4_mm::patchify(&resized, tw, th, vcfg.patch_pixels).map_err(to_core)?;
                 let patches = gemma4_mm::patch_array(&flat, vcfg.patch_elems()).map_err(to_core)?;
@@ -3254,7 +3255,7 @@ impl LlamaProvider {
                 let req = &reqs[*i];
                 crate::decode::BatchRequest {
                     prompt_ids: prompt_ids.clone(),
-                    sampling: map_sampling(&req.sampling),
+                    sampling: SamplingParams::from(&req.sampling),
                     seed: req.seed,
                     max_new_tokens: req.max_new_tokens as usize,
                     stop_tokens: self.stop_tokens.clone(),
@@ -4056,7 +4057,7 @@ impl LlamaProvider {
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
-            sampling: map_sampling(&req.sampling),
+            sampling: SamplingParams::from(&req.sampling),
             seed: req.seed,
             stop_tokens: self.stop_tokens.clone(),
         };
@@ -5273,19 +5274,6 @@ fn parse_token_ids(v: Option<&serde_json::Value>) -> Option<Vec<i32>> {
     (!ids.is_empty()).then_some(ids)
 }
 
-fn map_sampling(s: &Sampling) -> SamplingParams {
-    SamplingParams {
-        temperature: s.temperature,
-        top_p: s.top_p,
-        top_k: s.top_k,
-        presence_penalty: s.presence_penalty,
-        presence_penalty_generated_only: s.presence_penalty_generated_only,
-        presence_penalty_prompt_len: 0,
-        repetition_penalty: s.repetition_penalty,
-        repetition_context: s.repetition_context,
-    }
-}
-
 #[derive(Clone, Copy)]
 enum MlxWorkspaceContract<'a> {
     Eager,
@@ -5844,20 +5832,6 @@ fn map_finish(f: FinishReason) -> CoreFinish {
         FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
         FinishReason::MaxTokens => CoreFinish::Length,
         FinishReason::Cancelled => CoreFinish::Cancelled,
-    }
-}
-
-/// Bridge an engine error into the contract error, preserving the typed cancellation / capability
-/// variants (do not stringify those).
-fn to_core(e: crate::Error) -> CoreError {
-    match e {
-        crate::Error::Canceled => CoreError::Canceled,
-        crate::Error::Unsupported(m) => CoreError::Unsupported(m),
-        crate::Error::MissingTensor(m) => CoreError::Load(format!("missing tensor: {m}")),
-        crate::Error::Config(m) => CoreError::Load(m),
-        crate::Error::ResourceExhausted(evidence) => CoreError::RequestResourceExhausted(evidence),
-        crate::Error::Io(e) => CoreError::Io(e),
-        other => CoreError::backend(other),
     }
 }
 

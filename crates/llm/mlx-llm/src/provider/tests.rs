@@ -1095,7 +1095,7 @@ fn plain_loop(provider: &LlamaProvider, req: &TextLlmRequest) -> Vec<u32> {
         .collect();
     let config = GenerationConfig {
         max_new_tokens: req.max_new_tokens as usize,
-        sampling: map_sampling(&req.sampling),
+        sampling: SamplingParams::from(&req.sampling),
         seed: req.seed,
         stop_tokens: provider.stop_tokens.clone(),
     };

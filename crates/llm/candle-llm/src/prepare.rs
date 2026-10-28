@@ -59,12 +59,12 @@ use core_llm::{
 };
 
 use crate::config::{Architecture, ModelConfig};
+use crate::error::to_core;
 use crate::error::{Error, Result};
 use crate::gguf::GgufCheckpoint;
 use crate::models::{llama, qwen35, Qwen35Config};
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::Weights;
-use crate::provider::to_core;
 
 /// The backend tag this preparer registers under (matches the provider's `backend` field).
 const BACKEND: &str = "candle";

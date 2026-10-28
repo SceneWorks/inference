@@ -165,6 +165,24 @@ impl SamplingParams {
     }
 }
 
+/// The contract's sampling knobs as the sampler's — the one mapping every provider uses
+/// (sc-27398), the inverse of [`SamplingParams::to_core`]. `presence_penalty_prompt_len` starts at
+/// `0`: it is request-local and the decode engine resets it after prefill.
+impl From<&core_llm::Sampling> for SamplingParams {
+    fn from(s: &core_llm::Sampling) -> Self {
+        Self {
+            temperature: s.temperature,
+            top_p: s.top_p,
+            top_k: s.top_k,
+            presence_penalty: s.presence_penalty,
+            presence_penalty_generated_only: s.presence_penalty_generated_only,
+            presence_penalty_prompt_len: 0,
+            repetition_penalty: s.repetition_penalty,
+            repetition_context: s.repetition_context,
+        }
+    }
+}
+
 /// The largest vocabulary the device sampler serves: its fixed-point weight sums (`w * 2^40`) stay
 /// below `2^63` up to `2^23` tokens.
 pub const DEVICE_SAMPLER_MAX_VOCAB: usize = 1 << 23;
@@ -1016,6 +1034,26 @@ mod tests {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^= z >> 31;
         ((z >> 40) as f32) / ((1u64 << 24) as f32)
+    }
+
+    /// sc-27398: the contract mapping is the exact inverse of `to_core` for a prompt-free lane.
+    #[test]
+    fn contract_sampling_round_trips() {
+        let params = SamplingParams {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            repetition_penalty: 1.1,
+            repetition_context: 64,
+            presence_penalty: 1.5,
+            presence_penalty_generated_only: true,
+            presence_penalty_prompt_len: 0,
+        };
+        assert_eq!(SamplingParams::from(&params.to_core()), params);
+        assert_eq!(
+            SamplingParams::from(&params.for_prompt(9).to_core()).presence_penalty_prompt_len,
+            0
+        );
     }
 
     #[test]
