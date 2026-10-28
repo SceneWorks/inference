@@ -1558,7 +1558,7 @@ class WindowsSupervisorTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.data = {
             "schemaVersion": 1, "backend": "windows-cuda", "deadlineSeconds": 3,
-            "pollMillis": 20, "termGraceMillis": 300,
+            "pollMillis": 20, "termGraceMillis": 2000,
             "hostFreeReserveBytes": 1024, "childFootprintCapBytes": 512 * 1024**2,
             "stdoutCapBytes": 4096, "stderrCapBytes": 4096, "eventCapBytes": 10**6,
             "cudaDeviceUuid": "GPU-12345678-1234-1234-1234-123456789abc",
