@@ -36,7 +36,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_audio::candle_core::{DType, Device, Tensor};
-use candle_audio_yue2::inventory;
 use candle_audio_yue2::nar::{
     synthesize, Evaluation, NarOptions, QueryTile, SongNoise, SynthesisHooks, SynthesisObserver,
     SynthesisRequest, Yue2Nar,
@@ -66,15 +65,7 @@ fn hub() -> SnapshotDirs {
             "real-weight test run without YUE2_HF_HUB (a hub directory holding the pinned repos)"
         )
     }));
-    inventory::REPOS
-        .iter()
-        .fold(SnapshotDirs::new(), |dirs, repo| {
-            let dir = hub
-                .join(format!("models--{}", repo.id.replace('/', "--")))
-                .join("snapshots")
-                .join(repo.revision);
-            dirs.with(repo.id, dir)
-        })
+    SnapshotDirs::from_hub_layout(&hub)
 }
 
 fn meta() -> Value {

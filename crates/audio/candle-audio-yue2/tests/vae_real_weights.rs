@@ -38,7 +38,7 @@ use std::time::Instant;
 
 use candle_audio::candle_core::{Device, Tensor};
 use candle_audio_yue2::decode::{decode_latents, DecodeMode, DecodeOptions, DecodedAudio};
-use candle_audio_yue2::inventory::{self, ComponentId};
+use candle_audio_yue2::inventory::ComponentId;
 use candle_audio_yue2::latent::{AcousticLatents, LatentSource};
 use candle_audio_yue2::snapshot::resolve_component;
 use candle_audio_yue2::vae::{VaeParts, Yue2Vae};
@@ -72,15 +72,7 @@ fn hub() -> SnapshotDirs {
             "real-weight test run without YUE2_HF_HUB (a hub directory holding the pinned repos)"
         )
     }));
-    inventory::REPOS
-        .iter()
-        .fold(SnapshotDirs::new(), |dirs, repo| {
-            let dir = hub
-                .join(format!("models--{}", repo.id.replace('/', "--")))
-                .join("snapshots")
-                .join(repo.revision);
-            dirs.with(repo.id, dir)
-        })
+    SnapshotDirs::from_hub_layout(&hub)
 }
 
 fn meta() -> Value {

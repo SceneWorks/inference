@@ -30,10 +30,8 @@
 //!
 //! [`StubVocoder`] stays as the end-to-end seam test's weights-free double.
 
-use std::collections::HashMap;
 use std::path::Path;
 
-use candle_audio::candle_core::safetensors::MmapedSafetensors;
 use candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio::gen_core::{self, CancelFlag};
 use candle_audio::vocos::{Vocos, VocosConfig};
@@ -178,18 +176,10 @@ impl VocosUpsampler {
 /// widths read from the tensors and the hop fixed at [`SAMPLES_PER_FRAME`].
 pub fn load_decoder(checkpoint: &Path, device: &Device) -> Result<Vocos, AudioError> {
     let err = |m: String| AudioError::Msg(format!("vocos {}: {m}", checkpoint.display()));
-    // SAFETY: the checkpoint is a caller-staged, read-only weight file; nothing in this process
-    // writes it while the map is alive (the contract every candle mmap loader relies on).
-    let st =
-        unsafe { MmapedSafetensors::new(checkpoint) }.map_err(|e| err(format!("open: {e}")))?;
-    let mut tensors = HashMap::new();
-    for (name, _) in st.tensors() {
-        let t = st
-            .load(&name, device)
-            .and_then(|t| t.to_dtype(DType::F32))
-            .map_err(|e| err(format!("tensor {name:?}: {e}")))?;
-        tensors.insert(name, t);
-    }
+    let st = candle_audio::weights::mmap_safetensors(checkpoint)
+        .map_err(|e| err(format!("open: {e}")))?;
+    let tensors = candle_audio::weights::load_f32_map(&st, device, |_| true)
+        .map_err(|e| err(e.to_string()))?;
     let get = |name: &str| {
         tensors
             .get(name)
@@ -285,6 +275,7 @@ impl Vocoder for StubVocoder {
 mod tests {
     use super::*;
     use candle_audio::candle_core::safetensors::save;
+    use std::collections::HashMap;
 
     /// Tiny synthetic widths with the production transform (n_fft 3528, hop 882) — the loader
     /// reads widths from the tensors, so a small checkpoint exercises the real load + decode path.

@@ -66,7 +66,7 @@ use crate::engine::{
 };
 use crate::evidence;
 use crate::fp8::ArPrecision;
-use crate::inventory::{self, ComponentId, VaeVariant};
+use crate::inventory::{ComponentId, VaeVariant};
 use crate::plan::{PlanStep, SymbolicPlan};
 use crate::precision::Tier;
 use crate::protocol::{GenerationConfig, Sampling, SongRequest};
@@ -79,15 +79,7 @@ fn env(name: &str) -> Option<String> {
 
 fn hub() -> SnapshotDirs {
     let hub = PathBuf::from(env("YUE2_HF_HUB").expect("YUE2_HF_HUB (a hub holding the pins)"));
-    inventory::REPOS
-        .iter()
-        .fold(SnapshotDirs::new(), |dirs, repo| {
-            let dir = hub
-                .join(format!("models--{}", repo.id.replace('/', "--")))
-                .join("snapshots")
-                .join(repo.revision);
-            dirs.with(repo.id, dir)
-        })
+    SnapshotDirs::from_hub_layout(&hub)
 }
 
 fn out_dir() -> PathBuf {

@@ -4,6 +4,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -26,30 +27,14 @@ use candle_audio_stable_audio_3::sampler::{
     SamplerKind, Schedule, SeededNoise,
 };
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
-use candle_nn::VarBuilder;
 
-/// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
-/// `chunked_oracle.rs`.
-///
-/// The three real-weight cases below each branched on `SA3_TEST_METAL` alone, so on the CUDA lanes
-/// — which set `SA3_TEST_CUDA` — they silently executed on `Device::Cpu`. A requested backend that
-/// is unavailable is a hard failure, never a fallback.
-fn test_device() -> Device {
-    if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
-        #[cfg(feature = "cuda")]
-        {
-            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            panic!("SA3_TEST_CUDA requires --features cuda")
-        }
-    } else {
-        Device::Cpu
-    }
-}
+// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
+// `chunked_oracle.rs`.
+//
+// The three real-weight cases below each branched on `SA3_TEST_METAL` alone, so on the CUDA lanes
+// — which set `SA3_TEST_CUDA` — they silently executed on `Device::Cpu`. A requested backend that
+// is unavailable is a hard failure, never a fallback.
+use common::test_device;
 
 fn values(tensor: &Tensor) -> Vec<f32> {
     tensor
@@ -850,11 +835,7 @@ const REAL_CASES: &[RealCase] = &[
     },
 ];
 
-fn snapshot(name: &str) -> PathBuf {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("{name} must point to its pinned immutable snapshot"))
-}
+use common::snapshot_dir as snapshot;
 
 fn cosine(actual: &Tensor, expected: &Tensor) -> f64 {
     let actual = values(actual);
@@ -910,9 +891,7 @@ fn all_six_real_p0_pingpong_trajectories_match_stepwise() {
         let artifact = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../docs/migration/sa3-reference")
             .join(case.artifact);
-        let oracle = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[artifact], DType::F32, &device).unwrap()
-        };
+        let oracle = common::mmap_f32(&[artifact], &device);
         let get = |name: &str| oracle.get_unchecked(name).unwrap();
         let initial = get("sampler_initial_noise");
         let prompt = get("t5_projected_padded");
@@ -1004,9 +983,7 @@ fn real_sampler_cfg_apg_scale_phi_matches_frozen_upstream() {
     let device = test_device();
     let guidance_artifact = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../docs/migration/sa3-sampler-reference/guidance.safetensors");
-    let guidance_oracle = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[guidance_artifact], DType::F32, &device).unwrap()
-    };
+    let guidance_oracle = common::mmap_f32(&[guidance_artifact], &device);
     for (case, oracle_prefix) in [
         (&REAL_CASES[0], "small-music"),
         (&REAL_CASES[2], "small-music-base"),
@@ -1016,9 +993,7 @@ fn real_sampler_cfg_apg_scale_phi_matches_frozen_upstream() {
         let p0_artifact = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../docs/migration/sa3-reference")
             .join(case.artifact);
-        let oracle = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[p0_artifact], DType::F32, &device).unwrap()
-        };
+        let oracle = common::mmap_f32(&[p0_artifact], &device);
         let initial = oracle.get_unchecked("sampler_initial_noise").unwrap();
         let prompt = oracle.get_unchecked("t5_projected_padded").unwrap();
         let seconds = Tensor::from_vec(vec![0.25f32], 1, &device).unwrap();
@@ -1133,8 +1108,7 @@ fn real_default_sampler_resource_probe() {
     )
     .unwrap();
     let model = StableAudio3Dit::from_layout(&layout, &device).unwrap();
-    let p0 =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[p0_path], DType::F32, &device).unwrap() };
+    let p0 = common::mmap_f32(&[p0_path], &device);
     let prompt = p0.get_unchecked("t5_projected_padded").unwrap();
     let initial = Tensor::zeros((1, 256, geometry.latent_length), DType::F32, &device).unwrap();
     let local = Tensor::zeros((1, 257, geometry.latent_length), DType::F32, &device).unwrap();

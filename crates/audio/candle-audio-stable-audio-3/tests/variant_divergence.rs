@@ -15,6 +15,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -70,45 +71,25 @@ const SEEDS: &[u64] = &[14_544, 7, 2_026];
 const MAX_RUNTIME_COSINE: f64 = 0.15;
 const MIN_RUNTIME_RMS_DELTA: f64 = 0.9;
 
-fn snapshot(env: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var(env).unwrap_or_else(|_| panic!("set {env} to the pinned immutable snapshot")),
-    )
-}
+use common::snapshot_dir as snapshot;
 
-/// The crate's three-way real-weight device selector, identical to `same_oracle.rs`,
-/// `chunked_oracle.rs`, `sampler_oracle.rs`, `dit_oracle.rs` and `base_guidance.rs`.
-///
-/// This target is run whole (`--test variant_divergence`) by `sa3-small-sfx-metal`, which sets
-/// `SA3_TEST_METAL`, **and** by `sa3-small-sfx-cuda`, which sets `SA3_TEST_CUDA`. Its runtime half
-/// drives `provider_registry().load(…)`, which resolves through `candle_audio::default_device()`
-/// and therefore already ran on the lane's accelerator; the single-step DiT half hardcoded
-/// `Device::Cpu` and so certified neither lane's backend while still spending both lanes' time.
-/// A requested backend that is unavailable is a hard failure, never a fallback.
-fn test_device() -> Device {
-    if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
-        #[cfg(feature = "cuda")]
-        {
-            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            panic!("SA3_TEST_CUDA requires --features cuda")
-        }
-    } else {
-        Device::Cpu
-    }
-}
+// The crate's three-way real-weight device selector, identical to `same_oracle.rs`,
+// `chunked_oracle.rs`, `sampler_oracle.rs`, `dit_oracle.rs` and `base_guidance.rs`.
+//
+// This target is run whole (`--test variant_divergence`) by `sa3-small-sfx-metal`, which sets
+// `SA3_TEST_METAL`, **and** by `sa3-small-sfx-cuda`, which sets `SA3_TEST_CUDA`. Its runtime half
+// drives `provider_registry().load(…)`, which resolves through `candle_audio::default_device()`
+// and therefore already ran on the lane's accelerator; the single-step DiT half hardcoded
+// `Device::Cpu` and so certified neither lane's backend while still spending both lanes' time.
+// A requested backend that is unavailable is a hard failure, never a fallback.
+use common::test_device;
 
 fn reference_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/migration/sa3-reference")
 }
 
 fn reference(artifact: &str) -> MmapedSafetensors {
-    // Safety: the sc-14534 artifacts are committed, immutable, and hash-pinned by their manifest.
-    unsafe { MmapedSafetensors::new(reference_dir().join(artifact)).unwrap() }
+    common::mmap_artifact(reference_dir().join(artifact))
 }
 
 fn values(tensor: &Tensor) -> Vec<f32> {

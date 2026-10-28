@@ -50,6 +50,7 @@ use candle_audio::gen_core;
 use candle_llm::primitives::{
     apply_rope, embed, sdpa_gqa, swiglu, AttnMask, KvCache, Rope, StaticKvCache,
 };
+#[cfg(test)]
 use candle_nn::VarBuilder;
 use serde_json::Value;
 
@@ -244,9 +245,9 @@ pub(crate) fn open_verified(
         config_path,
         |__model_input_path| std::fs::read_to_string(__model_input_path)
     )?;
-    // SAFETY: the file is the snapshot's verified weights file, opened read-only; the mapping
-    // lives only for the duration of the caller's load (every tensor is copied out in `dtype`).
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device) }
+    // The snapshot's verified weights file; the mapping lives only for the duration of the
+    // caller's load (every tensor is copied out in `dtype`).
+    let vb = candle_audio::weights::mmap_var_builder(&[weights], dtype, device)
         .map_err(backend("open weights"))?;
     Ok(VerifiedLmFiles {
         config_json,
@@ -292,10 +293,9 @@ pub(crate) fn open_tier(
         verified.config_path(),
         |__model_input_path| std::fs::read_to_string(__model_input_path)
     )?;
-    // SAFETY: the verified tier weights file, opened read-only; every tensor is copied out.
-    let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[verified.weights_path()], dtype, device) }
-            .map_err(backend("open tier weights"))?;
+    // The verified tier weights file; every tensor is copied out.
+    let vb = candle_audio::weights::mmap_var_builder(&[verified.weights_path()], dtype, device)
+        .map_err(backend("open tier weights"))?;
     let storage: BTreeMap<String, Storage> = verified.storage_map();
     Ok(VerifiedLmFiles {
         config_json,

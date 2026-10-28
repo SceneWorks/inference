@@ -25,6 +25,9 @@ candle-nn = { workspace = true }
 thiserror = { workspace = true }
 # Repeatability hash over generated PCM bytes for the validation harness (`harness`, sc-12854).
 sha2 = { workspace = true }
+# The one bounded safetensors header reader (`weights::read_safetensors_header`, sc-27343) and the
+# shared `config.json` snapshot probe (`prepare`, sc-27265). Already in every audio provider's graph.
+serde_json = { workspace = true }
 
 # Peak-RSS process metric for the validation harness (`harness`, sc-12854):
 # `getrusage(RUSAGE_SELF).ru_maxrss` on macOS/Linux. Non-unix targets report `None`.

@@ -510,10 +510,11 @@ impl Flow {
             )));
         }
         let device = candle_audio::default_device()?;
-        // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the shared idiom.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&path), DType::F32, &device)?
-        };
+        let vb = candle_audio::weights::mmap_var_builder(
+            std::slice::from_ref(&path),
+            DType::F32,
+            &device,
+        )?;
         Ok(Self::new(&S3GenConfig::DEFAULT, vb.pp("flow"), device)?)
     }
 

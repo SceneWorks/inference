@@ -273,47 +273,78 @@ fn lane_backend() -> &'static str {
     AUDIO_BACKEND
 }
 
+/// One audio snapshot-preparer accommodation: its weightless probe and its prepare entry point.
+type AudioPreparer = (
+    fn(&core_llm::PrepareSpec) -> bool,
+    fn(&core_llm::PrepareSpec) -> core_llm::Result<core_llm::PrepareReport>,
+);
+
+/// The audio-lane preparers in probe order (sc-27359): the single list both [`lane_can_prepare`]
+/// and [`lane_prepare`] consult, so a provider cannot be added to one and silently fall through to
+/// the `candle-llm` preparer in the other. The first matching probe wins.
+const AUDIO_PREPARERS: &[AudioPreparer] = &[
+    (
+        candle_audio_kokoro::prepare::can_prepare,
+        candle_audio_kokoro::prepare::prepare,
+    ),
+    (
+        candle_audio_moss_sfx::prepare::can_prepare,
+        candle_audio_moss_sfx::prepare::prepare,
+    ),
+    (
+        candle_audio_acestep::prepare::can_prepare,
+        candle_audio_acestep::prepare::prepare,
+    ),
+    (
+        candle_audio_stable_audio_3::prepare::can_prepare,
+        candle_audio_stable_audio_3::prepare::prepare,
+    ),
+    (
+        candle_audio_moss_tts_realtime::prepare::can_prepare,
+        candle_audio_moss_tts_realtime::prepare::prepare,
+    ),
+    (
+        candle_audio_moss_tts::prepare::can_prepare,
+        candle_audio_moss_tts::prepare::prepare,
+    ),
+    (
+        candle_audio_chatterbox::prepare::can_prepare,
+        candle_audio_chatterbox::prepare::prepare,
+    ),
+    (
+        candle_audio_openvoice::prepare::can_prepare,
+        candle_audio_openvoice::prepare::prepare,
+    ),
+    (
+        candle_audio_whisper::prepare::can_prepare,
+        candle_audio_whisper::prepare::prepare,
+    ),
+    (
+        candle_audio_clap::prepare::can_prepare,
+        candle_audio_clap::prepare::prepare,
+    ),
+    // YuE2's q8 / q4 tiers are derived locally from the verified original (sc-22995).
+    (
+        candle_audio_yue2::prepare::can_prepare,
+        candle_audio_yue2::prepare::prepare,
+    ),
+];
+
+/// The first audio preparer whose probe accepts `spec` — each probe runs at most once.
+fn audio_preparer_for(spec: &core_llm::PrepareSpec) -> Option<&'static AudioPreparer> {
+    AUDIO_PREPARERS
+        .iter()
+        .find(|(can_prepare, _)| can_prepare(spec))
+}
+
 fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
-    candle_audio_kokoro::prepare::can_prepare(spec)
-        || candle_audio_moss_sfx::prepare::can_prepare(spec)
-        || candle_audio_acestep::prepare::can_prepare(spec)
-        || candle_audio_stable_audio_3::prepare::can_prepare(spec)
-        || candle_audio_moss_tts_realtime::prepare::can_prepare(spec)
-        || candle_audio_moss_tts::prepare::can_prepare(spec)
-        || candle_audio_chatterbox::prepare::can_prepare(spec)
-        || candle_audio_openvoice::prepare::can_prepare(spec)
-        || candle_audio_whisper::prepare::can_prepare(spec)
-        || candle_audio_clap::prepare::can_prepare(spec)
-        || candle_audio_yue2::prepare::can_prepare(spec)
-        || (candle_llm::prepare::REGISTRATION.can_prepare)(spec)
+    audio_preparer_for(spec).is_some() || (candle_llm::prepare::REGISTRATION.can_prepare)(spec)
 }
 
 fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::PrepareReport> {
-    if candle_audio_kokoro::prepare::can_prepare(spec) {
-        candle_audio_kokoro::prepare::prepare(spec)
-    } else if candle_audio_moss_sfx::prepare::can_prepare(spec) {
-        candle_audio_moss_sfx::prepare::prepare(spec)
-    } else if candle_audio_acestep::prepare::can_prepare(spec) {
-        candle_audio_acestep::prepare::prepare(spec)
-    } else if candle_audio_stable_audio_3::prepare::can_prepare(spec) {
-        candle_audio_stable_audio_3::prepare::prepare(spec)
-    } else if candle_audio_moss_tts_realtime::prepare::can_prepare(spec) {
-        candle_audio_moss_tts_realtime::prepare::prepare(spec)
-    } else if candle_audio_moss_tts::prepare::can_prepare(spec) {
-        candle_audio_moss_tts::prepare::prepare(spec)
-    } else if candle_audio_chatterbox::prepare::can_prepare(spec) {
-        candle_audio_chatterbox::prepare::prepare(spec)
-    } else if candle_audio_openvoice::prepare::can_prepare(spec) {
-        candle_audio_openvoice::prepare::prepare(spec)
-    } else if candle_audio_whisper::prepare::can_prepare(spec) {
-        candle_audio_whisper::prepare::prepare(spec)
-    } else if candle_audio_clap::prepare::can_prepare(spec) {
-        candle_audio_clap::prepare::prepare(spec)
-    } else if candle_audio_yue2::prepare::can_prepare(spec) {
-        // YuE2's q8 / q4 tiers are derived locally from the verified original (sc-22995).
-        candle_audio_yue2::prepare::prepare(spec)
-    } else {
-        (candle_llm::prepare::REGISTRATION.prepare)(spec)
+    match audio_preparer_for(spec) {
+        Some((_, prepare)) => prepare(spec),
+        None => (candle_llm::prepare::REGISTRATION.prepare)(spec),
     }
 }
 
@@ -1542,6 +1573,29 @@ mod tests {
         let empty = empty_tmp.path().to_path_buf();
         let spec = super::core_llm::PrepareSpec::dense(&empty, empty.join("out"));
         assert!(!(regs[0].can_prepare)(&spec));
+    }
+
+    /// The lane's preparer table must name every audio provider crate that ships a `prepare`
+    /// module (sc-27359): a provider missing from it would silently fall through to the
+    /// `candle-llm` preparer. The shared `candle-audio` helper module is not a provider.
+    #[test]
+    fn audio_preparer_table_covers_every_provider_prepare_module() {
+        let audio_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let mut with_prepare: Vec<String> = std::fs::read_dir(audio_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.join("src/prepare.rs").is_file())
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .filter(|name| name.starts_with("candle-audio-"))
+            .collect();
+        with_prepare.sort();
+        assert_eq!(
+            super::AUDIO_PREPARERS.len(),
+            with_prepare.len(),
+            "AUDIO_PREPARERS is out of step with the provider prepare modules {with_prepare:?}"
+        );
     }
 
     fn assert_sa3_snapshot_prepares(env: &str) {

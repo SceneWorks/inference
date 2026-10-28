@@ -39,7 +39,6 @@ use candle_audio::gen_core::{
     ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Progress, VoiceEmbedder, WeightsSource,
 };
-use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -390,17 +389,14 @@ impl ChatterboxGenerator {
                 )));
             }
             let device = candle_audio::default_device()?;
-            // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the shared idiom.
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    std::slice::from_ref(&path),
-                    DType::F32,
-                    &device,
-                )
-                .map_err(|e| {
-                    gen_core::Error::Msg(format!("{MODEL_ID}: load {T3_WEIGHTS_FILE}: {e}"))
-                })?
-            };
+            let vb = candle_audio::weights::mmap_var_builder(
+                std::slice::from_ref(&path),
+                DType::F32,
+                &device,
+            )
+            .map_err(|e| {
+                gen_core::Error::Msg(format!("{MODEL_ID}: load {T3_WEIGHTS_FILE}: {e}"))
+            })?;
             let t3 = T3::new(&self.t3_config, vb)
                 .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: build T3: {e}")))?;
             *guard = Some(t3);

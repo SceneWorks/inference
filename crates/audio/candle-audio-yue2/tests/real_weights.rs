@@ -30,15 +30,7 @@ fn hub() -> SnapshotDirs {
             "real-weight test run without YUE2_HF_HUB (a hub directory holding the pinned repos)"
         )
     }));
-    inventory::REPOS
-        .iter()
-        .fold(SnapshotDirs::new(), |dirs, repo| {
-            let dir = hub
-                .join(format!("models--{}", repo.id.replace('/', "--")))
-                .join("snapshots")
-                .join(repo.revision);
-            dirs.with(repo.id, dir)
-        })
+    SnapshotDirs::from_hub_layout(&hub)
 }
 
 /// Every closure resolves offline and verifies through the production entry point, and the

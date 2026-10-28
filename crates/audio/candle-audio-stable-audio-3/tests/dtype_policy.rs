@@ -47,13 +47,12 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
     );
 };
-
-use std::path::PathBuf;
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device};
 use candle_audio_stable_audio_3::gen_core::WeightsSource;
@@ -156,11 +155,7 @@ const COMMITTED_F16_ENVELOPE: [Character; 2] = [
     },
 ];
 
-fn snapshot(env: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var(env).unwrap_or_else(|_| panic!("set {env} to the pinned immutable snapshot")),
-    )
-}
+use common::snapshot_dir as snapshot;
 
 fn device() -> Device {
     #[cfg(feature = "metal")]

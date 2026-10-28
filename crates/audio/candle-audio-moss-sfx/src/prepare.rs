@@ -14,10 +14,11 @@
 use std::path::Path;
 
 use candle_audio::candle_core::pickle::read_pth_tensor_info;
-use candle_audio::gen_core::safetensors_shards::{
-    resolve_safetensors_shards, snapshot_shard_roots,
+use candle_audio::prepare::{
+    component_tensor_count, json_str_is, passthrough_report, probe_json_config,
+    safetensors_tensor_count,
 };
-use core_llm::{Error as CoreError, ModelFormat, PrepareReport, PrepareSpec, Result as CoreResult};
+use core_llm::{Error as CoreError, PrepareReport, PrepareSpec, Result as CoreResult};
 
 /// Relative path of the DiT checkpoint inside a snapshot.
 pub const DIT_WEIGHTS: &str = "transformer/diffusion_pytorch_model.safetensors";
@@ -26,20 +27,9 @@ pub const DIT_WEIGHTS: &str = "transformer/diffusion_pytorch_model.safetensors";
 /// `MossSoundEffectPipeline` + the DiT safetensors)? Reads only `model_index.json`, never a
 /// weight shard.
 pub fn is_moss_sfx_snapshot(dir: &Path) -> bool {
-    if !dir.is_dir() || !dir.join(DIT_WEIGHTS).is_file() {
-        return false;
-    }
-    let Ok(text) = std::fs::read_to_string(dir.join("model_index.json")) else {
-        return false;
-    };
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| {
-            v.get("_class_name")
-                .and_then(|c| c.as_str())
-                .map(|c| c == "MossSoundEffectPipeline")
-        })
-        .unwrap_or(false)
+    probe_json_config(dir, DIT_WEIGHTS, "model_index.json", |v| {
+        json_str_is(v, "_class_name", "MossSoundEffectPipeline")
+    })
 }
 
 /// [`is_moss_sfx_snapshot`] over a [`PrepareSpec`] — the probe the composed audio-lane
@@ -48,69 +38,25 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
     is_moss_sfx_snapshot(&spec.source)
 }
 
-/// Count the tensors of one safetensors file from its header only (8-byte little-endian length
-/// + JSON; the `__metadata__` entry is not a tensor). No tensor storage is read.
-fn safetensors_tensor_count(path: &Path) -> CoreResult<usize> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| CoreError::Msg(format!("prepare: read {}: {e}", path.display())))?;
-    if bytes.len() < 8 {
-        return Err(CoreError::Msg(format!(
-            "prepare: {} is not a safetensors file (short header)",
-            path.display()
-        )));
-    }
-    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-    let header = bytes.get(8..8 + n).ok_or_else(|| {
-        CoreError::Msg(format!(
-            "prepare: {} safetensors header truncated",
-            path.display()
-        ))
-    })?;
-    let v: serde_json::Value = serde_json::from_slice(header)
-        .map_err(|e| CoreError::Msg(format!("prepare: {} header: {e}", path.display())))?;
-    let obj = v.as_object().ok_or_else(|| {
-        CoreError::Msg(format!(
-            "prepare: {} header is not a JSON object",
-            path.display()
-        ))
-    })?;
-    Ok(obj.keys().filter(|k| *k != "__metadata__").count())
-}
-
-fn text_encoder_tensor_count(dir: &Path) -> CoreResult<usize> {
-    let roots = snapshot_shard_roots(dir).map_err(|e| CoreError::Msg(e.to_string()))?;
-    let shards = resolve_safetensors_shards(dir, "model", &roots)
-        .map_err(|e| CoreError::Msg(e.to_string()))?;
-    shards
-        .iter()
-        .map(|shard| safetensors_tensor_count(shard))
-        .sum()
-}
-
 /// Prepare (verify + passthrough) a MOSS-SoundEffect snapshot. Counts the DiT and text-encoder
 /// safetensors tensors from their headers and the VAE checkpoint's tensors from pickle
 /// metadata (no storage reads) so the report is honest about what the snapshot holds.
 pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
-    if !is_moss_sfx_snapshot(&spec.source) {
-        return Err(CoreError::Unsupported(format!(
-            "prepare: {} is not a MOSS-SoundEffect audio snapshot",
-            spec.source.display()
-        )));
-    }
-    if let Some(q) = spec.quantize {
-        return Err(CoreError::Unsupported(format!(
-            "prepare: MOSS-SoundEffect snapshots have no {q:?} form — the pinned checkpoint \
-             ships dense-only"
-        )));
-    }
-    let mut num_tensors = safetensors_tensor_count(&spec.source.join(DIT_WEIGHTS))?;
+    passthrough_report(spec, "MOSS-SoundEffect", is_moss_sfx_snapshot, |source| {
+        let mut num_tensors = safetensors_tensor_count(&source.join(DIT_WEIGHTS))?;
 
-    // Resolve the full text-encoder set before reading any shard headers.
-    num_tensors += text_encoder_tensor_count(&spec.source.join("text_encoder"))?;
+        // Resolve the full text-encoder set before reading any shard headers.
+        num_tensors += component_tensor_count(&source.join("text_encoder"), "model")?;
 
-    // The VAE torch checkpoint (state_dict section, metadata only).
-    let vae = spec.source.join("vae").join(crate::vae::VAE_FILE);
-    if vae.is_file() {
+        // The VAE torch checkpoint (state_dict section, metadata only).
+        let vae = source.join("vae").join(crate::vae::VAE_FILE);
+        if !vae.is_file() {
+            return Err(CoreError::Msg(format!(
+                "prepare: {} is missing the VAE checkpoint {}",
+                source.display(),
+                crate::vae::VAE_FILE
+            )));
+        }
         let infos = read_pth_tensor_info(&vae, false, Some("state_dict"))
             .map_err(|e| CoreError::Msg(format!("prepare: {}: {e}", vae.display())))?;
         if infos.is_empty() {
@@ -119,29 +65,14 @@ pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
                 vae.display()
             )));
         }
-        num_tensors += infos.len();
-    } else {
-        return Err(CoreError::Msg(format!(
-            "prepare: {} is missing the VAE checkpoint {}",
-            spec.source.display(),
-            crate::vae::VAE_FILE
-        )));
-    }
-
-    Ok(PrepareReport {
-        // core-llm's own detect_format calls a safetensors-bearing snapshot dir Safetensors;
-        // the VAE pickle rides inside that shape (same convention as the Kokoro report).
-        input_format: ModelFormat::Safetensors,
-        quantized: None,
-        out_dir: spec.source.clone(),
-        num_tensors,
-        passthrough: true,
+        Ok(num_tensors + infos.len())
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_audio::testkit::tiny_safetensors;
 
     fn spec(dir: &Path) -> PrepareSpec {
         PrepareSpec {
@@ -152,16 +83,6 @@ mod tests {
     }
 
     /// A minimal valid safetensors byte blob with `n` zero-size F32 tensors.
-    fn tiny_safetensors(names: &[&str]) -> Vec<u8> {
-        let entries: Vec<String> = names
-            .iter()
-            .map(|n| format!(r#""{n}": {{"dtype": "F32", "shape": [0], "data_offsets": [0, 0]}}"#))
-            .collect();
-        let header = format!("{{{}}}", entries.join(", "));
-        let mut out = (header.len() as u64).to_le_bytes().to_vec();
-        out.extend_from_slice(header.as_bytes());
-        out
-    }
 
     #[test]
     fn probe_rejects_non_moss_layouts() {
@@ -205,57 +126,5 @@ mod tests {
         let mut s = spec(&dir);
         s.quantize = Some(core_llm::Quantize::Q4);
         assert!(matches!(prepare(&s), Err(CoreError::Unsupported(_))));
-    }
-
-    #[test]
-    fn safetensors_header_count_is_metadata_free() {
-        let dir_tmp = tempfile::tempdir().unwrap();
-        let dir = dir_tmp.path().to_path_buf();
-        let p = dir.join("x.safetensors");
-        std::fs::write(&p, tiny_safetensors(&["a", "b", "__metadata__"])).unwrap();
-        assert_eq!(safetensors_tensor_count(&p).unwrap(), 2);
-    }
-
-    #[test]
-    fn preparer_rejects_index_paths_and_nonregular_shards() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("text_encoder");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("model.safetensors"), tiny_safetensors(&["x"])).unwrap();
-        let index = dir.join("model.safetensors.index.json");
-        std::fs::write(&index, r#"{"weight_map":{"x":"model.safetensors"}}"#).unwrap();
-        assert_eq!(text_encoder_tensor_count(&dir).unwrap(), 1);
-        for name in [
-            "../outside.safetensors",
-            "/tmp/outside.safetensors",
-            "missing.safetensors",
-        ] {
-            std::fs::write(
-                &index,
-                serde_json::json!({"weight_map":{"x":name}}).to_string(),
-            )
-            .unwrap();
-            assert!(text_encoder_tensor_count(&dir).is_err(), "{name}");
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            let outside = temp.path().join("outside.safetensors");
-            std::fs::write(&outside, tiny_safetensors(&["x"])).unwrap();
-            symlink(&outside, dir.join("external.safetensors")).unwrap();
-            std::fs::write(&index, r#"{"weight_map":{"x":"external.safetensors"}}"#).unwrap();
-            assert!(text_encoder_tensor_count(&dir).is_err());
-            let fifo = dir.join("pipe.safetensors");
-            assert!(std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success());
-            std::fs::write(&index, r#"{"weight_map":{"x":"pipe.safetensors"}}"#).unwrap();
-            assert!(text_encoder_tensor_count(&dir)
-                .unwrap_err()
-                .to_string()
-                .contains("not a regular file"));
-        }
     }
 }

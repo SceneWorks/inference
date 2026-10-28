@@ -11,7 +11,8 @@
 use candle_audio::candle_core::{Device, Tensor};
 use candle_nn::ops;
 use image::imageops::FilterType;
-use image::RgbImage;
+use image::{ImageBuffer, Rgb, RgbImage};
+use std::ops::Deref;
 
 use crate::config;
 use crate::{AudioError, Result};
@@ -22,7 +23,7 @@ use crate::{AudioError, Result};
 /// torchvision bicubic. The `image` crate has no bicubic filter, so we use `CatmullRom`, its
 /// closest analogue. This **approximates** the reference — it does not bit-match torchvision's
 /// a=-0.75 bicubic kernel — so conditioning features on non-224 input can differ slightly.
-fn resize_center_crop(frame: &RgbImage) -> RgbImage {
+fn resize_center_crop<C: Deref<Target = [u8]>>(frame: &ImageBuffer<Rgb<u8>, C>) -> RgbImage {
     let (w, h) = frame.dimensions();
     let target = config::IMG_SIZE as u32;
     // Shorter-edge → target, preserving aspect ratio.
@@ -53,7 +54,7 @@ fn resize_center_crop(frame: &RgbImage) -> RgbImage {
 
 /// Flatten one preprocessed frame into a channel-major `[C, H, W]` f32 buffer, normalized to
 /// `[-1, 1]`. Channel-major so a stack of frames reshapes directly into `(T, C, H, W)`.
-fn frame_to_chw(frame: &RgbImage) -> Vec<f32> {
+fn frame_to_chw<C: Deref<Target = [u8]>>(frame: &ImageBuffer<Rgb<u8>, C>) -> Vec<f32> {
     let cropped = resize_center_crop(frame);
     let hw = config::IMG_SIZE * config::IMG_SIZE;
     let mut out = vec![0f32; config::IN_CHANS * hw];
@@ -83,7 +84,12 @@ pub fn num_segments(n_frames: usize) -> usize {
 /// [`config::SYNC_FRAME_RATE`] fps (the caller is responsible for the temporal resample — that is a
 /// container/decoder concern outside this deterministic encoder); this fn does the spatial
 /// transform + normalization + overlapping-window packing.
-pub fn frames_to_segments(frames: &[RgbImage], device: &Device) -> Result<Tensor> {
+///
+/// Generic over the pixel container so callers can pass owned [`RgbImage`]s or borrowed views.
+pub fn frames_to_segments<C: Deref<Target = [u8]>>(
+    frames: &[ImageBuffer<Rgb<u8>, C>],
+    device: &Device,
+) -> Result<Tensor> {
     let n = frames.len();
     let s = num_segments(n);
     if s == 0 {

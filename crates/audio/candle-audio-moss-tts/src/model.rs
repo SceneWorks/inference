@@ -26,7 +26,6 @@ use candle_audio::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     Modality, ModelDescriptor, Progress, SpeechSegment, WeightsSource,
 };
-use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 use crate::backbone::Backbone;
@@ -234,14 +233,15 @@ impl Loaded {
             )));
         }
         let device = candle_audio::default_device()?;
-        // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the shared idiom. The
-        // BF16 checkpoint is loaded as F32 (CPU-friendly; the reference runs the AR head in f32).
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights), DType::F32, &device)
-                .map_err(|e| {
-                    gen_core::Error::Msg(format!("{MODEL_ID}: mmap {}: {e}", weights.display()))
-                })?
-        };
+        // The BF16 checkpoint is loaded as F32 (CPU-friendly; the reference runs the AR head in f32).
+        let vb = candle_audio::weights::mmap_var_builder(
+            std::slice::from_ref(&weights),
+            DType::F32,
+            &device,
+        )
+        .map_err(|e| {
+            gen_core::Error::Msg(format!("{MODEL_ID}: mmap {}: {e}", weights.display()))
+        })?;
         let backbone = Backbone::new(&cfg, vb)
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: build backbone: {e}")))?;
         Ok(Self {
