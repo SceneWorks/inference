@@ -273033,6 +273033,7 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
+      "campaign",
       "model-inference-proof"
     ],
     "cargo_target_metadata": {
@@ -278502,6 +278503,7 @@
     "configuration_source": "body-local construction (preserved verbatim)",
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "cargo_features": [
+      "campaign",
       "model-inference-proof"
     ],
     "cargo_target_metadata": {
