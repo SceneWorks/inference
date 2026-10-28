@@ -10,7 +10,7 @@
 //!   `max(triple-TE, MMDiT+VAE)` identically for Large, Large-Turbo, and Medium.
 //! * **BoundedDecode** — the 16-channel VAE is loaded by `loader::load_vae` with no variant
 //!   parameter at all; the decode tile domain is therefore literally the same object for all three.
-//! * **BoundedAttention** — `attention_plan` threads one [`AttentionPlan`] into
+//! * **BoundedAttention** — `attention_plan` threads one [`AttentionPlan`](mlx_gen::attention::AttentionPlan) into
 //!   `JointBlock::forward`, which applies it to the joint double-stream attention **and** to
 //!   Medium's MMDiT-X image-stream-only `attn2` branch. SD3.5 has no RoPE, and its per-head
 //!   qk-RMSNorm is applied after the BHSD reshape inside the attention itself, so chunking the
