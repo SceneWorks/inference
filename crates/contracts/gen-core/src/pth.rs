@@ -65,9 +65,16 @@ pub struct PthTensorSpec {
 }
 
 impl PthTensorSpec {
-    /// Element count (validated non-negative dims; saturating only for display paths).
-    pub fn numel(&self) -> usize {
-        self.shape.iter().map(|&d| d.max(0) as usize).product()
+    /// Element count, or `None` when the archive-supplied shape is not a valid tensor shape: a
+    /// negative dimension, one beyond an `i32` axis, or a product that overflows `usize` — the same
+    /// rules [`PthArchive::read_tensor`] enforces before reading (sc-27471).
+    pub fn checked_numel(&self) -> Option<usize> {
+        self.shape.iter().try_fold(1usize, |n, &d| {
+            if !(0..=i32::MAX as i64).contains(&d) {
+                return None;
+            }
+            n.checked_mul(d as usize)
+        })
     }
 }
 
@@ -922,6 +929,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(off.contains("storage byte offset overflows usize"), "{off}");
+    }
+
+    /// sc-27471: `checked_numel` applies the reader's shape rules instead of clamping negative
+    /// dimensions to zero and wrapping the product.
+    #[test]
+    fn checked_numel_rejects_invalid_shapes() {
+        let spec = |shape: Vec<i64>| PthTensorSpec {
+            dtype: PthDtype::F32,
+            shape,
+            storage_key: "0".into(),
+            offset: 0,
+            stride: Vec::new(),
+        };
+        assert_eq!(spec(vec![3, 4]).checked_numel(), Some(12));
+        assert_eq!(spec(vec![]).checked_numel(), Some(1));
+        assert_eq!(spec(vec![0, 5]).checked_numel(), Some(0));
+        assert_eq!(spec(vec![-1, 2]).checked_numel(), None);
+        assert_eq!(spec(vec![i32::MAX as i64 + 1]).checked_numel(), None);
+        let m = i32::MAX as i64;
+        assert_eq!(spec(vec![m, m, m]).checked_numel(), None);
     }
 
     fn push_str(p: &mut Vec<u8>, s: &str) {
