@@ -784,6 +784,28 @@ impl PthTensors {
             )
         }
         let start_offset = tensor_info.layout.start_offset();
+        // Local hardening (sc-27456, not upstream): the shape comes from the untrusted pickle, and
+        // `Tensor::from_reader` allocates `elem_count` elements before reading. Refuse a tensor
+        // whose bytes (with checked arithmetic) do not fit the storage entry it is read from, so a
+        // crafted header is an error instead of a huge allocation / abort.
+        let needed = tensor_info
+            .layout
+            .dims()
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .and_then(|n| n.checked_mul(tensor_info.dtype.size_in_bytes()))
+            .and_then(|n| n.checked_add(start_offset))
+            .and_then(|n| u64::try_from(n).ok());
+        if needed.is_none_or(|needed| needed > reader.size()) {
+            crate::bail!(
+                "tensor {name}: shape {:?} ({:?}) at offset {start_offset} needs more bytes than \
+                 its {}-byte archive entry {} holds",
+                tensor_info.layout.dims(),
+                tensor_info.dtype,
+                reader.size(),
+                tensor_info.path
+            )
+        }
         if start_offset > 0 {
             std::io::copy(
                 &mut reader.by_ref().take(start_offset as u64),
