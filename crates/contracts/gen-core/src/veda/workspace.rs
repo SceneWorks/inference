@@ -483,6 +483,8 @@ pub struct Request<'a> {
     pub prompt: &'a str,
     pub conditioning: &'a [Conditioning],
     pub reference_image_short_edge: Option<u32>,
+    /// sc-26691: `None` ⇒ [`crate::ReferenceImageResizeMode::Match`].
+    pub reference_image_resize_mode: Option<crate::ReferenceImageResizeMode>,
 }
 impl<'a> From<&'a GenerationRequest> for Request<'a> {
     fn from(r: &'a GenerationRequest) -> Self {
@@ -495,6 +497,7 @@ impl<'a> From<&'a GenerationRequest> for Request<'a> {
             prompt: &r.prompt,
             conditioning: &r.conditioning,
             reference_image_short_edge: r.reference_image_short_edge,
+            reference_image_resize_mode: r.reference_image_resize_mode,
         }
     }
 }
@@ -602,13 +605,23 @@ fn layout_envelope_with_patch(req: Request<'_>, patch: [usize; 3]) -> Result<Lay
         if w == 0 || h == 0 {
             return Err(bad("empty reference image"));
         }
-        let edge = req.reference_image_short_edge.unwrap_or(2048) as f64;
-        let scale = edge / w.min(h) as f64;
+        // The engine's own resolver (sc-26691), so admission prices the plate the render encodes.
+        let (rw, rh) = crate::resolve_reference_image_size(
+            w,
+            h,
+            req.width,
+            req.height,
+            req.reference_image_resize_mode.unwrap_or_default(),
+            req.reference_image_short_edge
+                .unwrap_or(crate::REFERENCE_IMAGE_SHORT_EDGE_DEFAULT),
+            crate::h3_reference::REFERENCE_IMAGE_MULTIPLE,
+        )
+        .map_err(|e| bad(&e.to_string()))?;
         // Stride-32 lattice in pixels == one DiT patch per 32 pixels.
         Ok([
             1,
-            ((h as f64 * scale / 32.).round_ties_even().max(1.) as usize * 32).div_ceil(pixel_h),
-            ((w as f64 * scale / 32.).round_ties_even().max(1.) as usize * 32).div_ceil(pixel_w),
+            (rh as usize).div_ceil(pixel_h),
+            (rw as usize).div_ceil(pixel_w),
         ])
     };
     // Same factor/min/max geometry as native Qwen3-VL preprocessing. Extreme aspects
@@ -642,11 +655,17 @@ fn layout_envelope_with_patch(req: Request<'_>, patch: [usize; 3]) -> Result<Lay
         if a.sample_rate == 0 || a.channels == 0 {
             return Err(bad("invalid reference audio"));
         }
-        Ok(
-            ((a.samples.len() as u128 * 40).div_ceil(a.sample_rate as u128 * a.channels as u128))
-                .saturating_mul(a.channels as u128)
-                .min(usize::MAX as u128) as usize,
-        )
+        // sc-26691: the engine truncates a reference soundtrack to the generated duration.
+        let per_channel = (a.samples.len() / a.channels as usize).min(
+            crate::h3_reference::reference_audio_max_samples_per_channel(
+                frames,
+                24.0,
+                a.sample_rate,
+            ),
+        );
+        Ok(((per_channel as u128 * 40).div_ceil(a.sample_rate as u128))
+            .saturating_mul(a.channels as u128)
+            .min(usize::MAX as u128) as usize)
     };
     for c in req.conditioning {
         match c {
@@ -904,10 +923,11 @@ mod tests {
     }
     #[test]
     fn reference_and_keyframe_spans_are_priced_in_patch_units() {
-        // A 320x576 reference at the default 2048 short edge is 2048x3680 px on the
+        // A 320x576 reference at the `diffusers` 2048 short edge is 2048x3680 px on the
         // stride-32 lattice: 64x115 patches, i.e. 7,360 reference tokens.
         let base = for_request(&req(), Backend::Cuda).unwrap().unwrap();
         let mut refs = req();
+        refs.reference_image_resize_mode = Some(crate::ReferenceImageResizeMode::Diffusers);
         refs.conditioning.push(Conditioning::Reference {
             image: crate::Image {
                 width: 320,
@@ -926,6 +946,11 @@ mod tests {
         assert_eq!(b.target_tokens, 37 * 24 * 42);
         assert_eq!(r.ref_tokens, 115 * 64);
         assert_eq!(r.target_tokens, b.target_tokens);
+        // sc-26691: under the default `match` the plate is below the canvas area and is priced at
+        // its own 320x576 (10x18 patches).
+        let mut matched = refs.clone();
+        matched.reference_image_resize_mode = None;
+        assert_eq!(sizes(&matched).ref_tokens, 10 * 18);
         let mut keyframe = req();
         keyframe.conditioning.push(Conditioning::Keyframe {
             image: crate::Image {

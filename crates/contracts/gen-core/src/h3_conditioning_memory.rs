@@ -629,11 +629,15 @@ pub fn workspace_with_patch(
             {
                 return Err(bad());
             }
-            let (peak, keep) = audio_encode(
-                (a.samples.len() / a.channels as usize) as u64,
-                a.channels as u64,
-                f,
-            )?;
+            // sc-26691: the engine truncates a reference soundtrack to the generated duration.
+            let per_channel = (a.samples.len() / a.channels as usize).min(
+                crate::h3_reference::reference_audio_max_samples_per_channel(
+                    req.frames as usize,
+                    24.0,
+                    a.sample_rate,
+                ),
+            );
+            let (peak, keep) = audio_encode(per_channel as u64, a.channels as u64, f)?;
             transient = transient.max(peak - keep);
             retained = add(&[retained, keep])?;
         }
@@ -780,6 +784,8 @@ mod tests {
             prompt: "fixture",
             conditioning,
             reference_image_short_edge: Some(256),
+            // The short-edge fixtures below scale the plate, which only `diffusers` does.
+            reference_image_resize_mode: Some(crate::ReferenceImageResizeMode::Diffusers),
         }
     }
     #[test]
@@ -810,6 +816,16 @@ mod tests {
         let mut large = request(&refs);
         large.reference_image_short_edge = Some(512);
         assert!(workspace(&large, &f).unwrap().conditioning_bytes > one.conditioning_bytes);
+        // sc-26691: under `match` the 320 plate is below the 1344x768 canvas area, so it is not
+        // upscaled and the short-edge knob is inert.
+        let mut matched = request(&refs);
+        matched.reference_image_resize_mode = Some(crate::ReferenceImageResizeMode::Match);
+        let mut matched_large = matched;
+        matched_large.reference_image_short_edge = Some(2048);
+        assert_eq!(
+            workspace(&matched, &f).unwrap().conditioning_bytes,
+            workspace(&matched_large, &f).unwrap().conditioning_bytes
+        );
         let refs2 = [Conditioning::MultiReference {
             images: vec![image.clone(), image],
         }];

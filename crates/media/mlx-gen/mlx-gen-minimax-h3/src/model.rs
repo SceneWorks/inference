@@ -1530,13 +1530,26 @@ impl MiniMaxH3 {
         // gate refused. It sizes the reference and its latent rows only; the canvas above is
         // untouched by it.
         let reference_short_edge = effective_reference_image_short_edge(req) as i32;
+        // sc-26691: the image resize mode (default `match`) and the upstream soundtrack bound.
+        let resize_mode = mlx_gen::gen_core::effective_reference_image_resize_mode(req);
+        let num_frames = geometry.joint.num_frames as usize;
+        let truncate = |a: &mlx_gen::media::AudioTrack| {
+            mlx_gen::gen_core::truncate_reference_audio(
+                a,
+                num_frames,
+                crate::denoise::MINIMAX_H3_FPS,
+            )
+        };
         let mut normalized: Vec<Ref2VaReference> = Vec::with_capacity(references.len());
         for r in references.as_slice() {
             normalized.push(match r {
                 Ref2VaReference::Image(img) => {
-                    Ref2VaReference::Image(crate::reference::normalize_reference_image(
+                    Ref2VaReference::Image(crate::reference::resize_reference_image(
                         img,
                         SPATIAL_STRIDE as i32,
+                        geometry.width,
+                        geometry.height,
+                        resize_mode,
                         reference_short_edge,
                     )?)
                 }
@@ -1551,9 +1564,13 @@ impl MiniMaxH3 {
                         crate::denoise::MINIMAX_H3_FPS,
                     )?,
                     fps: crate::denoise::MINIMAX_H3_FPS,
-                    audio: v.audio.clone(),
+                    audio: v.audio.as_ref().map(truncate),
                 }),
-                Ref2VaReference::Audio(a) => Ref2VaReference::Audio(a.clone()),
+                Ref2VaReference::Audio(a) => {
+                    Ref2VaReference::Audio(crate::reference::AudioReference {
+                        audio: truncate(&a.audio),
+                    })
+                }
             });
         }
         if req.cancel.is_cancelled() {

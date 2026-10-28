@@ -1255,4 +1255,89 @@ mod tests {
         assert!(t2va_layout(&g, 0, PATCH_SIZE, &d).is_err());
         assert!(fl2va_layout(&g, &[], &[], PATCH_SIZE, &d).is_err());
     }
+
+    /// sc-26691 — the `match` resize mode and the upstream soundtrack bound, measured on the packed
+    /// sequence the DiT actually attends over (no weights: the layout is pure geometry).
+    ///
+    /// Case: a 1088x544x124 render with two 576x320 image references, two video references on a
+    /// 1376x768 canvas each carrying a 30 s stereo soundtrack, and two 30 s stereo audio references.
+    /// Before: the plates upscaled to a 2048 short edge (`diffusers`) and every soundtrack encoded
+    /// whole. After: the plates stay 576x320 (`match`, area below the canvas) and every soundtrack
+    /// is cut to `124 / 24` s.
+    #[test]
+    fn match_resize_and_audio_truncation_shrink_the_ref2va_sequence() {
+        use crate::reference::ReferenceKind;
+        use candle_gen::gen_core::{
+            h3_reference::{reference_audio_max_samples_per_channel, REFERENCE_IMAGE_MULTIPLE},
+            resolve_reference_image_size, ReferenceImageResizeMode,
+        };
+        let d = Device::Cpu;
+        let g = resolve_geometry(1088, 544, 124).unwrap();
+        let hop = 800; // 32 kHz / 40 latent tokens per second
+        let source_samples = 30 * 32_000;
+        let rows = |mode: ReferenceImageResizeMode, truncate: bool| {
+            let (w, h) = resolve_reference_image_size(
+                576,
+                320,
+                g.width,
+                g.height,
+                mode,
+                2048,
+                REFERENCE_IMAGE_MULTIPLE,
+            )
+            .unwrap();
+            let samples = if truncate {
+                source_samples.min(reference_audio_max_samples_per_channel(
+                    124,
+                    MINIMAX_H3_FPS,
+                    32_000,
+                ))
+            } else {
+                source_samples
+            };
+            let audio_latents = samples.div_ceil(hop);
+            let image = ReferenceLatentGeometry {
+                kind: ReferenceKind::Image,
+                num_latent_frames: 1,
+                latent_height: h as usize / 16,
+                latent_width: w as usize / 16,
+                num_audio_latents: 0,
+            };
+            let video = ReferenceLatentGeometry {
+                kind: ReferenceKind::Video,
+                num_latent_frames: g.joint.num_latent_frames,
+                latent_height: 768 / 16,
+                latent_width: 1376 / 16,
+                num_audio_latents: audio_latents,
+            };
+            let audio = ReferenceLatentGeometry {
+                kind: ReferenceKind::Audio,
+                num_latent_frames: 0,
+                latent_height: 0,
+                latent_width: 0,
+                num_audio_latents: audio_latents,
+            };
+            let refs = [image, image, video, video, audio, audio];
+            let channels = [0, 0, 2, 2, 2, 2];
+            let layout = ref2va_layout_with_audio_channels(
+                &g,
+                &[TEXT_TAG; 512],
+                &refs,
+                &channels,
+                PATCH_SIZE,
+                &d,
+            )
+            .unwrap();
+            ((w, h), audio_latents, layout.seq_len())
+        };
+        let (before_plate, before_audio, before) = rows(ReferenceImageResizeMode::Diffusers, false);
+        let (after_plate, after_audio, after) = rows(ReferenceImageResizeMode::Match, true);
+        assert_eq!(before_plate, (3680, 2048));
+        assert_eq!(after_plate, (576, 320));
+        assert_eq!((before_audio, after_audio), (1200, 207));
+        // Images: 2 x (115 x 64 - 18 x 10) = 14_360 rows. Audio: 4 refs x 2 channels x (1200 - 207)
+        // = 7_944 rows.
+        assert_eq!(before - after, 14_360 + 7_944);
+        assert_eq!((before, after), (123_000, 100_696));
+    }
 }

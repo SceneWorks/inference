@@ -59,6 +59,7 @@ pub mod guidance;
 pub mod h3_adapter_memory;
 pub mod h3_conditioning_memory;
 pub mod h3_memory;
+pub mod h3_reference;
 pub mod hdr;
 pub mod image_embed;
 pub mod imageops;
@@ -184,6 +185,10 @@ pub use generator::{
     StagedResidencyAvailability, StepSupport, TimeRegion, TokenSampling, VideoClipRef,
     REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
     REFERENCE_IMAGE_SHORT_EDGE_MIN,
+};
+pub use h3_reference::{
+    effective_reference_image_resize_mode, resolve_reference_image_size, truncate_reference_audio,
+    ReferenceImageResizeMode,
 };
 pub use hdr::{
     exr_conditioning_to_vae_range, from_vae_range, hlg_inverse_oetf, hlg_oetf,
