@@ -358,9 +358,8 @@ pub fn has_diff_patch_keys(path: &Path) -> Result<bool> {
 fn read_safetensors_header_keys(path: &Path) -> Result<Vec<String>> {
     use std::io::Read;
 
-    // Cap mirrors safetensors' own `MAX_HEADER_SIZE` (100 MB) so a corrupt length can't request a
-    // multi-GB allocation.
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
+    // The shared cap, so a corrupt length can't request a multi-GB allocation.
+    const MAX_HEADER_SIZE: u64 = wmeta::SAFETENSORS_MAX_HEADER_BYTES;
 
     let mut file = std::fs::File::open(path)
         .map_err(|e| CandleError::Msg(format!("open adapter {}: {e}", path.display())))?;

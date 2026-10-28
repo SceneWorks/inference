@@ -67,7 +67,7 @@ const SIDECAR_EXCLUDES: [&str; 2] = ["config.json", "tokenizer.json"];
 
 /// Same bound `crate::weightsmeta::safetensors_path_tensor_headers` uses: a header larger than this
 /// is a corrupt/mis-detected file (e.g. an AppleDouble `._` sidecar), not a real checkpoint.
-const MAX_HEADER_SIZE: u64 = 100_000_000;
+const MAX_HEADER_SIZE: u64 = crate::weightsmeta::SAFETENSORS_MAX_HEADER_BYTES;
 
 // =================================================================================================
 // GemmaAssets

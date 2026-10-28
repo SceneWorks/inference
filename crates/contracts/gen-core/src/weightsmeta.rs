@@ -194,6 +194,12 @@ pub fn visible_safetensors(dir: impl AsRef<Path>) -> std::io::Result<Vec<std::ff
     Ok(names)
 }
 
+/// Largest safetensors header (the JSON after the 8-byte length prefix) any shared reader accepts.
+///
+/// Mirrors the `safetensors` crate's own `MAX_HEADER_SIZE`, so a corrupt or hostile length prefix
+/// cannot request an arbitrary allocation before the header is parsed.
+pub const SAFETENSORS_MAX_HEADER_BYTES: u64 = 100_000_000;
+
 /// The hidden directory Candle writes its content-addressed **device-format weight cache** into,
 /// beside the source component it was derived from (`<component>/.candle-device-format-v1/`,
 /// SC-16096). Every packed q4/q8 component that has ever been opened for block streaming carries
@@ -226,9 +232,9 @@ pub fn is_hidden_dir(path: &Path) -> bool {
 /// uses this reader instead. An absent `__metadata__` block yields an empty map, not an error — a
 /// safetensors file is allowed to carry none.
 pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<String, String>> {
-    /// Same ceiling `safetensors_path_tensor_headers` applies, for the same reason: refuse to
-    /// allocate an arbitrary buffer from an untrusted 8-byte length prefix.
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
+    // Same ceiling `safetensors_path_tensor_headers` applies, for the same reason: refuse to
+    // allocate an arbitrary buffer from an untrusted 8-byte length prefix.
+    const MAX_HEADER_SIZE: u64 = SAFETENSORS_MAX_HEADER_BYTES;
 
     let path = path.as_ref();
     let mut file = std::fs::File::open(path)?;
@@ -665,7 +671,7 @@ fn reader_tensor_locations_impl(
     source: &Path,
     mut observer: Option<&mut SourceMetadataObserver<'_>>,
 ) -> Result<SafetensorsFileLayout> {
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
+    const MAX_HEADER_SIZE: u64 = SAFETENSORS_MAX_HEADER_BYTES;
     let path = source;
     let mut prefix = [0_u8; 8];
     reader.read_exact(&mut prefix)?;
