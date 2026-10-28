@@ -132,20 +132,22 @@ impl SourceAudio {
                 self.resampled_to.unwrap_or(0)
             )));
         }
-        let mut samples = self.samples.clone();
         let mut conversion = self.conversion.clone();
+        // Crop before copying (sc-27345): only the kept prefix of the source is cloned.
+        let mut keep = self.samples.len();
         if let Some(max) = max_seconds {
             if !(max.is_finite() && max > 0.0) {
                 return Err(Error::Request(
                     "max_seconds must be finite and positive".into(),
                 ));
             }
-            let keep = (max * f64::from(rate)).round_ties_even() as usize;
-            if keep < samples.len() {
-                samples.truncate(keep);
+            let max_samples = (max * f64::from(rate)).round_ties_even() as usize;
+            if max_samples < keep {
+                keep = max_samples;
                 conversion.push_str(&format!("; cropped to {max} s"));
             }
         }
+        let samples = self.samples[..keep].to_vec();
         if samples.len() < minimum || samples.iter().any(|s| !s.is_finite()) {
             return Err(Error::Request(format!(
                 "audio must contain at least {minimum} finite samples at {rate} Hz"

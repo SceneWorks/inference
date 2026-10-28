@@ -44,33 +44,10 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
     is_moss_ttsd_snapshot(&spec.source)
 }
 
-/// Count the tensors of one safetensors file from its header only (8-byte length + JSON;
-/// `__metadata__` is not a tensor). No tensor storage is read.
+/// Header-only tensor count through the shared bounded reader (sc-27264); never reads a shard.
 fn safetensors_tensor_count(path: &Path) -> CoreResult<usize> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| CoreError::Msg(format!("prepare: read {}: {e}", path.display())))?;
-    if bytes.len() < 8 {
-        return Err(CoreError::Msg(format!(
-            "prepare: {} is not a safetensors file (short header)",
-            path.display()
-        )));
-    }
-    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-    let header = bytes.get(8..8 + n).ok_or_else(|| {
-        CoreError::Msg(format!(
-            "prepare: {} safetensors header truncated",
-            path.display()
-        ))
-    })?;
-    let v: serde_json::Value = serde_json::from_slice(header)
-        .map_err(|e| CoreError::Msg(format!("prepare: {} header: {e}", path.display())))?;
-    let obj = v.as_object().ok_or_else(|| {
-        CoreError::Msg(format!(
-            "prepare: {} header is not a JSON object",
-            path.display()
-        ))
-    })?;
-    Ok(obj.keys().filter(|k| *k != "__metadata__").count())
+    candle_audio::prepare::safetensors_tensor_count(path)
+        .map_err(|e| CoreError::Msg(format!("prepare: {e}")))
 }
 
 /// Prepare (verify + passthrough) a MOSS-TTSD snapshot.

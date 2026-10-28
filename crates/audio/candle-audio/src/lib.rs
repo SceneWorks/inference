@@ -31,6 +31,10 @@
 //!   meters reused from `gen_core::audio_dsp`, never reimplemented), the PCM
 //!   repeatability hash, and the [`harness::MetricEnvelope`] the per-model regression
 //!   fixtures assert against.
+//! - [`weights`] — the lane's one audited `unsafe` safetensors mmap surface and its
+//!   caller-provisioned-file contract (sc-27259 / sc-27358).
+//! - [`prepare`] — header-only safetensors tensor counting shared by the snapshot preparers
+//!   (sc-27264 / sc-27265).
 //!
 //! Scope discipline (sc-12835): these modules are exactly what the first shipped
 //! provider (Kokoro, sc-12836) needs — no speculative surface. Grow this crate
@@ -63,8 +67,10 @@ pub mod harness;
 pub mod mel;
 pub mod neural_codec;
 pub mod ops;
+pub mod prepare;
 pub mod vocos;
 pub mod wav;
+pub mod weights;
 
 // Test-support helpers shared across the candle audio provider crates. Feature-gated so it never
 // compiles into a production build — provider crates enable `candle-audio/testkit` under

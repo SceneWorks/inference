@@ -37,7 +37,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_audio::candle_core::safetensors::MmapedSafetensors;
 use candle_audio::candle_core::{DType, Device, Module, Tensor, D};
 use candle_audio::gen_core::{self, AudioTrack, CancelFlag};
 use candle_audio::neural_codec::{resolve_weight_norm, rvq_encode, DacEncoder};
@@ -250,9 +249,7 @@ impl XcodecEncoder {
     /// (HuBERT — the checkpoint's copy, which upstream's `load_state_dict` puts over the
     /// `semantic_ckpts` one) and quantizer 0's codebook. The decoder half is never paged in.
     pub fn load(checkpoint: &Path, device: &Device) -> Result<Self, AudioError> {
-        // SAFETY: the checkpoint is a caller-staged, read-only weight file; nothing in this process
-        // writes it while the map is alive (the contract every candle mmap loader relies on).
-        let st = unsafe { MmapedSafetensors::new(checkpoint) }
+        let st = candle_audio::weights::mmap_safetensors(checkpoint)
             .map_err(|e| AudioError::Msg(format!("xcodec: open {}: {e}", checkpoint.display())))?;
         let load = |name: &str| -> Result<Tensor, AudioError> {
             Ok(st

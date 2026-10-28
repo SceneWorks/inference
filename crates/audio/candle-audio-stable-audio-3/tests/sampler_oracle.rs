@@ -4,6 +4,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -27,28 +28,13 @@ use candle_audio_stable_audio_3::sampler::{
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
 use candle_nn::VarBuilder;
 
-/// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
-/// `chunked_oracle.rs`.
-///
-/// The three real-weight cases below each branched on `SA3_TEST_METAL` alone, so on the CUDA lanes
-/// — which set `SA3_TEST_CUDA` — they silently executed on `Device::Cpu`. A requested backend that
-/// is unavailable is a hard failure, never a fallback.
-fn test_device() -> Device {
-    if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
-        #[cfg(feature = "cuda")]
-        {
-            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            panic!("SA3_TEST_CUDA requires --features cuda")
-        }
-    } else {
-        Device::Cpu
-    }
-}
+// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
+// `chunked_oracle.rs`.
+//
+// The three real-weight cases below each branched on `SA3_TEST_METAL` alone, so on the CUDA lanes
+// — which set `SA3_TEST_CUDA` — they silently executed on `Device::Cpu`. A requested backend that
+// is unavailable is a hard failure, never a fallback.
+use common::test_device;
 
 fn values(tensor: &Tensor) -> Vec<f32> {
     tensor

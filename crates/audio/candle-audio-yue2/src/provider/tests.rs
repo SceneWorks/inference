@@ -514,9 +514,7 @@ fn registered_fp8_load_publishes_a_mode_bound_run() {
     let hub = std::path::PathBuf::from(std::env::var("YUE2_HF_HUB").expect("YUE2_HF_HUB"));
     let snapshot = |component: ComponentId| {
         let repo = component.component().repo;
-        hub.join(format!("models--{}", repo.id.replace('/', "--")))
-            .join("snapshots")
-            .join(repo.revision)
+        crate::snapshot::hub_layout_snapshot_dir(&hub, &repo)
     };
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot(ComponentId::Lm)))
         .with_component(

@@ -57,6 +57,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -1333,11 +1334,7 @@ const CASES: &[Case] = &[
     },
 ];
 
-fn snapshot(env: &str) -> WeightsSource {
-    WeightsSource::Dir(PathBuf::from(
-        std::env::var(env).unwrap_or_else(|_| panic!("set {env} to the pinned immutable snapshot")),
-    ))
-}
+use common::snapshot_source as snapshot;
 
 fn audio(output: GenerationOutput) -> AudioTrack {
     match output {

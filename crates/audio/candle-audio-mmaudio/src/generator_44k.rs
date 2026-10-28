@@ -37,7 +37,8 @@ use candle_audio::{AudioError, Result as AudioResult};
 use crate::clip::{self, DfnClipEncoder};
 use crate::generator::{
     cfg_flow, check_seq, effective_duration, lock_recover, resample_frames, seeded_prior,
-    validate_request, video_sync_frames, PipelineProgress, CLIP_FPS, REQUIRED_COMPONENTS, SYNC_FPS,
+    validate_request, video_sync_frames, FrameView, PipelineProgress, CLIP_FPS,
+    REQUIRED_COMPONENTS, SYNC_FPS,
 };
 use crate::output::{AudioDecoder44k, SAMPLE_RATE_44K};
 use crate::sync::SynchformerVisualEncoder;
@@ -286,7 +287,7 @@ impl MmAudio44kPipeline {
         Ok(samples)
     }
 
-    fn encode_clip_visual(&self, frames: &[image::RgbImage]) -> AudioResult<Tensor> {
+    fn encode_clip_visual(&self, frames: &[FrameView<'_>]) -> AudioResult<Tensor> {
         let input = clip::frames_to_clip_input(frames, &self.device)?; // (M, 3, 384, 384)
         let feat = self.clip.encode_image(&input)?; // (M, 1024)
         Ok(feat.unsqueeze(0)?) // (1, M, 1024)
@@ -298,7 +299,7 @@ impl MmAudio44kPipeline {
         Ok(self.clip.encode_text(&tokens)?) // (1, 77, 1024)
     }
 
-    fn encode_sync(&self, frames: &[image::RgbImage]) -> AudioResult<Tensor> {
+    fn encode_sync(&self, frames: &[FrameView<'_>]) -> AudioResult<Tensor> {
         let segments = preprocess::frames_to_segments(frames, &self.device)?; // (S, 3, 16, 224, 224)
         let feat = self.sync.encode(&segments)?; // (S, 8, 768)
         let (s, per_seg, d) = feat.dims3()?;

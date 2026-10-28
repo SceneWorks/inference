@@ -33,7 +33,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_audio::candle_core::safetensors::MmapedSafetensors;
 use candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio::gen_core::{self, CancelFlag};
 use candle_audio::vocos::{Vocos, VocosConfig};
@@ -178,10 +177,8 @@ impl VocosUpsampler {
 /// widths read from the tensors and the hop fixed at [`SAMPLES_PER_FRAME`].
 pub fn load_decoder(checkpoint: &Path, device: &Device) -> Result<Vocos, AudioError> {
     let err = |m: String| AudioError::Msg(format!("vocos {}: {m}", checkpoint.display()));
-    // SAFETY: the checkpoint is a caller-staged, read-only weight file; nothing in this process
-    // writes it while the map is alive (the contract every candle mmap loader relies on).
-    let st =
-        unsafe { MmapedSafetensors::new(checkpoint) }.map_err(|e| err(format!("open: {e}")))?;
+    let st = candle_audio::weights::mmap_safetensors(checkpoint)
+        .map_err(|e| err(format!("open: {e}")))?;
     let mut tensors = HashMap::new();
     for (name, _) in st.tensors() {
         let t = st

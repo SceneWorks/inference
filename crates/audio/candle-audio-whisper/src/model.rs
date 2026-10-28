@@ -158,11 +158,8 @@ impl WhisperTranscriber {
         )
         .map_err(|e| AudioError::Msg(format!("whisper: loading {TOKENIZER_FILE}: {e}")))?;
         let weights = self.root.join(WEIGHTS_FILE);
-        // Safety: from_mmaped_safetensors mmaps a trusted, pinned-SHA snapshot file (F-029).
-        let vb = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(&[weights], DTYPE, &device)
-                .map_err(AudioError::from)?
-        };
+        let vb = candle_audio::weights::mmap_var_builder(&[weights], DTYPE, &device)
+            .map_err(AudioError::from)?;
         let model = Whisper::load(&vb, config.clone()).map_err(AudioError::from)?;
         Ok(LoadedModel {
             model,

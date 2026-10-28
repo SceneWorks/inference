@@ -4,6 +4,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -41,9 +42,7 @@ fn portable(shape: &[usize], stream: u64, scale: f32, device: &Device) -> Tensor
 }
 
 fn snapshot() -> PathBuf {
-    std::env::var_os("SA3_SMALL_MUSIC_SNAPSHOT")
-        .map(PathBuf::from)
-        .expect("SA3_SMALL_MUSIC_SNAPSHOT must point to the pinned immutable snapshot")
+    common::snapshot_dir("SA3_SMALL_MUSIC_SNAPSHOT")
 }
 
 fn oracle() -> MmapedSafetensors {

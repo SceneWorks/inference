@@ -371,9 +371,9 @@ fn mmap_builder(
 /// [`crate::adapters::AdapterBackend`] between the mmap and the builder. Nothing else changed: the
 /// no-adapter path composes exactly the same backend it always did.
 fn mmap_backend(path: &Path) -> Result<Box<dyn candle_nn::var_builder::SimpleBackend>> {
-    // Safety: callers of SnapshotLayout require an immutable snapshot. The returned backend
-    // owns its mmap for the lifetime of the 'static VarBuilder.
-    let safetensors = unsafe { MmapedSafetensors::new(path)? };
+    // The returned backend owns its mmap for the lifetime of the 'static VarBuilder; the
+    // caller-provisioned-file contract is `candle_audio::weights`'.
+    let safetensors = candle_audio::weights::mmap_safetensors(path)?;
     Ok(Box::new(ZeroElementSafeMmap { inner: safetensors }))
 }
 
@@ -390,9 +390,9 @@ fn packed_metal_backend(
     device: &Device,
     prefix: Option<&str>,
 ) -> Result<Box<dyn candle_nn::var_builder::SimpleBackend>> {
-    // Safety: SnapshotLayout requires this file to remain immutable for the duration of loading.
-    // All values are copied into owned Candle storage before this function returns.
-    let safetensors = unsafe { MmapedSafetensors::new(path)? };
+    // All values are copied into owned Candle storage before this function returns; the
+    // caller-provisioned-file contract is `candle_audio::weights`'.
+    let safetensors = candle_audio::weights::mmap_safetensors(path)?;
     let mut names = safetensors
         .tensors()
         .into_iter()
@@ -716,6 +716,9 @@ pub fn safetensors_header_object(
     safetensors_header(path)
 }
 
+/// Upper bound on a safetensors JSON header, matching gen-core's `weightsmeta` reader.
+const SAFETENSORS_MAX_HEADER_BYTES: u64 = 100_000_000;
+
 fn safetensors_header(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut file =
         File::open(path).map_err(|e| AudioError::Msg(format!("open {}: {e}", path.display())))?;
@@ -723,6 +726,15 @@ fn safetensors_header(path: &Path) -> Result<serde_json::Map<String, serde_json:
     file.read_exact(&mut len_bytes)
         .map_err(|e| AudioError::Msg(format!("read {} safetensors length: {e}", path.display())))?;
     let header_len_u64 = u64::from_le_bytes(len_bytes);
+    // Same cap as gen-core's bounded header reader (`weightsmeta`): a corrupt or hostile length
+    // prefix must not size a multi-GB allocation before the JSON is even parsed (sc-27343).
+    if header_len_u64 > SAFETENSORS_MAX_HEADER_BYTES {
+        return Err(AudioError::Msg(format!(
+            "{} safetensors header length {header_len_u64} exceeds the \
+             {SAFETENSORS_MAX_HEADER_BYTES}-byte maximum",
+            path.display()
+        )));
+    }
     let header_len: usize = header_len_u64.try_into().map_err(|_| {
         AudioError::Msg(format!(
             "{} safetensors header length does not fit this platform",
@@ -894,5 +906,21 @@ mod tests {
                 "an empty request whose shape does not match the persisted shape must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn safetensors_header_rejects_oversized_and_truncated_length_prefixes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bad.safetensors");
+        for len in [u64::MAX, SAFETENSORS_MAX_HEADER_BYTES + 1, 64] {
+            let mut bytes = len.to_le_bytes().to_vec();
+            bytes.extend_from_slice(b"{}");
+            std::fs::write(&path, bytes).unwrap();
+            assert!(safetensors_header(&path).is_err(), "{len}");
+        }
+        let mut bytes = 2_u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(safetensors_header(&path).unwrap().is_empty());
     }
 }

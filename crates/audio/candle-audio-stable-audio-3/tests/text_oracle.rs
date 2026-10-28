@@ -4,6 +4,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -104,9 +105,7 @@ fn cpu_fixture_path() -> PathBuf {
 }
 
 fn snapshot() -> PathBuf {
-    std::env::var_os("SA3_SMALL_MUSIC_SNAPSHOT")
-        .map(PathBuf::from)
-        .expect("SA3_SMALL_MUSIC_SNAPSHOT must point to the pinned immutable snapshot")
+    common::snapshot_dir("SA3_SMALL_MUSIC_SNAPSHOT")
 }
 
 fn cosine_and_max_abs(actual: &[f32], expected: &[f32]) -> (f64, f32) {

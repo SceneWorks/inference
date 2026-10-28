@@ -10,9 +10,7 @@
 
 use std::path::Path;
 
-use candle_audio::gen_core::safetensors_shards::{
-    resolve_safetensors_shards, snapshot_shard_roots,
-};
+use candle_audio::prepare::optional_component_tensor_count;
 use core_llm::{Error as CoreError, ModelFormat, PrepareReport, PrepareSpec, Result as CoreResult};
 
 /// Relative path of the DiT shard index inside a snapshot.
@@ -42,57 +40,6 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
     is_acestep_snapshot(&spec.source)
 }
 
-/// Count the tensors of one safetensors file from its 8-byte header length + JSON header only.
-fn safetensors_tensor_count(path: &Path) -> CoreResult<usize> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| CoreError::Msg(format!("prepare: read {}: {e}", path.display())))?;
-    if bytes.len() < 8 {
-        return Err(CoreError::Msg(format!(
-            "prepare: {} is not a safetensors file (short header)",
-            path.display()
-        )));
-    }
-    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-    let header = bytes.get(8..8 + n).ok_or_else(|| {
-        CoreError::Msg(format!(
-            "prepare: {} safetensors header truncated",
-            path.display()
-        ))
-    })?;
-    let v: serde_json::Value = serde_json::from_slice(header)
-        .map_err(|e| CoreError::Msg(format!("prepare: {} header: {e}", path.display())))?;
-    let obj = v.as_object().ok_or_else(|| {
-        CoreError::Msg(format!(
-            "prepare: {} header is not an object",
-            path.display()
-        ))
-    })?;
-    Ok(obj.keys().filter(|k| *k != "__metadata__").count())
-}
-
-fn count_component(dir: &Path, stem: &str, total: &mut usize) -> CoreResult<()> {
-    let index = dir.join(format!("{stem}.safetensors.index.json"));
-    let single = dir.join(format!("{stem}.safetensors"));
-    let present = |path: &Path| match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(CoreError::Msg(format!(
-            "prepare: inspect {}: {error}",
-            path.display()
-        ))),
-    };
-    if !present(&index)? && !present(&single)? {
-        return Ok(());
-    }
-    let roots = snapshot_shard_roots(dir).map_err(|e| CoreError::Msg(e.to_string()))?;
-    let shards =
-        resolve_safetensors_shards(dir, stem, &roots).map_err(|e| CoreError::Msg(e.to_string()))?;
-    for shard in shards {
-        *total += safetensors_tensor_count(&shard)?;
-    }
-    Ok(())
-}
-
 /// Prepare (verify + passthrough) an ACE-Step snapshot: counts the DiT, condition-encoder,
 /// text-encoder, and VAE tensors from their safetensors headers (no storage reads).
 pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
@@ -108,22 +55,15 @@ pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
         )));
     }
     let mut num_tensors = 0usize;
-    count_component(
-        &spec.source.join("transformer"),
-        "diffusion_pytorch_model",
-        &mut num_tensors,
-    )?;
-    count_component(
-        &spec.source.join("condition_encoder"),
-        "diffusion_pytorch_model",
-        &mut num_tensors,
-    )?;
-    count_component(&spec.source.join("text_encoder"), "model", &mut num_tensors)?;
-    count_component(
-        &spec.source.join("vae"),
-        "diffusion_pytorch_model",
-        &mut num_tensors,
-    )?;
+    for (component, stem) in [
+        ("transformer", "diffusion_pytorch_model"),
+        ("condition_encoder", "diffusion_pytorch_model"),
+        ("text_encoder", "model"),
+        ("vae", "diffusion_pytorch_model"),
+    ] {
+        num_tensors += optional_component_tensor_count(&spec.source.join(component), stem)
+            .map_err(|e| CoreError::Msg(format!("prepare: {e}")))?;
+    }
     if num_tensors == 0 {
         return Err(CoreError::Msg(format!(
             "prepare: {} carries no component safetensors tensors",
@@ -211,54 +151,5 @@ mod tests {
         let mut s = spec(&dir);
         s.quantize = Some(core_llm::Quantize::Q4);
         assert!(matches!(prepare(&s), Err(CoreError::Unsupported(_))));
-    }
-
-    #[test]
-    fn preparer_rejects_index_paths_and_nonregular_shards() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("text_encoder");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("model.safetensors"), tiny_safetensors(&["x"])).unwrap();
-        let index = dir.join("model.safetensors.index.json");
-        let mut total = 0;
-        std::fs::write(&index, r#"{"weight_map":{"x":"model.safetensors"}}"#).unwrap();
-        count_component(&dir, "model", &mut total).unwrap();
-        assert_eq!(total, 1);
-        for name in [
-            "../outside.safetensors",
-            "/tmp/outside.safetensors",
-            "missing.safetensors",
-        ] {
-            std::fs::write(
-                &index,
-                serde_json::json!({"weight_map":{"x":name}}).to_string(),
-            )
-            .unwrap();
-            assert!(
-                count_component(&dir, "model", &mut total).is_err(),
-                "{name}"
-            );
-            assert_eq!(total, 1);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            let outside = temp.path().join("outside.safetensors");
-            std::fs::write(&outside, tiny_safetensors(&["x"])).unwrap();
-            symlink(&outside, dir.join("external.safetensors")).unwrap();
-            std::fs::write(&index, r#"{"weight_map":{"x":"external.safetensors"}}"#).unwrap();
-            assert!(count_component(&dir, "model", &mut total).is_err());
-            let fifo = dir.join("pipe.safetensors");
-            assert!(std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success());
-            std::fs::write(&index, r#"{"weight_map":{"x":"pipe.safetensors"}}"#).unwrap();
-            assert!(count_component(&dir, "model", &mut total)
-                .unwrap_err()
-                .to_string()
-                .contains("not a regular file"));
-        }
     }
 }

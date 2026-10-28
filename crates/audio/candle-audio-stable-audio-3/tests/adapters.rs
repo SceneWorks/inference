@@ -32,6 +32,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -2856,11 +2857,7 @@ const REAL_CASES: &[RealCase] = &[
     },
 ];
 
-fn snapshot_root(env: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var(env).unwrap_or_else(|_| panic!("set {env} to the pinned immutable snapshot")),
-    )
-}
+use common::snapshot_dir as snapshot_root;
 
 /// Pick real adapter targets out of a real checkpoint header: the conditioner Linear plus the two
 /// smallest DiT Linears, so the synthetic adapter is genuinely spread across **both** target

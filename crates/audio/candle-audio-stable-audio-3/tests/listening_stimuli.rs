@@ -62,6 +62,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -74,7 +75,7 @@ use std::time::Duration;
 use candle_audio_stable_audio_3::candle_audio;
 use candle_audio_stable_audio_3::candle_audio::harness::MetricSet;
 use candle_audio_stable_audio_3::gen_core::{
-    AudioParams, AudioTrack, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource,
+    AudioParams, AudioTrack, GenerationOutput, GenerationRequest, LoadSpec,
 };
 use candle_audio_stable_audio_3::Variant;
 
@@ -363,11 +364,7 @@ fn common_target(measurements: &[MetricSet]) -> f32 {
         .min(MAX_TRUE_PEAK_DBTP - worst_peak_to_loudness - TRUE_PEAK_SAFETY_MARGIN_DB)
 }
 
-fn snapshot(env: &str) -> WeightsSource {
-    WeightsSource::Dir(PathBuf::from(
-        std::env::var(env).unwrap_or_else(|_| panic!("set {env} to the pinned immutable snapshot")),
-    ))
-}
+use common::snapshot_source as snapshot;
 
 fn request(prompt: &str, seed: u64) -> GenerationRequest {
     GenerationRequest {

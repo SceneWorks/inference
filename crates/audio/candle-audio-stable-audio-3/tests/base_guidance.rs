@@ -47,6 +47,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -101,35 +102,16 @@ fn cfg_error_amplification(guidance: f64) -> f64 {
     2.0 * guidance - 1.0
 }
 
-/// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
-/// `chunked_oracle.rs`.
-///
-/// Honouring `SA3_TEST_METAL` alone would silently run every gate in this file — and the
-/// frozen-Torch agreement floor they derive, which is only meaningful as a statement about *this*
-/// device and dtype — on `Device::Cpu` inside `sa3-base-identity-cuda`, which sets `SA3_TEST_CUDA`.
-/// A requested backend that is unavailable is a hard failure, never a fallback.
-fn device() -> Device {
-    if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
-        #[cfg(feature = "cuda")]
-        {
-            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            panic!("SA3_TEST_CUDA requires --features cuda")
-        }
-    } else {
-        Device::Cpu
-    }
-}
+// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
+// `chunked_oracle.rs`.
+//
+// Honouring `SA3_TEST_METAL` alone would silently run every gate in this file — and the
+// frozen-Torch agreement floor they derive, which is only meaningful as a statement about *this*
+// device and dtype — on `Device::Cpu` inside `sa3-base-identity-cuda`, which sets `SA3_TEST_CUDA`.
+// A requested backend that is unavailable is a hard failure, never a fallback.
+use common::test_device as device;
 
-fn snapshot(env: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var(env).unwrap_or_else(|_| panic!("set {env} to the pinned immutable snapshot")),
-    )
-}
+use common::snapshot_dir as snapshot;
 
 fn values(tensor: &Tensor) -> Vec<f32> {
     tensor
