@@ -46,7 +46,7 @@ const RETENTION_MEMORY_AUDIT_SCHEMA_VERSION: &str = "sceneworks.mlx-retention-me
 /// deliberately appears twice because its matching-dtype and strong-f32-literal policies own
 /// separate compiler handles. The audit executes this exact handle multiset twice in one child
 /// process: one miss and one hit per entry.
-const RETAINED_COMPILE_HANDLES: [&str; 25] = [
+const RETAINED_COMPILE_HANDLES: [&str; 24] = [
     "mlx_gen::nn::gated",
     "mlx_gen::nn::rope_rotate",
     "mlx_gen::nn::modulate",
@@ -55,7 +55,6 @@ const RETAINED_COMPILE_HANDLES: [&str; 25] = [
     "mlx_gen::nn::gelu_quick",
     "flux::transformer::gelu_ffn",
     "flux2::transformer::swiglu",
-    "ltx::rope::rope_rotate",
     "ltx::transformer::modulate",
     "ltx::transformer::gated",
     "ltx::transformer::gelu_ffn",
@@ -290,8 +289,6 @@ fn exercise_retained_compile_inventory(input: &mlx_rs::Array) -> Result<(), Stri
         .map_err(|error| format!("audit Flux retained handles: {error}"))?;
     runtime_macos::providers::flux2::transformer::exercise_retained_compile_inventory(input)
         .map_err(|error| format!("audit Flux2 retained handles: {error}"))?;
-    runtime_macos::providers::ltx::rope::exercise_retained_compile_inventory(input)
-        .map_err(|error| format!("audit LTX RoPE retained handles: {error}"))?;
     runtime_macos::providers::ltx::transformer::exercise_retained_compile_inventory(input)
         .map_err(|error| format!("audit LTX transformer retained handles: {error}"))?;
     runtime_macos::providers::qwen_image::transformer::attention::exercise_retained_compile_inventory(input)
@@ -352,7 +349,7 @@ fn run_retention_memory_child() -> Result<(), String> {
     drop(compile_guard);
 
     // The audit helpers evaluate and drop every output before returning. This releases the final
-    // request-owned tensor before allocator/cache sampling while the 25 retained compiler handles
+    // request-owned tensor before allocator/cache sampling while the 24 retained compiler handles
     // remain alive in their thread-local owners.
     drop(input);
     // MLX's completed default Metal command buffer keeps shallow references to its most recent
@@ -2043,16 +2040,16 @@ mod tests {
             .contains("exact full-inventory miss/hit"));
 
         let expected = expected_retention_diagnostics();
-        assert_eq!(RETAINED_COMPILE_HANDLES.len(), 25);
+        assert_eq!(RETAINED_COMPILE_HANDLES.len(), 24);
         assert_eq!(
             RETAINED_COMPILE_HANDLES
                 .iter()
                 .copied()
                 .collect::<BTreeSet<_>>()
                 .len(),
-            24
+            23
         );
-        assert_eq!(expected.len(), 49);
+        assert_eq!(expected.len(), 47);
         assert_eq!(
             expected
                 .get(&(
@@ -2077,7 +2074,7 @@ mod tests {
                     None,
                 ))
                 .copied(),
-            Some(50)
+            Some(48)
         );
     }
 
