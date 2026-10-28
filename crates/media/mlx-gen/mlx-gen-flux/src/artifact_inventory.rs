@@ -237,6 +237,30 @@ struct DigestCache {
     ready: Condvar,
 }
 
+/// Clears an identity's `Hashing` placeholder and wakes its waiters when the hashing caller leaves
+/// without publishing a result — an early `?` return (a poisoned relock) or a panic while hashing.
+/// Without it those waiters would block in `Condvar::wait` forever. The normal path has already
+/// replaced the placeholder when this runs, so it only re-notifies.
+struct HashingGuard<'a> {
+    cache: &'a DigestCache,
+    identity: ArtifactFileIdentity,
+}
+
+impl Drop for HashingGuard<'_> {
+    fn drop(&mut self) {
+        let mut entries = self
+            .cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(entries.get(&self.identity), Some(DigestState::Hashing)) {
+            entries.remove(&self.identity);
+        }
+        drop(entries);
+        self.cache.ready.notify_all();
+    }
+}
+
 fn digest_cache() -> &'static DigestCache {
     static CACHE: OnceLock<DigestCache> = OnceLock::new();
     CACHE.get_or_init(|| DigestCache {
@@ -302,12 +326,15 @@ fn hash_exact_file(identity: &ArtifactFileIdentity) -> CoreResult<String> {
         hasher.update(&buffer[..count]);
     }
     #[cfg(test)]
-    if let Some(hook) = hash_completion_hooks()
-        .lock()
-        .map_err(|_| CoreError::Msg("flux1: hash-hook lock poisoned".to_owned()))?
-        .remove(&identity.canonical_path)
     {
-        hook();
+        // Take the hook out before running it, so a hook that panics cannot poison the hook map.
+        let hook = hash_completion_hooks()
+            .lock()
+            .map_err(|_| CoreError::Msg("flux1: hash-hook lock poisoned".to_owned()))?
+            .remove(&identity.canonical_path);
+        if let Some(hook) = hook {
+            hook();
+        }
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -346,6 +373,10 @@ fn pinned_artifact(path: &Path) -> CoreResult<PinnedArtifact> {
             None => {
                 entries.insert(identity.clone(), DigestState::Hashing);
                 drop(entries);
+                let _hashing = HashingGuard {
+                    cache,
+                    identity: identity.clone(),
+                };
                 let digest = hash_exact_file(&identity);
                 let unchanged = source_entry_identity(&source.absolute_path).ok().as_ref()
                     == Some(&source)
@@ -1450,6 +1481,44 @@ mod tests {
         assert!(first.ensure_unchanged().is_err());
         let second = PinnedArtifact::verify_file(&path).unwrap();
         assert_ne!(first.digest(), second.digest());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// sc-27430: a panic while hashing must not strand later callers on the `Hashing` placeholder.
+    /// MUTATION: drop the `HashingGuard` and the second caller never returns (the bounded wait
+    /// below turns that hang into a failure).
+    #[test]
+    fn a_panic_while_hashing_does_not_strand_later_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "hash-panic");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("model.safetensors");
+        std::fs::write(&path, [5_u8; 32]).unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        hash_completion_hooks()
+            .lock()
+            .unwrap()
+            .insert(canonical, Box::new(|| panic!("injected hashing panic")));
+        let first = {
+            let path = path.clone();
+            std::thread::spawn(move || PinnedArtifact::verify_file(&path).map(|_| ()))
+        };
+        assert!(
+            first.join().is_err(),
+            "the injected hook panics the first caller"
+        );
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let second = path.clone();
+        std::thread::spawn(move || {
+            let _ = sender
+                .send(PinnedArtifact::verify_file(&second).map(|pin| pin.digest().to_owned()));
+        });
+        let digest = receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("a later caller must not wait forever on an abandoned hash")
+            .unwrap();
+        assert_eq!(digest.len(), 64);
         std::fs::remove_dir_all(root).ok();
     }
 
