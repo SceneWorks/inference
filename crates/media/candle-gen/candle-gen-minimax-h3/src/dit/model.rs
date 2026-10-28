@@ -1288,8 +1288,11 @@ mod veda_controls_tests {
     /// sc-26691: an attached cancel flag is observed **inside** the forward, before the first
     /// block — not only at the denoise loop's step boundary. Called through `JointVelocity`
     /// directly, so the loop's own check cannot be what answers. No block executes.
-    #[test]
-    fn an_attached_cancel_stops_the_forward_before_the_first_block() {
+    ///
+    /// A control of the gated [`native_controls_capture_every_mode_packed_tier_and_adapter_stack`]
+    /// rather than its own `#[test]`: it constructs a complete synthetic `JointDit`, which the H3
+    /// ordinary-execution policy keeps out of ordinary CI.
+    fn assert_attached_cancel_stops_the_forward_before_the_first_block() {
         let device = Device::Cpu;
         let w = weights(None);
         let dit = MiniMaxH3Dit::from_weights(&w, &config(), &device, DType::F32).unwrap();
@@ -1350,6 +1353,7 @@ mod veda_controls_tests {
                 }
             }
         }
+        assert_attached_cancel_stops_the_forward_before_the_first_block();
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack");
