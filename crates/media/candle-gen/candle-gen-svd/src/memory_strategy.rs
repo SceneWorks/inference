@@ -151,8 +151,8 @@ fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<&Path> {
             crate::MODEL_ID
         )));
     };
-    if std::env::var_os("SVD_FORCE_F16").is_some()
-        || std::env::var_os("SVD_FORCE_BF16").is_some()
+    if candle_gen::gen_core::env_flag("SVD_FORCE_F16")
+        || candle_gen::gen_core::env_flag("SVD_FORCE_BF16")
         || spec.precision != Precision::Bf16
         || spec.quantize.is_some()
         || !spec.adapters.is_empty()
@@ -295,8 +295,8 @@ impl PreparedSvdMemory {
     }
 
     pub fn ensure_unchanged(&self) -> gen_core::Result<()> {
-        if std::env::var_os("SVD_FORCE_F16").is_some()
-            || std::env::var_os("SVD_FORCE_BF16").is_some()
+        if candle_gen::gen_core::env_flag("SVD_FORCE_F16")
+            || candle_gen::gen_core::env_flag("SVD_FORCE_BF16")
         {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: Candle dtype override appeared after admission",
@@ -674,12 +674,7 @@ pub fn safety_check(
     prepared: &PreparedSvdMemory,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match validate_context(prepared, context) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_result(validate_context(prepared, context))
 }
 
 thread_local! {

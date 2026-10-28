@@ -215,12 +215,57 @@ class RustSourceLintTests(unittest.TestCase):
         self.check()  # no raise
 
 
+class ProductionEnvReadTests(unittest.TestCase):
+    """sc-27313: production `src/` env reads must be listed in PRODUCTION_ENV_READS."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def write(self, relative: str, body: str) -> None:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+
+    def check(self) -> None:
+        self.gate.check_production_env_reads(self.root)
+
+    def test_unlisted_production_read_fails(self) -> None:
+        self.write("crates/media/x/src/lib.rs", 'fn f() -> bool { std::env::var_os("X_FORCE_F16").is_some() }\n')
+        with self.assertRaisesRegex(AssertionError, "X_FORCE_F16"):
+            self.check()
+
+    def test_unlisted_env_flag_read_fails(self) -> None:
+        self.write("crates/media/x/src/lib.rs", 'fn f() -> bool { gen_core::env_flag("X_SOFTMAX_BF16") }\n')
+        with self.assertRaisesRegex(AssertionError, "X_SOFTMAX_BF16"):
+            self.check()
+
+    def test_listed_knob_test_code_comments_and_non_src_are_allowed(self) -> None:
+        self.write(
+            "crates/media/x/src/lib.rs",
+            'fn f() -> bool { gen_core::env_flag("WAN_ATTN_SOFTMAX_BF16") }\n'
+            '// std::env::var("X_IN_A_COMMENT")\n'
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            '    fn g() -> String { std::env::var("X_TEST_ONLY").unwrap() }\n'
+            "}\n"
+            "#[cfg(test)]\n"
+            "mod fixtures;\n",
+        )
+        self.write("crates/media/x/src/fixtures.rs", 'fn h() { std::env::var("X_FIXTURE").ok(); }\n')
+        self.write("crates/media/x/tests/real.rs", 'fn r() { std::env::var("X_SNAPSHOT").ok(); }\n')
+        self.check()  # no raise
+
+
 class RepositoryTreeIsCleanTests(unittest.TestCase):
     """The real inference tree must satisfy the guardrail (green on the committed clean tree)."""
 
     def test_workspace_rust_has_no_hf_cache_or_side_channel(self) -> None:
         gate = load_gate_module()
         gate.check_rust_sources(ROOT)  # no raise on the clean tree
+        gate.check_production_env_reads(ROOT)
 
 
 if __name__ == "__main__":

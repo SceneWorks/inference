@@ -179,6 +179,37 @@ DELETED_ENV_SIDE_CHANNELS = (
     "PULID_FACE_WEIGHTS_DIR",
 )
 
+# Every process-environment variable production `crates/**/src/**` code (outside `#[cfg(test)]`)
+# reads by literal name, through `env::var` / `env::var_os` or gen-core's `env_flag` (sc-27313). An
+# env var that changes numerics, shapes or routing sits outside the request and the provider contract,
+# so two workers with different environments render differently for the same request; adding one is a
+# deliberate edit here, not an incidental `env::var` call. Boolean knobs parse through
+# `gen_core::env_flag` (`1`/`true`/`yes`/`on`), never presence (`var_os(..).is_some()`).
+PRODUCTION_ENV_READS = frozenset({
+    # Platform / device / process plumbing.
+    "CANDLE_LLM_DEVICE", "CUDA_PATH", "CUDA_VISIBLE_DEVICES", "HOME", "LOCALAPPDATA", "SystemRoot",
+    "XDG_CACHE_HOME", "SCENEWORKS_CANDLE_DEVICE_CACHE_DIR", "SCENEWORKS_ROOT",
+    # Memory-budget / attention-budget / token-cap overrides.
+    "LTX_MAX_LATENT_TOKENS", "SEEDVR2_BUDGET_GIB", "WAN_ATTN_SCORES_BUDGET", "MLX_SDPA_BLOCKS",
+    "SDXL_PREDICTION_BUDGET_BYTES", "MLX_GEN_SANA_DECODE_TILE", "ANIMA_SPLIT_FILES",
+    # Numeric / behaviour A/B toggles (boolean ones go through `env_flag`).
+    "FLUX2_IMG_GUIDANCE", "PID_PIXEL_POS_ABS", "SCAIL2_COMPUTE_BF16", "SDXL_LORA_VENDORED",
+    "SVD_FORCE_BF16", "SVD_FORCE_F16", "WAN_ATTN_SOFTMAX_BF16", "MOSS_TTS_MIN_FRAMES",
+    # Calibration / measurement / proof harness inputs and CI provenance.
+    "MEMORY_EXPECTED_ABI", "MEMORY_EXPECTED_FINGERPRINT", "MODEL_INFERENCE_CASE_FQN", "GITHUB_SHA",
+    "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "MOSS_CPU_RECEIPT_PATH", "MOSS_CUDA_UNIT_EXPECTED_GPU_UUID",
+    "MOSS_PORTABLE_EXCHANGE_INPUT", "MOSS_PORTABLE_EXCHANGE_OUTPUT", "SDXL_PREDICTION_SNAPSHOTS",
+    "SDXL_LDM_CHECKPOINT", "SDXL_TOKENIZER_ROOT", "SDXL_GOLDEN_WRITE",
+    "QWEN_IMAGE_2_1_LORA_PHASE", "QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS",
+    "QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS_OUT",
+    # Subprocess capture markers set by a parent test harness for its own child.
+    "IOS_CAPTURE_IN_CHILD", "IOS_CAPTURE_PERMIT_CPU_CHILD", "IRIS_STREAM_CPU_CHILD",
+    "SDXL_IOS_QUANTUM_CPU_BODY_DONE", "SDXL_IOS_QUANTUM_CPU_CHILD",
+    # Debug output only (never numerics).
+    "MOSS_CODEC_DEBUG", "MOSS_TTSD_CODEC_DEBUG", "PID_CAPTURE_LATENT", "SDXL_VAE_TRACE_TILE",
+    "SVD_DEBUG", "ZIMAGE_PRINT_ANCHOR", "ZIMAGE_PROOF_PRINT_ONLY",
+})
+
 # The crate that owns the shared PiD decode seam and, since sc-15775, the shared per-route decode
 # domain. A direct dependency on it is what makes a provider PiD-eligible.
 PID_SEAM_CRATE = "mlx-gen-pid"
@@ -2027,6 +2058,41 @@ def check_rust_sources(root: Path) -> None:
         fail(f"inference source must not reference HF caches or deleted env side channels:\n  {joined}")
 
 
+def check_production_env_reads(root: Path) -> None:
+    """Fail on a production `src/` read of a process-environment variable that is not in
+    PRODUCTION_ENV_READS (sc-27313). `#[cfg(test)]` blocks and `#[cfg(test)] mod name;` files are test
+    code and exempt; only literal names are matched."""
+    crates = root / "crates"
+    if not crates.is_dir():
+        return
+    read = re.compile(r"\b(?:env::var(?:_os)?|env_flag)\s*\(\s*\"([A-Za-z0-9_]+)\"\s*\)")
+    test_only = _test_only_files(root)
+    violations: list[str] = []
+    for path in sorted(crates.rglob("*.rs")):
+        relative = path.relative_to(root)
+        if "src" not in relative.parts or path in test_only:
+            continue
+        if not SOURCE_LINT_IGNORED_PARTS.isdisjoint(relative.parts):
+            continue
+        text = path.read_text(encoding="utf-8")
+        code = strip_rust_comments(text)
+        spans = _cfg_test_spans(code)
+        for match in read.finditer(code):
+            name = match.group(1)
+            if name in PRODUCTION_ENV_READS:
+                continue
+            if any(start <= match.start() < end for start, end in spans):
+                continue
+            violations.append(f"{relative}:{_line_of(code, match.start())}: {name}")
+    if violations:
+        joined = "\n  ".join(violations)
+        fail(
+            "production code reads an unlisted process-environment variable; inference takes its "
+            "inputs from the request/provider contract — add a deliberate knob to "
+            f"PRODUCTION_ENV_READS:\n  {joined}"
+        )
+
+
 def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
     """A PiD-eligible provider that adopts bounded decode must declare its routes through the shared
     ``mlx_gen_pid::DecodeRoutes`` (sc-15775).
@@ -3330,6 +3396,7 @@ def main() -> int:
         check_network_clients(metadata)
         check_ios_graph(args.offline)
         check_rust_sources(ROOT)
+        check_production_env_reads(ROOT)
         check_pid_decode_route_adoption(metadata, ROOT)
         check_snapshot_path_derivation(ROOT)
         check_test_temp_dir_guards(ROOT)
@@ -3342,7 +3409,7 @@ def main() -> int:
         "workspace gate: OK "
         f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
         "intentional tokenizer split, no network clients, no trainers in the iOS graph, "
-        "no HF-cache references, "
+        "no HF-cache references, only listed production env reads, "
         "no $HOME-derived snapshot paths, no unguarded test temp roots, "
         "no cross-backend geometry drift)"
     )

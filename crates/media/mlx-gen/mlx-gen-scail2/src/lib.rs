@@ -50,7 +50,7 @@ pub type ProviderVae = mlx_gen_wan::WanVae;
 /// hardcoded 4 while its own comment named the hatch, so an opted-in run published a 2x
 /// over-estimate of every activation-sized term.
 pub fn compute_bf16_opt_in() -> bool {
-    std::env::var("SCAIL2_COMPUTE_BF16").is_ok_and(|value| value == "1")
+    mlx_gen::gen_core::env_flag("SCAIL2_COMPUTE_BF16")
 }
 
 pub const VAE_TILING: mlx_gen::tiling::VaeTiling = ProviderVae::VAE_TILING;
