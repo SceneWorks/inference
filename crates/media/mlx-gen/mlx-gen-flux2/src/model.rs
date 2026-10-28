@@ -585,6 +585,8 @@ pub struct Flux2 {
 
 impl Flux2 {
     /// Construct a weightless instance for validation tests (no tokenizer, loader closures that error).
+    /// In-crate tests only: unlike `Flux1::new_for_tests`, no other crate consumes this fixture.
+    #[cfg(test)]
     pub fn new_for_tests(variant: Flux2Variant) -> Self {
         let loaded_spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         Self {
