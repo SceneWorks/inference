@@ -27,6 +27,13 @@ use crate::Error;
 /// The model's sample rate.
 pub const SAMPLE_RATE: u32 = 24_000;
 
+/// The longest source a transcription accepts, in seconds (sc-27345), applied after
+/// [`TranscriptionSettings::max_seconds`](crate::review::TranscriptionSettings::max_seconds) crops
+/// it. The model input and the transcription's retained copy both scale with the source length, so
+/// an unbounded source could exhaust memory before the model runs; one hour is far past any song.
+/// A longer source is a typed request error naming `max_seconds`, never a silent crop.
+pub const MAX_SOURCE_LENGTH_S: f64 = 3600.0;
+
 /// The transcriber's provider id (the key of its component mapping).
 pub const TRANSCRIBER_ID: &str = "sheetsage2";
 
@@ -119,7 +126,8 @@ impl SourceAudio {
         &self.samples
     }
 
-    /// Apply `max_seconds` and upstream's validity checks; returns the model input and its identity.
+    /// Apply `max_seconds`, the [`MAX_SOURCE_LENGTH_S`] ceiling and upstream's validity checks;
+    /// returns the model input and its identity.
     fn prepare(
         &self,
         max_seconds: Option<f64>,
@@ -132,20 +140,30 @@ impl SourceAudio {
                 self.resampled_to.unwrap_or(0)
             )));
         }
-        let mut samples = self.samples.clone();
         let mut conversion = self.conversion.clone();
+        // Crop before copying (sc-27345): only the kept prefix of the source is cloned.
+        let mut keep = self.samples.len();
         if let Some(max) = max_seconds {
             if !(max.is_finite() && max > 0.0) {
                 return Err(Error::Request(
                     "max_seconds must be finite and positive".into(),
                 ));
             }
-            let keep = (max * f64::from(rate)).round_ties_even() as usize;
-            if keep < samples.len() {
-                samples.truncate(keep);
+            let max_samples = (max * f64::from(rate)).round_ties_even() as usize;
+            if max_samples < keep {
+                keep = max_samples;
                 conversion.push_str(&format!("; cropped to {max} s"));
             }
         }
+        let ceiling = (MAX_SOURCE_LENGTH_S * f64::from(rate)) as usize;
+        if keep > ceiling {
+            return Err(Error::Request(format!(
+                "source is {:.1} s, past the {MAX_SOURCE_LENGTH_S} s transcription ceiling; set \
+                 max_seconds to crop it",
+                keep as f64 / f64::from(rate)
+            )));
+        }
+        let samples = self.samples[..keep].to_vec();
         if samples.len() < minimum || samples.iter().any(|s| !s.is_finite()) {
             return Err(Error::Request(format!(
                 "audio must contain at least {minimum} finite samples at {rate} Hz"
