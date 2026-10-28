@@ -100,44 +100,74 @@ pub fn preprocess_image(
     width: usize,
     device: &Device,
 ) -> Result<(Tensor, [i32; 3])> {
+    preprocess_frames(&[pixels_hwc; TEMPORAL_PATCH_SIZE], height, width, device)
+}
+
+/// Qwen3-VL preprocessing of one temporal patch of video: exactly [`TEMPORAL_PATCH_SIZE`]
+/// consecutive RGB8 frames of one geometry, laid out across the temporal axis in order. Same
+/// `pixel_values` / `grid_thw` contract as [`preprocess_image`], which is this with the single image
+/// repeated. A video reference is one such group per sampled frame pair, each its own `grid_t == 1`
+/// block: the tower attends within a temporal group, so encoding the pairs separately is the
+/// reference's whole-clip encoding.
+pub fn preprocess_frames(
+    frames_hwc: &[&[u8]],
+    height: usize,
+    width: usize,
+    device: &Device,
+) -> Result<(Tensor, [i32; 3])> {
+    if frames_hwc.len() != TEMPORAL_PATCH_SIZE {
+        return Err(CandleError::Msg(format!(
+            "boogu vision: a temporal patch is {TEMPORAL_PATCH_SIZE} frames, got {}",
+            frames_hwc.len()
+        )));
+    }
     if height == 0 || width == 0 {
         return Err(CandleError::Msg(format!(
             "boogu vision: zero dimension ({width}x{height})"
         )));
     }
-    if pixels_hwc.len()
-        != candle_gen::gen_core::imageops::checked_image_buffer_len(width, height, 3)
-            .unwrap_or(usize::MAX)
-    {
-        return Err(CandleError::Msg(format!(
-            "boogu vision: pixel buffer {} != {width}x{height}x3",
-            pixels_hwc.len()
-        )));
+    let expected = candle_gen::gen_core::imageops::checked_image_buffer_len(width, height, 3)
+        .unwrap_or(usize::MAX);
+    for pixels_hwc in frames_hwc {
+        if pixels_hwc.len() != expected {
+            return Err(CandleError::Msg(format!(
+                "boogu vision: pixel buffer {} != {width}x{height}x3",
+                pixels_hwc.len()
+            )));
+        }
     }
     let geometry = image_geometry(height, width)?;
     let (rh, rw) = (geometry.resized_height, geometry.resized_width);
 
     // Resize on the uint8 image (PIL-exact bicubic) → f32 HWC in [0, 255].
-    let resized: Vec<f32> = if (height, width) == (rh, rw) {
-        pixels_hwc.iter().map(|&p| p as f32).collect()
-    } else {
-        resize_bicubic_u8(pixels_hwc, height, width, rh, rw)?
+    let resize = |pixels_hwc: &[u8]| -> Result<Vec<f32>> {
+        if (height, width) == (rh, rw) {
+            Ok(pixels_hwc.iter().map(|&p| p as f32).collect())
+        } else {
+            Ok(resize_bicubic_u8(pixels_hwc, height, width, rh, rw)?)
+        }
     };
 
-    // /255, normalize (x - 0.5)/0.5, laid out as the single frame repeated across the temporal axis.
+    // /255, normalize (x - 0.5)/0.5, each frame laid out at its own temporal index.
     let (c, t) = (3usize, TEMPORAL_PATCH_SIZE);
     let plane = rh * rw;
     let mut chw = vec![0f32; t * c * plane];
-    for ch in 0..c {
-        for y in 0..rh {
-            for x in 0..rw {
-                let v = (resized[(y * rw + x) * c + ch] / 255.0 - IMAGE_MEAN) / IMAGE_STD;
-                let chw_idx = ch * plane + y * rw + x;
-                for frame in 0..t {
-                    chw[frame * c * plane + chw_idx] = v;
+    let mut previous: Option<(&[u8], Vec<f32>)> = None;
+    for (frame, pixels_hwc) in frames_hwc.iter().enumerate() {
+        // An image fills every temporal slot with the same buffer: resize it once.
+        let resized = match previous.take() {
+            Some((source, resized)) if std::ptr::eq(source, *pixels_hwc) => resized,
+            _ => resize(pixels_hwc)?,
+        };
+        for ch in 0..c {
+            for y in 0..rh {
+                for x in 0..rw {
+                    let v = (resized[(y * rw + x) * c + ch] / 255.0 - IMAGE_MEAN) / IMAGE_STD;
+                    chw[frame * c * plane + ch * plane + y * rw + x] = v;
                 }
             }
         }
+        previous = Some((pixels_hwc, resized));
     }
 
     // Patchify to (gh·gw, c·T·patch²) in the merge-grouped row order.
@@ -181,6 +211,35 @@ pub fn preprocess_image(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_frame_pair_lays_each_frame_on_its_own_temporal_slot() {
+        let (h, w) = (64usize, 64usize);
+        let (a, b) = (vec![10u8; h * w * 3], vec![200u8; h * w * 3]);
+        let device = Device::Cpu;
+        let (image, image_grid) = preprocess_image(&a, h, w, &device).unwrap();
+        let (repeated, repeated_grid) = preprocess_frames(&[&a, &a], h, w, &device).unwrap();
+        assert_eq!(image_grid, repeated_grid);
+        assert_eq!(
+            image.to_vec2::<f32>().unwrap(),
+            repeated.to_vec2::<f32>().unwrap(),
+            "an image is exactly its own frame repeated across the temporal patch"
+        );
+        let (pair, pair_grid) = preprocess_frames(&[&a, &b], h, w, &device).unwrap();
+        assert_eq!(
+            pair_grid, image_grid,
+            "one temporal patch is one grid_t == 1 block"
+        );
+        // Feature order is (channel, temporal, patch_y, patch_x): frame a, then frame b.
+        let row = pair.get(0).unwrap().to_vec1::<f32>().unwrap();
+        let p2 = PATCH_SIZE * PATCH_SIZE;
+        let level = |u: f32| (u / 255.0 - IMAGE_MEAN) / IMAGE_STD;
+        assert!(row[..p2].iter().all(|&x| (x - level(10.0)).abs() < 1e-5));
+        assert!(row[p2..2 * p2]
+            .iter()
+            .all(|&x| (x - level(200.0)).abs() < 1e-5));
+        assert!(preprocess_frames(&[&a], h, w, &device).is_err());
+    }
+
     use super::*;
 
     #[test]
