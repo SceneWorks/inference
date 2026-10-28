@@ -495,6 +495,26 @@ def automatic_jobs(workflow: dict, event: str, extra_context: dict | None = None
     return possible
 
 
+# Reviewed Windows storage housekeeping: Node dispatches only its fixed PowerShell helper;
+# the pure test uses fake storage/process/API inputs. Bind the complete local action/test closure
+# rather than treating arbitrary Node programs or JavaScript actions as ordinary CI commands.
+REVIEWED_STORAGE_CLEANUP = {
+    '.github/actions/cleanup-runner-storage/action.yml': 'af221193e9b1d5a2cadecd048a9922f9d783cd278583e7320ec5d03f9d1143b1',
+    '.github/actions/cleanup-runner-storage/index.mjs': '49ac6fc7b0f679a3c07a31a788b9e7858db83b118736e6679692ba0aae639f1b',
+    '.github/actions/cleanup-runner-storage/storage.ps1': 'ce0adc2af81eb99e158c7758c6dbab3a3c817dc845be9337a1726534b26ed269',
+    'scripts/runner-storage-cleanup.test.mjs': '7d2e2101535e13a095dea5e5e8937e02776f415b7ee901130876e593d2b8e2a8',
+}
+
+
+def reviewed_storage_cleanup(root: Path) -> bool:
+    for relative, digest in REVIEWED_STORAGE_CLEANUP.items():
+        path = root / relative
+        if (not path.is_file() or not path.resolve().is_relative_to(root.resolve())
+                or hashlib.sha256(path.read_bytes()).hexdigest() != digest):
+            return False
+    return True
+
+
 class RunGraph:
     """Resolve repository script/driver edges, without importing or executing the scripts.
 
@@ -579,6 +599,13 @@ class RunGraph:
                 if option in ('-u', '-g', '-n', '-k', '--kill-after', '--signal') and args: args.pop(0)
             if leaf == 'timeout' and args: args.pop(0)
             self.command(args or [UNKNOWN], (*chain, leaf + ' command'), base)
+            return
+        if leaf in ('node', 'node.exe'):
+            if (args == ['--test', 'scripts/runner-storage-cleanup.test.mjs']
+                    and reviewed_storage_cleanup(self.root)):
+                self.finding('ordinary', chain, 'exact-source storage cleanup pure Node tests')
+            else:
+                self.finding('unknown', chain, 'unreviewed Node source or arguments')
             return
         if leaf == 'uv' and args[:1] in (['run'], ['tool']):
             self.finding('unknown', chain, 'unresolved uv execution route')
@@ -1669,6 +1696,9 @@ def workflow_errors(workflow: dict, name: str, root: Path = ROOT, evidence: list
                         child['on'] = {event: None for event in callable_events or {'workflow_dispatch'}}
                         child.pop(True, None)
                         errors.extend(workflow_errors(child, target, root, evidence, seen))
+                    elif (target == '.github/actions/cleanup-runner-storage'
+                          and reviewed_storage_cleanup(root)):
+                        graph.finding('ordinary', (name, job_name), 'exact-source Windows storage housekeeping action and post hook')
                     else:
                         graph.finding('unknown', (name, job_name), 'local action execution requires resolution: ' + target)
                 else:

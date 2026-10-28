@@ -6866,6 +6866,7 @@ jobs:
       # CI config); its daemon resets mid-build on heavy Candle/CUDA graphs ("os error 10054" with
       # zero rustc diagnostics). Clear the wrapper for THIS job only; sibling jobs keep sccache and
       # the registry/git/target caches stay intact. Same step as windows-candle.yml's heavy lane.
+      - uses: ./.github/actions/cleanup-runner-storage
       - name: Disable unstable sccache wrapper for the heavy Candle lane
         shell: powershell
         run: |
@@ -6963,6 +6964,7 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: ./.github/actions/cleanup-runner-storage
       - name: Select Git Bash
         shell: cmd
         run: |

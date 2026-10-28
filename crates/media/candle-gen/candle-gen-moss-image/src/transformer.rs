@@ -38,6 +38,16 @@ pub(crate) fn check_cancel(cancel: &CancelFlag) -> Result<()> {
     }
 }
 
+pub(super) fn ordinary_time_silu(x: &Tensor) -> Result<Tensor> {
+    // Reuse the edit graph's author nn.SiLU boundary only for BF16.
+    // Other dtype arithmetic remains unchanged.
+    if x.dtype() == DType::BF16 {
+        edit::silu(x)
+    } else {
+        Ok(candle_nn::ops::silu(x)?)
+    }
+}
+
 struct LowRank {
     down: Tensor,
     up: Tensor,
@@ -882,7 +892,7 @@ impl Transformer {
             .to_dtype(self.time1.dtype())?;
         let t = self
             .time2
-            .forward(&candle_nn::ops::silu(&self.time1.forward(&t)?)?)?
+            .forward(&ordinary_time_silu(&self.time1.forward(&t)?)?)?
             .to_dtype(DType::F32)?;
         let m = self
             .shared
@@ -1013,7 +1023,7 @@ impl Transformer {
             .to_dtype(self.time1.dtype())?;
         let t = self
             .time2
-            .forward(&candle_nn::ops::silu(&self.time1.forward(&t)?)?)?
+            .forward(&ordinary_time_silu(&self.time1.forward(&t)?)?)?
             .to_dtype(DType::F32)?;
         let m = self
             .shared

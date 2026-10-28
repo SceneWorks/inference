@@ -1,35 +1,39 @@
 //! Actual-tensor, bounded-chunk observations for explicit native acceptance only.
 use super::*;
 use gen_core_testkit::moss_training_probe::{
-    EvaluationContentHasher, EvaluationObservation, EvaluationTensorDescriptor, RunProbe,
-    EVALUATION_CONTENT_ENCODING,
+    update_audit_f32_hash, EvaluationContentHasher, EvaluationObservation,
+    EvaluationTensorDescriptor, RunProbe, EVALUATION_CONTENT_ENCODING,
 };
 use sha2::{Digest, Sha256};
-const CHUNK: usize = 4_194_304;
-pub(super) fn digest(arrays: impl IntoIterator<Item = Array>) -> Result<String> {
+mod chunks;
+use chunks::audit_chunks;
+pub(super) fn digest(
+    arrays: impl IntoIterator<Item = Array>,
+    cancel: &CancelFlag,
+) -> Result<String> {
+    crate::pipeline::check(cancel)?;
     let mut hash = Sha256::new();
     for array in arrays {
+        crate::pipeline::check(cancel)?;
         hash.update(format!("{:?}:{:?};", array.dtype(), array.shape()).as_bytes());
         let flat = array.reshape(&[-1])?;
         let n = usize::try_from(flat.shape()[0])
             .map_err(|_| Error::Msg("unrepresentable audit tensor".into()))?;
-        for start in (0..n).step_by(CHUNK) {
-            let end = start + CHUNK.min(n - start);
-            let part = mlx_gen::attention::slice_axis(&flat, 0, start as i32, end as i32)?;
+        for (start, len) in audit_chunks(n) {
+            crate::pipeline::check(cancel)?;
+            let part = mlx_gen::attention::slice_axis(&flat, 0, start as i32, len as i32)?;
             let values = crate::pipeline::logical_f32_readback(&part)?;
-            let bytes = values
-                .into_iter()
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<_>>();
-            hash.update(&bytes);
+            crate::pipeline::check(cancel)?;
+            update_audit_f32_hash(&mut hash, &values, cancel)?;
         }
     }
     Ok(format!("{:x}", hash.finalize()))
 }
-pub(super) fn factors(params: &LoraParams) -> Result<String> {
+pub(super) fn factors(params: &LoraParams, cancel: &CancelFlag) -> Result<String> {
+    crate::pipeline::check(cancel)?;
     let mut ordered = params.iter().collect::<Vec<_>>();
     ordered.sort_unstable_by_key(|(a, _)| *a);
-    digest(ordered.into_iter().map(|(_, v)| v.clone()))
+    digest(ordered.into_iter().map(|(_, v)| v.clone()), cancel)
 }
 pub(super) fn gradients(probe: &RunProbe, grads: &LoraParams) -> Result<()> {
     let mut finite = true;
@@ -118,10 +122,12 @@ pub(super) fn prepare(
     })
 }
 impl Evaluation {
-    fn descriptor(tensor: &Array) -> Result<EvaluationTensorDescriptor> {
+    fn descriptor(tensor: &Array, cancel: &CancelFlag) -> Result<EvaluationTensorDescriptor> {
+        crate::pipeline::check(cancel)?;
         // MLX reports placeholder contiguous strides until evaluation; inspect only
         // after materialization of the original array, never of the flattened copy.
         eval([tensor])?;
+        crate::pipeline::check(cancel)?;
         let shape = tensor
             .shape()
             .iter()
@@ -136,14 +142,12 @@ impl Evaluation {
         let flat = tensor.reshape(&[-1])?;
         let n = usize::try_from(flat.shape()[0])
             .map_err(|_| Error::Msg("unrepresentable audit tensor".into()))?;
-        for start in (0..n).step_by(CHUNK) {
-            let part = mlx_gen::attention::slice_axis(
-                &flat,
-                0,
-                start as i32,
-                (start + CHUNK.min(n - start)) as i32,
-            )?;
-            hash.update(crate::pipeline::logical_f32_readback(&part)?);
+        for (start, len) in audit_chunks(n) {
+            crate::pipeline::check(cancel)?;
+            let part = mlx_gen::attention::slice_axis(&flat, 0, start as i32, len as i32)?;
+            let values = crate::pipeline::logical_f32_readback(&part)?;
+            crate::pipeline::check(cancel)?;
+            hash.update_cancellable(&values, cancel)?;
         }
         Ok(EvaluationTensorDescriptor {
             shape,
@@ -153,17 +157,21 @@ impl Evaluation {
             content_sha256: hash.finish(),
         })
     }
-    pub(super) fn observation(&self, loss: f32) -> Result<EvaluationObservation> {
+    pub(super) fn observation(
+        &self,
+        loss: f32,
+        cancel: &CancelFlag,
+    ) -> Result<EvaluationObservation> {
         let mut tensors = std::collections::BTreeMap::new();
         for (name, tensor) in [
             ("latent", &self.latent),
             ("context", &self.context),
             ("noise", &self.noise),
         ] {
-            tensors.insert(name.into(), Self::descriptor(tensor)?);
+            tensors.insert(name.into(), Self::descriptor(tensor, cancel)?);
         }
         if let Some(mask) = &self.mask {
-            tensors.insert("mask".into(), Self::descriptor(mask)?);
+            tensors.insert("mask".into(), Self::descriptor(mask, cancel)?);
         }
         Ok(EvaluationObservation {
             tensors,
@@ -195,5 +203,21 @@ impl Evaluation {
             return Err(Error::Unsupported("heldout objective is nonfinite".into()));
         }
         Ok(loss)
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn precancelled_digest_never_requests_a_tensor() {
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let shared =
+            update_audit_f32_hash(&mut Sha256::new(), &[1.0], &cancel).map_err(Error::from);
+        assert!(matches!(shared, Err(Error::Canceled)));
+        let tensors = std::iter::from_fn(|| panic!("canceled audit must not touch tensor input"));
+        assert!(matches!(digest(tensors, &cancel), Err(Error::Canceled)));
     }
 }

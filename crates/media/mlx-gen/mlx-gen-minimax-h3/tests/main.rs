@@ -30,6 +30,9 @@ mod adaln_evict_real_weights;
 #[path = "adapter_topology.rs"]
 mod adapter_topology;
 
+#[path = "artifact_probe.rs"]
+mod artifact_probe;
+
 #[path = "audio_vae_encode_parity.rs"]
 mod audio_vae_encode_parity;
 

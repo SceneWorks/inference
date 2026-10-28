@@ -934,13 +934,7 @@ impl Transformer {
                 .forward(&Array::from_slice(&features, &[1, g.freq]))?;
             let time = self
                 .time2
-                .forward(&if self.training
-                    || mlx_rs::Device::try_default()? == mlx_rs::Device::cpu()
-                {
-                    multiply(&time, sigmoid(&time)?)?
-                } else {
-                    mlx_rs::fast::silu_exact(&time)?
-                })?
+                .forward(&ordinary_time_silu(&time, self.training)?)?
                 .as_dtype(Dtype::Float32)?;
             let modulation = self.modulation.forward(&time)?.reshape(&[1, 6, g.dim])?;
             let head = self.head.forward(&time)?.reshape(&[1, 2, g.dim])?;
@@ -1157,6 +1151,43 @@ mod author_fixture_tests {
     fn frozen_author_full_graph_ragged_masks_fp32_bf16_and_skipping() {
         #[cfg(feature = "test-support")]
         crate::test_support::assert_default_metal_profile_device();
+        ordinary_author_time_conformance();
+    }
+
+    pub(super) fn ordinary_author_time_conformance() {
+        // CI_IMPACT: reuse actual nn.SiLU hooks from the frozen author edit packet;
+        // these tiny BF16 operations run only through existing manual Metal oracles.
+        // The edit entry also reuses four tiny author forwards plus two training forwards.
+        // The ordinary packet has no time-activation hook. Both graphs use nn.SiLU.
+        let time_fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v2/fixture.json"
+        ))
+        .unwrap();
+        for probe in time_fixture["time_probes"].as_array().unwrap() {
+            let input = array(&probe["silu_input"])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let expected = &probe["silu"];
+            for training in [false, true] {
+                assert_eq!(
+                    delta(&ordinary_time_silu(&input, training).unwrap(), expected),
+                    0.0,
+                    "author BF16 time SiLU training={training}"
+                );
+            }
+            for (label, eager) in [
+                ("inference", mlx_rs::fast::silu_exact(&input).unwrap()),
+                (
+                    "training",
+                    multiply(&input, sigmoid(&input).unwrap()).unwrap(),
+                ),
+            ] {
+                assert!(
+                    delta(&eager, expected) > 0.0,
+                    "author time SiLU hook must discriminate eager BF16 {label} rounding"
+                );
+            }
+        }
         let f = fixture("ordinary");
         let g = geometry(&f);
         let context = contexts(
@@ -1178,7 +1209,7 @@ mod author_fixture_tests {
                 Dtype::Bfloat16
             };
             let w = weights(&f["weights"], dtype);
-            let model = Transformer::load(&w, g.clone()).unwrap();
+            let mut model = Transformer::load(&w, g.clone()).unwrap();
             assert!(w.unused_keys().is_empty());
             assert!(context.iter().all(|c| c.dtype() == Dtype::Float32));
             if dtype == Dtype::Float32 {
@@ -1216,6 +1247,19 @@ mod author_fixture_tests {
                 difference < tolerance,
                 "dtype={dtype:?} skip={skip:?} max_abs={difference}"
             );
+            if dtype == Dtype::Bfloat16 {
+                // Training mode must match the same frozen author packet,
+                // including its fused SiLU boundary; no regenerated golden or wider tolerance.
+                model.training = true;
+                let training_output = model
+                    .forward(&input, &times, &context, &skip, &CancelFlag::new())
+                    .unwrap();
+                let training_difference = delta(&training_output, &case["velocity"]);
+                assert!(
+                    training_difference < tolerance,
+                    "training dtype={dtype:?} skip={skip:?} max_abs={training_difference}"
+                );
+            }
         }
         let hidden = array(&f["leaf_ops"]["situ_hidden"]);
         let gate = array(&f["leaf_ops"]["situ_gate"]);
@@ -1493,6 +1537,22 @@ fn edit_situ(hidden: &Array, gate: &Array) -> Result<Array> {
         gated,
         scale(&divide_then_tanh(hidden, 25.0)?, 25.0)?,
     )?)
+}
+
+fn ordinary_time_silu(x: &Array, training: bool) -> Result<Array> {
+    // Author nn.SiLU evaluates BF16 inputs in FP32 and rounds only its output.
+    // Preserve the existing primitive training path and fast inference path.
+    let input = if x.dtype() == Dtype::Bfloat16 {
+        x.as_dtype(Dtype::Float32)?
+    } else {
+        x.clone()
+    };
+    let output = if training || mlx_rs::Device::try_default()? == mlx_rs::Device::cpu() {
+        multiply(&input, sigmoid(&input)?)?
+    } else {
+        mlx_rs::fast::silu_exact(&input)?
+    };
+    Ok(output.as_dtype(x.dtype())?)
 }
 
 fn edit_silu(x: &Array) -> Result<Array> {
@@ -2042,6 +2102,7 @@ mod edit_fixture_tests {
             Ok("1")
         );
         mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+            author_fixture_tests::ordinary_author_time_conformance();
             run_oracle(false);
             trained_custom_adapters_compose_with_edit();
         });
@@ -3078,6 +3139,205 @@ mod training_graph_tests {
     fn read(a: &Array) -> Vec<f32> {
         crate::pipeline::logical_f32_readback(a).unwrap()
     }
+    #[cfg(feature = "test-support")]
+    #[test]
+    #[ignore = "manual MOSS Metal model proof; CI lanes=moss-metal-fixture"]
+    fn moss_adamw_bias_correction_resume_and_fixed_batch_descent() {
+        crate::test_support::assert_default_metal_profile_device();
+        use crate::training::TrainOptimizer;
+        use mlx_gen::train::lora::LoraParams;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+        let cfg = TrainingConfig {
+            learning_rate: 0.001,
+            weight_decay: 0.2,
+            ..Default::default()
+        };
+        let initial = || {
+            LoraParams::from([
+                (Rc::from("first"), Array::from_slice(&[1f32], &[1, 1])),
+                (Rc::from("second"), Array::from_slice(&[-2f32], &[1, 1])),
+            ])
+        };
+        let mut params = initial();
+        let mut opt =
+            TrainOptimizer::from_config("adamw", cfg.learning_rate, cfg.weight_decay).unwrap();
+        let mut reference = [1f64, -2.];
+        let (mut first, mut second) = ([0f64; 2], [0f64; 2]);
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = directory.path().join("optimizer.safetensors");
+        let mut resumed: Option<(TrainOptimizer, LoraParams)> = None;
+        for update in 0..4 {
+            // Tiny gradients expose epsilon placement; two names expose a clock
+            // accidentally incremented per parameter. Later steps expose decay,
+            // sign changes, LR scheduling and restoration of both moment slots.
+            let gradient = if update == 0 {
+                [1e-10f32, -2e-10]
+            } else {
+                [0.25, -0.4]
+            };
+            let multiplier = if update < 2 { 1. } else { 0.25 };
+            let grads = LoraParams::from([
+                (
+                    Rc::from("first"),
+                    Array::from_slice(&gradient[..1], &[1, 1]),
+                ),
+                (
+                    Rc::from("second"),
+                    Array::from_slice(&gradient[1..], &[1, 1]),
+                ),
+            ]);
+            opt.set_lr_scaled(multiplier);
+            opt.update(&mut params, &grads, &cfg, update, 1789).unwrap();
+            for i in 0..2 {
+                let t = f64::from(update + 1);
+                let lr = f64::from(cfg.learning_rate * multiplier);
+                first[i] = 0.9 * first[i] + 0.1 * f64::from(gradient[i]);
+                second[i] = 0.999 * second[i] + 0.001 * f64::from(gradient[i]).powi(2);
+                reference[i] = reference[i] * (1. - lr * f64::from(cfg.weight_decay))
+                    - lr * (first[i] / (1. - 0.9f64.powf(t)))
+                        / ((second[i] / (1. - 0.999f64.powf(t))).sqrt() + 1e-8);
+                let name = ["first", "second"][i];
+                let actual = read(&params[name])[0];
+                assert!(
+                    (f64::from(actual) - reference[i]).abs() < 3e-7,
+                    "step {update}, {name}: {actual} != host AdamW {}",
+                    reference[i]
+                );
+            }
+            if let Some((loaded, restored)) = &mut resumed {
+                loaded.set_lr_scaled(multiplier);
+                loaded.update(restored, &grads, &cfg, update, 1789).unwrap();
+                for key in params.keys() {
+                    assert_eq!(
+                        read(&params[key]),
+                        read(&restored[key]),
+                        "resume factor {key}"
+                    );
+                }
+            }
+            if update == 1 {
+                opt.save_state(&checkpoint).unwrap();
+                let mut loaded =
+                    TrainOptimizer::from_config("adamw", cfg.learning_rate, cfg.weight_decay)
+                        .unwrap();
+                loaded.load_state_checked(&checkpoint, &params, 2).unwrap();
+                resumed = Some((loaded, params.clone()));
+                let (arrays, metadata) =
+                    mlx_gen::weights::load_safetensors_on_cpu(&checkpoint).unwrap();
+                mlx_rs::transforms::eval_pending_loads(arrays.values()).unwrap();
+                for (policy, clock) in [
+                    (None, None),
+                    (Some("legacy"), Some("2")),
+                    (
+                        metadata.get("moss_optimizer_policy").map(String::as_str),
+                        Some("3"),
+                    ),
+                ] {
+                    let mut bad = HashMap::new();
+                    if let Some(value) = policy {
+                        bad.insert("moss_optimizer_policy".to_owned(), value.to_owned());
+                    }
+                    if let Some(value) = clock {
+                        bad.insert("moss_optimizer_updates".to_owned(), value.to_owned());
+                    }
+                    let file = directory.path().join("invalid.safetensors");
+                    Array::save_safetensors(arrays.iter(), Some(&bad), &file).unwrap();
+                    let mut rejected =
+                        TrainOptimizer::from_config("adamw", cfg.learning_rate, cfg.weight_decay)
+                            .unwrap();
+                    assert!(rejected.load_state_checked(&file, &params, 2).is_err());
+                }
+            }
+        }
+        assert!(opt.update(&mut params, &initial(), &cfg, 0, 1789).is_err());
+        let (loaded, _) = resumed.unwrap();
+        let restored = directory.path().join("restored.safetensors");
+        let final_state = directory.path().join("final.safetensors");
+        loaded.save_state(&restored).unwrap();
+        opt.save_state(&final_state).unwrap();
+        let (a, a_meta) = mlx_gen::weights::load_safetensors_on_cpu(restored).unwrap();
+        let (b, b_meta) = mlx_gen::weights::load_safetensors_on_cpu(final_state).unwrap();
+        assert_eq!(a_meta, b_meta);
+        assert_eq!(
+            a.keys().collect::<std::collections::BTreeSet<_>>(),
+            b.keys().collect()
+        );
+        for (key, value) in a {
+            assert_eq!(read(&value), read(&b[&key]), "resume moment {key}");
+        }
+
+        // One fixed batch through the existing production BF16 graph. This
+        // synthetic oracle does not replace the real-weight heldout criterion.
+        let f = fixture("ordinary");
+        let g = geometry(&f);
+        let mut model =
+            Transformer::load(&weights(&f["weights"], Dtype::Bfloat16), g.clone()).unwrap();
+        let x = slice_axis(&array(&f["inputs"]["hidden_states"]), 0, 0, 1).unwrap();
+        let context = contexts(
+            &f["inputs"]["encoder_hidden_states"],
+            &f["inputs"]["encoder_attention_mask"],
+            g.text,
+        );
+        let noise = mlx_rs::ops::add(&x, Array::from_f32(0.37)).unwrap();
+        let paths = contract::target_paths(g.layers, &[]).unwrap();
+        let (targets, mut params) = build_lora_targets(&mut model, &paths, 4, 1789).unwrap();
+        let adapter = TrainAdapter::Lora { targets };
+        let cfg = TrainingConfig {
+            rank: 4,
+            alpha: 6.,
+            learning_rate: 0.001,
+            gradient_checkpointing: false,
+            weight_decay: 0.,
+            seed: 1789,
+            ..Default::default()
+        };
+        let cancel = CancelFlag::new();
+        let frozen = model
+            .frozen_training_arrays()
+            .iter()
+            .map(read)
+            .collect::<Vec<_>>();
+        let (before, grads) = crate::training::loss_grads(
+            &mut model,
+            &params,
+            &adapter,
+            &cfg,
+            &x,
+            &context[0],
+            &noise,
+            0.375,
+            None,
+            &cancel,
+        )
+        .unwrap();
+        let mut opt =
+            TrainOptimizer::from_config("adamw", cfg.learning_rate, cfg.weight_decay).unwrap();
+        opt.update(&mut params, &grads, &cfg, 0, cfg.seed).unwrap();
+        let (after, _) = crate::training::loss_grads(
+            &mut model,
+            &params,
+            &adapter,
+            &cfg,
+            &x,
+            &context[0],
+            &noise,
+            0.375,
+            None,
+            &cancel,
+        )
+        .unwrap();
+        assert!(after < before, "fixed-batch AdamW update did not descend");
+        assert_eq!(
+            frozen,
+            model
+                .frozen_training_arrays()
+                .iter()
+                .map(read)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn cpu_native_backward_updates_only_factors_and_reload_changes_generation() {

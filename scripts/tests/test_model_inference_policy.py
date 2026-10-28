@@ -132,6 +132,33 @@ class WorkflowExecutionGraph(unittest.TestCase):
     def errors(self, workflow):
         return policy.workflow_errors(workflow, 'renamable.yml', self.root)
 
+    def test_reviewed_storage_action_and_node_test_require_the_complete_exact_source(self):
+        workflow = self.workflow('node --test scripts/runner-storage-cleanup.test.mjs')
+        workflow['jobs']['execute']['steps'].append(
+            {'uses': './.github/actions/cleanup-runner-storage'})
+        for relative in policy.REVIEWED_STORAGE_CLEANUP:
+            self.script(relative, (ROOT / relative).read_text(encoding='utf-8'))
+        self.assertEqual(self.errors(workflow), [])
+        for relative in policy.REVIEWED_STORAGE_CLEANUP:
+            with self.subTest(changed=relative):
+                path = self.root / relative
+                original = path.read_text(encoding='utf-8')
+                path.write_text(original + '\n# unreviewed source\n', encoding='utf-8')
+                self.assertTrue(self.errors(workflow))
+                path.write_text(original, encoding='utf-8')
+        missing = self.root / '.github/actions/cleanup-runner-storage/storage.ps1'
+        missing.unlink()
+        self.assertTrue(self.errors(workflow))
+
+    def test_node_execution_is_not_generically_exempted_by_the_storage_review(self):
+        for relative in policy.REVIEWED_STORAGE_CLEANUP:
+            self.script(relative, (ROOT / relative).read_text(encoding='utf-8'))
+        for command in ('node --eval "model()"', 'node scripts/runner-storage-cleanup.test.mjs',
+                        'node --test scripts/another.mjs',
+                        'node --test scripts/runner-storage-cleanup.test.mjs --extra'):
+            with self.subTest(command=command):
+                self.assertTrue(self.errors(self.workflow(command)))
+
     def test_schedule_model_workflow_rejected(self):
         workflow = self.workflow('cargo test -p fixture -- --ignored', 'schedule')
         self.assertTrue(any('automatic schedule' in error and 'model' in error for error in self.errors(workflow)))

@@ -733,6 +733,7 @@ fn a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta() {
         0.0,
         "the LoKr delta must fold bit-identically across topologies"
     );
+    genuine_lora_lokr_stack_causality(&cfg, dir.path(), &path);
 }
 
 /// **AC1 (namespace):** the ComfyUI `_comfyui_` export shape converts — fused `attn.qkv_proj`
@@ -1601,5 +1602,103 @@ fn the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve() {
     );
     for (g, w) in got.iter().zip(&want) {
         assert_eq!(*g as f64, *w, "the exact LoKr residual must be bit-exact");
+    }
+}
+
+// Called only by the existing ignored genuine-LoKr proof: actual native projection output,
+// genuine safetensors LoRA+LoKr files, no model-count or installed-adapter-count oracle.
+fn genuine_lora_lokr_stack_causality(cfg: &MiniMaxH3DitConfig, dir: &Path, lokr: &Path) {
+    let lora = write_lora(
+        dir,
+        "causal-stack-lora.safetensors",
+        &[(PROBE.into(), cfg.inner_dim(), cfg.hidden_size)],
+        Some("128"),
+    );
+    let x = tensor(&[3, cfg.hidden_size], 0.91);
+    for pruned in [false, true] {
+        let run = |lora_on, lokr_on, reverse| {
+            let mut model = if pruned {
+                pruned_dit(cfg)
+            } else {
+                full_dit(cfg)
+            };
+            let mut adapters = Vec::new();
+            if lora_on {
+                adapters.push(spec(lora.clone(), 0.75));
+            }
+            if lokr_on {
+                adapters.push(spec(lokr.to_path_buf(), 0.5));
+            }
+            if reverse {
+                adapters.reverse();
+            }
+            if !adapters.is_empty() {
+                let report = apply_minimax_h3_adapters(&mut model, &adapters).unwrap();
+                assert!(report.unmatched_paths.is_empty());
+            }
+            let out = model
+                .adaptable_mut(&segs(PROBE))
+                .unwrap()
+                .forward(&x)
+                .unwrap();
+            let values = f32s(&out);
+            assert!(values.iter().all(|x| x.is_finite()));
+            values
+        };
+        let base = run(false, false, false);
+        let only_lora = run(true, false, false);
+        let only_lokr = run(false, true, false);
+        let both = run(true, true, false);
+        let reversed = run(true, true, true);
+        let topology = if pruned { "pruned" } else { "full" };
+        let effect = |property, a: &[f32], b: &[f32]| {
+            assert_eq!(a.len(), b.len());
+            let peak = a.iter().chain(b).map(|x| x.abs()).fold(0., f32::max);
+            let delta = a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0., f32::max);
+            let floor = 8. * f32::EPSILON * peak;
+            println!("H3_ADAPTER_STACK_CAUSAL backend=metal topology={topology} property={property} max_abs={delta:.9e} floor={floor:.9e} seam=adaptable_projection");
+            assert!(
+                delta > floor,
+                "{topology}/{property}: stack component is not load bearing"
+            );
+        };
+        effect("lora_vs_base", &only_lora, &base);
+        effect("lokr_vs_base", &only_lokr, &base);
+        effect("stack_vs_base", &both, &base);
+        effect("stack_drop_lora", &both, &only_lokr);
+        effect("stack_drop_lokr", &both, &only_lora);
+        let peak = base
+            .iter()
+            .chain(&only_lora)
+            .chain(&only_lokr)
+            .chain(&both)
+            .map(|x| x.abs())
+            .fold(0., f32::max);
+        let tolerance = 64. * f32::EPSILON * peak;
+        let additive_error = both
+            .iter()
+            .zip(&only_lora)
+            .zip(&only_lokr)
+            .zip(&base)
+            .map(|(((both, lora), lokr), base)| (both - lora - lokr + base).abs())
+            .fold(0., f32::max);
+        let order_error = both
+            .iter()
+            .zip(&reversed)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0., f32::max);
+        println!("H3_ADAPTER_STACK_CAUSAL backend=metal topology={topology} property=component_differentials additive_max_abs={additive_error:.9e} order_max_abs={order_error:.9e} bound={tolerance:.9e}");
+        assert!(
+            additive_error <= tolerance,
+            "stack-minus-LoRA must preserve the standalone LoKr differential, and vice versa"
+        );
+        assert!(
+            order_error <= tolerance,
+            "additive stack order must not silently replace a component"
+        );
     }
 }

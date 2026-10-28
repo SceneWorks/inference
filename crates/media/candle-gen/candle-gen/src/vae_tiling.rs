@@ -401,12 +401,28 @@ impl GlobalGroupNorm {
         // candle reduces over `(C/G)·H·W` per (batch, group) — the same partition as its
         // `reshape((b, num_groups, hidden_size))`.
         let hidden = (c / groups) * h * w;
-        let grouped = x.reshape((b, groups, hidden))?.to_dtype(internal)?;
-        let mean = (grouped.sum_keepdim(2)? / hidden as f64)?;
-        let centered = grouped.broadcast_sub(&mean)?;
-        let var = (centered.sqr()?.sum_keepdim(2)? / hidden as f64)?;
-        // NOT `.recip()` — `apply` divides by this, matching candle's `broadcast_div` bit for bit.
-        let std = (var + eps)?.sqrt()?;
+        // Keep the activation in its input dtype and promote only one complete group at a time.
+        // The former whole-activation promotion retained grouped + centered + squared f32 buffers
+        // together: three GiB at SDXL's [1, 256, 1024, 1024] layer. Each reduction still sees every
+        // spatial element of exactly the same group, in the same order; no crop-local statistics
+        // or cancellation-prone E[x²] - E[x]² variance are introduced.
+        let grouped = x.reshape((b, groups, hidden))?;
+        let mut means = Vec::with_capacity(groups);
+        let mut stds = Vec::with_capacity(groups);
+        for group in 0..groups {
+            let values = grouped
+                .narrow(1, group, 1)?
+                .contiguous()?
+                .to_dtype(internal)?;
+            let mean = (values.sum_keepdim(2)? / hidden as f64)?;
+            let centered = values.broadcast_sub(&mean)?;
+            let var = (centered.sqr()?.sum_keepdim(2)? / hidden as f64)?;
+            // NOT `.recip()` — `apply` divides by this, matching candle's `broadcast_div` bit for bit.
+            stds.push((var + eps)?.sqrt()?);
+            means.push(mean);
+        }
+        let mean = Tensor::cat(&means, 1)?;
+        let std = Tensor::cat(&stds, 1)?;
         Ok(Self {
             mean,
             std,
@@ -599,6 +615,62 @@ mod global_group_norm_tests {
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiling::global_group_norm_tests::whole_activation_matches_candle_group_norm");
+    }
+
+    /// Reference the previous whole-activation statistics directly. These are small raw-tensor
+    /// arithmetic fixtures, with multiple batches and groups, not a learned-layer/model forward.
+    #[test]
+    fn bounded_group_statistics_match_whole_tensor_reference() {
+        let (b, c, h, w) = (2, 8, 5, 7);
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let x = activation(b, c, h, w).to_dtype(dtype).unwrap();
+            let weight = ramp(c, 0.7, 0.013).to_dtype(dtype).unwrap();
+            let bias = ramp(c, -0.04, 0.011).to_dtype(dtype).unwrap();
+            for groups in [1, 2, 4, 8] {
+                let hidden = c / groups * h * w;
+                let whole = x
+                    .reshape((b, groups, hidden))
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                let mean = (whole.sum_keepdim(2).unwrap() / hidden as f64).unwrap();
+                let centered = whole.broadcast_sub(&mean).unwrap();
+                let var =
+                    (centered.sqr().unwrap().sum_keepdim(2).unwrap() / hidden as f64).unwrap();
+                let std = (var + 1e-6).unwrap().sqrt().unwrap();
+                let reference = GlobalGroupNorm {
+                    mean,
+                    std,
+                    weight: weight.reshape((1, c, 1, 1)).unwrap(),
+                    bias: bias.reshape((1, c, 1, 1)).unwrap(),
+                    groups,
+                    channels: c,
+                    dtype,
+                };
+                let bounded = GlobalGroupNorm::new(&x, &weight, &bias, groups, 1e-6).unwrap();
+                assert_eq!(
+                    max_abs(&bounded.mean, &reference.mean),
+                    0.0,
+                    "mean {dtype:?}/{groups}"
+                );
+                assert_eq!(
+                    max_abs(&bounded.std, &reference.std),
+                    0.0,
+                    "std {dtype:?}/{groups}"
+                );
+                // The same global statistics must also normalize an interior convolution crop.
+                let crop = x.narrow(2, 1, 3).unwrap().narrow(3, 2, 4).unwrap();
+                for input in [&x, &crop] {
+                    let actual = bounded.apply(input).unwrap().to_dtype(DType::F32).unwrap();
+                    let expected = reference
+                        .apply(input)
+                        .unwrap()
+                        .to_dtype(DType::F32)
+                        .unwrap();
+                    assert_eq!(max_abs(&actual, &expected), 0.0, "apply {dtype:?}/{groups}");
+                }
+            }
+        }
     }
 
     /// The layer-wise pair — global statistics plus halo/core convolution tiling — must track the

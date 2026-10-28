@@ -1504,14 +1504,14 @@ impl MiniMaxH3 {
 
         // The tower's sources, in **sequence order** — the order the pad runs appear in, which is
         // what `forward_with_references` consumes them in.
-        let mut sources: Vec<&Image> = Vec::new();
+        let mut sources: Vec<crate::text_encoder::VisionSource<'_>> = Vec::new();
         // Per reference: how many tower sources it contributes, and its block timestamps.
         let mut plan: Vec<(usize, Vec<f64>)> = Vec::new();
         for r in references {
             match r {
                 Ref2VaReference::Audio(_) => plan.push((0, Vec::new())),
                 Ref2VaReference::Image(img) => {
-                    sources.push(img);
+                    sources.push(crate::text_encoder::VisionSource::Image(img));
                     plan.push((1, Vec::new()));
                 }
                 Ref2VaReference::Video(v) => {
@@ -1521,10 +1521,26 @@ impl MiniMaxH3 {
                         VIDEO_SAMPLE_FPS,
                         VISION_TEMPORAL_PATCH,
                     )?;
-                    for &i in &indices {
-                        sources.push(&v.frames[i]);
+                    // One tower input per merged group — the block the tokenizer presents — not one
+                    // per sampled frame. A trailing partial group repeats its last frame, exactly
+                    // as its timestamp label does.
+                    let groups =
+                        crate::reference::condition_frame_groups(&indices, VISION_TEMPORAL_PATCH);
+                    if groups.len() != timestamps.len() {
+                        return Err(CandleError::Msg(format!(
+                            "{MODEL_ID}: a reference clip sampled {} frame group(s) for {} block \
+                             timestamp(s)",
+                            groups.len(),
+                            timestamps.len()
+                        )));
                     }
-                    plan.push((indices.len(), timestamps));
+                    for &(first, second) in &groups {
+                        sources.push(crate::text_encoder::VisionSource::FramePair(
+                            &v.frames[first],
+                            &v.frames[second],
+                        ));
+                    }
+                    plan.push((groups.len(), timestamps));
                 }
             }
         }
@@ -1536,7 +1552,7 @@ impl MiniMaxH3 {
         }
 
         let vision = load_vision_tower(&self.tiers.text_encoder_dir, &self.device)?;
-        let grounded = crate::text_encoder::run_vision(&vision, &sources, &self.device)?;
+        let grounded = crate::text_encoder::run_vision_sources(&vision, &sources, &self.device)?;
         drop(vision);
         crate::dit::release_device_memory(&self.device)?;
 

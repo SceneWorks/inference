@@ -55,7 +55,7 @@ use std::path::Path;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::Image;
 use candle_gen::{CandleError, Result};
-use candle_gen_boogu::vision::preprocess::preprocess_image;
+use candle_gen_boogu::vision::preprocess::{preprocess_frames, preprocess_image};
 use candle_gen_boogu::vision::{VisionConfig, VisionTower};
 
 /// Weight-key prefix of the text tower inside `text_encoder/`. The published checkpoint nests the
@@ -397,6 +397,29 @@ pub fn run_vision(
     sources: &[&Image],
     device: &Device,
 ) -> Result<GroundedVision> {
+    let sources: Vec<VisionSource<'_>> = sources
+        .iter()
+        .map(|&image| VisionSource::Image(image))
+        .collect();
+    run_vision_sources(vision, &sources, device)
+}
+
+/// One vision-tower input: a still image, or one temporal patch of a reference clip — a sampled
+/// frame pair, which the tokenizer presents as one block. Feeding a clip's frames as separate
+/// images gave one grid per frame against one block per pair, and every ref2va request with a
+/// reference video was refused (`N vision-pad run(s) but M embeds`).
+#[derive(Clone, Copy, Debug)]
+pub enum VisionSource<'a> {
+    Image(&'a Image),
+    FramePair(&'a Image, &'a Image),
+}
+
+/// [`run_vision`] over still images and clip frame pairs alike, one grid per source in order.
+pub fn run_vision_sources(
+    vision: &VisionTower,
+    sources: &[VisionSource<'_>],
+    device: &Device,
+) -> Result<GroundedVision> {
     if sources.is_empty() {
         return Err(CandleError::Msg(
             "minimax-h3 te (grounded): at least one reference image is required".into(),
@@ -407,8 +430,28 @@ pub fn run_vision(
     let mut grids = Vec::with_capacity(sources.len());
     let mut counts = Vec::with_capacity(sources.len());
     for &src in sources {
-        let (pixels, grid) =
-            preprocess_image(&src.pixels, src.height as usize, src.width as usize, device)?;
+        let (pixels, grid) = match src {
+            VisionSource::Image(image) => preprocess_image(
+                &image.pixels,
+                image.height as usize,
+                image.width as usize,
+                device,
+            )?,
+            VisionSource::FramePair(first, second) => {
+                if (first.width, first.height) != (second.width, second.height) {
+                    return Err(CandleError::Msg(
+                        "minimax-h3 te (grounded): a clip's frame pair must share one geometry"
+                            .into(),
+                    ));
+                }
+                preprocess_frames(
+                    &[&first.pixels, &second.pixels],
+                    first.height as usize,
+                    first.width as usize,
+                    device,
+                )?
+            }
+        };
         let (emb, ds) = vision.forward(&pixels, &[grid])?;
         counts.push(emb.dim(0)?);
         embeds.push(emb);

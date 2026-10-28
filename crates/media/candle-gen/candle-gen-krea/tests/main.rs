@@ -22,6 +22,9 @@ const _: fn() = || {
 
 mod common;
 
+#[path = "comfy_quant_real_weights.rs"]
+mod comfy_quant_real_weights;
+
 #[path = "convrot_int8_gpu.rs"]
 mod convrot_int8_gpu;
 

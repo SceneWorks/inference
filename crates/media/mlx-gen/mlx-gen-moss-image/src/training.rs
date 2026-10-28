@@ -2,9 +2,11 @@
 //! encoding are cached before functional autograd; only the explicit adapter-factor map is a leaf.
 #[cfg(feature = "test-support")]
 mod audit;
+mod optimizer;
 mod recovery;
 #[cfg(feature = "test-support")]
 use gen_core_testkit::moss_training_probe::{RunProbe, TrainingProbe};
+pub(crate) use optimizer::MossOptimizer as TrainOptimizer;
 
 use crate::training_memory::{
     self as admission, EstimateRequest, FootprintFacts, MemoryEstimate, Phase,
@@ -18,15 +20,12 @@ use mlx_gen::gen_core::{self, moss_image::*, moss_image_training as contract};
 use mlx_gen::train::{
     checkpoint,
     dataset::center_crop_square,
-    lora::{
-        accumulate_grads, adapter_optimizer_update, build_lokr_targets, build_lora_targets,
-        LoraParams, TrainAdapter,
-    },
+    lora::{accumulate_grads, build_lokr_targets, build_lora_targets, LoraParams, TrainAdapter},
     schedule::{lr_multiplier, schedule_updates},
 };
 use mlx_gen::{
-    CancelFlag, Error, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
-    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+    CancelFlag, Error, LoadSpec, Modality, NetworkType, Result, Trainer, TrainerDescriptor,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use mlx_gen_flux2::vae::{Flux2Vae, Flux2VaeDecoderConfig};
 use mlx_rs::error::{Exception, Result as MlxResult};
@@ -138,7 +137,7 @@ impl MossImageTrainer {
                 "MOSS trainer requires the exact unadapted Base/SFT checkpoint".into(),
             ));
         }
-        let sources = Sources::prepare(variant, spec)?;
+        let sources = Sources::selected(variant, spec, MossImageAcceleration::Off)?;
         Self::from_sources(variant, sources)
     }
     pub(crate) fn from_sources(variant: MossImageVariant, sources: Sources) -> Result<Self> {
@@ -838,7 +837,10 @@ impl LoadedTrainer {
 
         #[cfg(feature = "test-support")]
         let base_before = if probe.is_some() {
-            Some(audit::digest(self.transformer.frozen_training_arrays())?)
+            Some(audit::digest(
+                self.transformer.frozen_training_arrays(),
+                &req.cancel,
+            )?)
         } else {
             None
         };
@@ -849,6 +851,7 @@ impl LoadedTrainer {
                     .as_ref()
                     .expect("run encoder")
                     .frozen_training_arrays(),
+                &req.cancel,
             )?)
         } else {
             None
@@ -860,6 +863,7 @@ impl LoadedTrainer {
                     .as_ref()
                     .expect("run VAE")
                     .frozen_training_arrays()?,
+                &req.cancel,
             )?)
         } else {
             None
@@ -946,6 +950,7 @@ impl LoadedTrainer {
                         .as_ref()
                         .expect("run encoder")
                         .frozen_training_arrays(),
+                    &req.cancel,
                 )?,
             )?;
             probe.frozen(
@@ -956,6 +961,7 @@ impl LoadedTrainer {
                         .as_ref()
                         .expect("run VAE")
                         .frozen_training_arrays()?,
+                    &req.cancel,
                 )?,
             )?;
             for context in contexts
@@ -1042,7 +1048,7 @@ impl LoadedTrainer {
                 )?;
                 probe.record_run_start_export(&target, start, update, self.variant)?;
             }
-            let factors = audit::factors(&params)?;
+            let factors = audit::factors(&params, &req.cancel)?;
             let loss = evaluation.as_ref().expect("heldout prepared").loss(
                 &mut self.transformer,
                 &params,
@@ -1052,7 +1058,7 @@ impl LoadedTrainer {
             let observation = evaluation
                 .as_ref()
                 .expect("heldout prepared")
-                .observation(loss)?;
+                .observation(loss, &req.cancel)?;
             probe.update(|r| {
                 r.factor_before = factors;
                 r.evaluation_before = Some(loss);
@@ -1153,7 +1159,7 @@ impl LoadedTrainer {
                     accumulated_tokens,
                 )?;
                 accumulated_tokens = 0;
-                adapter_optimizer_update(&mut opt, &mut params, &avg, c, update, c.seed)?;
+                opt.update(&mut params, &avg, c, update, c.seed)?;
                 update += 1;
             }
             #[cfg(feature = "test-support")]
@@ -1229,11 +1235,11 @@ impl LoadedTrainer {
                 &adapter,
                 req,
             )?;
-            let factors = audit::factors(&params)?;
+            let factors = audit::factors(&params, &req.cancel)?;
             let observation = evaluation
                 .as_ref()
                 .expect("heldout prepared")
-                .observation(loss)?;
+                .observation(loss, &req.cancel)?;
             probe.update(|r| {
                 r.factor_after = factors;
                 r.evaluation_after = Some(loss);
@@ -1244,20 +1250,20 @@ impl LoadedTrainer {
             probe.frozen(
                 "backbone",
                 base_before.as_ref().expect("observed backbone"),
-                &audit::digest(self.transformer.frozen_training_arrays())?,
+                &audit::digest(self.transformer.frozen_training_arrays(), &req.cancel)?,
             )?;
             if let Some(encoder) = &self.encoder {
                 probe.frozen(
                     "text_encoder",
                     te_before.as_ref().expect("observed encoder"),
-                    &audit::digest(encoder.frozen_training_arrays())?,
+                    &audit::digest(encoder.frozen_training_arrays(), &req.cancel)?,
                 )?;
             }
             if let Some(vae) = &self.vae {
                 probe.frozen(
                     "vae",
                     vae_before.as_ref().expect("observed VAE"),
-                    &audit::digest(vae.frozen_training_arrays()?)?,
+                    &audit::digest(vae.frozen_training_arrays()?, &req.cancel)?,
                 )?;
             }
         }
@@ -1371,6 +1377,54 @@ impl LoadedTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn public_trainer_factories_require_backbone_before_shared_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("parent");
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&shared).unwrap();
+        let unrelated = root.join("prepared-literal");
+        std::fs::write(&unrelated, b"source identity only").unwrap();
+
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.clone()));
+            spec.components.insert(
+                MOSS_SHARED_SNAPSHOT_COMPONENT.into(),
+                gen_core::WeightsSource::Dir(shared.clone()),
+            );
+            spec.prepare_with_file_pins([gen_core::PinnedWeightsFile::pin(&unrelated).unwrap()])
+                .unwrap();
+
+            // Generation still defers the backbone until a request selects its acceleration.
+            let deferred = Sources::prepare(variant, &spec).err().unwrap().to_string();
+            assert!(
+                deferred.contains(
+                    &shared
+                        .join("text_encoder/config.json")
+                        .display()
+                        .to_string()
+                ),
+                "{variant:?}: {deferred}"
+            );
+
+            // Exercise the actual registry factories, not synthetic from_sources fixtures.
+            // Missing prepared identity fails before a header read, device query or model load.
+            EAGER_LOAD_ENTRIES.with(|entries| entries.set(0));
+            let result = match variant {
+                MossImageVariant::Base => load_base(&spec),
+                MossImageVariant::Sft => load_sft(&spec),
+            };
+            let error = result.err().expect("backbone pin is absent").to_string();
+            assert!(error.contains("prepared MOSS identity missing"), "{error}");
+            assert!(
+                error.contains(&root.join("transformer/config.json").display().to_string()),
+                "{variant:?}: {error}"
+            );
+            EAGER_LOAD_ENTRIES.with(|entries| assert_eq!(entries.get(), 0));
+        }
+    }
+
     #[test]
     fn image_token_normalization_preserves_different_bucket_areas() {
         let _device = crate::cpu_test_device();

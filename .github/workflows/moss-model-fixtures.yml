@@ -227,6 +227,7 @@ jobs:
           persist-credentials: false
       # Same runner-global sccache hazard as the other heavy Candle lanes (native-12219): clear the
       # wrapper for THIS job only, in a step, never as a job-level env override.
+      - uses: ./.github/actions/cleanup-runner-storage
       - name: Disable unstable sccache wrapper for the heavy Candle lane
         shell: powershell
         run: |

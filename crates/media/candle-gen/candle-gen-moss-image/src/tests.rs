@@ -148,6 +148,7 @@ fn exact_author_graph_fp32_bf16_and_ragged_masks() {
 #[test]
 #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn exact_author_leaf_functions() {
+    ordinary_author_time_silu(&Device::Cpu);
     let d = fixture("fixture.json");
     let l = &d["leaf_ops"];
     compare(
@@ -175,6 +176,38 @@ fn exact_author_leaf_functions() {
         &l["rope_2x3_text3"],
         2e-7,
         "rope",
+    );
+}
+
+pub(crate) fn ordinary_author_time_silu(device: &Device) {
+    // CI_IMPACT: five tiny BF16 activation checks, reached only through existing
+    // manual CPU/CUDA profiles. Reuse actual author nn.SiLU hooks; no new golden.
+    let time_fixture: Value = serde_json::from_str(include_str!(
+        "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v2/fixture.json"
+    ))
+    .unwrap();
+    let mut eager_differs = false;
+    for probe in time_fixture["time_probes"].as_array().unwrap() {
+        let input = &probe["silu_input"];
+        let shape: Vec<usize> = serde_json::from_value(input["shape"].clone()).unwrap();
+        let values: Vec<f32> = serde_json::from_value(input["values"].clone()).unwrap();
+        let input = Tensor::from_vec(values, shape, device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        compare(
+            &transformer::ordinary_time_silu(&input).unwrap(),
+            &probe["silu"],
+            0.0,
+            "author BF16 time SiLU",
+        );
+        let eager = loader::tensor_f32(&candle_gen::candle_nn::ops::silu(&input).unwrap()).unwrap();
+        let expected: Vec<f32> = serde_json::from_value(probe["silu"]["values"].clone()).unwrap();
+        eager_differs |= eager != expected;
+    }
+    assert!(
+        eager_differs,
+        "author time SiLU hooks must discriminate eager BF16 rounding"
     );
 }
 

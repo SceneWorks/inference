@@ -4,22 +4,40 @@ use mlx_gen::gen_core::moss_image::MossImageVariant;
 use mlx_gen::gen_core::*;
 
 /// Asset residency for the explicitly selected policy. Optional cached files do not imply a
-/// loaded renderer. Header parsing authenticates the same owned bytes and caches by content pin;
-/// this function does not construct tensors or execute Metal work.
+/// loaded renderer. Bounded header parsing uses unchanged authenticated content pins;
+/// materialization authenticates full consumed bytes. No tensors or Metal work are constructed.
 pub fn selected_asset_facts(
     variant: MossImageVariant,
     spec: &LoadSpec,
     mode: moss_image::MossImageAcceleration,
 ) -> Result<MemoryAssetFacts> {
-    let sources = Sources::selected(variant, spec, mode).map_err(Error::from)?;
-    let mut facts = selected_facts(&sources, mode)?;
-    facts.overlay_bytes = facts
-        .overlay_bytes
-        .checked_add(
-            crate::adapters::estimated_bytes(&spec.adapters, &sources.config)
-                .map_err(Error::from)?,
-        )
-        .ok_or_else(|| Error::Unsupported("MOSS adapter residency overflow".into()))?;
+    selected_asset_facts_with_check(variant, spec, mode, &mut || Ok(()))
+}
+
+/// Cooperative metadata admission. The caller owns cancellation/deadline policy; checks also run
+/// on identity/cache hits, during source authentication and between bounded header reads.
+pub fn selected_asset_facts_with_check(
+    variant: MossImageVariant,
+    spec: &LoadSpec,
+    mode: moss_image::MossImageAcceleration,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<MemoryAssetFacts> {
+    let sources = Sources::selected_with_check(variant, spec, mode, check).map_err(Error::from)?;
+    let mut facts = selected_facts_with(&sources, mode, |asset| {
+        asset.headers_with_check(check).map_err(Error::from)
+    })?;
+    for adapter in &spec.adapters {
+        check()?;
+        let bytes =
+            crate::adapters::estimated_bytes(std::slice::from_ref(adapter), &sources.config)
+                .map_err(Error::from)?;
+        check()?;
+        facts.overlay_bytes = facts
+            .overlay_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Unsupported("MOSS adapter residency overflow".into()))?;
+    }
+    check()?;
     Ok(facts)
 }
 

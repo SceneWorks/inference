@@ -64,7 +64,10 @@ use mlx_gen::media::Image;
 use mlx_gen::nn::TokenEmbedding;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
-use mlx_gen_boogu::{vision::preprocess::preprocess_image, VisionConfig, VisionTower};
+use mlx_gen_boogu::{
+    vision::preprocess::{preprocess_frames, preprocess_image},
+    VisionConfig, VisionTower,
+};
 
 /// Weight-key prefix of the text tower inside `text_encoder/`. The published checkpoint nests the
 /// Qwen3-VL submodules under `model.` (`model.language_model.*`, `model.visual.*`, plus a top-level
@@ -337,6 +340,28 @@ pub struct GroundedVision {
 /// **additively** over the first few layers, so a zero there degrades the grounding rather than
 /// voiding it, whereas the merged embeds *replace* the pad rows outright and a zero there is total.
 pub fn run_vision(vision: &VisionTower, sources: &[&Image]) -> Result<GroundedVision> {
+    let sources: Vec<VisionSource<'_>> = sources
+        .iter()
+        .map(|&image| VisionSource::Image(image))
+        .collect();
+    run_vision_sources(vision, &sources)
+}
+
+/// One vision-tower input: a still image, or one temporal patch of a reference clip — a sampled
+/// frame pair, which the tokenizer presents as one block. Feeding a clip's frames as separate
+/// images gave one grid per frame against one block per pair, and every ref2va request with a
+/// reference video was refused (`N vision-pad run(s) but M embeds`).
+#[derive(Clone, Copy, Debug)]
+pub enum VisionSource<'a> {
+    Image(&'a Image),
+    FramePair(&'a Image, &'a Image),
+}
+
+/// [`run_vision`] over still images and clip frame pairs alike, one grid per source in order.
+pub fn run_vision_sources(
+    vision: &VisionTower,
+    sources: &[VisionSource<'_>],
+) -> Result<GroundedVision> {
     if sources.is_empty() {
         return Err(Error::Msg(
             "minimax-h3 te (grounded): at least one reference image is required".into(),
@@ -346,12 +371,18 @@ pub fn run_vision(vision: &VisionTower, sources: &[&Image]) -> Result<GroundedVi
     let mut deepstack = Vec::with_capacity(sources.len());
     let mut grids = Vec::with_capacity(sources.len());
     let mut counts = Vec::with_capacity(sources.len());
+    let rgb = |image: &Image| {
+        RgbImage::from_raw(image.width, image.height, image.pixels.clone()).ok_or_else(|| {
+            Error::Msg("minimax-h3 te (grounded): reference image is not valid RGB8".into())
+        })
+    };
     for &src in sources {
-        let rgb =
-            RgbImage::from_raw(src.width, src.height, src.pixels.clone()).ok_or_else(|| {
-                Error::Msg("minimax-h3 te (grounded): reference image is not valid RGB8".into())
-            })?;
-        let (pixels, grid) = preprocess_image(&rgb)?;
+        let (pixels, grid) = match src {
+            VisionSource::Image(image) => preprocess_image(&rgb(image)?)?,
+            VisionSource::FramePair(first, second) => {
+                preprocess_frames(&[&rgb(first)?, &rgb(second)?])?
+            }
+        };
         let (emb, ds) = vision.forward(&pixels, &[grid])?;
         counts.push(emb.shape()[0] as usize);
         embeds.push(emb);
