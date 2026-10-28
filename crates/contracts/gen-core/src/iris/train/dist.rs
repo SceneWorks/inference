@@ -192,16 +192,9 @@ impl Precision {
     }
 }
 
-/// Round to the nearest bfloat16 (ties to even), returned as f32.
-pub fn round_bf16(x: f32) -> f32 {
-    if x.is_nan() {
-        return x;
-    }
-    let b = x.to_bits();
-    let lsb = (b >> 16) & 1;
-    let r = b.wrapping_add(0x7FFF + lsb) & 0xFFFF_0000;
-    f32::from_bits(r)
-}
+/// Round to the nearest bfloat16 (ties to even), returned as f32 — the shared
+/// [`crate::numeric::round_bf16`], re-exported at its historical path (sc-27419).
+pub use crate::numeric::round_bf16;
 
 /// Round to the nearest IEEE half (ties to even, overflow to ±inf, subnormals kept), as f32.
 pub fn round_f16(x: f32) -> f32 {
@@ -343,7 +336,9 @@ pub struct World {
     pub cancel_grace: Duration,
     /// The per-job rendezvous secret ([`DIST_TOKEN_ENV`]): every rank presents it in its hello and
     /// the coordinator drops a connection whose token differs. `None` = no secret (any peer that
-    /// speaks the protocol and names a free rank joins — only safe on a trusted network).
+    /// speaks the protocol and names a free rank joins), so a multi-node `tcp` world without one is
+    /// refused by [`assert_single_world`] (sc-27470). The token authenticates the rendezvous only:
+    /// the TCP frames themselves are plaintext, so run multi-node jobs on a trusted network.
     pub token: Option<DistToken>,
     /// `dist.world.share_device`: an explicit opt-in to run several ranks on one accelerator when
     /// a rank's own device (`cuda:<local_rank>`) does not exist — same semantics, shared memory
@@ -458,6 +453,15 @@ pub fn assert_single_world(w: &World) -> std::result::Result<(), DistError> {
         return Err(DistError::SplitWorld(format!(
             "MASTER_ADDR={:?} is loopback but the job declares {} nodes",
             w.master_addr, w.num_nodes
+        )));
+    }
+    // A multi-node TCP world binds a routable address; without a rendezvous secret any host that
+    // reaches it could join as a rank (sc-27470). Loopback single-node worlds stay token-optional.
+    if w.num_nodes > 1 && w.transport == "tcp" && w.token.is_none() {
+        return Err(DistError::SplitWorld(format!(
+            "a {}-node tcp world on MASTER_ADDR={:?} needs a rendezvous secret: set \
+             {DIST_TOKEN_ENV} to the same per-job value on every rank",
+            w.num_nodes, w.master_addr
         )));
     }
     if let Some(n) = w.expected_nodes {
@@ -2318,6 +2322,27 @@ mod tests {
         let mut w = world(1, 2, 1);
         w.expected_nodes = Some(2);
         assert!(assert_single_world(&w).is_err());
+    }
+
+    /// sc-27470: a multi-node tcp world on a routable address is refused without a rendezvous
+    /// token, and admitted with one; single-node and non-tcp transports are unaffected.
+    #[test]
+    fn multi_node_tcp_worlds_require_a_token() {
+        let mut w = world(0, 4, 1);
+        w.local_world_size = 2;
+        w.num_nodes = 2;
+        w.master_addr = "10.0.0.5".into();
+        assert!(
+            matches!(assert_single_world(&w), Err(DistError::SplitWorld(m)) if m.contains(DIST_TOKEN_ENV))
+        );
+        w.token = Some(DistToken("secret".into()));
+        assert!(assert_single_world(&w).is_ok());
+        // MLX transports carry no token through this collective.
+        w.token = None;
+        w.transport = "mlx_ring".into();
+        assert!(assert_single_world(&w).is_ok());
+        // A single-node loopback world stays token-optional.
+        assert!(assert_single_world(&world(0, 2, 1)).is_ok());
     }
 
     #[test]

@@ -30,6 +30,7 @@ use candle_nn::VarBuilder;
 use crate::config;
 use crate::encoder::SpeakerEncoder;
 use crate::frontend::wav_to_mel_frames;
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes a voice-embed request to this exact id).
 pub const MODEL_ID: &str = "chatterbox_ve";
@@ -102,14 +103,6 @@ impl ChatterboxVoiceEmbedder {
     }
 }
 
-/// Recover a poisoned mutex — the audio twin of `candle_gen::lock_recover`.
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 impl VoiceEmbedder for ChatterboxVoiceEmbedder {
     fn descriptor(&self) -> &VoiceEmbedderDescriptor {
         &self.descriptor
@@ -158,13 +151,7 @@ fn to_mono(samples: &[f32], channels: u16) -> Cow<'_, [f32]> {
     if channels <= 1 {
         return Cow::Borrowed(samples);
     }
-    let ch = channels as usize;
-    Cow::Owned(
-        samples
-            .chunks(ch)
-            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-            .collect(),
-    )
+    Cow::Owned(candle_audio::dsp::to_mono(samples, channels))
 }
 
 /// Construct the (lazy) Chatterbox voice embedder from a [`LoadSpec`]. `spec.weights` must be the

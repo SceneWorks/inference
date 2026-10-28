@@ -59,12 +59,12 @@ use core_llm::{
 };
 
 use crate::config::{Architecture, ModelConfig};
+use crate::error::to_core;
 use crate::error::{Error, Result};
 use crate::gguf::GgufCheckpoint;
 use crate::models::{llama, qwen35, Qwen35Config};
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::Weights;
-use crate::provider::to_core;
 
 /// The backend tag this preparer registers under (matches the provider's `backend` field).
 const BACKEND: &str = "candle";
@@ -412,26 +412,11 @@ fn count_safetensors_tensors(dir: &Path) -> Result<usize> {
 }
 
 /// Count tensors in one safetensors file from its header (an 8-byte little-endian length prefix
-/// followed by that many bytes of JSON), excluding the reserved `__metadata__` key.
+/// followed by that many bytes of JSON), excluding the reserved `__metadata__` key. The header read
+/// is the provider's capped reader, so a corrupt length is an error, not an abort (sc-27298).
 fn count_header_tensors(path: &Path) -> Result<usize> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
-    let mut len = [0u8; 8];
-    f.read_exact(&mut len)?;
-    let mut header = vec![0u8; u64::from_le_bytes(len) as usize];
-    f.read_exact(&mut header)?;
-    let v: Json = serde_json::from_slice(&header).map_err(|e| {
-        Error::Msg(format!(
-            "prepare: safetensors header {}: {e}",
-            path.display()
-        ))
-    })?;
-    let obj = v.as_object().ok_or_else(|| {
-        Error::Msg(format!(
-            "prepare: safetensors header {} is not an object",
-            path.display()
-        ))
-    })?;
+    let obj = crate::provider::read_safetensors_header(path)
+        .map_err(|e| Error::Msg(format!("prepare: {e}")))?;
     Ok(obj.keys().filter(|k| k.as_str() != "__metadata__").count())
 }
 
@@ -477,6 +462,39 @@ pub const REGISTRATION: SnapshotPreparerRegistration = SnapshotPreparerRegistrat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-27298: a safetensors shard whose length prefix declares an absurd header (u64::MAX, or
+    /// just above the cap) is a typed error from the dense passthrough's tensor count — never an
+    /// attempt to allocate the declared size.
+    #[test]
+    fn count_safetensors_tensors_rejects_a_hostile_header_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("model.safetensors");
+        for len in [u64::MAX, crate::provider::MAX_SAFETENSORS_HEADER_BYTES + 1] {
+            let mut bytes = len.to_le_bytes().to_vec();
+            bytes.extend_from_slice(b"{}");
+            std::fs::write(&shard, &bytes).unwrap();
+            let err = count_safetensors_tensors(dir.path()).unwrap_err();
+            assert!(err.to_string().contains("exceeds"), "{err}");
+        }
+        // A short header (length larger than the file) and a non-object header are errors too.
+        let mut bytes = 64u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}");
+        std::fs::write(&shard, &bytes).unwrap();
+        let err = count_safetensors_tensors(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("-byte file"), "{err}");
+        let mut bytes = 2u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"[]");
+        std::fs::write(&shard, &bytes).unwrap();
+        assert!(count_safetensors_tensors(dir.path()).is_err());
+        // A well-formed header counts its tensors, excluding `__metadata__`.
+        let json = br#"{"__metadata__":{},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(json);
+        bytes.extend_from_slice(&[0; 4]);
+        std::fs::write(&shard, &bytes).unwrap();
+        assert_eq!(count_safetensors_tensors(dir.path()).unwrap(), 1);
+    }
 
     /// sc-19375: the preparer stores blocks for exactly the tensors the loader quantizes and load
     /// admission prices — the shared `loads_quantized` rule — so a projection-named tensor outside

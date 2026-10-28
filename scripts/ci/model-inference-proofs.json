@@ -119240,7 +119240,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119258,8 +119258,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens; source setup helpers=load,load_record,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens; source setup helpers=load,load_record,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119269,7 +119269,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119289,7 +119289,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens",
       "requirements": []
     }
   },
@@ -119298,7 +119298,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119316,8 +119316,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback; source setup helpers=load,load_report,synthetic_cfg_json,synthetic_snapshot_weights,write_snapshot; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback; source setup helpers=load,load_report,synthetic_cfg_json,synthetic_snapshot_weights,write_snapshot; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119327,7 +119327,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119347,7 +119347,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback",
       "requirements": []
     }
   },
@@ -119356,7 +119356,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119374,8 +119374,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft; source setup helpers=draft_model_prompts,load,write_draft_model_fixture; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft; source setup helpers=draft_model_prompts,load,write_draft_model_fixture; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly2successful libtest summaries; child0 late BODY exactFQN#child=0 +actual learned DEVICE, one root PARENT; no unindexed root BODY",
@@ -119385,7 +119385,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119413,7 +119413,7 @@
     },
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft",
       "requirements": []
     }
   },
@@ -119422,7 +119422,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119440,8 +119440,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp; source setup helpers=fixture_prompts,load,load_memory_estimate,loaded_census,q8_capable_qwen35_snapshot,qwen35_snapshot; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp; source setup helpers=fixture_prompts,load,load_memory_estimate,loaded_census,q8_capable_qwen35_snapshot,qwen35_snapshot; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119451,7 +119451,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119471,7 +119471,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp",
       "requirements": []
     }
   },
@@ -119480,7 +119480,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119498,8 +119498,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks; source setup helpers=load,phi3_snapshot; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks; source setup helpers=load,phi3_snapshot; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119509,7 +119509,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119529,7 +119529,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks",
       "requirements": []
     }
   },
@@ -119538,7 +119538,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119556,8 +119556,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes; source setup helpers=load,q8_capable_qwen35_snapshot; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes; source setup helpers=load,q8_capable_qwen35_snapshot; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119567,7 +119567,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119587,7 +119587,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes",
       "requirements": []
     }
   },
@@ -119596,7 +119596,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119614,8 +119614,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks; source setup helpers=load,qwen35_snapshot,snapshot_tensor_headers; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks; source setup helpers=load,qwen35_snapshot,snapshot_tensor_headers; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119625,7 +119625,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119645,7 +119645,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks",
       "requirements": []
     }
   },
@@ -119654,7 +119654,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119672,8 +119672,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback; source setup helpers=fixture_prompts,image_fixture_prompts,synthetic_qwen3vl_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback; source setup helpers=fixture_prompts,image_fixture_prompts,synthetic_qwen3vl_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119683,7 +119683,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119703,7 +119703,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback",
       "requirements": []
     }
   },
@@ -119712,7 +119712,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119730,8 +119730,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one; source setup helpers=synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one; source setup helpers=synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119741,7 +119741,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119761,7 +119761,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one",
       "requirements": []
     }
   },
@@ -119770,7 +119770,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119788,8 +119788,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot,synthetic_causal_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot,synthetic_causal_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119799,7 +119799,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119819,7 +119819,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp",
       "requirements": []
     }
   },
@@ -119828,7 +119828,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119846,8 +119846,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure; source setup helpers=load,load_record,load_report,q8_capable_qwen35_snapshot,synthetic_causal_provider,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure; source setup helpers=load,load_record,load_report,q8_capable_qwen35_snapshot,synthetic_causal_provider,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119857,7 +119857,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119877,7 +119877,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure",
       "requirements": []
     }
   },
@@ -119886,7 +119886,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::an_unset_speculative_option_runs_the_providers_default",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119904,8 +119904,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default; source setup helpers=draft_model_prompts,load,write_draft_model_fixture; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default; source setup helpers=draft_model_prompts,load,write_draft_model_fixture; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119915,7 +119915,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119935,7 +119935,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default",
       "requirements": []
     }
   },
@@ -119944,7 +119944,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -119962,8 +119962,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -119973,7 +119973,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -119993,7 +119993,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not",
       "requirements": []
     }
   },
@@ -120002,7 +120002,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120020,8 +120020,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain; source setup helpers=synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain; source setup helpers=synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120031,7 +120031,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120051,7 +120051,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain",
       "requirements": []
     }
   },
@@ -120060,7 +120060,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120078,14 +120078,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run; source setup helpers=inline source-declared tensors/parameters; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run; source setup helpers=inline source-declared tensors/parameters; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run",
       "requirements": []
     }
   },
@@ -120094,7 +120094,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120112,14 +120112,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot; source setup helpers=tiny_causal_from,tiny_llama_parts; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot; source setup helpers=tiny_causal_from,tiny_llama_parts; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot",
       "requirements": []
     }
   },
@@ -120128,7 +120128,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120146,14 +120146,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run; source setup helpers=prefix_snapshot_bytes; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run; source setup helpers=prefix_snapshot_bytes; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run",
       "requirements": []
     }
   },
@@ -120162,7 +120162,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120180,14 +120180,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it; source setup helpers=prefix_snapshot_bytes; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it; source setup helpers=prefix_snapshot_bytes; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it",
       "requirements": []
     }
   },
@@ -120196,7 +120196,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120214,14 +120214,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why; source setup helpers=inline source-declared tensors/parameters; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why; source setup helpers=inline source-declared tensors/parameters; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why",
       "requirements": []
     }
   },
@@ -120230,7 +120230,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120248,8 +120248,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot,synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures; source setup helpers=fixture_prompts,load,q8_capable_qwen35_snapshot,synthetic_qwen35_provider_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120259,7 +120259,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120279,7 +120279,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures",
       "requirements": []
     }
   },
@@ -120288,7 +120288,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120306,8 +120306,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request; source setup helpers=image_fixture_prompts,synthetic_qwen35_vl_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request; source setup helpers=image_fixture_prompts,synthetic_qwen35_vl_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120317,7 +120317,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120337,7 +120337,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request",
       "requirements": []
     }
   },
@@ -120346,7 +120346,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120364,8 +120364,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture; source setup helpers=fixture_prompts,synthetic_causal_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture; source setup helpers=fixture_prompts,synthetic_causal_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120375,7 +120375,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120395,7 +120395,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture",
       "requirements": []
     }
   },
@@ -120404,7 +120404,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120422,14 +120422,14 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds; source setup helpers=checkpoint_offsets,max_checkpoints,memory_geometry_with_checkpoints,text_model; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds; source setup helpers=checkpoint_offsets,max_checkpoints,memory_geometry_with_checkpoints,text_model; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds",
       "requirements": []
     }
   },
@@ -120438,7 +120438,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120456,8 +120456,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop; source setup helpers=image_fixture_prompts,synthetic_qwen3vl_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop; source setup helpers=image_fixture_prompts,synthetic_qwen3vl_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120467,7 +120467,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120487,7 +120487,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop",
       "requirements": []
     }
   },
@@ -120496,7 +120496,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120514,8 +120514,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model; source setup helpers=synthetic_causal_provider; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model; source setup helpers=synthetic_causal_provider; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120525,7 +120525,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120545,7 +120545,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model",
       "requirements": []
     }
   },
@@ -120554,7 +120554,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120572,8 +120572,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports; source setup helpers=load,load_record,load_report,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports; source setup helpers=load,load_record,load_report,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120583,7 +120583,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120603,7 +120603,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports",
       "requirements": []
     }
   },
@@ -120612,7 +120612,7 @@
     "target": "candle_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
-    "source": "crates/llm/candle-llm/src/provider.rs",
+    "source": "crates/llm/candle-llm/src/provider/tests.rs",
     "cargo_target_metadata": {
       "name": "candle_llm",
       "kind": [
@@ -120630,8 +120630,8 @@
     "cargo_features": [
       "model-inference-proof"
     ],
-    "fixture_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run; source setup helpers=load,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
-    "configuration_source": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
+    "fixture_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run; source setup helpers=load,synthetic_qwen35_snapshot_without_mtp; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -120641,7 +120641,7 @@
     "default_configuration": "source-fixed-candle-cpu",
     "configurations": {
       "source-fixed-candle-cpu": {
-        "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run/source-fixed-candle-cpu",
+        "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run/source-fixed-candle-cpu",
         "environment": {
           "CANDLE_LLM_DEVICE": null
         },
@@ -120661,7 +120661,7 @@
     "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/candle-llm/src/provider.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
+      "source_identity": "crates/llm/candle-llm/src/provider/tests.rs::provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run",
       "requirements": []
     }
   },
@@ -273410,10 +273410,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_caller_sampler_draws_every_token@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_caller_sampler_draws_every_token@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273440,10 +273440,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_cancel_during_prefill_emits_no_token@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_cancel_during_prefill_emits_no_token@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273470,10 +273470,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_demoted_mtp_head_hands_the_hybrid_to_the_pipelined_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_demoted_mtp_head_hands_the_hybrid_to_the_pipelined_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273500,10 +273500,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_demoted_run_asks_for_no_hidden_rows@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_demoted_run_asks_for_no_hidden_rows@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273530,10 +273530,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_demotion_on_the_runs_last_step_is_reported@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_demotion_on_the_runs_last_step_is_reported@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273560,10 +273560,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_device_resident_sampler_drives_the_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_device_resident_sampler_drives_the_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273590,10 +273590,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_draft_cache_is_the_committed_sequence_after_every_commit@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_draft_cache_is_the_committed_sequence_after_every_commit@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273620,10 +273620,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_draft_padded_differently_proposes_only_tokenizer_ids@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_draft_padded_differently_proposes_only_tokenizer_ids@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273650,10 +273650,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_draft_proposed_stop_token_accepted_by_the_target_ends_the_run@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_draft_proposed_stop_token_accepted_by_the_target_ends_the_run@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273680,10 +273680,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_late_loser_is_demoted_at_its_first_failing_window@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_late_loser_is_demoted_at_its_first_failing_window@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273710,10 +273710,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_penalized_or_constrained_request_reports_the_host_path_and_is_not_pipelined@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_penalized_or_constrained_request_reports_the_host_path_and_is_not_pipelined@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273740,10 +273740,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_pipelined_end_reports_the_committed_cache_length@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_pipelined_end_reports_the_committed_cache_length@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273770,10 +273770,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_pipelined_run_returns_with_no_look_ahead_in_flight@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_pipelined_run_returns_with_no_look_ahead_in_flight@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273800,10 +273800,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_pipelined_step_is_enqueued_before_the_previous_token_is_read@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_pipelined_step_is_enqueued_before_the_previous_token_is_read@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273830,10 +273830,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_production_decode_records_no_cache_events@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_production_decode_records_no_cache_events@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273860,10 +273860,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_seeded_stochastic_run_across_a_demotion_is_the_plain_seeded_run@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_seeded_stochastic_run_across_a_demotion_is_the_plain_seeded_run@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273890,10 +273890,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_step_target_is_the_plain_prefilled_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_step_target_is_the_plain_prefilled_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273920,10 +273920,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_stochastic_draft_model_reports_one_q_per_draft_and_is_seeded@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_stochastic_draft_model_reports_one_q_per_draft_and_is_seeded@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273950,10 +273950,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_stop_token_inside_a_draft_run_ends_like_the_plain_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_stop_token_inside_a_draft_run_ends_like_the_plain_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -273980,10 +273980,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_timed_auto_weighs_the_requests_own_verify_cost@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_timed_auto_weighs_the_requests_own_verify_cost@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274010,10 +274010,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_timed_clear_loser_is_demoted_within_its_first_window_and_a_winner_never@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274040,10 +274040,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_timed_mtp_head_catches_up_after_the_probe@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_timed_mtp_head_catches_up_after_the_probe@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274070,10 +274070,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_timed_pipelined_run_demotes_on_a_measured_loss_or_its_static_threshold@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_timed_pipelined_run_demotes_on_a_measured_loss_or_its_static_threshold@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274100,10 +274100,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::a_top_p_request_samples_on_the_device_one_id_per_step@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::a_top_p_request_samples_on_the_device_one_id_per_step@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274130,10 +274130,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::an_explicit_proposer_request_is_never_demoted@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::an_explicit_proposer_request_is_never_demoted@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274160,10 +274160,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::auto_demotes_a_losing_proposer_to_the_pipelined_plain_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::auto_demotes_a_losing_proposer_to_the_pipelined_plain_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274190,10 +274190,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::auto_keeps_a_proposer_that_pays_for_itself@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::auto_keeps_a_proposer_that_pays_for_itself@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274220,10 +274220,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::greedy_draft_model_is_the_plain_loop_on_every_cache_pairing@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::greedy_draft_model_is_the_plain_loop_on_every_cache_pairing@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274250,10 +274250,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::greedy_mtp_is_the_plain_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::greedy_mtp_is_the_plain_loop@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274280,10 +274280,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::greedy_prompt_lookup_is_the_plain_loop_and_recovers_both_ways@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::greedy_prompt_lookup_is_the_plain_loop_and_recovers_both_ways@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274310,10 +274310,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::lookup_is_demoted_only_where_the_plain_loop_is_pipelined@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::lookup_is_demoted_only_where_the_plain_loop_is_pipelined@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274340,10 +274340,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::off_is_the_plain_loop_on_the_causal_and_hybrid_targets@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::off_is_the_plain_loop_on_the_causal_and_hybrid_targets@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274370,10 +274370,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::pipelining_is_invisible_on_the_causal_and_hybrid_targets@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::pipelining_is_invisible_on_the_causal_and_hybrid_targets@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274405,10 +274405,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::pipelining_overlap_microbench@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::pipelining_overlap_microbench@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274435,10 +274435,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::seeded_device_sampling_is_reproducible@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::seeded_device_sampling_is_reproducible@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274465,10 +274465,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::speculative_runs_are_not_pipelined@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::speculative_runs_are_not_pipelined@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274495,10 +274495,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::stochastic_speculation_is_seeded@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::stochastic_speculation_is_seeded@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274525,10 +274525,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::the_constraint_is_rewound_only_when_something_advanced_it@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::the_constraint_is_rewound_only_when_something_advanced_it@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274555,10 +274555,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::the_first_delivered_token_is_read_before_a_look_ahead_is_enqueued@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::the_first_delivered_token_is_read_before_a_look_ahead_is_enqueued@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274585,10 +274585,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::the_first_token_is_delivered_before_step_one_is_enqueued@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::the_first_token_is_delivered_before_step_one_is_enqueued@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274615,10 +274615,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::the_first_token_is_dispatched_before_step_one_is_enqueued@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::the_first_token_is_dispatched_before_step_one_is_enqueued@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274645,10 +274645,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::the_handoff_honours_the_budget_and_a_stop_token_it_draws@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::the_handoff_honours_the_budget_and_a_stop_token_it_draws@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274675,10 +274675,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::the_hybrid_rolls_back_through_its_checkpoint_ring_without_replay_or_clone@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::the_hybrid_rolls_back_through_its_checkpoint_ring_without_replay_or_clone@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274705,10 +274705,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::the_mtp_head_caught_up_on_plain_steps_matches_one_stepped_through_them@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274735,10 +274735,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::the_pipelining_and_device_sampler_switches_turn_each_path_off@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::the_pipelining_and_device_sampler_switches_turn_each_path_off@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274765,10 +274765,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::the_report_carries_the_measured_speculation@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::the_report_carries_the_measured_speculation@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -274795,10 +274795,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/decode/engine.rs",
+    "source": "crates/llm/mlx-llm/src/decode/engine/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/decode/engine.rs::decode::engine::tests::the_ring_recovers_a_draft_window_of_single_token_forwards@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
+      "source_identity": "crates/llm/mlx-llm/src/decode/engine/tests.rs::decode::engine::tests::the_ring_recovers_a_draft_window_of_single_token_forwards@43d975af4f021eaa95d41fc9ee867ff9129b8429dcede2f938ff6da70df0a919",
       "requirements": []
     }
   },
@@ -275695,10 +275695,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::a_checkpoint_window_over_several_forwards_truncates_to_each_position@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::a_checkpoint_window_over_several_forwards_truncates_to_each_position@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -275725,10 +275725,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::a_forward_past_the_armed_window_is_refused_untouched@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::a_forward_past_the_armed_window_is_refused_untouched@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -275755,10 +275755,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::a_mismatched_companion_head_is_refused_by_name_and_leaves_the_target_intact@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::a_mismatched_companion_head_is_refused_by_name_and_leaves_the_target_intact@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -275785,10 +275785,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::a_moe_mtp_head_runs_identically_in_both_expert_layouts@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::a_moe_mtp_head_runs_identically_in_both_expert_layouts@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -275815,10 +275815,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::assembled_forward_produces_finite_logits@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::assembled_forward_produces_finite_logits@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -275845,10 +275845,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::decode_after_prefill_advances_cache@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::decode_after_prefill_advances_cache@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -275875,10 +275875,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::decode_from_embeds_text_only_equals_decode_logits@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::decode_from_embeds_text_only_equals_decode_logits@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -275905,10 +275905,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::deepstack_fused_path_consumes_features_and_differs@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::deepstack_fused_path_consumes_features_and_differs@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -275938,10 +275938,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::deltanet_layer_matches_qwen3_5_reference@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::deltanet_layer_matches_qwen3_5_reference@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -275968,10 +275968,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::flat_text_and_wrapped_qwen35_match_target_and_mtp@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::flat_text_and_wrapped_qwen35_match_target_and_mtp@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -275998,10 +275998,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::greedy_tokens_match_pre_sc24442_sdpa_routing@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::greedy_tokens_match_pre_sc24442_sdpa_routing@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276028,14 +276028,14 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "no_default_features": false,
     "expected_devices": [
       "mlx-metal"
     ],
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::greedy_tokens_match_the_ops_reference_recurrence@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::greedy_tokens_match_the_ops_reference_recurrence@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276062,10 +276062,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::image_text_decode_from_embeds_runs@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::image_text_decode_from_embeds_runs@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276074,7 +276074,7 @@
     "target": "mlx_llm",
     "target_kind": "lib",
     "fqn": "models::qwen35::tests::moe_ffn_matches_qwen3_5_moe_reference",
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
@@ -276102,7 +276102,7 @@
     ],
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moe_ffn_matches_qwen3_5_moe_reference@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moe_ffn_matches_qwen3_5_moe_reference@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276129,10 +276129,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moe_model_forward_and_prefill_equals_stepwise@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moe_model_forward_and_prefill_equals_stepwise@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276159,10 +276159,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::mtp_generation_covers_verification_rollback_stop_and_cancel@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::mtp_generation_covers_verification_rollback_stop_and_cancel@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276189,10 +276189,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::mtp_loads_all_frozen_components_and_executes@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::mtp_loads_all_frozen_components_and_executes@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276219,10 +276219,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::mtp_prefill_projects_only_last_row_and_warm_cache_matches_full@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::mtp_prefill_projects_only_last_row_and_warm_cache_matches_full@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276249,10 +276249,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::multimodal_mtp_seed_uses_fused_embeddings_and_matches_text_equivalent@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::multimodal_mtp_seed_uses_fused_embeddings_and_matches_text_equivalent@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276282,10 +276282,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::prefill_equals_stepwise_decode@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::prefill_equals_stepwise_decode@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276312,10 +276312,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::prism_greedy_tokens_and_logits_are_unchanged_by_the_fused_rotation@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::prism_greedy_tokens_and_logits_are_unchanged_by_the_fused_rotation@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276342,10 +276342,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::prism_target_with_a_companion_head_drafts_and_keeps_greedy_tokens@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::prism_target_with_a_companion_head_drafts_and_keeps_greedy_tokens@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276372,10 +276372,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::stored_quantized_scales_keep_activations_and_kv_in_compute_dtype@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::stored_quantized_scales_keep_activations_and_kv_in_compute_dtype@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276402,10 +276402,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::the_checkpoint_ring_footprint_is_what_admission_prices@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::the_checkpoint_ring_footprint_is_what_admission_prices@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276414,7 +276414,7 @@
     "target": "mlx_llm",
     "target_kind": "lib",
     "fqn": "models::qwen35::tests::the_mtp_layer_ffn_matches_the_moe_reference",
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
@@ -276442,7 +276442,7 @@
     ],
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::the_mtp_layer_ffn_matches_the_moe_reference@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::the_mtp_layer_ffn_matches_the_moe_reference@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276469,10 +276469,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::truncate_outside_the_checkpoint_window_is_refused_and_closes_it@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::truncate_outside_the_checkpoint_window_is_refused_and_closes_it@60d8d8b7325cf9093b17200c3223e36a2dd8e4d2a01e6ce0ef6c9fee37bb6875",
       "requirements": []
     }
   },
@@ -276924,10 +276924,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -276954,10 +276954,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_compressed_request_speculates_on_the_compressed_cache@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_compressed_request_speculates_on_the_compressed_cache@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -276984,10 +276984,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_compressed_turn_imports_the_dense_turns_prefix@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_compressed_turn_imports_the_dense_turns_prefix@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277014,10 +277014,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_configured_mtp_head_the_snapshot_does_not_carry_is_a_named_load_fallback@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_configured_mtp_head_the_snapshot_does_not_carry_is_a_named_load_fallback@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277044,10 +277044,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_declined_prefix_import_is_named_not_counted_as_reuse@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_declined_prefix_import_is_named_not_counted_as_reuse@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277074,10 +277074,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_lone_batch_survivor_runs_on_the_contiguous_path_not_paged@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_lone_batch_survivor_runs_on_the_contiguous_path_not_paged@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277104,10 +277104,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277134,10 +277134,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_one_token_request_working_set_is_priced_under_either_activation_dtype@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_one_token_request_working_set_is_priced_under_either_activation_dtype@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277164,10 +277164,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_qwen35_request_keeps_its_snapshot_only_when_admission_holds_it@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_qwen35_request_keeps_its_snapshot_only_when_admission_holds_it@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277194,10 +277194,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277224,10 +277224,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_reader_fault_or_refusal_is_reported_as_a_dense_fallback@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_reader_fault_or_refusal_is_reported_as_a_dense_fallback@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277254,10 +277254,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_request_reclaims_the_prefix_cache_up_to_the_admission_boundary@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_request_reclaims_the_prefix_cache_up_to_the_admission_boundary@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277284,10 +277284,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_resident_draft_routes_draft_model_and_is_priced@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_resident_draft_routes_draft_model_and_is_priced@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277314,10 +277314,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277344,10 +277344,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::admission_estimates_cover_the_measured_peak_compressed_and_dense@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::admission_estimates_cover_the_measured_peak_compressed_and_dense@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277374,10 +277374,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::admission_prices_compressed_kv_only_when_the_request_runs_it@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::admission_prices_compressed_kv_only_when_the_request_runs_it@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277404,10 +277404,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::an_off_cache_is_never_read_or_fed@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::an_off_cache_is_never_read_or_fed@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277434,10 +277434,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277464,10 +277464,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::an_unset_speculative_option_runs_the_providers_default@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277494,10 +277494,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::auto_is_demoted_and_an_explicit_proposer_is_not@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::auto_is_demoted_and_an_explicit_proposer_is_not@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277525,10 +277525,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::campaign_forced_continuation_teacher_forces_the_compressed_arm_on_the_dense_stream@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::campaign_forced_continuation_teacher_forces_the_compressed_arm_on_the_dense_stream@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277556,10 +277556,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::campaign_multi_turn_prompt_ids_do_not_depend_on_the_date@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::campaign_multi_turn_prompt_ids_do_not_depend_on_the_date@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277587,10 +277587,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::campaign_steady_decode_is_fixed_length_on_both_arms_and_refuses_a_dense_compressed_arm@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::campaign_steady_decode_is_fixed_length_on_both_arms_and_refuses_a_dense_compressed_arm@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277617,14 +277617,14 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "mixed",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::chat_template_byte_matches_hf_processor@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::chat_template_byte_matches_hf_processor@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": [],
       "requirement_bundles": [
         {
-          "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::chat_template_byte_matches_hf_processor@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b/source-supported-bundle-0",
+          "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::chat_template_byte_matches_hf_processor@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b/source-supported-bundle-0",
           "requirements": [
             {
               "slot": "actual-external-model-config",
@@ -277668,7 +277668,7 @@
           ]
         },
         {
-          "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::chat_template_byte_matches_hf_processor@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b/source-supported-bundle-1",
+          "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::chat_template_byte_matches_hf_processor@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b/source-supported-bundle-1",
           "requirements": [
             {
               "slot": "actual-external-model-config",
@@ -277737,10 +277737,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::compressed_8bit_multi_turn_prompt_cache_reuse_agrees_with_dense@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::compressed_8bit_multi_turn_prompt_cache_reuse_agrees_with_dense@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277768,10 +277768,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::compressed_campaign_decoder_keeps_prefill_and_decode_on_the_fused_reader@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::compressed_campaign_decoder_keeps_prefill_and_decode_on_the_fused_reader@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277799,10 +277799,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::compressed_coordinate_storage_reconciles_across_a_block_plateau@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::compressed_coordinate_storage_reconciles_across_a_block_plateau@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277829,10 +277829,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::compressed_kv_decode_logits_match_dense_within_8_bit_rounding@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::compressed_kv_decode_logits_match_dense_within_8_bit_rounding@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277859,10 +277859,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::compressed_prefill_sample_holds_the_reported_packed_store@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::compressed_prefill_sample_holds_the_reported_packed_store@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277889,10 +277889,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::compressed_prefix_hit_imports_the_reused_prefix_into_the_compressed_cache@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::compressed_prefix_hit_imports_the_reused_prefix_into_the_compressed_cache@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277919,10 +277919,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::every_proposer_is_greedy_exact_on_the_vector_kernel_geometry@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::every_proposer_is_greedy_exact_on_the_vector_kernel_geometry@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277949,10 +277949,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::generate_batch_decodes_concurrent_qualified_requests_dense_as_batched@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::generate_batch_decodes_concurrent_qualified_requests_dense_as_batched@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -277979,10 +277979,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::llama_compressed_kv_matches_dense_at_its_qualified_context@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::llama_compressed_kv_matches_dense_at_its_qualified_context@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278009,10 +278009,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::memory_geometry_prices_kv_at_the_cached_width@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::memory_geometry_prices_kv_at_the_cached_width@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278040,10 +278040,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::multi_turn_prompt_cache_fixture_agrees_at_8_bit_and_requires_a_turn_two_hit@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::multi_turn_prompt_cache_fixture_agrees_at_8_bit_and_requires_a_turn_two_hit@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278070,10 +278070,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::no_dense_kv_copy_survives_a_paged_compressed_attention_call@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::no_dense_kv_copy_survives_a_paged_compressed_attention_call@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278100,10 +278100,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::no_dense_kv_mirror_survives_a_compressed_attention_call@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::no_dense_kv_mirror_survives_a_compressed_attention_call@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278112,7 +278112,7 @@
     "target": "mlx_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::paged_compressed_kv_logits_match_contiguous_compressed_and_dense_paged",
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
@@ -278141,7 +278141,7 @@
     ],
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::paged_compressed_kv_logits_match_contiguous_compressed_and_dense_paged@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::paged_compressed_kv_logits_match_contiguous_compressed_and_dense_paged@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278150,7 +278150,7 @@
     "target": "mlx_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::paged_compressed_requests_share_a_fragmented_pool_and_cancellation_frees_pages",
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
@@ -278179,7 +278179,7 @@
     ],
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::paged_compressed_requests_share_a_fragmented_pool_and_cancellation_frees_pages@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::paged_compressed_requests_share_a_fragmented_pool_and_cancellation_frees_pages@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278188,7 +278188,7 @@
     "target": "mlx_llm",
     "target_kind": "lib",
     "fqn": "provider::tests::paged_selection_is_the_dense_paged_cache_when_off_or_refused",
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
@@ -278217,7 +278217,7 @@
     ],
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::paged_selection_is_the_dense_paged_cache_when_off_or_refused@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::paged_selection_is_the_dense_paged_cache_when_off_or_refused@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278244,10 +278244,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::prism_companion_head_in_f32_keeps_the_off_tokens_exactly@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::prism_companion_head_in_f32_keeps_the_off_tokens_exactly@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278274,10 +278274,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::prism_with_a_companion_head_decodes_mtp_with_the_off_tokens@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::prism_with_a_companion_head_decodes_mtp_with_the_off_tokens@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278304,10 +278304,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::qwen3_compressed_kv_matches_dense_at_its_qualified_context@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::qwen3_compressed_kv_matches_dense_at_its_qualified_context@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278334,10 +278334,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::speculative_requests_emit_the_off_tokens_and_off_is_the_plain_loop@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::speculative_requests_emit_the_off_tokens_and_off_is_the_plain_loop@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278364,10 +278364,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::the_backend_neutral_parity_suite_holds_on_both_decoders@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::the_backend_neutral_parity_suite_holds_on_both_decoders@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278394,10 +278394,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::the_final_context_bounds_a_production_compressed_request@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::the_final_context_bounds_a_production_compressed_request@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278424,10 +278424,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::the_resolution_fallback_reaches_the_decode_report@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::the_resolution_fallback_reaches_the_decode_report@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278454,10 +278454,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::the_speculative_route_names_every_downgrade@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::the_speculative_route_names_every_downgrade@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278484,10 +278484,10 @@
         "lib"
       ]
     },
-    "source": "crates/llm/mlx-llm/src/provider.rs",
+    "source": "crates/llm/mlx-llm/src/provider/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/provider.rs::provider::tests::unqualified_models_stay_dense_with_their_reason@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
+      "source_identity": "crates/llm/mlx-llm/src/provider/tests.rs::provider::tests::unqualified_models_stay_dense_with_their_reason@3ad3d43e9056024e303cea9da52037a1552a0cf77a4473f248819ae8b21d907b",
       "requirements": []
     }
   },
@@ -278990,13 +278990,13 @@
     ],
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "fqn": "models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu",
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
-    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu; source-defined synthetic decoder weights and original assertions",
-    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
+    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu; source-defined synthetic decoder weights and original assertions",
+    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu",
     "required_environment": [],
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu",
       "requirements": []
     },
     "expected_devices": [
@@ -279023,13 +279023,13 @@
     ],
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "fqn": "models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays",
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
-    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays; source-defined synthetic decoder weights and original assertions",
-    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
+    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays; source-defined synthetic decoder weights and original assertions",
+    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays",
     "required_environment": [],
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays",
       "requirements": []
     },
     "expected_devices": [
@@ -279056,13 +279056,13 @@
     ],
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "fqn": "models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native",
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
-    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native; committed frozen HF CPU-oracle fixture and original numerical assertions",
-    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
+    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native; committed frozen HF CPU-oracle fixture and original numerical assertions",
+    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native",
     "required_environment": [],
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native",
       "requirements": []
     },
     "expected_devices": [
@@ -279089,13 +279089,13 @@
     ],
     "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
     "fqn": "models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace",
-    "source": "crates/llm/mlx-llm/src/models/qwen35.rs",
-    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace; committed frozen HF CPU-oracle fixture and original numerical assertions",
-    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace",
+    "source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs",
+    "fixture_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace; committed frozen HF CPU-oracle fixture and original numerical assertions",
+    "configuration_source": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace",
     "required_environment": [],
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/llm/mlx-llm/src/models/qwen35.rs::models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace",
+      "source_identity": "crates/llm/mlx-llm/src/models/qwen35/tests.rs::models::qwen35::tests::moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace",
       "requirements": []
     },
     "expected_devices": [

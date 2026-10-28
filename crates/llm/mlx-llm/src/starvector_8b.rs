@@ -5,19 +5,17 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 use serde_json::Value;
 
 use core_llm::{
-    Channel, Content, DecodeReport, DecoderArchitecture, Error as CoreError, FinishReason,
-    ImagePreprocessing, LoadSpec, ProjectionMetadata, Result as CoreResult,
-    StarVectorBoundedStream, StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput,
-    StarVectorProvider, StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus,
-    StarVectorTier, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, Tokenizer, Usage, VisionEncoderArchitecture,
+    DecodeReport, Error as CoreError, LoadSpec, Result as CoreResult, StarVectorBoundedStream,
+    StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput, StarVectorProvider,
+    StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus, StreamEvent, TextLlm,
+    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer,
 };
 
 use crate::decode::{
@@ -25,7 +23,7 @@ use crate::decode::{
     NoProposer, SpeculativePrompt, StepTarget, StreamEvent as DecodeEvent,
 };
 use crate::error::{Error, Result};
-use crate::image::SiglipImageProcessor;
+use crate::image::{SiglipImageProcessor, SiglipPreprocess};
 use crate::models::{SiglipVisionConfig, SiglipVisionTower, StarCoder2, StarCoder2Config};
 use crate::primitives::nn::{layer_norm, linear, silu};
 use crate::primitives::sampler::SamplingParams;
@@ -33,23 +31,15 @@ use crate::primitives::{input_ids, Weights};
 
 /// Explicit provider id used by the ordinary MLX text registry.
 pub const PROVIDER_ID: &str = "mlx-starvector-8b";
-const SNAPSHOT_REPOSITORY: &str = "starvector/starvector-8b-im2svg";
-const SNAPSHOT_REVISION: &str = "518beea8dcb5f7a37c5911e92d1d62a76beee7f9";
-const SVG_PROMPT: &str = "<svg";
-const EOS_TOKEN_ID: i32 = 0;
-const IMAGE_SIZE: usize = 384;
-const IMAGE_TOKENS: i32 = 576;
-const VISION_HIDDEN: i32 = 1024;
-const DECODER_HIDDEN: i32 = 4608;
-const MAX_CONTEXT_TOKENS: usize = 16_000;
-// The exact snapshot tokenizer encodes the fixed `<svg` decoder prompt as two IDs; `load`
-// verifies this against the local snapshot before provider advertisement is trusted.
-const SVG_PROMPT_TOKEN_COUNT: usize = 2;
-/// Hard wall-time cap for one SVG decode. Sized so a decode that uses the whole context window
-/// can finish; hosts may request less.
-const MAX_WALL_TIME: Duration = Duration::from_secs(600);
-const MAX_NEW_TOKENS: u32 =
-    (MAX_CONTEXT_TOKENS - (IMAGE_TOKENS as usize + SVG_PROMPT_TOKEN_COUNT)) as u32;
+// The snapshot's geometry and probe are shared with Candle (sc-27255); the MLX shape math reads
+// the token and width facts as `i32`.
+use core_llm::starvector::starvector_8b::{
+    exact_config, EOS_TOKEN_ID, IMAGE_SIZE, MAX_SVG_BYTES, MAX_WALL_TIME, SNAPSHOT_REPOSITORY,
+    SNAPSHOT_REVISION, SVG_PROMPT,
+};
+const IMAGE_TOKENS: i32 = core_llm::starvector::starvector_8b::IMAGE_TOKENS as i32;
+const VISION_HIDDEN: i32 = core_llm::starvector::starvector_8b::VISION_HIDDEN as i32;
+const DECODER_HIDDEN: i32 = core_llm::starvector::starvector_8b::DECODER_HIDDEN as i32;
 
 /// A fully loaded StarVector-8B MLX model. Dropping it releases all MLX array handles; reload is
 /// an ordinary new explicit-registry load.
@@ -184,7 +174,8 @@ impl StarVector8bProvider {
             dir.join("merges.txt"),
             dir.join("tokenizer_config.json"),
         )?;
-        validate_loaded_context_cap(
+        core_llm::validate_loaded_svg_context_cap(
+            "StarVector-8B",
             &descriptor,
             &starvector,
             tokenizer.encode(SVG_PROMPT, false)?.len(),
@@ -242,19 +233,14 @@ impl StarVector8bProvider {
                 index: 0,
             }),
             StarVectorStreamStatus::Stop(_) => {
-                let output = guard.output()?;
-                on_event(StarVectorStreamEvent::Done {
-                    finish_reason: output.finish_reason,
-                    generated_tokens: output.generated_tokens,
-                    generated_bytes: output.generated_bytes,
-                });
+                let output = core_llm::emit_svg_done(guard.output()?, on_event);
                 return Ok((output, None));
             }
         }
         let (first_logits, mut cache) = self.model.prefill(image, &prompt).map_err(to_core)?;
         let config = GenerationConfig {
             max_new_tokens: request.text_request.max_new_tokens as usize,
-            sampling: sampling(&request.text_request.sampling),
+            sampling: SamplingParams::from(&request.text_request.sampling),
             seed: request.text_request.seed,
             stop_tokens: vec![EOS_TOKEN_ID],
         };
@@ -351,42 +337,13 @@ impl StarVector8bProvider {
                 DecodeFinish::Stopped => {}
             }
         }
-        let output = guard.output()?;
-        on_event(StarVectorStreamEvent::Done {
-            finish_reason: output.finish_reason,
-            generated_tokens: output.generated_tokens,
-            generated_bytes: output.generated_bytes,
-        });
+        let output = core_llm::emit_svg_done(guard.output()?, on_event);
         Ok((output, Some(run.report)))
     }
 }
 
 fn image_from_request(request: &TextLlmRequest) -> CoreResult<&core_llm::ImageRef> {
-    if request
-        .messages
-        .iter()
-        .any(|message| !message.text_content().trim().is_empty())
-    {
-        return Err(CoreError::Unsupported(
-            "StarVector-8B im2svg is image-conditioned and does not accept free-form text guidance"
-                .into(),
-        ));
-    }
-    let mut image = None;
-    for message in &request.messages {
-        for content in &message.content {
-            if let Content::Image(value) = content {
-                if image.replace(value).is_some() {
-                    return Err(CoreError::Unsupported(
-                        "StarVector-8B accepts exactly one conditioning image".into(),
-                    ));
-                }
-            }
-        }
-    }
-    image.ok_or_else(|| {
-        CoreError::InvalidRequest("StarVector-8B requires one conditioning image".into())
-    })
+    core_llm::starvector_conditioning_image("StarVector-8B", request)
 }
 
 impl TextLlm for StarVector8bProvider {
@@ -411,70 +368,19 @@ impl TextLlm for StarVector8bProvider {
         request: &TextLlmRequest,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> CoreResult<TextLlmOutput> {
-        let svg_request = StarVectorRequest::new(request.clone(), 2 * 1024 * 1024, MAX_WALL_TIME);
         let prompt_tokens = self.tokenizer.encode(SVG_PROMPT, false)?.len() as u32;
-        let (output, report) = self.generate_svg_inner(&svg_request, &mut |event| match event {
-            StarVectorStreamEvent::Source { text, index } => {
-                on_event(StreamEvent::Token {
-                    id: index,
-                    text,
-                    index: index as usize,
-                    channel: Channel::Content,
-                });
-            }
-            StarVectorStreamEvent::Progress { .. } => {}
-            StarVectorStreamEvent::Done {
-                finish_reason,
-                generated_tokens,
-                ..
-            } => {
-                on_event(StreamEvent::Done {
-                    finish_reason: map_finish(finish_reason),
-                    usage: Usage {
-                        prompt_tokens: IMAGE_TOKENS as u32 + prompt_tokens,
-                        generated_tokens,
-                    },
-                });
-            }
-        })?;
-        Ok(svg_text_output(
-            output.svg,
-            Usage {
-                prompt_tokens: IMAGE_TOKENS as u32 + prompt_tokens,
-                generated_tokens: output.generated_tokens,
-            },
-            // StarVector advertises no proposer and has no prefix cache: the request's speculative
-            // fallback and the prefix-cache reason join the measured report in the shared words
-            // Candle's StarVector uses — never a silent downgrade (E2, E8).
-            report.map(|report| {
-                report.with_captioner_reasons(request.speculative_or(self.speculative_default))
-            }),
-            map_finish(output.finish_reason),
-            request.kv_compression,
-        ))
-    }
-}
-
-/// The text output of one SVG generation: the SVG source (empty when none closed), its measured
-/// `decode` report, and — the StarVector wrapper having no compressed-KV table family — the dense
-/// KV-cache report for the request's `policy` (sc-20683).
-fn svg_text_output(
-    svg: Option<String>,
-    usage: Usage,
-    decode: Option<core_llm::DecodeReport>,
-    finish: FinishReason,
-    policy: core_llm::KvCompressionPolicy,
-) -> TextLlmOutput {
-    TextLlmOutput {
-        timings: None,
-        text: svg.unwrap_or_default(),
-        thinking: None,
-        tool_calls: Vec::new(),
-        usage,
-        mtp: None,
-        decode,
-        finish_reason: Some(finish),
-        kv_cache: Some(core_llm::KvCacheReport::without_table_family(policy)),
+        // StarVector advertises no proposer and has no prefix cache: the shared scaffolding joins
+        // the request's speculative fallback and the prefix-cache reason to the measured report in
+        // the words Candle's StarVector uses too — never a silent downgrade (E2, E8; sc-27301).
+        core_llm::svg_text_output(
+            request,
+            IMAGE_TOKENS as u32 + prompt_tokens,
+            MAX_SVG_BYTES,
+            MAX_WALL_TIME,
+            self.speculative_default,
+            on_event,
+            |svg_request, events| self.generate_svg_inner(svg_request, events),
+        )
     }
 }
 
@@ -492,71 +398,14 @@ impl StarVectorProvider for StarVector8bProvider {
     }
 }
 
-/// Descriptor used before weight loading by the existing explicit registry.
+/// Descriptor used before weight loading by the explicit registry.
 pub fn descriptor() -> TextLlmDescriptor {
-    TextLlmDescriptor {
-        id: PROVIDER_ID.into(),
-        family: "starvector".into(),
-        backend: "mlx".into(),
-        capabilities: TextLlmCapabilities {
-            max_context_tokens: MAX_CONTEXT_TOKENS,
-            max_new_tokens: MAX_NEW_TOKENS,
-            supports_system_prompt: false,
-            supports_vision: true,
-            supports_video: false,
-            supports_audio: false,
-            supports_thinking: false,
-            supports_reasoning_effort: false,
-            reasoning_efforts: Vec::new(),
-            model_sampling_defaults: None,
-            supports_preserve_thinking: false,
-            supports_tools: false,
-            mtp: None,
-            speculative: Vec::new(),
-            supported_constraints: Vec::new(),
-        },
-    }
-}
-
-fn validate_loaded_context_cap(
-    descriptor: &TextLlmDescriptor,
-    starvector: &StarVectorDescriptor,
-    prompt_tokens: usize,
-) -> CoreResult<()> {
-    let prefill_tokens = usize::try_from(starvector.projection.image_token_count)
-        .map_err(|_| {
-            CoreError::InvalidRequest("StarVector-8B image prefix does not fit usize".into())
-        })?
-        .checked_add(prompt_tokens)
-        .ok_or_else(|| {
-            CoreError::InvalidRequest("StarVector-8B prefill token count overflow".into())
-        })?;
-    core_llm::validate_advertised_generated_token_cap(
-        descriptor.capabilities.max_new_tokens,
-        descriptor.capabilities.max_context_tokens,
-        prefill_tokens,
-    )
+    core_llm::starvector::starvector_8b::text_descriptor(PROVIDER_ID, "mlx")
 }
 
 /// Tensor-neutral model facts visible through the shared StarVector contract.
 pub fn starvector_descriptor() -> StarVectorDescriptor {
-    StarVectorDescriptor {
-        tier: StarVectorTier::EightB,
-        preprocessing: ImagePreprocessing {
-            image_size: IMAGE_SIZE as u32,
-            channels: 3,
-            preserve_aspect_ratio: false,
-        },
-        projection: ProjectionMetadata {
-            vision_encoder: VisionEncoderArchitecture::Siglip,
-            decoder: DecoderArchitecture::StarCoder2,
-            vision_hidden_size: VISION_HIDDEN as u32,
-            decoder_hidden_size: DECODER_HIDDEN as u32,
-            image_token_count: IMAGE_TOKENS as u32,
-        },
-        max_svg_bytes: 2 * 1024 * 1024,
-        max_wall_time: Some(MAX_WALL_TIME),
-    }
+    core_llm::starvector::starvector_8b::starvector_descriptor()
 }
 
 /// Explicit runtime registration; no global constructors or side effects.
@@ -574,11 +423,7 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 
 /// Weightless structural probe used by the existing model-first registry selection.
 pub fn can_load(spec: &LoadSpec) -> bool {
-    let path = Path::new(&spec.source).join("config.json");
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .is_some_and(|config| exact_config(&config))
+    core_llm::starvector::starvector_8b::snapshot_matches(&spec.source)
 }
 
 fn validate_snapshot(dir: &Path) -> Result<()> {
@@ -606,20 +451,6 @@ fn validate_snapshot(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn exact_config(config: &Value) -> bool {
-    config.get("model_type").and_then(Value::as_str) == Some("starvector")
-        && config.get("starcoder_model_name").and_then(Value::as_str)
-            == Some("bigcode/starcoder2-7b")
-        && config.get("image_encoder_type").and_then(Value::as_str) == Some("siglip_384")
-        && config.get("adapter_norm").and_then(Value::as_str) == Some("layer_norm")
-        && config.get("image_size").and_then(Value::as_i64) == Some(384)
-        && config.get("hidden_size").and_then(Value::as_i64) == Some(4608)
-        && config.get("num_attention_heads").and_then(Value::as_i64) == Some(36)
-        && config.get("num_hidden_layers").and_then(Value::as_i64) == Some(32)
-        && config.get("num_kv_heads").and_then(Value::as_i64) == Some(4)
-        && config.get("vocab_size").and_then(Value::as_i64) == Some(49_152)
-}
-
 fn siglip_config() -> SiglipVisionConfig {
     SiglipVisionConfig {
         image_size: IMAGE_SIZE as i32,
@@ -641,67 +472,28 @@ fn preprocess_image(image: &core_llm::ImageRef) -> Result<Array> {
     .preprocess(&image.pixels, image.width as usize, image.height as usize)
 }
 
-fn sampling(value: &core_llm::Sampling) -> SamplingParams {
-    SamplingParams {
-        temperature: value.temperature,
-        top_p: value.top_p,
-        top_k: value.top_k,
-        presence_penalty: value.presence_penalty,
-        presence_penalty_generated_only: value.presence_penalty_generated_only,
-        presence_penalty_prompt_len: 0,
-        repetition_penalty: value.repetition_penalty,
-        repetition_context: value.repetition_context,
-    }
-}
-
-fn map_finish(reason: StarVectorFinishReason) -> FinishReason {
-    match reason {
-        StarVectorFinishReason::CompleteRoot | StarVectorFinishReason::Eos => FinishReason::Stop,
-        StarVectorFinishReason::TokenLimit
-        | StarVectorFinishReason::ByteLimit
-        | StarVectorFinishReason::WallTimeLimit => FinishReason::Length,
-        StarVectorFinishReason::Cancelled => FinishReason::Cancelled,
-    }
-}
-
+/// The crate-wide bridge (sc-27300), naming the model in a missing-tensor load failure.
 fn to_core(error: Error) -> CoreError {
     match error {
-        Error::Canceled => CoreError::Canceled,
-        Error::Unsupported(message) => CoreError::Unsupported(message),
         Error::MissingTensor(key) => {
             CoreError::Load(format!("missing StarVector-8B tensor: {key}"))
         }
-        Error::Config(message) => CoreError::Load(message),
-        Error::Io(error) => CoreError::Io(error),
-        other => CoreError::backend(other),
+        other => crate::error::to_core(other),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_llm::starvector::starvector_8b::{MAX_CONTEXT_TOKENS, SVG_PROMPT_TOKEN_COUNT};
+    use core_llm::{DecoderArchitecture, StarVectorTier};
     use serde_json::json;
     use std::env;
+    use std::time::Duration;
 
     use core_llm_testkit::{
         check_starvector_bounded_fixture, starvector_conformance, StarVectorProfile,
     };
-
-    /// sc-20683: every SVG text output reports the dense KV cache with the shared reason for its
-    /// policy.
-    #[test]
-    fn svg_text_output_reports_the_dense_kv_cache_for_the_policy() {
-        use core_llm::{
-            KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
-        };
-        for (policy, reason) in [
-            (Policy::Off, Reason::PolicyDisabled),
-            (Policy::Qualified, Reason::UnqualifiedModel),
-        ] {
-            let output = svg_text_output(None, Usage::default(), None, FinishReason::Stop, policy);
-            assert_eq!(output.kv_cache, Some(KvCacheReport::dense(reason, None)));
-        }
-    }
 
     fn exact_snapshot_config() -> Value {
         json!({
@@ -776,8 +568,8 @@ mod tests {
             vec![core_llm::Message {
                 role: core_llm::Role::User,
                 content: vec![
-                    Content::Text("turn this into an SVG".into()),
-                    Content::Image(image),
+                    core_llm::Content::Text("turn this into an SVG".into()),
+                    core_llm::Content::Image(image),
                 ],
                 thinking: None,
                 tool_calls: Vec::new(),
@@ -924,7 +716,7 @@ mod tests {
         TextLlmRequest {
             messages: vec![core_llm::Message {
                 role: core_llm::Role::User,
-                content: vec![Content::Image(
+                content: vec![core_llm::Content::Image(
                     core_llm::ImageRef::new(
                         8,
                         8,
@@ -964,7 +756,7 @@ mod tests {
             ..SamplingParams::default()
         };
         for (name, params) in [
-            ("greedy", sampling(&request.sampling)),
+            ("greedy", SamplingParams::from(&request.sampling)),
             ("stochastic", stochastic),
         ] {
             let config = GenerationConfig {

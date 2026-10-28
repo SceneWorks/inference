@@ -73,14 +73,11 @@ pub fn e4m3_byte_from_decoded(q: f32) -> u8 {
     (e as i32 * 8 + 48 + mant).clamp(0, 254) as u8
 }
 
-/// `f3_bf16_bits`: f32 → bf16 bits, nearest-even, NaN kept quiet.
+/// `f3_bf16_bits`: f32 → bf16 bits, nearest-even, NaN kept quiet. `half`'s conversion, which is
+/// bit-identical to the kernel's (and gen-core's `numeric::bf16_bits`) on all 2^32 inputs, rather
+/// than another hand-rolled copy (sc-27419).
 pub fn bf16_bits(x: f32) -> u16 {
-    let b = x.to_bits();
-    if x.is_nan() {
-        return ((b >> 16) | 0x40) as u16;
-    }
-    let round = 0x7fff + ((b >> 16) & 1);
-    (b.wrapping_add(round) >> 16) as u16
+    half::bf16::from_f32(x).to_bits()
 }
 
 /// `flux3_fp8_rowwise_quantize_f32` for one row: the row scale and the E4M3 BYTES of the on-grid
@@ -198,6 +195,11 @@ mod tests {
         assert_eq!(e4m3_byte_from_decoded(0.0), 0);
         assert_eq!(e4m3_byte_from_decoded(1.0 / 512.0), 1, "smallest subnormal");
         assert_eq!(bf16_bits(1.0), 0x3f80);
+        // Ties to even, overflow to inf, and a low-payload NaN stays a quiet NaN.
+        assert_eq!(bf16_bits(1.0 + 2f32.powi(-8)), 0x3f80);
+        assert_eq!(bf16_bits(1.0 + 3.0 * 2f32.powi(-8)), 0x3f82);
+        assert_eq!(bf16_bits(f32::MAX), 0x7f80);
+        assert_eq!(bf16_bits(f32::from_bits(0x7f80_0001)), 0x7fc0);
     }
 
     #[test]

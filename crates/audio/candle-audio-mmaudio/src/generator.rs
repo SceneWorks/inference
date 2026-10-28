@@ -45,6 +45,7 @@ use crate::clip::{self, DfnClipEncoder};
 use crate::output::{AudioDecoder16k, SAMPLE_RATE as OUT_SAMPLE_RATE};
 use crate::sync::SynchformerVisualEncoder;
 use crate::{mmdit, model, preprocess};
+pub(crate) use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes `payload.model` to this exact id). The 44.1 kHz
 /// quality-ceiling sibling is [`crate::generator_44k`]'s `mmaudio_large_44k` (sc-13441).
@@ -197,8 +198,10 @@ pub(crate) fn validate_request(
             )));
         }
         // Uniform frame geometry (the encoders resize per frame, but a zero-sized frame is malformed).
+        // The byte count is computed in `usize` with checked arithmetic (sc-27266): an unchecked
+        // `u32` product wraps for e.g. 65536x65536, letting a short buffer pass and panic later.
         if let Some(bad) = frames.iter().find(|f| {
-            f.width == 0 || f.height == 0 || f.pixels.len() != (f.width * f.height * 3) as usize
+            f.width == 0 || f.height == 0 || rgb_len(f.width, f.height) != Some(f.pixels.len())
         }) {
             return Err(gen_core::Error::Msg(format!(
                 "{id}: a VideoSync frame is malformed ({}x{}, {} bytes; expected w*h*3)",
@@ -209,6 +212,13 @@ pub(crate) fn validate_request(
         }
     }
     Ok(())
+}
+
+/// The RGB8 byte length of a `width x height` frame, or `None` if it does not fit in `usize`.
+pub(crate) fn rgb_len(width: u32, height: u32) -> Option<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(3))
 }
 
 /// The effective render duration: `min(target ?? default, clip_length, trained 8 s window)` — the
@@ -247,16 +257,27 @@ pub(crate) fn resample_frames(
     src_fps: f32,
     dst_fps: f32,
     count: usize,
-) -> Vec<image::RgbImage> {
+) -> AudioResult<Vec<image::RgbImage>> {
     let n = frames.len();
+    if n == 0 {
+        return Err(AudioError::Msg(
+            "mmaudio: no VideoSync frames to resample".into(),
+        ));
+    }
     (0..count)
         .map(|i| {
             let t = i as f32 / dst_fps;
             let src = (t * src_fps).round() as usize;
             let src = src.min(n - 1);
             let f = &frames[src];
-            image::RgbImage::from_raw(f.width, f.height, f.pixels.clone())
-                .expect("validated frame pixel buffer is w*h*3")
+            image::RgbImage::from_raw(f.width, f.height, f.pixels.clone()).ok_or_else(|| {
+                AudioError::Msg(format!(
+                    "mmaudio: VideoSync frame {src} is malformed ({}x{}, {} bytes; expected w*h*3)",
+                    f.width,
+                    f.height,
+                    f.pixels.len()
+                ))
+            })
         })
         .collect()
 }
@@ -333,9 +354,9 @@ impl MmAudioPipeline {
         let dev = &self.device;
 
         // --- conditioners -------------------------------------------------------------------
-        let clip_rgb = resample_frames(frames, src_fps, CLIP_FPS, clip_seq_len);
+        let clip_rgb = resample_frames(frames, src_fps, CLIP_FPS, clip_seq_len)?;
         let sync_rgb_count = (duration * SYNC_FPS).floor() as usize;
-        let sync_rgb = resample_frames(frames, src_fps, SYNC_FPS, sync_rgb_count);
+        let sync_rgb = resample_frames(frames, src_fps, SYNC_FPS, sync_rgb_count)?;
 
         let clip_feat = self.encode_clip_visual(&clip_rgb)?; // (1, clip_seq_len, 1024)
         let text_feat = self.encode_text(prompt)?; // (1, 77, 1024)
@@ -495,14 +516,6 @@ pub(crate) fn check_seq(t: &Tensor, batch: usize, seq: usize, name: &str) -> Aud
         )));
     }
     Ok(())
-}
-
-/// Recover a poisoned mutex (a prior panic mid-synthesis) — the audio twin of `candle_gen::lock_recover`.
-pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
 }
 
 /// The five caller-provisioned component sources resolved at [`load`] (epic 13657), held so the heavy
@@ -774,6 +787,42 @@ mod tests {
         let mut empty_prompt = foley_req(foley_frames(8, 16, 16, 0), 8);
         empty_prompt.prompt = String::new();
         assert!(validate_request(&d, &empty_prompt).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_frames_whose_byte_count_overflows_u32() {
+        // sc-27266: 65536 * 65536 * 3 wraps to 0 in u32, so an empty buffer used to pass validation
+        // (release) or panic in the multiply (debug), then panic in `resample_frames`.
+        let d = descriptor();
+        let huge = Image {
+            width: 65536,
+            height: 65536,
+            pixels: Vec::new(),
+        };
+        let req = foley_req(vec![huge; 8], 8);
+        let err = validate_request(&d, &req).expect_err("overflowing frame geometry rejected");
+        assert!(err.to_string().contains("malformed"), "{err}");
+        // A frame whose u32 product wraps to a small non-zero value is rejected too.
+        let wrapped = Image {
+            width: 0x8000_0001,
+            height: 2,
+            pixels: vec![0; 6],
+        };
+        assert!(validate_request(&d, &foley_req(vec![wrapped; 8], 8)).is_err());
+        assert_eq!(rgb_len(65536, 65536), Some(65536 * 65536 * 3));
+    }
+
+    #[test]
+    fn resample_frames_returns_a_typed_error_for_a_malformed_frame() {
+        let bad = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0; 5],
+        };
+        assert!(resample_frames(&[bad], 8.0, 8.0, 2).is_err());
+        assert!(resample_frames(&[], 8.0, 8.0, 2).is_err());
+        let ok = resample_frames(&foley_frames(2, 4, 4, 0), 8.0, 8.0, 3).unwrap();
+        assert_eq!(ok.len(), 3);
     }
 
     #[test]

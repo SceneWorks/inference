@@ -6,8 +6,8 @@
 //! BTreeMap::clone (alloc/src/collections/btree/map.rs:clone_subtree) allocates
 //! exactly one boxed leaf/internal payload per nonempty source node, with no
 //! heap traversal stack. node.rs has B=6, a leaf containing a parent pointer,
-//! two u16 fields, [MaybeUninit<K>;11], [MaybeUninit<V>;11]; repr(C) internal
-//! adds [MaybeUninit<NonNull<LeafNode<K,V>>>;12]. SetValZST has unit layout.
+//! two u16 fields, `[MaybeUninit<K>;11]`, `[MaybeUninit<V>;11]`; repr(C) internal
+//! adds `[MaybeUninit<NonNull<LeafNode<K,V>>>;12]`. SetValZST has unit layout.
 //!
 //! We bound the WHOLE payload from those fields, rounding EACH field to the
 //! largest field alignment. This upper covers every natural-alignment field
@@ -16,7 +16,7 @@
 //! Every nonempty node owns >=1 key, so node count <= element count. We charge
 //! every node at that internal upper and separately clone every owned key/value.
 //! Empty maps clone without a root allocation. These are source-derived bounds,
-//! NOT size_of<BTreeMap>, an opaque pointer stand-in, or an entry-name bound.
+//! NOT `size_of<BTreeMap>`, an opaque pointer stand-in, or an entry-name bound.
 //! Actual allocator-policing tests exercise empty, split and deep maps, so the
 //! supported compiler's requested allocations are checked independently as well.
 use crate::{source_inventory::bounded_fs::overflow, Result};

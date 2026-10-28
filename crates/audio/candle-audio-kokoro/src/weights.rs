@@ -20,6 +20,7 @@ use std::path::Path;
 
 use candle_audio::candle_core::pickle::PthTensors;
 use candle_audio::candle_core::{DType, Device, Tensor, D};
+use candle_audio::neural_codec::resolve_weight_norm;
 use candle_audio::{AudioError, Result};
 use candle_nn::VarBuilder;
 
@@ -47,33 +48,9 @@ pub fn load_section(pth: &Path, section: &str) -> Result<HashMap<String, Tensor>
         let stripped = name.strip_prefix("module.").unwrap_or(name).to_string();
         raw.insert(stripped, t);
     }
-    resolve_weight_norm(raw)
-}
-
-/// Fold every `X.weight_g` / `X.weight_v` pair into `X.weight = g · v / ‖v‖` (norm per
-/// out-channel — all dims except 0, the torch `weight_norm(dim=0)` default). Non-paired
-/// tensors pass through unchanged.
-fn resolve_weight_norm(raw: HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
-    let mut out = HashMap::with_capacity(raw.len());
-    let g_suffix = ".weight_g";
-    for (name, tensor) in &raw {
-        if let Some(base) = name.strip_suffix(g_suffix) {
-            let v = raw
-                .get(&format!("{base}.weight_v"))
-                .ok_or_else(|| AudioError::Msg(format!("{base}: weight_g without weight_v")))?;
-            // ‖v‖ over all dims except 0, kept broadcastable against v.
-            let mut sq = v.sqr()?;
-            for d in 1..v.rank() {
-                sq = sq.sum_keepdim(d)?;
-            }
-            let norm = sq.sqrt()?;
-            let w = v.broadcast_mul(&tensor.broadcast_div(&norm)?)?;
-            out.insert(format!("{base}.weight"), w);
-        } else if !name.ends_with(".weight_v") {
-            out.insert(name.clone(), tensor.clone());
-        }
-    }
-    Ok(out)
+    // `X.weight_g` / `X.weight_v` pairs folded by the shared commons resolver (sc-27269) — the
+    // same `v · (g / ‖v‖)` math and order this port used to carry privately.
+    Ok(resolve_weight_norm(raw)?)
 }
 
 /// [`load_section`] wrapped as a [`VarBuilder`] on `device` (f32 — the checkpoint's dtype).
@@ -355,6 +332,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// sc-27456: the vendored pickle reader refuses a tensor whose declared shape needs more
+    /// bytes than its storage entry holds, before allocating the declared size.
+    #[test]
+    fn vendored_pickle_refuses_a_tensor_larger_than_its_storage() {
+        use candle_audio::candle_core::pickle;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../contracts/gen-core/tests/fixtures/latent_perceptual/tiny_bn_state_dict.pth",
+        );
+        let mut source_zip = zip::ZipArchive::new(std::fs::File::open(&source).unwrap()).unwrap();
+        let mut entries = Vec::new();
+        for index in 0..source_zip.len() {
+            let mut entry = source_zip.by_index(index).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            // Truncate every tensor storage to one byte: the pickle still declares the shapes.
+            if name.contains("/data/") {
+                bytes.truncate(1);
+            }
+            entries.push((name, bytes));
+        }
+        let borrowed: Vec<_> = entries
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("truncated.pth");
+        write_archive(&path, zip::CompressionMethod::Stored, &borrowed);
+        let err = pickle::read_all(&path).unwrap_err().to_string();
+        assert!(err.contains("needs more bytes than"), "{err}");
     }
 
     fn voice_archive() -> Vec<u8> {
