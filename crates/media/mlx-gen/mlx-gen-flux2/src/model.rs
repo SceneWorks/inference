@@ -4321,8 +4321,10 @@ mod tests {
         assert_eq!(actual, expected);
 
         let runtime = [
-            include_str!("text_encoder/attention.rs"),
-            include_str!("text_encoder/mlp.rs"),
+            // The decoder block's projections are constructed by the shared core block
+            // (sc-27326), which this crate's layer loads through its `lin`.
+            include_str!("../../src/text_decoder.rs"),
+            include_str!("text_encoder/layer.rs"),
             include_str!("text_encoder/encoder.rs"),
             include_str!("text_encoder/mod.rs"),
         ]

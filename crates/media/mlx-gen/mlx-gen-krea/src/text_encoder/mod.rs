@@ -12,16 +12,15 @@
 //! RoPE: Qwen3-VL's interleaved MRoPE sections all index the same sequential text position when there
 //! are no image tokens, so it reduces exactly to standard RoPE. Weights live under `language_model.*`.
 
-pub mod attention;
 pub mod encoder;
 pub mod layer;
-pub mod mlp;
 pub mod tokenizer;
 
-pub use attention::Qwen3Attention;
+// The attention and SwiGLU MLP halves of the decoder block are the shared core modules (sc-27326).
 pub use encoder::KreaTextEncoder;
 pub use layer::Qwen3DecoderLayer;
-pub use mlp::Qwen3Mlp;
+pub use mlx_gen::nn::SwiGluMlp as Qwen3Mlp;
+pub use mlx_gen::text_decoder::Qwen3TextAttention as Qwen3Attention;
 pub use tokenizer::KreaTokenizer;
 
 // The HF half-split text RoPE is identical across families and lives in core.

@@ -64,6 +64,8 @@ pub mod sampler;
 pub mod sc20686;
 pub mod scheduler;
 pub mod text_sample;
+// The Qwen3-style text-encoder decoder block (sc-27326), shared by the decoder-LM text encoders.
+pub mod text_decoder;
 // Shared test-only comparison helpers (sc-27323); opt-in via the `test-support` feature.
 #[cfg(feature = "test-support")]
 pub mod testing;
