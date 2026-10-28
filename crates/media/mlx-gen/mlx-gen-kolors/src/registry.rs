@@ -635,10 +635,15 @@ impl KolorsGenerator {
 
                 // IP-Adapter image tokens are seed-independent — encode the reference once (the
                 // `denoise_ip_latents` method CFG-batches them per image). Carries the resolved scale.
-                let ip = match (ip_mode, reference) {
-                    (true, Some((image, strength))) => {
-                        let tokens = heavy_owned.ip_encoder.as_ref().unwrap().tokens(image)?;
+                let ip = match (ip_mode, reference, heavy_owned.ip_encoder.as_ref()) {
+                    (true, Some((image, strength)), Some(encoder)) => {
+                        let tokens = encoder.tokens(image)?;
                         Some((tokens, strength.unwrap_or(IP_DEFAULT_SCALE)))
+                    }
+                    (true, Some(_), None) => {
+                        return Err(Error::Msg(
+                            "kolors: IP mode needs the IP-Adapter image encoder loaded".into(),
+                        ))
                     }
                     _ => None,
                 };
