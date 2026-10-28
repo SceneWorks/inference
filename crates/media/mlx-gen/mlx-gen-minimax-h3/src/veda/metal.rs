@@ -8,7 +8,7 @@
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::MetalKernel;
 use mlx_rs::{Array, Dtype};
-use std::sync::OnceLock;
+use std::cell::OnceCell;
 
 /// SIMD groups of one attention threadgroup, eight query rows each: a quarter of a 128-row tile.
 const SIMD_GROUPS: i32 = 4;
@@ -452,62 +452,72 @@ struct Kernels {
     attend: MetalKernel,
     attend_nax: MetalKernel,
 }
-// MLX kernel handles are immutable descriptions (source + names); MLX compiles and caches the
-// pipelines itself, keyed on name/source/template arguments, behind its own device lock.
-unsafe impl Send for Kernels {}
-unsafe impl Sync for Kernels {}
 
-fn kernels() -> Result<&'static Kernels> {
-    static KERNELS: OnceLock<std::result::Result<Kernels, String>> = OnceLock::new();
-    KERNELS
-        .get_or_init(|| {
-            let nax_header = format!("{HEADER}{NAX_HEADER}");
-            let with = |name: &str, inputs: &[&str], outputs: &[&str], body: &str, header: &str| {
-                MetalKernel::with_options(
-                    &format!("sc26214_veda_{name}"),
-                    inputs,
-                    outputs,
-                    body,
-                    header,
-                    true,
-                    false,
-                )
-                .map_err(|e| e.to_string())
-            };
-            let make = |name: &str, inputs: &[&str], outputs: &[&str], body: &str| {
-                with(name, inputs, outputs, body, HEADER)
-            };
-            const ATTEND_INPUTS: [&str; 9] = [
-                "q", "k", "v", "perm", "valid", "heads", "keys", "counts", "params",
-            ];
-            Ok(Kernels {
-                pool: make(
-                    "pool",
-                    &["x", "perm", "valid", "heads", "params"],
-                    &["f"],
-                    POOL,
-                )?,
-                project: make(
-                    "project",
-                    &["fq", "fk", "proj_q", "proj_k", "heads", "params"],
-                    &["oq", "ok"],
-                    PROJECT,
-                )?,
-                logits: make("logits", &["q", "k", "divisor", "params"], &["s"], LOGITS)?,
-                attend: make("attend", &ATTEND_INPUTS, &["out"], ATTEND)?,
-                // Compiled on first dispatch only, so a GPU without the neural accelerators
-                // (whose Metal compiler may lack MetalPerformancePrimitives) never builds it.
-                attend_nax: with(
-                    "attend_nax",
-                    &ATTEND_INPUTS,
-                    &["out"],
-                    ATTEND_NAX,
-                    &nax_header,
-                )?,
+thread_local! {
+    // `MetalKernel` is thread-affine (MLX's shared Metal device is not thread-safe), so each thread
+    // builds its own handles — the core crate's `convrot_int8` / `w4a8_int8` pattern — instead of
+    // asserting `Send`/`Sync` for a process-wide static. The handles capture no arrays, and MLX
+    // caches the compiled pipelines itself (keyed on name/source/template arguments), so a second
+    // thread's handles do not recompile Metal.
+    static KERNELS: OnceCell<std::result::Result<Kernels, String>> = const { OnceCell::new() };
+}
+
+/// Run `f` with this thread's Veda kernels, building them on first use. A build failure is cached
+/// for the thread and reported on every call.
+fn with_kernels<T>(f: impl FnOnce(&Kernels) -> Result<T>) -> Result<T> {
+    KERNELS.with(|cell| {
+        let kernels = cell
+            .get_or_init(|| {
+                let nax_header = format!("{HEADER}{NAX_HEADER}");
+                let with =
+                    |name: &str, inputs: &[&str], outputs: &[&str], body: &str, header: &str| {
+                        MetalKernel::with_options(
+                            &format!("sc26214_veda_{name}"),
+                            inputs,
+                            outputs,
+                            body,
+                            header,
+                            true,
+                            false,
+                        )
+                        .map_err(|e| e.to_string())
+                    };
+                let make = |name: &str, inputs: &[&str], outputs: &[&str], body: &str| {
+                    with(name, inputs, outputs, body, HEADER)
+                };
+                const ATTEND_INPUTS: [&str; 9] = [
+                    "q", "k", "v", "perm", "valid", "heads", "keys", "counts", "params",
+                ];
+                Ok(Kernels {
+                    pool: make(
+                        "pool",
+                        &["x", "perm", "valid", "heads", "params"],
+                        &["f"],
+                        POOL,
+                    )?,
+                    project: make(
+                        "project",
+                        &["fq", "fk", "proj_q", "proj_k", "heads", "params"],
+                        &["oq", "ok"],
+                        PROJECT,
+                    )?,
+                    logits: make("logits", &["q", "k", "divisor", "params"], &["s"], LOGITS)?,
+                    attend: make("attend", &ATTEND_INPUTS, &["out"], ATTEND)?,
+                    // Compiled on first dispatch only, so a GPU without the neural accelerators
+                    // (whose Metal compiler may lack MetalPerformancePrimitives) never builds it.
+                    attend_nax: with(
+                        "attend_nax",
+                        &ATTEND_INPUTS,
+                        &["out"],
+                        ATTEND_NAX,
+                        &nax_header,
+                    )?,
+                })
             })
-        })
-        .as_ref()
-        .map_err(|e| Error::Msg(format!("Veda Metal kernels: {e}")))
+            .as_ref()
+            .map_err(|e| Error::Msg(format!("Veda Metal kernels: {e}")))?;
+        f(kernels)
+    })
 }
 
 fn ints(values: &[i32]) -> Array {
@@ -571,56 +581,57 @@ pub fn scores(
     layer: usize,
     dim: usize,
 ) -> Result<Vec<f32>> {
-    let k = kernels()?;
     let total = x_q.shape()[1];
     let (g, video, d) = (heads.len() as i32, layout.video as i32, dim as i32);
     let ids = ints(heads);
-    let pool = |x: &Array| -> Result<Array> {
-        Ok(k.pool
+    with_kernels(|k| {
+        let pool = |x: &Array| -> Result<Array> {
+            Ok(k.pool
+                .apply()
+                .inputs([
+                    x,
+                    &layout.perm,
+                    &layout.valid,
+                    &ids,
+                    &ints(&[total, video, d]),
+                ])
+                .output_shape(vec![g, video, 3 * d], Dtype::Float32)
+                .grid(video * d, g, 1)
+                .thread_group(256.min(video * d), 1, 1)
+                .run()?
+                .remove(0))
+        };
+        let (fq, fk) = (pool(x_q)?, pool(x_k)?);
+        let mut projected = k
+            .project
             .apply()
             .inputs([
-                x,
-                &layout.perm,
-                &layout.valid,
+                &fq,
+                &fk,
+                proj_q,
+                proj_k,
                 &ids,
-                &ints(&[total, video, d]),
+                &ints(&[total, video, d, layer as i32]),
             ])
-            .output_shape(vec![g, video, 3 * d], Dtype::Float32)
+            .output_shape(vec![g, video, d], Dtype::Float32)
+            .output_shape(vec![g, video, d], Dtype::Float32)
             .grid(video * d, g, 1)
             .thread_group(256.min(video * d), 1, 1)
+            .run()?;
+        let (pk, pq) = (projected.pop().unwrap(), projected.pop().unwrap());
+        let divisor = Array::from_slice(&[(dim as f32).sqrt()], &[1]);
+        let s = k
+            .logits
+            .apply()
+            .inputs([&pq, &pk, &divisor, &ints(&[video, d])])
+            .output_shape(vec![g, video, video], Dtype::Float32)
+            .grid(video * video, g, 1)
+            .thread_group(256.min(video * video), 1, 1)
             .run()?
-            .remove(0))
-    };
-    let (fq, fk) = (pool(x_q)?, pool(x_k)?);
-    let mut projected = k
-        .project
-        .apply()
-        .inputs([
-            &fq,
-            &fk,
-            proj_q,
-            proj_k,
-            &ids,
-            &ints(&[total, video, d, layer as i32]),
-        ])
-        .output_shape(vec![g, video, d], Dtype::Float32)
-        .output_shape(vec![g, video, d], Dtype::Float32)
-        .grid(video * d, g, 1)
-        .thread_group(256.min(video * d), 1, 1)
-        .run()?;
-    let (pk, pq) = (projected.pop().unwrap(), projected.pop().unwrap());
-    let divisor = Array::from_slice(&[(dim as f32).sqrt()], &[1]);
-    let s = k
-        .logits
-        .apply()
-        .inputs([&pq, &pk, &divisor, &ints(&[video, d])])
-        .output_shape(vec![g, video, video], Dtype::Float32)
-        .grid(video * video, g, 1)
-        .thread_group(256.min(video * video), 1, 1)
-        .run()?
-        .remove(0);
-    mlx_rs::transforms::eval([&s])?;
-    Ok(s.as_slice::<f32>().to_vec())
+            .remove(0);
+        mlx_rs::transforms::eval([&s])?;
+        Ok(s.as_slice::<f32>().to_vec())
+    })
 }
 
 /// Sparse attention of every video query tile of `heads` (all heads of one tile shape) over
@@ -655,7 +666,6 @@ pub(crate) fn attend_route(
     kmax: usize,
     nax: bool,
 ) -> Result<Array> {
-    let kernels = kernels()?;
     let total = q.shape()[1];
     let (g, tiles, video) = (heads.len(), layout.tiles, layout.video);
     if g == 0
@@ -703,32 +713,34 @@ pub(crate) fn attend_route(
         })
     };
     let (q16, k16, v16) = (narrow(q)?, narrow(k)?, narrow(v)?);
-    let (kernel, per_tile, threads) = if nax {
-        (&kernels.attend_nax, 1, 256)
-    } else {
-        (&kernels.attend, 4, 32 * SIMD_GROUPS)
-    };
-    let out = kernel
-        .apply()
-        .inputs([
-            &q16,
-            &k16,
-            &v16,
-            &layout.perm,
-            &layout.valid,
-            &ints(heads),
-            &keys,
-            &counts,
-            &ints(&[total, video as i32, kmax as i32]),
-        ])
-        .output_shape(
-            vec![total, (video * 128) as i32, HEAD_DIM as i32],
-            q16.dtype(),
-        )
-        .grid(threads * per_tile * video as i32, g as i32, 1)
-        .thread_group(threads, 1, 1)
-        .run()?
-        .remove(0);
+    let out = with_kernels(|kernels| {
+        let (kernel, per_tile, threads) = if nax {
+            (&kernels.attend_nax, 1, 256)
+        } else {
+            (&kernels.attend, 4, 32 * SIMD_GROUPS)
+        };
+        Ok(kernel
+            .apply()
+            .inputs([
+                &q16,
+                &k16,
+                &v16,
+                &layout.perm,
+                &layout.valid,
+                &ints(heads),
+                &keys,
+                &counts,
+                &ints(&[total, video as i32, kmax as i32]),
+            ])
+            .output_shape(
+                vec![total, (video * 128) as i32, HEAD_DIM as i32],
+                q16.dtype(),
+            )
+            .grid(threads * per_tile * video as i32, g as i32, 1)
+            .thread_group(threads, 1, 1)
+            .run()?
+            .remove(0))
+    })?;
     Ok(if out.dtype() == q.dtype() {
         out
     } else {
