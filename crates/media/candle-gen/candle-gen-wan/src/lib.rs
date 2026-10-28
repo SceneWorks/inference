@@ -64,6 +64,12 @@ pub mod model_vace_fun;
 pub mod pipeline;
 pub mod quant;
 pub mod rope;
+// SC-20686 campaign observer (sc-27296): the real recorder only under the `campaign-observer`
+// feature (and in this crate's unit tests); production builds get the inert hook stub.
+#[cfg(any(test, feature = "campaign-observer"))]
+pub mod sc20686_observer;
+#[cfg(not(any(test, feature = "campaign-observer")))]
+#[path = "sc20686_observer_off.rs"]
 pub mod sc20686_observer;
 pub mod scheduler;
 mod text_encode;
@@ -1260,20 +1266,23 @@ pub fn descriptor() -> ModelDescriptor {
             // GGUF loader is not a registered product tier.
             supports_lora: true,
             supports_lokr: true,
-            // Native flow samplers (curated `uni_pc` default / `euler`) + the epic 7114 P4 (sc-7124)
+            // Native flow samplers (curated `uni_pc` default / `euler` / flow-SNR `dpmpp_2m`, sc-27309,
+            // matching the MLX twin's menu) + the epic 7114 P4 (sc-7124)
             // curated fold-in: the gen-core-only solvers over Wan's native flow σ schedule. The curated
             // `uni_pc` (sc-7296) is honored by Wan's OWN native UniPC; gen-core's VE-space `uni_pc`/
             // `dpmpp_2m` solvers are NOT routed through the fold-in (they would diverge from Wan's
-            // diffusers FLOW-SNR parity). Legacy `unipc` retained as an alias for recipe back-compat. No
+            // diffusers FLOW-SNR parity). Legacy `unipc`/`dpmpp2m` retained as aliases for recipe back-compat. No
             // scheduler axis (the flow shift is the `scheduler_shift` knob).
             samplers: vec![
                 "uni_pc",
                 "euler",
+                "dpmpp_2m",
                 "euler_ancestral",
                 "heun",
                 "dpmpp_sde",
                 "ddim",
                 "unipc",
+                "dpmpp2m",
             ],
             // Per-side floor 480 (= a 15×15 latent-token grid): below it the z48 vae22's coarse
             // effective 32× stride starves the DiT, which renders rainbow garbage at ANY flow-shift
@@ -1856,7 +1865,7 @@ mod tests {
             },
             // unadvertised sampler
             GenerationRequest {
-                sampler: Some("dpmpp2m".into()),
+                sampler: Some("lms".into()),
                 ..ok.clone()
             },
         ] {

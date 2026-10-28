@@ -766,7 +766,7 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec!["uni_pc", "euler", "unipc"],
+            samplers: vec!["uni_pc", "euler", "dpmpp_2m", "unipc", "dpmpp2m"],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
