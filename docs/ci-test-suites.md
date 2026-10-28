@@ -144,7 +144,9 @@ work and runner variance. Target, suite and exhaustive invocation budgets,
 package selection and required-gate failure handling stay the same.
 
 CI_IMPACT: this changes only the existing hosted Metal job deadline, adding no
-jobs, tests or model execution. Its maximum wall-clock allowance increases by
+jobs, tests or model execution. Two existing policy-test expectations follow the
+new deadline; their suite, watchdog, cache and failure assertions stay intact.
+Its maximum wall-clock allowance increases by
 15 minutes; build/test work and compilation inputs are unchanged. The two main
 runs above are the measured evidence. Post-cache completion cost remains
 variable; the extra headroom is an engineering allowance, not a latency claim.

@@ -233,14 +233,14 @@ class TestSuites(unittest.TestCase):
             self.assertNotIn("continue-on-error", step)
             self.assertIn("-j 1", step["run"])
             self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" routine -- cargo test', step["run"])
-        self.assertEqual(jobs["macos-metal"]["timeout-minutes"], 75)
+        self.assertEqual(jobs["macos-metal"]["timeout-minutes"], 90)
 
     def test_hosted_mlx_full_graph_has_explicit_suite_headroom_only_at_its_step(self):
         import yaml
 
         jobs = yaml.safe_load((suites.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]
         metal = jobs["macos-metal"]
-        self.assertEqual(metal["timeout-minutes"], 75)
+        self.assertEqual(metal["timeout-minutes"], 90)
         self.assertNotIn("TEST_SUITE_DEADLINE_SECONDS", metal.get("env", {}))
         step = next(step for step in metal["steps"] if step.get("name") == "Test MLX packages")
         self.assertEqual(step["env"]["TEST_SUITE_DEADLINE_SECONDS"], 3600)
