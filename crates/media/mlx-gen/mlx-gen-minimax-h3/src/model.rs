@@ -51,8 +51,7 @@ use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::pipeline::{
     fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents, prepend_condition_rows,
     render_latents_with_observer, resolve_geometry, revert_pixel_normalization, t2va_layout,
-    RequestGeometry, MAX_CANVAS_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS,
-    SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+    RequestGeometry, MAX_CANVAS_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
@@ -720,12 +719,11 @@ pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2V
 /// Resolve the request's geometry: the canvas, and the frame count from `frames` (exact) or
 /// `duration` (aligned).
 pub(crate) fn request_geometry(req: &GenerationRequest) -> Result<RequestGeometry> {
-    let frames = match (req.frames, req.duration) {
-        (Some(frames), _) => i32::try_from(frames)
-            .map_err(|_| Error::Msg(format!("{MODEL_ID}: frames {frames} does not fit an i32")))?,
-        (None, Some(seconds)) => crate::pipeline::align_frames_for_duration(seconds)?,
-        (None, None) => SMALLEST_LEGAL_FRAMES,
-    };
+    // The shared resolver the Candle engine and allocation admission (`gen_core::veda::workspace`)
+    // use, so the three can never resolve one request to different frame counts (sc-26691).
+    let frames = mlx_gen::gen_core::h3_memory::resolve_request_frames(req.frames, req.duration)?;
+    let frames = i32::try_from(frames)
+        .map_err(|_| Error::Msg(format!("{MODEL_ID}: frames {frames} does not fit an i32")))?;
     if let Some(fps) = req.fps {
         if f64::from(fps) != crate::denoise::MINIMAX_H3_FPS {
             return Err(Error::Msg(format!(
@@ -3234,7 +3232,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .joint
                 .num_frames,
-            SMALLEST_LEGAL_FRAMES
+            crate::pipeline::SMALLEST_LEGAL_FRAMES
         );
     }
 
