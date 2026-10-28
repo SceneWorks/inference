@@ -65,20 +65,11 @@ impl MemPool {
     /// The device's current pool, including a custom capped pool installed by the runner.
     /// Reading the default pool would falsely report near-zero use in that configuration.
     pub fn device_current(ordinal: i32) -> Option<Self> {
-        unsafe {
-            if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
-                return None;
-            }
-            let mut dev: sys::CUdevice = 0;
-            if sys::cuDeviceGet(&mut dev, ordinal) != sys::CUresult::CUDA_SUCCESS {
-                return None;
-            }
-            let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-            if sys::cuDeviceGetMemPool(&mut pool, dev) != sys::CUresult::CUDA_SUCCESS {
-                return None;
-            }
-            Some(Self(pool))
-        }
+        let dev = device_handle(ordinal)?;
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        // SAFETY: `dev` is a valid device handle from `device_handle`; `pool` is a live out-pointer.
+        (unsafe { sys::cuDeviceGetMemPool(&mut pool, dev) } == sys::CUresult::CUDA_SUCCESS)
+            .then_some(Self(pool))
     }
 
     /// The **default** stream-ordered pool for logical device `ordinal`, or `None` on any driver
@@ -94,26 +85,23 @@ impl MemPool {
     /// **This is not the right handle if something has installed a custom current pool** — see trap 1
     /// in the module docs.
     pub fn device_default(ordinal: i32) -> Option<Self> {
-        unsafe {
-            if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
-                return None;
-            }
-            let mut dev: sys::CUdevice = 0;
-            if sys::cuDeviceGet(&mut dev, ordinal) != sys::CUresult::CUDA_SUCCESS {
-                return None;
-            }
-            let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-            if sys::cuDeviceGetDefaultMemPool(&mut pool, dev) != sys::CUresult::CUDA_SUCCESS {
-                return None;
-            }
-            Some(Self(pool))
-        }
+        let dev = device_handle(ordinal)?;
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        // SAFETY: `dev` is a valid device handle from `device_handle`; `pool` is a live out-pointer.
+        (unsafe { sys::cuDeviceGetDefaultMemPool(&mut pool, dev) } == sys::CUresult::CUDA_SUCCESS)
+            .then_some(Self(pool))
     }
 
     /// Wrap a pool handle the caller already owns — an explicitly created pool, typically one carrying
     /// a `CUmemPoolProps.maxSize` cap and installed as the device's current pool to emulate a smaller
     /// card (sc-16091).
-    pub fn from_raw(pool: sys::CUmemoryPool) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// `pool` must be a live `CUmemoryPool` handle that outlives every use of the returned
+    /// `MemPool` (and of its copies): the safe accessors pass it straight to
+    /// `cuMemPoolGetAttribute` / `cuMemPoolSetAttribute` / `cuMemPoolTrimTo`.
+    pub unsafe fn from_raw(pool: sys::CUmemoryPool) -> Self {
         Self(pool)
     }
 
@@ -195,6 +183,20 @@ impl MemPool {
     /// so on a stock candle setup this is a **no-op**.
     pub fn trim(&self) -> bool {
         unsafe { sys::cuMemPoolTrimTo(self.0, 0) == sys::CUresult::CUDA_SUCCESS }
+    }
+}
+
+/// The shared `cuInit` + `cuDeviceGet` prologue of [`MemPool::device_current`] /
+/// [`MemPool::device_default`]: the driver handle for logical device `ordinal`, or `None` on any
+/// driver error.
+fn device_handle(ordinal: i32) -> Option<sys::CUdevice> {
+    // SAFETY: `cuInit` is idempotent; `dev` is a live out-pointer for `cuDeviceGet`.
+    unsafe {
+        if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut dev: sys::CUdevice = 0;
+        (sys::cuDeviceGet(&mut dev, ordinal) == sys::CUresult::CUDA_SUCCESS).then_some(dev)
     }
 }
 
