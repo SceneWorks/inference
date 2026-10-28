@@ -10,6 +10,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use candle_gen::gen_core::snapshot_inventory::{hex_lower, update_framed};
 use candle_gen::gen_core::{
     self, AdapterKind, AdapterSpec, GenerationMemory, GenerationRequest, LoadSpec,
     MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
@@ -245,74 +246,13 @@ struct ComponentReceipt {
     digest: Sha256,
 }
 
-fn update_framed(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update((bytes.len() as u64).to_le_bytes());
-    digest.update(bytes);
-}
-
-fn hex_digest(digest: Sha256) -> String {
-    digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
+/// The shared snapshot-inventory policy (sc-27253), refusing hidden/partial-download markers.
 fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> gen_core::Result<()> {
-    let lexical = std::path::absolute(path)?;
-    let symlink = std::fs::symlink_metadata(&lexical).map_err(|error| {
-        gen_core::Error::Msg(format!(
-            "kolors receipt cannot inspect {}: {error}",
-            lexical.display()
-        ))
-    })?;
-    let metadata = std::fs::metadata(&lexical)?;
-    if symlink.file_type().is_symlink() && !metadata.is_file() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "kolors receipt only permits symlinks that resolve directly to files: {}",
-            lexical.display()
-        )));
-    }
-    if metadata.is_file() {
-        let name = lexical
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        if name.starts_with('.')
-            || [".part", ".tmp", ".lock", ".incomplete"]
-                .iter()
-                .any(|suffix| name.ends_with(suffix))
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "kolors receipt refuses incomplete/hidden artifact {}",
-                lexical.display()
-            )));
-        }
-        files.push(lexical);
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "kolors receipt refuses non-file source {}",
-            lexical.display()
-        )));
-    }
-    let mut entries = std::fs::read_dir(&lexical)
-        .map_err(|error| {
-            gen_core::Error::Msg(format!(
-                "kolors receipt reads {}: {error}",
-                lexical.display()
-            ))
-        })?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            gen_core::Error::Msg(format!("kolors receipt enumeration failed: {error}"))
-        })?;
-    entries.sort();
-    for entry in entries {
-        collect_files(&entry, files)?;
-    }
+    files.extend(gen_core::snapshot_inventory::collect_regular_files(
+        "kolors receipt",
+        path,
+        gen_core::snapshot_inventory::InventoryPolicy::REJECT_MARKERS,
+    )?);
     Ok(())
 }
 
@@ -651,7 +591,10 @@ fn sealed_contract(
     update_framed(&mut physical, &transformer.digest.finalize());
     update_framed(&mut physical, &decoder.digest.finalize());
     let mut components = vec![MemoryResidentComponent {
-        id: format!("{PHYSICAL_RECEIPT_PREFIX}{}", hex_digest(physical)),
+        id: format!(
+            "{PHYSICAL_RECEIPT_PREFIX}{}",
+            hex_lower(&physical.finalize())
+        ),
         kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
         resident_bytes: transformer.runtime_bytes,
         bounded_by: Some(MemoryStrategy::StagedResidency),
@@ -661,7 +604,10 @@ fn sealed_contract(
     if let Some(adapter) = adapter_receipt(adapters)? {
         overlay_bytes = overlay_bytes.saturating_add(adapter.runtime_bytes);
         components.push(MemoryResidentComponent {
-            id: format!("{ADAPTER_RECEIPT_PREFIX}{}", hex_digest(adapter.digest)),
+            id: format!(
+                "{ADAPTER_RECEIPT_PREFIX}{}",
+                hex_lower(&adapter.digest.finalize())
+            ),
             kind: MemoryComponentKind::AdapterStack,
             resident_bytes: adapter.runtime_bytes,
             bounded_by: Some(MemoryStrategy::StagedResidency),
@@ -674,7 +620,7 @@ fn sealed_contract(
         let receipt = receipt_for(prefix, &canonical)?;
         overlay_bytes = overlay_bytes.saturating_add(receipt.runtime_bytes);
         components.push(MemoryResidentComponent {
-            id: format!("{prefix}{}", hex_digest(receipt.digest)),
+            id: format!("{prefix}{}", hex_lower(&receipt.digest.finalize())),
             kind,
             resident_bytes: receipt.runtime_bytes,
             bounded_by: Some(MemoryStrategy::StagedResidency),
@@ -684,7 +630,7 @@ fn sealed_contract(
     if let Some(pid) = pid_receipt(pid)? {
         overlay_bytes = overlay_bytes.saturating_add(pid.runtime_bytes);
         components.push(MemoryResidentComponent {
-            id: format!("{PID_RECEIPT_PREFIX}{}", hex_digest(pid.digest)),
+            id: format!("{PID_RECEIPT_PREFIX}{}", hex_lower(&pid.digest.finalize())),
             kind: MemoryComponentKind::AdapterStack,
             resident_bytes: pid.runtime_bytes,
             bounded_by: Some(MemoryStrategy::StagedResidency),
