@@ -332,6 +332,9 @@ fn reference_partition_step_cost_against_base() {
         seed: Some(23402),
         cancel: cancel.clone(),
         conditioning,
+        // sc-26691: this probe measures the stock 2048-short-edge plate the analytic rows below
+        // assume; the render default is now `match`.
+        reference_image_resize_mode: Some(mlx_gen::gen_core::ReferenceImageResizeMode::Diffusers),
         ..Default::default()
     };
 

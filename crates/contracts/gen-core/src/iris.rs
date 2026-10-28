@@ -1231,7 +1231,7 @@ impl GenerationParams {
 /// `cfg_interval` / `prompt_batch` / `caption_overflow` support; this covers the remaining
 /// per-request knobs, so none is ever accepted and ignored.
 pub fn reject_unhonored_generation_controls(model_id: &str, req: &GenerationRequest) -> Result<()> {
-    let set: [(&str, bool); 24] = [
+    let set: [(&str, bool); 25] = [
         ("timestep_to_start_cfg", req.timestep_to_start_cfg.is_some()),
         ("guidance_eta", req.guidance_eta.is_some()),
         ("guidance_momentum", req.guidance_momentum.is_some()),
@@ -1251,6 +1251,10 @@ pub fn reject_unhonored_generation_controls(model_id: &str, req: &GenerationRequ
         (
             "reference_image_short_edge",
             req.reference_image_short_edge.is_some(),
+        ),
+        (
+            "reference_image_resize_mode",
+            req.reference_image_resize_mode.is_some(),
         ),
         ("motion_bucket_id", req.motion_bucket_id.is_some()),
         ("noise_aug_strength", req.noise_aug_strength.is_some()),
