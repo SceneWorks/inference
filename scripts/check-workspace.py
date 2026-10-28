@@ -2276,6 +2276,43 @@ def check_snapshot_path_derivation(root: Path) -> None:
         )
 
 
+# --- audio-lane HF hub-layout derivation (sc-27258) ----------------------------------------------
+# Building a `models--<owner>--<name>` directory name is deriving the Hugging Face cache's on-disk
+# layout. The YuE2 / SheetSage2 real-weight harnesses take a passed-in hub directory, and exactly
+# one helper maps it to per-repo snapshot dirs; a second copy is the drift (and quiet epic-13657
+# erosion) sc-27258 removed. Scoped to `crates/audio` deliberately: the media families carry their
+# own derivations and their own stories, and a fixture that merely *names* such a directory
+# (`temp.path().join("models--org--x")`) builds nothing from a repo id, so only the formatted
+# derivation is matched.
+AUDIO_HUB_LAYOUT_DERIVATION = re.compile(r'format!\(\s*"models--')
+AUDIO_HUB_LAYOUT_HELPER = Path("crates/audio/candle-audio-yue2/src/snapshot.rs")
+
+
+def check_audio_hub_layout_derivation(root: Path) -> None:
+    """Fail when audio-lane Rust formats an HF hub `models--` directory name outside the one
+    `candle_audio_yue2::snapshot::hub_layout_snapshot_dir` helper (sc-27258)."""
+    audio = root / "crates" / "audio"
+    if not audio.is_dir():
+        return
+    violations: list[str] = []
+    for path in sorted(audio.rglob("*.rs")):
+        relative = path.relative_to(root)
+        if not SOURCE_LINT_IGNORED_PARTS.isdisjoint(relative.parts):
+            continue
+        if relative == AUDIO_HUB_LAYOUT_HELPER:
+            continue
+        text = strip_rust_comments(path.read_text(encoding="utf-8"))
+        for match in AUDIO_HUB_LAYOUT_DERIVATION.finditer(text):
+            violations.append(f"{relative}:{_line_of(text, match.start())}")
+    if violations:
+        joined = "\n  ".join(violations)
+        fail(
+            "audio-lane Rust re-derives the HF hub `models--<owner>--<name>` layout; use "
+            "`candle_audio_yue2::SnapshotDirs::from_hub_layout` / `snapshot::hub_layout_snapshot_dir` "
+            "(sc-27258):\n  " + joined
+        )
+
+
 # --- test-fixture temp roots (sc-17704 / sc-17755 / sc-17768 / sc-17791) -------------------------
 TEMP_DIR_READ = re.compile(r"env::temp_dir\(\)")
 TEMPFILE_GUARD = re.compile(r"tempfile::|TempDir")
@@ -3315,6 +3352,7 @@ def main() -> int:
         check_rust_sources(ROOT)
         check_pid_decode_route_adoption(metadata, ROOT)
         check_snapshot_path_derivation(ROOT)
+        check_audio_hub_layout_derivation(ROOT)
         check_test_temp_dir_guards(ROOT)
         check_cross_backend_geometry(metadata, ROOT)
     except (AssertionError, json.JSONDecodeError) as error:
@@ -3326,7 +3364,8 @@ def main() -> int:
         f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
         "intentional tokenizer split, no network clients, no trainers in the iOS graph, "
         "no HF-cache references, "
-        "no $HOME-derived snapshot paths, no unguarded test temp roots, "
+        "no $HOME-derived snapshot paths, no audio hub-layout re-derivations, "
+        "no unguarded test temp roots, "
         "no cross-backend geometry drift)"
     )
     return 0

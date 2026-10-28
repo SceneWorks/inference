@@ -813,6 +813,62 @@ class PidDecodeRouteAdoptionTests(unittest.TestCase):
 
 
 
+class AudioHubLayoutDerivationTests(unittest.TestCase):
+    """`check_audio_hub_layout_derivation` (sc-27258): exactly one audio helper may format the HF
+    hub `models--` layout; a fixture that names such a directory without deriving it is fine."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def check(self, files: dict[str, str]):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for relative, source in files.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source, encoding="utf-8")
+            try:
+                self.gate.check_audio_hub_layout_derivation(root)
+            except AssertionError as error:
+                return str(error)
+            return None
+
+    DERIVATION = (
+        'fn hub(hub: &Path, id: &str) -> PathBuf {\n'
+        '    hub.join(format!("models--{}", id.replace(\'/\', "--")))\n'
+        '}\n'
+    )
+
+    def test_a_second_derivation_in_an_audio_harness_fails(self) -> None:
+        failure = self.check(
+            {"crates/audio/candle-audio-x/tests/real_weights.rs": self.DERIVATION}
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("candle-audio-x/tests/real_weights.rs:2", failure)
+
+    def test_the_one_helper_and_non_audio_crates_pass(self) -> None:
+        self.assertIsNone(
+            self.check(
+                {
+                    "crates/audio/candle-audio-yue2/src/snapshot.rs": self.DERIVATION,
+                    "crates/media/candle-gen-x/src/lib.rs": self.DERIVATION,
+                }
+            )
+        )
+
+    def test_a_named_fixture_dir_and_a_comment_pass(self) -> None:
+        self.assertIsNone(
+            self.check(
+                {
+                    "crates/audio/candle-audio-x/src/pipeline.rs": (
+                        'let repository = temp.path().join("models--org--ace");\n'
+                        '// hub.join(format!("models--{}", id))\n'
+                    )
+                }
+            )
+        )
+
+
 class SnapshotPathDerivationTests(unittest.TestCase):
     """`check_snapshot_path_derivation` must separate a `$HOME` *derivation* from a `$HOME`
     *fallback*, because a naive grep for `env::var("HOME")` cannot: 102 files matched that grep when

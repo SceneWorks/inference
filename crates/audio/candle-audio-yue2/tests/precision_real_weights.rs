@@ -76,16 +76,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn hub() -> SnapshotDirs {
     let dir = PathBuf::from(std::env::var_os("YUE2_HF_HUB").expect("YUE2_HF_HUB required"));
-    inventory::REPOS
-        .iter()
-        .fold(SnapshotDirs::new(), |dirs, repo| {
-            dirs.with(
-                repo.id,
-                dir.join(format!("models--{}", repo.id.replace('/', "--")))
-                    .join("snapshots")
-                    .join(repo.revision),
-            )
-        })
+    SnapshotDirs::from_hub_layout(&dir)
 }
 
 fn reference() -> (Value, std::collections::HashMap<String, Tensor>, String) {

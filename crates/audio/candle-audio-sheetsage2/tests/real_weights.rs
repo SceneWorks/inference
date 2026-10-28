@@ -49,7 +49,6 @@ use candle_audio_sheetsage2::candle_core::{Device, Tensor};
 use candle_audio_sheetsage2::events::parse_tokens_txt;
 use candle_audio_sheetsage2::provider::{live_models, SourceAudio, Transcriber};
 use candle_audio_sheetsage2::review::{Readiness, ReviewArtifact, TranscriptionSettings};
-use candle_audio_yue2::inventory;
 use candle_audio_yue2::snapshot::resolve_closure;
 use candle_audio_yue2::{Closure, SnapshotDirs};
 use sha2::{Digest, Sha256};
@@ -67,17 +66,7 @@ fn artifacts() -> PathBuf {
 }
 
 fn hub() -> SnapshotDirs {
-    let hub = env_dir("YUE2_HF_HUB");
-    inventory::REPOS
-        .iter()
-        .fold(SnapshotDirs::new(), |dirs, repo| {
-            dirs.with(
-                repo.id,
-                hub.join(format!("models--{}", repo.id.replace('/', "--")))
-                    .join("snapshots")
-                    .join(repo.revision),
-            )
-        })
+    SnapshotDirs::from_hub_layout(&env_dir("YUE2_HF_HUB"))
 }
 
 fn sha256_f32(samples: &[f32]) -> String {

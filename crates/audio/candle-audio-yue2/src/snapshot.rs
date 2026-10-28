@@ -198,6 +198,20 @@ impl SnapshotDirs {
         self
     }
 
+    /// **Test-side provisioning only** (sc-27258): every pinned repository at its pinned-revision
+    /// snapshot inside a caller-supplied hub-layout directory (`<hub>/models--<owner>--<name>/
+    /// snapshots/<revision>`), the shape the real-weight harnesses point `YUE2_HF_HUB` at.
+    /// Production never calls this and never derives a cache location (epic 13657); `hub` is
+    /// always a passed-in path.
+    #[doc(hidden)]
+    pub fn from_hub_layout(hub: &Path) -> Self {
+        crate::inventory::REPOS
+            .iter()
+            .fold(Self::new(), |dirs, repo| {
+                dirs.with(repo.id, hub_layout_snapshot_dir(hub, repo))
+            })
+    }
+
     /// The local snapshot directory for `repo`, or [`AssetError::CacheMiss`] when none was
     /// provisioned or the provisioned directory does not exist.
     pub fn snapshot_dir(&self, repo: &UpstreamRepo) -> Result<PathBuf, AssetError> {
@@ -216,6 +230,15 @@ impl SnapshotDirs {
             Err(miss(dir.clone()))
         }
     }
+}
+
+/// **Test-side provisioning only** (sc-27258): `repo`'s pinned-revision snapshot directory inside
+/// a caller-supplied hub-layout directory. See [`SnapshotDirs::from_hub_layout`].
+#[doc(hidden)]
+pub fn hub_layout_snapshot_dir(hub: &Path, repo: &UpstreamRepo) -> PathBuf {
+    hub.join(format!("models--{}", repo.id.replace('/', "--")))
+        .join("snapshots")
+        .join(repo.revision)
 }
 
 /// One pinned file of a verified component, at the exact path whose bytes were hashed.
