@@ -78,6 +78,7 @@ pub mod moss_image;
 mod moss_image_assets;
 pub mod moss_image_edit;
 pub mod moss_image_training;
+pub mod numeric;
 pub mod pruned_adaln;
 pub mod pth;
 pub mod registry;

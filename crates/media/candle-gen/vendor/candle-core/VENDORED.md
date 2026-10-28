@@ -101,6 +101,15 @@ evidence.
    CPU regressions in `candle-audio-kokoro/src/weights.rs` exercise this vendored reader/writer
    through STORED NPZ round trips, DEFLATE NPZ reads, and torch archive loading.
 
+9. `src/pickle.rs` `PthTensors::get` — one local hardening check, not upstream (sc-27456): before
+   `Tensor::from_reader` allocates the pickle-declared shape, the tensor's byte count
+   (`elem_count × dtype size + start_offset`, all checked) must fit the size of the storage entry
+   it is read from; otherwise `get` returns an error. A crafted `.pth` header therefore fails
+   cleanly instead of requesting a huge allocation that aborts the process. Every well-formed
+   checkpoint reads exactly as before (its storage holds the bytes it declares). The CI-run pin is
+   `candle-audio-kokoro`'s `weights::tests::vendored_pickle_refuses_a_tensor_larger_than_its_storage`.
+   Re-apply on a re-vendor unless upstream bounds the read itself.
+
 Everything else (`src/**`, `tests/**`, `benches/**`, `examples/**`, `README.md`, `LICENSE`) is
 byte-for-byte upstream. Diff against an upstream checkout to confirm these are the sole deltas.
 
@@ -246,8 +255,9 @@ candle-core = { git = "https://github.com/SceneWorks/inference", rev = "<the pin
 2. Re-apply `cabbc301` and `f53ed3bf` unless the new revision contains them (upstream main after
    2026-06-24 does), and the zeroed quantized padding (`src/quantized/cuda.rs`) unless the new
    revision zeroes it itself, and the untracked-operand backward guards (`src/backprop.rs`) unless
-   the new revision skips untracked operands itself — only then can this vendor and its `[patch]` be
-   dropped.
+   the new revision skips untracked operands itself, and the pickle storage-size check
+   (`src/pickle.rs`, sc-27456) unless the new revision bounds the read itself — only then can this
+   vendor and its `[patch]` be dropped.
 3. Re-derive `Cargo.toml` from the new upstream workspace manifest as described above.
 4. Move every pin (`Cargo.toml`, `scripts/check-workspace.py` `PINNED_WORKSPACE_DEPENDENCIES` and
    `VENDORED_PACKAGES`), re-vendor `candle-kernels` and `candle-metal-kernels` (their own

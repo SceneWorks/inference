@@ -1109,7 +1109,9 @@ fn parse_npy(bytes: &[u8]) -> std::result::Result<Plane, String> {
             "u4" => u32::from_le_bytes(c.try_into().unwrap()) as f64,
             "u2" => u16::from_le_bytes(c.try_into().unwrap()) as f64,
             "i2" => i16::from_le_bytes(c.try_into().unwrap()) as f64,
-            "f2" => half_to_f64(u16::from_le_bytes(c.try_into().unwrap())),
+            "f2" => f64::from(crate::numeric::f16_bits_to_f32(u16::from_le_bytes(
+                c.try_into().unwrap(),
+            ))),
             "i1" => c[0] as i8 as f64,
             _ => c[0] as f64,
         })
@@ -1119,18 +1121,6 @@ fn parse_npy(bytes: &[u8]) -> std::result::Result<Plane, String> {
         height,
         values,
     })
-}
-
-fn half_to_f64(h: u16) -> f64 {
-    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((h >> 10) & 0x1f) as i32;
-    let frac = (h & 0x3ff) as f64;
-    match exp {
-        0 => sign * frac * 2f64.powi(-24),
-        31 if frac == 0.0 => sign * f64::INFINITY,
-        31 => f64::NAN,
-        e => sign * (1.0 + frac / 1024.0) * 2f64.powi(e - 15),
-    }
 }
 
 /// One aligned example at its source size.

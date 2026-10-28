@@ -45,8 +45,23 @@ pub fn encode_wav_pcm16(track: &AudioTrack) -> Result<Vec<u8>> {
                 track.samples.len()
             ))
         })?;
-    let byte_rate = track.sample_rate * track.channels as u32 * 2;
-    let block_align = track.channels * 2;
+    // The fmt chunk's `block_align` (u16) and `byte_rate` (u32) are checked: an unchecked
+    // product panics in debug and silently wraps into a corrupt header in release (sc-27362).
+    let (block_align, byte_rate) = track
+        .channels
+        .checked_mul(2)
+        .and_then(|align| {
+            track
+                .sample_rate
+                .checked_mul(u32::from(align))
+                .map(|rate| (align, rate))
+        })
+        .ok_or_else(|| {
+            AudioError::Msg(format!(
+                "WAV encode: {} ch @ {} Hz exceeds the RIFF fmt fields",
+                track.channels, track.sample_rate
+            ))
+        })?;
 
     let mut out = Vec::with_capacity(44 + data_len as usize);
     out.extend_from_slice(b"RIFF");
@@ -169,5 +184,17 @@ mod tests {
         assert!(encode_wav_pcm16(&track(vec![0.0], 24_000, 0)).is_err()); // zero channels
         assert!(encode_wav_pcm16(&track(vec![0.0], 0, 1)).is_err()); // zero rate
         assert!(encode_wav_pcm16(&track(vec![0.0; 3], 24_000, 2)).is_err()); // ragged interleave
+    }
+
+    #[test]
+    fn rejects_fmt_fields_that_overflow_instead_of_panicking() {
+        // sc-27362: block_align = channels * 2 overflows u16 for channels >= 32768.
+        let err = encode_wav_pcm16(&track(vec![], 24_000, 40_000)).unwrap_err();
+        assert!(err.to_string().contains("RIFF fmt fields"), "{err}");
+        // byte_rate = sample_rate * block_align overflows u32.
+        assert!(encode_wav_pcm16(&track(vec![], u32::MAX, 1)).is_err());
+        assert!(encode_wav_pcm16(&track(vec![], 1 << 31, 1)).is_err());
+        // The largest representable mono rate still encodes.
+        assert!(encode_wav_pcm16(&track(vec![], u32::MAX / 2, 1)).is_ok());
     }
 }
