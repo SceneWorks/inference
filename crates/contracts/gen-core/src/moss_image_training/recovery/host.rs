@@ -24,8 +24,11 @@ pub fn available_bytes() -> Result<u64> {
 #[cfg(target_os = "windows")]
 pub fn available_bytes() -> Result<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: MEMORYSTATUSEX is a plain-old-data C struct of integers; all-zero is a valid value.
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `status` is a live, exclusively borrowed MEMORYSTATUSEX whose `dwLength` was set to
+    // its size above, as GlobalMemoryStatusEx requires; the call only writes within it.
     if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 || status.ullAvailPhys == 0 {
         return Err(invalid(std::io::Error::last_os_error()));
     }
@@ -33,6 +36,8 @@ pub fn available_bytes() -> Result<u64> {
 }
 // libc 0.2.186 exposes the Mach types and host query, but not this System symbol.
 // Release the send right returned by mach_host_self without adding a device/context API.
+// SAFETY: the declaration matches `kern_return_t mach_port_deallocate(ipc_space_t task,
+// mach_port_name_t name)` from <mach/mach_port.h> (both port types are `mach_port_t`-sized u32).
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn mach_port_deallocate(
@@ -43,11 +48,18 @@ unsafe extern "C" {
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
 pub fn available_bytes() -> Result<u64> {
+    // SAFETY: vm_statistics64 is a plain-old-data C struct of integers; all-zero is a valid value.
     let mut info: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
     let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: sysconf takes no pointers and is thread-safe; an error is the -1 return handled below.
     let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
         .map_err(|_| invalid("host page size unavailable"))?;
+    // SAFETY: mach_host_self takes no arguments; it returns a send right released exactly once by
+    // the mach_port_deallocate below.
     let host = unsafe { libc::mach_host_self() };
+    // SAFETY: `info` is a live vm_statistics64 and `count` is set to its size in natural_t units
+    // (HOST_VM_INFO64_COUNT), so the kernel writes at most `count` words into it; both outlive the
+    // call.
     let result = unsafe {
         libc::host_statistics64(
             host,
@@ -56,6 +68,8 @@ pub fn available_bytes() -> Result<u64> {
             &mut count,
         )
     };
+    // SAFETY: `host` is the send right mach_host_self returned above, released exactly once here
+    // and not used afterwards; mach_task_self names this task's own IPC space.
     unsafe { mach_port_deallocate(libc::mach_task_self(), host) };
     if result != libc::KERN_SUCCESS || page_size == 0 || count != libc::HOST_VM_INFO64_COUNT {
         return Err(invalid("host VM page metadata unavailable"));
@@ -85,6 +99,9 @@ pub fn available_bytes() -> Result<u64> {
 pub fn total_bytes() -> Result<u64> {
     let mut total = 0_u64;
     let mut size = std::mem::size_of::<u64>();
+    // SAFETY: the name is a NUL-terminated C-string literal; `total` and `size` are live locals,
+    // `size` holding the 8-byte capacity of `total`, so the kernel writes at most that many bytes;
+    // the new-value pointer is null with length 0 (read-only query).
     let status = unsafe {
         libc::sysctlbyname(
             c"hw.memsize".as_ptr(),

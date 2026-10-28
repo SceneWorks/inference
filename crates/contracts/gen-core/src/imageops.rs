@@ -558,22 +558,9 @@ pub fn resize_nearest_u8(
 }
 
 /// Round-half-to-even (Python `round`), for pixel-geometry parity with the worker's `_contain_box`
-/// (Rust's `f64::round` is half-away-from-zero, which differs at exact `.5`). Positive inputs only.
+/// (Rust's `f64::round` is half-away-from-zero, which differs at exact `.5`).
 fn round_half_even(x: f64) -> i64 {
-    let f = x.floor();
-    let diff = x - f;
-    if diff < 0.5 {
-        f as i64
-    } else if diff > 0.5 {
-        f as i64 + 1
-    } else {
-        let fi = f as i64;
-        if fi % 2 == 0 {
-            fi
-        } else {
-            fi + 1
-        }
-    }
+    x.round_ties_even() as i64
 }
 
 /// Where a `src_w`×`src_h` image lands when **contained** (long edge fits) and centered in a

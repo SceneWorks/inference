@@ -107,6 +107,10 @@ pub const MAX_TOTAL_REFERENCES: usize = 12;
 /// references and the generated canvas which share the one canvas rule. This is the concrete form
 /// of "references do not bind the generated geometry": a 2048-short-edge image reference conditions
 /// a 768-short-edge render.
+///
+/// Since sc-26691 this is the `diffusers` / `max` short edge only: the render applies the request's
+/// [`ReferenceImageResizeMode`](candle_gen::gen_core::ReferenceImageResizeMode) (default `match`)
+/// through [`resize_reference_image`].
 pub const REFERENCE_IMAGE_SHORT_EDGE: u32 = 2048;
 
 /// The rate the **conditioner** reads a video reference at — every `24 / 2 = 12`th frame of the
@@ -219,7 +223,8 @@ pub fn condition_frame_groups(indices: &[usize], temporal_patch: usize) -> Vec<(
         .collect()
 }
 
-/// Resize an **image** reference onto `short_edge`, on the stride-32 lattice.
+/// Resize an **image** reference onto `short_edge`, on the stride-32 lattice — the `diffusers`
+/// [resize mode](crate::reference::resize_reference_image) (sc-26691), no longer the render default.
 ///
 /// **No area cap and upscaling included** — an image reference is encoded at high detail, unlike a
 /// video reference and the generated canvas which share the one canvas rule. This is the concrete
@@ -237,6 +242,35 @@ pub fn normalize_reference_image(
     canvas_multiple: i32,
     short_edge: i32,
 ) -> Result<Image> {
+    // The `diffusers` mode never reads the target canvas, so any positive one will do.
+    resize_reference_image(
+        image,
+        canvas_multiple,
+        1,
+        1,
+        candle_gen::gen_core::ReferenceImageResizeMode::Diffusers,
+        short_edge,
+    )
+}
+
+/// **Resize an image reference under the request's resize mode** (sc-26691) — what
+/// `generate_ref2va` calls.
+///
+/// The size is [`candle_gen::gen_core::resolve_reference_image_size`]'s, shared with the gen-core admission
+/// pricers and the other backend: upstream sglang's `minimax_h3_resolve_reference_image_shape`
+/// (`match` / `max` / `diffusers`), every side rounded half-to-even onto `canvas_multiple`, and an
+/// aspect outside 1:4..=4:1 refused. `target_width` x `target_height` is the resolved render canvas
+/// (read by `match` only); `short_edge` is the effective
+/// [`reference_image_short_edge`](candle_gen::gen_core::GenerationRequest::reference_image_short_edge) (read by
+/// `max` / `diffusers` only). [`normalize_reference_image`] is the `diffusers` special case.
+pub fn resize_reference_image(
+    image: &Image,
+    canvas_multiple: i32,
+    target_width: u32,
+    target_height: u32,
+    mode: candle_gen::gen_core::ReferenceImageResizeMode,
+    short_edge: i32,
+) -> Result<Image> {
     if image.width == 0 || image.height == 0 {
         return Err(CandleError::Msg(
             "minimax-h3 ref2va: cannot normalize a zero-extent reference image".into(),
@@ -252,12 +286,16 @@ pub fn normalize_reference_image(
             "minimax-h3 ref2va: reference_image_short_edge must be positive, got {short_edge}"
         )));
     }
-    let (w, h) = (f64::from(image.width), f64::from(image.height));
-    let scale = f64::from(short_edge) / w.min(h);
-    let m = f64::from(canvas_multiple);
-    let round_to =
-        |v: f64| (crate::keyframe::round_half_to_even(v * scale / m) * m).max(m) as i32 as u32;
-    let (tw, th) = (round_to(w), round_to(h));
+    let (tw, th) = candle_gen::gen_core::resolve_reference_image_size(
+        image.width,
+        image.height,
+        target_width,
+        target_height,
+        mode,
+        short_edge as u32,
+        canvas_multiple as u32,
+    )
+    .map_err(|e| CandleError::Msg(e.to_string()))?;
     if (tw, th) == (image.width, image.height) {
         return Ok(image.clone());
     }
@@ -1173,6 +1211,31 @@ mod tests {
         assert!(normalize_reference_image(&image(0, 8), 32, 2048).is_err());
         assert!(normalize_reference_image(&image(8, 8), 0, 2048).is_err());
         assert!(normalize_reference_image(&image(8, 8), 32, 0).is_err());
+    }
+
+    /// sc-26691 — the render path resizes under the request's mode: the film-harness 576x320
+    /// plate against a 1088x544 render stays put under `match` (the default) and `max`, and only
+    /// `diffusers` upscales it to the 2048 short edge.
+    #[test]
+    fn the_resize_mode_decides_whether_a_small_plate_is_upscaled() {
+        use candle_gen::gen_core::ReferenceImageResizeMode as Mode;
+        let stride = crate::pipeline::SPATIAL_STRIDE as i32;
+        let plate = image(576, 320);
+        let at = |mode| {
+            let out = resize_reference_image(&plate, stride, 1088, 544, mode, 2048).unwrap();
+            (out.width, out.height)
+        };
+        assert_eq!(at(Mode::default()), (576, 320));
+        assert_eq!(at(Mode::Match), (576, 320));
+        assert_eq!(at(Mode::Max), (576, 320));
+        assert_eq!(at(Mode::Diffusers), (3680, 2048));
+        // `normalize_reference_image` is the `diffusers` case.
+        let stock = normalize_reference_image(&plate, stride, 2048).unwrap();
+        assert_eq!((stock.width, stock.height), at(Mode::Diffusers));
+        // Aspect beyond 4:1 is refused under every mode.
+        assert!(
+            resize_reference_image(&image(401, 100), stride, 1088, 544, Mode::Match, 2048).is_err()
+        );
     }
 
     /// sc-23402 — the requested short edge really drives the normalized geometry, and 1024 costs

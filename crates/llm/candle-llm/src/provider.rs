@@ -1320,21 +1320,45 @@ fn safetensors_header_names(path: &Path) -> Option<Vec<String>> {
 /// One safetensors file's JSON header (every tensor's `dtype`, `shape` and offsets, plus any
 /// `__metadata__`): the 8-byte length prefix and the header only, never tensor data.
 fn safetensors_header(path: &Path) -> Option<serde_json::Map<String, Value>> {
+    read_safetensors_header(path).ok()
+}
+
+/// A real safetensors header is kilobytes to a few megabytes; never allocate for a corrupt length.
+pub(crate) const MAX_SAFETENSORS_HEADER_BYTES: u64 = 256 << 20;
+
+/// The fallible form of [`safetensors_header`] shared with the snapshot preparer (sc-27298): the
+/// declared header length is bounded by [`MAX_SAFETENSORS_HEADER_BYTES`] *before* allocating, so a
+/// corrupt or hostile length prefix is a typed error rather than an allocation abort.
+pub(crate) fn read_safetensors_header(
+    path: &Path,
+) -> crate::error::Result<serde_json::Map<String, Value>> {
     use std::io::Read;
-    // A real header is kilobytes to a few megabytes; never allocate for a corrupt length.
-    const MAX_HEADER_BYTES: u64 = 256 << 20;
-    let mut file = std::fs::File::open(path).ok()?;
+    let malformed = |why: String| {
+        crate::error::Error::Msg(format!("safetensors header {}: {why}", path.display()))
+    };
+    let mut file = std::fs::File::open(path)?;
     let mut len = [0u8; 8];
-    file.read_exact(&mut len).ok()?;
+    file.read_exact(&mut len)
+        .map_err(|e| malformed(format!("length prefix: {e}")))?;
     let len = u64::from_le_bytes(len);
-    if len > MAX_HEADER_BYTES {
-        return None;
+    if len > MAX_SAFETENSORS_HEADER_BYTES {
+        return Err(malformed(format!(
+            "declared length {len} exceeds the {MAX_SAFETENSORS_HEADER_BYTES}-byte cap"
+        )));
+    }
+    // Nor allocate more than the file backs: a tiny file declaring a cap-sized header is short.
+    let file_len = file.metadata()?.len();
+    if len > file_len.saturating_sub(8) {
+        return Err(malformed(format!(
+            "declared length {len} exceeds the {file_len}-byte file"
+        )));
     }
     let mut header = vec![0u8; len as usize];
-    file.read_exact(&mut header).ok()?;
-    match serde_json::from_slice(&header).ok()? {
-        Value::Object(map) => Some(map),
-        _ => None,
+    file.read_exact(&mut header)
+        .map_err(|e| malformed(format!("{len}-byte header: {e}")))?;
+    match serde_json::from_slice(&header).map_err(|e| malformed(e.to_string()))? {
+        Value::Object(map) => Ok(map),
+        _ => Err(malformed("not a JSON object".into())),
     }
 }
 

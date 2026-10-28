@@ -65,9 +65,16 @@ pub struct PthTensorSpec {
 }
 
 impl PthTensorSpec {
-    /// Element count (validated non-negative dims; saturating only for display paths).
-    pub fn numel(&self) -> usize {
-        self.shape.iter().map(|&d| d.max(0) as usize).product()
+    /// Element count, or `None` when the archive-supplied shape is not a valid tensor shape: a
+    /// negative dimension, one beyond an `i32` axis, or a product that overflows `usize` — the same
+    /// rules [`PthArchive::read_tensor`] enforces before reading (sc-27471).
+    pub fn checked_numel(&self) -> Option<usize> {
+        self.shape.iter().try_fold(1usize, |n, &d| {
+            if !(0..=i32::MAX as i64).contains(&d) {
+                return None;
+            }
+            n.checked_mul(d as usize)
+        })
     }
 }
 
@@ -630,31 +637,9 @@ fn decode_to_f32(bytes: &[u8], dtype: PthDtype, numel: usize) -> Result<Vec<f32>
     Ok(out)
 }
 
-/// IEEE-754 half → f32 (no `half` crate dep).
-pub fn f16_bits_to_f32(h: u16) -> f32 {
-    let sign = (h & 0x8000) as u32;
-    let exp = (h >> 10) & 0x1f;
-    let mant = (h & 0x3ff) as u32;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign << 16
-        } else {
-            let mut e: i32 = -1;
-            let mut m = mant;
-            while m & 0x400 == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            m &= 0x3ff;
-            (sign << 16) | (((127 - 15 + 1 + e) as u32) << 23) | (m << 13)
-        }
-    } else if exp == 0x1f {
-        (sign << 16) | 0x7f80_0000 | (mant << 13)
-    } else {
-        (sign << 16) | (((exp as i32 - 15 + 127) as u32) << 23) | (mant << 13)
-    };
-    f32::from_bits(bits)
-}
+/// IEEE-754 half → f32: the shared [`crate::numeric`] decoder, re-exported at its historical path
+/// (sc-27419).
+pub use crate::numeric::f16_bits_to_f32;
 
 /// Validate externally supplied tensor metadata and compute the contiguous `[start..end)` byte range
 /// and element count. Every dimension must be non-negative and fit an `i32` axis (so a backend's
@@ -944,6 +929,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(off.contains("storage byte offset overflows usize"), "{off}");
+    }
+
+    /// sc-27471: `checked_numel` applies the reader's shape rules instead of clamping negative
+    /// dimensions to zero and wrapping the product.
+    #[test]
+    fn checked_numel_rejects_invalid_shapes() {
+        let spec = |shape: Vec<i64>| PthTensorSpec {
+            dtype: PthDtype::F32,
+            shape,
+            storage_key: "0".into(),
+            offset: 0,
+            stride: Vec::new(),
+        };
+        assert_eq!(spec(vec![3, 4]).checked_numel(), Some(12));
+        assert_eq!(spec(vec![]).checked_numel(), Some(1));
+        assert_eq!(spec(vec![0, 5]).checked_numel(), Some(0));
+        assert_eq!(spec(vec![-1, 2]).checked_numel(), None);
+        assert_eq!(spec(vec![i32::MAX as i64 + 1]).checked_numel(), None);
+        let m = i32::MAX as i64;
+        assert_eq!(spec(vec![m, m, m]).checked_numel(), None);
     }
 
     fn push_str(p: &mut Vec<u8>, s: &str) {

@@ -197,8 +197,10 @@ pub(crate) fn validate_request(
             )));
         }
         // Uniform frame geometry (the encoders resize per frame, but a zero-sized frame is malformed).
+        // The byte count is computed in `usize` with checked arithmetic (sc-27266): an unchecked
+        // `u32` product wraps for e.g. 65536x65536, letting a short buffer pass and panic later.
         if let Some(bad) = frames.iter().find(|f| {
-            f.width == 0 || f.height == 0 || f.pixels.len() != (f.width * f.height * 3) as usize
+            f.width == 0 || f.height == 0 || rgb_len(f.width, f.height) != Some(f.pixels.len())
         }) {
             return Err(gen_core::Error::Msg(format!(
                 "{id}: a VideoSync frame is malformed ({}x{}, {} bytes; expected w*h*3)",
@@ -209,6 +211,13 @@ pub(crate) fn validate_request(
         }
     }
     Ok(())
+}
+
+/// The RGB8 byte length of a `width x height` frame, or `None` if it does not fit in `usize`.
+pub(crate) fn rgb_len(width: u32, height: u32) -> Option<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(3))
 }
 
 /// The effective render duration: `min(target ?? default, clip_length, trained 8 s window)` — the
@@ -254,19 +263,32 @@ fn nearest_source_index(i: usize, src_fps: f32, dst_fps: f32, n: usize) -> usize
 /// sampling the first `count / dst_fps` seconds — the analogue of the reference's per-fps video decode.
 ///
 /// Returns borrowed views (sc-27364): a source frame picked several times is shared, not copied, so
-/// the clip + sync resamples no longer hold one full-resolution RGB copy per output frame.
+/// the clip + sync resamples no longer hold one full-resolution RGB copy per output frame. No frames,
+/// or a frame whose buffer is not `w*h*3`, is a typed error rather than a panic (sc-27266).
 pub(crate) fn resample_frames(
     frames: &[Image],
     src_fps: f32,
     dst_fps: f32,
     count: usize,
-) -> Vec<FrameView<'_>> {
+) -> AudioResult<Vec<FrameView<'_>>> {
     let n = frames.len();
+    if n == 0 {
+        return Err(AudioError::Msg(
+            "mmaudio: no VideoSync frames to resample".into(),
+        ));
+    }
     (0..count)
         .map(|i| {
-            let f = &frames[nearest_source_index(i, src_fps, dst_fps, n)];
-            FrameView::from_raw(f.width, f.height, f.pixels.as_slice())
-                .expect("validated frame pixel buffer is w*h*3")
+            let src = nearest_source_index(i, src_fps, dst_fps, n);
+            let f = &frames[src];
+            FrameView::from_raw(f.width, f.height, f.pixels.as_slice()).ok_or_else(|| {
+                AudioError::Msg(format!(
+                    "mmaudio: VideoSync frame {src} is malformed ({}x{}, {} bytes; expected w*h*3)",
+                    f.width,
+                    f.height,
+                    f.pixels.len()
+                ))
+            })
         })
         .collect()
 }
@@ -343,9 +365,9 @@ impl MmAudioPipeline {
         let dev = &self.device;
 
         // --- conditioners -------------------------------------------------------------------
-        let clip_rgb = resample_frames(frames, src_fps, CLIP_FPS, clip_seq_len);
+        let clip_rgb = resample_frames(frames, src_fps, CLIP_FPS, clip_seq_len)?;
         let sync_rgb_count = (duration * SYNC_FPS).floor() as usize;
-        let sync_rgb = resample_frames(frames, src_fps, SYNC_FPS, sync_rgb_count);
+        let sync_rgb = resample_frames(frames, src_fps, SYNC_FPS, sync_rgb_count)?;
 
         let clip_feat = self.encode_clip_visual(&clip_rgb)?; // (1, clip_seq_len, 1024)
         let text_feat = self.encode_text(prompt)?; // (1, 77, 1024)
@@ -695,7 +717,7 @@ mod tests {
     #[test]
     fn resample_frames_borrows_the_nearest_source_frame() {
         let frames = foley_frames(10, 4, 2, 3);
-        let views = resample_frames(&frames, 10.0, 25.0, 25);
+        let views = resample_frames(&frames, 10.0, 25.0, 25).unwrap();
         assert_eq!(views.len(), 25);
         for (i, view) in views.iter().enumerate() {
             let expected = ((i as f32 / 25.0) * 10.0).round() as usize;
@@ -707,7 +729,7 @@ mod tests {
             );
         }
         // Past the source's end the last frame is reused.
-        let views = resample_frames(&frames, 10.0, 8.0, 16);
+        let views = resample_frames(&frames, 10.0, 8.0, 16).unwrap();
         assert!(std::ptr::eq(
             views[15].as_raw().as_ptr(),
             frames[9].pixels.as_ptr()
@@ -808,6 +830,43 @@ mod tests {
         let mut empty_prompt = foley_req(foley_frames(8, 16, 16, 0), 8);
         empty_prompt.prompt = String::new();
         assert!(validate_request(&d, &empty_prompt).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_frames_whose_byte_count_overflows_u32() {
+        // sc-27266: 65536 * 65536 * 3 wraps to 0 in u32, so an empty buffer used to pass validation
+        // (release) or panic in the multiply (debug), then panic in `resample_frames`.
+        let d = descriptor();
+        let huge = Image {
+            width: 65536,
+            height: 65536,
+            pixels: Vec::new(),
+        };
+        let req = foley_req(vec![huge; 8], 8);
+        let err = validate_request(&d, &req).expect_err("overflowing frame geometry rejected");
+        assert!(err.to_string().contains("malformed"), "{err}");
+        // A frame whose u32 product wraps to a small non-zero value is rejected too.
+        let wrapped = Image {
+            width: 0x8000_0001,
+            height: 2,
+            pixels: vec![0; 6],
+        };
+        assert!(validate_request(&d, &foley_req(vec![wrapped; 8], 8)).is_err());
+        assert_eq!(rgb_len(65536, 65536), Some(65536 * 65536 * 3));
+    }
+
+    #[test]
+    fn resample_frames_returns_a_typed_error_for_a_malformed_frame() {
+        let bad = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0; 5],
+        };
+        assert!(resample_frames(&[bad], 8.0, 8.0, 2).is_err());
+        assert!(resample_frames(&[], 8.0, 8.0, 2).is_err());
+        let frames = foley_frames(2, 4, 4, 0);
+        let ok = resample_frames(&frames, 8.0, 8.0, 3).unwrap();
+        assert_eq!(ok.len(), 3);
     }
 
     #[test]

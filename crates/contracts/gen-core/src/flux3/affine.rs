@@ -13,19 +13,9 @@ fn invalid(detail: impl std::fmt::Display) -> Error {
     Error::Unsupported(format!("flux3 affine: {detail}"))
 }
 
-/// f32 → bf16 bits, round-to-nearest-even; NaN stays a quiet NaN.
-pub fn bf16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    if x.is_nan() {
-        return ((bits >> 16) | 0x0040) as u16;
-    }
-    let round = 0x7fff + ((bits >> 16) & 1);
-    (bits.wrapping_add(round) >> 16) as u16
-}
-
-pub fn bf16_value(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
+/// f32 → bf16 bits (round-to-nearest-even, NaN kept quiet) and back: the shared
+/// [`crate::numeric`] helpers, re-exported at their historical path (sc-27419).
+pub use crate::numeric::{bf16_bits, bf16_value};
 
 /// Decode a stored little-endian dense payload to f32. Only original dense float storage.
 pub fn decode_dense(dtype: &str, raw: &[u8]) -> Result<Vec<f32>> {
