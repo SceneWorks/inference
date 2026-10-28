@@ -313,11 +313,19 @@ impl ChatTemplate for JinjaChatTemplate {
     }
 }
 
+/// The instruction budget of one chat-template render (sc-27407). Templates come from caller-supplied
+/// model directories, so an unbounded `{% for %}` nest could hang a render. Real templates spend a
+/// few hundred instructions per message (see `chat_template_fuel_budget_*` tests), so this admits
+/// conversations orders of magnitude longer than any context window while failing a runaway loop
+/// within a fraction of a second.
+pub const CHAT_TEMPLATE_FUEL: u64 = 50_000_000;
+
 fn jinja_environment(source: String) -> (Environment<'static>, Option<String>) {
     let mut environment = Environment::new();
     // Match transformers' Jinja environment (ImmutableSandboxedEnvironment, trim/lstrip blocks).
     environment.set_trim_blocks(true);
     environment.set_lstrip_blocks(true);
+    environment.set_fuel(Some(CHAT_TEMPLATE_FUEL));
     environment.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     environment.add_function(
         "raise_exception",
@@ -337,6 +345,12 @@ fn jinja_environment(source: String) -> (Environment<'static>, Option<String>) {
 }
 
 fn jinja_err(e: minijinja::Error) -> Error {
+    if e.kind() == minijinja::ErrorKind::OutOfFuel {
+        return Error::Msg(format!(
+            "chat template render: exceeded the {CHAT_TEMPLATE_FUEL}-instruction budget (a runaway \
+             or hostile template loop): {e}"
+        ));
+    }
     Error::Msg(format!("chat template render: {e}"))
 }
 
@@ -631,6 +645,48 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../../docs/reference/qwen38/chat_template.jinja"
     ));
+
+    /// sc-27407: a hostile BYO template's runaway loop exhausts the fuel budget and fails with a
+    /// typed error instead of hanging the render.
+    #[test]
+    fn chat_template_fuel_budget_stops_a_runaway_loop() {
+        let t = JinjaChatTemplate::new(
+            "{% for a in range(100000) %}{% for b in range(100000) %}{% for c in range(100000) %}\
+             x{% endfor %}{% endfor %}{% endfor %}",
+        );
+        let err = t.render(&[Message::user("hi")], false).unwrap_err();
+        assert!(err.to_string().contains("instruction budget"), "{err}");
+    }
+
+    /// sc-27407 calibration: the largest shipped template (Qwen3.8's reasoning + tools template)
+    /// renders a far-longer-than-context conversation with tools and tool calls well inside the
+    /// budget, so the cap never trips on real use.
+    #[test]
+    fn chat_template_fuel_budget_admits_a_long_real_conversation() {
+        let t = JinjaChatTemplate::with_tokens(QWEN38_FROZEN_TEMPLATE, "", "<|im_end|>");
+        let tools: Vec<_> = (0..32).map(|_| weather_tool()).collect();
+        let mut args = serde_json::Map::new();
+        args.insert("location".into(), serde_json::json!("Paris"));
+        let mut msgs = vec![Message::system("You are helpful.")];
+        for i in 0..2_000 {
+            msgs.push(Message::user(format!("question {i}")));
+            msgs.push(
+                Message::assistant(format!("answer {i}")).with_tool_calls(vec![
+                    crate::tool::ToolCall::new("get_weather", args.clone()),
+                ]),
+            );
+            msgs.push(Message {
+                role: Role::Tool,
+                content: vec![crate::message::Content::Text("sunny".into())],
+                thinking: None,
+                tool_calls: Vec::new(),
+            });
+        }
+        let out = t
+            .render_with(&msgs, &RenderOptions::generation().with_tools(&tools))
+            .unwrap();
+        assert!(out.contains("question 1999"));
+    }
 
     #[test]
     fn qwen38_frozen_template_matches_reasoning_and_tool_controls() {
