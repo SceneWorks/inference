@@ -61,23 +61,9 @@ pub trait SourceTrainingSession {
     fn discard_created_export(&self, receipt: &ExportReceipt) -> Result<()>;
 }
 
-pub fn output_stem(file_name: &str) -> Result<&str> {
-    let path = Path::new(file_name);
-    let mut components = path.components();
-    if file_name.is_empty()
-        || file_name.contains(['/', '\\', ':', '\0'])
-        || file_name.chars().any(char::is_control)
-        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
-        || components.next().is_some()
-    {
-        return Err(invalid("adapter output must be a single safe file name"));
-    }
-    let stem = file_name
-        .strip_suffix(".safetensors")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| invalid("adapter output must end in .safetensors"))?;
-    Ok(stem)
-}
+/// Hoisted to [`crate::train::output_stem`] so every trainer validates its output name through
+/// [`crate::train::validate_training_techniques`] (sc-27282); re-exported to keep this path stable.
+pub use crate::train::output_stem;
 pub fn checkpoint_name(stem: &str, step: u64, resume: bool) -> String {
     if resume {
         format!("{stem}-step{step:06}.resume.safetensors")

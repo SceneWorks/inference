@@ -131,3 +131,7 @@ cuda = [
     "candle-gen-wan/cuda",
     "candle-gen-z-image/cuda",
 ]
+# FlashAttention-2 for the providers that dispatch through `candle_gen::sdpa_dispatch_bhsd`
+# (sc-26691: MiniMax-H3's DiT and video VAE decoder). Implies `cuda`; compiles the CUTLASS kernel
+# set, so it is opt-in rather than part of `cuda`.
+flash-attn = ["cuda", "candle-gen/flash-attn", "candle-gen-minimax-h3/flash-attn"]

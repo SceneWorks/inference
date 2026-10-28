@@ -48,7 +48,7 @@ use mlx_gen::gen_core::GenerationRequest;
 use crate::audio_config::{AUDIO_OUTPUT_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::config::{LATENT_CHANNELS, VAE_RATIO};
 use crate::denoise::{
-    adaln_schedule, align_num_frames, JointGeometry, JointSchedule, JointVelocity, PackedLayout,
+    adaln_schedule, JointGeometry, JointSchedule, JointVelocity, PackedLayout,
     MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS,
 };
 use crate::spatial_tiling::SpatialTiling;
@@ -225,22 +225,12 @@ pub const SMALLEST_LEGAL_FRAMES: i32 = 124;
 /// (5.1 s is **refused** by the range gate above, not aligned: the range's floor is the lattice's
 /// own 5.1667 s, and this crate's tests pin 5.0 s as a refusal.)
 pub fn align_frames_for_duration(seconds: f32) -> Result<i32> {
-    if !seconds.is_finite() {
-        return Err(Error::Msg(format!(
-            "minimax_h3: duration must be finite, got {seconds}"
-        )));
-    }
-    if !(MIN_DURATION_SECONDS - 1e-6..=MAX_DURATION_SECONDS + 1e-6).contains(&seconds) {
-        return Err(Error::Msg(format!(
-            "minimax_h3: duration {seconds} s is outside the model's \
-             {MIN_DURATION_SECONDS}-{MAX_DURATION_SECONDS} s range (the {} legal frame counts \
-             124-345 at {MINIMAX_H3_FPS} fps; the reference pipeline advertises 5-15 s but its own \
-             17n+5 lattice tops out at 14.375 s)",
-            crate::denoise::LEGAL_FRAME_COUNTS.len()
-        )));
-    }
-    let requested = (f64::from(seconds) * MINIMAX_H3_FPS).round() as i32;
-    let aligned = align_num_frames(requested.max(1));
+    // One definition, shared with the Candle engine and allocation admission
+    // (`gen_core::veda::workspace`), so pricing and rendering can never resolve the same duration
+    // to different rungs (sc-26691).
+    let aligned = mlx_gen::gen_core::h3_memory::align_frames_for_duration(seconds)?;
+    let aligned = i32::try_from(aligned)
+        .map_err(|_| Error::Msg(format!("minimax_h3: {aligned} frames does not fit an i32")))?;
     debug_assert!(
         crate::denoise::LEGAL_FRAME_COUNTS.contains(&aligned),
         "an in-range duration must align onto a lattice rung, got {aligned}"

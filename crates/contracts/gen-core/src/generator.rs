@@ -646,6 +646,21 @@ pub struct GenerationRequest {
     /// inert to it (the range refusal above still applies there, so a typo is reported rather than
     /// silently dropped).
     pub reference_image_short_edge: Option<u32>,
+    /// **How an image reference is resized** before it is encoded (sc-26691) — upstream sglang's
+    /// `reference_resize_mode`. `None` ⇒
+    /// [`ReferenceImageResizeMode::Match`](crate::ReferenceImageResizeMode::Match); read the effective
+    /// value with [`crate::effective_reference_image_resize_mode`] and record it in the recipe
+    /// beside [`reference_image_short_edge`](Self::reference_image_short_edge).
+    ///
+    /// `match` scales the reference to the target canvas's pixel area without upscaling; `max`
+    /// only downsizes a short edge above [`reference_image_short_edge`](Self::reference_image_short_edge);
+    /// `diffusers` forces that short edge, upscaling included (the pre-sc-26691 behaviour). The
+    /// short-edge knob is read by `max` / `diffusers` only — under `match` it is inert (still
+    /// range-checked). Arithmetic: [`crate::resolve_reference_image_size`].
+    ///
+    /// Same single consumer as the short edge: MiniMax-H3's `ref2va` image references. First/last
+    /// frames and video references never read it.
+    pub reference_image_resize_mode: Option<crate::ReferenceImageResizeMode>,
     /// Number of DFR temporal ×2 refine rounds, `0..=2` (reference `--temporal-upsample-rounds`:
     /// each round doubles the frame rate, splits the canvas into `2^round` keyframe-seam tiles and
     /// re-denoises them ancestrally). Requires the temporal latent upsampler component and a
@@ -1409,6 +1424,7 @@ impl Default for GenerationRequest {
             trim_first_frames: None,
             num_generated_keyframes: None,
             reference_image_short_edge: None,
+            reference_image_resize_mode: None,
             temporal_upsample_rounds: None,
             auto_duration: None,
             motion_bucket_id: None,
@@ -1698,6 +1714,8 @@ impl GenerationRequest {
             // sc-23402: an integer pixel extent, range-checked by
             // `validate_reference_image_short_edge` rather than by the float floor.
             reference_image_short_edge: _,
+            // sc-26691: a closed enum, no floats.
+            reference_image_resize_mode: _,
             temporal_upsample_rounds: _,
             // sc-18778: the auto-duration range's floats are validated at construction
             // (`AutoDurationRange::new` refuses non-finite / inverted / non-positive bounds), so

@@ -19,7 +19,11 @@ anonymous host memory.
    `PackedWeightSidecars::prepare_with_external_cache_root`; otherwise set
    `SCENEWORKS_CANDLE_DEVICE_CACHE_DIR`. Without an override, the platform per-user cache is used
    (`LOCALAPPDATA/SceneWorks`, `~/Library/Caches/SceneWorks`, or
-   `$XDG_CACHE_HOME/sceneworks` / `~/.cache/sceneworks`).
+   `$XDG_CACHE_HOME/sceneworks` / `~/.cache/sceneworks`). Only when none of those is available does
+   it fall back to the temp directory: on Unix as `sceneworks-candle-cache-<euid>`, created with mode
+   0700 and used only while it is a real directory owned by the effective uid with no group/other
+   permission bits; otherwise the external cache is refused with an error naming
+   `SCENEWORKS_CANDLE_DEVICE_CACHE_DIR` (sc-27414).
 
 The external path is a fallback, not a packed-feature downgrade: Krea still consumes mapped
 device-format sidecars and retains its normal resident or staged behavior. A cold read-only snapshot

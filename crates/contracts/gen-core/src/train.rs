@@ -1499,6 +1499,32 @@ fn lacks_x0_decoder(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> bool {
     cfg.perceptual_decoder_dir.is_none() && !desc.techniques.builtin_x0_decoder
 }
 
+/// The validated stem of a training adapter output name (sc-27282): `file_name` must be a single
+/// plain file name ending in `.safetensors` with a non-empty stem. Path separators (`/`, `\\`), drive
+/// or stream colons, NUL and other control characters, `.`/`..`, and absolute or multi-component
+/// names are refused with [`crate::Error::Unsupported`], so `output_dir.join(file_name)` (and every
+/// `{stem}-step…` checkpoint name derived from it) can never leave [`TrainingRequest::output_dir`].
+/// [`validate_training_techniques`] applies it, so every trainer that runs that floor gets it.
+pub fn output_stem(file_name: &str) -> crate::Result<&str> {
+    let invalid = |detail: &str| {
+        crate::Error::Unsupported(format!("training adapter output {file_name:?}: {detail}"))
+    };
+    let path = std::path::Path::new(file_name);
+    let mut components = path.components();
+    if file_name.is_empty()
+        || file_name.contains(['/', '\\', ':', '\0'])
+        || file_name.chars().any(char::is_control)
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(invalid("must be a single safe file name"));
+    }
+    file_name
+        .strip_suffix(".safetensors")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid("must end in .safetensors"))
+}
+
 /// The shared **training-technique floor** (epic 2123 E3/E5) — every trainer's `validate` *and*
 /// `train` entry point calls it before any expensive work, so a requested technique the trainer
 /// does not implement is refused instead of silently ignored.
@@ -1546,11 +1572,14 @@ fn lacks_x0_decoder(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> bool {
 /// - [`TrainingConfig::training_adapter`] set with [`TrainingConfig::full_finetune`], or on a
 ///   trainer whose descriptor lacks [`training_adapter`](TrainingTechniques::training_adapter) ⇒
 ///   typed [`crate::Error::Unsupported`].
+/// - an unsafe or non-`.safetensors` [`TrainingRequest::file_name`] ⇒ typed
+///   [`crate::Error::Unsupported`] (see [`output_stem`]; sc-27282).
 /// - every technique off ⇒ no-op.
 pub fn validate_training_techniques(
     desc: &TrainerDescriptor,
     req: &TrainingRequest,
 ) -> crate::Result<()> {
+    output_stem(&req.file_name)?;
     let cfg = &req.config;
     validate_memory_limit_fraction(cfg.memory_limit_fraction)?;
     if cfg.memory_limit_fraction.is_some() && desc.family != "moss_image" {
@@ -3193,6 +3222,49 @@ mod tests {
         }
     }
 
+    /// sc-27282: the shared floor refuses an output name that could escape `output_dir` (or is not
+    /// a `.safetensors` adapter) for every trainer, not only flux3.
+    #[test]
+    fn training_floor_refuses_unsafe_output_file_names() {
+        assert_eq!(output_stem("my_style.safetensors").unwrap(), "my_style");
+        assert_eq!(output_stem("a.b.safetensors").unwrap(), "a.b");
+        for bad in [
+            "",
+            ".safetensors",
+            "adapter",
+            "adapter.ckpt",
+            "../escape.safetensors",
+            "..",
+            ".",
+            "sub/adapter.safetensors",
+            "sub\\adapter.safetensors",
+            "/abs/adapter.safetensors",
+            "C:adapter.safetensors",
+            "nul\0.safetensors",
+            "line\nbreak.safetensors",
+        ] {
+            assert!(
+                matches!(output_stem(bad), Err(crate::Error::Unsupported(_))),
+                "{bad:?} must be refused"
+            );
+        }
+        let desc = trainer_desc(false);
+        let mut req = TrainingRequest {
+            items: vec![],
+            output_dir: PathBuf::from("unused"),
+            file_name: "ok.safetensors".into(),
+            trigger_words: vec![],
+            config: TrainingConfig::default(),
+            cancel: crate::CancelFlag::new(),
+        };
+        validate_training_techniques(&desc, &req).unwrap();
+        req.file_name = "../../etc/evil.safetensors".into();
+        assert!(matches!(
+            validate_training_techniques(&desc, &req),
+            Err(crate::Error::Unsupported(message)) if message.contains("single safe file name")
+        ));
+    }
+
     #[test]
     fn sd3_refuses_unimplemented_caller_byte_cap_before_preflight() {
         let mut desc = trainer_desc(false);
@@ -3200,7 +3272,7 @@ mod tests {
         let mut req = TrainingRequest {
             items: vec![],
             output_dir: PathBuf::from("unused"),
-            file_name: "unused".into(),
+            file_name: "unused.safetensors".into(),
             trigger_words: vec![],
             config: TrainingConfig::default(),
             cancel: crate::CancelFlag::new(),
