@@ -721,6 +721,49 @@ pub fn validate_request_geometry(width: u32, height: u32, frames: u64, count: u3
     Ok(())
 }
 
+/// The frame rate every MiniMax-H3 duration is expressed at.
+pub const FPS: f64 = 24.0;
+/// The shortest legal render (the `17n + 5` lattice floor, 5.1667 s).
+pub const MIN_FRAMES: u32 = 124;
+/// The longest legal render (the lattice ceiling, 14.375 s).
+pub const MAX_FRAMES: u32 = 345;
+/// The duration a request naming neither `frames` nor `duration` renders at — the lattice floor.
+pub const DEFAULT_DURATION_SECONDS: f32 = 5.1667;
+
+/// Align a requested `duration` **upward** onto the `17n + 5` lattice, refusing one outside the
+/// model's `MIN_FRAMES..=MAX_FRAMES` seconds range. The single definition the Candle engine
+/// renders with and allocation admission prices with (sc-26691).
+pub fn align_frames_for_duration(seconds: f32) -> Result<u32> {
+    if !seconds.is_finite() {
+        return Err(Error::Msg(format!(
+            "minimax_h3: duration must be finite, got {seconds}"
+        )));
+    }
+    let (min_s, max_s) = (f64::from(MIN_FRAMES) / FPS, f64::from(MAX_FRAMES) / FPS);
+    let seconds = f64::from(seconds);
+    if !(min_s - 1e-6..=max_s + 1e-6).contains(&seconds) {
+        return Err(Error::Msg(format!(
+            "minimax_h3: duration {seconds} s is outside the model's {min_s}-{max_s} s range (the \
+             legal frame counts {MIN_FRAMES}-{MAX_FRAMES} at {FPS} fps; the reference pipeline \
+             advertises 5-15 s but its own 17n+5 lattice tops out at 14.375 s)"
+        )));
+    }
+    let requested = (seconds * FPS).round().max(1.0) as u32;
+    // Round up to the next `17n + 5`.
+    Ok(requested + (17 + 5 - requested % 17) % 17)
+}
+
+/// The frame count a request renders: `frames` wins over `duration`, which aligns upward; neither
+/// renders [`DEFAULT_DURATION_SECONDS`]. Shared by the Candle engine's geometry resolution and
+/// [`crate::veda::workspace`] pricing, so admission prices the clip the engine will render.
+pub fn resolve_request_frames(frames: Option<u32>, duration: Option<f32>) -> Result<u32> {
+    match (frames, duration) {
+        (Some(frames), _) => Ok(frames),
+        (None, Some(seconds)) => align_frames_for_duration(seconds),
+        (None, None) => align_frames_for_duration(DEFAULT_DURATION_SECONDS),
+    }
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::Unsupported(message.into())
 }

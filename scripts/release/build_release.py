@@ -925,7 +925,7 @@ def build_release(
             "mlx": backend_pin(metadata, {"pmetal-mlx-rs", "pmetal-mlx-sys"}),
             "candle": backend_pin(
                 metadata,
-                {"candle-core", "candle-nn", "candle-transformers", "candle-flash-attn"},
+                {"candle-core", "candle-nn", "candle-transformers"},
             ),
         },
         "artifacts": artifacts,

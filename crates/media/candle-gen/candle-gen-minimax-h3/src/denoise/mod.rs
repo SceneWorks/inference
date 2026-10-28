@@ -246,6 +246,13 @@ pub fn denoise_av_with_observer(
         }
 
         let step_started = on_observed_step.as_ref().map(|_| std::time::Instant::now());
+        let step_clock = std::time::Instant::now();
+        tracing::info!(
+            step = i + 1,
+            total = schedule.num_evals(),
+            seq_len = layout.seq_len(),
+            "minimax-h3: denoise step start"
+        );
 
         // The one place a stale step index is catchable.
         let adaln_indices =
@@ -284,6 +291,12 @@ pub fn denoise_av_with_observer(
         // the whole of cancellation responsiveness, and it also bounds the queued work. A no-op on
         // the CPU device, where the arithmetic has already happened.
         device.synchronize()?;
+        tracing::info!(
+            step = i + 1,
+            total = schedule.num_evals(),
+            elapsed_ms = step_clock.elapsed().as_millis() as u64,
+            "minimax-h3: denoise step done"
+        );
         if let (Some(started), Some(observer)) = (step_started, on_observed_step.as_mut()) {
             observer(i + 1, started.elapsed());
         }

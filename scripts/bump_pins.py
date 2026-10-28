@@ -73,16 +73,17 @@ PIN_GROUPS = {
     "candle": PinGroup(
         key="candle",
         git="https://github.com/huggingface/candle",
-        # candle-flash-attn is CUDA-only and absent from the default resolved graph, but the root
-        # manifest pin and the gate's PINNED_WORKSPACE_DEPENDENCIES both list it, so it bumps here.
-        manifest_deps=("candle-core", "candle-nn", "candle-transformers", "candle-flash-attn"),
-        lock_packages=("candle-core", "candle-nn", "candle-transformers", "candle-flash-attn"),
+        # candle-flash-attn is a vendored PATH dependency (sc-26691) with no git rev to move; it is
+        # listed under `vendored` below so a candle bump re-vendors it.
+        manifest_deps=("candle-core", "candle-nn", "candle-transformers"),
+        lock_packages=("candle-core", "candle-nn", "candle-transformers"),
         # sc-24441: candle-core resolves to a vendored copy carrying upstream's CUDA-graph
         # parameter cache on top of the pinned revision; candle-metal-kernels to one carrying
         # upstream's rank > 4 strided-reduce indexing fix (#3873).
         vendored=(
             "crates/media/candle-gen/vendor/candle-core",
             "crates/media/candle-gen/vendor/candle-metal-kernels",
+            "crates/media/candle-gen/vendor/candle-flash-attn",
         ),
     ),
 }

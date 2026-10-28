@@ -42,7 +42,15 @@ PINNED_WORKSPACE_DEPENDENCIES = {
     "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
-    "candle-flash-attn": ("candle-flash-attn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
+}
+# In-tree forks reached by a plain workspace PATH dependency rather than a root [patch] (sc-26691),
+# so git-pinned consumers (SceneWorks) resolve the fork without a [patch] of their own.
+PATH_VENDORED_PACKAGES = {
+    # The multi-arch (sm_80/90/120 SASS + compute_120 PTX) FlashAttention-2 fatbin.
+    "candle-flash-attn": {
+        "path": "crates/media/candle-gen/vendor/candle-flash-attn",
+        "upstream_rev": "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
+    },
 }
 # candle-core resolves to the in-tree vendored copy (sc-24441), not the git pin: the root [patch]
 # redirects it to VENDORED_PACKAGES' path, which records the same upstream revision (plus the
@@ -66,7 +74,7 @@ VENDORED_PACKAGES = {
 DEFAULT_GRAPH_PINNED_PACKAGES = {
     package_name: revision
     for dependency_name, (package_name, revision) in PINNED_WORKSPACE_DEPENDENCIES.items()
-    if dependency_name != "candle-flash-attn" and package_name not in VENDORED_PACKAGES
+    if package_name not in VENDORED_PACKAGES
 }
 FORBIDDEN_GRAPH_PACKAGES = {
     # Provider composition is ordinary, value-scoped source code. Reintroducing this crate would
@@ -1301,6 +1309,15 @@ def check_filesystem() -> None:
             fail(f"{dependency_name} is not declared at {revision}: {dependency}")
         if dependency.get("package", dependency_name) != package_name:
             fail(f"{dependency_name} no longer aliases package {package_name}: {dependency}")
+    for dependency_name, vendored in PATH_VENDORED_PACKAGES.items():
+        dependency = dependencies.get(dependency_name)
+        if not isinstance(dependency, dict) or dependency.get("path") != vendored["path"]:
+            fail(f"{dependency_name} must be the vendored path {vendored['path']}: {dependency}")
+        provenance = ROOT / vendored["path"] / "VENDORED.md"
+        if not provenance.is_file() or vendored["upstream_rev"] not in provenance.read_text(
+            encoding="utf-8"
+        ):
+            fail(f"{vendored['path']}/VENDORED.md must record {vendored['upstream_rev']}")
 
 
 def check_graph(metadata: dict) -> None:
