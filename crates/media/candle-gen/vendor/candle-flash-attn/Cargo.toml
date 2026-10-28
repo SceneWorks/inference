@@ -7,7 +7,10 @@ description = "Flash attention layer for the candle ML framework."
 repository = "https://github.com/huggingface/candle"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
-license = "MIT OR Apache-2.0"
+# sc-26691: the Rust glue is candle's (MIT OR Apache-2.0); the CUDA kernels under kernels/ are
+# FlashAttention-2 (BSD-3-Clause, Tri Dao / the flash-attention contributors) and the compiled
+# library instantiates CUTLASS templates (BSD-3-Clause, NVIDIA). See VENDORED.md.
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
 readme = "README.md"
 
 [dependencies]
