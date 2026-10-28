@@ -1,23 +1,28 @@
-//! Shared Qwen3-style transformer blocks (sc-13334).
+//! Shared Qwen3-style transformer blocks (sc-13334; hoisted into the audio commons by
+//! sc-27270 / sc-27413).
 //!
-//! Both the MOSS-TTS-Realtime backbone (`config.json.language_config`) and the local/depth
-//! transformer (`config.json.local_config`) are Qwen3 decoder stacks with identical block math —
-//! GQA with per-head q/k RMSNorm, half-split (NeoX) RoPE at `rope_theta`, and a SiLU gated MLP.
-//! This module factors that block out so the two stacks share one verified implementation.
+//! Several audio providers run Qwen3 decoder stacks with identical block math — GQA with per-head
+//! q/k RMSNorm, half-split (NeoX) RoPE at `rope_theta`, and a SiLU gated MLP. MOSS-TTS-Realtime
+//! uses it for both its backbone (`config.json.language_config`) and its local/depth transformer
+//! (`config.json.local_config`); MOSS-TTSD's backbone (`language_model.layers`) is the identical
+//! Qwen3 layer weight-for-weight. This module is the one verified implementation both MOSS crates
+//! consume (each re-exports it as its `blocks` module, so the public paths are unchanged).
 //!
 //! Two attention forms share the same weights and math:
 //! - [`Layer::forward`] — the **stateless full-sequence** attention: every position is recomputed
-//!   from scratch. The local/depth transformer ([`crate::local`]) uses this (its depth axis is
-//!   short and re-embedded each frame).
+//!   from scratch. MOSS-TTS-Realtime's local/depth transformer uses this (its depth axis is short
+//!   and re-embedded each frame), and it is the parity reference for the cached form.
 //! - [`Layer::forward_cached`] — the **KV-cache** attention (sc-13417): keys/values for prior
 //!   positions are read from a per-layer [`LayerKv`] slot and only the new position(s) are computed,
 //!   turning the backbone AR step from O(seq) to O(1) amortized. Prefill runs the whole prompt with
 //!   a causal mask (empty cache); each subsequent single-token step appends one position and attends
 //!   maskless over the cache. This is a **pure latency optimization**: the cached path is
 //!   byte-identical to the stateless recompute (same projections/norms/RoPE per position, same
-//!   per-`(query, key)` dot products), proven by [`crate::backbone`]'s parity test.
+//!   per-`(query, key)` dot products), proven by the MOSS backbones' parity tests.
 
-use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor};
+use candle_core::{DType, Device, Result as CandleResult, Tensor};
+
+use crate::ops::repeat_kv;
 use candle_nn::{linear_b, rms_norm, Linear, Module, RmsNorm, VarBuilder};
 
 /// The per-block hyperparameters common to a Qwen3 decoder layer.
@@ -136,14 +141,13 @@ impl Attention {
     /// left operand has a single row (`M == 1`) whose accumulation order — and therefore rounding —
     /// differs from the M ≥ 2 gemm path by ~1e-7; the recompute reference always runs the whole
     /// sequence (`M == prompt_len ≥ 2`). To stay **byte-identical** rather than merely close, a
-    /// single-token step is driven with `l == 2` **duplicate** rows (see [`Backbone::run_cached`]):
+    /// single-token step is driven with `l == 2` **duplicate** rows (see the MOSS backbones' `run_cached`):
     /// every matmul then takes the gemm path, which is bit-for-bit invariant to the row count, so the
     /// real (last) row equals the recompute's last row exactly. Only the last `new_positions` row is
     /// appended to the cache; the duplicate scratch row is dropped (matmul/softmax rows are
     /// independent, so it never perturbs the real row). With those inputs matched, `q·kᵀ`, softmax
     /// and `att·v` are per-`(query, key)` reductions whose ordering is independent of the row count.
     ///
-    /// [`Backbone::run_cached`]: crate::backbone::Backbone
     fn forward_cached(
         &self,
         x: &Tensor,
@@ -221,17 +225,6 @@ impl LayerKv {
         self.kv = Some((merged.0.clone(), merged.1.clone()));
         Ok(merged)
     }
-}
-
-fn repeat_kv(x: &Tensor, groups: usize) -> CandleResult<Tensor> {
-    if groups == 1 {
-        return x.contiguous();
-    }
-    let (b, h, l, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, h, groups, l, d))?
-        .reshape((b, h * groups, l, d))?
-        .contiguous()
 }
 
 struct Mlp {

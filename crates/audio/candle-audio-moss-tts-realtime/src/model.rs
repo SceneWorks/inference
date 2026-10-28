@@ -33,6 +33,7 @@ use crate::config::MossTtsRealtimeConfig;
 use crate::conversation::{self, ConvState, PreparedTurn, Role};
 use crate::decode::{build_prompt_frames, Decoder};
 use crate::local::LocalTransformer;
+use candle_audio::lock_recover;
 
 /// Registry id — the id the catalog's ordered-generator surface carries.
 pub const MODEL_ID: &str = "moss_tts_realtime";
@@ -233,13 +234,6 @@ pub struct MossTtsRealtimeGenerator {
     codec_dir: PathBuf,
     loaded: Mutex<Option<Arc<Loaded>>>,
     codec: Mutex<Option<Arc<MossAudioCodec>>>,
-}
-
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
 }
 
 /// Downmix an interleaved [`AudioTrack`] to mono for codec analysis (the voice-clone reference input).

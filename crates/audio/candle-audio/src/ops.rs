@@ -78,6 +78,28 @@ pub fn nearest_downsample1d(x: &Tensor, k: usize) -> Result<Tensor> {
         .reshape((b, c, t / k))
 }
 
+/// Grouped-query attention key/value head expansion: `[B, H_kv, L, D]` → `[B, H_kv·groups, L, D]`,
+/// repeating each KV head `groups` times consecutively (the `repeat_interleave(groups, dim=1)`
+/// layout HF's `repeat_kv` produces), always returning a contiguous tensor.
+///
+/// The single audio-family copy of the helper every GQA attention block in the candle audio
+/// providers used to carry privately (sc-27260). It is pure data movement (`unsqueeze` +
+/// `expand` + `reshape` + `contiguous`), so sharing it changes no numerics. `groups == 1` is a
+/// contiguous copy of the input, which the attention matmuls downstream rely on.
+///
+/// Deliberately not candle-llm's `repeat_kv`: that one also feeds an LLM-only KV
+/// materialization counter, which the audio family must not depend on.
+pub fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
+    if groups == 1 {
+        return x.contiguous();
+    }
+    let (b, h, l, d) = x.dims4()?;
+    x.unsqueeze(2)?
+        .expand((b, h, groups, l, d))?
+        .reshape((b, h * groups, l, d))?
+        .contiguous()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +244,29 @@ mod tests {
         let x = Tensor::zeros((1usize, 1usize, 7usize), candle_core::DType::F32, &dev).unwrap();
         assert!(nearest_downsample1d(&x, 3).is_err());
         assert!(nearest_downsample1d(&x, 0).is_err());
+    }
+
+    /// Each KV head repeats `groups` times consecutively (`[h0, h0, h1, h1]`), and `groups == 1`
+    /// is the identity (mutation guard: an interleaved `[h0, h1, h0, h1]` layout turns this red).
+    #[test]
+    fn repeat_kv_repeats_each_head_consecutively() {
+        let dev = Device::Cpu;
+        // [1, 2, 1, 2]: head0 = [1, 2], head1 = [3, 4].
+        let x = Tensor::from_vec(
+            vec![1f32, 2.0, 3.0, 4.0],
+            (1usize, 2usize, 1usize, 2usize),
+            &dev,
+        )
+        .unwrap();
+        let rep = repeat_kv(&x, 2).unwrap();
+        assert_eq!(rep.dims(), &[1, 4, 1, 2]);
+        assert!(rep.is_contiguous());
+        assert_eq!(
+            rep.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0],
+        );
+        let same = repeat_kv(&x.transpose(1, 3).unwrap(), 1).unwrap();
+        assert!(same.is_contiguous());
+        assert_eq!(same.dims(), &[1, 2, 1, 2]);
     }
 }

@@ -13,6 +13,7 @@
 //! half-split (NeoX) RoPE at `rope_theta`, SiLU MLP.
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor};
+use candle_audio::ops::repeat_kv;
 use candle_nn::{linear_b, rms_norm, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::config::TextEncoderConfig;
@@ -105,17 +106,6 @@ impl Attention {
         ))?;
         __model_proof_output!(self.o_proj.forward(&out))
     }
-}
-
-fn repeat_kv(x: &Tensor, groups: usize) -> CandleResult<Tensor> {
-    if groups == 1 {
-        return x.contiguous();
-    }
-    let (b, h, l, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, h, groups, l, d))?
-        .reshape((b, h * groups, l, d))?
-        .contiguous()
 }
 
 struct Mlp {

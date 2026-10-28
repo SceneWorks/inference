@@ -123,8 +123,8 @@ impl LocalTransformer {
             let logits = self.heads[i].forward(&hidden)?; // [1, audio_vocab]
             let mut row: Vec<f32> = logits.reshape((logits.elem_count(),))?.to_vec1::<f32>()?;
             // Optional minimum-length control (off by default — reference parity, sc-13570): the
-            // audio-EOS marker lives on codebook 0. When the caller requests suppression (only when
-            // `MOSS_TTS_MIN_FRAMES` is set) it is masked to -inf before the floor. sc-13433 added this
+            // audio-EOS marker lives on codebook 0. When the caller requests suppression (only with a
+            // nonzero `DEFAULT_MIN_EOS_FRAMES` floor) it is masked to -inf before the floor. sc-13433 added this
             // to paper over spurious early EOS, but that was a symptom of the wrong conditioning; with
             // the reference delay-pattern restored ([`crate::decode::build_prompt_frames`]) `suppress_eos`
             // is normally false and the model reaches its natural EOS on its own.

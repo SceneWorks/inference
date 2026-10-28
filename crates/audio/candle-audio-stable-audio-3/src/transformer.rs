@@ -4,6 +4,7 @@
 //! `124e8a799f57a1f665495ecb72e547d0a62867f1`.
 
 use candle_audio::candle_core::{bail, DType, Device, Result, Tensor, D};
+use candle_audio::ops::repeat_kv;
 use candle_nn::{linear, linear_b, linear_no_bias, Init, Linear, Module, VarBuilder};
 
 use crate::config::{FeedForwardConfig, NormConfig, NormType, QkNorm};
@@ -333,17 +334,6 @@ fn to_heads(x: &Tensor, heads: usize, dim_head: usize) -> Result<Tensor> {
 fn from_heads(x: &Tensor) -> Result<Tensor> {
     let (batch, heads, seq, dim) = x.dims4()?;
     x.transpose(1, 2)?.reshape((batch, seq, heads * dim))
-}
-
-fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return x.contiguous();
-    }
-    let (b, h, n, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, h, groups, n, d))?
-        .reshape((b, h * groups, n, d))?
-        .contiguous()
 }
 
 fn combine_differential(ordinary: &Tensor, differential: &Tensor) -> Result<Tensor> {

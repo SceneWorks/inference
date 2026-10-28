@@ -19,7 +19,11 @@
 //!   vocoder head needs (Kokoro / StyleTTS2, sc-12836; resampling, sc-14561).
 //! - [`ops`] — tensor ops the providers share but candle's GPU backends leave
 //!   unimplemented, expressed in backend-portable primitives (nearest ×k upsample,
-//!   sc-13886 / sc-13691).
+//!   sc-13886 / sc-13691), plus the GQA `repeat_kv` head expansion (sc-27260).
+//! - [`qwen3`] — the Qwen3 decoder block (GQA + q/k RMSNorm + NeoX RoPE + SwiGLU, with the
+//!   KV-cache form) the MOSS-TTS backbones share (sc-27270).
+//! - [`sampling`] — the seeded repetition-penalty / temperature / top-k / top-p token sampler the
+//!   MOSS-TTS AR loops share (sc-27272).
 //! - [`mel`] — HTK mel filterbank construction and application for mel-spectrogram
 //!   front-ends (reference-audio conditioning, model preprocessing parity).
 //! - [`neural_codec`] — neural-codec building blocks several providers' decoders share
@@ -63,6 +67,8 @@ pub mod harness;
 pub mod mel;
 pub mod neural_codec;
 pub mod ops;
+pub mod qwen3;
+pub mod sampling;
 pub mod vocos;
 pub mod wav;
 
@@ -75,6 +81,19 @@ pub mod wav;
 // passed-in snapshot dir via env instead.
 #[cfg(feature = "testkit")]
 pub mod testkit;
+
+/// Lock a mutex, recovering the guard if a previous holder panicked (a poisoned lock).
+///
+/// The candle audio providers keep lazily-built model state behind `Mutex<Option<…>>`; a panic
+/// mid-build leaves `None` or stale state, which their lazy builders tolerate, so poisoning is not
+/// worth propagating. The audio twin of `candle_gen::lock_recover` — one shared copy instead of the
+/// per-provider ones (sc-27357).
+pub fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 /// The candle-backed audio-crate error. gen-core cannot name candle types, so device/tensor
 /// failures arrive boxed in [`gen_core::Error::Backend`] via the [`From`] bridge below —

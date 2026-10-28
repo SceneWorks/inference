@@ -54,7 +54,7 @@
 use std::path::Path;
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor};
-use candle_audio::{AudioError, Result};
+use candle_audio::{dsp, AudioError, Result};
 use candle_nn::ops::softmax_last_dim;
 use candle_nn::{
     conv1d, conv1d_no_bias, layer_norm, linear, linear_no_bias, Conv1d, Conv1dConfig, LayerNorm,
@@ -191,27 +191,9 @@ fn merge_tokenized_segments(
 
 // ---------------------------------------------------------------------------------------------
 // Mel front-end (host f32; n_fft = 400 is not a power of two, so a direct real-DFT is used, the
-// same idiom the chatterbox_ve front-end uses — the shared radix-2 `candle_audio::dsp` cannot
-// serve it).
+// same shared `candle_audio::dsp::DirectRdft` the chatterbox_ve front-end uses — the radix-2
+// `candle_audio::dsp::FftPlan` cannot serve it).
 // ---------------------------------------------------------------------------------------------
-
-/// Periodic Hann window of length `n` — `torch.hann_window(n)` (`0.5 − 0.5 cos(2π i / n)`).
-fn hann(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
-        .collect()
-}
-
-/// Reflect-pad by `pad` on both ends (numpy/torch `mode="reflect"`, edge sample excluded) — the
-/// `center=True` framing `torch.stft` uses.
-fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
-    let n = samples.len();
-    let mut out = Vec::with_capacity(n + 2 * pad);
-    out.extend((1..=pad).rev().map(|i| samples[i.min(n - 1)]));
-    out.extend_from_slice(samples);
-    out.extend((0..pad).map(|i| samples[n.saturating_sub(2 + i)]));
-    out
-}
 
 /// The loaded s3tokenizer: the checkpoint mel bank + the FSMN encoder + the FSQ projection.
 pub struct S3Tokenizer {
@@ -362,45 +344,10 @@ impl S3Tokenizer {
     /// (`n_fft = 400` is not a power of two), `center=True` reflect padding, periodic Hann.
     fn power_stft(&self, samples: &[f32]) -> Vec<Vec<f32>> {
         let cfg = &self.cfg;
-        let (n_fft, hop, n_bins) = (cfg.n_fft, cfg.hop, cfg.n_bins());
-        let window = hann(n_fft);
-        let pad = n_fft / 2;
-        let padded = reflect_pad(samples, pad);
-        if padded.len() < n_fft {
-            return Vec::new();
-        }
-        let n_frames = 1 + (padded.len() - n_fft) / hop;
-        // DFT twiddles: cos/sin for each (bin, sample).
-        let mut cos_tab = vec![0f32; n_bins * n_fft];
-        let mut sin_tab = vec![0f32; n_bins * n_fft];
-        for k in 0..n_bins {
-            for t in 0..n_fft {
-                let ang = -2.0 * std::f32::consts::PI * k as f32 * t as f32 / n_fft as f32;
-                cos_tab[k * n_fft + t] = ang.cos();
-                sin_tab[k * n_fft + t] = ang.sin();
-            }
-        }
-        let mut frames = Vec::with_capacity(n_frames);
-        let mut windowed = vec![0f32; n_fft];
-        for f in 0..n_frames {
-            let start = f * hop;
-            for (i, w) in windowed.iter_mut().enumerate() {
-                *w = padded[start + i] * window[i];
-            }
-            let mut row = vec![0f32; n_bins];
-            for (k, slot) in row.iter_mut().enumerate() {
-                let (cos_k, sin_k) = (&cos_tab[k * n_fft..], &sin_tab[k * n_fft..]);
-                let mut re = 0f32;
-                let mut im = 0f32;
-                for (t, &x) in windowed.iter().enumerate() {
-                    re += x * cos_k[t];
-                    im += x * sin_k[t];
-                }
-                *slot = re * re + im * im;
-            }
-            frames.push(row);
-        }
-        frames
+        let n_fft = cfg.n_fft;
+        let window = dsp::hann_window_torch_f32(n_fft);
+        let padded = dsp::reflect_pad(samples, n_fft / 2);
+        dsp::DirectRdft::new(n_fft).power_frames(&padded, cfg.hop, &window)
     }
 
     /// FSQ-encode the encoder hidden states `[1, T, n_state]` → token ids `[T]`.
@@ -631,7 +578,7 @@ mod tests {
 
     #[test]
     fn hann_window_is_periodic_and_bounded() {
-        let w = hann(400);
+        let w = dsp::hann_window_torch_f32(400);
         assert_eq!(w.len(), 400);
         assert!(w[0].abs() < 1e-6, "periodic Hann starts at 0");
         assert!(w.iter().all(|&v| (0.0..=1.0).contains(&v)));
@@ -641,7 +588,7 @@ mod tests {
     #[test]
     fn reflect_pad_excludes_the_edge_sample() {
         // torch reflect pad of [10,20,30,40] by 2 → [30,20, 10,20,30,40, 30,20].
-        let p = reflect_pad(&[10.0, 20.0, 30.0, 40.0], 2);
+        let p = dsp::reflect_pad(&[10.0, 20.0, 30.0, 40.0], 2);
         assert_eq!(p, vec![30.0, 20.0, 10.0, 20.0, 30.0, 40.0, 30.0, 20.0]);
     }
 

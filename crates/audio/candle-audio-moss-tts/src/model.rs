@@ -33,6 +33,7 @@ use crate::backbone::Backbone;
 use crate::codec::XyTokenizerCodec;
 use crate::config::MossTtsdConfig;
 use crate::decode::{build_prompt_grid, DecodeResult, Decoder, DEFAULT_SYSTEM_PROMPT};
+use candle_audio::lock_recover;
 
 /// Registry id — the id the catalog would carry once the codec lands and the provider ships.
 pub const MODEL_ID: &str = "moss_ttsd_v05";
@@ -260,13 +261,6 @@ pub struct MossTtsdGenerator {
     codec_ckpt: PathBuf,
     loaded: Mutex<Option<Arc<Loaded>>>,
     codec: Mutex<Option<Arc<XyTokenizerCodec>>>,
-}
-
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
 }
 
 impl MossTtsdGenerator {

@@ -21,8 +21,9 @@ use candle_audio_stable_audio_3::dit::{Guidance, StableAudio3Dit};
 use candle_audio_stable_audio_3::sampler::{
     adapt_sample_size_for_max, build_schedule, effective_schedule_lengths, initialize_latents,
     padding_mask, resource_estimate, sample, sample_dit, sample_initialized, sample_with_callback,
-    sample_with_host_timestep, validate_guidance, DistributionShift, GuidanceInterval,
-    InjectedNoise, NoiseSource, SamplerKind, Schedule, SeededNoise,
+    sample_with_host_timestep, validate_guidance, DistributionShift, DitConditioning,
+    GuidanceInterval, InjectedNoise, NoiseSource, SampleDitArgs, SamplerKind, Schedule,
+    SeededNoise,
 };
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
 use candle_nn::VarBuilder;
@@ -925,18 +926,25 @@ fn all_six_real_p0_pingpong_trajectories_match_stepwise() {
         let mut injected = InjectedNoise::new(draws);
         let output = sample_dit(
             &model,
-            SamplerKind::Pingpong,
+            SampleDitArgs {
+                record_trajectory: true,
+                ..SampleDitArgs::new(
+                    SamplerKind::Pingpong,
+                    &schedule,
+                    DitConditioning {
+                        positive_prompt: &prompt,
+                        negative_prompt: None,
+                        negative_prompt_mask: None,
+                        seconds_total: &seconds,
+                        local_conditioning: &local,
+                        padding: None,
+                    },
+                    Guidance::default(),
+                )
+            },
             &initial,
-            &schedule,
-            &prompt,
-            None,
-            None,
-            &seconds,
-            &local,
-            None,
-            Guidance::default(),
             &mut injected,
-            true,
+            None,
         )
         .unwrap();
         assert_eq!(output.model_calls, 8, "{}", case.env);
@@ -1038,18 +1046,22 @@ fn real_sampler_cfg_apg_scale_phi_matches_frozen_upstream() {
             let mut unused_noise = no_noise();
             let output = sample_dit(
                 &model,
-                SamplerKind::Euler,
+                SampleDitArgs::new(
+                    SamplerKind::Euler,
+                    &schedule,
+                    DitConditioning {
+                        positive_prompt: &prompt,
+                        negative_prompt: None,
+                        negative_prompt_mask: None,
+                        seconds_total: &seconds,
+                        local_conditioning: &local,
+                        padding: Some(&mask),
+                    },
+                    guidance,
+                ),
                 &initial,
-                &schedule,
-                &prompt,
-                None,
-                None,
-                &seconds,
-                &local,
-                Some(&mask),
-                guidance,
                 &mut unused_noise,
-                false,
+                None,
             )
             .unwrap();
             assert_eq!(output.model_calls, 1);
@@ -1121,18 +1133,22 @@ fn real_default_sampler_resource_probe() {
     let started = Instant::now();
     let output = sample_dit(
         &model,
-        kind,
+        SampleDitArgs::new(
+            kind,
+            &schedule,
+            DitConditioning {
+                positive_prompt: &prompt,
+                negative_prompt: None,
+                negative_prompt_mask: None,
+                seconds_total: &seconds,
+                local_conditioning: &local,
+                padding: Some(&mask),
+            },
+            Guidance::default(),
+        ),
         &initial,
-        &schedule,
-        &prompt,
-        None,
-        None,
-        &seconds,
-        &local,
-        Some(&mask),
-        Guidance::default(),
         &mut noise,
-        false,
+        None,
     )
     .unwrap();
     let checksum = output

@@ -10,9 +10,9 @@ use crate::same::{
     SameAutoencoder, SameChunkingParameters, SameChunkingPolicy, SameDecodeChunkNoise,
 };
 use crate::sampler::{
-    build_schedule, default_sample_geometry, inference_shift, padding_mask,
-    sample_dit_initialized_with_interval_and_cancel, GuidanceInterval, InjectedNoise, NoiseSource,
-    ProgressCallback, SampleGeometry, SamplerKind, SeededNoise, LATENT_DOWNSAMPLING,
+    build_schedule, default_sample_geometry, inference_shift, padding_mask, sample_dit,
+    DitConditioning, InitMix, InjectedNoise, NoiseSource, ProgressCallback, SampleDitArgs,
+    SampleGeometry, SamplerKind, SeededNoise, LATENT_DOWNSAMPLING,
 };
 use crate::t5gemma::T5GemmaConditioner;
 use crate::weights::{SnapshotKind, SnapshotLayout};
@@ -1851,28 +1851,34 @@ impl StableAudio3Pipeline {
             on_progress(step.index + 1, total);
             Ok(())
         };
-        let sampled = sample_dit_initialized_with_interval_and_cancel(
+        let sampled = sample_dit(
             &self.dit,
-            parameters.sampler,
+            SampleDitArgs {
+                init: Some(InitMix {
+                    init_latents,
+                    // Recomputed, not read from a binding shared with `build_schedule` above: an
+                    // edit to this expression alone leaves it disagreeing with `schedule[0]`,
+                    // which `initialized_start` rejects.
+                    strength: sampler_strength_for(reference),
+                }),
+                is_canceled: Some(is_canceled),
+                ..SampleDitArgs::new(
+                    parameters.sampler,
+                    &schedule,
+                    DitConditioning {
+                        positive_prompt: &positive.embeddings,
+                        negative_prompt: negative.as_ref().map(|value| &value.embeddings),
+                        negative_prompt_mask: negative.as_ref().map(|value| &value.attention_mask),
+                        seconds_total: &seconds,
+                        local_conditioning: local,
+                        padding: Some(&padding),
+                    },
+                    parameters.guidance,
+                )
+            },
             initial,
-            init_latents,
-            // Recomputed, not read from a binding shared with `build_schedule` above: an edit to
-            // this expression alone leaves it disagreeing with `schedule[0]`, which
-            // `initialized_start` rejects.
-            sampler_strength_for(reference),
-            &schedule,
-            &positive.embeddings,
-            negative.as_ref().map(|value| &value.embeddings),
-            negative.as_ref().map(|value| &value.attention_mask),
-            &seconds,
-            local,
-            Some(&padding),
-            parameters.guidance,
-            GuidanceInterval::FULL,
-            Some(&mut progress as &mut ProgressCallback<'_>),
             noise,
-            false,
-            is_canceled,
+            Some(&mut progress as &mut ProgressCallback<'_>),
         )?;
         Ok((sampled.latents, padding))
     }
