@@ -31,6 +31,11 @@
 //!   meters reused from `gen_core::audio_dsp`, never reimplemented), the PCM
 //!   repeatability hash, and the [`harness::MetricEnvelope`] the per-model regression
 //!   fixtures assert against.
+//! - [`weights`] — the lane's one audited `unsafe` safetensors mmap surface and its
+//!   caller-provisioned-file contract, the F32 tensor loaders, and the bounded raw-header reader
+//!   (sc-27259 / sc-27358 / sc-27343).
+//! - [`prepare`] — the snapshot preparers' shared probe, passthrough-report and header-only
+//!   tensor-counting skeleton (sc-27264 / sc-27265).
 //!
 //! Scope discipline (sc-12835): these modules are exactly what the first shipped
 //! provider (Kokoro, sc-12836) needs — no speculative surface. Grow this crate
@@ -63,8 +68,10 @@ pub mod harness;
 pub mod mel;
 pub mod neural_codec;
 pub mod ops;
+pub mod prepare;
 pub mod vocos;
 pub mod wav;
+pub mod weights;
 
 // Test-support helpers shared across the candle audio provider crates. Feature-gated so it never
 // compiles into a production build — provider crates enable `candle-audio/testkit` under
@@ -72,8 +79,8 @@ pub mod wav;
 // `--features candle-audio/testkit` (ci.yml) so the module never sits behind an unexercised cfg
 // (the sc-11990 cfg-hole guard). The HF-cache snapshot scanners this module once held were removed
 // under epic 13657 — inference never self-fetches or derives an HF-cache location; tests take a
-// passed-in snapshot dir via env instead.
-#[cfg(feature = "testkit")]
+// passed-in snapshot dir via env instead. Also compiled for this crate's own unit tests.
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
 /// The candle-backed audio-crate error. gen-core cannot name candle types, so device/tensor
