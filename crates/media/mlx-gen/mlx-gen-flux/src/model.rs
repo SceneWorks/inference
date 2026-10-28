@@ -7,7 +7,7 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, run_flow_sampler_with_latent_hook, Conditioning, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
-    Precision, Progress, Residency, Result, TimestepConvention, WeightsSource,
+    Precision, Progress, Residency, Result, SamplerRun, TimestepConvention, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_z_image::vae::Vae;
@@ -858,13 +858,15 @@ impl Flux1 {
             // `run_flow_sampler`.
             let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
             let final_latents = run_flow_sampler_with_latent_hook(
-                Some(sampler_name),
+                SamplerRun {
+                    sampler_name: Some(sampler_name),
+                    sigmas: denoise_sigmas,
+                    seed,
+                    cancel: &req.cancel,
+                    on_progress,
+                },
                 TimestepConvention::Sigma,
-                denoise_sigmas,
                 latents,
-                seed,
-                &req.cancel,
-                on_progress,
                 |latents, sigma| {
                     crate::preview::emit_preview(
                         &req.preview,

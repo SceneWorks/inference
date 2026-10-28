@@ -71,7 +71,7 @@ use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
 use mlx_gen::{
     LoadSpec, Modality, NetworkType, Precision, Result, TrainOptimizer, Trainer, TrainerDescriptor,
-    TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -477,10 +477,23 @@ impl Trainer for AnimaTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -491,6 +504,7 @@ impl AnimaTrainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         self.validate(req)?;
         let cfg = &req.config;
@@ -891,11 +905,18 @@ impl AnimaTrainer {
                         // F-117: a cancelled preview denoise exits the preview loop (the outer loop's
                         // cancel check then unwinds the run); other failures skip one preview.
                         Err(mlx_gen::Error::Canceled) => break,
-                        Err(e) => eprintln!(
-                            "[sc-10641] anima preview sample failed at step {step} (prompt {}): {e} \
-                             — skipping this preview, training continues",
-                            i + 1
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[sc-10641] anima preview sample failed at step {step} (prompt \
+                                 {}): {e} — skipping this preview, training continues",
+                                i + 1
+                            );
+                            warnings.push(gen_core::train::preview_sample_failed(
+                                step,
+                                i as u32 + 1,
+                                &e,
+                            ));
+                        }
                     }
                 }
                 // sc-5567 — release the preview's transient forward+VAE-decode residency before
@@ -1516,6 +1537,7 @@ fn encode_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::testing::max_abs_diff;
     use mlx_gen::{TrainingItem, TrainingRequest};
     use std::path::PathBuf;
 
@@ -2396,17 +2418,6 @@ mod tests {
     // ======================================================================================
     // sc-10641 — in-training preview sampling
     // ======================================================================================
-
-    /// Max abs element-wise diff between two same-shape latents.
-    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-        a.subtract(b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item::<f32>()
-    }
 
     /// The interval contract, deterministically (no weights): previews are enabled only with a positive
     /// cadence + at least one prompt + not cancelled, and fire on EXACTLY the cadence multiples — nowhere

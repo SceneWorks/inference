@@ -46,6 +46,7 @@ use tokenizers::Tokenizer;
 
 use crate::decode::{WhisperDecoder, LANGUAGES};
 use crate::mel;
+use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes a transcription request to this exact id).
 pub const MODEL_ID: &str = "whisper_base";
@@ -110,14 +111,6 @@ pub fn descriptor() -> TranscriberDescriptor {
     }
 }
 
-/// Recover a poisoned mutex — the audio twin of `candle_gen::lock_recover`.
-fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 /// The cached loaded model: the (expensive) weights + tokenizer + config, built once on first
 /// `transcribe` and reused across requests (the sibling providers' lazy-load discipline).
 struct LoadedModel {
@@ -158,11 +151,8 @@ impl WhisperTranscriber {
         )
         .map_err(|e| AudioError::Msg(format!("whisper: loading {TOKENIZER_FILE}: {e}")))?;
         let weights = self.root.join(WEIGHTS_FILE);
-        // Safety: from_mmaped_safetensors mmaps a trusted, pinned-SHA snapshot file (F-029).
-        let vb = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(&[weights], DTYPE, &device)
-                .map_err(AudioError::from)?
-        };
+        let vb = candle_audio::weights::mmap_var_builder(&[weights], DTYPE, &device)
+            .map_err(AudioError::from)?;
         let model = Whisper::load(&vb, config.clone()).map_err(AudioError::from)?;
         Ok(LoadedModel {
             model,

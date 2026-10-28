@@ -28,6 +28,7 @@
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
+use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, GenerationRequest, Result};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
@@ -52,11 +53,6 @@ fn f32c(x: &Array) -> Result<Array> {
 /// Non-affine `FP32LayerNorm` (`elementwise_affine=False`) on an f32 stream.
 fn ln(x: &Array, eps: f32) -> Result<Array> {
     Ok(layer_norm(x, None, None, eps)?)
-}
-
-/// SiLU `x·σ(x)` (the `condition_embedder`'s `nn.SiLU`), dtype-preserving.
-fn silu(x: &Array) -> Result<Array> {
-    mlx_gen::nn::silu(x)
 }
 
 /// Load a biased diffusers `nn.Linear` (`{prefix}.weight` `[out, in]` + `{prefix}.bias`). `dtype`

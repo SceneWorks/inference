@@ -15,7 +15,7 @@
 //! |---|---|
 //! | `qwen_image::block::modulate` | 4 (img/txt × mod1/mod2) |
 //! | `qwen_image::block::gated` | 4 |
-//! | `qwen_image::attention::rope_rotate` | 4 (img/txt × q/k) |
+//! | `mlx_gen::nn::rope_rotate` (core RoPE glue, sc-27453) | 4 (img/txt × q/k) |
 //! | `qwen_image::feed_forward::gelu_ffn` | 2 |
 //! | `silu` on the timestep embedding | 1 (P3 `EXACT_SILU`) |
 
@@ -33,7 +33,7 @@ use mlx_rs::Array;
 const RETAINED_SITES: [&str; 4] = [
     "qwen_image::block::modulate",
     "qwen_image::block::gated",
-    "qwen_image::attention::rope_rotate",
+    "mlx_gen::nn::rope_rotate",
     "qwen_image::feed_forward::gelu_ffn",
 ];
 

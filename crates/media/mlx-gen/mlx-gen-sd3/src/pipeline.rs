@@ -19,7 +19,7 @@
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, FlowMatchEuler, Image,
-    PreviewSink, Progress, Result, TimestepConvention,
+    PreviewSink, Progress, Result, SamplerRun, TimestepConvention,
 };
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -171,13 +171,15 @@ fn denoise_over_sigmas(
     };
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     run_flow_sampler_with_latent_hook(
-        sampler_name,
+        SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::Sigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         |latents, sigma| {
             crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents);
         },

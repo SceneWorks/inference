@@ -3,29 +3,17 @@
 //! can be quantized (Q8) without changing the forward.
 
 use mlx_rs::error::Exception;
-use mlx_rs::ops::{add, multiply, power, tanh};
 use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
-use mlx_gen::array::scalar;
-use mlx_gen::nn::gelu_tanh;
+use mlx_gen::nn::{gelu_tanh, gelu_tanh_ffn_impl};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use super::{compile_glue, join, linear_from};
 
 const SITE_GELU_FFN: &str = "qwen_image::feed_forward::gelu_ffn";
-
-fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
-    let dt = x.dtype();
-    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-    let x3 = power(x, Array::from_int(3))?;
-    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-    multiply(&multiply(x, &s(0.5)?)?, &gate)
-}
 
 thread_local! {
     static RETAINED_GELU_FFN: std::cell::RefCell<Option<mlx_gen::nn::RetainedUnary>> =
@@ -37,7 +25,7 @@ fn retained_gelu_ffn(x: &Array) -> std::result::Result<Array, Exception> {
     RETAINED_GELU_FFN.with(|slot| {
         slot.borrow_mut()
             .get_or_insert_with(|| {
-                mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_ffn_impl, true))
+                mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_tanh_ffn_impl, true))
             })
             .call(SITE_GELU_FFN, x)
     })
@@ -114,7 +102,7 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
             SITE_GELU_FFN,
             mlx_gen::diagnostics::CompileDisposition::OneShot,
         );
-        Ok(compile(gelu_ffn_impl, true)(x)?)
+        Ok(compile(gelu_tanh_ffn_impl, true)(x)?)
     }
 }
 

@@ -222,18 +222,16 @@ where
     Ok(concatenate_axis(&refs, 1)?)
 }
 
-/// Contiguous `[:, start:start+len, …]` slice along the sequence axis (axis 1), via the arange-index
-/// `take_axis` idiom used throughout this crate.
+/// Contiguous `[:, start:start+len, …]` slice along the sequence axis (axis 1) — core
+/// `slice_range` (sc-27448).
 fn slice_seq(x: &Array, start: i32, len: i32) -> Result<Array> {
-    let idx = Array::from_slice(&(start..start + len).collect::<Vec<i32>>(), &[len]);
-    Ok(x.take_axis(&idx, 1)?)
+    mlx_gen::array::slice_range(x, 1, start, start + len)
 }
 
 /// Contiguous `[start:start+len, …]` slice along axis 0 — for slicing the RoPE `cos`/`sin`
 /// `[seq_len, 1, half_d]` tables to a query block inside [`map_seq_chunks`].
 pub fn slice_axis0(x: &Array, start: i32, len: i32) -> Result<Array> {
-    let idx = Array::from_slice(&(start..start + len).collect::<Vec<i32>>(), &[len]);
-    Ok(x.take_axis(&idx, 0)?)
+    mlx_gen::array::slice_range(x, 0, start, start + len)
 }
 
 #[cfg(test)]

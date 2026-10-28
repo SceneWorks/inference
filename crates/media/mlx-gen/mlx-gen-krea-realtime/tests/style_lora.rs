@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use mlx_gen::adapters::loader::{apply_adapters_strict, apply_adapters_strict_with_diff_patch};
 use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::testing::{max_abs, max_abs_diff};
 use mlx_gen::{AdapterKind, AdapterSpec};
 use mlx_gen_krea_realtime::{
     load_krea_realtime_transformer, CausalKreaTransformer, KreaRealtimeConfig, MODEL_ID,
@@ -208,16 +209,6 @@ fn det_latent(c: i32, f: i32, h: i32, w: i32, seed: u64) -> Array {
         data.push((u as f32 - 0.5) * 2.0); // ~[-1, 1]
     }
     Array::from_slice(&data, &[c, f, h, w])
-}
-
-fn max_abs(a: &Array) -> f32 {
-    mlx_rs::ops::max(mlx_rs::ops::abs(a).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    max_abs(&mlx_rs::ops::subtract(a, b).unwrap())
 }
 
 /// A fresh tiny Krea Realtime DiT (identical deterministic weights every call) — the base each host

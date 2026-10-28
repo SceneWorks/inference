@@ -192,6 +192,26 @@ fn source_audio_is_validated_and_identified() {
     assert!(stereo.prepare(None, 1_600, 65).is_err());
 }
 
+/// sc-27345: a source past the ceiling is refused uncropped, and `max_seconds` admits it.
+#[test]
+fn over_long_sources_are_refused_unless_cropped() {
+    let rate = 100;
+    let over = SourceAudio::mono(vec![
+        0.25;
+        (MAX_SOURCE_LENGTH_S as usize) * rate as usize + 1
+    ]);
+    let err = over.prepare(None, rate, 1).unwrap_err().to_string();
+    assert!(err.contains("to crop it"), "{err}");
+    assert!(over
+        .prepare(Some(MAX_SOURCE_LENGTH_S + 10.0), rate, 1)
+        .is_err());
+    let (samples, identity) = over.prepare(Some(60.0), rate, 1).unwrap();
+    assert_eq!(samples.len(), 6_000);
+    assert!(identity.conversion.contains("cropped to 60 s"));
+    let at_ceiling = SourceAudio::mono(vec![0.25; (MAX_SOURCE_LENGTH_S as usize) * rate as usize]);
+    assert!(at_ceiling.prepare(None, rate, 1).is_ok());
+}
+
 /// The SheetSage2 config must pin the inventory's MERT parent.
 #[test]
 fn parent_pin_is_cross_checked() {

@@ -73,6 +73,7 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, divide, matmul, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::slice_range;
 use mlx_gen::nn::{linear, quantized_matmul_with_bias, silu, timestep_sincos};
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{Error, Result};
@@ -687,7 +688,7 @@ impl ProjWeight {
     /// packing and the scales grid both run along the input axis, so every row is self-contained.
     fn slice_out(&self, start: i32, end: i32) -> Result<Self> {
         Ok(match self {
-            ProjWeight::Dense(w) => ProjWeight::Dense(contiguous(&slice_axis(w, 0, start, end)?)?),
+            ProjWeight::Dense(w) => ProjWeight::Dense(contiguous(&slice_range(w, 0, start, end)?)?),
             ProjWeight::Quant {
                 q,
                 scales,
@@ -695,9 +696,9 @@ impl ProjWeight {
                 group,
                 bits,
             } => ProjWeight::Quant {
-                q: contiguous(&slice_axis(q, 0, start, end)?)?,
-                scales: contiguous(&slice_axis(scales, 0, start, end)?)?,
-                biases: contiguous(&slice_axis(biases, 0, start, end)?)?,
+                q: contiguous(&slice_range(q, 0, start, end)?)?,
+                scales: contiguous(&slice_range(scales, 0, start, end)?)?,
+                biases: contiguous(&slice_range(biases, 0, start, end)?)?,
                 group: *group,
                 bits: *bits,
             },
@@ -758,7 +759,7 @@ impl SwiGlu {
         let mut start = 0;
         while start < tokens {
             let end = (start + SWIGLU_TILE_TOKENS).min(tokens);
-            let part = self.tile(&slice_axis(&flat, 0, start, end)?)?;
+            let part = self.tile(&slice_range(&flat, 0, start, end)?)?;
             part.eval()?;
             parts.push(part);
             start = end;
@@ -772,23 +773,6 @@ impl SwiGlu {
         let up = self.w_up.apply(flat, None)?;
         self.w_down.apply(&multiply(&gate, &up)?, None)
     }
-}
-
-/// Slice `x` along `axis` to `[start, end)`.
-fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
-    let rank = x.ndim() as i32;
-    let axis = if axis < 0 { axis + rank } else { axis };
-    let len = x.shape()[axis as usize];
-    if start < 0 || end > len || start >= end {
-        return Err(Error::Msg(format!(
-            "ltx diffvae: slice [{start}, {end}) is out of range for axis {axis} of length {len}"
-        )));
-    }
-    if start == 0 && end == len {
-        return Ok(x.clone());
-    }
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), axis)?)
 }
 
 /// Pad or crop `axis` to `size`. `symmetric` splits the difference across both edges
@@ -816,7 +800,7 @@ fn resize_axis(x: &Array, axis: i32, size: i32, symmetric: bool) -> Result<(Arra
         let mut parts: Vec<Array> = Vec::new();
         if before > 0 {
             parts.push(Array::repeat_axis::<f32>(
-                slice_axis(x, axis, 0, 1)?,
+                slice_range(x, axis, 0, 1)?,
                 before,
                 axis,
             )?);
@@ -824,7 +808,7 @@ fn resize_axis(x: &Array, axis: i32, size: i32, symmetric: bool) -> Result<(Arra
         parts.push(x.clone());
         if after > 0 {
             parts.push(Array::repeat_axis::<f32>(
-                slice_axis(x, axis, len - 1, len)?,
+                slice_range(x, axis, len - 1, len)?,
                 after,
                 axis,
             )?);
@@ -838,7 +822,10 @@ fn resize_axis(x: &Array, axis: i32, size: i32, symmetric: bool) -> Result<(Arra
     } else {
         (0, need)
     };
-    Ok((slice_axis(x, axis, before, before + size)?, (before, after)))
+    Ok((
+        slice_range(x, axis, before, before + size)?,
+        (before, after),
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -947,9 +934,9 @@ pub fn na3d(q: &Array, k: &Array, v: &Array, kernel: [i32; 3]) -> Result<Array> 
     while t0 < t {
         let t1 = (t0 + tiles[0]).min(t);
         let (kt0, ktn) = key_range(0, t0, t1);
-        let qt = slice_axis(q, 1, t0, t1)?;
-        let kt = slice_axis(k, 1, kt0, kt0 + ktn)?;
-        let vt = slice_axis(v, 1, kt0, kt0 + ktn)?;
+        let qt = slice_range(q, 1, t0, t1)?;
+        let kt = slice_range(k, 1, kt0, kt0 + ktn)?;
+        let vt = slice_range(v, 1, kt0, kt0 + ktn)?;
         let mt = axis_mask(&starts[0], t0, t1, kernels[0], kt0, ktn);
 
         let mut h_parts: Vec<Array> = Vec::new();
@@ -957,9 +944,9 @@ pub fn na3d(q: &Array, k: &Array, v: &Array, kernel: [i32; 3]) -> Result<Array> 
         while h0 < h {
             let h1 = (h0 + tiles[1]).min(h);
             let (kh0, khn) = key_range(1, h0, h1);
-            let qth = slice_axis(&qt, 2, h0, h1)?;
-            let kth = slice_axis(&kt, 2, kh0, kh0 + khn)?;
-            let vth = slice_axis(&vt, 2, kh0, kh0 + khn)?;
+            let qth = slice_range(&qt, 2, h0, h1)?;
+            let kth = slice_range(&kt, 2, kh0, kh0 + khn)?;
+            let vth = slice_range(&vt, 2, kh0, kh0 + khn)?;
             let mh = axis_mask(&starts[1], h0, h1, kernels[1], kh0, khn);
 
             let mut w_parts: Vec<Array> = Vec::new();
@@ -983,13 +970,13 @@ pub fn na3d(q: &Array, k: &Array, v: &Array, kernel: [i32; 3]) -> Result<Array> 
                 )?
                 .reshape(&[1, 1, nq, nk])?;
 
-                let qs = contiguous(&slice_axis(&qth, 3, w0, w1)?)?
+                let qs = contiguous(&slice_range(&qth, 3, w0, w1)?)?
                     .reshape(&[b, nq, nh, hd])?
                     .transpose_axes(&[0, 2, 1, 3])?;
-                let ks = contiguous(&slice_axis(&kth, 3, kw0, kw0 + kwn)?)?
+                let ks = contiguous(&slice_range(&kth, 3, kw0, kw0 + kwn)?)?
                     .reshape(&[b, nk, nh, hd])?
                     .transpose_axes(&[0, 2, 1, 3])?;
-                let vs = contiguous(&slice_axis(&vth, 3, kw0, kw0 + kwn)?)?
+                let vs = contiguous(&slice_range(&vth, 3, kw0, kw0 + kwn)?)?
                     .reshape(&[b, nk, nh, hd])?
                     .transpose_axes(&[0, 2, 1, 3])?;
 
@@ -1061,8 +1048,8 @@ fn rotate_axis(x: &Array, inv: &Array, axis: usize) -> Result<Array> {
     let d = *sh.last().expect("rank >= 1");
     let half = d / 2;
     let pairs = contiguous(x)?.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half, 2])?;
-    let xe = slice_axis(&pairs, 6, 0, 1)?.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half])?;
-    let xo = slice_axis(&pairs, 6, 1, 2)?.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half])?;
+    let xe = slice_range(&pairs, 6, 0, 1)?.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half])?;
+    let xo = slice_range(&pairs, 6, 1, 2)?.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half])?;
 
     let len = sh[axis];
     let positions: Vec<f32> = (0..len).map(|i| i as f32).collect();
@@ -1130,7 +1117,7 @@ impl NaAttention {
         let part = |i: i32| -> Result<Linear> {
             Ok(Linear {
                 w: fused_w.slice_out(i * dim, (i + 1) * dim)?,
-                b: contiguous(&slice_axis(&fused_b, 0, i * dim, (i + 1) * dim)?)?,
+                b: contiguous(&slice_range(&fused_b, 0, i * dim, (i + 1) * dim)?)?,
             })
         };
         let split = rope_dim_split(head_dim)?;
@@ -1177,9 +1164,9 @@ impl NaAttention {
     fn rope(&self, x: &Array) -> Result<Array> {
         let [d_t, d_h, _] = self.split;
         let d = self.head_dim;
-        let xt = rotate_axis(&slice_axis(x, 5, 0, d_t)?, &self.inv[0], 1)?;
-        let xh = rotate_axis(&slice_axis(x, 5, d_t, d_t + d_h)?, &self.inv[1], 2)?;
-        let xw = rotate_axis(&slice_axis(x, 5, d_t + d_h, d)?, &self.inv[2], 3)?;
+        let xt = rotate_axis(&slice_range(x, 5, 0, d_t)?, &self.inv[0], 1)?;
+        let xh = rotate_axis(&slice_range(x, 5, d_t, d_t + d_h)?, &self.inv[1], 2)?;
+        let xw = rotate_axis(&slice_range(x, 5, d_t + d_h, d)?, &self.inv[2], 3)?;
         Ok(concatenate_axis(&[&xt, &xh, &xw], 5)?)
     }
 
@@ -1276,7 +1263,7 @@ impl DiffusionBlock {
     fn forward(&self, context: &Array, x: &Array, modulation: &[Array]) -> Result<Array> {
         let chunk = |i: i32| -> Result<Array> {
             let row =
-                slice_axis(&self.scale_shift_table, 0, i, i + 1)?.reshape(&[1, 1, 1, 1, -1])?;
+                slice_range(&self.scale_shift_table, 0, i, i + 1)?.reshape(&[1, 1, 1, 1, -1])?;
             Ok(add(&modulation[i as usize], &row)?)
         };
         let (scale_msa, shift_msa) = (chunk(0)?, chunk(1)?);
@@ -1347,7 +1334,7 @@ impl PixelShuffleUpsample {
         let y = y.transpose_axes(&[0, 1, 5, 2, 6, 3, 7, 4])?;
         let y = contiguous(&y)?.reshape(&[b, t * p1, h * p2, w * p3, c])?;
         if p1 == 2 && drop_leading_frame {
-            return slice_axis(&y, 1, 1, y.shape()[1]);
+            return slice_range(&y, 1, 1, y.shape()[1]);
         }
         Ok(y)
     }
@@ -1774,7 +1761,7 @@ impl NaDiffusionDecoder {
         let h = self.shared_adaln.forward(&silu(&emb)?)?;
         let c5 = self.cfg.stage5_width();
         (0..ADALN_CHUNKS)
-            .map(|i| Ok(slice_axis(&h, 1, i * c5, (i + 1) * c5)?.reshape(&[1, 1, 1, 1, c5])?))
+            .map(|i| Ok(slice_range(&h, 1, i * c5, (i + 1) * c5)?.reshape(&[1, 1, 1, 1, c5])?))
             .collect()
     }
 
@@ -1943,13 +1930,13 @@ impl NaDiffusionDecoder {
         let (x, _) = resize_axis(pixels, 2, frames, false)?;
         let h_before = h_pad.0 * self.cfg.pixel_scale()[1];
         let x = if h_pad.0 + h_pad.1 > 0 {
-            slice_axis(&x, 3, h_before, h_before + height)?
+            slice_range(&x, 3, h_before, h_before + height)?
         } else {
             resize_axis(&x, 3, height, true)?.0
         };
         let w_before = w_pad.0 * self.cfg.pixel_scale()[2];
         let x = if w_pad.0 + w_pad.1 > 0 {
-            slice_axis(&x, 4, w_before, w_before + width)?
+            slice_range(&x, 4, w_before, w_before + width)?
         } else {
             resize_axis(&x, 4, width, true)?.0
         };
@@ -2097,12 +2084,12 @@ impl NaDiffusionDecoder {
             } else {
                 t_s4.end
             };
-            let feature_t = slice_axis(&feature, 1, t_s4.start, t_end)?;
+            let feature_t = slice_range(&feature, 1, t_s4.start, t_end)?;
             for (h_s4, h_px) in &axes[1] {
-                let feature_th = slice_axis(&feature_t, 2, h_s4.start, h_s4.end)?;
+                let feature_th = slice_range(&feature_t, 2, h_s4.start, h_s4.end)?;
                 for (w_s4, w_px) in &axes[2] {
                     let tile_feature =
-                        contiguous(&slice_axis(&feature_th, 3, w_s4.start, w_s4.end)?)?;
+                        contiguous(&slice_range(&feature_th, 3, w_s4.start, w_s4.end)?)?;
                     let content = [
                         t_s4.end - t_s4.start,
                         h_s4.end - h_s4.start,
@@ -2115,9 +2102,9 @@ impl NaDiffusionDecoder {
                     // The tile's slice of the shared canvas, edge-extended to the stage-5 extent
                     // with the same policy the size floor uses — fresh noise would make the halo
                     // inconsistent with its neighbours, which is what the blend relies on.
-                    let mut x_t = slice_axis(&noise_f32, 2, t_px.start, t_px.end)?;
-                    x_t = slice_axis(&x_t, 3, h_px.start, h_px.end)?;
-                    x_t = slice_axis(&x_t, 4, w_px.start, w_px.end)?;
+                    let mut x_t = slice_range(&noise_f32, 2, t_px.start, t_px.end)?;
+                    x_t = slice_range(&x_t, 3, h_px.start, h_px.end)?;
+                    x_t = slice_range(&x_t, 4, w_px.start, w_px.end)?;
                     x_t = resize_axis(&x_t, 2, stage5[0], false)?.0;
                     x_t = resize_axis(&x_t, 3, stage5[1], true)?.0;
                     x_t = resize_axis(&x_t, 4, stage5[2], true)?.0;

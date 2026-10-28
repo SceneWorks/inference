@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+use mlx_gen::testing::max_abs_diff;
 use mlx_gen::{CancelFlag, Progress};
 use mlx_gen_krea_realtime::{
     generate_i2v_latents, generate_latents, generate_latents_conditioned_into,
@@ -197,13 +198,6 @@ fn native_random_map(cfg: &KreaRealtimeConfig) -> HashMap<String, Array> {
         put(&mut map, &format!("{p}.ffn.2.bias"), &[dim], 0.03, 0.0);
     }
     map
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let d = mlx_rs::ops::subtract(a, b).unwrap();
-    mlx_rs::ops::max(mlx_rs::ops::abs(&d).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
 }
 
 /// Load the tiny DiT, wrap it causal, and build a `[text_len, text_dim]` (f32) UMT5-shaped context.

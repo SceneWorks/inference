@@ -284,22 +284,17 @@ struct ConformerBlock {
     final_norm: LayerNorm,
 }
 
-fn rotate_half(x: &Tensor) -> Result<Tensor, Error> {
-    let d = x.dim(D::Minus1)?;
-    let first = x.narrow(D::Minus1, 0, d / 2)?;
-    let second = x.narrow(D::Minus1, d / 2, d / 2)?;
-    Ok(Tensor::cat(&[second.neg()?, first], D::Minus1)?)
-}
-
 impl Attention {
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor, Error> {
         let (b, t, width) = x.dims3()?;
         let head_dim = width / self.heads;
         let shape = (b, t, self.heads, head_dim);
-        let rope = |y: Tensor| -> Result<Tensor, Error> {
-            let y = y.reshape(shape)?;
-            Ok((y.broadcast_mul(cos)? + rotate_half(&y)?.broadcast_mul(sin)?)?)
-        };
+        let rope =
+            |y: Tensor| -> Result<Tensor, Error> {
+                let y = y.reshape(shape)?;
+                Ok((y.broadcast_mul(cos)?
+                    + candle_audio::ops::rotate_half(&y)?.broadcast_mul(sin)?)?)
+            };
         // [b, h, t, d]
         let q = rope(self.q.forward(x)?)?.transpose(1, 2)?.contiguous()?;
         let k = rope(self.k.forward(x)?)?.transpose(1, 2)?.contiguous()?;

@@ -33,11 +33,11 @@
 //! and [`compare_tensor_digests`] compares them with the pinned originals' digests in the manifest.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use candle_audio::candle_core::{self, CpuStorage, Device, Storage};
+use candle_audio::weights::SafetensorsHeaderError;
 use sha2::{Digest, Sha256};
 
 use crate::durable::hex;
@@ -198,6 +198,20 @@ impl SnapshotDirs {
         self
     }
 
+    /// **Test-side provisioning only** (sc-27258): every pinned repository at its pinned-revision
+    /// snapshot inside a caller-supplied hub-layout directory (`<hub>/models--<owner>--<name>/
+    /// snapshots/<revision>`), the shape the real-weight harnesses point `YUE2_HF_HUB` at.
+    /// Production never calls this and never derives a cache location (epic 13657); `hub` is
+    /// always a passed-in path.
+    #[doc(hidden)]
+    pub fn from_hub_layout(hub: &Path) -> Self {
+        crate::inventory::REPOS
+            .iter()
+            .fold(Self::new(), |dirs, repo| {
+                dirs.with(repo.id, hub_layout_snapshot_dir(hub, repo))
+            })
+    }
+
     /// The local snapshot directory for `repo`, or [`AssetError::CacheMiss`] when none was
     /// provisioned or the provisioned directory does not exist.
     pub fn snapshot_dir(&self, repo: &UpstreamRepo) -> Result<PathBuf, AssetError> {
@@ -216,6 +230,15 @@ impl SnapshotDirs {
             Err(miss(dir.clone()))
         }
     }
+}
+
+/// **Test-side provisioning only** (sc-27258): `repo`'s pinned-revision snapshot directory inside
+/// a caller-supplied hub-layout directory. See [`SnapshotDirs::from_hub_layout`].
+#[doc(hidden)]
+pub fn hub_layout_snapshot_dir(hub: &Path, repo: &UpstreamRepo) -> PathBuf {
+    hub.join(format!("models--{}", repo.id.replace('/', "--")))
+        .join("snapshots")
+        .join(repo.revision)
 }
 
 /// One pinned file of a verified component, at the exact path whose bytes were hashed.
@@ -334,32 +357,18 @@ pub fn read_tensor_table(
         file: file.to_string(),
         detail,
     };
-    let io = |source| AssetError::Io {
-        component: key.to_string(),
-        path: path.to_path_buf(),
-        source,
-    };
-    let mut f = File::open(path).map_err(io)?;
-    let file_len = f.metadata().map_err(io)?.len();
-    let mut len = [0u8; 8];
-    f.read_exact(&mut len)
-        .map_err(|e| invalid(format!("cannot read the header length: {e}")))?;
-    let header_len = u64::from_le_bytes(len);
-    if header_len.saturating_add(8) > file_len || header_len > 100 << 20 {
-        return Err(invalid(format!(
-            "header length {header_len} does not fit a {file_len}-byte file"
-        )));
-    }
-    let mut header = vec![0u8; header_len as usize];
-    f.read_exact(&mut header)
-        .map_err(|e| invalid(format!("cannot read the header: {e}")))?;
-    let header: serde_json::Value =
-        serde_json::from_slice(&header).map_err(|e| invalid(format!("header JSON: {e}")))?;
-    let entries = header
-        .as_object()
-        .ok_or_else(|| invalid("header is not a JSON object".into()))?;
+    // The audio lane's one bounded header reader (sc-27343): 100 MB cap, checked against the file
+    // length before anything is allocated.
+    let entries = candle_audio::weights::read_safetensors_header(path).map_err(|e| match e {
+        SafetensorsHeaderError::Io { path, source } => AssetError::Io {
+            component: key.to_string(),
+            path,
+            source,
+        },
+        SafetensorsHeaderError::Invalid { detail, .. } => invalid(detail),
+    })?;
     let mut table = BTreeMap::new();
-    for (name, v) in entries {
+    for (name, v) in &entries {
         if name == "__metadata__" {
             continue;
         }
@@ -654,10 +663,8 @@ pub fn native_tensor_digests(verified: &VerifiedComponent) -> Result<Vec<TensorE
         file: weights.path.to_string(),
         detail,
     };
-    // SAFETY: memory-mapping is sound as long as the file is not mutated while mapped; the file was
-    // just integrity-verified and is only read. Same contract as every Candle weights load.
-    let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(path) }
-        .map_err(|e| native(e.to_string()))?;
+    // The file was just integrity-verified and is only read.
+    let st = candle_audio::weights::mmap_safetensors(path).map_err(|e| native(e.to_string()))?;
     let mut names: Vec<String> = st.tensors().into_iter().map(|(n, _)| n).collect();
     let order: BTreeMap<&str, usize> = verified
         .manifest

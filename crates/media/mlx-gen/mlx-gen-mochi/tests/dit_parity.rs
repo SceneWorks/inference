@@ -10,9 +10,10 @@
 //! Run the real-weight gate:
 //!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test integration dit_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max, mean, subtract};
+use mlx_rs::ops::{abs, mean, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::{peak_rel, require_env_path};
 use mlx_gen::weights::Weights;
 use mlx_gen_mochi::{load_transformer_weights, MochiDitConfig, MochiTransformer3DModel};
 
@@ -20,23 +21,6 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/mochi_dit_golden.safetensors"
 );
-
-fn snapshot_dir() -> std::path::PathBuf {
-    std::env::var("MOCHI_SNAPSHOT")
-        .expect("set MOCHI_SNAPSHOT to the mochi-1-preview snapshot dir")
-        .into()
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
-}
-
-/// `max|got − want| / max|want|` — peak relative error.
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let got = got.as_dtype(Dtype::Float32).unwrap();
-    let want = want.as_dtype(Dtype::Float32).unwrap();
-    max_abs(&subtract(&got, &want).unwrap()) / max_abs(&want).max(1e-12)
-}
 
 /// `mean|got − want| / mean|want|` — mean relative error (the LTX dit_parity companion metric).
 fn mean_rel(got: &Array, want: &Array) -> f32 {
@@ -52,7 +36,7 @@ fn mean_rel(got: &Array, want: &Array) -> f32 {
 #[test]
 #[ignore = "needs $MOCHI_SNAPSHOT (bf16 DiT shards) + tools/golden/mochi_dit_golden.safetensors"]
 fn transformer_forward_matches_golden() {
-    let root = snapshot_dir();
+    let root = require_env_path("MOCHI_SNAPSHOT", "the mochi-1-preview snapshot dir");
     let g = Weights::from_file(GOLDEN).expect("dit golden");
     let cfg = MochiDitConfig::default();
 

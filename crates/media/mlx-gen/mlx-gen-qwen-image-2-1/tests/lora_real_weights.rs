@@ -68,6 +68,7 @@ use mlx_gen::gen_core;
 use mlx_gen::gen_core::weightsmeta::safetensors_file_metadata;
 use mlx_gen::gen_core::Conditioning;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+use mlx_gen::testing::save_png;
 use mlx_gen::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, NetworkType, Quant, Trainer,
     TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
@@ -708,17 +709,6 @@ fn assert_sane(label: &str, img: &Image) {
     );
 }
 
-fn save_png(path: &Path, img: &Image) {
-    image::save_buffer(
-        path,
-        &img.pixels,
-        img.width,
-        img.height,
-        image::ColorType::Rgb8,
-    )
-    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-}
-
 pub(crate) fn write_json(out: &Path, name: &str, value: &Value) {
     let path = out.join(format!("{name}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(value).unwrap()).unwrap();
@@ -946,7 +936,7 @@ pub(crate) fn render(
         (req.width, req.height),
         "{label}"
     );
-    save_png(&out.join(format!("{label}.png")), &image);
+    save_png(&image, out.join(format!("{label}.png")));
     eprintln!(
         "{label}: {seconds:.1}s (load {loaded:.1}s) mlx_peak={:.2} GiB footprint_max={:.2} GiB \
          predicted_overlay={:.2} GiB",
@@ -1640,7 +1630,7 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
     let eval_src = edit_source(99, RENDER_EDGE);
     eval_src.save(out.join("eval_source.png")).unwrap();
     let expected = to_image(edit_transform(&eval_src));
-    save_png(&out.join("eval_expected.png"), &expected);
+    save_png(&expected, out.join("eval_expected.png"));
     let request = GenerationRequest {
         prompt: EDIT_INSTRUCTION.to_owned(),
         width: RENDER_EDGE,

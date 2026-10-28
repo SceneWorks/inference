@@ -3,7 +3,10 @@
 //!
 //! - [`fold_weight_norm`] / [`resolve_weight_norm`] — old-style torch `weight_norm` pairs
 //!   (`X.weight_g` / `X.weight_v`) folded to a plain `X.weight` at load.
-//!   [`fold_weight_norm_dim`] is the same fold for a `weight_norm(dim = d)` other than 0.
+//!   [`fold_weight_norm_dim`] is the same fold for a `weight_norm(dim = d)` other than 0;
+//!   [`fold_weight_norm_gv`] is the `(v·g)/‖v‖` rounding order several ports pin, and
+//!   [`resolve_weight_norm_parametrized`] / [`wn_weight`] also read the
+//!   `parametrizations.weight.original0/1` storage (sc-27269).
 //! - [`rvq_dequantize`] — residual-VQ decode: each quantizer's codebook lookup, summed.
 //! - [`rvq_encode`] — residual-VQ encode: per quantizer, the nearest codeword (Euclidean) of the
 //!   running residual.
@@ -49,21 +52,75 @@ pub fn fold_weight_norm_dim(v: &Tensor, g: &Tensor, dim: usize) -> Result<Tensor
     v.broadcast_mul(&g.broadcast_div(&sq.sqrt()?)?)
 }
 
+/// Fold one weight-norm pair as `w = (v · g) / ‖v‖` — the norm over every dim except 0 taken in a
+/// **single** reduction, the scale applied **before** the divide.
+///
+/// This is the order the Stable Audio 3, ACE-Step and MMAudio/BigVGAN VAEs, the Chatterbox HiFT
+/// vocoder and the MOSS-TTS-Realtime codec were each ported with (candle-transformers'
+/// `encodec::conv1d_weight_norm` order), shared here so those ports keep their exact bits
+/// (sc-27269 / sc-27263). It differs from torch's `_weight_norm` order ([`fold_weight_norm`]) in
+/// the last ULP; moving a port from one to the other changes parity-pinned output and needs that
+/// port's parity rerun.
+pub fn fold_weight_norm_gv(v: &Tensor, g: &Tensor) -> Result<Tensor> {
+    let dims: Vec<usize> = (1..v.rank()).collect();
+    let norm = v.sqr()?.sum_keepdim(dims)?.sqrt()?;
+    v.broadcast_mul(g)?.broadcast_div(&norm)
+}
+
 /// Fold every `X.weight_g` / `X.weight_v` pair in `raw` into `X.weight` ([`fold_weight_norm`]);
 /// every other tensor passes through unchanged. A `weight_g` without its `weight_v` is an error.
 pub fn resolve_weight_norm(raw: HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
+    resolve_pairs(&raw, false, fold_weight_norm)
+}
+
+/// [`resolve_weight_norm`] that also folds the newer `torch.nn.utils.parametrizations` storage
+/// (`X.parametrizations.weight.original0` = `g`, `.original1` = `v`), with a caller-chosen `fold`
+/// ([`fold_weight_norm`] or [`fold_weight_norm_gv`]) so a port keeps its pinned rounding order.
+/// A `g` half without its `v` is an error.
+pub fn resolve_weight_norm_parametrized(
+    raw: &HashMap<String, Tensor>,
+    fold: fn(&Tensor, &Tensor) -> Result<Tensor>,
+) -> Result<HashMap<String, Tensor>> {
+    resolve_pairs(raw, true, fold)
+}
+
+const PARAM_G: &str = ".parametrizations.weight.original0";
+const PARAM_V: &str = ".parametrizations.weight.original1";
+
+fn resolve_pairs(
+    raw: &HashMap<String, Tensor>,
+    parametrizations: bool,
+    fold: fn(&Tensor, &Tensor) -> Result<Tensor>,
+) -> Result<HashMap<String, Tensor>> {
     let mut out = HashMap::with_capacity(raw.len());
-    for (name, tensor) in &raw {
+    for (name, tensor) in raw {
         if let Some(base) = name.strip_suffix(".weight_g") {
             let v = raw.get(&format!("{base}.weight_v")).ok_or_else(|| {
                 candle_core::Error::Msg(format!("{base}.weight_g without {base}.weight_v"))
             })?;
-            out.insert(format!("{base}.weight"), fold_weight_norm(v, tensor)?);
-        } else if !name.ends_with(".weight_v") {
+            out.insert(format!("{base}.weight"), fold(v, tensor)?);
+        } else if let Some(base) = name.strip_suffix(PARAM_G).filter(|_| parametrizations) {
+            let v = raw.get(&format!("{base}{PARAM_V}")).ok_or_else(|| {
+                candle_core::Error::Msg(format!("{base}{PARAM_G} without {base}{PARAM_V}"))
+            })?;
+            out.insert(format!("{base}.weight"), fold(v, tensor)?);
+        } else if name.ends_with(".weight_v") || (parametrizations && name.ends_with(PARAM_V)) {
+            // Consumed alongside its `g` partner above.
+        } else {
             out.insert(name.clone(), tensor.clone());
         }
     }
     Ok(out)
+}
+
+/// Load a weight-normed `[d0, d1, k]` weight from a [`candle_nn::VarBuilder`] holding
+/// `parametrizations.weight.original0` (`g`, `[d0, 1, 1]`) and `original1` (`v`, `[d0, d1, k]`),
+/// folded with [`fold_weight_norm_gv`] (the order its users were ported with). `d0` is `out` for a
+/// `Conv1d` and `in` for a `ConvTranspose1d`.
+pub fn wn_weight(vb: &candle_nn::VarBuilder, d0: usize, d1: usize, k: usize) -> Result<Tensor> {
+    let g = vb.get((d0, 1, 1), "parametrizations.weight.original0")?;
+    let v = vb.get((d0, d1, k), "parametrizations.weight.original1")?;
+    fold_weight_norm_gv(&v, &g)
 }
 
 /// Residual-VQ dequantization: `Σ_q codebooks[q][codes[q]]` as `[1, dim, T]`.
@@ -436,6 +493,46 @@ impl DacDecoder {
 mod tests {
     use super::*;
     use candle_core::DType;
+
+    /// sc-27269: the `(v·g)/‖v‖` order and the parametrized resolver. `resolve_weight_norm` keeps
+    /// passing `parametrizations.*` tensors through untouched (its callers' contract).
+    #[test]
+    fn gv_fold_and_parametrized_resolution() {
+        let dev = Device::Cpu;
+        let v = Tensor::new(&[[[3f32], [4.]], [[0.], [2.]]], &dev).unwrap();
+        let g = Tensor::new(&[[[10f32]], [[3.]]], &dev).unwrap();
+        let w = fold_weight_norm_gv(&v, &g).unwrap();
+        assert_eq!(
+            w.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            [6., 8., 0., 3.]
+        );
+        let mut raw = HashMap::new();
+        raw.insert("a.weight_g".to_string(), g.clone());
+        raw.insert("a.weight_v".to_string(), v.clone());
+        raw.insert("b.parametrizations.weight.original0".to_string(), g.clone());
+        raw.insert("b.parametrizations.weight.original1".to_string(), v.clone());
+        raw.insert(
+            "b.bias".to_string(),
+            Tensor::zeros(2, DType::F32, &dev).unwrap(),
+        );
+        let out = resolve_weight_norm_parametrized(&raw, fold_weight_norm_gv).unwrap();
+        let mut keys: Vec<_> = out.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["a.weight", "b.bias", "b.weight"]);
+        assert_eq!(
+            out["b.weight"]
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            [6., 8., 0., 3.]
+        );
+        let plain = resolve_weight_norm(raw.clone()).unwrap();
+        assert!(plain.contains_key("b.parametrizations.weight.original0"));
+        assert!(!plain.contains_key("b.weight"));
+        raw.remove("b.parametrizations.weight.original1");
+        assert!(resolve_weight_norm_parametrized(&raw, fold_weight_norm).is_err());
+    }
 
     #[test]
     fn weight_norm_fold_matches_the_closed_form() {

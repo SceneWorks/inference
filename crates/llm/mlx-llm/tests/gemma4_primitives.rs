@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use mlx_rs::{Array, Dtype};
 use serde_json::{json, Value};
 
-use mlx_llm::config::{LayerAttentionType, ModelConfig, RopeType};
+use mlx_llm::config::{LayerAttentionType, LayerRope, ModelConfig, RopeType};
 use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::nn::{linear, rms_norm, rms_norm_unscaled};
 use mlx_llm::primitives::projection::{KvProjection, Projection};

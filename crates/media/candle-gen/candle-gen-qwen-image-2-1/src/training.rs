@@ -91,7 +91,7 @@ use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress,
-    TrainingRequest,
+    TrainingReport, TrainingRequest,
 };
 use candle_gen::gen_core::{
     self, BucketSchedule, CancelFlag, Image, LoadSpec, Modality, NetworkType, Precision, Progress,
@@ -2076,11 +2076,24 @@ impl Trainer for QwenImage21Trainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -2090,6 +2103,7 @@ impl QwenImage21Trainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         // Edit mode is a different training input, so its floor is re-checked here rather than
         // trusted to a prior `validate` call.
@@ -2529,11 +2543,18 @@ impl QwenImage21Trainer {
                             image,
                         }),
                         Err(Error::Canceled) => break,
-                        Err(e) => eprintln!(
-                            "[sc-24160] {LABEL}: preview sample failed at step {step} (prompt {}): \
-                             {e} — skipping this preview, training continues",
-                            i + 1
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[sc-24160] {LABEL}: preview sample failed at step {step} (prompt \
+                                 {}): {e} — skipping this preview, training continues",
+                                i + 1
+                            );
+                            warnings.push(gen_core::train::preview_sample_failed(
+                                step,
+                                i as u32 + 1,
+                                &e,
+                            ));
+                        }
                     }
                 }
                 set_frozen(&mut dit, false)?;
@@ -3725,7 +3746,11 @@ mod tests {
         req.output_dir = out.path().to_path_buf();
         let mut events = Vec::new();
         let err = t
-            .train_impl(&req, &mut |p| events.push(format!("{p:?}")))
+            .train_impl(
+                &req,
+                &mut |p| events.push(format!("{p:?}")),
+                &mut Vec::new(),
+            )
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds"), "{err}");
@@ -5082,7 +5107,11 @@ mod tests {
         req.output_dir = out.path().to_path_buf();
         let mut events = Vec::new();
         let err = t
-            .train_impl(&req, &mut |p| events.push(format!("{p:?}")))
+            .train_impl(
+                &req,
+                &mut |p| events.push(format!("{p:?}")),
+                &mut Vec::new(),
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
         assert!(
@@ -6193,7 +6222,11 @@ mod tests {
             cfg.depth_anchoring.model_size = DepthModelSize::Large;
             let mut events = Vec::new();
             let err = t
-                .train_impl(&req_with(cfg), &mut |p| events.push(format!("{p:?}")))
+                .train_impl(
+                    &req_with(cfg),
+                    &mut |p| events.push(format!("{p:?}")),
+                    &mut Vec::new(),
+                )
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -6207,7 +6240,7 @@ mod tests {
                 "{events:?}"
             );
             let off = t
-                .train_impl(&req_with(base_config()), &mut |_| {})
+                .train_impl(&req_with(base_config()), &mut |_| {}, &mut Vec::new())
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -6234,7 +6267,11 @@ mod tests {
             cfg.perceptual_decoder_dir = Some(tmp.path().join("no-taeqi"));
             let mut events = Vec::new();
             let e = trainer()
-                .train_impl(&req_with(cfg), &mut |p| events.push(format!("{p:?}")))
+                .train_impl(
+                    &req_with(cfg),
+                    &mut |p| events.push(format!("{p:?}")),
+                    &mut Vec::new(),
+                )
                 .unwrap_err()
                 .to_string();
             assert!(e.contains("TAEQI2.1"), "{e}");

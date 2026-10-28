@@ -4,6 +4,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -20,35 +21,20 @@ use candle_audio_stable_audio_3::config::DiffusionObjective;
 use candle_audio_stable_audio_3::dit::{Guidance, StableAudio3Dit};
 use candle_audio_stable_audio_3::sampler::{
     adapt_sample_size_for_max, build_schedule, effective_schedule_lengths, initialize_latents,
-    padding_mask, resource_estimate, sample, sample_dit, sample_initialized, sample_with_callback,
-    sample_with_host_timestep, validate_guidance, DistributionShift, GuidanceInterval,
-    InjectedNoise, NoiseSource, SamplerKind, Schedule, SeededNoise,
+    padding_mask, resource_estimate, sample, sample_dit, sample_initialized,
+    sample_with_host_timestep, validate_guidance, DistributionShift, DitConditioning,
+    GuidanceInterval, InitMix, InjectedNoise, NoiseSource, SampleDitArgs, SampleOptions,
+    SamplerKind, Schedule, SeededNoise,
 };
 use candle_audio_stable_audio_3::weights::SnapshotLayout;
-use candle_nn::VarBuilder;
 
-/// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
-/// `chunked_oracle.rs`.
-///
-/// The three real-weight cases below each branched on `SA3_TEST_METAL` alone, so on the CUDA lanes
-/// — which set `SA3_TEST_CUDA` — they silently executed on `Device::Cpu`. A requested backend that
-/// is unavailable is a hard failure, never a fallback.
-fn test_device() -> Device {
-    if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
-        #[cfg(feature = "cuda")]
-        {
-            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            panic!("SA3_TEST_CUDA requires --features cuda")
-        }
-    } else {
-        Device::Cpu
-    }
-}
+// The crate's three-way real-weight device selector, identical to `same_oracle.rs` and
+// `chunked_oracle.rs`.
+//
+// The three real-weight cases below each branched on `SA3_TEST_METAL` alone, so on the CUDA lanes
+// — which set `SA3_TEST_CUDA` — they silently executed on `Device::Cpu`. A requested backend that
+// is unavailable is a hard failure, never a fallback.
+use common::test_device;
 
 fn values(tensor: &Tensor) -> Vec<f32> {
     tensor
@@ -98,9 +84,11 @@ fn frozen_torch_euler_dpmpp_and_scalar_rk4_match_every_step() {
             kind,
             &initial,
             &Schedule::Shared(schedule.clone()),
-            None,
+            SampleOptions {
+                record_trajectory: true,
+                ..SampleOptions::default()
+            },
             &mut unused_noise,
-            true,
             |x, t| Ok((((x * 0.25)? + (t.unsqueeze(1)?.unsqueeze(2)? * 0.5)?)? - 0.125)?),
         )
         .unwrap();
@@ -358,12 +346,16 @@ fn init_mix_bounds_shapes_and_zero_short_circuit_are_explicit() {
     let output = sample_initialized(
         SamplerKind::Euler,
         &noise,
-        Some(&init),
-        0.0,
+        InitMix {
+            init_latents: Some(&init),
+            strength: 0.0,
+        },
         &Schedule::Shared(vec![0.0, 0.0]),
-        None,
+        SampleOptions {
+            record_trajectory: true,
+            ..SampleOptions::default()
+        },
         &mut zero_noise,
-        true,
         move |x, _| {
             *observed.borrow_mut() += 1;
             Ok(x.clone())
@@ -377,12 +369,13 @@ fn init_mix_bounds_shapes_and_zero_short_circuit_are_explicit() {
     assert!(sample_initialized(
         SamplerKind::Euler,
         &noise,
-        Some(&init),
-        0.5,
+        InitMix {
+            init_latents: Some(&init),
+            strength: 0.5,
+        },
         &Schedule::Shared(vec![1.0, 0.0]),
-        None,
+        SampleOptions::default(),
         &mut mismatched_noise,
-        false,
         |x, _| Ok(x.clone()),
     )
     .is_err());
@@ -409,14 +402,15 @@ fn live_callback_is_pre_update_and_error_cancels_before_mutation() {
             Ok(())
         }
     };
-    let result = sample_with_callback(
+    let result = sample(
         SamplerKind::Euler,
         &initial,
         &schedule,
-        None,
+        SampleOptions {
+            callback: Some(&mut callback),
+            ..SampleOptions::default()
+        },
         &mut no_noise(),
-        false,
-        Some(&mut callback),
         move |x, _| {
             *model_calls.borrow_mut() += 1;
             Ok(x.clone())
@@ -501,10 +495,8 @@ fn rk4_host_timestep_surface_covers_every_stage_and_terminal_clamp() {
         SamplerKind::Rk4,
         &initial,
         &schedule,
-        None,
+        SampleOptions::default(),
         &mut no_noise(),
-        false,
-        None,
         move |x, _, host_timestep| {
             captured.borrow_mut().push(host_timestep.to_vec());
             Tensor::zeros_like(x).map_err(Into::into)
@@ -540,9 +532,8 @@ fn nonzero_per_example_euler_dpmpp_and_pingpong_are_locked() {
             kind,
             &initial,
             &schedule,
-            None,
+            SampleOptions::default(),
             &mut no_noise(),
-            false,
             field,
         )
         .unwrap();
@@ -557,9 +548,8 @@ fn nonzero_per_example_euler_dpmpp_and_pingpong_are_locked() {
         SamplerKind::Pingpong,
         &initial,
         &schedule,
-        None,
+        SampleOptions::default(),
         &mut InjectedNoise::new(draws),
-        false,
         field,
     )
     .unwrap();
@@ -578,9 +568,12 @@ fn euler_sign_callbacks_and_mask_shape_are_exact() {
         SamplerKind::Euler,
         &initial,
         &schedule,
-        Some(&mask),
+        SampleOptions {
+            padding_mask: Some(&mask),
+            record_trajectory: true,
+            ..SampleOptions::default()
+        },
         &mut noise,
-        true,
         |x, _| Ok((x * 2f64)?),
     )
     .unwrap();
@@ -603,9 +596,11 @@ fn corrected_rk4_supports_per_example_schedule_and_terminal_clamp() {
         SamplerKind::Rk4,
         &initial,
         &schedule,
-        None,
+        SampleOptions {
+            record_trajectory: true,
+            ..SampleOptions::default()
+        },
         &mut noise,
-        true,
         move |x, t| {
             capture.borrow_mut().push(values(t));
             Ok(x.clone()) // dx/dt=x; each element has its own dt.
@@ -656,9 +651,11 @@ fn rf_dpmpp_zero_velocity_is_identity_for_shared_and_batched_schedules() {
             SamplerKind::Dpmpp,
             &initial,
             &schedule,
-            None,
+            SampleOptions {
+                record_trajectory: true,
+                ..SampleOptions::default()
+            },
             &mut noise,
-            true,
             |x, _| Tensor::zeros_like(x).map_err(Into::into),
         )
         .unwrap();
@@ -681,9 +678,11 @@ fn pingpong_consumes_terminal_draw_and_seeded_requests_are_reproducible() {
         SamplerKind::Pingpong,
         &initial,
         &schedule,
-        None,
+        SampleOptions {
+            record_trajectory: true,
+            ..SampleOptions::default()
+        },
         &mut injected,
-        true,
         |x, _| Tensor::zeros_like(x).map_err(Into::into),
     )
     .unwrap();
@@ -698,9 +697,8 @@ fn pingpong_consumes_terminal_draw_and_seeded_requests_are_reproducible() {
             SamplerKind::Pingpong,
             &request_initial,
             &schedule,
-            None,
+            SampleOptions::default(),
             &mut seeded,
-            false,
             |x, _| Tensor::zeros_like(x).map_err(Into::into),
         )
         .unwrap();
@@ -738,9 +736,8 @@ fn truthful_defaults_and_fail_closed_objective_are_locked() {
             SamplerKind::Euler,
             &initial,
             &invalid,
-            None,
+            SampleOptions::default(),
             &mut no_noise(),
-            false,
             |x, _| Tensor::zeros_like(x).map_err(Into::into),
         )
         .is_err());
@@ -838,11 +835,7 @@ const REAL_CASES: &[RealCase] = &[
     },
 ];
 
-fn snapshot(name: &str) -> PathBuf {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("{name} must point to its pinned immutable snapshot"))
-}
+use common::snapshot_dir as snapshot;
 
 fn cosine(actual: &Tensor, expected: &Tensor) -> f64 {
     let actual = values(actual);
@@ -898,9 +891,7 @@ fn all_six_real_p0_pingpong_trajectories_match_stepwise() {
         let artifact = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../docs/migration/sa3-reference")
             .join(case.artifact);
-        let oracle = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[artifact], DType::F32, &device).unwrap()
-        };
+        let oracle = common::mmap_f32(&[artifact], &device);
         let get = |name: &str| oracle.get_unchecked(name).unwrap();
         let initial = get("sampler_initial_noise");
         let prompt = get("t5_projected_padded");
@@ -925,18 +916,25 @@ fn all_six_real_p0_pingpong_trajectories_match_stepwise() {
         let mut injected = InjectedNoise::new(draws);
         let output = sample_dit(
             &model,
-            SamplerKind::Pingpong,
+            SampleDitArgs {
+                record_trajectory: true,
+                ..SampleDitArgs::new(
+                    SamplerKind::Pingpong,
+                    &schedule,
+                    DitConditioning {
+                        positive_prompt: &prompt,
+                        negative_prompt: None,
+                        negative_prompt_mask: None,
+                        seconds_total: &seconds,
+                        local_conditioning: &local,
+                        padding: None,
+                    },
+                    Guidance::default(),
+                )
+            },
             &initial,
-            &schedule,
-            &prompt,
-            None,
-            None,
-            &seconds,
-            &local,
-            None,
-            Guidance::default(),
             &mut injected,
-            true,
+            None,
         )
         .unwrap();
         assert_eq!(output.model_calls, 8, "{}", case.env);
@@ -985,9 +983,7 @@ fn real_sampler_cfg_apg_scale_phi_matches_frozen_upstream() {
     let device = test_device();
     let guidance_artifact = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../docs/migration/sa3-sampler-reference/guidance.safetensors");
-    let guidance_oracle = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[guidance_artifact], DType::F32, &device).unwrap()
-    };
+    let guidance_oracle = common::mmap_f32(&[guidance_artifact], &device);
     for (case, oracle_prefix) in [
         (&REAL_CASES[0], "small-music"),
         (&REAL_CASES[2], "small-music-base"),
@@ -997,9 +993,7 @@ fn real_sampler_cfg_apg_scale_phi_matches_frozen_upstream() {
         let p0_artifact = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../docs/migration/sa3-reference")
             .join(case.artifact);
-        let oracle = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[p0_artifact], DType::F32, &device).unwrap()
-        };
+        let oracle = common::mmap_f32(&[p0_artifact], &device);
         let initial = oracle.get_unchecked("sampler_initial_noise").unwrap();
         let prompt = oracle.get_unchecked("t5_projected_padded").unwrap();
         let seconds = Tensor::from_vec(vec![0.25f32], 1, &device).unwrap();
@@ -1038,18 +1032,22 @@ fn real_sampler_cfg_apg_scale_phi_matches_frozen_upstream() {
             let mut unused_noise = no_noise();
             let output = sample_dit(
                 &model,
-                SamplerKind::Euler,
+                SampleDitArgs::new(
+                    SamplerKind::Euler,
+                    &schedule,
+                    DitConditioning {
+                        positive_prompt: &prompt,
+                        negative_prompt: None,
+                        negative_prompt_mask: None,
+                        seconds_total: &seconds,
+                        local_conditioning: &local,
+                        padding: Some(&mask),
+                    },
+                    guidance,
+                ),
                 &initial,
-                &schedule,
-                &prompt,
-                None,
-                None,
-                &seconds,
-                &local,
-                Some(&mask),
-                guidance,
                 &mut unused_noise,
-                false,
+                None,
             )
             .unwrap();
             assert_eq!(output.model_calls, 1);
@@ -1110,8 +1108,7 @@ fn real_default_sampler_resource_probe() {
     )
     .unwrap();
     let model = StableAudio3Dit::from_layout(&layout, &device).unwrap();
-    let p0 =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[p0_path], DType::F32, &device).unwrap() };
+    let p0 = common::mmap_f32(&[p0_path], &device);
     let prompt = p0.get_unchecked("t5_projected_padded").unwrap();
     let initial = Tensor::zeros((1, 256, geometry.latent_length), DType::F32, &device).unwrap();
     let local = Tensor::zeros((1, 257, geometry.latent_length), DType::F32, &device).unwrap();
@@ -1121,18 +1118,22 @@ fn real_default_sampler_resource_probe() {
     let started = Instant::now();
     let output = sample_dit(
         &model,
-        kind,
+        SampleDitArgs::new(
+            kind,
+            &schedule,
+            DitConditioning {
+                positive_prompt: &prompt,
+                negative_prompt: None,
+                negative_prompt_mask: None,
+                seconds_total: &seconds,
+                local_conditioning: &local,
+                padding: Some(&mask),
+            },
+            Guidance::default(),
+        ),
         &initial,
-        &schedule,
-        &prompt,
-        None,
-        None,
-        &seconds,
-        &local,
-        Some(&mask),
-        Guidance::default(),
         &mut noise,
-        false,
+        None,
     )
     .unwrap();
     let checksum = output

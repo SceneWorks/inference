@@ -337,10 +337,8 @@ impl CodecConfig {
 /// direction `v` (`[out, in, 1]`); the effective weight is `w = g · v / ‖v‖` with the norm over the
 /// non-output dims (the `weight_norm(dim=0)` default). Returned as a plain `Conv1d`.
 fn wn_conv1d(out_ch: usize, in_ch: usize, vb: &VarBuilder) -> CandleResult<Conv1d> {
-    let g = vb.get((out_ch, 1, 1), "parametrizations.weight.original0")?;
-    let v = vb.get((out_ch, in_ch, 1), "parametrizations.weight.original1")?;
-    let norm = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
-    let w = v.broadcast_mul(&g)?.broadcast_div(&norm)?;
+    // The shared parametrization fold (sc-27269), bit-identical to this port's former copy.
+    let w = candle_audio::neural_codec::wn_weight(vb, out_ch, in_ch, 1)?;
     let bias = vb.get(out_ch, "bias")?;
     Ok(Conv1d::new(w, Some(bias), Conv1dConfig::default()))
 }
@@ -1080,14 +1078,12 @@ impl MossAudioCodec {
         }
         let device = candle_audio::default_device()?;
         let shards = safetensors_shards(dir)?;
-        // SAFETY: mmap of provider-resolved, pinned-SHA safetensors; F32 checkpoint (config dtype
-        // float32) loaded as F32. Only the decoder + quantizer tensors are touched (the encoder half
-        // is never requested, so its pages stay unfaulted).
-        let vb = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device).map_err(
-                |e| AudioError::Msg(format!("codec: mmap safetensors in {}: {e}", dir.display())),
-            )?
-        };
+        // F32 checkpoint (config dtype float32) loaded as F32. Only the decoder + quantizer tensors
+        // are touched (the encoder half is never requested, so its pages stay unfaulted).
+        let vb =
+            candle_audio::weights::mmap_var_builder(&shards, DType::F32, &device).map_err(|e| {
+                AudioError::Msg(format!("codec: mmap safetensors in {}: {e}", dir.display()))
+            })?;
         Self::from_var_builder(config, num_code_quantizers, shards, vb, device)
     }
 
@@ -1379,10 +1375,8 @@ impl MossAudioCodec {
         if let Some(e) = self.encoder.get() {
             return Ok(e);
         }
-        // SAFETY: same idiom as `load` — mmap of the provider-resolved, pinned safetensors as F32.
-        let vb = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(&self.shards, DType::F32, &self.device)?
-        };
+        // Same mapping as `load`: the provider-resolved safetensors as F32.
+        let vb = candle_audio::weights::mmap_var_builder(&self.shards, DType::F32, &self.device)?;
         let built = EncoderHalf::load(&self.config, self.num_code_quantizers, &vb)?;
         Ok(self.encoder.get_or_init(|| built))
     }

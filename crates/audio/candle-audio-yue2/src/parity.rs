@@ -535,15 +535,7 @@ fn hub_dirs() -> crate::SnapshotDirs {
             "real-weight test run without YUE2_HF_HUB (a hub directory holding the pinned repos)"
         )
     }));
-    crate::inventory::REPOS
-        .iter()
-        .fold(crate::SnapshotDirs::new(), |dirs, repo| {
-            let dir = hub
-                .join(format!("models--{}", repo.id.replace('/', "--")))
-                .join("snapshots")
-                .join(repo.revision);
-            dirs.with(repo.id, dir)
-        })
+    crate::SnapshotDirs::from_hub_layout(&hub)
 }
 
 fn opt_u32s(v: &Value) -> Option<Vec<u32>> {

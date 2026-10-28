@@ -64,7 +64,9 @@ pub use candle_audio;
 pub use candle_audio::gen_core;
 
 pub mod backbone;
-pub mod blocks;
+/// The shared Qwen3 decoder blocks, re-exported from [`candle_audio::qwen3`] (sc-27270) so the
+/// `blocks::…` paths stay stable.
+pub use candle_audio::qwen3 as blocks;
 pub mod chunk;
 pub mod codec;
 pub mod config;

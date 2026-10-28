@@ -9,7 +9,7 @@
 //! approximately.
 
 use super::*;
-use mlx_rs::ops::{abs, max as max_op, softmax_axes, sum_axes};
+use mlx_rs::ops::{abs, softmax_axes, sum_axes};
 use std::collections::HashMap;
 
 /// The released `vae` block, verbatim from `vae/ltx-2.5-video-vae-bf16.safetensors`
@@ -41,10 +41,6 @@ const RELEASED_VAE: &str = r#"{
 fn released() -> NaDiffusionDecoderConfig {
     NaDiffusionDecoderConfig::from_embedded_vae(&serde_json::from_str(RELEASED_VAE).unwrap())
         .expect("the released vae block must parse")
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max_op(abs(a).unwrap(), None).unwrap().item::<f32>()
 }
 
 fn mean_abs(a: &Array) -> f32 {
@@ -1174,7 +1170,7 @@ fn a_tiled_interior_matches_the_untiled_decode() {
         interior > 4 * per_cell,
         "the test needs a real interior, got {interior}"
     );
-    let cut = |x: &Array| slice_axis(x, 4, 0, interior).unwrap();
+    let cut = |x: &Array| slice_range(x, 4, 0, interior).unwrap();
     let delta = max_abs(&subtract(cut(&tiled), cut(&untiled)).unwrap());
     assert!(
         delta < 1e-4,
@@ -1406,7 +1402,7 @@ fn the_pixel_shuffle_upsample_drops_the_duplicate_frame_only_at_the_origin() {
     assert_eq!(up.forward(&x, false).unwrap().shape(), &[1, 6, 4, 4, 4]);
     // The kept frames are the same ones; only the leading duplicate differs.
     let dropped = up.forward(&x, true).unwrap();
-    let kept = slice_axis(&up.forward(&x, false).unwrap(), 1, 1, 6).unwrap();
+    let kept = slice_range(&up.forward(&x, false).unwrap(), 1, 1, 6).unwrap();
     assert_eq!(max_abs(&subtract(&dropped, &kept).unwrap()), 0.0);
 
     // A spatial-only hop never drops anything.
@@ -1450,8 +1446,8 @@ fn keys_outside_the_window_contribute_nothing() {
     }
     let v = Array::from_slice(&v, &shape);
     let out = na3d(&q, &k, &v, kernel).unwrap();
-    let corner = slice_axis(
-        &slice_axis(&slice_axis(&out, 1, 0, 1).unwrap(), 2, 0, 1).unwrap(),
+    let corner = slice_range(
+        &slice_range(&slice_range(&out, 1, 0, 1).unwrap(), 2, 0, 1).unwrap(),
         3,
         0,
         1,
@@ -1464,8 +1460,8 @@ fn keys_outside_the_window_contribute_nothing() {
     );
     // Sanity: a query whose window does reach the loaded region must see it, or the test above
     // would pass on an all-zero output.
-    let far = slice_axis(
-        &slice_axis(&slice_axis(&out, 1, 3, 4).unwrap(), 2, 3, 4).unwrap(),
+    let far = slice_range(
+        &slice_range(&slice_range(&out, 1, 3, 4).unwrap(), 2, 3, 4).unwrap(),
         3,
         3,
         4,
@@ -1487,6 +1483,7 @@ use super::budget::{
     estimated_diffvae_decode_peak_bytes, plan_diffvae_tiling, DecodeGeometry, DecodePlan,
     DiffVaeMode, HostNaSupport, NaKind, ResolvedDiffVaeMode,
 };
+use mlx_gen::testing::max_abs;
 
 /// The resolved mode every plan on this host runs under.
 fn eager() -> ResolvedDiffVaeMode {

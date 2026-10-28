@@ -516,80 +516,49 @@ impl StableAudio3Dit {
     }
 
     /// Upstream classifier-free guidance with optional APG and channel-wise rescale.
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_guided(
         &self,
         latents: &Tensor,
         timestep: &Tensor,
-        positive_prompt: &Tensor,
-        negative_prompt: Option<&Tensor>,
-        negative_prompt_mask: Option<&Tensor>,
-        seconds_total: &Tensor,
-        local_conditioning: &Tensor,
-        padding_mask: Option<&Tensor>,
+        conditioning: &DitConditioning<'_>,
         guidance: Guidance,
     ) -> Result<Tensor> {
-        self.forward_guided_impl(
-            latents,
-            timestep,
-            positive_prompt,
-            negative_prompt,
-            negative_prompt_mask,
-            seconds_total,
-            local_conditioning,
-            padding_mask,
-            guidance,
-            None,
-        )
+        self.forward_guided_impl(latents, timestep, conditioning, guidance, None)
     }
 
     /// Guided forward with cooperative cancellation before every transformer block.
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_guided_with_cancel(
         &self,
         latents: &Tensor,
         timestep: &Tensor,
-        positive_prompt: &Tensor,
-        negative_prompt: Option<&Tensor>,
-        negative_prompt_mask: Option<&Tensor>,
-        seconds_total: &Tensor,
-        local_conditioning: &Tensor,
-        padding_mask: Option<&Tensor>,
+        conditioning: &DitConditioning<'_>,
         guidance: Guidance,
         is_canceled: &dyn Fn() -> bool,
     ) -> candle_audio::Result<Tensor> {
-        match self.forward_guided_impl(
-            latents,
-            timestep,
-            positive_prompt,
-            negative_prompt,
-            negative_prompt_mask,
-            seconds_total,
-            local_conditioning,
-            padding_mask,
-            guidance,
-            Some(is_canceled),
-        ) {
+        match self.forward_guided_impl(latents, timestep, conditioning, guidance, Some(is_canceled))
+        {
             Err(_) if is_canceled() => Err(candle_audio::AudioError::Canceled),
             Err(error) => Err(error.into()),
             Ok(output) => Ok(output),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn forward_guided_impl(
         &self,
         latents: &Tensor,
         timestep: &Tensor,
-        positive_prompt: &Tensor,
-        negative_prompt: Option<&Tensor>,
-        negative_prompt_mask: Option<&Tensor>,
-        seconds_total: &Tensor,
-        local_conditioning: &Tensor,
-        padding_mask: Option<&Tensor>,
+        conditioning: &DitConditioning<'_>,
         guidance: Guidance,
         is_canceled: Option<&dyn Fn() -> bool>,
     ) -> Result<Tensor> {
+        let &DitConditioning {
+            positive_prompt,
+            negative_prompt,
+            negative_prompt_mask,
+            seconds_total,
+            local_conditioning,
+            padding: padding_mask,
+        } = conditioning;
         if guidance.cfg_scale == 1.0 {
             return self.forward_impl(
                 DitInputs {
@@ -653,6 +622,19 @@ impl StableAudio3Dit {
     }
 }
 
+/// The conditioning tensors every guided DiT forward takes (and a sampling run feeds each step) —
+/// one argument instead of six threaded parameters (sc-27262).
+#[derive(Clone, Copy)]
+pub struct DitConditioning<'a> {
+    pub positive_prompt: &'a Tensor,
+    pub negative_prompt: Option<&'a Tensor>,
+    pub negative_prompt_mask: Option<&'a Tensor>,
+    pub seconds_total: &'a Tensor,
+    pub local_conditioning: &'a Tensor,
+    /// The `[batch, time]` latent padding mask.
+    pub padding: Option<&'a Tensor>,
+}
+
 /// Decompose `value` into components parallel and orthogonal to `reference`.
 pub fn apg_project(
     value: &Tensor,
@@ -702,7 +684,6 @@ pub fn apg_project(
     Ok((parallel.to_dtype(original)?, orthogonal.to_dtype(original)?))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn guided_prediction(
     objective: DiffusionObjective,
     latents: &Tensor,

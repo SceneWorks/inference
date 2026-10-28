@@ -948,6 +948,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     model: &T,
     req: &TrainingRequest,
     on_progress: &mut dyn FnMut(TrainingProgress),
+    warnings: &mut Vec<crate::gen_core::GenerationWarning>,
 ) -> Result<TrainingOutput> {
     let cfg = &req.config;
     let device = model.device();
@@ -1113,12 +1114,19 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                                 prompt: prompt.clone(),
                                 image,
                             }),
-                            Err(e) => eprintln!(
-                                "[sc-8650] {}: preview sample failed at step {step} (prompt {}): {e} \
-                                 — skipping this preview, training continues",
-                                T::LABEL,
-                                index + 1
-                            ),
+                            Err(e) => {
+                                eprintln!(
+                                    "[sc-8650] {}: preview sample failed at step {step} (prompt \
+                                     {}): {e} — skipping this preview, training continues",
+                                    T::LABEL,
+                                    index + 1
+                                );
+                                warnings.push(crate::gen_core::train::preview_sample_failed(
+                                    step,
+                                    index as u32 + 1,
+                                    &e,
+                                ));
+                            }
                         }
                     }
                 }
@@ -1755,7 +1763,7 @@ mod tests {
         };
         let model = recording(3);
         let (_fixture, req) = mock_request(3, 7, 1, 0, CancelFlag::new());
-        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
         assert_eq!(*model.seen.borrow(), vec![0, 1, 2, 0, 1, 2, 0]);
 
         // 2 items × 2 buckets (repeats 3 and 1) = 4 entries; one epoch = 2 · (3 + 1) = 8 steps.
@@ -1771,7 +1779,7 @@ mod tests {
                 repeats: 1,
             },
         ];
-        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
         let mut counts = [0u32; 4];
         for &i in model.seen.borrow().iter() {
             counts[i] += 1;
@@ -1915,7 +1923,7 @@ mod tests {
                 repeats: 1,
             },
         ];
-        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
         assert_eq!(model.references.get(), 4);
         let seen = model.seen.borrow();
         assert_eq!(seen.len(), 16);
@@ -2110,7 +2118,7 @@ mod tests {
         // the final adapter — the handles most likely to outlive the run.
         let (fixture, req) = mock_request(2, 5, 1, 2, CancelFlag::new());
         let dir = req.output_dir.clone();
-        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
         drop(req);
         drop(fixture);
         assert!(
@@ -2131,7 +2139,7 @@ mod tests {
             cache_len: 3,
         };
         let (_fixture, req) = mock_request(3, 5, 1, 0, CancelFlag::new());
-        let out = run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        let out = run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
         assert_eq!(out.steps, 5);
         assert_eq!(model.steps_seen.get(), 5);
         assert_eq!(model.saves.get(), 1, "only the final save");
@@ -2150,7 +2158,7 @@ mod tests {
         };
         // steps 1..=6, save_every 2 → checkpoints at 2 and 4 (6 is the final step, excluded) + 1 final.
         let (_fixture, req) = mock_request(2, 6, 1, 2, CancelFlag::new());
-        let out = run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        let out = run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
         assert_eq!(out.steps, 6);
         assert_eq!(model.saves.get(), 3, "2 checkpoints + 1 final");
     }
@@ -2169,7 +2177,7 @@ mod tests {
         let (_fixture, mut req) = mock_request(2, 5, 1, 0, cancel);
         // Cancellation must win over fingerprint I/O: this deliberately missing path is never opened.
         req.items[0].image_path = req.output_dir.join("does-not-exist.png");
-        let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
+        let err = run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap_err();
         assert!(
             matches!(err, CandleError::Canceled),
             "expected Canceled, got {err:?}"
@@ -2187,7 +2195,7 @@ mod tests {
             built_dit: Rc::clone(&built_dit),
         };
         let (_fixture, req) = mock_request(2, 5, 1, 0, cancel);
-        let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
+        let err = run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap_err();
         assert!(matches!(err, CandleError::Canceled), "{err:?}");
         assert!(
             !built_dit.get(),
@@ -2300,7 +2308,7 @@ mod tests {
         };
         // steps=7, accum=4 → windows [1..4] full, [5..7] partial (3 micros) flushed at the end.
         let (_fixture, req) = mock_request(3, 7, 4, 0, CancelFlag::new());
-        let out = run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        let out = run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
         assert_eq!(out.steps, 7);
         assert!(out.final_loss.is_finite());
     }
@@ -2315,7 +2323,7 @@ mod tests {
             cache_len: 0,
         };
         let (_fixture, req) = mock_request(0, 5, 1, 0, CancelFlag::new());
-        let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
+        let err = run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap_err();
         match err {
             CandleError::Msg(m) => assert!(m.contains("no usable dataset items"), "got {m}"),
             other => panic!("expected Msg, got {other:?}"),
@@ -2465,8 +2473,17 @@ mod tests {
         };
         // steps=2, sample_every=1 → the preview block runs each step (freeze + thaw = 2 passes/cadence).
         let (_fixture, req) = preview_request(2, 1);
-        let out = run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        let mut warnings = Vec::new();
+        let out = run_flow_match_training(&model, &req, &mut |_| {}, &mut warnings).unwrap();
         assert_eq!(out.steps, 2);
+        // sc-27451: each skipped preview is reported, not only logged to stderr.
+        assert_eq!(
+            warnings,
+            vec![
+                crate::gen_core::train::preview_sample_failed(1, 1, &"injected render failure"),
+                crate::gen_core::train::preview_sample_failed(2, 1, &"injected render failure"),
+            ]
+        );
         assert!(
             passes.get() >= 2,
             "the freeze + thaw visitor passes must have run, got {}",
@@ -2493,7 +2510,7 @@ mod tests {
             render_errors: false,
         };
         let (_fixture, req) = preview_request(1, 1);
-        let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
+        let err = run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap_err();
         match err {
             CandleError::Msg(m) => {
                 assert!(m.contains("injected visitor failure"), "got {m}")
@@ -2516,7 +2533,7 @@ mod tests {
             render_errors: false,
         };
         let (_fixture, req) = preview_request(1, 1);
-        let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
+        let err = run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap_err();
         match err {
             CandleError::Msg(m) => {
                 assert!(m.contains("injected visitor failure"), "got {m}")
@@ -2635,7 +2652,7 @@ mod tests {
         req.config.alpha = 2.0;
         req.config.weight_noise_sigma = weight_sigma;
         req.config.gradient_noise_eta = grad_eta;
-        run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
         let saved = model.saved.borrow().clone();
         assert!(!saved.is_empty());
         saved

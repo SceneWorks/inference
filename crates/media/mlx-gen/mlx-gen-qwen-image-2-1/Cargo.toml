@@ -42,6 +42,8 @@ sha2 = { workspace = true }
 image = { workspace = true }
 
 [dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }
 # Depth anchoring (epic 2123, sc-24830): the frozen Depth-Anything-V2 perceptor the trainer's
 # decoded-x0 depth loss runs. Depends only on core (acyclic).
 mlx-gen-depth = { path = "../mlx-gen-depth" }

@@ -48,7 +48,9 @@
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, split_sections};
 use mlx_rs::{Array, Dtype};
 
-use crate::config::{Architecture, BidirectionalAttention, LayerAttentionType, ModelConfig};
+use crate::config::{
+    Architecture, BidirectionalAttention, LayerAttentionType, LayerRope, ModelConfig,
+};
 use crate::error::{Error, Result};
 use crate::models::deepstack::deepstack_fused_decoder_layers;
 use crate::primitives::activation::{gelu_precision, ActivationRole, GeluPrecision};
@@ -2195,14 +2197,10 @@ pub(crate) struct LayerPlan {
 impl LayerPlan {
     pub(crate) fn new(cfg: &ModelConfig, decoder_root: String, compute_dtype: Dtype) -> Self {
         // `num_kv_shared_layers`: the trailing layers project no K/V of their own and instead reuse
-        // the K/V of the **last** earlier layer of their own type. Upstream's
-        // `first_kv_shared_layer_idx = num_hidden_layers - num_kv_shared_layers`, with the `> 0`
-        // guard that keeps a `0` setting from making every layer "shared".
-        let kv_shared_from = cfg
-            .gemma4
-            .as_ref()
-            .filter(|g| g.num_kv_shared_layers > 0)
-            .map(|g| cfg.num_layers.saturating_sub(g.num_kv_shared_layers));
+        // the K/V of the **last** earlier layer of their own type — the shared upstream rule
+        // ([`Gemma4Config::first_kv_shared_layer`](crate::config::Gemma4Config::first_kv_shared_layer),
+        // sc-27308), `> 0` guard included.
+        let kv_shared_from = cfg.gemma4.as_ref().and_then(|g| g.first_kv_shared_layer());
         // `store_full_length_kv`: the **last** layer of each type before the sharing tail is the one
         // whose K/V the tail reuses. Walking forward and overwriting leaves exactly that layer.
         let mut kv_store_at: [Option<usize>; 2] = [None, None];

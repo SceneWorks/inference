@@ -599,8 +599,19 @@ impl Svd {
 }
 
 /// Decoded frames NHWC `[1, F, H, W, 3]` (roughly `[-1,1]`) → `Vec<Image>` (`clip(x·0.5+0.5)·255`).
+/// The per-frame split is the shared [`mlx_gen::image::u8_frames_to_images`] (sc-27319): its
+/// frame-major `[F, H·W·3]` readback carries the sc-12748 / sc-5326 i32-overflow guard this copy
+/// introduced, plus rank/shape validation. The rounded `[0, 255]` values convert to u8 on device;
+/// for every finite value and NaN that matches the host `v as u8` cast this replaced (probed on the
+/// pinned MLX: NaN → 0, as Rust's saturating cast gives).
 fn frames_to_images(decoded: &Array) -> Result<Vec<Image>> {
     use mlx_rs::ops::{maximum, minimum, round};
+    let sh = decoded.shape();
+    if sh.len() != 5 || sh[0] != 1 {
+        return Err(Error::Msg(format!(
+            "svd frames_to_images: expected a [1, F, H, W, 3] decode, got {sh:?}"
+        )));
+    }
     let half = mlx_gen::array::scalar(0.5);
     let x = add(&multiply(decoded, &half)?, &half)?;
     let x = minimum(
@@ -608,30 +619,7 @@ fn frames_to_images(decoded: &Array) -> Result<Vec<Image>> {
         mlx_gen::array::scalar(1.0),
     )?;
     let x = round(&multiply(&x, mlx_gen::array::scalar(255.0))?, 0)?;
-    let sh = x.shape();
-    let (f, h, w) = (sh[1], sh[2], sh[3]);
-    // sc-12748: reshape to the frame-major `[F, H·W·3]` — the natural per-frame layout (batch is 1).
-    // Collapsing H/W/C forces the contiguous logical-order copy `as_slice` needs, while `f` stays its
-    // own dim so the full `f·h·w·3` product is never formed (the F-076 i32 overflow footgun). Retires
-    // the `reshape(-1)` workaround: on the pinned MLX 0.32.0 fork, a multi-dimensional reshape whose
-    // individual dimensions fit i32 is exact past an `i32::MAX` total (verified in
-    // `mlx-gen/tests/mlx_write_bound_probe.rs`; a single `reshape(-1)` dimension still raises), so
-    // large frame/resolution decodes render instead of overflowing. Byte-identical to the old reshape
-    // below-bound.
-    let per = (h as i64 * w as i64 * 3) as usize;
-    let flat = x.reshape(&[f, h * w * 3])?;
-    let data = flat.as_slice::<f32>();
-    let mut frames = Vec::with_capacity(f as usize);
-    for fi in 0..f as usize {
-        let start = fi * per;
-        let pixels: Vec<u8> = data[start..start + per].iter().map(|&v| v as u8).collect();
-        frames.push(Image {
-            width: w as u32,
-            height: h as u32,
-            pixels,
-        });
-    }
-    Ok(frames)
+    mlx_gen::image::u8_frames_to_images(&x.squeeze_axes(&[0])?)
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral

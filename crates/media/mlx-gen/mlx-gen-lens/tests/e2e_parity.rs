@@ -19,6 +19,7 @@
 use mlx_rs::ops::{abs, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::pipeline::LensPipeline;
 use mlx_gen_lens::text::LensTokenizer;
@@ -46,13 +47,6 @@ fn meta_usize(g: &Weights, key: &str) -> usize {
 }
 fn meta_f32(g: &Weights, key: &str) -> f32 {
     g.metadata(key).unwrap().parse().unwrap()
-}
-
-/// `max|a-b| / max|b|`.
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 
 /// Cosine similarity over the flattened tensors.

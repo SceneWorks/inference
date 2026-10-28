@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::max_abs_diff;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_sdxl::{load_ip_kv_pairs, load_unet_dtype, text_time_ids};
@@ -43,15 +44,6 @@ fn randn(shape: &[i32], seed: u64) -> Array {
         .unwrap()
         .as_dtype(Dtype::Float16)
         .unwrap()
-}
-
-fn max_abs(a: &Array, b: &Array) -> f32 {
-    let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
-    mlx_rs::ops::max(&d, None)
-        .unwrap()
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .item::<f32>()
 }
 
 #[test]
@@ -91,8 +83,8 @@ fn ip_decoupled_attn_remap_and_scale_zero() {
         .1
         .unwrap();
 
-    let d0 = max_abs(&eps_plain, &eps_ip0);
-    let di = max_abs(&eps_plain, &eps_ip);
+    let d0 = max_abs_diff(&eps_plain, &eps_ip0);
+    let di = max_abs_diff(&eps_plain, &eps_ip);
     println!("[ip-adapter] forward vs forward_with_ip(scale=0): max|Δ|={d0:.3e}");
     println!("[ip-adapter] forward vs forward_with_ip(scale=0.6): max|Δ|={di:.3e}");
     assert_eq!(d0, 0.0, "scale=0 must be byte-identical to plain forward");

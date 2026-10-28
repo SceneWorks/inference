@@ -22,6 +22,8 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }
 # The shared weights-free conformance suite (epic SC-22657): the crate's contract tests assert
 # the provider-declared architecture axes against it.
 sceneworks-gen-core-testkit = { workspace = true }

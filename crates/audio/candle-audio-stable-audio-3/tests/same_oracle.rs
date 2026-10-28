@@ -4,6 +4,7 @@
 #[macro_use]
 #[path = "../../../llm/test-support/model_proof.rs"]
 mod model_proof;
+mod common;
 const _: fn() = || {
     let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
         std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
@@ -30,36 +31,16 @@ use candle_audio_stable_audio_3::weights::{
 use candle_nn::var_builder::SimpleBackend;
 use candle_nn::{Init, VarBuilder};
 
-fn snapshot(name: &str) -> PathBuf {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("{name} must point to the pinned immutable snapshot"))
-}
+use common::snapshot_dir as snapshot;
 
-fn test_device() -> Device {
-    if std::env::var_os("SA3_TEST_METAL").is_some() {
-        Device::new_metal(0).expect("SA3_TEST_METAL requested but Metal is unavailable")
-    } else if std::env::var_os("SA3_TEST_CUDA").is_some() {
-        #[cfg(feature = "cuda")]
-        {
-            Device::new_cuda(0).expect("SA3_TEST_CUDA requested but CUDA is unavailable")
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            panic!("SA3_TEST_CUDA requires --features cuda")
-        }
-    } else {
-        Device::Cpu
-    }
-}
+use common::test_device;
 
 fn mmap(path: &Path, device: &Device) -> VarBuilder<'static> {
     mmap_many(&[path.to_path_buf()], device)
 }
 
 fn mmap_many(paths: &[PathBuf], device: &Device) -> VarBuilder<'static> {
-    // Safety: tests require immutable, hash-pinned artifacts for the full process lifetime.
-    unsafe { VarBuilder::from_mmaped_safetensors(paths, DType::F32, device).unwrap() }
+    common::mmap_f32(paths, device)
 }
 
 fn same_l_fixture(device: &Device) -> VarBuilder<'static> {

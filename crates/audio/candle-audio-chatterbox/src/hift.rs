@@ -37,7 +37,7 @@
 //! reproducibility law: same mel + seed ⇒ byte-identical waveform), rather than torch's global RNG.
 
 use candle_audio::candle_core::{DType, Device, Result as CandleResult, Tensor, D};
-use candle_audio::{dsp, AudioError, Result};
+use candle_audio::{dsp, neural_codec, AudioError, Result};
 use candle_nn::{
     Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Linear, Module, VarBuilder,
 };
@@ -102,11 +102,10 @@ const fn get_padding(kernel: usize, dilation: usize) -> usize {
 /// with `‖v‖` taken per `d0`-slice (the `weight_norm` default `dim = 0`). Same math as
 /// candle-transformers `encodec::conv1d_weight_norm`, keyed on the newer `parametrizations.*` names
 /// this checkpoint uses. `d0` is `out` for `Conv1d` and `in` for `ConvTranspose1d`.
+///
+/// The shared [`neural_codec::wn_weight`] (sc-27269), bit-identical to the copy this port carried.
 fn weight_norm_weight(vb: &VarBuilder, d0: usize, d1: usize, k: usize) -> CandleResult<Tensor> {
-    let g = vb.get((d0, 1, 1), "parametrizations.weight.original0")?;
-    let v = vb.get((d0, d1, k), "parametrizations.weight.original1")?;
-    let norm = v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
-    v.broadcast_mul(&g)?.broadcast_div(&norm)
+    neural_codec::wn_weight(vb, d0, d1, k)
 }
 
 /// Load a weight-normed `Conv1d(in_c → out_c, k)` with the given config from a
@@ -351,10 +350,11 @@ impl HiftGenerator {
             )));
         }
         let device = candle_audio::default_device()?;
-        // SAFETY: mmap of a provider-resolved, pinned-SHA safetensors file — the shared idiom.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&path), DType::F32, &device)?
-        };
+        let vb = candle_audio::weights::mmap_var_builder(
+            std::slice::from_ref(&path),
+            DType::F32,
+            &device,
+        )?;
         Ok(Self::load(vb.pp("mel2wav"), device)?)
     }
 

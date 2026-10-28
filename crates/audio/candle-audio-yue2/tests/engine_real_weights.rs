@@ -75,10 +75,7 @@ fn hub() -> PathBuf {
 }
 
 fn snapshot(repo: &inventory::UpstreamRepo) -> PathBuf {
-    let dir = hub()
-        .join(format!("models--{}", repo.id.replace('/', "--")))
-        .join("snapshots")
-        .join(repo.revision);
+    let dir = candle_audio_yue2::snapshot::hub_layout_snapshot_dir(&hub(), repo);
     assert!(dir.is_dir(), "{} is not staged", dir.display());
     dir
 }

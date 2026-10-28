@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use mlx_gen::array::scalar;
 use mlx_gen::{Error, Result};
 use mlx_rs::ops::{add, divide, multiply, sqrt, subtract};
 use mlx_rs::{Array, Dtype};
@@ -88,10 +89,6 @@ pub enum DevBranch {
     Conditional,
     StgConditional,
     IsolatedModality,
-}
-
-fn scalar(value: f32) -> Array {
-    Array::from_slice(&[value], &[1])
 }
 
 /// Combine the four upstream LTX guided denoised predictions in f32, then restore the model dtype.

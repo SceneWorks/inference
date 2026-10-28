@@ -8,21 +8,10 @@
 //!   SAM3_TOKENIZER=.../tokenizer.json \
 //!     cargo test -p mlx-gen-sam3 --release --test integration text_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::cosine;
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::{Sam3TextConfig, Sam3TextEncoder, Sam3Tokenizer};
-use mlx_rs::ops::{multiply, sqrt, sum};
 use mlx_rs::Array;
-
-fn scalar_f32(a: &Array) -> f32 {
-    a.as_dtype(mlx_rs::Dtype::Float32).unwrap().item::<f32>()
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let dot = scalar_f32(&sum(multiply(a, b).unwrap(), None).unwrap());
-    let na = scalar_f32(&sqrt(sum(multiply(a, a).unwrap(), None).unwrap()).unwrap());
-    let nb = scalar_f32(&sqrt(sum(multiply(b, b).unwrap(), None).unwrap()).unwrap());
-    dot / (na * nb)
-}
 
 #[test]
 #[ignore = "needs SAM3_WEIGHTS + SAM3_TEXT_FIXTURE (+ SAM3_TOKENIZER for the tokenizer check)"]

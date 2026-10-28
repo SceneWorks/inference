@@ -70,21 +70,8 @@ pub fn sinusoidal_embedding(freq_dim: usize, t: f64, device: &Device) -> CandleR
 /// `precompute_freqs_cis_1d(head_dim)` (θ=10 000; the chunk-into-3-then-concat in the reference
 /// forward reassembles exactly this table). Returns `(cos, sin)` of shape `[len, head_dim/2]`.
 pub fn rope_tables(head_dim: usize, len: usize, device: &Device) -> CandleResult<(Tensor, Tensor)> {
-    let half = head_dim / 2;
-    let mut cos = Vec::with_capacity(len * half);
-    let mut sin = Vec::with_capacity(len * half);
-    for pos in 0..len {
-        for j in 0..half {
-            let freq = 1.0 / 10_000f64.powf(2.0 * j as f64 / head_dim as f64);
-            let angle = pos as f64 * freq;
-            cos.push(angle.cos() as f32);
-            sin.push(angle.sin() as f32);
-        }
-    }
-    Ok((
-        Tensor::from_vec(cos, (len, half), device)?,
-        Tensor::from_vec(sin, (len, half), device)?,
-    ))
+    // The audio commons' f64 half-split table (sc-27260) — the same arithmetic this port carried.
+    candle_audio::ops::rope_tables(device, len, head_dim, 10_000.0)
 }
 
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> CandleResult<Tensor> {

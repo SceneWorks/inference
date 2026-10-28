@@ -7,6 +7,7 @@
 //! there is deliberately no new field on the generic training request. These are structural
 //! operator bounds, not measured calibration, an allocator prediction, or a runtime RSS limit.
 use crate::loader::Sources;
+use mlx_gen::gen_core::moss_image_training::admission as shared;
 use mlx_gen::gen_core::{
     self,
     moss_image::{MossImageAssetRole, MossImageConfig},
@@ -51,6 +52,14 @@ impl fmt::Display for AdmissionError {
     }
 }
 impl std::error::Error for AdmissionError {}
+impl From<shared::AdmissionArithmeticError> for AdmissionError {
+    fn from(e: shared::AdmissionArithmeticError) -> Self {
+        match e {
+            shared::AdmissionArithmeticError::Overflow(what) => Self::Overflow(what),
+            shared::AdmissionArithmeticError::Invalid(why) => Self::Invalid(why),
+        }
+    }
+}
 fn source(e: impl fmt::Display) -> AdmissionError {
     AdmissionError::Source(e.to_string())
 }
@@ -58,29 +67,19 @@ fn invalid(s: impl Into<String>) -> AdmissionError {
     AdmissionError::Invalid(s.into())
 }
 fn sum(xs: impl IntoIterator<Item = u64>, what: &'static str) -> Result<u64> {
-    xs.into_iter().try_fold(0u64, |a, b| {
-        a.checked_add(b).ok_or(AdmissionError::Overflow(what))
-    })
+    Ok(shared::checked_sum(xs, what)?)
 }
 fn mul(xs: &[u64], what: &'static str) -> Result<u64> {
-    xs.iter().try_fold(1u64, |a, b| {
-        a.checked_mul(*b).ok_or(AdmissionError::Overflow(what))
-    })
+    Ok(shared::checked_product(xs, what)?)
 }
 fn dim(n: usize) -> Result<u64> {
-    u64::try_from(n).map_err(|_| invalid("dimension exceeds u64"))
+    Ok(shared::dim(n)?)
 }
 fn positive(n: i32) -> Result<u64> {
-    if n <= 0 {
-        return Err(invalid("nonpositive encoder dimension"));
-    }
-    u64::try_from(n).map_err(|_| invalid("unrepresentable encoder dimension"))
+    Ok(shared::positive(n)?)
 }
 
-/// Pure override resolution: a zero override is a real zero cap, not a request to disable guards.
-pub(crate) fn resolve_budget(override_bytes: Option<u64>, device_bytes: u64) -> u64 {
-    override_bytes.unwrap_or(device_bytes)
-}
+pub(crate) use shared::resolve_budget;
 /// Pure ceiling selection: MLX's configured soft limit can exceed physical residency, so it
 /// does not replace the actual recommended working set. Unknown metadata fails closed.
 fn native_device_budget(limit: u64, recommended: Option<u64>) -> Result<u64> {
@@ -334,11 +333,7 @@ pub(crate) enum AssetKind {
     Backbone,
 }
 fn vae_selected(name: &str) -> bool {
-    ["encoder.", "decoder.", "quant_conv.", "post_quant_conv."]
-        .iter()
-        .any(|p| name.starts_with(p))
-        || name == "bn.running_mean"
-        || name == "bn.running_var"
+    shared::is_constructed_vae_tensor(name)
 }
 
 #[derive(Clone, Debug)]
@@ -510,31 +505,13 @@ fn adapter_shape(out: u64, input: u64, c: &TrainingConfig, tokens: u64) -> Resul
     }
 }
 fn optimizer_states(name: &str) -> Result<u64> {
-    let n: String = name
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| *c != '-' && *c != '_')
-        .collect();
-    match n.as_str() {
-        "adam" | "adamw" | "adam8bit" | "adamw8bit" => Ok(2),
-        "rose" | "roseopt" => Ok(0),
-        "prodigy" | "prodigyopt" => Ok(4),
-        _ => Err(invalid(format!("unsupported optimizer {name}"))),
-    }
+    Ok(shared::optimizer_states(name)?)
 }
 fn compute_width(c: &TrainingConfig) -> Result<u64> {
-    match c.train_dtype.to_ascii_lowercase().as_str() {
-        "bf16" | "bfloat16" => Ok(2),
-        "f32" | "float32" | "fp32" => Ok(4),
-        _ => Err(invalid("compute dtype must be bf16 or f32")),
-    }
+    Ok(shared::compute_width(c)?)
 }
 fn image_tokens(edge: u64) -> Result<u64> {
-    if edge == 0 || !edge.is_multiple_of(16) {
-        return Err(invalid("bucket edge must be positive and divisible by 16"));
-    }
-    mul(&[edge / 16, edge / 16], "image tokens")
+    Ok(shared::image_tokens(edge)?)
 }
 
 /// Whole-layer encoder live tensors plus fresh per-caption KV/recurrent state. The layer hook

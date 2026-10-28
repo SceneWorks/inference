@@ -17,9 +17,10 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::ops::{abs, concatenate_axis, max, subtract};
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::max_abs_diff;
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::dit::{LensDitConfig, LensTransformer};
 
@@ -189,12 +190,6 @@ fn pad_layers(layers: &[Array], target: i32) -> Vec<Array> {
             concatenate_axis(&[f, &z], 1).unwrap()
         })
         .collect()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    max(abs(subtract(a, b).unwrap()).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
 }
 
 /// The divergent case: at guidance `1.0` with a negative LONGER than the positive, the pre-sc-17616

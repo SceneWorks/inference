@@ -45,6 +45,7 @@ use crate::clip::{self, DfnClipEncoder};
 use crate::output::{AudioDecoder16k, SAMPLE_RATE as OUT_SAMPLE_RATE};
 use crate::sync::SynchformerVisualEncoder;
 use crate::{mmdit, model, preprocess};
+pub(crate) use candle_audio::lock_recover;
 
 /// Registry id (the SceneWorks worker routes `payload.model` to this exact id). The 44.1 kHz
 /// quality-ceiling sibling is [`crate::generator_44k`]'s `mmaudio_large_44k` (sc-13441).
@@ -249,14 +250,28 @@ pub(crate) fn seq_lengths(duration: f32) -> (usize, usize, usize) {
     (latent, clip, sync)
 }
 
+/// A borrowed RGB view over one caller frame's pixel buffer (no copy).
+pub(crate) type FrameView<'a> = image::ImageBuffer<image::Rgb<u8>, &'a [u8]>;
+
+/// The source frame index nearest output frame `i` at `dst_fps`, clamped to the last of `n` frames.
+fn nearest_source_index(i: usize, src_fps: f32, dst_fps: f32, n: usize) -> usize {
+    let t = i as f32 / dst_fps;
+    let src = (t * src_fps).round() as usize;
+    src.min(n - 1)
+}
+
 /// Nearest-frame temporal resample of `frames` (captured at `src_fps`) to `count` frames at `dst_fps`,
 /// sampling the first `count / dst_fps` seconds — the analogue of the reference's per-fps video decode.
+///
+/// Returns borrowed views (sc-27364): a source frame picked several times is shared, not copied, so
+/// the clip + sync resamples no longer hold one full-resolution RGB copy per output frame. No frames,
+/// or a frame whose buffer is not `w*h*3`, is a typed error rather than a panic (sc-27266).
 pub(crate) fn resample_frames(
     frames: &[Image],
     src_fps: f32,
     dst_fps: f32,
     count: usize,
-) -> AudioResult<Vec<image::RgbImage>> {
+) -> AudioResult<Vec<FrameView<'_>>> {
     let n = frames.len();
     if n == 0 {
         return Err(AudioError::Msg(
@@ -265,11 +280,9 @@ pub(crate) fn resample_frames(
     }
     (0..count)
         .map(|i| {
-            let t = i as f32 / dst_fps;
-            let src = (t * src_fps).round() as usize;
-            let src = src.min(n - 1);
+            let src = nearest_source_index(i, src_fps, dst_fps, n);
             let f = &frames[src];
-            image::RgbImage::from_raw(f.width, f.height, f.pixels.clone()).ok_or_else(|| {
+            FrameView::from_raw(f.width, f.height, f.pixels.as_slice()).ok_or_else(|| {
                 AudioError::Msg(format!(
                     "mmaudio: VideoSync frame {src} is malformed ({}x{}, {} bytes; expected w*h*3)",
                     f.width,
@@ -453,7 +466,7 @@ impl MmAudioPipeline {
         Ok(samples)
     }
 
-    fn encode_clip_visual(&self, frames: &[image::RgbImage]) -> AudioResult<Tensor> {
+    fn encode_clip_visual(&self, frames: &[FrameView<'_>]) -> AudioResult<Tensor> {
         let input = clip::frames_to_clip_input(frames, &self.device)?; // (M, 3, 384, 384)
         let feat = self.clip.encode_image(&input)?; // (M, 1024)
         Ok(feat.unsqueeze(0)?) // (1, M, 1024)
@@ -465,7 +478,7 @@ impl MmAudioPipeline {
         Ok(self.clip.encode_text(&tokens)?) // (1, 77, 1024)
     }
 
-    fn encode_sync(&self, frames: &[image::RgbImage]) -> AudioResult<Tensor> {
+    fn encode_sync(&self, frames: &[FrameView<'_>]) -> AudioResult<Tensor> {
         let segments = preprocess::frames_to_segments(frames, &self.device)?; // (S, 3, 16, 224, 224)
         let feat = self.sync.encode(&segments)?; // (S, 8, 768)
         let (s, per_seg, d) = feat.dims3()?;
@@ -515,14 +528,6 @@ pub(crate) fn check_seq(t: &Tensor, batch: usize, seq: usize, name: &str) -> Aud
         )));
     }
     Ok(())
-}
-
-/// Recover a poisoned mutex (a prior panic mid-synthesis) — the audio twin of `candle_gen::lock_recover`.
-pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
 }
 
 /// The five caller-provisioned component sources resolved at [`load`] (epic 13657), held so the heavy
@@ -700,6 +705,30 @@ mod tests {
             .collect()
     }
 
+    /// sc-27364: the borrowed resample picks the same nearest source frame as the old owned copy
+    /// and aliases its pixel buffer instead of cloning it.
+    #[test]
+    fn resample_frames_borrows_the_nearest_source_frame() {
+        let frames = foley_frames(10, 4, 2, 3);
+        let views = resample_frames(&frames, 10.0, 25.0, 25).unwrap();
+        assert_eq!(views.len(), 25);
+        for (i, view) in views.iter().enumerate() {
+            let expected = ((i as f32 / 25.0) * 10.0).round() as usize;
+            let src = &frames[expected.min(frames.len() - 1)];
+            assert_eq!(view.dimensions(), (src.width, src.height));
+            assert!(
+                std::ptr::eq(view.as_raw().as_ptr(), src.pixels.as_ptr()),
+                "frame {i}"
+            );
+        }
+        // Past the source's end the last frame is reused.
+        let views = resample_frames(&frames, 10.0, 8.0, 16).unwrap();
+        assert!(std::ptr::eq(
+            views[15].as_raw().as_ptr(),
+            frames[9].pixels.as_ptr()
+        ));
+    }
+
     fn foley_req(frames: Vec<Image>, fps: u32) -> GenerationRequest {
         GenerationRequest {
             prompt: "footsteps on gravel".into(),
@@ -828,7 +857,8 @@ mod tests {
         };
         assert!(resample_frames(&[bad], 8.0, 8.0, 2).is_err());
         assert!(resample_frames(&[], 8.0, 8.0, 2).is_err());
-        let ok = resample_frames(&foley_frames(2, 4, 4, 0), 8.0, 8.0, 3).unwrap();
+        let frames = foley_frames(2, 4, 4, 0);
+        let ok = resample_frames(&frames, 8.0, 8.0, 3).unwrap();
         assert_eq!(ok.len(), 3);
     }
 

@@ -13,16 +13,11 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::require_env_path;
 use mlx_gen_sensenova::{
     loader::load_raw, text::load_tokenizer, NeoChatConfig, T2iModel, T2iOptions,
 };
 use mlx_rs::Array;
-
-fn snapshot_dir() -> PathBuf {
-    PathBuf::from(std::env::var("SENSENOVA_SNAPSHOT").expect(
-        "set SENSENOVA_SNAPSHOT to the SenseNova-U1-8B-MoT snapshot dir; inference never self-fetches or derives a cache location (epic 13657)",
-    ))
-}
 
 fn fixture() -> PathBuf {
     PathBuf::from(concat!(
@@ -39,7 +34,7 @@ fn flat(a: &Array) -> Vec<f32> {
 #[test]
 #[ignore = "needs the local 35GB checkpoint + dumped golden; run with --ignored"]
 fn t2i_realweight_matches_reference() {
-    let snap = snapshot_dir();
+    let snap = require_env_path("SENSENOVA_SNAPSHOT", "the SenseNova-U1-8B-MoT snapshot dir");
     let fix = fixture();
     if !snap.exists() || !fix.exists() {
         eprintln!(

@@ -9,9 +9,7 @@
 //!
 //! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration block_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max as max_op, subtract};
-use mlx_rs::Array;
-
+use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::transformer::{Precision, VideoBlock};
@@ -28,12 +26,6 @@ fn base_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap();
     std::path::PathBuf::from(home)
         .join("Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8")
-}
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let denom = max_op(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max_op(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 
 #[test]

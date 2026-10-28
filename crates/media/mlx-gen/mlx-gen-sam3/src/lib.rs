@@ -51,13 +51,7 @@ pub(crate) fn load_linear(w: &Weights, name: &str) -> Result<AdaptableLinear> {
 /// embedders, the geometry `4→256` box projection and its `258→256` pos projection) stay dense —
 /// their parameter mass is negligible, so this is lossless for the Q8-near-bf16 target (sc-4925).
 pub(crate) fn quantize_linear(l: &mut AdaptableLinear, bits: i32) -> Result<()> {
-    if let Some((weight, _)) = l.dense_weight() {
-        let shape = weight.shape();
-        let in_features = shape[shape.len() - 1];
-        if in_features % mlx_gen::quant::DEFAULT_GROUP_SIZE == 0 {
-            l.quantize(bits, None)?;
-        }
-    }
+    l.quantize_if_aligned(bits, None)?;
     Ok(())
 }
 

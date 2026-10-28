@@ -491,6 +491,45 @@ pub fn slice_axis(a: &Array, axis: i32, start: i32, len: i32) -> Result<Array> {
     Ok(a.split_axis(&[start, start + len], axis)?.swap_remove(1))
 }
 
+/// Block-diagonal ("windowed") SDPA over `[heads, seq, head_dim]` q/k/v, the vision-tower form keyed
+/// by cumulative window lengths `cu` (`[0, …, seq]`, as `cu_seqlens`). `cu.len() > 2` runs one SDPA
+/// per window (gathering its rows with `take_axis`) and concatenates the outputs back over the
+/// sequence axis; otherwise it is one full-sequence SDPA. Returns `[heads, seq, head_dim]`.
+///
+/// The exact op sequence the Qwen2.5-VL (qwen-image) and Pixtral (flux2) vision attentions each
+/// open-coded (sc-27431); unmasked, so callers keep their own projections around it.
+pub fn windowed_sdpa(q: &Array, k: &Array, v: &Array, cu: &[i32], scale: f32) -> Result<Array> {
+    let sh = q.shape();
+    if sh.len() != 3 {
+        return Err(Error::Msg(format!(
+            "windowed_sdpa: expected [heads, seq, head_dim] q, got shape {sh:?}"
+        )));
+    }
+    let (h, seq, hd) = (sh[0], sh[1], sh[2]);
+    if cu.len() > 2 {
+        let mut outs = Vec::with_capacity(cu.len() - 1);
+        for i in 0..cu.len() - 1 {
+            let (off, len) = (cu[i], cu[i + 1] - cu[i]);
+            let idx = Array::from_slice(&(off..off + len).collect::<Vec<i32>>(), &[len]);
+            let qc = q.take_axis(&idx, 1)?.reshape(&[1, h, len, hd])?;
+            let kc = k.take_axis(&idx, 1)?.reshape(&[1, h, len, hd])?;
+            let vc = v.take_axis(&idx, 1)?.reshape(&[1, h, len, hd])?;
+            let o = scaled_dot_product_attention(&qc, &kc, &vc, scale, None, None)?;
+            outs.push(o.reshape(&[h, len, hd])?);
+        }
+        let refs: Vec<&Array> = outs.iter().collect();
+        Ok(concatenate_axis(&refs, 1)?) // [h, seq, hd]
+    } else {
+        let q4 = q.reshape(&[1, h, seq, hd])?;
+        let k4 = k.reshape(&[1, h, seq, hd])?;
+        let v4 = v.reshape(&[1, h, seq, hd])?;
+        Ok(
+            scaled_dot_product_attention(&q4, &k4, &v4, scale, None, None)?
+                .reshape(&[h, seq, hd])?,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

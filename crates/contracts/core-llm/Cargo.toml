@@ -35,6 +35,15 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # NO tensor dependency and NO gen-ai dependency — this crate must build standalone on any platform.
 
+# In-process host-availability probes for request/load admission (sc-27306, sc-27311, sc-27317):
+# the Mach VM statistics query on macOS and GlobalMemoryStatusEx on Windows, instead of spawning
+# `vm_stat` / `powershell.exe` by bare name. Both are OS bindings, not tensor dependencies.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
+
 [features]
 model-inference-proof = []
 # Test-only `template::with_template_clock`: lets a dependent's tests mock the date `strftime_now`

@@ -23,6 +23,7 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, sum, tile};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::nn::gelu_tanh;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -32,10 +33,6 @@ use crate::rope::apply_split_rotary_emb;
 use crate::transformer::{Linear, Precision};
 
 const CONNECTOR_EPS: f32 = 1e-6;
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// One connector transformer block (attn1 + gelu FF, both pre-normed with a unit-weight RMSNorm).
 ///

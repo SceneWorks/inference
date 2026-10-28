@@ -14,15 +14,14 @@
 //! sections all index the same sequential text position when there are no image tokens, so it
 //! reduces to standard RoPE. Dense-only for now; quantization is E6 (sc-5989).
 
-pub mod attention;
 pub mod encoder;
 pub mod layer;
-pub mod mlp;
 
-pub use attention::Qwen3Attention;
+// The attention and SwiGLU MLP halves of the decoder block are the shared core modules (sc-27326).
 pub use encoder::Ideogram4TextEncoder;
 pub use layer::Qwen3DecoderLayer;
-pub use mlp::Qwen3Mlp;
+pub use mlx_gen::nn::SwiGluMlp as Qwen3Mlp;
+pub use mlx_gen::text_decoder::Qwen3TextAttention as Qwen3Attention;
 
 // The HF half-split text RoPE is identical across families and lives in core.
 pub use mlx_gen::nn::TextRope;
@@ -39,11 +38,5 @@ pub(crate) fn lin(w: &Weights, key: &str) -> Result<AdaptableLinear> {
     crate::quant::lin(w, base, false)
 }
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix.
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;

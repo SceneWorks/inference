@@ -331,9 +331,9 @@ pub use train::{
     DepthModelSize, FaceLandmarkLossConfig, IdentityLossConfig, IdentityReferenceMode,
     LatentLpipsConfig, LatentLpipsFamily, LrSchedule, NetworkType, ResolutionBucket,
     SubjectMaskLoss, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput,
-    TrainingProgress, TrainingRequest, TrainingTechniques, VaeAnchorConfig, BODY_SURFACE_SCHEDULE,
-    LATENT_PERCEPTUAL_SCHEDULE, MAX_RESOLUTION_BUCKETS, PIXEL_PERCEPTUAL_SCHEDULE,
-    RESOLUTION_BUCKET_STRIDE,
+    TrainingProgress, TrainingReport, TrainingRequest, TrainingTechniques, VaeAnchorConfig,
+    BODY_SURFACE_SCHEDULE, LATENT_PERCEPTUAL_SCHEDULE, MAX_RESOLUTION_BUCKETS,
+    PIXEL_PERCEPTUAL_SCHEDULE, RESOLUTION_BUCKET_STRIDE,
 };
 pub use transcribe::{
     TimestampGranularity, TranscribeCapabilities, TranscribeFinishReason, TranscribeOptions,

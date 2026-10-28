@@ -12,9 +12,11 @@
 //! reference is `sigmas.tolist()` on a float32 array, i.e. f64 values that equal the f32 sigmas
 //! exactly — mirrored here by storing f32 sigmas and widening to f64 for scalar math.
 
-use mlx_rs::ops::{add, multiply, subtract};
+use mlx_rs::ops::{add, subtract};
 use mlx_rs::Array;
 
+// `x · f64`, the weak scalar rounded to the array's f32 dtype, is core's `fscale` (sc-27448).
+use mlx_gen::array::fscale;
 use mlx_gen::{Error, Result};
 
 /// Which flow-match solver to use. `UniPC` is the Wan2.2 default.
@@ -109,12 +111,6 @@ fn integer_timesteps(sigmas: &[f32], num_train_timesteps: usize) -> Vec<f32> {
         .iter()
         .map(|&s| (s * nt).trunc())
         .collect()
-}
-
-/// Multiply an array by an f64 scalar, rounded to the array's (f32) latent dtype — mirrors the
-/// reference's `python_float * mx.array(f32)` (the weak scalar adopts the array dtype).
-fn fscale(a: &Array, c: f64) -> Result<Array> {
-    Ok(multiply(a, Array::from_f32(c as f32))?)
 }
 
 // =====================================================================================
@@ -608,6 +604,7 @@ fn solve_linear(r: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::ops::multiply;
 
     #[test]
     fn ensure_step_in_range_guards_over_and_under_run() {

@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use core_llm::{
     Channel, Content, DecodeReport, Error as CoreError, FinishReason as CoreFinish,
-    IncrementalDetok, LoadSpec, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
+    IncrementalDetok, LoadSpec, Result as CoreResult, StreamEvent as CoreEvent, TextLlm,
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
@@ -32,8 +32,8 @@ use crate::decode::{
     generate_speculative, CancelFlag, EngineOptions, FinishReason, GenerationConfig, NoProposer,
     SpeculativePrompt, StreamEvent as DecodeEvent,
 };
-use crate::error::{Error, Result};
-use crate::image::SiglipImageProcessor;
+use crate::error::{to_core, Error, Result};
+use crate::image::{SiglipImageProcessor, SiglipPreprocess};
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
 use crate::models::CausalLm;
 use crate::primitives::nn::{gelu, gelu_tanh, linear};
@@ -479,7 +479,7 @@ impl TextLlm for JoyCaptionProvider {
             .image_features(&image.pixels, image.width as usize, image.height as usize)
             .map_err(to_core)?;
 
-        let params = map_sampling(&req.sampling);
+        let params = SamplingParams::from(&req.sampling);
         let max_new = req.max_new_tokens as usize;
 
         // Stream contract token events via incremental detokenization (re-decode, emit new suffix).
@@ -592,19 +592,6 @@ pub fn descriptor() -> TextLlmDescriptor {
     }
 }
 
-fn map_sampling(s: &Sampling) -> SamplingParams {
-    SamplingParams {
-        temperature: s.temperature,
-        top_p: s.top_p,
-        top_k: s.top_k,
-        presence_penalty: s.presence_penalty,
-        presence_penalty_generated_only: s.presence_penalty_generated_only,
-        presence_penalty_prompt_len: 0,
-        repetition_penalty: s.repetition_penalty,
-        repetition_context: s.repetition_context,
-    }
-}
-
 fn map_finish(f: FinishReason) -> CoreFinish {
     match f {
         // `Stopped` (a host stop condition) maps to `Stop` like an EOS id; JoyCaption's loop never
@@ -612,17 +599,6 @@ fn map_finish(f: FinishReason) -> CoreFinish {
         FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
         FinishReason::MaxTokens => CoreFinish::Length,
         FinishReason::Cancelled => CoreFinish::Cancelled,
-    }
-}
-
-fn to_core(e: Error) -> CoreError {
-    match e {
-        Error::Canceled => CoreError::Canceled,
-        Error::Unsupported(m) => CoreError::Unsupported(m),
-        Error::MissingTensor(m) => CoreError::Load(format!("missing tensor: {m}")),
-        Error::Config(m) => CoreError::Load(m),
-        Error::Io(e) => CoreError::Io(e),
-        other => CoreError::backend(other),
     }
 }
 
@@ -1056,7 +1032,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Vec::new(),
             }],
-            sampling: Sampling::greedy(),
+            sampling: core_llm::Sampling::greedy(),
             max_new_tokens: 6,
             seed: Some(3),
             speculative,

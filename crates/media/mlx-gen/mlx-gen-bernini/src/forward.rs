@@ -679,6 +679,7 @@ pub fn vit_one_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::testing::max_abs_diff;
     use mlx_gen::weights::Weights;
     use mlx_gen_wan::config::WanModelConfig;
 
@@ -705,12 +706,6 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         Weights::from_file(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
-    }
-
-    fn max_abs(a: &Array, b: &Array) -> f32 {
-        mlx_rs::ops::max(subtract(a, b).unwrap().abs().unwrap(), None)
-            .unwrap()
-            .item::<f32>()
     }
 
     /// `t2v` (plain CFG over the target-only combo) computed by [`guided_velocity`] must equal the
@@ -775,7 +770,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got.shape(), noisy.shape());
-        assert_eq!(max_abs(&got, &want), 0.0, "t2v must equal manual CFG");
+        assert_eq!(max_abs_diff(&got, &want), 0.0, "t2v must equal manual CFG");
         crate::model_inference_device::record_model_inference_device();
         println!("MODEL_INFERENCE_BODY_COMPLETED forward::tests::t2v_mode_matches_manual_cfg");
     }
@@ -796,7 +791,7 @@ mod tests {
         );
         // the 2nd entry is the 2nd clip (ones), not a duplicate of videos[0] (zeros).
         assert!(
-            max_abs(&c.v[1].0, &v0) > 0.0,
+            max_abs_diff(&c.v[1].0, &v0) > 0.0,
             "v[1] must be the 2nd clip, not a copy of videos[0]"
         );
         // source-ids mirror the `vi` combo's video portion (videos-first ordering).
@@ -902,7 +897,7 @@ mod tests {
         .unwrap();
         assert_eq!(got.shape(), noisy.shape());
         assert_eq!(
-            max_abs(&got, &want),
+            max_abs_diff(&got, &want),
             0.0,
             "vae_txt_vit dispatch must equal manual combine"
         );

@@ -7,23 +7,10 @@
 //!   SAM3_E2E_FIXTURE=scripts/spikes/sam3_oracle/e2e_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration quant_smoke:: -- --ignored --nocapture
 
+use mlx_gen::testing::{cosine, iou};
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::{Instance, Sam3ImageSegmenter, Sam3Tracker};
-use mlx_rs::ops::{multiply, sqrt, sum};
 use mlx_rs::Array;
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.reshape(&[-1]).unwrap();
-    let b = b.reshape(&[-1]).unwrap();
-    let dot = sum(multiply(&a, &b).unwrap(), None).unwrap().item::<f32>();
-    let na = sqrt(sum(multiply(&a, &a).unwrap(), None).unwrap())
-        .unwrap()
-        .item::<f32>();
-    let nb = sqrt(sum(multiply(&b, &b).unwrap(), None).unwrap())
-        .unwrap()
-        .item::<f32>();
-    dot / (na * nb)
-}
 
 /// Binarize mask logits at 0 (the sign is what the output mask depends on).
 fn binarize(logits: &Array) -> Array {
@@ -35,22 +22,6 @@ fn binarize(logits: &Array) -> Array {
         .map(|&x| if x > 0.0 { 1.0 } else { 0.0 })
         .collect();
     Array::from_slice(&v, logits.shape())
-}
-
-fn iou(a: &Array, b: &Array) -> f32 {
-    let af = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-    let bf = b.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-    let inter = sum(multiply(&af, &bf).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let sa = sum(&af, None).unwrap().item::<f32>();
-    let sb = sum(&bf, None).unwrap().item::<f32>();
-    let union = sa + sb - inter;
-    if union <= 0.0 {
-        1.0
-    } else {
-        inter / union
-    }
 }
 
 /// Worst index-aligned mask IoU between two instance lists (must be equal length).

@@ -13,13 +13,14 @@ pub mod attention;
 pub mod encoder;
 pub mod generate;
 pub mod layer;
-pub mod mlp;
 
-pub use attention::Qwen3Attention;
+// The attention and SwiGLU MLP halves of the decoder block are the shared core modules (sc-27326);
+// `attention` keeps only the KV-cached decode step.
 pub use encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
 pub use generate::UpsampleSampling;
 pub use layer::Qwen3DecoderLayer;
-pub use mlp::Qwen3Mlp;
+pub use mlx_gen::nn::SwiGluMlp as Qwen3Mlp;
+pub use mlx_gen::text_decoder::Qwen3TextAttention as Qwen3Attention;
 
 // The HF half-split text RoPE is identical across families and lives in core (F-006).
 pub use mlx_gen::nn::TextRope;

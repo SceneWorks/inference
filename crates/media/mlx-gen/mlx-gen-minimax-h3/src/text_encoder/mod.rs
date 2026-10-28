@@ -35,18 +35,17 @@
 //! 3. **The seven MiniMax special-token ids are assigned by list ORDER at load time** and appear in
 //!    no vocabulary file. See [`tokenizer`].
 
-pub mod attention;
 pub mod degeneracy;
 pub mod encoder;
 pub mod layer;
-pub mod mlp;
 pub mod tokenizer;
 
-pub use attention::Qwen3Attention;
+// The attention and SwiGLU MLP halves of the decoder block are the shared core modules (sc-27326).
 pub use degeneracy::{inspect_conditioning, ConditioningDefect, DegenerateConditioning};
 pub use encoder::MiniMaxH3TextEncoder;
 pub use layer::Qwen3DecoderLayer;
-pub use mlp::Qwen3Mlp;
+pub use mlx_gen::nn::SwiGluMlp as Qwen3Mlp;
+pub use mlx_gen::text_decoder::Qwen3TextAttention as Qwen3Attention;
 pub use tokenizer::{
     MiniMaxH3Tokenizer, SpecialTokens, APPLIES_CHAT_TEMPLATE, MINIMAX_ADDED_SPECIALS,
 };

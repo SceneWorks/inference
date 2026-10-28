@@ -7,7 +7,7 @@
 use std::cell::OnceCell;
 
 use gen_core::train::{
-    Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+    Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
 };
 
 use crate::Result;
@@ -82,11 +82,22 @@ impl<T: Trainer> Trainer for LazyTrainer<T> {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// Forwards to the loaded trainer's [`Trainer::train_with_report`] so its warnings (sc-27451)
+    /// survive the lazy wrapper instead of the trait default discarding them.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Every validate floor (techniques included, epic 2123 E3) refuses before the base loads.
         self.validate(req)?;
         self.loaded().map_err(gen_core::Error::from)?;
         let trainer = self.loaded.get_mut().expect("the base was loaded above");
-        trainer.train(req, on_progress)
+        trainer.train_with_report(req, on_progress)
     }
 }
 
@@ -185,5 +196,52 @@ mod tests {
         custom.config.lora_target_modules = vec!["to_q".into()];
         t.validate(&custom).unwrap();
         assert_eq!(loads.get(), 1, "custom targets validate on the loaded base");
+    }
+
+    /// sc-27451: the wrapper forwards `train_with_report`, so the loaded trainer's warnings reach
+    /// the caller. Mutation: drop the override ⇒ the trait default wraps `train` ⇒ no warnings ⇒ red.
+    #[test]
+    fn train_with_report_forwards_the_loaded_trainers_warnings() {
+        struct Reporting;
+        impl Trainer for Reporting {
+            fn descriptor(&self) -> &TrainerDescriptor {
+                &DESC
+            }
+            fn validate(&self, _req: &TrainingRequest) -> gen_core::Result<()> {
+                Ok(())
+            }
+            fn train(
+                &mut self,
+                req: &TrainingRequest,
+                on_progress: &mut dyn FnMut(TrainingProgress),
+            ) -> gen_core::Result<TrainingOutput> {
+                self.train_with_report(req, on_progress)
+                    .map(|report| report.output)
+            }
+            fn train_with_report(
+                &mut self,
+                _req: &TrainingRequest,
+                _on_progress: &mut dyn FnMut(TrainingProgress),
+            ) -> gen_core::Result<TrainingReport> {
+                Ok(TrainingReport {
+                    output: TrainingOutput {
+                        adapter_path: PathBuf::from("/out/x.safetensors"),
+                        steps: 1,
+                        final_loss: 0.5,
+                    },
+                    warnings: vec![gen_core::train::preview_sample_failed(1, 1, &"boom")],
+                })
+            }
+        }
+        let mut t = LazyTrainer::new(DESC, gen_core::train::validate_training_techniques, || {
+            Ok(Reporting)
+        });
+        let report = t.train_with_report(&request(), &mut |_| {}).unwrap();
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(
+            report.warnings[0].code,
+            gen_core::train::PREVIEW_SAMPLE_FAILED
+        );
+        assert_eq!(t.train(&request(), &mut |_| {}).unwrap().steps, 1);
     }
 }

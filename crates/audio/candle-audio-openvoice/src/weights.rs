@@ -15,6 +15,7 @@ use std::path::Path;
 
 use candle_audio::candle_core::pickle::PthTensors;
 use candle_audio::candle_core::{DType, Device, Tensor};
+use candle_audio::neural_codec::resolve_weight_norm;
 use candle_audio::{AudioError, Result};
 use candle_nn::VarBuilder;
 
@@ -40,33 +41,9 @@ pub fn load_state_dict(pth: &Path, device: &Device) -> Result<HashMap<String, Te
             .to_device(device)?;
         raw.insert(name.clone(), t);
     }
-    resolve_weight_norm(raw)
-}
-
-/// Fold every `X.weight_g` / `X.weight_v` pair into `X.weight = g · v / ‖v‖` (norm per out-channel —
-/// all dims except 0, the torch `weight_norm(dim=0)` default). Non-paired tensors pass through
-/// unchanged.
-fn resolve_weight_norm(raw: HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
-    let mut out = HashMap::with_capacity(raw.len());
-    let g_suffix = ".weight_g";
-    for (name, tensor) in &raw {
-        if let Some(base) = name.strip_suffix(g_suffix) {
-            let v = raw
-                .get(&format!("{base}.weight_v"))
-                .ok_or_else(|| AudioError::Msg(format!("{base}: weight_g without weight_v")))?;
-            // ‖v‖ over all dims except 0, kept broadcastable against v.
-            let mut sq = v.sqr()?;
-            for d in 1..v.rank() {
-                sq = sq.sum_keepdim(d)?;
-            }
-            let norm = sq.sqrt()?;
-            let w = v.broadcast_mul(&tensor.broadcast_div(&norm)?)?;
-            out.insert(format!("{base}.weight"), w);
-        } else if !name.ends_with(".weight_v") {
-            out.insert(name.clone(), tensor.clone());
-        }
-    }
-    Ok(out)
+    // `X.weight_g` / `X.weight_v` pairs folded by the shared commons resolver (sc-27269) — the
+    // same `v · (g / ‖v‖)` math and order this port used to carry privately.
+    Ok(resolve_weight_norm(raw)?)
 }
 
 /// A [`VarBuilder`] over the resolved state dict, rooted at the top (`dec.*`, `enc_q.*`, `flow.*`,

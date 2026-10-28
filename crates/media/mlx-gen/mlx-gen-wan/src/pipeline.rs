@@ -18,6 +18,7 @@ use mlx_rs::memory::{get_active_memory, get_memory_limit};
 use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
+use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tiling::{
     budgeted_plan, SpatialTiling, TemporalOverlapPolicy, TileCandidates, TilingBudgetError,
@@ -29,10 +30,6 @@ use crate::scheduler::{compute_sigmas, make_scheduler, SolverKind, WanScheduler}
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
 use crate::vae22::Wan22Vae;
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// Align a pixel dimension **down** to a multiple of `patch · vae_stride` (the reference rounds the
 /// requested size to the nearest valid grid; sub-tile requests are rejected by `validate`).
@@ -1195,13 +1192,15 @@ pub fn denoise_curated(
     let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
     let nt = num_train_timesteps as f32;
     mlx_gen::run_flow_sampler(
-        Some(sampler_name),
+        mlx_gen::SamplerRun {
+            sampler_name: Some(sampler_name),
+            sigmas: &sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         mlx_gen::TimestepConvention::Sigma,
-        &sigmas,
         init_noise.clone(),
-        seed,
-        cancel,
-        on_progress,
         |x, sigma| {
             // Wan feeds the DiT the integer-valued timestep `(σ·num_train).trunc()`, not raw σ.
             let t = (sigma * nt).trunc();
@@ -1476,13 +1475,15 @@ pub fn denoise_moe_curated(
     let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
     let nt = num_train_timesteps as f32;
     mlx_gen::run_flow_sampler(
-        Some(sampler_name),
+        mlx_gen::SamplerRun {
+            sampler_name: Some(sampler_name),
+            sigmas: &sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         mlx_gen::TimestepConvention::Sigma,
-        &sigmas,
         init_noise.clone(),
-        seed,
-        cancel,
-        on_progress,
         |x, sigma| {
             let t = (sigma * nt).trunc();
             let (e, cache) = if t >= boundary_timestep {
@@ -1524,13 +1525,15 @@ pub(crate) fn denoise_moe_curated_swapped(
     let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
     let nt = num_train_timesteps as f32;
     let result = mlx_gen::run_flow_sampler(
-        Some(sampler_name),
+        mlx_gen::SamplerRun {
+            sampler_name: Some(sampler_name),
+            sigmas: &sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         mlx_gen::TimestepConvention::Sigma,
-        &sigmas,
         init_noise.clone(),
-        seed,
-        cancel,
-        on_progress,
         |x, sigma| {
             let t = (sigma * nt).trunc();
             let wants_high = t >= boundary_timestep;
@@ -1672,33 +1675,12 @@ pub fn decode_to_frames_22(
 }
 
 /// Split a `[F, H, W, 3]` `uint8` video tensor (the [`decode_to_frames`] output) into one
-/// [`Image`] per frame. The tensor is transpose-strided, so a raw `as_slice` would read the
-/// physical (pre-transpose) buffer — `reshape` first re-materializes it in logical C-order, then we
-/// chunk the contiguous bytes `H·W·3` at a time (see `mlx_rs_as_slice_physical_buffer`).
+/// [`Image`] per frame. Delegates to the shared [`mlx_gen::image::u8_frames_to_images`] (sc-27319):
+/// shape-checked, forced to logical row-major order before the host read (the tensor is
+/// transpose-strided), and split frame-major as `[F, H·W·3]` so a clip past `i32::MAX` total
+/// elements still renders (sc-12748).
 pub fn frames_to_images(frames_u8: &Array) -> Result<Vec<Image>> {
-    let sh = frames_u8.shape(); // [F, H, W, 3]
-    let (f, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
-    // sc-12748: reshape to the frame-major `[F, H·W·C]` — the natural per-frame layout. This collapses
-    // the (transpose-strided) H/W/C axes, which forces a contiguous logical-order copy (`as_slice`
-    // returns the physical buffer), and it never forms the full `f·h·w·c` product — `f` stays its own
-    // dim and the inner `h·w·c` is a single frame (≤ ~1e8 even at 8K, well within i32). This retires
-    // the F-070 `reshape(-1)` workaround: on the pinned MLX 0.32.0 fork, a multi-dimensional reshape
-    // whose individual dimensions fit i32 is exact past an `i32::MAX` total (verified in
-    // `mlx-gen/tests/mlx_write_bound_probe.rs`; a single `reshape(-1)` dimension still raises). Thus
-    // `f·h·w·3 > i32::MAX` (1920×1088@349f ≈ 2.19e9; 4K@89f) now renders rather than overflowing.
-    // Byte-identical to the old reshape below-bound.
-    let per = (h as i64 * w as i64 * c as i64) as usize;
-    let flat = frames_u8.reshape(&[f, h * w * c])?;
-    let bytes = flat.as_slice::<u8>();
-    let mut out = Vec::with_capacity(f as usize);
-    for i in 0..f as usize {
-        out.push(Image {
-            width: w as u32,
-            height: h as u32,
-            pixels: bytes[i * per..(i + 1) * per].to_vec(),
-        });
-    }
-    Ok(out)
+    mlx_gen::image::u8_frames_to_images(frames_u8)
 }
 
 /// `[d0, d1, ...]` → `[1, d0, d1, ...]` (prepend a batch axis).

@@ -378,16 +378,8 @@ pub(crate) fn silu_glue(x: &mlx_rs::Array) -> mlx_gen::Result<mlx_rs::Array> {
 
 #[cfg(test)]
 mod sc2963 {
-    use mlx_rs::{random, Array, Dtype};
-
-    fn max_abs(a: &Array, b: &Array) -> f32 {
-        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
-        mlx_rs::ops::max(&d, None)
-            .unwrap()
-            .as_dtype(Dtype::Float32)
-            .unwrap()
-            .item::<f32>()
-    }
+    use mlx_gen::testing::max_abs_diff;
+    use mlx_rs::{random, Dtype};
 
     // sc-2963 invariant: the compiled SiLU is **bit-identical** to the eager core SiLU in **fp16**
     // (the precision-load-bearing UNet dtype) AND f32 — `max|Δ|=0`. SDXL's fp16 golden matches the
@@ -407,7 +399,7 @@ mod sc2963 {
             let compiled = super::silu_glue(&x).unwrap();
             super::set_compile_glue(false);
             assert_eq!(compiled.dtype(), dt, "silu_glue preserves dtype {dt:?}");
-            let d = max_abs(&compiled, &eager);
+            let d = max_abs_diff(&compiled, &eager);
             let rel = mlx_gen::nn::max_rel_diff(&compiled, &eager);
             println!("[sdxl silu {dt:?}] max|Δ|={d:.3e} rel|Δ|={rel:.3e}");
             // sc-12747: under MLX 0.32.0 the compiled SiLU rounds ~1 ULP-f32 differently from eager
@@ -448,7 +440,7 @@ mod sc2963 {
         )
         .unwrap();
         for _ in 0..2 {
-            assert_eq!(max_abs(&super::silu_glue(&x).unwrap(), &eager), 0.0);
+            assert_eq!(max_abs_diff(&super::silu_glue(&x).unwrap(), &eager), 0.0);
         }
         let report = scope.finish();
         for disposition in [
@@ -479,7 +471,7 @@ mod sc2963 {
             &[RETAINED_COMPILATION],
         )
         .unwrap();
-        assert_eq!(max_abs(&super::silu_glue(&x).unwrap(), &eager), 0.0);
+        assert_eq!(max_abs_diff(&super::silu_glue(&x).unwrap(), &eager), 0.0);
         let next = next.finish();
         assert!(next.counters.iter().any(|counter| matches!(
             counter,
@@ -491,7 +483,7 @@ mod sc2963 {
         )));
 
         let baseline = diagnostics::begin_request("sdxl-oneshot-silu", "sdxl").unwrap();
-        assert_eq!(max_abs(&super::silu_glue(&x).unwrap(), &eager), 0.0);
+        assert_eq!(max_abs_diff(&super::silu_glue(&x).unwrap(), &eager), 0.0);
         let baseline = baseline.finish();
         assert!(baseline.counters.iter().any(|counter| matches!(
             counter,
