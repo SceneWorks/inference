@@ -18,7 +18,6 @@
 use std::path::Path;
 
 use crate::support::{cosine, iou, max_abs_diff};
-use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::default_device;
 use candle_gen_sam3::{Sam3GeometryConfig, Sam3GeometryEncoder, Sam3ImageSegmenter, Weights};
 

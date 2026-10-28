@@ -13,7 +13,6 @@
 use std::path::Path;
 
 use crate::support::iou;
-use candle_gen::candle_core::Tensor;
 use candle_gen::default_device;
 use candle_gen_sam3::{Sam3ImageSegmenter, Weights};
 

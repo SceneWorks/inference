@@ -14,7 +14,6 @@
 use std::path::Path;
 
 use crate::support::cosine;
-use candle_gen::candle_core::Tensor;
 use candle_gen::default_device;
 use candle_gen_sam3::{Sam3TextConfig, Sam3TextEncoder, Sam3Tokenizer, Weights};
 
