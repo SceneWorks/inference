@@ -164,11 +164,8 @@ fn safetensors_shards(dir: &Path, stem: &str) -> Result<Vec<PathBuf>> {
 }
 
 fn mmap_vb(paths: &[PathBuf], device: &Device) -> Result<VarBuilder<'static>> {
-    // Safety: mmap of pinned-SHA snapshot files the contract guarantees are not mutated.
-    unsafe {
-        VarBuilder::from_mmaped_safetensors(paths, DType::F32, device)
-            .map_err(|e| AudioError::Msg(format!("mmap safetensors: {e}")))
-    }
+    candle_audio::weights::mmap_var_builder(paths, DType::F32, device)
+        .map_err(|e| AudioError::Msg(format!("mmap safetensors: {e}")))
 }
 
 impl AceStepPipeline {

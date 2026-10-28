@@ -1359,29 +1359,3 @@ fn validate_request_rejects_late_conditioning_shape_errors_preflight() {
     ]);
     assert!(err.contains("replace_person latent frame index 7"), "{err}");
 }
-
-#[test]
-fn frames_to_images_splits_per_frame() {
-    // (F=2, H=1, W=2, 3): each frame = 6 bytes.
-    let data: Vec<u8> = (0..12).collect();
-    let frames = Array::from_slice(&data, &[2, 1, 2, 3]);
-    let imgs = frames_to_images(&frames).unwrap();
-    assert_eq!(imgs.len(), 2);
-    assert_eq!((imgs[0].width, imgs[0].height), (2, 1));
-    assert_eq!(imgs[0].pixels, vec![0, 1, 2, 3, 4, 5]);
-    assert_eq!(imgs[1].pixels, vec![6, 7, 8, 9, 10, 11]);
-}
-
-#[test]
-fn frames_to_images_reads_a_strided_view_logically() {
-    // Physical (3, F=2, H=1, W=2) planes → logical (F, H, W, 3) through a transpose view; a raw
-    // `as_slice` would return the planes in physical order.
-    let planes: Vec<u8> = (0..12).collect();
-    let frames = Array::from_slice(&planes, &[3, 2, 1, 2])
-        .transpose_axes(&[1, 2, 3, 0])
-        .unwrap();
-    frames.eval().unwrap();
-    let imgs = frames_to_images(&frames).unwrap();
-    assert_eq!(imgs[0].pixels, vec![0, 4, 8, 1, 5, 9]);
-    assert_eq!(imgs[1].pixels, vec![2, 6, 10, 3, 7, 11]);
-}

@@ -3,9 +3,10 @@
 //! to exercise MMDiT masking). A correct forward matching end-to-end validates the double/single
 //! blocks, pruned-adaLN slice offsets, RoPE, masking, and the pruned `norm_out`.
 
+use mlx_gen::testing::max_abs;
 use mlx_gen::weights::Weights;
 use mlx_gen_chroma::{ChromaTransformer, ChromaTransformerConfig};
-use mlx_rs::ops::{abs, max, subtract};
+use mlx_rs::ops::subtract;
 
 fn tiny_cfg() -> ChromaTransformerConfig {
     ChromaTransformerConfig {
@@ -20,10 +21,6 @@ fn tiny_cfg() -> ChromaTransformerConfig {
         approximator_hidden_dim: 16,
         approximator_layers: 2,
     }
-}
-
-fn max_abs(a: &mlx_rs::Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
 }
 
 #[ignore = "model inference; explicit model-proof workflow"]

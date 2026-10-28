@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::require_env_path;
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::load_vae;
 use mlx_rs::ops::{multiply, sqrt, sum};
@@ -21,10 +22,6 @@ fn cosine(a: &Array, b: &Array) -> f32 {
     let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
     let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
     (dot / (na * nb)).item::<f32>()
-}
-
-fn snapshot_dir() -> PathBuf {
-    PathBuf::from(std::env::var("BOOGU_BASE_DIR").expect("set BOOGU_BASE_DIR to the snapshot root"))
 }
 
 fn golden_path() -> PathBuf {
@@ -40,7 +37,11 @@ fn golden_path() -> PathBuf {
 #[ignore = "needs real weights + golden (tools/dump_boogu_vae_golden.py)"]
 fn vae_decode_matches_reference() {
     let g = Weights::from_file(golden_path()).expect("golden — run tools/dump_boogu_vae_golden.py");
-    let vae = load_vae(snapshot_dir()).expect("load Boogu FLUX.1 VAE");
+    let vae = load_vae(require_env_path(
+        "BOOGU_BASE_DIR",
+        "the Boogu snapshot root",
+    ))
+    .expect("load Boogu FLUX.1 VAE");
 
     // `Vae::decode` de-normalizes (z/scaling + shift) internally, so feed the raw latent.
     let out = vae.decode(g.require("z").unwrap()).unwrap();
@@ -65,7 +66,11 @@ fn vae_decode_matches_reference() {
 #[ignore = "needs real weights + golden (tools/dump_boogu_vae_golden.py)"]
 fn vae_encode_matches_reference() {
     let g = Weights::from_file(golden_path()).expect("golden — run tools/dump_boogu_vae_golden.py");
-    let vae = load_vae(snapshot_dir()).expect("load Boogu FLUX.1 VAE");
+    let vae = load_vae(require_env_path(
+        "BOOGU_BASE_DIR",
+        "the Boogu snapshot root",
+    ))
+    .expect("load Boogu FLUX.1 VAE");
 
     // img2img path: encoder → posterior mean → (mean − shift) · scaling.
     let out = vae.encode(g.require("img_in").unwrap()).unwrap();

@@ -12,7 +12,7 @@
 
 use mlx_gen::gen_core::sampling::TimestepConvention;
 use mlx_gen::image::{decoded_to_image, decoded_to_rgba_image};
-use mlx_gen::sampler::run_flow_sampler;
+use mlx_gen::sampler::{run_flow_sampler, SamplerRun};
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{CancelFlag, Error, GenerationRequest, Image, Progress, Result, RgbaImage};
@@ -534,13 +534,15 @@ pub fn denoise_reported(
         }
     };
     run_flow_sampler(
-        inputs.sampler,
+        SamplerRun {
+            sampler_name: inputs.sampler,
+            sigmas: inputs.sigmas,
+            seed: inputs.seed,
+            cancel: inputs.cancel,
+            on_progress,
+        },
         TimestepConvention::Sigma,
-        inputs.sigmas,
         inputs.latents,
-        inputs.seed,
-        inputs.cancel,
-        on_progress,
         predict,
     )
 }

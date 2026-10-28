@@ -3,11 +3,10 @@
 //! (the fork's `nn.quantize` predicate hits every Linear); they are not LoRA targets (Z-Image LoRAs
 //! hit the DiT).
 
-use mlx_rs::ops::multiply;
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::nn::silu;
+use mlx_gen::nn::SwiGluMlp;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -15,11 +14,9 @@ use super::join;
 
 pub(crate) const QUANTIZATION_LINEAR_PATHS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
-pub struct TextMlp {
-    gate: AdaptableLinear,
-    up: AdaptableLinear,
-    down: AdaptableLinear,
-}
+/// The shared [`SwiGluMlp`] (sc-27326) loaded through Z-Image's packed-detect text seam; runs the
+/// plain (activation-dtype) projection forward.
+pub struct TextMlp(SwiGluMlp);
 
 impl TextMlp {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
@@ -28,29 +25,25 @@ impl TextMlp {
         let lin = |name: &str| {
             crate::quant::lin(w, &join(prefix, name), crate::quant::TEXT_LINEAR_HAS_BIAS)
         };
-        Ok(Self {
-            gate: lin(QUANTIZATION_LINEAR_PATHS[0])?,
-            up: lin(QUANTIZATION_LINEAR_PATHS[1])?,
-            down: lin(QUANTIZATION_LINEAR_PATHS[2])?,
-        })
+        Ok(Self(SwiGluMlp::new(
+            lin(QUANTIZATION_LINEAR_PATHS[0])?,
+            lin(QUANTIZATION_LINEAR_PATHS[1])?,
+            lin(QUANTIZATION_LINEAR_PATHS[2])?,
+        )))
     }
 
     /// Quantize the three projections to Q4/Q8 (group_size 64) — the fork quantizes every Linear
     /// in the text encoder. Activations run f32 here, so the quantized matmuls need no dtype guard.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        for lin in [&mut self.gate, &mut self.up, &mut self.down] {
-            lin.quantize(bits, None)?;
-        }
-        Ok(())
+        self.0.quantize(bits, None)
     }
 
     /// The three projections, in `gate, up, down` order (iOS quantum accounting reads their shapes).
     pub(crate) fn projections(&self) -> [&AdaptableLinear; 3] {
-        [&self.gate, &self.up, &self.down]
+        self.0.projections()
     }
 
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let gated = multiply(&silu(&self.gate.forward(x)?)?, &self.up.forward(x)?)?;
-        self.down.forward(&gated)
+        self.0.forward(x)
     }
 }

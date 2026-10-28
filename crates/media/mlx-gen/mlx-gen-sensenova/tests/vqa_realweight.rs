@@ -10,13 +10,8 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::require_env_path;
 use mlx_gen_sensenova::{loader::load_raw, text::load_tokenizer, NeoChatConfig, Sampler, T2iModel};
-
-fn snapshot_dir() -> PathBuf {
-    PathBuf::from(std::env::var("SENSENOVA_SNAPSHOT").expect(
-        "set SENSENOVA_SNAPSHOT to the SenseNova-U1-8B-MoT snapshot dir; inference never self-fetches or derives a cache location (epic 13657)",
-    ))
-}
 
 fn fixture() -> PathBuf {
     PathBuf::from(concat!(
@@ -28,7 +23,7 @@ fn fixture() -> PathBuf {
 #[test]
 #[ignore = "needs the local 35GB checkpoint + dumped golden; run with --ignored"]
 fn vqa_realweight_matches_reference() {
-    let snap = snapshot_dir();
+    let snap = require_env_path("SENSENOVA_SNAPSHOT", "the SenseNova-U1-8B-MoT snapshot dir");
     let fix = fixture();
     if !snap.exists() || !fix.exists() {
         eprintln!(
@@ -145,7 +140,7 @@ fn vqa_realweight_matches_reference() {
 #[test]
 #[ignore = "needs the local 35GB checkpoint; run with --ignored"]
 fn vqa_primes_no_think_on_small_budget() {
-    let snap = snapshot_dir();
+    let snap = require_env_path("SENSENOVA_SNAPSHOT", "the SenseNova-U1-8B-MoT snapshot dir");
     if !snap.exists() {
         eprintln!("skipping: snapshot missing at {}", snap.display());
         crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in vqa_primes_no_think_on_small_budget; see preceding skip diagnostic");

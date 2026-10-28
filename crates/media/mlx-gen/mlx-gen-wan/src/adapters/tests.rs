@@ -2,6 +2,56 @@ use super::*;
 use mlx_rs::ops::{all_close, array_eq};
 use std::path::PathBuf;
 
+/// sc-27451: `apply_recorded` attributes each spec's share of the running report, and
+/// `adapter_apply_reports` folds the per-expert shares into one load-order entry per spec
+/// (summing applied, unioning skipped) — host bookkeeping only, no tensors.
+#[test]
+fn adapter_apply_reports_fold_per_spec_outcomes_across_experts() {
+    let specs = vec![
+        AdapterSpec::new(PathBuf::from("shared.safetensors"), 1.0, AdapterKind::Lora),
+        AdapterSpec::new(PathBuf::from("low.safetensors"), 1.0, AdapterKind::Lora)
+            .with_moe_expert(MoeExpert::Low),
+    ];
+
+    let mut high = WanLoraReport::default();
+    apply_recorded(&mut high, 0, |r| {
+        r.applied += 3;
+        r.skipped.push("blocks.0.x".into());
+        Ok(())
+    })
+    .unwrap();
+    let mut low = WanLoraReport::default();
+    apply_recorded(&mut low, 0, |r| {
+        r.applied += 2;
+        r.skipped.push("blocks.0.x".into());
+        Ok(())
+    })
+    .unwrap();
+    apply_recorded(&mut low, 1, |r| {
+        r.applied += 5;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!((low.applied, low.applicable), (7, 2));
+    assert_eq!(
+        low.per_spec[1],
+        WanSpecOutcome {
+            spec_index: 1,
+            applied: 5,
+            skipped: vec![],
+        }
+    );
+
+    let reports =
+        adapter_apply_reports(&specs, &[high.per_spec.as_slice(), low.per_spec.as_slice()]);
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports[0].adapter_path, PathBuf::from("shared.safetensors"));
+    assert_eq!(reports[0].applied, 5, "a shared spec counts both experts");
+    assert_eq!(reports[0].skipped, vec!["blocks.0.x".to_string()]);
+    assert_eq!(reports[1].applied, 5);
+    assert!(reports[1].skipped.is_empty());
+}
+
 /// sc-4986 — retire the "does a lightx2v Lightning LoRA actually load through mlx-gen?" risk by
 /// running the **real** distill-LoRA file's keys through the genuine [`normalize_wan_key`] and
 /// asserting every module resolves to a valid Wan DiT target (`blocks.N.{self,cross}_attn.{q,k,v,o}`

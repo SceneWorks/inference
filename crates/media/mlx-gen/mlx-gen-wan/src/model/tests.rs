@@ -168,6 +168,7 @@ fn validate_refuses_conditioning_strength_on_a14b_i2v() {
         quant: None,
         offload_policy: OffloadPolicy::Resident,
         i2v_memory: None,
+        adapter_reports: Default::default(),
     };
     let reference = |strength: Option<f32>| Conditioning::Reference {
         image: dummy_image(),
@@ -451,6 +452,7 @@ fn wan_5b() -> Wan {
         memory_strategy: None,
         memory_tier: None,
         i2v_memory: None,
+        adapter_reports: Default::default(),
     }
 }
 
@@ -463,6 +465,7 @@ fn wan_t2v_14b() -> Wan14b {
         quant: None,
         offload_policy: OffloadPolicy::Resident,
         i2v_memory: None,
+        adapter_reports: Default::default(),
     }
 }
 
@@ -921,6 +924,7 @@ fn wan_5b_prequant(tmp: &tempfile::TempDir, adapters: Vec<AdapterSpec>) -> Wan {
         memory_strategy: None,
         memory_tier: None,
         i2v_memory: None,
+        adapter_reports: Default::default(),
     }
 }
 
@@ -939,6 +943,7 @@ fn wan_14b_prequant(tmp: &tempfile::TempDir, adapters: Vec<AdapterSpec>) -> Wan1
         quant: None,
         offload_policy: OffloadPolicy::Resident,
         i2v_memory: None,
+        adapter_reports: Default::default(),
     }
 }
 

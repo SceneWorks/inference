@@ -264640,10 +264640,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::apply_specs_empty_is_noop; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::apply_specs_empty_is_noop; positive source lineage from own candidate+case scan",
       "requirements": [],
       "case_generated_inputs": true
     }
@@ -264671,10 +264671,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::apply_specs_stacks_mixed_lora_and_lokr; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::apply_specs_stacks_mixed_lora_and_lokr; positive source lineage from own candidate+case scan",
       "requirements": []
     }
   },
@@ -264701,10 +264701,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::bfl_detection_unmatched_and_scale_zero; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::bfl_detection_unmatched_and_scale_zero; positive source lineage from own candidate+case scan",
       "requirements": [],
       "case_generated_inputs": true
     }
@@ -264732,10 +264732,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::fixed_prefix_lokr_kind_routes_keys_only_file_to_thirdparty; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::fixed_prefix_lokr_kind_routes_keys_only_file_to_thirdparty; positive source lineage from own candidate+case scan",
       "requirements": []
     }
   },
@@ -264762,10 +264762,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::kohya_equiv_to_peft_bit_exact; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::kohya_equiv_to_peft_bit_exact; positive source lineage from own candidate+case scan",
       "requirements": []
     }
   },
@@ -264792,10 +264792,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::kohya_scale_zero_is_bit_exact_noop; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::kohya_scale_zero_is_bit_exact_noop; positive source lineage from own candidate+case scan",
       "requirements": []
     }
   },
@@ -264822,10 +264822,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::lora_bf16_scalar_alpha_reads_without_panic; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::lora_bf16_scalar_alpha_reads_without_panic; positive source lineage from own candidate+case scan",
       "requirements": [],
       "case_generated_inputs": true
     }
@@ -264853,10 +264853,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::lora_peft_folds_bare_alpha_under_a_prefix; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::lora_peft_folds_bare_alpha_under_a_prefix; positive source lineage from own candidate+case scan",
       "requirements": [],
       "case_generated_inputs": true
     }
@@ -264884,10 +264884,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::lora_peft_honors_lora_adapter_metadata_alpha; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::lora_peft_honors_lora_adapter_metadata_alpha; positive source lineage from own candidate+case scan",
       "requirements": [],
       "case_generated_inputs": true
     }
@@ -264915,10 +264915,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "source-defined",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::lora_peft_transposes_and_folds_alpha; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::lora_peft_transposes_and_folds_alpha; positive source lineage from own candidate+case scan",
       "requirements": []
     }
   },
@@ -264952,10 +264952,10 @@
         "lib"
       ]
     },
-    "source": "crates/media/mlx-gen/src/adapters/loader.rs",
+    "source": "crates/media/mlx-gen/src/adapters/loader/tests.rs",
     "input_contract": {
       "fixture_kind": "external",
-      "source_identity": "crates/media/mlx-gen/src/adapters/loader.rs@sha256:8c623584af9561639b878a59d500939afb692b429009d0ecacbfa7f6ec94fb5d::adapters::loader::tests::peft_lora_adapter_metadata_ab; positive source lineage from own candidate+case scan",
+      "source_identity": "crates/media/mlx-gen/src/adapters/loader/tests.rs@sha256:4d512183ec16772dcaa4b736c1e5bc92474d4c8fe7ad4c04d65589154b0957a3::adapters::loader::tests::peft_lora_adapter_metadata_ab; positive source lineage from own candidate+case scan",
       "requirements": [
         {
           "slot": "path_0",

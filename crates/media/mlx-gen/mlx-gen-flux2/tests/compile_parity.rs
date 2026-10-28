@@ -5,10 +5,11 @@
 //! 1–2 ULP differently from eager. This gates the whole double+single-block composition on the
 //! committed tiny synthetic f32 config — in CI, no real checkpoint.
 
+use mlx_gen::testing::max_abs_diff;
 use mlx_gen::weights::Weights;
 use mlx_gen_flux2::transformer::set_compile_glue;
 use mlx_gen_flux2::{Flux2Config, Flux2Transformer};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
 /// Peak-relative f32 allowance for the tiny two-block whole-forward composition. The shared
 /// primitive contract is four ULP; the repository's established shallow whole-forward budget is
@@ -43,11 +44,6 @@ fn tiny_config() -> Flux2Config {
     }
 }
 
-fn max_abs(got: &Array, exp: &Array) -> f32 {
-    let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(got, exp).unwrap()).unwrap();
-    mlx_rs::ops::max(&d, None).unwrap().item::<f32>()
-}
-
 #[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn compiled_glue_matches_eager_within_f32_contract() {
@@ -74,7 +70,7 @@ fn compiled_glue_matches_eager_within_f32_contract() {
     assert_eq!(compiled.shape(), eager.shape(), "shape");
     assert_eq!(eager.dtype(), Dtype::Float32, "fixture output dtype");
     assert_eq!(compiled.dtype(), eager.dtype(), "compiled output dtype");
-    let d = max_abs(&compiled, &eager);
+    let d = max_abs_diff(&compiled, &eager);
     let rel = mlx_gen::nn::max_rel_diff(&compiled, &eager);
     println!("[flux2 compiled vs eager] max|Δ|={d:.3e} rel={rel:.3e}");
     assert!(

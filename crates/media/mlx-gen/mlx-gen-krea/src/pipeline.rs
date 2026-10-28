@@ -34,7 +34,7 @@ use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, LatentDecoder, PreviewSink,
-    Progress, Result, TimestepConvention, WeightsSource,
+    Progress, Result, SamplerRun, TimestepConvention, WeightsSource,
 };
 
 use std::path::Path;
@@ -97,13 +97,15 @@ where
     F: FnMut(&Array, f32) -> Result<Array>,
 {
     run_flow_sampler(
-        sampler,
+        SamplerRun {
+            sampler_name: sampler,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::Sigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         |x, timestep| {
             preview.emit(timestep, x);
             predict(x, timestep)
@@ -2805,13 +2807,15 @@ mod tests {
         let sigmas = [1.0_f32, 0.6, 0.0];
         let seed = 42;
         let direct = run_flow_sampler(
-            None,
+            SamplerRun {
+                sampler_name: None,
+                sigmas: &sigmas,
+                seed,
+                cancel: &CancelFlag::new(),
+                on_progress: &mut |_| {},
+            },
             TimestepConvention::Sigma,
-            &sigmas,
             init_noise(16, 16, seed).unwrap(),
-            seed,
-            &CancelFlag::new(),
-            &mut |_| {},
             zero_velocity,
         )
         .unwrap();

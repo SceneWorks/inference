@@ -12,8 +12,8 @@ use mlx_gen::media::Image;
 use mlx_gen::runtime::{AdapterSpec, CancelFlag};
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, Error, PreviewSink, Progress, Result, StagedHeavy,
-    TimestepConvention, WeightsSource,
+    resolve_flow_schedule, run_flow_sampler, Error, PreviewSink, Progress, Result, SamplerRun,
+    StagedHeavy, TimestepConvention, WeightsSource,
 };
 
 use crate::block_stream::BlockWindow;
@@ -371,13 +371,15 @@ impl AnimaPipeline {
             Ok(v.as_dtype(Dtype::Float32)?)
         };
         let final_latent = run_flow_sampler(
-            Some(sampler),
+            SamplerRun {
+                sampler_name: Some(sampler),
+                sigmas: &sigmas,
+                seed: 0,
+                cancel: &cancel,
+                on_progress: &mut prog,
+            },
             TimestepConvention::Sigma,
-            &sigmas,
             init.clone(),
-            0,
-            &cancel,
-            &mut prog,
             predict,
         )?;
         Ok((final_latent, captures.into_inner()))
@@ -427,13 +429,15 @@ where
     F: FnMut(&Array, f32) -> Result<Array>,
 {
     run_flow_sampler(
-        sampler,
+        SamplerRun {
+            sampler_name: sampler,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::Sigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         |x, timestep| {
             preview.emit(timestep, x);
             predict(x, timestep)
@@ -1098,13 +1102,15 @@ pub(crate) fn render_latent_with_enc(
         Ok(v.as_dtype(Dtype::Float32)?)
     };
     run_flow_sampler(
-        Some(DEFAULT_SAMPLER),
+        SamplerRun {
+            sampler_name: Some(DEFAULT_SAMPLER),
+            sigmas: &sigmas,
+            seed,
+            cancel,
+            on_progress: &mut prog,
+        },
         TimestepConvention::Sigma,
-        &sigmas,
         init.clone(),
-        seed,
-        cancel,
-        &mut prog,
         predict,
     )
 }
@@ -1188,13 +1194,15 @@ mod tests {
         let seed = 16629;
         let initial = create_noise(seed, 16, 16).unwrap();
         let direct = run_flow_sampler(
-            Some(DEFAULT_SAMPLER),
+            SamplerRun {
+                sampler_name: Some(DEFAULT_SAMPLER),
+                sigmas: &sigmas,
+                seed,
+                cancel: &CancelFlag::new(),
+                on_progress: &mut |_| {},
+            },
             TimestepConvention::Sigma,
-            &sigmas,
             initial.clone(),
-            seed,
-            &CancelFlag::new(),
-            &mut |_| {},
             zero_velocity,
         )
         .unwrap();

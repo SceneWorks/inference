@@ -1095,13 +1095,15 @@ pub fn denoise_curated_with_preview(
     let preview_counter = mlx_gen::preview::PreviewCounter::new(sigmas);
     let mut evaluation = 0u64;
     mlx_gen::run_curated_sampler_with_latent_hook(
-        sampler_name,
+        mlx_gen::SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         ms,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         |latents, sigma| {
             crate::preview::emit_nhwc_ve_preview(preview, &preview_counter, sigmas, sigma, latents);
         },
@@ -1227,12 +1229,15 @@ pub fn denoise_cfgpp_with_preview(
     let preview_counter = mlx_gen::preview::PreviewCounter::new(sigmas);
     let mut evaluation = 0u64;
     mlx_gen::run_cfgpp_sampler_with_latent_hook(
-        base_sampler_name,
+        mlx_gen::SamplerRun {
+            sampler_name: base_sampler_name,
+            sigmas,
+            seed: 0,
+            cancel,
+            on_progress,
+        },
         ms,
-        sigmas,
         latents,
-        cancel,
-        on_progress,
         |latents, sigma| {
             crate::preview::emit_nhwc_ve_preview(preview, &preview_counter, sigmas, sigma, latents);
         },

@@ -29,16 +29,12 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Quant, Result};
 
 use crate::config::GptOssConfig;
 use crate::text_encoder::mxfp4::dequantize_mxfp4;
-
-/// A scalar `[1]` array for broadcasting multiplies.
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// `y = x · Wᵀ + b` for a stored `[out, in]` weight and `[out]` bias (the gpt-oss attention
 /// projections all have biases — `attention_bias: true`).
@@ -352,14 +348,9 @@ fn apply_half_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
 /// `repeat_kv`: expand `[B, kv, L, d]` to `[B, H, L, d]` by repeat-interleaving each KV head
 /// `H/kv` times (matching `transformers.repeat_kv`).
 fn repeat_kv(x: &Array, num_heads: i32) -> Result<Array> {
-    let sh = x.shape();
-    let (b, kv, l, d) = (sh[0], sh[1], sh[2], sh[3]);
-    if kv == num_heads {
-        return Ok(x.clone());
-    }
-    let n_rep = num_heads / kv;
-    let expanded = broadcast_to(&x.reshape(&[b, kv, 1, l, d])?, &[b, kv, n_rep, l, d])?;
-    Ok(expanded.reshape(&[b, num_heads, l, d])?)
+    // The head-major GQA expand is core's `qkv::repeat_kv` (sc-27429); `groups == 1` is the identity.
+    let kv = x.shape()[1];
+    mlx_gen::qkv::repeat_kv(x, num_heads / kv, mlx_gen::qkv::RotationAxes::HeadMajor)
 }
 
 /// Build the additive attention mask `[1, 1, L, L]` for a single un-padded sequence: causal, and —

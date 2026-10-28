@@ -27,14 +27,17 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy,
-    Precision, Progress, Quant, Result, WeightsSource,
+    AdapterApplyReport, AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
+    OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
 
-use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters};
+use crate::adapters::{
+    adapter_apply_reports, merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters,
+    WanSpecOutcome,
+};
 use crate::config::{WanModelConfig, WanVaceConfig};
 use crate::model::{is_wan_curated, moe_denoise_resident_bytes};
 use crate::pipeline::{
@@ -351,6 +354,9 @@ pub struct WanVace {
     /// load — the no-adapter path is byte-identical to pre-sc-3439.
     adapters: Vec<AdapterSpec>,
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
+    /// Per-adapter apply outcomes from the most recent adapter fold (sc-27451), published through
+    /// [`Generator::adapter_apply_reports`]; interior-mutable because the fold runs in `generate`.
+    adapter_reports: std::sync::Mutex<Vec<AdapterApplyReport>>,
 }
 
 impl WanVace {
@@ -388,6 +394,11 @@ impl WanVace {
                 self.adapters.len()
             )));
         }
+        *self
+            .adapter_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            adapter_apply_reports(&self.adapters, &[report.per_spec.as_slice()]);
         warn_skipped_adapters(MODEL_ID_VACE, &report.skipped);
         Ok(())
     }
@@ -432,6 +443,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         quantize: spec.quantize,
         adapters: spec.adapters.clone(),
         i2v_memory,
+        adapter_reports: Default::default(),
     }))
 }
 
@@ -454,6 +466,13 @@ fn preprocess_clip(frames: &[Image], width: u32, height: u32) -> Result<Array> {
 impl Generator for WanVace {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+        self.adapter_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
@@ -694,6 +713,10 @@ pub struct WanVaceFun {
     adapters: Vec<AdapterSpec>,
     offload_policy: OffloadPolicy,
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
+    /// Per-spec apply outcomes of the most recent fold onto each expert (`[high, low]`, sc-27451),
+    /// combined by [`Generator::adapter_apply_reports`]. `None` until that expert has been adapted.
+    /// Interior-mutable because the experts are built (and adapted) inside `generate`.
+    adapter_outcomes: std::sync::Mutex<[Option<Vec<WanSpecOutcome>>; 2]>,
 }
 
 impl WanVaceFun {
@@ -712,6 +735,13 @@ impl WanVaceFun {
             return Ok(0);
         }
         let report = merge_vace_adapters_expert(w, &self.adapters, expert)?;
+        let slot = match expert {
+            MoeExpert::High => 0,
+            MoeExpert::Low => 1,
+        };
+        self.adapter_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[slot] = Some(report.per_spec);
         warn_skipped_adapters(MODEL_ID_VACE_FUN, &report.skipped);
         Ok(report.applied)
     }
@@ -878,12 +908,25 @@ pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         offload_policy: spec.offload_policy,
         i2v_memory,
+        adapter_outcomes: Default::default(),
     }))
 }
 
 impl Generator for WanVaceFun {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+    fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+        let outcomes = self
+            .adapter_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let adapted: Vec<&[WanSpecOutcome]> =
+            outcomes.iter().flatten().map(Vec::as_slice).collect();
+        if adapted.is_empty() {
+            return Vec::new();
+        }
+        adapter_apply_reports(&self.adapters, &adapted)
     }
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
         validate_vace_clip(&self.descriptor, MODEL_ID_VACE_FUN, &self.config, req)

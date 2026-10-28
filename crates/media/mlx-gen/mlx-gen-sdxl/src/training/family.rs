@@ -743,6 +743,7 @@ pub fn train_family<H: SdxlFamilyHooks>(
     vae: &Autoencoder,
     req: &TrainingRequest,
     on_progress: &mut dyn FnMut(TrainingProgress),
+    warnings: &mut Vec<mlx_gen::gen_core::GenerationWarning>,
 ) -> Result<TrainingOutput> {
     let cfg = &req.config;
     let label = hooks.label();
@@ -1066,11 +1067,18 @@ pub fn train_family<H: SdxlFamilyHooks>(
                         prompt: prompt.clone(),
                         image,
                     }),
-                    Err(e) => eprintln!(
-                        "[sc-5637] {label} preview sample failed at step {step} \
-                         (prompt {}): {e} — skipping this preview, training continues",
-                        i + 1
-                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "[sc-5637] {label} preview sample failed at step {step} \
+                             (prompt {}): {e} — skipping this preview, training continues",
+                            i + 1
+                        );
+                        warnings.push(mlx_gen::gen_core::train::preview_sample_failed(
+                            step,
+                            i as u32 + 1,
+                            &e,
+                        ));
+                    }
                 }
             }
         }

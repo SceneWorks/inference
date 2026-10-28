@@ -4,24 +4,9 @@ use mlx_rs::Array;
 
 use mlx_gen::{Error, Result};
 
-/// `x[..., start..end, ...]` along `axis` (half-open), as a materialized copy.
-pub fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
-    let rank = x.shape().len() as i32;
-    if axis < 0 || axis >= rank {
-        return Err(Error::Msg(format!(
-            "minimax-h3 slice_axis: axis {axis} out of range for rank {rank}"
-        )));
-    }
-    let len = x.shape()[axis as usize];
-    if start < 0 || end > len || start > end {
-        return Err(Error::Msg(format!(
-            "minimax-h3 slice_axis: [{start}, {end}) out of range for axis {axis} of length {len}"
-        )));
-    }
-    let idx: Vec<i32> = (start..end).collect();
-    let idx = Array::from_slice(&idx, &[idx.len() as i32]);
-    Ok(x.take_axis(&idx, axis)?)
-}
+/// `x[..., start..end, ...]` along `axis` (half-open, `end` not `len`): the shared core
+/// [`mlx_gen::array::slice_range`] (sc-27448), re-exported under this crate's name.
+pub use mlx_gen::array::slice_range as slice_axis;
 
 /// Pack an NCTHW latent into ViT tokens `[B, T·H·W, C]`.
 ///

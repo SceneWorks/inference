@@ -42,6 +42,8 @@ default = ["training"]
 training = ["dep:image", "dep:mlx-gen-perceptual"]
 
 [dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }
 # Explicit native CPU stream pinning in the Metal-trapped quantum proofs.
 mlx-sys = { workspace = true }
 sha2 = { workspace = true }

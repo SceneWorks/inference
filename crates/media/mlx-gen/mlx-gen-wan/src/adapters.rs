@@ -47,7 +47,7 @@ use mlx_gen::adapters::loader::{
 use mlx_gen::adapters::{build_lokr_factors, AdaptableHost, Adapter};
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
-use mlx_gen::runtime::{AdapterKind, AdapterSpec, MoeExpert};
+use mlx_gen::runtime::{AdapterApplyReport, AdapterKind, AdapterSpec, MoeExpert};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -71,6 +71,73 @@ pub struct WanLoraReport {
     pub applicable: usize,
     /// LoRA module paths (normalized) that matched no weight in this checkpoint.
     pub skipped: Vec<String>,
+    /// The same outcome broken down per applicable spec, in apply order (sc-27451) — what the
+    /// providers fold into the contract's per-adapter `Generator::adapter_apply_reports`.
+    pub per_spec: Vec<WanSpecOutcome>,
+}
+
+/// One applicable spec's share of a [`WanLoraReport`] (sc-27451).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WanSpecOutcome {
+    /// Index of the spec in the `specs` slice the merge/install was given (load order).
+    pub spec_index: usize,
+    /// Module targets this spec merged/installed on this expert.
+    pub applied: usize,
+    /// This spec's normalized module paths that matched nothing on this expert.
+    pub skipped: Vec<String>,
+}
+
+/// Apply one spec through `apply` (a fold or an additive install) and record its per-spec share of
+/// `report` — the delta in `applied` / `skipped` that call produced (sc-27451).
+fn apply_recorded(
+    report: &mut WanLoraReport,
+    spec_index: usize,
+    apply: impl FnOnce(&mut WanLoraReport) -> Result<()>,
+) -> Result<()> {
+    let (applied_before, skipped_before) = (report.applied, report.skipped.len());
+    report.applicable += 1;
+    apply(report)?;
+    report.per_spec.push(WanSpecOutcome {
+        spec_index,
+        applied: report.applied - applied_before,
+        skipped: report.skipped[skipped_before..].to_vec(),
+    });
+    Ok(())
+}
+
+/// Fold one or more experts' per-spec outcomes ([`WanLoraReport::per_spec`]) into the contract's
+/// per-adapter outcomes, one per
+/// `specs` entry in load order (sc-27451): `applied` sums the spec's targets across the experts it
+/// reached (a shared spec on a dual-expert model counts both), `skipped` is the sorted, de-duplicated
+/// union of its unmatched paths. This is the engine-owned result `Generator::adapter_apply_reports`
+/// publishes — `warn_skipped_adapters` remains a secondary stderr log.
+pub(crate) fn adapter_apply_reports(
+    specs: &[AdapterSpec],
+    experts: &[&[WanSpecOutcome]],
+) -> Vec<AdapterApplyReport> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let mut applied = 0;
+            let mut skipped = Vec::new();
+            for outcome in experts
+                .iter()
+                .flat_map(|outcomes| outcomes.iter())
+                .filter(|outcome| outcome.spec_index == index)
+            {
+                applied += outcome.applied;
+                skipped.extend(outcome.skipped.iter().cloned());
+            }
+            skipped.sort();
+            skipped.dedup();
+            AdapterApplyReport {
+                adapter_path: spec.path.clone(),
+                applied,
+                skipped,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -503,8 +570,10 @@ fn merge_one_loha_thirdparty(
 /// Emit a single, uniform warning for adapter targets that aren't present in the loaded checkpoint —
 /// a *partial* skip, distinct from the hard "matched no module" error the model entries return. The
 /// three Wan `Generator` load paths (`model.rs` ×2, `model_vace.rs`) share this so the message can't
-/// drift (F-026); `eprintln!` is the only channel available at load time (no `Progress` callback, no
-/// workspace logging facade). A no-op when nothing was skipped.
+/// drift (sc-4031). The structured per-adapter outcome is published through
+/// `Generator::adapter_apply_reports` (sc-27451, built by [`adapter_apply_reports`]); this stderr
+/// line is kept as a secondary log for runs nobody inspects programmatically. A no-op when nothing
+/// was skipped.
 pub(crate) fn warn_skipped_adapters(model_id: &str, skipped: &[String]) {
     if skipped.is_empty() {
         return;
@@ -566,13 +635,12 @@ fn merge_adapters_into(
     normalize: fn(&str) -> String,
 ) -> Result<WanLoraReport> {
     let mut report = WanLoraReport::default();
-    for spec in specs.iter().filter(|s| s.moe_expert.is_none()) {
-        report.applicable += 1;
-        merge_one(w, spec, normalize, &mut report)?;
+    let indexed = || specs.iter().enumerate();
+    for (index, spec) in indexed().filter(|(_, s)| s.moe_expert.is_none()) {
+        apply_recorded(&mut report, index, |r| merge_one(w, spec, normalize, r))?;
     }
-    for spec in specs.iter().filter(|s| s.moe_expert == Some(expert)) {
-        report.applicable += 1;
-        merge_one(w, spec, normalize, &mut report)?;
+    for (index, spec) in indexed().filter(|(_, s)| s.moe_expert == Some(expert)) {
+        apply_recorded(&mut report, index, |r| merge_one(w, spec, normalize, r))?;
     }
     Ok(report)
 }
@@ -709,13 +777,16 @@ fn apply_additive_into(
     normalize: fn(&str) -> String,
 ) -> Result<WanLoraReport> {
     let mut report = WanLoraReport::default();
-    for spec in specs.iter().filter(|s| s.moe_expert.is_none()) {
-        report.applicable += 1;
-        install_one_additive(host, spec, normalize, &mut report)?;
+    let indexed = || specs.iter().enumerate();
+    for (index, spec) in indexed().filter(|(_, s)| s.moe_expert.is_none()) {
+        apply_recorded(&mut report, index, |r| {
+            install_one_additive(host, spec, normalize, r)
+        })?;
     }
-    for spec in specs.iter().filter(|s| s.moe_expert == Some(expert)) {
-        report.applicable += 1;
-        install_one_additive(host, spec, normalize, &mut report)?;
+    for (index, spec) in indexed().filter(|(_, s)| s.moe_expert == Some(expert)) {
+        apply_recorded(&mut report, index, |r| {
+            install_one_additive(host, spec, normalize, r)
+        })?;
     }
     Ok(report)
 }

@@ -89,7 +89,7 @@ use mlx_gen::train::vocab::{normalize_cfg, sample_timestep, validate_common_requ
 use mlx_gen::{
     CancelFlag, Error, Image, LoadSpec, Modality, NetworkType, Precision, Progress, Result,
     RgbaImage, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
-    TrainingOutput, TrainingProgress, TrainingRequest,
+    TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
@@ -1899,6 +1899,17 @@ impl Trainer for QwenImage21Trainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
@@ -1906,7 +1917,9 @@ impl Trainer for QwenImage21Trainer {
         // caller that skips it cannot slip a control or full-tune request through as a plain
         // text-to-image run (the candle twin does the same).
         self.validate(req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -1916,6 +1929,7 @@ impl QwenImage21Trainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         validate_request(req)?;
         // Edit mode is a different training input, so its floor is re-checked here rather than
@@ -2512,11 +2526,18 @@ impl QwenImage21Trainer {
                             image,
                         }),
                         Err(Error::Canceled) => break,
-                        Err(e) => eprintln!(
-                            "[sc-24159] {TRAINER_ID} preview sample failed at step {step} (prompt \
-                             {}): {e} — skipping this preview, training continues",
-                            i + 1
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[sc-24159] {TRAINER_ID} preview sample failed at step {step} \
+                                 (prompt {}): {e} — skipping this preview, training continues",
+                                i + 1
+                            );
+                            warnings.push(gen_core::train::preview_sample_failed(
+                                step,
+                                i as u32 + 1,
+                                &e,
+                            ));
+                        }
                     }
                 }
                 mlx_rs::memory::clear_cache();
@@ -3247,7 +3268,11 @@ mod tests {
         req.output_dir = out.path().to_path_buf();
         let mut events = Vec::new();
         let err = trainer
-            .train_impl(&req, &mut |p| events.push(format!("{p:?}")))
+            .train_impl(
+                &req,
+                &mut |p| events.push(format!("{p:?}")),
+                &mut Vec::new(),
+            )
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds"), "{err}");
@@ -3847,7 +3872,11 @@ mod tests {
         req.output_dir = out.path().to_path_buf();
         let mut events = Vec::new();
         let err = trainer
-            .train_impl(&req, &mut |p| events.push(format!("{p:?}")))
+            .train_impl(
+                &req,
+                &mut |p| events.push(format!("{p:?}")),
+                &mut Vec::new(),
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
         assert!(
@@ -5242,7 +5271,9 @@ mod adapter_noise_loop_tests {
             trigger_words: vec![],
             cancel: CancelFlag::new(),
         };
-        let result = trainer.train_impl(&req, &mut |_| {}).unwrap();
+        let result = trainer
+            .train_impl(&req, &mut |_| {}, &mut Vec::new())
+            .unwrap();
         assert_eq!(result.steps, steps);
         let saved = Array::load_safetensors(&result.adapter_path).unwrap();
         let params: LoraParams = saved

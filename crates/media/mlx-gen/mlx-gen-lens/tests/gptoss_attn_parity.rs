@@ -11,9 +11,9 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration gptoss_attn_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::config::GptOssConfig;
 use mlx_gen_lens::text_encoder::gpt_oss::{attention_mask, GptOssAttention};
@@ -22,12 +22,6 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/lens_gptoss_attn_golden.safetensors"
 );
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
-}
 
 #[test]
 #[ignore = "needs tools/golden/lens_gptoss_attn_golden.safetensors (dump_lens_gptoss_attn_golden.py)"]

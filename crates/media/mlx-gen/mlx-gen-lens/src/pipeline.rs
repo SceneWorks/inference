@@ -37,7 +37,7 @@ use mlx_gen::scheduler::compute_mu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, Error, Image,
-    MlxLatentOps, PreviewSink, Progress, Quant, Result, TimestepConvention,
+    MlxLatentOps, PreviewSink, Progress, Quant, Result, SamplerRun, TimestepConvention,
 };
 use mlx_gen_flux2::{load_vae, Flux2Vae};
 
@@ -836,13 +836,15 @@ impl LensHeavy {
         // `FlowMatchEuler::step` loop within the N1 parity tolerance.
         let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
         run_flow_sampler_with_latent_hook(
-            sampler_name,
+            SamplerRun {
+                sampler_name,
+                sigmas,
+                seed,
+                cancel,
+                on_progress: &mut on_progress,
+            },
             TimestepConvention::Sigma,
-            sigmas,
             init_latents.as_dtype(dtype)?,
-            seed,
-            cancel,
-            &mut on_progress,
             |latents, sigma| {
                 mlx_gen_flux2::preview::emit_flux_preview(
                     preview,
@@ -1248,33 +1250,19 @@ fn pad_mask(mask: &Array, cur: i32, target: i32) -> Result<Array> {
 
 /// Convert a decoded image `[1, H, W, 3]` (NHWC) in `[-1, 1]` to an RGB8 [`Image`]
 /// (`((x·0.5+0.5).clamp(0,1)·255).round()`), matching the reference `_to_pil` quantization.
+///
+/// Routed through the shared [`mlx_gen::image::decoded_to_image`] (sc-27437): the lazy NHWC→NCHW
+/// view below is transposed straight back by the shared helper, so the pixels are identical while
+/// the denormalize/clip/round/u8 chain, the f32 cast, and the batch / channel checks are the core
+/// ones rather than a private copy.
 pub(crate) fn decoded_to_image(decoded: &Array) -> Result<Image> {
-    let x = decoded.as_dtype(Dtype::Float32)?;
-    let half = Array::from_f32(0.5);
-    let x = mlx_rs::ops::add(&mlx_rs::ops::multiply(&x, &half)?, &half)?;
-    let x = mlx_rs::ops::clip(&x, (0.0, 1.0))?;
-    let x = mlx_rs::ops::round(&mlx_rs::ops::multiply(&x, Array::from_f32(255.0))?, 0)?;
-    let sh = x.shape();
-    // One image per call: reject B>1 instead of silently keeping only batch 0, and size in usize /
-    // flatten via -1 to avoid the u32/i32 product overflow at large resolutions (F-068).
-    if sh[0] != 1 {
+    let rank = decoded.shape().len();
+    if rank != 4 {
         return Err(Error::Msg(format!(
-            "lens decoded_to_image: expected batch size 1, got {}",
-            sh[0]
+            "lens decoded_to_image: expected a 4-D NHWC tensor, got rank {rank}"
         )));
     }
-    let (h, w, c) = (sh[1] as usize, sh[2] as usize, sh[3] as usize);
-    let n = h * w * c;
-    let flat = x.reshape(&[-1])?;
-    let pixels: Vec<u8> = flat.as_slice::<f32>()[..n]
-        .iter()
-        .map(|&v| v as u8)
-        .collect();
-    Ok(Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    })
+    mlx_gen::image::decoded_to_image(&decoded.transpose_axes(&[0, 3, 1, 2])?)
 }
 
 #[cfg(test)]

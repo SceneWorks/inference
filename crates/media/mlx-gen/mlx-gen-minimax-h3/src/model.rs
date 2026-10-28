@@ -2039,6 +2039,10 @@ const _: () = {
 /// errors. The rung semantics are not restated here: all three bodies delegate to
 /// [`crate::memory_strategy`], whose `strategies()` is the single declaration and whose
 /// `route_gate` is the single geometry predicate.
+/// [`GenerationReport::warnings`](mlx_gen::gen_core::GenerationReport::warnings) code: the text
+/// encoder's GPU view of its weights needed re-reads before it verified (sc-23053, sc-27451).
+pub const GPU_VISIBILITY_RECOVERED: &str = "gpu_visibility_recovered";
+
 impl Generator for MiniMaxH3 {
     fn veda_execution_report(&self) -> Option<mlx_gen::gen_core::VedaExecutionReport> {
         Some(self.veda_report.borrow().clone())
@@ -2058,6 +2062,31 @@ impl Generator for MiniMaxH3 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    /// The render plus its non-fatal warnings (sc-27451): GPU weight-visibility re-reads the text
+    /// encoder needed before its token table verified (sc-23053) are reported as a
+    /// [`GPU_VISIBILITY_RECOVERED`] warning, not only on stderr. The count is the same process-wide
+    /// `coherence::retries` delta the encoder logs.
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::GenerationReport> {
+        let before = mlx_gen::coherence::retries();
+        let output = self.generate_impl(req, on_progress)?;
+        let retries = mlx_gen::coherence::retries().saturating_sub(before);
+        let mut report = mlx_gen::gen_core::GenerationReport::from_output(output);
+        if retries != 0 {
+            report.warnings.push(mlx_gen::gen_core::GenerationWarning {
+                code: GPU_VISIBILITY_RECOVERED.to_owned(),
+                message: format!(
+                    "GPU weight visibility recovered after {retries} verification retries; \
+                     generation was not retried"
+                ),
+            });
+        }
+        Ok(report)
     }
 
     fn veda_workspace_bound(

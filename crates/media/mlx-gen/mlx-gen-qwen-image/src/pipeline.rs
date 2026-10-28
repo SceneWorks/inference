@@ -20,7 +20,7 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_scheduler_names, default_seed, resolve_flow_schedule, run_flow_sampler, CancelFlag,
     Error, FlowMatchEuler, GenerationRequest, Image, LatentDecoder, PreviewSink, Progress, Result,
-    TimestepConvention,
+    SamplerRun, TimestepConvention,
 };
 
 use crate::control_transformer::QwenFunControlBranch;
@@ -599,13 +599,15 @@ pub(crate) fn denoise_with_progress_windowed(
     // blended init latents are denoised from there (the fork's `init_time_step`). Cancellation, the
     // per-step `eval` (F-119), and progress live in `run_flow_sampler` (epic 7114 P3).
     run_flow_sampler(
-        sampler_name,
+        SamplerRun {
+            sampler_name,
+            sigmas: sliced,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::Sigma,
-        sliced,
         latents,
-        seed,
-        cancel,
-        on_progress,
         predict,
     )
 }
@@ -723,13 +725,15 @@ pub(crate) fn denoise_control_with_progress_windowed(
     };
     // Cancellation, the per-step `eval` (F-119), and progress live in `run_flow_sampler` (epic 7114).
     run_flow_sampler(
-        sampler_name,
+        SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::Sigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         predict,
     )
 }
@@ -856,13 +860,15 @@ pub(crate) fn denoise_edit_with_progress_windowed(
     // Cancellation, the per-step `eval` (the command-buffer-watchdog boundary), and progress live in
     // `run_flow_sampler` (epic 7114 P3).
     run_flow_sampler(
-        sampler_name,
+        SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::Sigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         predict,
     )
 }

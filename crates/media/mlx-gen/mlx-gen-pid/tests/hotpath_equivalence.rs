@@ -10,10 +10,9 @@
 //!   env var symmetrically with `decode`.
 
 use mlx_gen::decoder::LatentDecoder;
+use mlx_gen::testing::max_abs_diff;
 use mlx_gen::weights::Weights;
 use mlx_gen_pid::{ConvPadding, PidConfig, PidDecoder, PidNet, Sampler, SamplerConfig};
-use mlx_rs::ops::{abs, max, subtract};
-use mlx_rs::Array;
 
 /// The tiny latent-only config baked into `dump_pid_sampler.py` (matches `sampler_parity.rs`).
 fn tiny_cfg() -> PidConfig {
@@ -46,12 +45,6 @@ fn tiny_cfg() -> PidConfig {
 fn fixture() -> Weights {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     Weights::from_file(format!("{dir}/sampler_tiny.safetensors")).unwrap()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    max(abs(subtract(a, b).unwrap()).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
 }
 
 #[ignore = "model inference; explicit model-proof workflow"]

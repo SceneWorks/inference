@@ -7,23 +7,11 @@
 //!   SAM3_MEMORY_FIXTURE=scripts/spikes/sam3_oracle/memory_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration memory_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{cosine, item_f32};
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::Sam3Tracker;
-use mlx_rs::ops::{add, multiply, sqrt, sum};
-use mlx_rs::{Array, Dtype};
-
-fn scalar(a: &Array) -> f32 {
-    a.as_dtype(Dtype::Float32).unwrap().item::<f32>()
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.reshape(&[-1]).unwrap();
-    let b = b.reshape(&[-1]).unwrap();
-    let dot = scalar(&sum(multiply(&a, &b).unwrap(), None).unwrap());
-    let na = scalar(&sqrt(sum(multiply(&a, &a).unwrap(), None).unwrap()).unwrap());
-    let nb = scalar(&sqrt(sum(multiply(&b, &b).unwrap(), None).unwrap()).unwrap());
-    dot / (na * nb)
-}
+use mlx_rs::ops::add;
+use mlx_rs::Array;
 
 /// NCHW `[1,C,H,W]` fixture → NHWC `[1,H,W,C]` to match our layout.
 fn to_nhwc(a: &Array) -> Array {
@@ -44,7 +32,7 @@ fn memory_encoder_matches_oracle() {
 
     let pix_feat = to_nhwc(fx.require("pix_feat").unwrap()); // [1,72,72,256]
     let pred_high_res = fx.require("pred_masks_high_res").unwrap().clone(); // [1,1,1008,1008]
-    let obj_score = scalar(fx.require("object_score_logits").unwrap());
+    let obj_score = item_f32(fx.require("object_score_logits").unwrap());
 
     // --- Stage 1: mask prep (bilinear resize 1008→1152 + sigmoid/binarize + scale·20−10).
     for (key, is_pts) in [("mask_for_mem", false), ("mask_for_mem_bin", true)] {

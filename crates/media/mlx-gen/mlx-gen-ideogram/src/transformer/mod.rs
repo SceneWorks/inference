@@ -27,11 +27,5 @@ pub(crate) fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear
     crate::quant::lin(w, base, bias)
 }
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix (the DiT keys are top-level).
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;

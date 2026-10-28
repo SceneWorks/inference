@@ -42,22 +42,16 @@ pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 /// Load a Linear at `{prefix}.weight` (+ `{prefix}.bias` when `has_bias`) into an
 /// [`AdaptableLinear`] — the dense-or-quantizable base every transformer Linear uses, so the whole
 /// model can be Q8-quantized in place without touching the forward. Routes through
-/// [`crate::quant::lin`], which **auto-detects** a pre-quantized (packed) snapshot via
+/// [`mlx_gen::quant::lin`], which **auto-detects** a pre-quantized (packed) snapshot via
 /// `{prefix}.scales` and loads it packed with no dense transient (sc-8670); a dense snapshot loads
 /// dense exactly as before. The post-load `transformer.quantize(bits)` is a no-op on an
 /// already-packed module, so the same path serves both pre-quantized tiers and dense control loads.
 pub(crate) fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLinear> {
-    crate::quant::lin(w, prefix, has_bias)
+    mlx_gen::quant::lin(w, prefix, has_bias, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix.
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;
 
 /// sc-2963 shared helpers for the per-module compiled-glue bit-exactness tests (each submodule's
 /// private compiled chain — `modulate`/`gated` in [`block`], `gelu_ffn` in [`feed_forward`],
@@ -76,14 +70,5 @@ pub(crate) mod compile_test_util {
         };
         mlx_rs::transforms::eval([&x]).unwrap();
         x
-    }
-
-    pub(crate) fn max_abs(a: &Array, b: &Array) -> f32 {
-        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
-        mlx_rs::ops::max(&d, None)
-            .unwrap()
-            .as_dtype(Dtype::Float32)
-            .unwrap()
-            .item::<f32>()
     }
 }

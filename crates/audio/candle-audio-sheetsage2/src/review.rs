@@ -118,7 +118,8 @@ pub struct TranscriptionSettings {
     pub overlap_seconds: f64,
     /// Right-hand look-ahead of each non-final window, seconds.
     pub lookahead_seconds: f64,
-    /// Crop the source to this many seconds before transcribing.
+    /// Crop the source to this many seconds before transcribing. Uncropped (`None`, the default),
+    /// a source longer than [`crate::provider::MAX_SOURCE_LENGTH_S`] is refused.
     pub max_seconds: Option<f64>,
 }
 

@@ -8,14 +8,8 @@ use mlx_rs::Array;
 
 use mlx_gen::Result;
 
-/// `"{prefix}.{leaf}"` (or just `leaf` when `prefix` is empty).
-pub(crate) fn join(prefix: &str, leaf: &str) -> String {
-    if prefix.is_empty() {
-        leaf.to_string()
-    } else {
-        format!("{prefix}.{leaf}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;
 
 /// Permute a torch conv weight `[out, in, kH, kW]` (OIHW) → MLX `[out, kH, kW, in]` (OHWI).
 pub(crate) fn conv_w_ohwi(w: &Array) -> Result<Array> {

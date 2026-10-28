@@ -369,6 +369,188 @@ fn compiled_gated(args: (&Array, &Array, &Array)) -> std::result::Result<Array, 
     gated_impl(args)
 }
 
+/// Provider compiled-glue body: gated residual `x + y·gate` (argument order `(x, y, gate)`). The
+/// fn the LTX and Wan DiTs hand to `mx.compile` / `compile_retained` and run eagerly when the glue
+/// toggle is off — one shared definition so the fused and eager forms cannot drift (sc-27339).
+/// Distinct from this module's private `(x, gate, y)` [`gated`] body, whose operand order differs.
+pub fn gated_residual_impl(
+    (x, y, gate): (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    add(x, &multiply(y, gate)?)
+}
+
+/// Provider compiled-glue body: the tanh-GELU FFN activation, op-for-op the eager tail of
+/// [`gelu_tanh`] (dtype-preserving, f64-host `√(2/π)`, integer-exponent `x³`). The fn the LTX, Wan,
+/// FLUX.1 and Qwen-Image DiTs hand to `mx.compile` / `compile_retained` for their fused FFN
+/// activation, previously a private byte-identical copy in each (sc-27339).
+pub fn gelu_tanh_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
+    let dt = x.dtype();
+    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+    let x3 = power(x, Array::from_int(3))?;
+    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+    multiply(&multiply(x, &s(0.5)?)?, &gate)
+}
+
+/// A provider's three-input compiled-glue body (its adaLN `modulate`), the shape
+/// [`DitCompileGlue`] retains alongside the shared [`gated_residual_impl`] / [`gelu_tanh_ffn_impl`].
+pub type TernaryGlueFn = fn((&Array, &Array, &Array)) -> std::result::Result<Array, Exception>;
+
+/// Retained compiled handles a [`DitGlue`] owns — one per site, per thread.
+#[doc(hidden)]
+pub const DIT_GLUE_RETAINED_HANDLES: usize = 3;
+
+/// The retained handles of one family's adaLN-DiT glue trio: its own `modulate`, plus the shared
+/// gated residual and tanh-GELU FFN bodies.
+#[doc(hidden)]
+pub struct DitCompileGlue {
+    modulate: RetainedTernary,
+    gated: RetainedTernary,
+    gelu_ffn: RetainedUnary,
+}
+
+impl DitCompileGlue {
+    fn new(modulate_impl: TernaryGlueFn) -> Self {
+        Self {
+            modulate: RetainedTernary::new(compile_retained(modulate_impl, true)),
+            gated: RetainedTernary::new(compile_retained(gated_residual_impl, true)),
+            gelu_ffn: RetainedUnary::new(compile_retained(gelu_tanh_ffn_impl, true)),
+        }
+    }
+}
+
+/// The adaLN-DiT compiled-glue trio — `modulate`, gated residual, tanh-GELU FFN activation — with
+/// the retained / one-shot / eager dispatch the LTX and Wan transformers each carried a private copy
+/// of (sc-27339). Each family declares one `static` with its own diagnostic site names, its own
+/// `modulate` body (the one part that genuinely differs: Wan's `m·(1+e_scale)+e_shift` adds an f32
+/// `1`, LTX casts it to `scale`'s dtype) and its own thread-local slot, so the retained handles stay
+/// per family and per thread exactly as before. The compiled bodies, toggles and diagnostics are
+/// unchanged, so every dispatch arm is bit-identical to the per-crate copies.
+pub struct DitGlue {
+    modulate_site: &'static str,
+    gated_site: &'static str,
+    gelu_ffn_site: &'static str,
+    modulate_impl: TernaryGlueFn,
+    slot: &'static std::thread::LocalKey<RefCell<Option<DitCompileGlue>>>,
+}
+
+impl DitGlue {
+    /// `slot` is the family's own `thread_local!` (initially `None`), which owns its retained
+    /// handles.
+    pub const fn new(
+        sites: [&'static str; DIT_GLUE_RETAINED_HANDLES],
+        modulate_impl: TernaryGlueFn,
+        slot: &'static std::thread::LocalKey<RefCell<Option<DitCompileGlue>>>,
+    ) -> Self {
+        let [modulate_site, gated_site, gelu_ffn_site] = sites;
+        Self {
+            modulate_site,
+            gated_site,
+            gelu_ffn_site,
+            modulate_impl,
+            slot,
+        }
+    }
+
+    fn with_retained<T>(
+        &self,
+        f: impl FnOnce(&mut DitCompileGlue) -> std::result::Result<T, Exception>,
+    ) -> std::result::Result<T, Exception> {
+        prepare_retained_compilation_thread();
+        self.slot.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            f(slot.get_or_insert_with(|| DitCompileGlue::new(self.modulate_impl)))
+        })
+    }
+
+    fn ternary(
+        &self,
+        site: &'static str,
+        body: TernaryGlueFn,
+        retained: impl FnOnce(&mut DitCompileGlue) -> &mut RetainedTernary,
+        args: (&Array, &Array, &Array),
+    ) -> Result<Array> {
+        if compile_glue() {
+            if retained_compilation_requested() {
+                Ok(self.with_retained(|compiled| retained(compiled).call(site, args))?)
+            } else {
+                crate::diagnostics::record_compile(
+                    site,
+                    crate::diagnostics::CompileDisposition::OneShot,
+                );
+                Ok(compile(body, true)(args)?)
+            }
+        } else {
+            crate::diagnostics::record_fallback(site, "compiled_glue_disabled");
+            Ok(body(args)?)
+        }
+    }
+
+    /// The family's adaLN `modulate(x, scale, shift)`: one fused kernel when [`compile_glue`] is on.
+    pub fn modulate(&self, x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
+        self.ternary(
+            self.modulate_site,
+            self.modulate_impl,
+            |c| &mut c.modulate,
+            (x, scale, shift),
+        )
+    }
+
+    /// Gated residual `x + y·gate` ([`gated_residual_impl`]): one fused kernel when
+    /// [`compile_glue`] is on.
+    pub fn gated(&self, x: &Array, y: &Array, gate: &Array) -> Result<Array> {
+        self.ternary(
+            self.gated_site,
+            gated_residual_impl,
+            |c| &mut c.gated,
+            (x, y, gate),
+        )
+    }
+
+    /// The tanh-GELU FFN activation ([`gelu_tanh_ffn_impl`]): its ~8 elementwise ops fused into one
+    /// kernel when [`compile_glue`] is on; off ⇒ the eager [`gelu_tanh`], byte-for-byte the same.
+    pub fn gelu_ffn(&self, x: &Array) -> Result<Array> {
+        if !compile_glue() {
+            crate::diagnostics::record_fallback(self.gelu_ffn_site, "compiled_glue_disabled");
+            return gelu_tanh(x);
+        }
+        if retained_compilation_requested() {
+            Ok(self.with_retained(|compiled| compiled.gelu_ffn.call(self.gelu_ffn_site, x))?)
+        } else {
+            crate::diagnostics::record_compile(
+                self.gelu_ffn_site,
+                crate::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(gelu_tanh_ffn_impl, true)(x)?)
+        }
+    }
+
+    /// Exercise each of this family's retained handles once for the release memory audit.
+    #[doc(hidden)]
+    pub fn exercise_retained_compile_inventory(&self, input: &Array) -> Result<()> {
+        let output = self.with_retained(|compiled| {
+            compiled
+                .modulate
+                .call(self.modulate_site, (input, input, input))
+        })?;
+        output.eval()?;
+        drop(output);
+
+        let output = self.with_retained(|compiled| {
+            compiled.gated.call(self.gated_site, (input, input, input))
+        })?;
+        output.eval()?;
+        drop(output);
+
+        let output =
+            self.with_retained(|compiled| compiled.gelu_ffn.call(self.gelu_ffn_site, input))?;
+        output.eval()?;
+        drop(output);
+        Ok(())
+    }
+}
+
 fn rope_rotate_impl(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
     let (real, imag, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
     let out_real = subtract(&multiply(real, cos)?, &multiply(imag, sin)?)?;
@@ -1173,6 +1355,95 @@ pub fn apply_text_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     Ok(add(&multiply(x, &cos)?, &multiply(&rot, &sin)?)?)
 }
 
+/// HF **half-split** (NeoX) `rotate_half` on the **last** axis: `cat(-x[d/2:], x[:d/2])`, i.e.
+/// `[x1, x2] → [-x2, x1]`. Rank-agnostic. NOT the interleaved-pair rotation (seedvr2's DiT, PuLID's
+/// EVA-CLIP `rotate_half_interleaved`) — those are a different op. Shared by the bernini / boogu /
+/// pid / Qwen-style vision RoPEs that open-coded the identical `split` + `negative` + `concatenate`
+/// sequence (sc-27441).
+pub fn rotate_half(x: &Array) -> Result<Array> {
+    let ax = x.ndim() as i32 - 1;
+    let parts = mlx_rs::ops::split(x, 2, ax)?;
+    Ok(mlx_rs::ops::concatenate_axis(
+        &[&parts[1].negative()?, &parts[0]],
+        ax,
+    )?)
+}
+
+/// Vision-tower half-split RoPE computed **in f32** and cast back to `x`'s dtype:
+/// `x·cos + rotate_half(x)·sin`. `x` is `[heads, seq, head_dim]`; `cos`/`sin` are `[seq, head_dim]`
+/// and broadcast over the head axis. The exact op sequence of the Qwen2.5-VL (qwen-image) and
+/// Pixtral (flux2) vision attentions, which each carried a private copy (sc-27431).
+pub fn apply_rope_rotate_half_f32(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
+    let orig = x.dtype();
+    let xf = x.as_dtype(Dtype::Float32)?;
+    let cos = cos.expand_dims(0)?.as_dtype(Dtype::Float32)?; // [1, seq, hd]
+    let sin = sin.expand_dims(0)?.as_dtype(Dtype::Float32)?;
+    let rotated = rotate_half(&xf)?;
+    let out = add(&multiply(&xf, &cos)?, &multiply(&rotated, &sin)?)?;
+    Ok(out.as_dtype(orig)?)
+}
+
+/// Bias-free **SwiGLU** feed-forward `down(silu(gate(x)) · up(x))` over three
+/// [`AdaptableLinear`](crate::adapters::AdaptableLinear)s — the Qwen/Qwen3(-VL) text-encoder MLP the
+/// z-image, krea, boogu, ideogram and mage text encoders each re-declared (sc-27326). The provider
+/// loads the projections through its own seam (packed-detect vs dense, its group size) and picks the
+/// forward that matches its parity regime: [`forward`](Self::forward) (activation-dtype matmuls) or
+/// [`forward_upcast`](Self::forward_upcast). Same op sequence as each prior copy.
+pub struct SwiGluMlp {
+    gate: crate::adapters::AdaptableLinear,
+    up: crate::adapters::AdaptableLinear,
+    down: crate::adapters::AdaptableLinear,
+}
+
+impl SwiGluMlp {
+    /// Assemble from already-loaded `gate_proj` / `up_proj` / `down_proj`.
+    pub fn new(
+        gate: crate::adapters::AdaptableLinear,
+        up: crate::adapters::AdaptableLinear,
+        down: crate::adapters::AdaptableLinear,
+    ) -> Self {
+        Self { gate, up, down }
+    }
+
+    /// `down(silu(gate(x)) · up(x))` with each projection's plain
+    /// [`forward`](crate::adapters::AdaptableLinear::forward).
+    pub fn forward(&self, x: &Array) -> Result<Array> {
+        let gated = multiply(&silu(&self.gate.forward(x)?)?, &self.up.forward(x)?)?;
+        self.down.forward(&gated)
+    }
+
+    /// As [`forward`](Self::forward), through each projection's
+    /// [`forward_upcast`](crate::adapters::AdaptableLinear::forward_upcast).
+    pub fn forward_upcast(&self, x: &Array) -> Result<Array> {
+        let gated = multiply(
+            &silu(&self.gate.forward_upcast(x)?)?,
+            &self.up.forward_upcast(x)?,
+        )?;
+        self.down.forward_upcast(&gated)
+    }
+
+    /// Quantize all three projections to `bits` at `group_size` (`None` = the default 64).
+    pub fn quantize(&mut self, bits: i32, group_size: Option<i32>) -> Result<()> {
+        for lin in [&mut self.gate, &mut self.up, &mut self.down] {
+            lin.quantize(bits, group_size)?;
+        }
+        Ok(())
+    }
+
+    /// The three projections, in `gate, up, down` order.
+    pub fn projections(&self) -> [&crate::adapters::AdaptableLinear; 3] {
+        [&self.gate, &self.up, &self.down]
+    }
+
+    /// Materialize the three projections' (lazy) weights.
+    pub fn materialize_weights(&self) -> Result<()> {
+        for lin in self.projections() {
+            lin.materialize_weights()?;
+        }
+        Ok(())
+    }
+}
+
 /// Grouped-query-attention key/value expansion: `[b, s, hkv, hd]` → `[b, s, hkv·groups, hd]`,
 /// repeating each kv head `groups` times consecutively (`repeat_interleave` over the head axis,
 /// matching `mx.repeat(x, groups, axis=2)` / torch `enable_gqa`). `groups == 1` is the identity.
@@ -1297,6 +1568,46 @@ mod tests {
     use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
     use mlx_rs::ops::{abs, array_eq, max, subtract};
     use mlx_rs::Dtype;
+
+    /// sc-27453: the Wan / Z-Image / Qwen-Image RoPE glue computed the imaginary part as
+    /// `real·sin + imag·cos`, core [`rope_rotate`] as `imag·cos + real·sin`. IEEE addition is
+    /// commutative, so the two are bit-identical — eager and compiled (no fused-multiply-add
+    /// contraction reorders the products inside the fused kernel; retained handles compile the same
+    /// kernel, and the runtime-macos audit counts every literal retained constructor). Pins
+    /// the premise that let those crates drop their private copies.
+    #[test]
+    fn rope_rotate_imag_operand_order_is_bit_irrelevant() {
+        fn sin_first(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
+            let (real, imag, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+            let out_real = subtract(&multiply(real, cos)?, &multiply(imag, sin)?)?;
+            let out_imag = add(&multiply(real, sin)?, &multiply(imag, cos)?)?;
+            Ok(vec![out_real, out_imag])
+        }
+        let same = |a: &[Array], b: &[Array]| {
+            a.iter()
+                .zip(b)
+                .all(|(x, y)| array_eq(x, y, None).unwrap().item::<bool>())
+        };
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            let args: Vec<Array> = (0..4u64)
+                .map(|i| {
+                    let key = mlx_rs::random::key(0x2745_3000 + i).unwrap();
+                    mlx_rs::random::normal::<f32>(&[4, 64, 512], None, None, Some(&key))
+                        .unwrap()
+                        .as_dtype(dtype)
+                        .unwrap()
+                })
+                .collect();
+            assert!(same(
+                &rope_rotate_impl(&args).unwrap(),
+                &sin_first(&args).unwrap()
+            ));
+            assert!(same(
+                &compile(rope_rotate_impl, true)(&args).unwrap(),
+                &compile(sin_first, true)(&args).unwrap()
+            ));
+        }
+    }
 
     // The retained handles are thread-local, but the trace probes behind [`COMPILE_TRACE_COUNTS`]
     // are process-global: every test that resets, asserts, or increments them must hold this lock,

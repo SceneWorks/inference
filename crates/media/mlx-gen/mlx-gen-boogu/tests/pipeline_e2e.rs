@@ -8,13 +8,10 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::require_env_path;
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::tokenizer::BooguTokenizer;
 use mlx_gen_boogu::{BooguPipeline, EditOptions, GenerateOptions, TurboOptions};
-
-fn snapshot_dir() -> PathBuf {
-    PathBuf::from(std::env::var("BOOGU_BASE_DIR").expect("set BOOGU_BASE_DIR to the snapshot root"))
-}
 
 fn turbo_dir() -> PathBuf {
     PathBuf::from(
@@ -30,7 +27,7 @@ fn turbo_dir() -> PathBuf {
 fn edit_dir() -> PathBuf {
     std::env::var("BOOGU_EDIT_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| snapshot_dir())
+        .unwrap_or_else(|_| require_env_path("BOOGU_BASE_DIR", "the Boogu snapshot root"))
 }
 
 fn golden_path() -> PathBuf {
@@ -48,7 +45,11 @@ fn golden_path() -> PathBuf {
 #[ignore = "needs the mllm tokenizer + golden (tools/golden_dump.py)"]
 fn tokenizer_matches_golden() {
     let g = Weights::from_file(golden_path()).expect("golden — run tools/golden_dump.py");
-    let tok = BooguTokenizer::from_snapshot(snapshot_dir()).expect("load mllm tokenizer");
+    let tok = BooguTokenizer::from_snapshot(require_env_path(
+        "BOOGU_BASE_DIR",
+        "the Boogu snapshot root",
+    ))
+    .expect("load mllm tokenizer");
 
     let ids = tok.t2i_ids("a red apple on a wooden table").unwrap();
     let want: Vec<i32> = g
@@ -71,7 +72,11 @@ fn tokenizer_matches_golden() {
 #[test]
 #[ignore = "needs real weights (128 GB Mac): set BOOGU_BASE_DIR"]
 fn t2i_smoke() {
-    let pipe = BooguPipeline::from_snapshot(snapshot_dir()).expect("load Boogu pipeline");
+    let pipe = BooguPipeline::from_snapshot(require_env_path(
+        "BOOGU_BASE_DIR",
+        "the Boogu snapshot root",
+    ))
+    .expect("load Boogu pipeline");
     let opts = GenerateOptions {
         height: 512,
         width: 512,
@@ -160,7 +165,11 @@ fn edit_smoke() {
     // Reference image (T2I) on Base, in a scope so the Base pipeline (~40 GB) is dropped before the
     // Edit pipeline loads — keeps peak memory at one pipeline, not two.
     let ref_img = {
-        let base = BooguPipeline::from_snapshot(snapshot_dir()).expect("load Boogu Base pipeline");
+        let base = BooguPipeline::from_snapshot(require_env_path(
+            "BOOGU_BASE_DIR",
+            "the Boogu snapshot root",
+        ))
+        .expect("load Boogu Base pipeline");
         base.generate(
             "a red apple on a wooden table",
             &GenerateOptions {

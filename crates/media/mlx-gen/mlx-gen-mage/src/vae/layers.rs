@@ -114,14 +114,12 @@ impl Linear {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        if self.in_features % 64 == 0 {
-            self.inner.quantize(bits, None)?;
-        }
+        self.inner.quantize_if_aligned(bits, None)?;
         Ok(())
     }
 
     pub(crate) fn quantization_count(&self) -> (usize, usize) {
-        if self.in_features % 64 == 0 {
+        if mlx_gen::quant::is_quant_aligned(self.in_features, mlx_gen::quant::DEFAULT_GROUP_SIZE) {
             (1, usize::from(self.inner.is_quantized()))
         } else {
             (0, 0)

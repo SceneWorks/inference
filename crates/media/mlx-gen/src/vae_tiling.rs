@@ -21,7 +21,7 @@
 //! layer-wise tiling ([`GlobalGroupNorm`] + [`tiled_conv2d_3x3_nhwc`]), which partitions each 3×3
 //! convolution into halo-expanded cores and needs no blend at all.
 
-use crate::array::scalar;
+use crate::array::{scalar, slice_range};
 use crate::tiling::{AxisTile, TilePlan, MAX_WRITABLE_ELEMS};
 use crate::{CancelFlag, Error, Result};
 use mlx_rs::ops::{add, concatenate_axis, divide, maximum, multiply, pad, rsqrt, subtract};
@@ -150,7 +150,7 @@ fn half_precision_group_stats(
         .map(|y0| (y0, (y0 + rows_per_chunk).min(height)))
         .collect::<Vec<_>>();
     let grouped_f32 = |y0: i32, y1: i32| -> Result<Array> {
-        Ok(slice_axis(x, 1, y0, y1)?
+        Ok(slice_range(x, 1, y0, y1)?
             .as_dtype(mlx_rs::Dtype::Float32)?
             .reshape(&[batch, y1 - y0, width, groups, group_size])?
             .transpose_axes(&[0, 3, 1, 2, 4])?)
@@ -302,13 +302,13 @@ fn tiled_conv2d_3x3_impl(
             let input_x0 = (x0 - HALO).max(0);
             let input_x1 = (x1 + HALO).min(width);
 
-            let tile = slice_axis(x, 1, input_y0, input_y1)?;
-            let tile = slice_axis(&tile, 2, input_x0, input_x1)?;
+            let tile = slice_range(x, 1, input_y0, input_y1)?;
+            let tile = slice_range(&tile, 2, input_x0, input_x1)?;
             let convolved = convolve(&tile)?;
             let crop_y0 = y0 - input_y0;
             let crop_x0 = x0 - input_x0;
-            let core = slice_axis(&convolved, 1, crop_y0, crop_y0 + (y1 - y0))?;
-            let core = slice_axis(&core, 2, crop_x0, crop_x0 + (x1 - x0))?;
+            let core = slice_range(&convolved, 1, crop_y0, crop_y0 + (y1 - y0))?;
+            let core = slice_range(&core, 2, crop_x0, crop_x0 + (x1 - x0))?;
             // Cast per core, not after concatenate: the full assembled image stays at storage width.
             let core = to_storage(core)?;
             core.eval()?;
@@ -372,12 +372,6 @@ pub fn check_output_writable(full_elems: i64, out_f: i32, out_h: i32, out_w: i32
         )));
     }
     Ok(())
-}
-
-/// Gather the contiguous range `[start, end)` along `axis` (mlx-rs has no slice op). Layout-agnostic.
-fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), axis)?)
 }
 
 /// `[1; rank]` with `len` placed at `axis` — a 1-D vector reshaped to broadcast along its own axis.
@@ -655,9 +649,9 @@ pub fn tiled_decode_with_finalizer(
                 // Fold one tile in. The inner scope owns every tile-local handle so they are dropped
                 // before `materialize`/`release` run — the accumulators are all that stay live.
                 let folded = (|| -> Result<()> {
-                    let tile = slice_axis(denorm, t_ax, t.start, t.end)?;
-                    let tile = slice_axis(&tile, h_ax, hh.start, hh.end)?;
-                    let tile = slice_axis(&tile, w_ax, ww.start, ww.end)?;
+                    let tile = slice_range(denorm, t_ax, t.start, t.end)?;
+                    let tile = slice_range(&tile, h_ax, hh.start, hh.end)?;
+                    let tile = slice_range(&tile, w_ax, ww.start, ww.end)?;
                     let dec = decode_tile(&tile)?;
 
                     let ds = dec.shape();
@@ -701,9 +695,9 @@ pub fn tiled_decode_with_finalizer(
                     );
                     let blend = multiply(&multiply(&tm, &hm)?, &wm)?;
 
-                    let dec = slice_axis(&dec, t_ax, 0, at)?;
-                    let dec = slice_axis(&dec, h_ax, 0, ah)?;
-                    let dec = slice_axis(&dec, w_ax, 0, aw)?;
+                    let dec = slice_range(&dec, t_ax, 0, at)?;
+                    let dec = slice_range(&dec, h_ax, 0, ah)?;
+                    let dec = slice_range(&dec, w_ax, 0, aw)?;
                     let weighted = multiply(&dec, &blend)?;
 
                     // Stage 1 — place along w only, into the w-full strip.
@@ -1336,9 +1330,9 @@ mod tests {
         for t in &plan.t {
             for hh in &plan.h {
                 for ww in &plan.w {
-                    let tile = slice_axis(denorm, t_ax, t.start, t.end)?;
-                    let tile = slice_axis(&tile, h_ax, hh.start, hh.end)?;
-                    let tile = slice_axis(&tile, w_ax, ww.start, ww.end)?;
+                    let tile = slice_range(denorm, t_ax, t.start, t.end)?;
+                    let tile = slice_range(&tile, h_ax, hh.start, hh.end)?;
+                    let tile = slice_range(&tile, w_ax, ww.start, ww.end)?;
                     let dec = decode_tile(&tile)?;
                     let ds = dec.shape();
                     let rank = ds.len();
@@ -1358,9 +1352,9 @@ mod tests {
                         &axis_broadcast_shape(rank, w_ax, aw),
                     );
                     let blend = multiply(&multiply(&tm, &hm)?, &wm)?;
-                    let dec = slice_axis(&dec, t_ax, 0, at)?;
-                    let dec = slice_axis(&dec, h_ax, 0, ah)?;
-                    let dec = slice_axis(&dec, w_ax, 0, aw)?;
+                    let dec = slice_range(&dec, t_ax, 0, at)?;
+                    let dec = slice_range(&dec, h_ax, 0, ah)?;
+                    let dec = slice_range(&dec, w_ax, 0, aw)?;
                     let weighted = multiply(&dec, &blend)?;
                     let mut pads = vec![(0, 0); rank];
                     pads[t_ax as usize] = (t.out_start, plan.out_f - (t.out_start + at));
@@ -1899,7 +1893,7 @@ mod tests {
             // per-axis extent bookkeeping must catch a decoder that is not separable.
             if calls.get() == 2 {
                 let ds = decoded.shape();
-                return slice_axis(&decoded, axes[2], 0, ds[axes[2] as usize] - 1);
+                return slice_range(&decoded, axes[2], 0, ds[axes[2] as usize] - 1);
             }
             Ok(decoded)
         });
@@ -2297,7 +2291,7 @@ mod tests {
             for _ in 0..5 {
                 measured = measured.max(
                     crate::ios_quantum::measured_peak_bytes(|| {
-                        let tile = slice_axis(&slice_axis(&x, 1, 0, crop)?, 2, 0, crop)?;
+                        let tile = slice_range(&slice_range(&x, 1, 0, crop)?, 2, 0, crop)?;
                         let tile = if normalized {
                             silu(&norm.apply(&tile)?)?
                         } else {
@@ -2308,7 +2302,8 @@ mod tests {
                         } else {
                             crate::nn::conv2d(&tile, &w, Some(&b), 1, 1)?
                         };
-                        let core = slice_axis(&slice_axis(&out, 1, 1, crop - 1)?, 2, 1, crop - 1)?;
+                        let core =
+                            slice_range(&slice_range(&out, 1, 1, crop - 1)?, 2, 1, crop - 1)?;
                         Ok(vec![if f32_accum {
                             core.as_dtype(dtype)?
                         } else {

@@ -739,20 +739,28 @@ pub fn tokenize_str(text: &str) -> [u32; CONTEXT_LENGTH] {
 /// `resize_mode: squash`), scale to `[0,1]`, normalize with the OpenAI-CLIP [`CLIP_MEAN`]/[`CLIP_STD`].
 /// Uses `CatmullRom` as a bicubic approximation (see module doc): faithful for already-384 input,
 /// slightly approximate otherwise.
-pub fn frames_to_clip_input(frames: &[image::RgbImage], device: &Device) -> CResult<Tensor> {
+///
+/// Generic over the pixel container so callers can pass owned [`image::RgbImage`]s or borrowed
+/// views; an already-384 frame is read in place rather than cloned.
+pub fn frames_to_clip_input<C: std::ops::Deref<Target = [u8]>>(
+    frames: &[image::ImageBuffer<image::Rgb<u8>, C>],
+    device: &Device,
+) -> CResult<Tensor> {
     use image::imageops::FilterType;
     let sz = IMAGE_SIZE as u32;
     let hw = IMAGE_SIZE * IMAGE_SIZE;
     let mut buf: Vec<f32> = Vec::with_capacity(frames.len() * IN_CHANS * hw);
     for frame in frames {
-        let resized = if frame.dimensions() == (sz, sz) {
-            frame.clone()
+        let resized;
+        let raw: &[u8] = if frame.dimensions() == (sz, sz) {
+            frame.as_raw()
         } else {
-            image::imageops::resize(frame, sz, sz, FilterType::CatmullRom)
+            resized = image::imageops::resize(frame, sz, sz, FilterType::CatmullRom);
+            resized.as_raw()
         };
-        // channel-major (C, H, W)
+        // channel-major (C, H, W); `raw` is row-major interleaved RGB, the `pixels()` order.
         for c in 0..IN_CHANS {
-            for px in resized.pixels() {
+            for px in raw.chunks_exact(3) {
                 let v = (px[c] as f32) / 255.0;
                 buf.push((v - CLIP_MEAN[c]) / CLIP_STD[c]);
             }

@@ -52,6 +52,7 @@ use mlx_gen_minimax_h3::adapters::{
 use mlx_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig, SMALLEST_LEGAL_FRAMES};
 
 use common::{dit_fixture_config, DIT_FIXTURE};
+use mlx_gen::testing::max_abs;
 
 /// The published rank — every one of the seven turbo files is rank 128. Used verbatim in the tiny
 /// fixtures so the folds asserted below are the *published* numbers (1.0 and 0.0625) and not a
@@ -176,16 +177,6 @@ fn probe_residual(cfg: &MiniMaxH3DitConfig, lora: &Path, scale: f32, x: &Array) 
         .forward(x)
         .expect("adapted forward");
     subtract(&y1, &y0).expect("residual")
-}
-
-fn max_abs(a: &Array) -> f32 {
-    a.abs()
-        .unwrap()
-        .max(None)
-        .unwrap()
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .item::<f32>()
 }
 
 /// **The alpha gate.** All three published spellings, over the committed fixture, at strength 1.0:

@@ -10,7 +10,7 @@
 //! The 3-D RoPE / positions for the visual grid are built **inside** [`MochiTransformer3DModel::forward`]
 //! from the geometry (`f`/`ph`/`pw`), so the pipeline only supplies the latent + conditioning.
 
-use mlx_rs::ops::{add, concatenate_axis, divide, maximum, minimum, multiply};
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::{CancelFlag, Error, Image, Progress, Result};
@@ -18,19 +18,6 @@ use mlx_gen::{CancelFlag, Error, Image, Progress, Result};
 use crate::scheduler::{cfg_combine, MochiScheduler};
 use crate::transformer::MochiTransformer3DModel;
 use crate::vae::{MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES};
-
-/// `[v]` as a length-1 `Array` (small scalar helper for the uint8 conversion).
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
-
-/// Force a logically-contiguous copy: host reads (`as_slice`) return the *physical* buffer, so an
-/// array left strided by the `(F,H,W,C)` transpose reads scrambled. sc-12748: delegates to the shared
-/// int64-safe [`mlx_gen::array::contiguous`] (Mochi's RGB output stays under `i32::MAX` at its 848×480
-/// design point, but this keeps every video model on one materialization helper).
-fn contiguous(x: &Array) -> Result<Array> {
-    mlx_gen::array::contiguous(x)
-}
 
 /// N-step 1st-order FlowMatchEuler **true-CFG** denoise (Mochi is not distilled).
 ///
@@ -102,54 +89,16 @@ pub fn decode_to_frames(
 }
 
 /// `(1, 3, F, H, W)` video in ~[-1, 1] → `(F, H, W, 3)` uint8. Mirrors the reference
-/// `((x + 1) / 2).clamp(0, 1)·255` with a truncating cast (saturating at 255).
+/// `((x + 1) / 2).clamp(0, 1)·255` + round. The body is the shared
+/// [`mlx_gen::image::video_bcfhw_to_u8_frames`] (identical to LTX's; sc-27319).
 pub fn to_uint8_frames(video: &Array) -> Result<Array> {
-    let sh = video.shape(); // (1, 3, F, H, W)
-    if sh[0] != 1 {
-        return Err(Error::Msg(format!(
-            "mochi to_uint8_frames: batch size must be 1, got {}",
-            sh[0]
-        )));
-    }
-    let (c, f, h, w) = (sh[1], sh[2], sh[3], sh[4]);
-    let dt = video.dtype();
-    let chw = video
-        .reshape(&[c, f, h, w])?
-        .transpose_axes(&[1, 2, 3, 0])?; // (F, H, W, 3)
-    let half = divide(
-        &add(&chw, &scalar(1.0).as_dtype(dt)?)?,
-        &scalar(2.0).as_dtype(dt)?,
-    )?;
-    let clipped = minimum(
-        &maximum(&half, &scalar(0.0).as_dtype(dt)?)?,
-        &scalar(1.0).as_dtype(dt)?,
-    )?;
-    let scaled = multiply(&clipped, &scalar(255.0).as_dtype(dt)?)?;
-    contiguous(&mlx_rs::ops::round(&scaled, None)?.as_dtype(Dtype::Uint8)?)
+    mlx_gen::image::video_bcfhw_to_u8_frames(video, "mochi to_uint8_frames")
 }
 
-/// `(F, H, W, 3)` uint8 → one [`Image`] per frame.
+/// `(F, H, W, 3)` uint8 → one [`Image`] per frame, via the shared shape-checked, logical-order
+/// [`mlx_gen::image::u8_frames_to_images`] (sc-27319).
 pub fn frames_to_images(frames: &Array) -> Result<Vec<Image>> {
-    let sh = frames.shape(); // (F, H, W, 3)
-    if sh.len() != 4 || sh[3] != 3 {
-        return Err(Error::Msg(format!(
-            "mochi frames_to_images: expected (F, H, W, 3) uint8, got {sh:?}"
-        )));
-    }
-    let (fr, h, w) = (sh[0] as usize, sh[1] as u32, sh[2] as u32);
-    // `as_slice` reads the physical buffer: force logical row-major order so a strided view (a
-    // caller's transpose, or a future `decode_to_frames` that drops its trailing `contiguous`) is
-    // read correctly rather than scrambled.
-    let owned = contiguous(&frames.as_dtype(Dtype::Uint8)?)?;
-    let data = owned.as_slice::<u8>();
-    let per = (h as usize) * (w as usize) * 3;
-    Ok((0..fr)
-        .map(|i| Image {
-            width: w,
-            height: h,
-            pixels: data[i * per..(i + 1) * per].to_vec(),
-        })
-        .collect())
+    mlx_gen::image::u8_frames_to_images(frames)
 }
 
 #[cfg(test)]
@@ -167,34 +116,5 @@ mod tests {
         assert_eq!(out.shape(), &[1, 1, 2, 3]);
         let px: Vec<u8> = out.as_slice::<u8>().to_vec();
         assert_eq!(px, vec![0, 0, 128, 255, 255, 255]);
-    }
-
-    /// `frames_to_images` splits `(F, H, W, 3)` into per-frame RGB8 `Image`s.
-    #[test]
-    fn frames_to_images_splits_per_frame() {
-        // 2 frames, 1×1, 3 channels.
-        let f = Array::from_slice(&[10u8, 20, 30, 40, 50, 60], &[2, 1, 1, 3]);
-        let imgs = frames_to_images(&f).unwrap();
-        assert_eq!(imgs.len(), 2);
-        assert_eq!(imgs[0].width, 1);
-        assert_eq!(imgs[0].height, 1);
-        assert_eq!(imgs[0].pixels, vec![10, 20, 30]);
-        assert_eq!(imgs[1].pixels, vec![40, 50, 60]);
-    }
-
-    /// A permuted (non-row-contiguous) `(F, H, W, 3)` view is split in LOGICAL order, not the
-    /// physical buffer order a raw `as_slice` would return.
-    #[test]
-    fn frames_to_images_reads_a_strided_view_logically() {
-        // Physical (3, F=2, H=1, W=2) planes → logical (F, H, W, 3) through a transpose view.
-        let planes: Vec<u8> = (0..12).collect();
-        let f = Array::from_slice(&planes, &[3, 2, 1, 2])
-            .transpose_axes(&[1, 2, 3, 0])
-            .unwrap();
-        f.eval().unwrap();
-        let imgs = frames_to_images(&f).unwrap();
-        // Frame 0 pixel (0,0) = channels (0, 4, 8), pixel (0,1) = (1, 5, 9); frame 1 offsets by 2.
-        assert_eq!(imgs[0].pixels, vec![0, 4, 8, 1, 5, 9]);
-        assert_eq!(imgs[1].pixels, vec![2, 6, 10, 3, 7, 11]);
     }
 }

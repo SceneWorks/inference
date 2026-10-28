@@ -27,7 +27,7 @@ use mlx_gen::{
     require_control, run_flow_sampler_with_latent_hook, Capabilities, Conditioning,
     ConditioningKind, ControlBranch, Error, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
-    Result, TimestepConvention,
+    Result, SamplerRun, TimestepConvention,
 };
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
@@ -497,13 +497,15 @@ impl Flux2DevControl {
                     let denoise_sigmas = &sched.sigmas[start_step..];
                     let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
                     let final_latents = run_flow_sampler_with_latent_hook(
-                        sampler_name,
+                        SamplerRun {
+                            sampler_name,
+                            sigmas: denoise_sigmas,
+                            seed,
+                            cancel: &req.cancel,
+                            on_progress,
+                        },
                         TimestepConvention::Sigma,
-                        denoise_sigmas,
                         latents,
-                        seed,
-                        &req.cancel,
-                        on_progress,
                         |latents, sigma| {
                             crate::preview::emit_flux_preview(
                                 &req.preview,

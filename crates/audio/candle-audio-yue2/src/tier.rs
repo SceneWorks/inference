@@ -622,9 +622,8 @@ fn assemble(
         .map(|t| (t.name.as_str(), t.sha256.as_str()))
         .collect();
     let path = lm.weights_path().expect("YuE2-3B has a weights file");
-    // SAFETY: the file was just verified and is only read; same contract as every Candle load.
-    let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(path) }
-        .map_err(candle_run("open original"))?;
+    // The file was just verified and is only read.
+    let st = candle_audio::weights::mmap_safetensors(path).map_err(candle_run("open original"))?;
     let mut out: HashMap<String, Tensor> = HashMap::with_capacity(plan.len());
     let mut entries = Vec::with_capacity(plan.len());
     for t in &plan {

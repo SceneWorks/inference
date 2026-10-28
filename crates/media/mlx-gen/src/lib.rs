@@ -64,6 +64,11 @@ pub mod sampler;
 pub mod sc20686;
 pub mod scheduler;
 pub mod text_sample;
+// The Qwen3-style text-encoder decoder block (sc-27326), shared by the decoder-LM text encoders.
+pub mod text_decoder;
+// Shared test-only comparison helpers (sc-27323); opt-in via the `test-support` feature.
+#[cfg(feature = "test-support")]
+pub mod testing;
 // Native packed W4A8 (asym_w4a8_int8) projections (sc-26685): the descriptor-driven consume side of
 // the frozen Comfy Kitchen PR#90 dialect, sharing the S4 ConvRot activation kernels.
 pub mod w4a8_int8;
@@ -148,13 +153,14 @@ pub use sampler::{
     run_av_curated_sampler, run_cfgpp_sampler, run_cfgpp_sampler_with_latent_hook,
     run_curated_sampler, run_curated_sampler_with_latent_hook, run_flow_sampler,
     run_flow_sampler_with_latent_hook, AlphaSchedule, AvLatents, DiffusionSampler,
-    FlowMatchSampler, LcmSampler, LightningSampler, MlxAvLatentOps, MlxLatentOps, TcdSampler,
+    FlowMatchSampler, LcmSampler, LightningSampler, MlxAvLatentOps, MlxLatentOps, SamplerRun,
+    TcdSampler,
 };
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling, VideoDecodeMemoryProfile};
 pub use train::{
     LrSchedule, NetworkType, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
-    TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest,
+    TrainingItem, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
 };
 pub use transform::{
     InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,

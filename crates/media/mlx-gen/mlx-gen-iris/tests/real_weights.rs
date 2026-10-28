@@ -24,6 +24,7 @@ use mlx_gen_iris::{
 use mlx_rs::Dtype;
 
 use crate::common::{assert_close, cpu_process, errors, fixtures, host_i32};
+use mlx_gen::testing::save_png;
 
 fn env_dir(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
@@ -329,13 +330,6 @@ fn provider_renders_a_real_image() {
     eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::provider_renders_a_real_image");
 }
 
-fn save_png(img: &mlx_gen::Image, path: &std::path::Path) {
-    image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
-        .unwrap()
-        .save(path)
-        .unwrap();
-}
-
 /// A bounded real-weight LoRA run (sc-25685): `IRIS_TRAIN_DATA` (a directory of PNGs, one shared
 /// caption) at 256², batch 1, a few AdamW steps through the catalog trainer (bf16 mixed precision,
 /// cached Qwen3-VL conditioning, EMA, a preview from the in-progress EMA weights) → the adapter
@@ -410,7 +404,7 @@ fn real_lora_trains_exports_and_renders() {
                 last = std::time::Instant::now();
             }
             TrainingProgress::Sample { step, image, .. } => {
-                save_png(&image, &out.join(format!("train_preview_step{step}.png")));
+                save_png(&image, out.join(format!("train_preview_step{step}.png")));
                 eprintln!("preview at step {step}");
                 last = std::time::Instant::now();
             }
@@ -467,14 +461,14 @@ fn real_lora_trains_exports_and_renders() {
     };
     let t = std::time::Instant::now();
     let before = render(&[]);
-    save_png(&before, &out.join("base_256.png"));
+    save_png(&before, out.join("base_256.png"));
     mlx_rs::memory::clear_cache();
     let after = render(&[mlx_gen::AdapterSpec::new(
         res.adapter_path.clone(),
         1.0,
         mlx_gen::AdapterKind::Lora,
     )]);
-    save_png(&after, &out.join("lora_adapted_256.png"));
+    save_png(&after, out.join("lora_adapted_256.png"));
     let diff = before
         .pixels
         .iter()

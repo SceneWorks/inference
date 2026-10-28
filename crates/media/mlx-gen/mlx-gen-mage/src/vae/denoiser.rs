@@ -166,13 +166,9 @@ impl NerfEmbedder {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        if self.projection.base_shape()[1] % 64 == 0 {
-            self.projection.quantize(bits, None)?;
-        }
+        self.projection.quantize_if_aligned(bits, None)?;
         if let Some(projection) = &mut self.zero_rgb_projection {
-            if projection.base_shape()[1] % 64 == 0 {
-                projection.quantize(bits, None)?;
-            }
+            projection.quantize_if_aligned(bits, None)?;
         }
         Ok(())
     }
@@ -182,7 +178,7 @@ impl NerfEmbedder {
         let mut packed = 0;
         for projection in std::iter::once(&self.projection).chain(self.zero_rgb_projection.as_ref())
         {
-            if projection.base_shape()[1] % 64 == 0 {
+            if projection.is_quant_aligned(None) {
                 expected += 1;
                 packed += usize::from(projection.is_quantized());
             }

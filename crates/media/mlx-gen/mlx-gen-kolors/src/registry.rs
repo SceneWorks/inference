@@ -619,13 +619,31 @@ impl KolorsGenerator {
             // loop. Identical body for both residencies.
             |heavy_owned: &KolorsHeavyOwned, (pos, neg), on_progress: &mut dyn FnMut(Progress)| {
                 let heavy = &heavy_owned.heavy;
+                // sc-27336: pair the Control conditioning with the loaded ControlNet once, as a
+                // typed error rather than three `expect("validated above")`s held by distance.
+                let control_net = match (control, heavy_owned.control.as_ref()) {
+                    (Some((image, scale)), Some(net)) => Some((net, image, scale)),
+                    (Some(_), None) => {
+                        return Err(Error::Msg(
+                            "kolors: a Control conditioning needs the ControlNet loaded \
+                             (`spec.control`)"
+                                .into(),
+                        ))
+                    }
+                    (None, _) => None,
+                };
 
                 // IP-Adapter image tokens are seed-independent — encode the reference once (the
                 // `denoise_ip_latents` method CFG-batches them per image). Carries the resolved scale.
-                let ip = match (ip_mode, reference) {
-                    (true, Some((image, strength))) => {
-                        let tokens = heavy_owned.ip_encoder.as_ref().unwrap().tokens(image)?;
+                let ip = match (ip_mode, reference, heavy_owned.ip_encoder.as_ref()) {
+                    (true, Some((image, strength)), Some(encoder)) => {
+                        let tokens = encoder.tokens(image)?;
                         Some((tokens, strength.unwrap_or(IP_DEFAULT_SCALE)))
+                    }
+                    (true, Some(_), None) => {
+                        return Err(Error::Msg(
+                            "kolors: IP mode needs the IP-Adapter image encoder loaded".into(),
+                        ))
                     }
                     _ => None,
                 };
@@ -645,26 +663,27 @@ impl KolorsGenerator {
                 // F-083: the curated-path init latent (`encode_init_latents`) is seed-INDEPENDENT (the
                 // VAE encode draws no RNG), so it is identical across the count loop (only the noise
                 // varies per seed). Hoist it above the loop instead of re-encoding every iteration.
+                // sc-27336: matched on the resolved inputs rather than `expect`ing the reference —
+                // `ip_mode` without a reference was already refused above, so the arms are exhaustive
+                // over every reachable request and no invariant is held "by distance".
                 let curated_init: Option<(Option<Array>, f32)> = if use_curated {
-                    let (init_opt, strength) = if control.is_some() && ip_mode {
-                        let (reference_image, _) = reference.expect("ip mode requires a reference");
-                        (
-                            Some(encode_init_latents(
-                                heavy.vae(),
-                                reference_image,
-                                w as u32,
-                                h as u32,
-                            )?),
-                            req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH),
-                        )
-                    } else if let Some((image, strength)) = img2img {
-                        (
-                            Some(encode_init_latents(heavy.vae(), image, w as u32, h as u32)?),
-                            strength,
-                        )
-                    } else {
-                        (None, 0.0)
-                    };
+                    let (init_opt, strength) =
+                        match (control.is_some() && ip_mode, reference, img2img) {
+                            (true, Some((reference_image, _)), _) => (
+                                Some(encode_init_latents(
+                                    heavy.vae(),
+                                    reference_image,
+                                    w as u32,
+                                    h as u32,
+                                )?),
+                                req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH),
+                            ),
+                            (false, _, Some((image, strength))) => (
+                                Some(encode_init_latents(heavy.vae(), image, w as u32, h as u32)?),
+                                strength,
+                            ),
+                            _ => (None, 0.0),
+                        };
                     Some((init_opt, strength))
                 } else {
                     None
@@ -675,16 +694,11 @@ impl KolorsGenerator {
                 // branch arms below: the combined strict-pose tier (Control + IP-Adapter, seeded from
                 // the reference == IP image) and plain img2img (seeded from its reference).
                 let legacy_pose_init: Option<Array> =
-                    if !use_curated && control.is_some() && ip.is_some() {
-                        let (reference_image, _) = reference.expect("ip mode requires a reference");
-                        Some(encode_init_latents(
-                            heavy.vae(),
-                            reference_image,
-                            w as u32,
-                            h as u32,
-                        )?)
-                    } else {
-                        None
+                    match (use_curated, control.is_some(), &ip, reference) {
+                        (false, true, Some(_), Some((reference_image, _))) => Some(
+                            encode_init_latents(heavy.vae(), reference_image, w as u32, h as u32)?,
+                        ),
+                        _ => None,
                     };
                 let legacy_img2img_init: Option<Array> =
                     match (use_curated, control.is_none(), &ip, img2img) {
@@ -774,19 +788,11 @@ impl KolorsGenerator {
                     // above draws none, so the per-image output stays byte-identical to the struct API.
                     let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
 
-                    if use_curated {
-                        let control_arg = control.map(|(image, scale)| {
-                            (
-                                heavy_owned.control.as_ref().expect("validated above"),
-                                image,
-                                scale,
-                            )
-                        });
+                    // `curated_init` is `Some` exactly when `use_curated` (sc-27336: bind it here
+                    // instead of re-`expect`ing that invariant).
+                    if let Some((init_opt, strength)) = curated_init.clone() {
+                        let control_arg = control_net;
                         let ip_arg = ip.as_ref().map(|(tokens, scale)| (tokens, *scale));
-
-                        let (init_opt, strength) = curated_init
-                            .clone()
-                            .expect("curated_init is Some iff use_curated (computed above)");
 
                         let latents = heavy.denoise_curated_latents_with_preview(
                             req.sampler.as_deref(),
@@ -827,113 +833,114 @@ impl KolorsGenerator {
                         continue;
                     }
 
-                    let latents =
-                        if let (Some((skeleton, control_scale)), Some((tokens, ip_scale))) =
-                            (control, &ip)
-                        {
-                            // Combined strict-pose tier (sc-5012): pose ControlNet + IP-Adapter identity,
-                            // on an img2img init from the SAME reference (the IP image).
-                            let init_latents = legacy_pose_init.as_ref().expect(
-                                "legacy_pose_init is Some in the non-curated combined-pose mode",
-                            );
-                            let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
-                            heavy.denoise_controlnet_ip_latents_with_preview(
-                                heavy_owned.control.as_ref().expect("validated above"),
-                                tokens,
-                                init_latents,
-                                &noise,
-                                skeleton,
-                                &pos,
-                                neg.as_ref(),
-                                steps,
-                                strength,
-                                cfg,
-                                control_scale,
-                                *ip_scale,
-                                h,
-                                w,
-                                run_steps,
-                                &req.cancel,
-                                on_progress,
-                                &req.preview,
-                                forward_plan,
-                                cfg_batching,
-                            )?
-                        } else if let Some((image, scale)) = control {
-                            heavy.denoise_controlnet_latents_with_preview(
-                                heavy_owned.control.as_ref().expect("validated above"),
-                                &noise,
-                                image,
-                                &pos,
-                                neg.as_ref(),
-                                steps,
-                                cfg,
-                                scale,
-                                h,
-                                w,
-                                run_steps,
-                                &req.cancel,
-                                on_progress,
-                                &req.preview,
-                                forward_plan,
-                                cfg_batching,
-                            )?
-                        } else if let Some((tokens, scale)) = &ip {
-                            heavy.denoise_ip_latents_with_preview(
-                                tokens,
-                                &noise,
-                                &pos,
-                                neg.as_ref(),
-                                steps,
-                                cfg,
-                                *scale,
-                                h,
-                                w,
-                                run_steps,
-                                &req.cancel,
-                                on_progress,
-                                &req.preview,
-                                forward_plan,
-                                cfg_batching,
-                            )?
-                        } else if let Some((_image, strength)) = img2img {
-                            let x0 = legacy_img2img_init.as_ref().expect(
-                                "legacy_img2img_init is Some in the non-curated img2img mode",
-                            );
-                            heavy.denoise_img2img_latents_with_preview(
-                                x0,
-                                &noise,
-                                &pos,
-                                neg.as_ref(),
-                                steps,
-                                strength,
-                                cfg,
-                                h,
-                                w,
-                                run_steps,
-                                &req.cancel,
-                                on_progress,
-                                &req.preview,
-                                forward_plan,
-                                cfg_batching,
-                            )?
-                        } else {
-                            heavy.denoise_latents_with_preview(
-                                &noise,
-                                &pos,
-                                neg.as_ref(),
-                                steps,
-                                cfg,
-                                h,
-                                w,
-                                run_steps,
-                                &req.cancel,
-                                on_progress,
-                                &req.preview,
-                                forward_plan,
-                                cfg_batching,
-                            )?
-                        };
+                    // sc-27336: each legacy arm binds the hoisted init it needs in its own pattern
+                    // (`legacy_pose_init` / `legacy_img2img_init` are `Some` exactly for the arm
+                    // that reads them on this non-curated path) instead of `expect`ing it.
+                    let latents = if let (
+                        Some((net, skeleton, control_scale)),
+                        Some((tokens, ip_scale)),
+                        Some(init_latents),
+                    ) = (control_net, &ip, legacy_pose_init.as_ref())
+                    {
+                        // Combined strict-pose tier (sc-5012): pose ControlNet + IP-Adapter identity,
+                        // on an img2img init from the SAME reference (the IP image).
+                        let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
+                        heavy.denoise_controlnet_ip_latents_with_preview(
+                            net,
+                            tokens,
+                            init_latents,
+                            &noise,
+                            skeleton,
+                            &pos,
+                            neg.as_ref(),
+                            steps,
+                            strength,
+                            cfg,
+                            control_scale,
+                            *ip_scale,
+                            h,
+                            w,
+                            run_steps,
+                            &req.cancel,
+                            on_progress,
+                            &req.preview,
+                            forward_plan,
+                            cfg_batching,
+                        )?
+                    } else if let Some((net, image, scale)) = control_net {
+                        heavy.denoise_controlnet_latents_with_preview(
+                            net,
+                            &noise,
+                            image,
+                            &pos,
+                            neg.as_ref(),
+                            steps,
+                            cfg,
+                            scale,
+                            h,
+                            w,
+                            run_steps,
+                            &req.cancel,
+                            on_progress,
+                            &req.preview,
+                            forward_plan,
+                            cfg_batching,
+                        )?
+                    } else if let Some((tokens, scale)) = &ip {
+                        heavy.denoise_ip_latents_with_preview(
+                            tokens,
+                            &noise,
+                            &pos,
+                            neg.as_ref(),
+                            steps,
+                            cfg,
+                            *scale,
+                            h,
+                            w,
+                            run_steps,
+                            &req.cancel,
+                            on_progress,
+                            &req.preview,
+                            forward_plan,
+                            cfg_batching,
+                        )?
+                    } else if let (Some((_image, strength)), Some(x0)) =
+                        (img2img, legacy_img2img_init.as_ref())
+                    {
+                        heavy.denoise_img2img_latents_with_preview(
+                            x0,
+                            &noise,
+                            &pos,
+                            neg.as_ref(),
+                            steps,
+                            strength,
+                            cfg,
+                            h,
+                            w,
+                            run_steps,
+                            &req.cancel,
+                            on_progress,
+                            &req.preview,
+                            forward_plan,
+                            cfg_batching,
+                        )?
+                    } else {
+                        heavy.denoise_latents_with_preview(
+                            &noise,
+                            &pos,
+                            neg.as_ref(),
+                            steps,
+                            cfg,
+                            h,
+                            w,
+                            run_steps,
+                            &req.cancel,
+                            on_progress,
+                            &req.preview,
+                            forward_plan,
+                            cfg_batching,
+                        )?
+                    };
 
                     let latents = match &vp_plan {
                         Some(p) => {

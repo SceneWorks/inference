@@ -7,10 +7,10 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration schedule_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::guidance::cfg_rescale;
+use mlx_gen::testing::{max_abs_diff, peak_rel};
 use mlx_gen::weights::Weights;
 use mlx_gen::MlxLatentOps;
 use mlx_gen_lens::schedule::{lens_schedule, timesteps};
@@ -21,23 +21,6 @@ const GOLDEN: &str = concat!(
 );
 
 const LATENT: usize = 64; // 64×64 = 4096 seq_len (matches the dump)
-
-fn max_abs(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    max(abs(subtract(&a, &b).unwrap()).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-}
-
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let b32 = b.as_dtype(Dtype::Float32).unwrap();
-    let denom = max(abs(&b32).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .max(1e-12);
-    max_abs(a, b) / denom
-}
 
 #[test]
 #[ignore = "needs tools/golden/lens_schedule_golden.safetensors"]
@@ -50,7 +33,7 @@ fn lens_schedule_matches_reference() {
         // (a) shifted sigmas (n+1, trailing 0).
         let got_sigmas = Array::from_slice(&sched.sigmas, &[sched.sigmas.len() as i32]);
         let want_sigmas = g.require(&format!("sigmas_{n}")).unwrap();
-        let d_sig = max_abs(&got_sigmas, want_sigmas);
+        let d_sig = max_abs_diff(&got_sigmas, want_sigmas);
 
         // (b) per-step timesteps = shifted sigma; golden stores sigma·1000.
         let ts = timesteps(&sched);
@@ -61,7 +44,7 @@ fn lens_schedule_matches_reference() {
             Array::from_f32(1.0 / 1000.0),
         )
         .unwrap();
-        let d_ts = max_abs(&got_ts, &want_ts_div);
+        let d_ts = max_abs_diff(&got_ts, &want_ts_div);
 
         // (c) one flow-match Euler step at index 0.
         let step_in = g.require(&format!("step_in_{n}")).unwrap().clone();
@@ -136,7 +119,7 @@ fn migrated_cfg_rescale_is_byte_identical() {
     for &g in &[1.0f32, 5.0] {
         let legacy = legacy_cfg_rescale(&cond, &uncond, g);
         let migrated = cfg_rescale(&MlxLatentOps, &cond, &uncond, g, &[], &[-1]).unwrap();
-        let d = max_abs(&migrated, &legacy);
+        let d = max_abs_diff(&migrated, &legacy);
         eprintln!("g={g}: migrated-vs-legacy max|Δ| = {d:e}");
         assert_eq!(d, 0.0, "g={g} migration not bit-identical: max|Δ| = {d:e}");
     }

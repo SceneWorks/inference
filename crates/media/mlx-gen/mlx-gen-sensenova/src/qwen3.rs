@@ -21,12 +21,12 @@
 //! interleaved generation) is resolved in sc-3190, where the correct behaviour is defined.
 
 use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis, matmul, multiply, softmax_axis, split};
+use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, softmax_axis, split};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
-use mlx_gen::nn::silu;
+use mlx_gen::nn::{repeat_kv, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Quant, Result};
 
@@ -330,18 +330,6 @@ fn rope_cos_sin(positions: &[i32], dim: usize, theta: f32) -> Result<(Array, Arr
 /// half-split branch — identical to the prior hand-rolled `cat(-x2, x1)` rotation.
 fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     mll_apply_rope(x, cos, sin, false).map_err(mll)
-}
-
-/// Expand `[B,S,Hkv,D]` → `[B,S,Hkv*groups,D]` (GQA), repeating each kv head `groups` times.
-fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let sh = x.shape();
-    let (b, s, hkv, d) = (sh[0], sh[1], sh[2], sh[3]);
-    let x = x.expand_dims(3)?;
-    let x = broadcast_to(&x, &[b, s, hkv, groups, d])?;
-    Ok(x.reshape(&[b, s, hkv * groups, d])?)
 }
 
 /// The dense dual-path Qwen3 backbone: embeddings, the decoder stack, the dual final norm, and the
@@ -891,8 +879,8 @@ impl Qwen3Backbone {
             extend_use_only(cache, layer_idx, &k, &v)?
         };
         let groups = self.num_heads / self.num_kv_heads;
-        let k_all = repeat_kv_bhsd(&k_all, groups)?;
-        let v_all = repeat_kv_bhsd(&v_all, groups)?;
+        let k_all = mlx_gen::qkv::repeat_kv(&k_all, groups, mlx_gen::qkv::RotationAxes::HeadMajor)?;
+        let v_all = mlx_gen::qkv::repeat_kv(&v_all, groups, mlx_gen::qkv::RotationAxes::HeadMajor)?;
 
         let scale = (hd as f32).powf(-0.5);
         // Preserve the historical eager kernel exactly unless rung 3 was selected. The shared MLX
@@ -1019,21 +1007,6 @@ impl Qwen3Backbone {
         let w = apply_rope(&hw_parts[1], cos_w, sin_w)?;
         concatenate_axis(&[&t, &h, &w], 3).map_err(Error::from)
     }
-}
-
-/// Expand `[B,Hkv,S,D]` → `[B,Hkv*groups,S,D]` (GQA), repeating each kv head `groups` times. The
-/// cached-attention counterpart of [`repeat_kv`] (which operates on the pre-transpose `[B,S,Hkv,D]`
-/// layout); both insert the repeat axis immediately after the head axis, so the resulting head
-/// ordering is identical.
-fn repeat_kv_bhsd(x: &Array, groups: i32) -> Result<Array> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let sh = x.shape();
-    let (b, hkv, s, d) = (sh[0], sh[1], sh[2], sh[3]);
-    let x = x.expand_dims(2)?;
-    let x = broadcast_to(&x, &[b, hkv, groups, s, d])?;
-    Ok(x.reshape(&[b, hkv * groups, s, d])?)
 }
 
 /// Cached additive mask `[1,1,S_new, past+S_new]` (0 / -inf). New query row `r` attends to: every
