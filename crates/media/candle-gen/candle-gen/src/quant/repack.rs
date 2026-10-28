@@ -156,25 +156,76 @@ pub fn repack_mlx_q4_to_q4_1(
     repack_mlx_q4_to_q4_1_gs(wq, scales, biases, MLX_GROUP_SIZE, device)
 }
 
-/// Repack an MLX affine **Q4** triple at an explicit `group_size` (a multiple of 32) into a GGML
-/// **`Q4_1`** [`QTensor`] on `device` (sc-9410) — lossless up to the bf16 → f16 scale/bias cast (see
-/// the module docs). One MLX group splits into `group_size / 32` consecutive `Q4_1` blocks sharing
-/// the group's `d = scale` / `m = bias`. The result plugs straight into the per-crate
-/// `QLinear::Quantized` dequant-on-forward path.
-pub fn repack_mlx_q4_to_q4_1_gs(
-    wq: &Tensor,
-    scales: &Tensor,
-    biases: &Tensor,
+/// Spread the 8 nibbles of `w` into the low nibbles of 8 bytes (nibble `k` -> byte `k`, little-endian).
+#[inline(always)]
+fn spread_nibbles(w: u32) -> u64 {
+    let mut x = w as u64;
+    x = (x | (x << 16)) & 0x0000_FFFF_0000_FFFF;
+    x = (x | (x << 8)) & 0x00FF_00FF_00FF_00FF;
+    x = (x | (x << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
+    x
+}
+
+/// Build the GGML `Q4_1` byte stream of an MLX Q4 triple (sc-26691). Word-wise, row-parallel
+/// equivalent of the per-byte unpack/rebuild: a Q4_1 block's 32 elements are 4 consecutive u32 words
+/// `w0..w3`, and `qs[j] = nib(w[j / 8], j % 8) | nib(w[2 + j / 8], j % 8) << 4`, so each pair
+/// `(w0, w2)` / `(w1, w3)` yields 8 `qs` bytes with two nibble-spreads. Output is byte-identical to
+/// the reference ([`q4_1_bytes_reference`] under test). `group_size` must be a multiple of 32.
+fn q4_1_bytes(
+    wq: &[u32],
+    scales: &[f32],
+    biases: &[f32],
+    out_dim: usize,
+    in_dim: usize,
     group_size: usize,
-    device: &Device,
-) -> Result<QTensor> {
-    if !group_size.is_multiple_of(Q4_1_BLOCK) {
-        candle_core::bail!(
-            "MLX Q4 group_size {group_size} must be a multiple of the Q4_1 block ({Q4_1_BLOCK})"
-        );
+) -> Vec<u8> {
+    use rayon::prelude::*;
+    let groups_per_row = in_dim / group_size;
+    let blocks_per_group = group_size / Q4_1_BLOCK;
+    let words_per_row = in_dim / 8;
+    let row_bytes = in_dim / Q4_1_BLOCK * Q4_1_BLOCK_BYTES;
+    let mut bytes = vec![0u8; out_dim * row_bytes];
+    if bytes.is_empty() {
+        return bytes;
     }
-    let (wq, scales, biases, out_dim, in_dim) = q4_parts(wq, scales, biases, group_size)?;
-    let codes = unpack_mlx_q4(&wq, out_dim, in_dim);
+    bytes
+        .par_chunks_mut(row_bytes)
+        .zip(wq.par_chunks(words_per_row))
+        .enumerate()
+        .for_each(|(row, (out, words))| {
+            let mut blocks = out.chunks_exact_mut(Q4_1_BLOCK_BYTES);
+            let mut words = words.chunks_exact(4);
+            for g in 0..groups_per_row {
+                let d = f16::from_f32(scales[row * groups_per_row + g]).to_le_bytes();
+                let m = f16::from_f32(biases[row * groups_per_row + g]).to_le_bytes();
+                for _ in 0..blocks_per_group {
+                    let (blk, w) = (blocks.next().unwrap(), words.next().unwrap());
+                    blk[0..2].copy_from_slice(&d);
+                    blk[2..4].copy_from_slice(&m);
+                    blk[4..12].copy_from_slice(
+                        &(spread_nibbles(w[0]) | spread_nibbles(w[2]) << 4).to_le_bytes(),
+                    );
+                    blk[12..20].copy_from_slice(
+                        &(spread_nibbles(w[1]) | spread_nibbles(w[3]) << 4).to_le_bytes(),
+                    );
+                }
+            }
+        });
+    bytes
+}
+
+/// The pre-sc-26691 per-byte, single-threaded repack, kept verbatim as the bit-identity oracle for
+/// [`q4_1_bytes`] (and the old side of the timing micro-benchmark).
+#[cfg(test)]
+fn q4_1_bytes_reference(
+    wq: &[u32],
+    scales: &[f32],
+    biases: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) -> Vec<u8> {
+    let codes = unpack_mlx_q4(wq, out_dim, in_dim);
 
     let blocks = out_dim * in_dim / Q4_1_BLOCK;
     let mut bytes = Vec::with_capacity(blocks * Q4_1_BLOCK_BYTES);
@@ -194,6 +245,28 @@ pub fn repack_mlx_q4_to_q4_1_gs(
             }
         }
     }
+    bytes
+}
+
+/// Repack an MLX affine **Q4** triple at an explicit `group_size` (a multiple of 32) into a GGML
+/// **`Q4_1`** [`QTensor`] on `device` (sc-9410) — lossless up to the bf16 → f16 scale/bias cast (see
+/// the module docs). One MLX group splits into `group_size / 32` consecutive `Q4_1` blocks sharing
+/// the group's `d = scale` / `m = bias`. The result plugs straight into the per-crate
+/// `QLinear::Quantized` dequant-on-forward path.
+pub fn repack_mlx_q4_to_q4_1_gs(
+    wq: &Tensor,
+    scales: &Tensor,
+    biases: &Tensor,
+    group_size: usize,
+    device: &Device,
+) -> Result<QTensor> {
+    if !group_size.is_multiple_of(Q4_1_BLOCK) {
+        candle_core::bail!(
+            "MLX Q4 group_size {group_size} must be a multiple of the Q4_1 block ({Q4_1_BLOCK})"
+        );
+    }
+    let (wq, scales, biases, out_dim, in_dim) = q4_parts(wq, scales, biases, group_size)?;
+    let bytes = q4_1_bytes(&wq, &scales, &biases, out_dim, in_dim, group_size);
 
     // MUST be `Cow::Borrowed`: candle's `as_t_slice` takes the Cow by value and returns a slice
     // borrowed from it, so an `Owned` cow's backing Vec is dropped before `from_data` copies the
@@ -609,5 +682,80 @@ mod tests {
             "constant group must dequant to 0.75 exactly"
         );
         Ok(())
+    }
+
+    /// Deterministic xorshift64* stream (no `rand` dependency; full-range u32 words and bf16-ish f32).
+    struct Xs(u64);
+    impl Xs {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    fn random_triple(
+        out_dim: usize,
+        in_dim: usize,
+        group: usize,
+        seed: u64,
+    ) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        let mut r = Xs(seed | 1);
+        let wq = (0..out_dim * in_dim / 8)
+            .map(|_| (r.next() >> 16) as u32)
+            .collect();
+        let g = out_dim * (in_dim / group);
+        // Include values outside f16 range / subnormals so the f16 cast path is exercised too.
+        let mut f = |_: usize| {
+            let bits = (r.next() >> 32) as u32;
+            f32::from_bits(bits)
+        };
+        let scales = (0..g).map(&mut f).collect();
+        let biases = (0..g).map(&mut f).collect();
+        (wq, scales, biases)
+    }
+
+    /// sc-26691: the word-wise parallel repack is byte-identical to the original per-byte one across
+    /// group sizes (32/64/128, covering 1/2/4 blocks per group), odd row counts and full-range codes.
+    #[test]
+    fn fast_q4_1_repack_is_bit_identical_to_the_reference() {
+        for &(out_dim, in_dim, group) in &[
+            (1, 32, 32),
+            (3, 64, 32),
+            (7, 128, 64),
+            (5, 256, 128),
+            (33, 512, 64),
+            (17, 384, 128),
+            (129, 256, 32),
+            (64, 1024, 64),
+            (1001, 128, 128),
+        ] {
+            let (wq, s, b) = random_triple(out_dim, in_dim, group, (out_dim * 31 + in_dim) as u64);
+            let fast = q4_1_bytes(&wq, &s, &b, out_dim, in_dim, group);
+            let old = q4_1_bytes_reference(&wq, &s, &b, out_dim, in_dim, group);
+            assert_eq!(fast.len(), out_dim * in_dim / 32 * 20);
+            assert!(
+                fast == old,
+                "mismatch at [{out_dim}, {in_dim}] group {group}"
+            );
+        }
+    }
+
+    /// Timing micro-benchmark on one H3-sized `[5120, 25600]` triple (run with
+    /// `cargo test --release -p candle-gen --lib bench_q4_1_repack -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "timing measurement, not a gate"]
+    fn bench_q4_1_repack() {
+        let (out_dim, in_dim, group) = (5120, 25600, 64);
+        let (wq, s, b) = random_triple(out_dim, in_dim, group, 7);
+        let t = std::time::Instant::now();
+        let old = q4_1_bytes_reference(&wq, &s, &b, out_dim, in_dim, group);
+        let t_old = t.elapsed();
+        let t = std::time::Instant::now();
+        let new = q4_1_bytes(&wq, &s, &b, out_dim, in_dim, group);
+        let t_new = t.elapsed();
+        assert!(old == new);
+        eprintln!("repack [5120, 25600] g64: old {t_old:?}  new {t_new:?}");
     }
 }

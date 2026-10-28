@@ -858,8 +858,12 @@ impl MiniMaxH3 {
             candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
         let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-        let w =
-            candle_gen::Weights::from_files_filtered(&shards, &self.device, TE_STORE_DTYPE, &refs)?;
+        let w = candle_gen::Weights::from_files_filtered_host_packed(
+            &shards,
+            &self.device,
+            TE_STORE_DTYPE,
+            &refs,
+        )?;
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
         let context = te.forward(&ids, &mask)?;
@@ -899,8 +903,12 @@ impl MiniMaxH3 {
             candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
         let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-        let w =
-            candle_gen::Weights::from_files_filtered(&shards, &self.device, TE_STORE_DTYPE, &refs)?;
+        let w = candle_gen::Weights::from_files_filtered_host_packed(
+            &shards,
+            &self.device,
+            TE_STORE_DTYPE,
+            &refs,
+        )?;
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
         let context = te.forward_with_images(
@@ -1586,8 +1594,12 @@ impl MiniMaxH3 {
             candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
         let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-        let w =
-            candle_gen::Weights::from_files_filtered(&shards, &self.device, TE_STORE_DTYPE, &refs)?;
+        let w = candle_gen::Weights::from_files_filtered_host_packed(
+            &shards,
+            &self.device,
+            TE_STORE_DTYPE,
+            &refs,
+        )?;
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
         let context = te.forward_with_references(
@@ -2743,7 +2755,7 @@ mod tests {
         "MiniMaxH3VideoVae::load_decode_only(",
         "load_vision_tower(",
         "Weights::from_files(",
-        "Weights::from_files_filtered(",
+        "Weights::from_files_filtered_host_packed(",
         "MiniMaxH3TextEncoder::from_weights(",
         "MiniMaxH3AudioVae::from_weights(",
         "MiniMaxH3AudioVaeEncoder::from_weights(",

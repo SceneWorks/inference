@@ -319,6 +319,25 @@ impl MiniMaxH3TextEncoder {
         cfg: &MiniMaxH3TeConfig,
         dtype: DType,
     ) -> Result<Self> {
+        // sc-26691: the q4 repack + upload runs inside this call and used to be invisible in logs.
+        let started = std::time::Instant::now();
+        let te = Self::build(w, prefix, cfg, dtype)?;
+        let (tensors, bytes) = w.keys().fold((0usize, 0usize), |(n, b), k| {
+            let bytes = w
+                .require(k)
+                .map_or(0, |t| t.elem_count() * t.dtype().size_in_bytes());
+            (n + 1, b + bytes)
+        });
+        eprintln!(
+            "minimax-h3 te: from_weights built {} layers from {tensors} tensors ({:.2} GiB source) in {:.1?}",
+            te.num_loaded_layers(),
+            bytes as f64 / (1u64 << 30) as f64,
+            started.elapsed()
+        );
+        Ok(te)
+    }
+
+    fn build(w: &Weights, prefix: &str, cfg: &MiniMaxH3TeConfig, dtype: DType) -> Result<Self> {
         let out_layer = cfg.out_layer()?;
         if out_layer >= cfg.num_layers {
             return Err(CandleError::Msg(format!(
@@ -354,7 +373,9 @@ impl MiniMaxH3TextEncoder {
         // built on the device the *weights* are on — falling back to the `embed_tokens` weight
         // itself, which exists on both paths (a float table, or the u32 code stream) and is what a
         // `Weights::from_map` fixture carries.
-        let device = match w.device() {
+        // A host-packed set (sc-26691) keeps its packed triples on the CPU, so `w.device()` could name
+        // the host; its explicit destination wins.
+        let device = match w.host_packed_target().or_else(|| w.device()) {
             Some(d) => d.clone(),
             None => w
                 .require(&format!("{prefix}.embed_tokens.weight"))?

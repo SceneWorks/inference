@@ -498,6 +498,7 @@ dependencies = [
  "image",
  "rand",
  "rand_distr",
+ "rayon",
  "safetensors 0.7.0",
  "sceneworks-gen-core",
  "serde_json",
