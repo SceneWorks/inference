@@ -15,7 +15,6 @@ mlx-gen-flux = { path = "../mlx-gen-flux" }
 mlx-gen-face = { path = "../mlx-gen-face" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
-sha2 = { workspace = true }
 
 [dev-dependencies]
 # The shared weights-free conformance suite (epic SC-22657): the crate's contract tests assert

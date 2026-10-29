@@ -1672,25 +1672,6 @@ fn additive_skips_target_absent_from_host() {
     );
 }
 
-#[test]
-fn read_alpha_empty_tensor_errors_not_panic() {
-    // F-059 (sc-11129): a size-0 `.alpha` from a malformed/truncated adapter file must produce a
-    // TYPED error, not the `as_slice()[0]` panic that would abort the worker on any Wan entry.
-    // (safetensors cannot serialize an empty array, so exercise `read_alpha` directly on the
-    // in-memory empty tensor — the exact value a truncated file would deserialize to.)
-    let empty = Array::from_slice::<f32>(&[], &[0]);
-    let err = read_alpha(&empty).expect_err("an empty .alpha must error, not panic");
-    assert!(
-        matches!(err, Error::Msg(_)),
-        "expected a typed Msg error, got {err:?}"
-    );
-    // Happy-path regression: a well-formed bf16 scalar still reads its value.
-    let good = Array::from_slice(&[8.0f32], &[1])
-        .as_dtype(Dtype::Bfloat16)
-        .unwrap();
-    assert_eq!(read_alpha(&good).unwrap(), 8.0);
-}
-
 /// Write a PEFT LoRA file for `blocks.0.self_attn.q` whose factors are **1-D** (non-2-D) — a
 /// malformed adapter that would otherwise derive a degenerate rank and merge garbage (sc-11129,
 /// F-058). A true 0-size `lora_A` leading dim triggers the same guard but is not serializable.

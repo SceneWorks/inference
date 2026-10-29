@@ -1,6 +1,5 @@
 //! Exact Resident-only memory contract for the public SCAIL-2 character-animation route.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -125,23 +124,15 @@ impl AdapterReceipt {
         };
         pin.ensure_unchanged()?;
         let canonical_path = pin.canonical_target_path().to_path_buf();
-        let (digest, realization, physical_bytes, resident_bytes, transient_bytes) = pin
-            .read_unchanged(|path| {
+        // The seal's acquisition-time content digest: hashed once per file identity, not re-read.
+        let digest = pin.content_sha256_hex();
+        let (realization, physical_bytes, resident_bytes, transient_bytes) =
+            pin.read_unchanged(|path| {
                 let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
                 if headers.is_empty() {
                     return Err(gen_core::Error::Unsupported(format!(
                         "{PROVIDER_ID}: adapter {ordinal} contains no tensors"
                     )));
-                }
-                let mut file = std::fs::File::open(path)?;
-                let mut hasher = Sha256::new();
-                let mut buffer = [0_u8; 1024 * 1024];
-                loop {
-                    let read = file.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..read]);
                 }
                 let mut folded = 0_u64;
                 let mut residual = 0_u64;
@@ -170,13 +161,7 @@ impl AdapterReceipt {
                     (true, true) => AdapterRealization::Hybrid,
                     (false, false) => unreachable!("nonempty headers carry bytes"),
                 };
-                Ok::<_, gen_core::Error>((
-                    format!("{:x}", hasher.finalize()),
-                    realization,
-                    physical,
-                    residual,
-                    folded,
-                ))
+                Ok::<_, gen_core::Error>((realization, physical, residual, folded))
             })?;
         Ok(Self {
             ordinal,

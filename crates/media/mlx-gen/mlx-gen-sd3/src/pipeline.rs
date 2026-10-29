@@ -690,6 +690,23 @@ mod tests {
             matches!(resolve_clip_pad_id(&f_dir), Err(mlx_gen::Error::Io(_))),
             "a present unreadable config must preserve the typed IO error"
         );
+
+        // sc-27443: once a pad token is configured, the vocab must resolve it — no eos fallback.
+        let v_dir = synthetic_clip_tokenizer_dir(&tmp, "padv", "!");
+        let vocab_error = |dir: &std::path::Path, needle: &str| {
+            let error = resolve_clip_pad_id(dir).unwrap_err();
+            assert!(
+                matches!(error, mlx_gen::Error::Msg(ref message) if
+                message.contains("vocab.json") && message.contains(needle)),
+                "expected a contextual vocab error containing {needle:?}, got: {error}"
+            );
+        };
+        std::fs::write(v_dir.join("vocab.json"), "{").unwrap();
+        vocab_error(&v_dir, "parse");
+        std::fs::write(v_dir.join("vocab.json"), r#"{"<|endoftext|>": 49407}"#).unwrap();
+        vocab_error(&v_dir, "not in");
+        std::fs::remove_file(v_dir.join("vocab.json")).unwrap();
+        vocab_error(&v_dir, "read");
     }
 
     #[test]

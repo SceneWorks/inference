@@ -739,6 +739,7 @@ fn write_response(
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        413 => "Content Too Large",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         _ => "OK",

@@ -44,7 +44,7 @@ use mlx_gen::adapters::loader::{
     is_loha_keys, is_lokr, is_lokr_keys, parse_loha_thirdparty, parse_lokr, parse_lokr_thirdparty,
     resolve_lokr_path,
 };
-use mlx_gen::adapters::{build_lokr_factors, AdaptableHost, Adapter};
+use mlx_gen::adapters::{build_lokr_factors, read_scalar_alpha, AdaptableHost, Adapter};
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterApplyReport, AdapterKind, AdapterSpec, MoeExpert};
@@ -164,24 +164,6 @@ const SUFFIXES: [(&str, Role); 5] = [
     (".lora_up.weight", Role::Up),
     (".alpha", Role::Alpha),
 ];
-
-/// Read a scalar `.alpha` as f32 regardless of on-disk dtype (real files ship it bf16; a direct
-/// `as_slice::<f32>()` would panic on a dtype mismatch). A `[]`- or `[1]`-shaped scalar both read.
-///
-/// A size-0 `.alpha` tensor (a malformed/truncated third-party adapter file) has no element to read,
-/// so `as_slice::<f32>()[0]` would index an empty slice and PANIC — aborting the worker on any of the
-/// five Wan generator entries (F-059). Fail this one job with a typed error instead, mirroring the core
-/// loader's `scalar_alpha` (sc-11129).
-fn read_alpha(a: &Array) -> Result<f32> {
-    a.as_dtype(Dtype::Float32)?
-        .try_as_slice::<f32>()
-        .map_err(|e| Error::Msg(format!("read_alpha: not a readable scalar array: {e}")))?
-        .first()
-        .copied()
-        .ok_or_else(|| {
-            Error::Msg("read_alpha: empty .alpha tensor (malformed adapter file)".into())
-        })
-}
 
 /// Normalize a LoRA module path to the Wan checkpoint's naming (the reference
 /// `_normalize_wan_lora_key`): strip a known prefix, then the `convert_wan` renames
@@ -398,7 +380,7 @@ fn merge_one(
         match role {
             Role::Down => parts.down = Some(lw.require(&key)?.clone()),
             Role::Up => parts.up = Some(lw.require(&key)?.clone()),
-            Role::Alpha => parts.alpha = Some(read_alpha(lw.require(&key)?)?),
+            Role::Alpha => parts.alpha = Some(read_scalar_alpha(lw.require(&key)?, &key)?),
         }
     }
 
@@ -858,7 +840,7 @@ fn install_one_lora_additive(
         match role {
             Role::Down => parts.down = Some(lw.require(&key)?.clone()),
             Role::Up => parts.up = Some(lw.require(&key)?.clone()),
-            Role::Alpha => parts.alpha = Some(read_alpha(lw.require(&key)?)?),
+            Role::Alpha => parts.alpha = Some(read_scalar_alpha(lw.require(&key)?, &key)?),
         }
     }
 

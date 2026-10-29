@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -10,7 +9,8 @@ use mlx_gen::gen_core::weightsmeta::{
     safetensors_path_tensor_headers, Dtype, SafetensorsTensorHeader,
 };
 use mlx_gen::gen_core::{
-    EncoderContract, Error as CoreError, Result as CoreResult, ValidatedEncoderSource,
+    ArtifactSeal, EncoderContract, Error as CoreError, ResolvedFileIdentity, Result as CoreResult,
+    SingleFlight, ValidatedEncoderSource,
 };
 use mlx_gen::{LoadSpec, Quant, WeightsSource};
 use sha2::{Digest, Sha256};
@@ -181,79 +181,37 @@ fn expected_sha256<'a>(relative: &str, blob: &'a str) -> &'a str {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Identity {
-    canonical: PathBuf,
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-}
+type Identity = ResolvedFileIdentity;
 
 fn identity(path: &Path) -> std::io::Result<Identity> {
-    let canonical = std::fs::canonicalize(path)?;
-    let metadata = std::fs::metadata(&canonical)?;
-    Ok(Identity {
-        canonical,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        size: metadata.size(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
-    })
+    ResolvedFileIdentity::capture(path)
 }
 
-fn digest_cache() -> &'static Mutex<HashMap<Identity, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<Identity, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
+/// Whole-file SHA-256 of `file`, through the shared [`ArtifactSeal`] (once per file identity,
+/// single-flight across concurrent loads). `id` is the identity the caller already pinned; a seal
+/// of a different object means the file changed between the two observations.
 fn sha256(file: &Path, id: &Identity) -> CoreResult<String> {
-    if let Some(value) = digest_cache()
-        .lock()
-        .map_err(|_| CoreError::Msg("flux2 artifact digest cache poisoned".to_owned()))?
-        .get(id)
-        .cloned()
+    let seal = ArtifactSeal::pin(file)?;
+    if seal.canonical_target_path() != id.canonical_path
+        || seal.target_fingerprint() != &id.fingerprint
     {
-        return Ok(value);
-    }
-    let file = std::fs::File::open(file)
-        .map_err(|error| CoreError::Msg(format!("open {} for hashing: {error}", file.display())))?;
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-    let mut hash = Sha256::new();
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|error| CoreError::Msg(format!("hash {}: {error}", id.canonical.display())))?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-    }
-    let value = format!("{:x}", hash.finalize());
-    if identity(&id.canonical).ok().as_ref() != Some(id) {
         return Err(CoreError::Unsupported(
             "flux2 calibrated artifact changed while it was hashed".to_owned(),
         ));
     }
-    digest_cache()
-        .lock()
-        .map_err(|_| CoreError::Msg("flux2 artifact digest cache poisoned".to_owned()))?
-        .insert(id.clone(), value.clone());
-    Ok(value)
+    Ok(seal.content_sha256_hex())
 }
 
 /// Pin tensor content independently of safetensors header/payload ordering. The converter
 /// serializes a HashMap, so valid conversions need not share a whole-file digest.
 fn tensor_content_sha256(file: &Path, id: &Identity) -> CoreResult<String> {
     static CACHE: OnceLock<Mutex<HashMap<Identity, String>>> = OnceLock::new();
+    static FLIGHTS: OnceLock<SingleFlight<Identity>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Concurrent first loads hash the multi-GB transformer once; the rest hit the cache below.
+    let _flight = FLIGHTS
+        .get_or_init(SingleFlight::default)
+        .claim(id.clone(), || Ok(()))?;
     if let Some(digest) = cache
         .lock()
         .map_err(|_| CoreError::Msg("tensor digest cache poisoned".into()))?
@@ -387,31 +345,17 @@ fn turnkey_identity(root: &Path) -> Option<(TurnkeyFamily, Option<Quant>)> {
 }
 
 fn visible_safetensors(directory: &Path) -> CoreResult<BTreeSet<String>> {
-    let mut visible = BTreeSet::new();
-    for entry in std::fs::read_dir(directory).map_err(|error| {
-        CoreError::Msg(format!(
-            "read FLUX.2 Klein component {}: {error}",
-            directory.display()
-        ))
-    })? {
-        let path = entry
-            .map_err(|error| CoreError::Msg(error.to_string()))?
-            .path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("safetensors")
-            && !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.'))
-        {
-            visible.insert(
-                path.file_name()
-                    .expect("directory entry has a file name")
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-    }
-    Ok(visible)
+    let names =
+        mlx_gen::gen_core::weightsmeta::visible_safetensors(directory).map_err(|error| {
+            CoreError::Msg(format!(
+                "read FLUX.2 Klein component {}: {error}",
+                directory.display()
+            ))
+        })?;
+    Ok(names
+        .into_iter()
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect())
 }
 
 /// Every visible safetensors shard of one turnkey component, in name order, with the membership

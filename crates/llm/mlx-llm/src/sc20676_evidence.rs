@@ -4330,7 +4330,7 @@ mod tests {
             Ok(Array::from_slice(&[1.0_f32, 2.0], &[1, 2]).multiply(Array::from_f32(3.0))?)
         })
         .unwrap();
-        assert!(crate::decode::stream::mlx_array_is_available(&logits));
+        assert!(crate::primitives::weights::is_available(&logits));
     }
 
     #[test]

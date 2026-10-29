@@ -126,7 +126,16 @@ impl EditAssets {
                     "MOSS edit tensor shape/dtype mismatch: {name}"
                 )));
             }
-            let shape: Vec<i32> = shape.iter().map(|v| *v as i32).collect();
+            let shape = shape
+                .iter()
+                .map(|v| {
+                    i32::try_from(*v).map_err(|_| {
+                        Error::Unsupported(format!(
+                            "MOSS edit tensor {name} shape exceeds backend range"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i32>>>()?;
             // SAFETY: authenticated owned safetensors validates dtype, shape and payload size;
             // MLX copies the source bytes into its own retained allocation.
             let array =

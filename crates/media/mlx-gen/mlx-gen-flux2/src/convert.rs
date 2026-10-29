@@ -219,64 +219,35 @@ pub fn build_target_state_dict(src: &Weights) -> Result<HashMap<String, Array>> 
     Ok(out)
 }
 
-/// Read a safetensors file's tensor names + shapes from the JSON header alone (no weights), the
-/// fork's `_safetensors_header_keys`. The format is an 8-byte little-endian header length followed
-/// by that many UTF-8 JSON bytes mapping `name → { "shape": [...], "dtype": ..., "data_offsets": … }`.
+/// Read a safetensors file's tensor names + shapes from the JSON header alone (no weights) — the
+/// fork's `_safetensors_header_keys` — through
+/// gen-core's shared validated header parser
+/// ([`safetensors_file_tensor_locations`](mlx_gen::gen_core::weightsmeta::safetensors_file_tensor_locations)):
+/// bounded header length, typed errors for a malformed dimension, and offsets checked against the
+/// dtype and the file length. Never reads the (multi-GB) weight body, so validating a real
+/// checkpoint costs a few KB of I/O.
 fn safetensors_header_shapes(path: &Path) -> Result<HashMap<String, Vec<i64>>> {
-    use std::io::Read;
-
-    // Read ONLY the 8-byte length prefix + the `n` header bytes — never the (multi-GB) weight body
-    // (F-097: `std::fs::read` of the whole shard transiently doubled converter peak RSS just to parse
-    // a few-KB header, at the worst moment — while the converted map is also resident).
-    let mut file = std::fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
-    if file_len < 8 {
-        return Err(Error::Msg(format!(
-            "{}: too small to be a safetensors file",
-            path.display()
-        )));
-    }
-    let mut len_buf = [0u8; 8];
-    file.read_exact(&mut len_buf)?;
-    let n = u64::from_le_bytes(len_buf);
-    // A safetensors header is JSON metadata (KB–MB), never gigabytes; it must also fit in the file
-    // after the 8-byte prefix. Reject an out-of-range / absurd length rather than allocating it.
-    const MAX_HEADER: u64 = 256 << 20; // 256 MiB — far above any real header
-    if n > MAX_HEADER || 8 + n > file_len {
-        return Err(Error::Msg(format!(
-            "{}: safetensors header length out of range",
-            path.display()
-        )));
-    }
-    let mut header_bytes = vec![0u8; n as usize];
-    file.read_exact(&mut header_bytes)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes).map_err(|e| {
-        Error::Msg(format!(
-            "{}: bad safetensors header JSON: {e}",
-            path.display()
-        ))
-    })?;
-    let obj = header.as_object().ok_or_else(|| {
-        Error::Msg(format!(
-            "{}: safetensors header is not an object",
-            path.display()
-        ))
-    })?;
-    let mut shapes = HashMap::new();
-    for (k, v) in obj {
-        if k == "__metadata__" {
-            continue;
-        }
-        let shape = v
-            .get("shape")
-            .and_then(|s| s.as_array())
-            .ok_or_else(|| Error::Msg(format!("{}: tensor {k} has no shape", path.display())))?
-            .iter()
-            .map(|d| d.as_i64().unwrap_or(-1))
-            .collect();
-        shapes.insert(k.clone(), shape);
-    }
-    Ok(shapes)
+    mlx_gen::gen_core::weightsmeta::safetensors_file_tensor_locations(path)?
+        .tensors
+        .into_iter()
+        .map(|location| {
+            let header = location.header;
+            let shape = header
+                .shape
+                .iter()
+                .map(|&d| {
+                    i64::try_from(d).map_err(|_| {
+                        Error::Msg(format!(
+                            "{}: tensor {} dimension {d} exceeds i64",
+                            path.display(),
+                            header.name
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i64>>>()?;
+            Ok((header.name, shape))
+        })
+        .collect()
 }
 
 /// Hard guard: the produced key set + shapes must exactly match the base klein diffusers
@@ -689,7 +660,7 @@ mod tests {
         assert_eq!(shapes.get("w"), Some(&vec![2i64, 3]));
         std::fs::remove_file(&path).ok();
 
-        // A header length larger than the file is rejected (not allocated).
+        // A header length beyond the shared cap is rejected (not allocated).
         let mut bad = Vec::new();
         bad.extend_from_slice(&(1u64 << 40).to_le_bytes()); // claims a 1 TiB header
         bad.extend_from_slice(b"{}");
@@ -704,7 +675,7 @@ mod tests {
         let err = safetensors_header_shapes(&bad_path)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("header length out of range"), "{err}");
+        assert!(err.contains("exceeds the"), "{err}");
         std::fs::remove_file(&bad_path).ok();
     }
 

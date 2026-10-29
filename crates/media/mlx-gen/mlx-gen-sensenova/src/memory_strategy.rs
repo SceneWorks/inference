@@ -43,20 +43,17 @@
 //! cannot do at all and stays fail-closed on every authority.
 
 use mlx_gen::gen_core::{
-    Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
-    MemoryOptimizationAuthority, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
-    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport,
-    Result as CoreResult, TransformerComponent,
+    ArtifactSeal, Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
+    MemoryNumericTier, MemoryOptimizationAuthority, MemoryPhase, MemoryProviderContract,
+    MemoryRequestScope, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{LoadShape, LoadSpec, Quant, WeightsSource};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, OnceLock};
 
 /// Exact production parameters exercised by the serial real-Metal runner below.
 pub const ATTENTION_CHUNK_SIZE: u32 = 16_777_216;
@@ -209,42 +206,12 @@ pub(crate) fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> Core
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ArtifactFileIdentity {
-    canonical_path: PathBuf,
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-}
-
-/// The pinned SNAPSHOT ENTRY, captured by `lstat` so a symlink is described as a symlink rather
-/// than silently followed. This is the path runtime loaders open ([`PinnedArtifact::loader_path`]);
-/// [`ArtifactFileIdentity`] describes what it resolves to. Mirrors `mlx-gen-flux`'s
-/// `artifact_inventory::SourceEntryIdentity`, which pins the same two-level shape.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SourceEntryIdentity {
-    absolute_path: PathBuf,
-    is_symlink: bool,
-    symlink_target: Option<PathBuf>,
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-}
-
-/// One verified checkpoint file: the pinned snapshot entry, the object it resolves to, and the
-/// SHA-256 of its exact bytes.
+/// One verified checkpoint file: the shared [`ArtifactSeal`] over its snapshot entry (entry,
+/// parent chain, resolution and resolved target, plus the once-per-identity SHA-256 of its exact
+/// bytes) and that digest in hex.
 #[derive(Clone, Debug)]
 struct PinnedFile {
-    source: SourceEntryIdentity,
-    identity: ArtifactFileIdentity,
+    seal: ArtifactSeal,
     digest: String,
 }
 
@@ -292,8 +259,8 @@ impl PinnedArtifact {
         let mut hasher = Sha256::new();
         for file in &files {
             let name = file
-                .source
-                .absolute_path
+                .seal
+                .loader_path()
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
@@ -323,9 +290,7 @@ impl PinnedArtifact {
     /// all re-checked by [`ensure_unchanged`](Self::ensure_unchanged) on both sides of every open,
     /// so a repointed symlink is rejected rather than followed.
     pub(crate) fn loader_paths(&self) -> impl Iterator<Item = &Path> {
-        self.files
-            .iter()
-            .map(|file| file.source.absolute_path.as_path())
+        self.files.iter().map(|file| file.seal.loader_path())
     }
 
     pub(crate) fn digest(&self) -> &str {
@@ -349,7 +314,7 @@ impl PinnedArtifact {
         self.ensure_unchanged()
             .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
         let weights = if let [only] = self.files.as_slice() {
-            mlx_gen::weights::Weights::from_file(&only.source.absolute_path)?
+            mlx_gen::weights::Weights::from_file(only.seal.loader_path())?
         } else {
             let mut tensors = HashMap::new();
             for path in self.loader_paths() {
@@ -378,190 +343,20 @@ impl PinnedArtifact {
 
 impl PinnedFile {
     fn ensure_unchanged(&self) -> CoreResult<()> {
-        // Canonical-target check FIRST so an in-place replacement of a regular file keeps reporting
-        // "replaced or mutated" (the established message for that lane). The two entry-level checks
-        // below are what the canonical stat cannot see: when the entry is an HF symlink, re-statting
-        // the already-resolved blob describes the OLD target no matter where the link now points.
-        let current = file_identity(&self.identity.canonical_path).map_err(|error| {
+        self.seal.ensure_unchanged().map_err(|error| {
             CoreError::Msg(format!(
-                "sensenova: verified checkpoint is no longer readable: {error}"
+                "sensenova: verified checkpoint was replaced or mutated after load: {error}"
             ))
-        })?;
-        if current != self.identity {
-            return Err(CoreError::Msg(
-                "sensenova: verified checkpoint was replaced or mutated after load".to_owned(),
-            ));
-        }
-        let source = source_entry_identity(&self.source.absolute_path).map_err(|error| {
-            CoreError::Msg(format!(
-                "sensenova: pinned snapshot entry is no longer readable: {error}"
-            ))
-        })?;
-        if source != self.source {
-            return Err(CoreError::Msg(
-                "sensenova: pinned snapshot entry or symlink target changed after verification"
-                    .to_owned(),
-            ));
-        }
-        let resolved = file_identity(&self.source.absolute_path).map_err(|error| {
-            CoreError::Msg(format!(
-                "sensenova: pinned snapshot entry no longer resolves: {error}"
-            ))
-        })?;
-        if resolved != self.identity {
-            return Err(CoreError::Msg(
-                "sensenova: pinned snapshot entry resolves to a different canonical target"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
+        })
     }
 }
 
-fn source_entry_identity(path: &Path) -> std::io::Result<SourceEntryIdentity> {
-    let absolute_path = std::path::absolute(path)?;
-    let metadata = std::fs::symlink_metadata(&absolute_path)?;
-    let is_symlink = metadata.file_type().is_symlink();
-    Ok(SourceEntryIdentity {
-        symlink_target: is_symlink
-            .then(|| std::fs::read_link(&absolute_path))
-            .transpose()?,
-        absolute_path,
-        is_symlink,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        size: metadata.size(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
-    })
-}
-
-fn file_identity(path: &Path) -> std::io::Result<ArtifactFileIdentity> {
-    let canonical_path = std::fs::canonicalize(path)?;
-    let metadata = std::fs::metadata(&canonical_path)?;
-    Ok(ArtifactFileIdentity {
-        canonical_path,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        size: metadata.size(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
-    })
-}
-
-#[derive(Clone, Debug)]
-enum DigestState {
-    Hashing,
-    Ready(String),
-}
-
-struct DigestCache {
-    entries: Mutex<HashMap<ArtifactFileIdentity, DigestState>>,
-    ready: Condvar,
-}
-
-fn digest_cache() -> &'static DigestCache {
-    static CACHE: OnceLock<DigestCache> = OnceLock::new();
-    CACHE.get_or_init(|| DigestCache {
-        entries: Mutex::new(HashMap::new()),
-        ready: Condvar::new(),
-    })
-}
-
-#[cfg(test)]
-fn hash_operation_counts() -> &'static Mutex<HashMap<PathBuf, u64>> {
-    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
-    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn hash_exact_file(identity: &ArtifactFileIdentity) -> Option<String> {
-    #[cfg(test)]
-    {
-        *hash_operation_counts()
-            .lock()
-            .ok()?
-            .entry(identity.canonical_path.clone())
-            .or_default() += 1;
-    }
-    let file = File::open(&identity.canonical_path).ok()?;
-    let opened = file.metadata().ok()?;
-    if opened.dev() != identity.device || opened.ino() != identity.inode {
-        return None;
-    }
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).ok()?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Some(format!("{:x}", hasher.finalize()))
-}
-
+/// Pin one checkpoint file, or `None` when it cannot be pinned (the selector's fail-closed answer
+/// for an inventory it does not admit).
 fn pinned_file(path: &Path) -> Option<PinnedFile> {
-    loop {
-        // Pin the ENTRY (lstat) and the object it resolves to (canonicalize) as one observation.
-        // The digest cache stays keyed on the resolved identity, so two snapshot entries backed by
-        // the same HF blob still coalesce onto one content hash.
-        let source = source_entry_identity(path).ok()?;
-        let identity = file_identity(&source.absolute_path).ok()?;
-        let cache = digest_cache();
-        let mut entries = cache.entries.lock().ok()?;
-        match entries.get(&identity).cloned() {
-            Some(DigestState::Ready(digest)) => {
-                drop(entries);
-                // A cache hit is useful only if the entry AND the object it resolves to are still
-                // the ones just observed. This closes the replacement race between the first stat
-                // and the cache lookup.
-                if source_entry_identity(&source.absolute_path).ok().as_ref() == Some(&source)
-                    && file_identity(&source.absolute_path).ok()? == identity
-                {
-                    return Some(PinnedFile {
-                        source,
-                        identity,
-                        digest,
-                    });
-                }
-            }
-            Some(DigestState::Hashing) => {
-                entries = cache.ready.wait(entries).ok()?;
-                drop(entries);
-            }
-            None => {
-                entries.insert(identity.clone(), DigestState::Hashing);
-                drop(entries);
-                let digest = hash_exact_file(&identity);
-                let unchanged = source_entry_identity(&source.absolute_path).ok().as_ref()
-                    == Some(&source)
-                    && file_identity(&source.absolute_path).ok().as_ref() == Some(&identity);
-                let mut entries = cache.entries.lock().ok()?;
-                entries.remove(&identity);
-                let result = if unchanged {
-                    digest.map(|digest| {
-                        entries
-                            .retain(|cached, _| cached.canonical_path != identity.canonical_path);
-                        entries.insert(identity.clone(), DigestState::Ready(digest.clone()));
-                        PinnedFile {
-                            source,
-                            identity,
-                            digest,
-                        }
-                    })
-                } else {
-                    None
-                };
-                cache.ready.notify_all();
-                return result;
-            }
-        }
-    }
+    let seal = ArtifactSeal::pin(path).ok()?;
+    let digest = seal.content_sha256_hex();
+    Some(PinnedFile { seal, digest })
 }
 
 /// The Hugging Face shard index a sharded snapshot ships next to its `model-0000N-of-0000M
@@ -3556,8 +3351,8 @@ mod tests {
         );
         assert!(
             artifact.files[0]
-                .identity
-                .canonical_path
+                .seal
+                .canonical_target_path()
                 .extension()
                 .is_none(),
             "the canonical HF blob is extensionless — opening IT is the regression"
@@ -3598,11 +3393,7 @@ mod tests {
         let error = artifact
             .ensure_unchanged()
             .expect_err("a repointed snapshot entry must fail closed");
-        assert!(
-            error.to_string().contains("symlink target changed")
-                || error.to_string().contains("different canonical target"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("replaced or mutated"), "{error}");
         assert!(
             artifact.open_weights().is_err(),
             "no load may proceed through a repointed entry"
@@ -3629,53 +3420,6 @@ mod tests {
         assert!(
             error.contains("replaced or mutated"),
             "every deferred stream open must reject a changed source: {error}"
-        );
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn concurrent_verification_coalesces_one_content_hash() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = unique_root(&tmp, "coalesced-hash");
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("model.safetensors");
-        std::fs::write(&path, vec![7_u8; 4 * 1024 * 1024]).unwrap();
-        let canonical = std::fs::canonicalize(&path).unwrap();
-        let before = hash_operation_counts()
-            .lock()
-            .unwrap()
-            .get(&canonical)
-            .copied()
-            .unwrap_or(0);
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let path = path.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    PinnedArtifact::verify_file(path)
-                        .unwrap()
-                        .digest()
-                        .to_owned()
-                })
-            })
-            .collect();
-        let digests: Vec<_> = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect();
-        assert!(digests.iter().all(|digest| digest == &digests[0]));
-        assert_eq!(
-            hash_operation_counts()
-                .lock()
-                .unwrap()
-                .get(&canonical)
-                .copied()
-                .unwrap_or(0)
-                - before,
-            1,
-            "one file identity must be read only once even under concurrent first use"
         );
         std::fs::remove_dir_all(root).ok();
     }
