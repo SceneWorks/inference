@@ -362,7 +362,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod veda;
 pub use veda::{VedaBudget, VedaExecutionReport, VedaRequest};
-pub mod h3_terminal_telemetry;
 
 mod source_inventory;
 pub use source_inventory::SourceInventory;

@@ -33,6 +33,13 @@ contract is backend-independent.
   VAE tiling, guidance/sampling policy, and the LR schedule — the math that must match the
   reference exactly and has no reason to live in a tensor backend.
 
+Two host-side pieces that only some consumers need live in sibling crates rather than here
+(sc-27316): the Iris trainers' TCP collective transport
+([`gen-core-dist`](../gen-core-dist/README.md); the `Collective` trait, `World` and the rest of
+the distributed contract stay in `gen_core::iris::train::dist`) and the opt-in MiniMax-H3 host
+telemetry collector ([`gen-core-telemetry`](../gen-core-telemetry/README.md); the
+`h3_terminal_telemetry` request flag stays here).
+
 ## Registry model
 
 Providers publish registration *values*; there is no `inventory`, no global mutable state,

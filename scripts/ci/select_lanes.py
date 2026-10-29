@@ -182,8 +182,16 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             )
             continue
 
-        if _under(path, "crates/contracts/gen-core") or _under(
-            path, "crates/contracts/gen-core-testkit"
+        # gen-core's sibling contract crates (sc-27316: the Iris TCP transport and the H3 host
+        # telemetry) are consumed by the same backends, so they select the same lanes.
+        if any(
+            _under(path, f"crates/contracts/{crate}")
+            for crate in (
+                "gen-core",
+                "gen-core-testkit",
+                "gen-core-dist",
+                "gen-core-telemetry",
+            )
         ):
             lanes.update(
                 contracts=True,

@@ -22,6 +22,8 @@ members = [
     "crates/contracts/core-llm",
     "crates/contracts/core-llm/core-llm-testkit",
     "crates/contracts/gen-core",
+    "crates/contracts/gen-core-dist",
+    "crates/contracts/gen-core-telemetry",
     "crates/contracts/gen-core-testkit",
     "crates/kernels/candle-quant-kernels",
     "crates/bundles/*",
@@ -54,6 +56,10 @@ candle-llm = { path = "crates/llm/candle-llm" }
 candle-quant-kernels = { path = "crates/kernels/candle-quant-kernels" }
 sceneworks-gen-core = { path = "crates/contracts/gen-core" }
 sceneworks-gen-core-testkit = { path = "crates/contracts/gen-core-testkit" }
+# The Iris host TCP collective transport and the opt-in H3 host telemetry, split out of gen-core
+# with their socket / process FFI (sc-27316).
+sceneworks-gen-core-dist = { path = "crates/contracts/gen-core-dist" }
+sceneworks-gen-core-telemetry = { path = "crates/contracts/gen-core-telemetry" }
 runtime-catalog = { path = "crates/bundles/runtime-catalog" }
 mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 mlx-gen-ios-catalog = { path = "crates/media/mlx-gen/mlx-gen-ios-catalog" }

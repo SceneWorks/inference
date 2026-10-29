@@ -206,9 +206,7 @@ impl RssSampler {
         let (m, s) = (max.clone(), stop.clone());
         let thread = std::thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
-                if let Some(bytes) =
-                    candle_gen::gen_core::h3_terminal_telemetry::host_process_rss_bytes()
-                {
+                if let Some(bytes) = gen_core_telemetry::host_process_rss_bytes() {
                     m.fetch_max(bytes, Ordering::Relaxed);
                 }
                 std::thread::sleep(Duration::from_millis(50));

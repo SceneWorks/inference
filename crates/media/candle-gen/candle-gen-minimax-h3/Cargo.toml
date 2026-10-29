@@ -18,6 +18,8 @@ candle-gen = { path = "../candle-gen" }
 # header-only mmap is what keeps the 351 `model.visual.*` tensors from dragging in the rest of
 # shard 14 (layers 50-63 and `lm_head`, ~15 GB no render ever executes).
 candle-gen-boogu = { path = "../candle-gen-boogu" }
+# Opt-in H3 terminal telemetry (host RSS sampling), moved out of gen-core with its FFI (sc-27316).
+sceneworks-gen-core-telemetry = { workspace = true }
 # `RgbImage` + `Lanczos3` for the `fl2va` keyframe fit, and the RGB8 round-trip the video VAE's
 # pixel normalization runs on. The reference resizes with PIL's Lanczos; this is the same a=3
 # windowed sinc, and the parity boundary is drawn AFTER the resize (see `keyframe`).

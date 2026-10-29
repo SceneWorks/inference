@@ -1161,7 +1161,7 @@ impl MiniMaxH3 {
         };
         let mut terminal_probe = req
             .h3_terminal_telemetry
-            .then(candle_gen::gen_core::h3_terminal_telemetry::Collector::default);
+            .then(gen_core_telemetry::Collector::default);
         let mut observe_step = |index, elapsed| {
             if let Some(probe) = terminal_probe.as_mut() {
                 probe.record(index, elapsed, terminal_device_sample(&self.device));
@@ -1533,7 +1533,7 @@ impl MiniMaxH3 {
         };
         let mut terminal_probe = req
             .h3_terminal_telemetry
-            .then(candle_gen::gen_core::h3_terminal_telemetry::Collector::default);
+            .then(gen_core_telemetry::Collector::default);
         let mut observe_step = |index, elapsed| {
             if let Some(probe) = terminal_probe.as_mut() {
                 probe.record(index, elapsed, terminal_device_sample(&self.device));

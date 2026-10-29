@@ -315,6 +315,11 @@ implicit fallback disappeared.
 Future inference work should preserve these rules:
 
 - backend-neutral contracts do not depend on MLX or Candle tensor types;
+- host transports and process/OS FFI that only some consumers need live in sibling
+  crates beside the contract, not in it: the Iris TCP collective transport is
+  `sceneworks-gen-core-dist` and the opt-in H3 host telemetry is
+  `sceneworks-gen-core-telemetry` (sc-27316), each depending on `gen-core`, never
+  the reverse;
 - internal SceneWorks dependencies use workspace paths, not repository SHA pins;
 - provider registration is explicit—do not add `inventory` submissions or
   `force_link` anchors as a shortcut;

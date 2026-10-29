@@ -764,6 +764,7 @@ dependencies = [
  "image",
  "rand",
  "safetensors 0.7.0",
+ "sceneworks-gen-core-dist",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",
@@ -889,6 +890,7 @@ dependencies = [
  "image",
  "rand",
  "safetensors 0.4.5",
+ "sceneworks-gen-core-telemetry",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
@@ -2728,6 +2730,7 @@ dependencies = [
  "mlx-llm",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
+ "sceneworks-gen-core-dist",
  "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
@@ -2849,6 +2852,7 @@ dependencies = [
  "mlx-gen-boogu",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
+ "sceneworks-gen-core-telemetry",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
@@ -3868,6 +3872,26 @@ dependencies = [
  "tokenizers 0.21.4",
  "windows-sys",
  "zip",
+]
+
+[[package]]
+name = "sceneworks-gen-core-dist"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sceneworks-gen-core",
+ "serde_json",
+ "tempfile",
+ "windows-sys",
+]
+
+[[package]]
+name = "sceneworks-gen-core-telemetry"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "windows-sys",
 ]
 
 [[package]]
