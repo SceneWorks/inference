@@ -27,10 +27,10 @@
 
 use std::path::Path;
 
-use mlx_gen::gen_core::iris::depth::DEPTH_EXTRA_INPUT_CHANNELS;
-use mlx_gen::gen_core::iris::downstream::TaskExport;
-use mlx_gen::gen_core::iris::restoration::RestorationResources;
-use mlx_gen::gen_core::iris::{
+use gen_core_iris::depth::DEPTH_EXTRA_INPUT_CHANNELS;
+use gen_core_iris::downstream::TaskExport;
+use gen_core_iris::restoration::RestorationResources;
+use gen_core_iris::{
     DpmStep, GenerationParams, GenerationResources, IrisConfig, IrisTask, ModelConfig as IrisModel,
     Prediction, PROMPT_PREFIX,
 };
@@ -255,7 +255,7 @@ impl SamplingWire {
 
     /// Validate normalized metadata directly through the actual pure plan/gate methods: no fake
     /// architecture config, prompts or invented checkpoint defaults are needed to parse a family.
-    fn checked_plan(&self) -> Result<mlx_gen::gen_core::iris::DpmSolverPlan> {
+    fn checked_plan(&self) -> Result<gen_core_iris::DpmSolverPlan> {
         let images = self
             .prompt_rows
             .checked_mul(self.serial_count)
@@ -288,12 +288,9 @@ impl SamplingWire {
                 "unguided Iris recipe cannot carry an ineffective interval".into(),
             ));
         }
-        let plan = mlx_gen::gen_core::iris::DpmSolverPlan::new(
-            self.steps as usize,
-            self.order as usize,
-            shift,
-        )
-        .map_err(Error::from)?;
+        let plan =
+            gen_core_iris::DpmSolverPlan::new(self.steps as usize, self.order as usize, shift)
+                .map_err(Error::from)?;
         if guidance != 1.0 && plan.cfg_span(guidance, interval).is_none() {
             return Err(Error::Unsupported(
                 "Iris recipe interval contains no actual guided evaluation".into(),
@@ -510,7 +507,7 @@ impl SamplingToken {
 }
 
 fn epoch_class_runs(
-    plan: &mlx_gen::gen_core::iris::DpmSolverPlan,
+    plan: &gen_core_iris::DpmSolverPlan,
     guidance: f32,
     interval: (f64, f64),
 ) -> Vec<[bool; 4]> {
@@ -518,12 +515,9 @@ fn epoch_class_runs(
     for index in plan.epoch_indices(guidance, interval) {
         let step = plan.step(index).expect("bounded canonical epoch");
         let facts = [
-            mlx_gen::gen_core::iris::cfg_active(guidance, step.s, interval),
+            gen_core_iris::cfg_active(guidance, step.s, interval),
             index != 0,
-            matches!(
-                step.update,
-                mlx_gen::gen_core::iris::DpmUpdate::Second { .. }
-            ),
+            matches!(step.update, gen_core_iris::DpmUpdate::Second { .. }),
             index + 1 == plan.len(),
         ];
         if runs.last() != Some(&facts) {
@@ -615,7 +609,7 @@ fn sampling_grammar_templates(
     shift_override: Option<f32>,
 ) -> Result<Vec<SamplingTemplate>> {
     let mut by_class = std::collections::BTreeMap::new();
-    for sampler in mlx_gen::gen_core::iris::SAMPLERS {
+    for sampler in gen_core_iris::SAMPLERS {
         let order = match sampler {
             "euler" => 1,
             "dpmpp_2m" => 2,
@@ -623,8 +617,8 @@ fn sampling_grammar_templates(
         };
         // This finite grammar bound is independent of any requested step count or hardware cell.
         for steps in 1..=5 {
-            let plan = mlx_gen::gen_core::iris::DpmSolverPlan::new(steps, order, shift)
-                .map_err(Error::from)?;
+            let plan =
+                gen_core_iris::DpmSolverPlan::new(steps, order, shift).map_err(Error::from)?;
             let mut controls = vec![(1.0, None)];
             for start in 0..steps {
                 for end in start + 1..=steps {
@@ -679,7 +673,7 @@ fn resolved_generation_controls(
         .capabilities
         .validate_request(crate::model::MODEL_ID, request)
         .map_err(Error::from)?;
-    mlx_gen::gen_core::iris::validate_generation_request(crate::model::MODEL_ID, request, config)
+    gen_core_iris::validate_generation_request(crate::model::MODEL_ID, request, config)
         .map_err(Error::from)?;
     crate::model::refuse_unhonored_memory(request)?;
     GenerationParams::resolve(request, default_seed, config).map_err(Error::from)
@@ -2341,11 +2335,11 @@ struct GuardedSources<'a> {
 enum GuardedTask {
     Restoration {
         resources: RestorationResources,
-        plan: mlx_gen::gen_core::iris::restoration::RestorationPlanMetadata,
+        plan: gen_core_iris::restoration::RestorationPlanMetadata,
     },
     Depth {
         export: TaskExport,
-        plan: mlx_gen::gen_core::iris::depth::DepthInputPlan,
+        plan: gen_core_iris::depth::DepthInputPlan,
     },
 }
 
@@ -2785,10 +2779,9 @@ fn guarded_pricing_facts<'a>(
                 let actual = req
                     .depth
                     .ok_or_else(|| Error::Unsupported("missing actual depth context".into()))?;
-                mlx_gen::gen_core::iris::depth::validate_depth_request(actual)
-                    .map_err(Error::from)?;
+                gen_core_iris::depth::validate_depth_request(actual).map_err(Error::from)?;
                 (
-                    mlx_gen::gen_core::iris::depth::plan_depth_input(
+                    gen_core_iris::depth::plan_depth_input(
                         actual.image.width,
                         actual.image.height,
                         actual.resolution,
@@ -3047,12 +3040,12 @@ fn token_window(req: &IosPricingRequest<'_>, te_dir: &Path, max_length: u64) -> 
     if req.token_window > 0 {
         return Ok(u64::from(req.token_window));
     }
-    let tokenizer = mlx_gen::gen_core::tokenizer::TextTokenizer::from_file(
+    let tokenizer = gen_core_tokenizer::TextTokenizer::from_file(
         te_dir.join("tokenizer.json"),
-        mlx_gen::gen_core::tokenizer::TokenizerConfig {
+        gen_core_tokenizer::TokenizerConfig {
             max_length: usize::MAX,
             pad_token_id: 0,
-            chat_template: mlx_gen::gen_core::tokenizer::ChatTemplate::None,
+            chat_template: gen_core_tokenizer::ChatTemplate::None,
             pad_to_max_length: false,
         },
     )
@@ -3085,7 +3078,7 @@ struct GenerationEnvelope {
     rows: u64,
     cfg_scale: f32,
     cfg_interval: (f64, f64),
-    plan: mlx_gen::gen_core::iris::DpmSolverPlan,
+    plan: gen_core_iris::DpmSolverPlan,
     count: u32,
 }
 
@@ -3118,7 +3111,7 @@ impl GenerationEnvelope {
     }
 
     fn cfg_at(&self, step: &DpmStep) -> bool {
-        mlx_gen::gen_core::iris::cfg_active(self.cfg_scale, step.s, self.cfg_interval)
+        gen_core_iris::cfg_active(self.cfg_scale, step.s, self.cfg_interval)
     }
 
     fn epochs(&self) -> impl Iterator<Item = GenerationEpoch> + '_ {
@@ -3281,7 +3274,7 @@ fn generation(
         &config,
         &resources
             .backbone_dir
-            .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
+            .join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
         "",
         spec.precision,
         spec.quantize,
@@ -3296,7 +3289,7 @@ fn generation(
         let host = crate::adapters::projection_host_facts_from_headers(
             &resources
                 .backbone_dir
-                .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                .join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
         )?;
         (
             crate::adapters::header_inventory(
@@ -3517,7 +3510,7 @@ fn generation(
         && crate::packed::artifact_tier(
             &resources
                 .backbone_dir
-                .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                .join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
         )?
         .is_none();
     if !spec.adapters.is_empty() || dense_load_quant {
@@ -3783,10 +3776,7 @@ fn generation(
             },
             &format!(
                 "iris.gen.solver/update{}/guided{}/history{}/first{}/terminal{}/serial{}",
-                if matches!(
-                    epoch.step.update,
-                    mlx_gen::gen_core::iris::DpmUpdate::Second { .. }
-                ) {
+                if matches!(epoch.step.update, gen_core_iris::DpmUpdate::Second { .. }) {
                     2
                 } else {
                     1
@@ -3905,7 +3895,7 @@ pub struct RestorationMemoryClass {
 }
 
 impl RestorationWire {
-    fn plan(&self) -> Result<mlx_gen::gen_core::iris::restoration::RestorationPlanMetadata> {
+    fn plan(&self) -> Result<gen_core_iris::restoration::RestorationPlanMetadata> {
         let sigma = f64::from_bits(self.sigma_bits);
         let scale = f64::from_bits(self.scale_bits);
         let image_bytes = u64::from(self.source_width)
@@ -3925,7 +3915,7 @@ impl RestorationWire {
                 "invalid normalized Iris restoration metadata".into(),
             ));
         }
-        let roundtrip = mlx_gen::gen_core::iris::restoration::request_scale(scale as f32);
+        let roundtrip = gen_core_iris::restoration::request_scale(scale as f32);
         if roundtrip.to_bits() != self.scale_bits {
             return Err(Error::Unsupported(
                 "Iris restoration scale is not a canonical request scale".into(),
@@ -3936,14 +3926,14 @@ impl RestorationWire {
             1 => mlx_gen::InputSizing::Budgeted,
             _ => return Err(Error::Unsupported("invalid Iris input sizing".into())),
         };
-        let plan = mlx_gen::gen_core::iris::restoration::plan_metadata(
-            mlx_gen::gen_core::iris::restoration::Dims::new(self.source_width, self.source_height),
-            &mlx_gen::gen_core::iris::restoration::RestorationOptions {
+        let plan = gen_core_iris::restoration::plan_metadata(
+            gen_core_iris::restoration::Dims::new(self.source_width, self.source_height),
+            &gen_core_iris::restoration::RestorationOptions {
                 scale,
                 input_sizing,
                 color_fix: self.color_fix,
             },
-            mlx_gen::gen_core::iris::restoration::TileGeometry {
+            gen_core_iris::restoration::TileGeometry {
                 tile: self.tile,
                 patch: self.patch,
             },
@@ -3995,14 +3985,13 @@ pub fn restoration_representatives(
     let mut classes = std::collections::BTreeSet::from([actual.memory_class()?]);
     let mut representatives = vec![Ok(actual)];
     for input_sizing in [0u8, 1] {
-        let source =
-            mlx_gen::gen_core::iris::restoration::Dims::new(base.source_width, base.source_height);
+        let source = gen_core_iris::restoration::Dims::new(base.source_width, base.source_height);
         let input = if input_sizing == 0 {
             source
         } else {
-            mlx_gen::gen_core::iris::restoration::fit_budget_dims(
+            gen_core_iris::restoration::fit_budget_dims(
                 source,
-                mlx_gen::gen_core::iris::restoration::INPUT_BUDGET,
+                gen_core_iris::restoration::INPUT_BUDGET,
             )
         };
         let short = input.width.min(input.height) as f64;
@@ -4017,8 +4006,7 @@ pub fn restoration_representatives(
                 let mut wire = base.clone();
                 wire.input_sizing = input_sizing;
                 wire.color_fix = color_fix;
-                wire.scale_bits =
-                    mlx_gen::gen_core::iris::restoration::request_scale(scale).to_bits();
+                wire.scale_bits = gen_core_iris::restoration::request_scale(scale).to_bits();
                 let token = serde_json::to_string(&wire)
                     .map_err(|e| Error::Msg(e.to_string()))
                     .and_then(|wire| {
@@ -4072,7 +4060,7 @@ impl RestorationToken {
     pub fn to_value(&self) -> Result<serde_json::Value> {
         serde_json::to_value(self.wire()?).map_err(|e| Error::Msg(e.to_string()))
     }
-    pub fn plan(&self) -> Result<mlx_gen::gen_core::iris::restoration::RestorationPlanMetadata> {
+    pub fn plan(&self) -> Result<gen_core_iris::restoration::RestorationPlanMetadata> {
         self.wire()?.plan()
     }
     /// Replay actual task controls in place; source RGB ownership/capacity and artifact metadata
@@ -4162,7 +4150,7 @@ pub struct DepthMemoryClass {
 }
 
 impl DepthWire {
-    fn plan(&self) -> Result<mlx_gen::gen_core::iris::depth::DepthInputPlan> {
+    fn plan(&self) -> Result<gen_core_iris::depth::DepthInputPlan> {
         let bytes = u64::from(self.source_width)
             .checked_mul(u64::from(self.source_height))
             .and_then(|pixels| pixels.checked_mul(3))
@@ -4173,11 +4161,11 @@ impl DepthWire {
             ));
         }
         let resolution = if self.max_side == 0 {
-            mlx_gen::gen_core::iris::depth::DepthResolution::Native
+            gen_core_iris::depth::DepthResolution::Native
         } else {
-            mlx_gen::gen_core::iris::depth::DepthResolution::Capped(self.max_side)
+            gen_core_iris::depth::DepthResolution::Capped(self.max_side)
         };
-        let plan = mlx_gen::gen_core::iris::depth::plan_depth_input(
+        let plan = gen_core_iris::depth::plan_depth_input(
             self.source_width,
             self.source_height,
             resolution,
@@ -4191,7 +4179,7 @@ impl DepthWire {
 
 pub fn canonical_depth_token(
     spec: &mlx_gen::LoadSpec,
-    actual: &mlx_gen::gen_core::iris::depth::DepthRequest,
+    actual: &gen_core_iris::depth::DepthRequest,
 ) -> Result<DepthToken> {
     let export = TaskExport::from_spec(spec, IrisTask::Depth, crate::depth::DEPTH_MODEL_ID)
         .map_err(Error::from)?;
@@ -4214,7 +4202,7 @@ pub fn canonical_depth_token(
 /// patch. Unreachable resize classes are not manufactured with fake media.
 pub fn depth_representatives(
     spec: &mlx_gen::LoadSpec,
-    carrier: &mlx_gen::gen_core::iris::depth::DepthRequest,
+    carrier: &gen_core_iris::depth::DepthRequest,
 ) -> Result<Vec<Result<DepthToken>>> {
     let actual = canonical_depth_token(spec, carrier)?;
     let base = actual.wire()?;
@@ -4270,7 +4258,7 @@ impl DepthToken {
     pub fn to_value(&self) -> Result<serde_json::Value> {
         serde_json::to_value(self.wire()?).map_err(|e| Error::Msg(e.to_string()))
     }
-    pub fn plan(&self) -> Result<mlx_gen::gen_core::iris::depth::DepthInputPlan> {
+    pub fn plan(&self) -> Result<gen_core_iris::depth::DepthInputPlan> {
         self.wire()?.plan()
     }
     /// Apply max-side/native controls to the real source request without copying its RGB payload.
@@ -4278,7 +4266,7 @@ impl DepthToken {
     pub fn apply_runtime_to(
         &self,
         spec: &mlx_gen::LoadSpec,
-        carrier: &mut mlx_gen::gen_core::iris::depth::DepthRequest,
+        carrier: &mut gen_core_iris::depth::DepthRequest,
     ) -> Result<()> {
         let wire = self.wire()?;
         wire.plan()?;
@@ -4301,9 +4289,9 @@ impl DepthToken {
         }
         let previous = carrier.resolution;
         carrier.resolution = if wire.max_side == 0 {
-            mlx_gen::gen_core::iris::depth::DepthResolution::Native
+            gen_core_iris::depth::DepthResolution::Native
         } else {
-            mlx_gen::gen_core::iris::depth::DepthResolution::Capped(wire.max_side)
+            gen_core_iris::depth::DepthResolution::Capped(wire.max_side)
         };
         let result = canonical_depth_token(spec, carrier).and_then(|actual| {
             if actual == *self {
@@ -4331,10 +4319,10 @@ impl DepthToken {
 pub fn restoration_input_plan(
     spec: &mlx_gen::LoadSpec,
     actual: &mlx_gen::TransformRequest,
-) -> Result<mlx_gen::gen_core::iris::restoration::RestorationPlanMetadata> {
+) -> Result<gen_core_iris::restoration::RestorationPlanMetadata> {
     let resources =
         RestorationResources::from_spec(spec, crate::restoration::MODEL_ID).map_err(Error::from)?;
-    mlx_gen::gen_core::iris::restoration::plan_request_metadata(
+    gen_core_iris::restoration::plan_request_metadata(
         actual,
         resources.settings.geometry(&resources.export.config),
         crate::restoration::MODEL_ID,
@@ -4344,12 +4332,12 @@ pub fn restoration_input_plan(
 
 pub fn depth_input_plan(
     spec: &mlx_gen::LoadSpec,
-    actual: &mlx_gen::gen_core::iris::depth::DepthRequest,
-) -> Result<mlx_gen::gen_core::iris::depth::DepthInputPlan> {
+    actual: &gen_core_iris::depth::DepthRequest,
+) -> Result<gen_core_iris::depth::DepthInputPlan> {
     let export = TaskExport::from_spec(spec, IrisTask::Depth, crate::depth::DEPTH_MODEL_ID)
         .map_err(Error::from)?;
-    mlx_gen::gen_core::iris::depth::validate_depth_request(actual).map_err(Error::from)?;
-    mlx_gen::gen_core::iris::depth::plan_depth_input(
+    gen_core_iris::depth::validate_depth_request(actual).map_err(Error::from)?;
+    gen_core_iris::depth::plan_depth_input(
         actual.image.width,
         actual.image.height,
         actual.resolution,
@@ -4363,7 +4351,7 @@ fn restoration_priced_plan(
     req: &IosPricingRequest<'_>,
     resources: &RestorationResources,
     token: Option<&RestorationToken>,
-) -> Result<mlx_gen::gen_core::iris::restoration::RestorationPlanMetadata> {
+) -> Result<gen_core_iris::restoration::RestorationPlanMetadata> {
     if req.generation.is_some() || req.depth.is_some() {
         return Err(Error::Unsupported(
             "Iris restoration cannot carry generation/depth context".into(),
@@ -4387,7 +4375,7 @@ fn restoration_priced_plan(
     let actual = req.transform.ok_or_else(|| Error::Unsupported(
         "Iris restoration pricing requires the actual TransformRequest source/scale/sizing/color-fix context".into()
     ))?;
-    let p = mlx_gen::gen_core::iris::restoration::plan_request_metadata(
+    let p = gen_core_iris::restoration::plan_request_metadata(
         actual,
         resources.settings.geometry(&resources.export.config),
         crate::restoration::MODEL_ID,
@@ -4861,8 +4849,8 @@ fn depth_with_sources(
             )
         })?;
         if sources.is_some() {
-            mlx_gen::gen_core::iris::depth::validate_depth_request(actual).map_err(Error::from)?;
-            mlx_gen::gen_core::iris::depth::plan_depth_input(
+            gen_core_iris::depth::validate_depth_request(actual).map_err(Error::from)?;
+            gen_core_iris::depth::plan_depth_input(
                 actual.image.width,
                 actual.image.height,
                 actual.resolution,
@@ -5360,13 +5348,13 @@ mod tests {
         assert!(incompatible
             .apply_runtime_to(&restore_spec, &mut restore)
             .is_err());
-        let mut depth = mlx_gen::gen_core::iris::depth::DepthRequest {
+        let mut depth = gen_core_iris::depth::DepthRequest {
             image: restore.image,
-            resolution: mlx_gen::gen_core::iris::depth::DepthResolution::Native,
+            resolution: gen_core_iris::depth::DepthResolution::Native,
             ..Default::default()
         };
         let token = canonical_depth_token(&depth_spec, &depth).unwrap();
-        depth.resolution = mlx_gen::gen_core::iris::depth::DepthResolution::Capped(8);
+        depth.resolution = gen_core_iris::depth::DepthResolution::Capped(8);
         token.apply_runtime_to(&depth_spec, &mut depth).unwrap();
         assert_eq!(canonical_depth_token(&depth_spec, &depth).unwrap(), token);
         assert_eq!(depth.image.pixels.as_ptr(), rgb);
@@ -5536,9 +5524,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             crate::model::descriptor().capabilities.samplers,
-            mlx_gen::gen_core::iris::SAMPLERS
+            gen_core_iris::SAMPLERS
         );
-        for sampler in mlx_gen::gen_core::iris::SAMPLERS {
+        for sampler in gen_core_iris::SAMPLERS {
             for steps in [1, 2, 4] {
                 for rows in [1usize, 2] {
                     for count in [1u32, 2] {
@@ -5568,7 +5556,7 @@ mod tests {
                             assert_eq!(recipe.plan.last().unwrap().t, 0.0);
                             assert!(matches!(
                                 recipe.plan.last().unwrap().update,
-                                mlx_gen::gen_core::iris::DpmUpdate::First { cx: 0.0, c0: -1.0 }
+                                gen_core_iris::DpmUpdate::First { cx: 0.0, c0: -1.0 }
                             ));
                             let epochs: Vec<_> = recipe.epochs().collect();
                             assert_eq!(epochs.len(), steps as usize * count as usize);
@@ -5590,7 +5578,7 @@ mod tests {
                                 assert_eq!(
                                     matches!(
                                         epoch.step.update,
-                                        mlx_gen::gen_core::iris::DpmUpdate::Second { .. }
+                                        gen_core_iris::DpmUpdate::Second { .. }
                                     ),
                                     sampler == "dpmpp_2m"
                                         && epoch.index > 0

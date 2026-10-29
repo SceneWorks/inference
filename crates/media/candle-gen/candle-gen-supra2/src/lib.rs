@@ -2,17 +2,17 @@
 //!
 //! Native Supra2-IMG text-to-image on Candle (Windows/Linux CUDA; CPU) — epic sc-24212, story
 //! sc-24214. The Candle sibling of `mlx-gen-supra2` (sc-24213), registered under the **same** engine
-//! id [`PROVIDER_ID`](candle_gen::gen_core::supra2::PROVIDER_ID) (`supra2_img`) and loading the
+//! id [`PROVIDER_ID`](gen_core_checkpoint::supra2::PROVIDER_ID) (`supra2_img`) and loading the
 //! **same** inputs.
 //!
 //! `SupraLabs/Supra2-IMG` — a 104.1M-parameter rectified-flow DiT conditioned on Flan-T5-Base and
 //! decoded by SD VAE ft-MSE — at 256×256. The backend-neutral half (geometry, revision pins, the
 //! install-time `.pt` → bundle converter, component resolution, tokenization, schedule, noise, pixel
-//! quantization, memory facts) lives in [`gen_core::supra2`](candle_gen::gen_core::supra2) and is
+//! quantization, memory facts) lives in [`gen_core_checkpoint::supra2`] and is
 //! shared with MLX, so both backends integrate the identical seeded `z0` for the same seed.
 //!
 //! Load contract (identical to MLX): `LoadSpec::weights` is the converted bundle directory
-//! ([`convert_pinned_checkpoint`](candle_gen::gen_core::supra2::convert_pinned_checkpoint) output);
+//! ([`convert_pinned_checkpoint`](gen_core_checkpoint::supra2::convert_pinned_checkpoint) output);
 //! `LoadSpec::components` carries `text_encoder` (the pinned `google/flan-t5-base` snapshot) and
 //! `vae` (the pinned `stabilityai/sd-vae-ft-mse` snapshot). Nothing is downloaded.
 //!
@@ -46,7 +46,7 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION)
         .register_memory_strategy(model::MEMORY)
         .register_resident_only_memory_contract(ResidentOnlyMemoryContractRegistration {
-            provider_id: candle_gen::gen_core::supra2::PROVIDER_ID,
+            provider_id: gen_core_checkpoint::supra2::PROVIDER_ID,
             contract: memory_strategy::witness,
             surface_specs: memory_strategy::witness_specs,
         })

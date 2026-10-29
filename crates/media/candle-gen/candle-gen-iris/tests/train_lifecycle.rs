@@ -13,11 +13,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::gen_core::iris::train::{
-    checkpoint_root, latest_checkpoint, list_checkpoints, read_checkpoint_state, AdapterMetadata,
-    Prediction, WeightsSelect, OPTIONS_KEY,
-};
-use candle_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, LrSchedule,
     NetworkType, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
@@ -26,6 +21,11 @@ use candle_gen::gen_core::{
 use candle_gen_iris::train::model::provider_dtype;
 use candle_gen_iris::train::render_preview_with;
 use candle_gen_iris::{load_backbone, load_backbone_with_adapters, IrisDiT, IrisTextEncoder};
+use gen_core_iris::train::{
+    checkpoint_root, latest_checkpoint, list_checkpoints, read_checkpoint_state, AdapterMetadata,
+    Prediction, WeightsSelect, OPTIONS_KEY,
+};
+use gen_core_iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use serde_json::json;
 
 use crate::common::{cpu, device, fixture_at, tiny_backbone, tiny_config, tiny_text_encoder};

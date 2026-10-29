@@ -10,17 +10,15 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::gen_core::iris::train::repa::{
-    TeacherArch, TEACHER_COMPONENT, TEACHER_WEIGHTS_FILE,
-};
-use candle_gen::gen_core::iris::train::upstream::stage_preset_config;
-use candle_gen::gen_core::iris::train::{
-    checkpoint_root, latest_checkpoint, read_checkpoint_state, HostRng, OPTIONS_KEY,
-};
-use candle_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
 use candle_gen::gen_core::{
     LoadSpec, LrSchedule, Trainer, TrainingConfig, TrainingItem, TrainingRequest, WeightsSource,
 };
+use gen_core_iris::train::repa::{TeacherArch, TEACHER_COMPONENT, TEACHER_WEIGHTS_FILE};
+use gen_core_iris::train::upstream::stage_preset_config;
+use gen_core_iris::train::{
+    checkpoint_root, latest_checkpoint, read_checkpoint_state, HostRng, OPTIONS_KEY,
+};
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use serde_json::{json, Value as Json};
 
 use crate::common::{cpu, device, tiny_backbone, tiny_text_encoder};

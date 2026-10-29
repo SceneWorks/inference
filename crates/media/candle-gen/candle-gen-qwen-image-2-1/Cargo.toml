@@ -40,9 +40,13 @@ rand = { workspace = true }
 # their headers in the preflight. Also used by the real-weight renders (`tests/e2e_real_weights.rs`,
 # sc-24114) to write PNGs a reviewer can open from the CUDA evidence artifact.
 image = { workspace = true }
+sceneworks-gen-core-family = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
+sceneworks-gen-core-memory-wan = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof", "candle-llm/model-inference-proof", "candle-core/model-inference-proof"]
+model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof", "candle-llm/model-inference-proof", "candle-core/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider crate selects the matching candle backend everywhere.
 default = []

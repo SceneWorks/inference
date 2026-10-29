@@ -7,7 +7,7 @@
 //! the joint DiT four times at each transition.
 
 use candle_gen::candle_core::{DType, Error, Result, Tensor};
-use candle_gen::gen_core::ltx_checkpoint::{LtxBundle, LtxComponent};
+use gen_core_ltx::ltx_checkpoint::{LtxBundle, LtxComponent};
 use serde::{Deserialize, Serialize};
 
 use crate::config::STAGE1_SIGMAS;
@@ -210,7 +210,7 @@ fn whole_prediction_std(prediction: &Tensor) -> Result<Tensor> {
 mod tests {
     use super::*;
     use crate::config::NATIVE_STEPS;
-    use candle_gen::gen_core::ltx_checkpoint::LtxBundleBuilder;
+    use gen_core_ltx::ltx_checkpoint::LtxBundleBuilder;
 
     fn transformer_bundle(variant: Option<&str>) -> LtxBundle {
         let dir = tempfile::tempdir().unwrap();

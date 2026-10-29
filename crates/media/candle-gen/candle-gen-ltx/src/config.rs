@@ -25,10 +25,10 @@
 //! learned latent upsampler and its second distilled refinement pass are consumed by the provider.
 //! I2V/keyframes/IC-LoRA clips and inference LoRA/PEFT-LoKr are wired by the package pipeline.
 
-use candle_gen::gen_core::ltx_checkpoint::{
+use candle_gen::gen_core::{self, Error as GenError};
+use gen_core_ltx::ltx_checkpoint::{
     caption_feature_version, CaptionFeatureVersion, LtxBundle, LtxComponent,
 };
-use candle_gen::gen_core::{self, Error as GenError};
 use serde_json::Value;
 
 /// Registry id (the distilled 22B text-to-video model).
@@ -754,7 +754,7 @@ impl VideoVaeDeclaration {
     /// The shipped LTX-2.3 convolutional VAE declaration.
     pub fn ltx_2_3() -> Self {
         Self {
-            class_name: gen_core::ltx_checkpoint::CONV_VIDEO_VAE_CLASS.to_string(),
+            class_name: gen_core_ltx::ltx_checkpoint::CONV_VIDEO_VAE_CLASS.to_string(),
             latent_channels: LATENT_CHANNELS as i32,
             patch_size: 4,
         }
@@ -762,7 +762,7 @@ impl VideoVaeDeclaration {
 
     /// True when the file holds the diffusion decoder rather than the convolutional one.
     pub fn is_diffusion(&self) -> bool {
-        self.class_name == gen_core::ltx_checkpoint::DIFFUSION_VIDEO_VAE_CLASS
+        self.class_name == gen_core_ltx::ltx_checkpoint::DIFFUSION_VIDEO_VAE_CLASS
     }
 
     /// Read the declaration from a `config.vae` object.
@@ -906,7 +906,7 @@ mod caption_feature_version_tests {
     use super::*;
 
     // Detector collapse (sc-18757/#688, 2026-08-19 coordinator review): candle-gen-ltx no longer
-    // duplicates upstream's V1/V2 detection logic — `gen_core::ltx_checkpoint::caption_feature_
+    // duplicates upstream's V1/V2 detection logic — `gen_core_ltx::ltx_checkpoint::caption_feature_
     // version` (imported above) is the single shared detector both backends fold onto. These
     // tests are KEPT (per the coordinator's explicit instruction) but now call that shared
     // function directly with JSON fixtures instead of a local `KeyPresence`-array twin.

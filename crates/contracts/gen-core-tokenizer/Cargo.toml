@@ -1,0 +1,27 @@
+[package]
+name = "sceneworks-gen-core-tokenizer"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-neutral text tokenization (the HF tokenizers wrapper) for the gen-core contract layer."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["tokenizer", "inference", "generative"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_tokenizer::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_tokenizer"
+
+[features]
+# Manual source-bound model input receipts on the reader sites this crate owns; no ordinary
+# runtime/read behavior changes.
+model-inference-proof = ["sceneworks-gen-core/model-inference-proof"]
+
+[dependencies]
+# The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
+# never depends on them (sc-27316). Tensor-free, like gen-core.
+sceneworks-gen-core = { workspace = true }
+# The HF tokenizers Rust core, moved out of gen-core with the wrapper (sc-27316).
+# `TextTokenizer::constraint_decode_table` delegates to the one live implementation in core-llm.
+core-llm = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

@@ -8,7 +8,7 @@
 //! and target-time (flow-map) conditioning, and the flow-map Euler sampler.
 //!
 //! The backend-neutral half (identity, resources, `config.json`, text window, schedule, id and
-//! RoPE tables, request params) is [`gen_core::flux3`], shared with the Candle twin (sc-26235) and
+//! RoPE tables, request params) is [`gen_core_flux3`], shared with the Candle twin (sc-26235) and
 //! the SceneWorks worker. The tensor work is here.
 //!
 //! ## Resources
@@ -21,7 +21,7 @@
 //! pinned revisions and the coverage table, and `tests/fixtures/` for the committed miniature
 //! fixtures dumped by `../tools/dump_flux3_*.py` from the frozen source.
 //!
-//! [`gen_core::flux3`]: mlx_gen::gen_core::flux3
+//! [`gen_core_flux3`]: gen_core_flux3
 
 pub mod adapters;
 pub mod autoencoder;
@@ -37,11 +37,12 @@ pub mod training;
 
 pub use autoencoder::Flux3AutoEncoder;
 pub use dit::{Flux3Dit, SampleTokens};
-pub use mlx_gen::gen_core::flux3::{
-    AUTOENCODER_COMPONENT, DISTILLED_MODEL_ID, DISTILLED_WEIGHTS_REPO, DISTILLED_WEIGHTS_REVISION,
-    FAMILY, TEXT_ENCODER_COMPONENT, TEXT_ENCODER_UPSTREAM_REPO, TEXT_ENCODER_UPSTREAM_REVISION,
+pub use gen_core_flux3::{
+    AUTOENCODER_COMPONENT, DISTILLED_WEIGHTS_REPO, DISTILLED_WEIGHTS_REVISION, FAMILY,
+    TEXT_ENCODER_COMPONENT, TEXT_ENCODER_UPSTREAM_REPO, TEXT_ENCODER_UPSTREAM_REVISION,
     UPSTREAM_CODE_REVISION,
 };
+pub use mlx_gen::gen_core::flux3::DISTILLED_MODEL_ID;
 pub use model::{
     compute_dtype, descriptor, descriptor_base, load, load_autoencoder, load_base, load_dit,
     Flux3Klein, MODEL_ID,

@@ -33,7 +33,7 @@ components["text_encoder"] (a directory)       = the Qwen/Qwen3-VL-4B-Instruct s
 A missing/incomplete resource is a typed load error that names the path and the task.
 
 The **depth** task (`iris_3b_depth`, sc-25682) is its own closure — the `depth/` folder only, no text
-encoder (`gen_core::iris::downstream::TaskExport`):
+encoder (`gen_core_iris::downstream::TaskExport`):
 
 ```
 weights (LoadSpec::weights, a directory)      = the HF repo's depth/ folder
@@ -49,15 +49,15 @@ Any staged component (e.g. `text_encoder`), `LoadSpec::text_encoder`, the genera
 ## Generation coverage table (source → native)
 
 Later stories extend this table (depth, restoration, full control surface S3). The Candle column is
-sc-25680 (`crates/media/candle-gen/candle-gen-iris`), which reads the same `gen_core::iris` contract
+sc-25680 (`crates/media/candle-gen/candle-gen-iris`), which reads the same `gen_core_iris` contract
 and is held to the same fixtures.
 
 | Upstream control / behaviour | Source | MLX (`mlx-gen-iris`) | Candle (`candle-gen-iris`) | Status |
 | --- | --- | --- | --- | --- |
-| Chat template prefix/suffix (system "Describe the image…", user turn, assistant marker) | `text/qwen3_vl.py` `_PROMPT_PREFIX`/`_PROMPT_SUFFIX` | `text_encoder.rs` `PROMPT_PREFIX`/`PROMPT_SUFFIX` | `text_encoder.rs` (same `gen_core::iris` constants) | ported verbatim; prefix, caption, suffix tokenized **separately** (`add_special_tokens=False`) |
+| Chat template prefix/suffix (system "Describe the image…", user turn, assistant marker) | `text/qwen3_vl.py` `_PROMPT_PREFIX`/`_PROMPT_SUFFIX` | `text_encoder.rs` `PROMPT_PREFIX`/`PROMPT_SUFFIX` | `text_encoder.rs` (same `gen_core_iris` constants) | ported verbatim; prefix, caption, suffix tokenized **separately** (`add_special_tokens=False`) |
 | 300-token conditioning window, caption truncated to `max_length - len(suffix)`, suffix always kept | `_run`, `caption_budget` | `assemble_window` | `assemble_window` (shared) | ported; overflow golden |
 | Right padding with `pad_token_id` (fallback `eos`), mask = 1 over caption + suffix | `_run` | `assemble_window` | same (runs only the real tokens) | ported; the tower is causal and the pads trail, so real rows never see a pad and pad rows are zeroed by the mask — the port runs only the real tokens and writes zeros (the pad id cannot affect the output) |
-| `on_caption_overflow` (`warn`/`error`/`silent`) | `TextEncoderConfig`, `_tokenize_captions` (also `--set text_encoder.on_caption_overflow=…`) | config value, overridden per request by `GenerationRequest::caption_overflow`; `gen_core::iris::apply_caption_overflow_policy` in `IrisTextEncoder::encode_with_policy` | same (`text_encoder.rs`) | ported (sc-25681): `warn` truncates, logs and returns a `caption_truncated` `GenerationWarning` (`generate_with_report`); `silent` truncates quietly; `error` refuses the request before the tower runs. Applies to the negative prompt too (upstream's `null()` shares `_tokenize_captions`). Any other config value is refused at load. Upstream rate-limits its log line to once per 100 calls — a logging cadence, not behaviour; the port reports every truncation |
+| `on_caption_overflow` (`warn`/`error`/`silent`) | `TextEncoderConfig`, `_tokenize_captions` (also `--set text_encoder.on_caption_overflow=…`) | config value, overridden per request by `GenerationRequest::caption_overflow`; `gen_core_iris::apply_caption_overflow_policy` in `IrisTextEncoder::encode_with_policy` | same (`text_encoder.rs`) | ported (sc-25681): `warn` truncates, logs and returns a `caption_truncated` `GenerationWarning` (`generate_with_report`); `silent` truncates quietly; `error` refuses the request before the tower runs. Applies to the negative prompt too (upstream's `null()` shares `_tokenize_captions`). Any other config value is refused at load. Upstream rate-limits its log line to once per 100 calls — a logging cadence, not behaviour; the port reports every truncation |
 | 12 post-block hidden states `[2,5,…,35]` (1-based), sliced to the window, pad rows zeroed | `_run`, `hidden_layers` | `IrisTextEncoder::encode` | `IrisTextEncoder::encode_window` | ported; index law asserted by the oracle |
 | Qwen3-VL language tower (GQA 32/8×128, q/k RMSNorm, SwiGLU, θ = 5e6; interleaved mRoPE collapses to 1-D for text) | transformers `Qwen3VLTextModel` | the shared generic decoder `mlx_llm::CausalLm` (`qwen3_vl` architecture, HF-ordered hidden states) | the shared generic decoder `candle_llm::CausalLm` (`qwen3_vl`, HF-ordered hidden states); bf16 on CUDA, f32 on the Candle CPU lane (no CPU half GEMM) | reused; bf16, the release's `text_encoder.dtype` |
 | CFG null = the negative prompt run through the **same** template (empty ⇒ training dropout null) | `null()` | `encode` of the negative prompt | `pipeline::encode` | ported (the on-disk null cache is a pure memo, not behaviour) |
@@ -69,9 +69,9 @@ and is held to the same fixtures.
 | Trunk attention is **unmasked** (pad text keys participate) | `JointAttention`, `SingleStreamBlock` | `dit.rs` | `dit.rs` | ported as-is (source fidelity) |
 | Timestep re-fusion `silu(t_emb + s)` | `IrisDiT.forward` | `dit.rs` | `dit.rs` | ported |
 | PiT pixel head: per-pixel Linear(3→16) + full-resolution 2D sincos, 4 post-modulation blocks (pixel-wise adaLN, patch compaction 256·16→1280, 10-head RoPE attention over the patch grid, GELU MLP), RMSNorm + Linear(16→3), `fold` | `blocks/pit.py`, `PixelEmbedder`, `FinalLayer` | `dit.rs` | `dit.rs` (`gelu_erf`) | ported |
-| Flow schedule: `σ = 1 − linspace(1, 0.001, N+1)`, shift `s·σ/(1+(s−1)σ)` with `flow.shift` = 4, model time `1000·t` | `flow/schedule.py`, `FlowDPMSolver.time_grid` | `solver.rs` `time_grid` (f64) | `gen_core::iris::time_grid` (shared, f64) | ported |
+| Flow schedule: `σ = 1 − linspace(1, 0.001, N+1)`, shift `s·σ/(1+(s−1)σ)` with `flow.shift` = 4, model time `1000·t` | `flow/schedule.py`, `FlowDPMSolver.time_grid` | `solver.rs` `time_grid` (f64) | `gen_core_iris::time_grid` (shared, f64) | ported |
 | FlowDPM-Solver++ multistep, lower-order warm-up and final (terminal step = exact x0 projection) | `flow/solver.py` | `solver.rs` | `solver.rs` (shared plan; FP32 state) | ported; FP32 integration state |
-| `prediction`: `v` (`x0 = x − t·out`) or `x` (`x0 = out`) — a checkpoint property | `FlowConfig.prediction`, `_pred_x0` | `config.yaml` `flow.prediction` → `gen_core::iris::Prediction` → `solver::sample` | same | ported (sc-25681); any other value is refused at load (upstream raises) |
+| `prediction`: `v` (`x0 = x − t·out`) or `x` (`x0 = out`) — a checkpoint property | `FlowConfig.prediction`, `_pred_x0` | `config.yaml` `flow.prediction` → `gen_core_iris::Prediction` → `solver::sample` | same | ported (sc-25681); any other value is refused at load (upstream raises) |
 | CFG on the raw model output, `uncond + s·(cond − uncond)`, gated strictly inside `cfg_interval` | `_model_out` | `solver.rs` `cfg_combine`, `GenerationParams::cfg_at` | same | ported |
 | Output `clamp(−1, 1)` → `[0, 255]` (torchvision `save_image(normalize, value_range=(−1,1))`) | `generate`, `sample.py` | `pipeline.rs` `to_image` | `pipeline.rs` `to_image` (nearest-even rounding) | ported (`round(255·(x+1)/2)`) |
 | Noise `torch.randn` on the generator device | `generate` | seeded MLX normal (repo convention) | launch-portable CPU `StdRng` (`candle_gen::seed`) — not bit-reproducible with torch or MLX; parity uses injected noise | **not bit-reproducible** with torch RNG; parity is measured with injected noise |
@@ -80,14 +80,14 @@ and is held to the same fixtures.
 
 The backend-neutral half (request surface, plan, positional randomness, schedule, data walk and
 preprocessing, Muon routing, random-init law, artifact schemas, checkpoint layout) is
-`gen_core::iris::train`; the MLX half is `src/train/`. Oracle: `../tools/dump_iris_train.py`
+`gen_core_iris::train`; the MLX half is `src/train/`. Oracle: `../tools/dump_iris_train.py`
 (frozen `train/*.py`, `flow/*.py`, `seeding.py` sha256-pinned; Dion `microsoft/dion@58d38adb`, the
 commit upstream's `pyproject.toml` pins). The Candle half (sc-25686) is `candle-gen-iris/src/train/`,
 held to the same fixture by its own `train_parity` (Candle CPU, FP32) and the same lifecycle cases. The release ships no downstream training loop; generation
 training follows `train/trainer.py`. Upstream trains no adapters: LoRA/LoKr are the standard PEFT /
 LyCORIS parameterizations over the frozen upstream Linears, under the same objective and loop.
 
-| Upstream behaviour | Source | MLX (`src/train`, `gen_core::iris::train`) | Candle | Status |
+| Upstream behaviour | Source | MLX (`src/train`, `gen_core_iris::train`) | Candle | Status |
 | --- | --- | --- | --- | --- |
 | Rectified-flow loss: `x_t = (1−σ)x0 + σε`, target `ε − x0`, per-sample MSE then mean; v- or x-prediction (`v̂ = (x_t − x̂0)/max(σ, x_pred_sigma_min)`) | `flow/transport.py` | `model::flow_loss` | `train::model::flow_loss` | ported; `loss_v`/`loss_x` fixtures 3e-7 (Candle 5e-7, also through the autograd forward) |
 | 1000-point shifted training grid, integer-truncated model time; `shift_law` none/sd3/flux | `flow/schedule.py` | `TrainSchedule`, `resolution_shift` | shared contract | ported (f64, exact values pinned) |
@@ -186,7 +186,7 @@ bounded official curriculum (`curricula_real_weights`: the shipped `stage1_256` 
 steps → `stage2_512` as a `new_phase` to step 4, batch 1).
 
 **Upstream config map.** Every leaf of `configs/` (`TrainConfig` and its sections) and the trainer
-CLI, as `gen_core::iris::train::upstream::UPSTREAM_OPTIONS` records it; `translate_upstream` turns a
+CLI, as `gen_core_iris::train::upstream::UPSTREAM_OPTIONS` records it; `translate_upstream` turns a
 config + dotlist overrides into the native request, refusing a refused key that is set away from its
 default, and `check_resources` holds every `resource` key to the provisioned backbone / text encoder.
 *honored* = carried into the request; *mapped* = a framework / performance flag with the named native
@@ -374,7 +374,7 @@ backends, against `iris_controls_golden.safetensors`) and the provider-level che
 | `prompts: list[str]` | `prompt`, or `prompt_batch` (non-empty ⇒ `prompt` empty) | `pipeline::encode` per prompt → one batched `denoise` (`[B, …]` text states, per-row masks, null expanded over the batch in `cat([uncond, cond])`) | same | `batch` | `prompt_batch.len() × count ≤ 8` images; image `k = c·B + j` draws noise from seed `k` (MLX `seed + k`, Candle `image_seed(seed, k)`), so a batched image equals its single render up to batched-GEMM rounding (`a_prompt_batch_renders_one_image_per_prompt_per_count`, FP32 ≤ 1 code value) |
 | `height` / `width` (1024²) | `height` / `width` (multiples of 16, 16..=2048) | noise geometry, patch grid, 2-D RoPE grid, PiT sincos table | same | `square` (8×8), `portrait` (12×8), `landscape` (8×16) vs `base` (8×12, also landscape) | aspect ratio is the pair; no separate aspect control upstream |
 | `steps` (100) | `steps` | `dpm_solver_plan(steps, …)` | same | `steps` (8) vs every other case (5 steps) | |
-| `order` (2) | `sampler`: `dpmpp_2m` = order 2 (default), `euler` = order 1 | `GenerationParams::order` → plan | same | `order1` | order 1 is the first-order DPM-Solver++ update `x ← (t/s)·x + ((s−t)/s)·x0` on every step — exactly the flow Euler (= DDIM) step (`gen_core::iris` `the_order_one_plan_is_the_euler_step`). Upstream runs the 2M update for every `order ≥ 2`, so 3+ is not a distinct solver and has no name; any other sampler name is refused |
+| `order` (2) | `sampler`: `dpmpp_2m` = order 2 (default), `euler` = order 1 | `GenerationParams::order` → plan | same | `order1` | order 1 is the first-order DPM-Solver++ update `x ← (t/s)·x + ((s−t)/s)·x0` on every step — exactly the flow Euler (= DDIM) step (`gen_core_iris` `the_order_one_plan_is_the_euler_step`). Upstream runs the 2M update for every `order ≥ 2`, so 3+ is not a distinct solver and has no name; any other sampler name is refused |
 | `cfg_scale` (3.0) | `guidance` | `cfg_combine`; `1.0` skips the unconditional branch and its encode | same | `negative` (4.0), `cfg_off` (1.0) | |
 | `cfg_interval` ((0, 1)) | `cfg_interval: Option<(f32, f32)>` | `GenerationParams::cfg_at` | same | `interval` (0.3, 0.8) | `0 ≤ lo < hi ≤ 1` (model time `t` ∈ (0, 1)); an interval holding none of the plan's evaluation times while guidance ≠ 1 is refused (the guidance would be accepted and never run), and any interval at guidance 1.0 is refused (CFG is off, so the interval would do nothing) |
 | `shift` (checkpoint `flow.shift`) | `scheduler_shift` | `time_grid(steps, shift)` | same | `shift2` | `> 0`; default is the checkpoint's own `flow.shift` |
@@ -383,10 +383,10 @@ backends, against `iris_controls_golden.safetensors`) and the provider-level che
 | `noise` | — | — | — | — | test-only injection (`denoise` takes the noise tensor) |
 | `num_train_timesteps`, `prediction` | — (checkpoint `flow.*`) | read from `config.yaml` | same | `prediction_x` | checkpoint properties, not request controls |
 | `--set KEY=VALUE` config overrides | — | the inference-relevant keys are the rows above (`sample.*` → request fields; `flow.shift` → `scheduler_shift`; `text_encoder.on_caption_overflow` → `caption_overflow`); architecture keys are the checkpoint's and are validated, never overridden | same | — | an override of an architecture key would mis-load the checkpoint upstream too |
-| `flow.shift_law` (`none`/`sd3`/`flux`) | — | accepted, inert at inference | same | `gen_core::iris` `unsupported_switches_are_typed_refusals` | `scripts/sample.py` samples with `flow.shift` verbatim whatever the law — the law only resolves the *training* stage shift (`RectifiedFlow`). Unknown laws are refused (upstream's `resolution_shift` raises) |
+| `flow.shift_law` (`none`/`sd3`/`flux`) | — | accepted, inert at inference | same | `gen_core_iris` `unsupported_switches_are_typed_refusals` | `scripts/sample.py` samples with `flow.shift` verbatim whatever the law — the law only resolves the *training* stage shift (`RectifiedFlow`). Unknown laws are refused (upstream's `resolution_shift` raises) |
 | `sample:` section of a checkpoint config | — | ignored | same | — | upstream's `inference_config` keeps only `model`/`text_encoder`/`flow` (`INFERENCE_SECTIONS`); `SampleConfig` defaults always apply |
 
-Refused by name (`gen_core::iris::reject_unhonored_generation_controls` and the shared floor): every
+Refused by name (`gen_core_iris::reject_unhonored_generation_controls` and the shared floor): every
 other request field — `true_cfg`, `timestep_to_start_cfg`, `guidance_method` and the APG knobs,
 `scheduler` names, `strength`, conditioning inputs, video/audio fields, PiD, phases.
 
@@ -400,7 +400,7 @@ the upstream `IrisDiT` module path (the checkpoint key stem, e.g. `blocks.3.attn
 | --- | --- | --- |
 | Application | forward-time residual on the projection (`mlx_gen::adapters::AdaptableLinear`, `apply_adapters_strict`), base never mutated; LoRA `scale·(x·Aᵀ)·Bᵀ`; LoKr / LoHa the reconstructed `[out, in]` delta (`Adapter::Lokr` — the projections are dense, so the shared loader materializes rather than taking its packed-base structured `w1·X·w2ᵀ` form) built in the backbone compute dtype (`AdaptableHost::lycoris_dtype`: bf16 under `Precision::Bf16`, f32 under `Precision::Fp32` — sc-25690) | forward-time residual on the projection (`nn::Residual`, sc-25686 — previously folded `W += δ`, which rounds a sub-ulp delta away under bf16 compute and is not the forward the trainer optimizes), base never mutated; LoRA `(x·Aᵀ)·(Bᵀ·scale·alpha/rank)`, factors and GEMMs in f32; LoKr (stamped or LyCORIS) the structured `Residual::Kron` — its Kronecker factors held **f32** with `scale·(alpha/rank)` baked into `w2`, applied as `w1·X·w2ᵀ` (GEMMs in the activation's dtype, f32 on the CPU backend) without forming `kron(w1, w2)` — falling back to the reconstructed delta (`Residual::Delta`, compute dtype) only when the factors do not decompose the projection; LoHa its exact rank-`r₁r₂` factorisation (`Residual::LowRank`, compute dtype) when `r₁r₂·(in + out) < in·out`, else the reconstructed delta (`Residual::Delta`, compute dtype); a stamped LoKr's per-target `.alpha` must equal its metadata alpha |
 | Formats | PEFT/diffusers LoRA (`transformer.` / `diffusion_model.` / bare; `lora_A/B`, `lora_down/up`; per-target `.alpha` or `lora_adapter_metadata`), kohya `lora_unet_…`, PEFT-stamped LoKr (`networkType=lokr`), LyCORIS-layout LoKr/LoHa factors — key layouts only: every one of them must also carry the identity stamps below | same set |
-| Identity | `gen_core::iris::check_adapter_identity`: `family=iris` and `irisTask=<task>` **required**, `baseModel` must match when present — the task backbones share one architecture, so only the stamp tells a depth adapter from a generation one. Required for **every** format: a file exported by a third-party trainer (kohya, LyCORIS) carries neither stamp and is refused until it is re-stamped; unstamped third-party files are not supported | same |
+| Identity | `gen_core_iris::check_adapter_identity`: `family=iris` and `irisTask=<task>` **required**, `baseModel` must match when present — the task backbones share one architecture, so only the stamp tells a depth adapter from a generation one. Required for **every** format: a file exported by a third-party trainer (kohya, LyCORIS) carries neither stamp and is refused until it is re-stamped; unstamped third-party files are not supported | same |
 | Strictness | a target that resolves to no projection, a file that lands nothing, a diff-patch (`.diff`/`.diff_b`) file, per-pass scales / MoE expert → typed error | same, plus a delta whose shape differs from its projection |
 | Provenance | `Generator::adapter_apply_reports()` — one `AdapterApplyReport { adapter_path, applied, skipped }` per file, from the most recent backbone load | same |
 
@@ -422,12 +422,12 @@ branch per step.
 ## Depth coverage table (source → native, sc-25682)
 
 Source: `src/iris3b/downstream/{__init__,depth}.py`, `scripts/depth.py`, `scripts/export_downstream.py`
-at the pinned commit. Host-side steps live once in `gen_core::iris::depth` (both backends call
+at the pinned commit. Host-side steps live once in `gen_core_iris::depth` (both backends call
 `estimate_with`); the tensor forward is `mlx_gen_iris::depth` / `candle_gen_iris::depth`.
 
 | Upstream control / behaviour | Source | MLX (`mlx-gen-iris`) | Candle (`candle-gen-iris`) | Status |
 | --- | --- | --- | --- | --- |
-| Export layout + task identity (`task.name == "depth"`), strict key set (`pixel.*` + `depth_reducer.*`) | `load_export`, `export_downstream.py` | `depth::load_depth` over `gen_core::iris::downstream::TaskExport` | same | ported; wrong-task artifacts are typed refusals; no text encoder in the closure (E4) |
+| Export layout + task identity (`task.name == "depth"`), strict key set (`pixel.*` + `depth_reducer.*`) | `load_export`, `export_downstream.py` | `depth::load_depth` over `gen_core_iris::downstream::TaskExport` | same | ported; wrong-task artifacts are typed refusals; no text encoder in the closure (E4) |
 | Empty-prompt conditioning `[1, T, L, D]` F32 + BOOL mask, shape-checked against the config | `load_export`, `DepthPredictor.__init__` | `EmptyPrompt::read` (shared) | same | ported |
 | Widened input projections (`s_embedder.proj` p²·4, `pixel_embedder.proj` 4 → 16), output stays 3 channels | `IrisDepth._widen` | `IrisDiT::from_weights_widened` | `IrisDiT::from_checkpoint_widened` | ported |
 | Input = RGB ‖ zero channel, t = `flow.num_train_timesteps` (1000), one forward, empty-prompt mask | `IrisDepth.forward` | `IrisDepth::forward` | `IrisDepth::forward` | ported |
@@ -530,7 +530,7 @@ asserts a "direct-regression (stage 0)" checkpoint carrying its own `conditionin
 paper (arXiv 2610.09450v1 §5.2 "Recipe." / "Data.", Eq. 5). Nothing below is a verbatim port of a
 training script; each row names its source, and where the paper is silent the choice is a documented
 assumption **and** a `model_options.iris` option (never a hidden constant). Contract:
-`gen_core::iris::train::depth` (plan, items, paired transforms, normalization, Eq. 5 host reference,
+`gen_core_iris::train::depth` (plan, items, paired transforms, normalization, Eq. 5 host reference,
 export layout, resume identity); tensors: `mlx_gen_iris::train::depth` / `candle_gen_iris::train::depth`.
 
 | Choice | Source | MLX | Candle | Status |
@@ -552,7 +552,7 @@ export layout, resume identity); tensors: `mlx_gen_iris::train::depth` / `candle
 | Parent init: reducer | paper silent; `nn.Conv2d` default in `IrisDepth.__init__` | `reducer_init: torch_default` (U(±1/√C)), or `channel_mean` | same | upstream-construction default + option |
 | Parent empty prompt | export carries `payload["conditioning"]` | `empty_prompt` component file, or encode `""` once with `text_encoder` | same | ported; a `depth/` export uses its own |
 | Export | `export_downstream.py depth` | `<out>/<stem>/{config.yaml (model/text_encoder/flow + task: depth), model.safetensors (FP32 `pixel.*` + `depth_reducer.*`), empty_prompt.safetensors}` + `irisTask=depth` / `irisArtifact=full_model` / `irisBaseIdentity` stamps | same | ported; runs in `depth::load` unchanged; generation / restoration loaders refuse it |
-| Lifecycle (cancel, checkpoints, resume incl. optimizer/scheduler/EMA/RNG/data position, new phase, retention, previews) | generation trainer contract (sc-25685) | shared `gen_core::iris::train` machinery; `state.json` `task = depth` | same | ported |
+| Lifecycle (cancel, checkpoints, resume incl. optimizer/scheduler/EMA/RNG/data position, new phase, retention, previews) | generation trainer contract (sc-25685) | shared `gen_core_iris::train` machinery; `state.json` `task = depth` | same | ported |
 
 Fixtures: `iris_depth_train_golden.safetensors` from `../tools/dump_iris_depth_train.py` (upstream
 `IrisDepth` on `tiny-depth`, torch FP32 CPU, the paper's normalization + Eq. 5, one
@@ -647,7 +647,7 @@ Source: `src/iris3b/downstream/restoration.py`, `src/iris3b/downstream/__init__.
 `../tools/dump_iris_restoration.py`). Registered as a **transform** (`gen_core::Transform`, the
 non-prompt image→image contract) under `iris_3b_restore` on both backends
 (`mlx-gen-iris::restoration`, `candle-gen-iris::restoration`). The host-side pixel path is ONE
-backend-neutral implementation in `gen_core::iris::restoration` (planner + driver); each backend
+backend-neutral implementation in `gen_core_iris::restoration` (planner + driver); each backend
 supplies only a tile's velocity.
 
 ### Resources (E4)
@@ -665,7 +665,7 @@ weights — upstream `load_export`'s task-name check. A missing file names the p
 
 ### Coverage table (source → native)
 
-| Upstream control / behaviour | Source | Shared (`gen_core::iris::restoration`) | MLX (`mlx-gen-iris`) | Candle (`candle-gen-iris`) | Status |
+| Upstream control / behaviour | Source | Shared (`gen_core_iris::restoration`) | MLX (`mlx-gen-iris`) | Candle (`candle-gen-iris`) | Status |
 | --- | --- | --- | --- | --- | --- |
 | Task identity (`task.name == "restoration"`), `sigma`, `tile` from `config.yaml` | `load_export`, `Restorer.__init__` | `downstream::TaskExport` (S4's shared export closure) + `RestorationSettings::from_task/validate` | `IrisRestorer::load` | `IrisRestorer::load` | ported; tile must be a multiple of the patch; v-prediction required (upstream's check) |
 | Empty-prompt conditioning, no text encoder | `Restorer.__init__` | `downstream::EmptyPrompt::read` (shape-checked against `text_len` / `text_lap_num_layers` / `text_dim`) | `[1, T, L, D]` array, read once | same | ported |
@@ -685,7 +685,7 @@ weights — upstream `load_export`'s task-name check. A missing file names the p
 
 ### Planner (consumer preview)
 
-`gen_core::iris::restoration::plan_request(req, TileGeometry::RELEASE, MODEL_ID)` (or `plan(dims,
+`gen_core_iris::restoration::plan_request(req, TileGeometry::RELEASE, MODEL_ID)` (or `plan(dims,
 &options, …)`) returns, before any execution and without weights: source, budgeted input, output
 (`floor(input · scale)`), processing size, whether it was enlarged, padded size, tile rows/columns
 and `forward_count()`. A scale whose output rounds to zero pixels, or whose output, enlarged
@@ -730,7 +730,7 @@ choice the paper leaves open is traced to HYPIR's reference trainer, `XPixelGrou
 `b61d107c6cef38f01a93c7833558869731cfa8c1` (`HYPIR/trainer/base.py`, `HYPIR/model/{D,backbone}.py`,
 `HYPIR/dataset/{realesrgan,batch_transform,utils,diffjpeg}.py`, `HYPIR/utils/degradation.py`,
 `configs/sd2_train.yaml`; sha256-pinned in `../tools/dump_iris_restoration_train.py`). One
-backend-neutral contract (`gen_core::iris::restoration_train` + `gen_core::iris::degradation`), two
+backend-neutral contract (`gen_core_iris::restoration_train` + `gen_core_iris::degradation`), two
 native trainers (`mlx-gen-iris::train::restore`, `candle-gen-iris::train::restore`) with their own
 LPIPS-VGG (`train::lpips`) and critic (`train::critic`).
 
@@ -742,7 +742,7 @@ LPIPS-VGG (`train::lpips`) and critic (`train::critic`).
 | `lpips_vgg16` | `lpips.LPIPS(net="vgg")` trunk (`base.py` L129) = torchvision `vgg16-397923af` | `timm/vgg16.tv_in1k` @ `b8d8aa2dd860af9233c8c67385a8097fd6c35d3f` `model.safetensors` (`features.*` bit-identical to torchvision's, checked) | `57b02691…203fad8` |
 | `lpips_lin` | LPIPS v0.1 VGG heads (`lpips==0.1.4`) | `vivym/lpips` @ `270571f1fb2a2c4c5f920cec96cd87838c345982` `vgg_lpips_linear.safetensors` (bit-identical to `richzhang/PerceptualSimilarity@082bb24` `vgg.pth`, checked) | `0c6387bf…4333ac` |
 
-Full hashes, sizes and URLs: `gen_core::iris::restoration_train::TRAINING_RESOURCES`.
+Full hashes, sizes and URLs: `gen_core_iris::restoration_train::TRAINING_RESOURCES`.
 
 ### Recipe trace (source → native)
 
@@ -763,20 +763,20 @@ Full hashes, sizes and URLs: `gen_core::iris::restoration_train::TRAINING_RESOUR
 | EMA 0.999, updated after each G optimizer step; EMA weights exported | paper ("EMA … decay 0.999 is scored"); `base.py` L343, `ema.py` | `ema_update` after the G step; `export_weights` default `ema` | ported |
 | LR schedule | paper (Iris arm: constant) | constant (default) or cosine; warmup in steps | constant ported; cosine = the shared knob; linear refused |
 | Crops 1024², horizontal flip | paper; `realesrgan.py` `augment`, `utils.py` `random_crop_arr(min_crop_frac=0.7)` / `center_crop_arr` (PIL BOX halving + BICUBIC) | `training_pair` (`crop`: random / center / none), PIL-exact BOX/BICUBIC (`imageops`) | ported; `resolution` is the crop |
-| Second-order Real-ESRGAN degradation at 4× incl. USM sharpening of the GT | paper; `batch_transform.py` `__call__`; yaml dataset + batch_transform | `gen_core::iris::degradation` (kernels, sinc via J₁, reflect `filter2D`, area/bilinear/bicubic `F.interpolate`, Gaussian/Poisson (gray) noise, `DiffJPEG(differentiable=False)`, USM, 8-bit round) | ported; per-op parity + end-to-end 8-bit LQ bit-exact on recorded draws |
+| Second-order Real-ESRGAN degradation at 4× incl. USM sharpening of the GT | paper; `batch_transform.py` `__call__`; yaml dataset + batch_transform | `gen_core_iris::degradation` (kernels, sinc via J₁, reflect `filter2D`, area/bilinear/bicubic `F.interpolate`, Gaussian/Poisson (gray) noise, `DiffJPEG(differentiable=False)`, USM, 8-bit round) | ported; per-op parity + end-to-end 8-bit LQ bit-exact on recorded draws |
 | Batch-level resize/mode draws + 256-entry training-pair queue | `batch_transform.py` (`_dequeue_and_enqueue`) | drawn **per item** from `mix_seed(seed, RESTORE1, epoch, item)` | deliberate mapping: the queue only diversifies per-batch draws; per-item draws do that directly and keep each pair a function of `(seed, epoch, item)` (cancel/resume bit-exact) |
 | Aligned degraded/clean pairs | (not in HYPIR) | `TrainingItem::model_options["degraded_image"]`; integer-scale aligned crops, torch-exact bicubic upsample | native addition (story AC); all-or-none per run |
 | Full fine-tune — **the recipe** | paper §5.3 ("We fully fine-tune …") | `full_finetune: true` (set by `recipe_training_config()`) | ported; the default request |
 | LoRA (`init_lora_weights="gaussian"`, `lora_alpha = rank`) merged into the export — HYPIR's arm, supported but **not** the default | HYPIR's own arm (`sd2.py` `LoraConfig`) | LoRA / LoKr over `blocks.*`, `lora_init` gaussian default, merged (f32) at export | ported; export is always the full `upscaler/` layout |
 | Mixed precision bf16; critic trunk `precision="bf16"` | yaml `mixed_precision: bf16`; `base.py` L151 | `train_dtype`, `critic_dtype` (convs/linears in bf16, LayerNorm/reductions f32) | ported; Candle CPU refuses a bf16 critic (no CPU bf16 GEMM) |
-| Data order (shuffled DataLoader) | `base.py` L188 | `gen_core::iris::train::DataWalk` (the generation trainer's ranged walk) | native (reused machinery, deterministic) |
+| Data order (shuffled DataLoader) | `base.py` L188 | `gen_core_iris::train::DataWalk` (the generation trainer's ranged walk) | native (reused machinery, deterministic) |
 | Checkpoints: `accelerator.save_state` + EMA dict, `checkpoints_total_limit` | `base.py` L431–453 | generation-trainer checkpoint machinery + `critic.safetensors` (head + `u`/`v`), `critic_optimizer.safetensors`, `state.json` (`iris-restoration-train-checkpoint-v1`) | ported; resume restores generator, EMA, both optimizers, spectral buffers, data cursor |
 | Export | — | `upscaler/` layout: `config.yaml` + `empty_prompt.safetensors` copied verbatim from the base export, `model.safetensors` (FP32, `irisTask=restoration`, `irisArtifact=full_model`) | loads in `iris_3b_restore` with no training-only component; the depth loader and the generation loader (`downstream::refuse_task_export`) refuse it |
 | Previews | `log_images` | the first item's degraded input restored with `preview_weights` every `sample_every` | native (no prompts — `sample_prompts` refused) |
 
 ### Verification
 
-* `gen_core::iris::degradation` parity (`degradation_parity.rs`): HYPIR kernels ≤1e-8, every op on its
+* `gen_core_iris::degradation` parity (`degradation_parity.rs`): HYPIR kernels ≤1e-8, every op on its
   recorded input ≤2e-5 (JPEG: ≤2 % of elements past 1e-3), the full chain's 8-bit LQ bit-exact on all
   three scripted chains.
 * `tests/restoration_train_parity.rs` (both): LPIPS (formula weights), miniature ConvNeXt critic

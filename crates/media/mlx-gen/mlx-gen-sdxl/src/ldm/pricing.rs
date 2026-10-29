@@ -1,6 +1,6 @@
 //! Actual fused source operations and load-floor facts. No order enumeration, alias rejection,
 //! synthetic directory, tensor payload/model graph or guessed HashMap order.
-use mlx_gen::gen_core::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
+use gen_core_family::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
 use mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader;
 use mlx_gen::{Error, Result};
 use std::collections::BTreeMap;

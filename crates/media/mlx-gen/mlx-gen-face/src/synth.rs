@@ -1,9 +1,9 @@
 //! MLX tensors from the face-loss fixture's counter-based synthetic generator
-//! ([`mlx_gen::gen_core::train::face_loss::synth`], shared with `candle-gen-face` and the Python producer),
+//! ([`gen_core_train::face_loss::synth`], shared with `candle-gen-face` and the Python producer),
 //! so torch, MLX and Candle build bit-identical weights and images without any downloaded
 //! checkpoint (epic 2123, sc-24831, AC3).
 
-use mlx_gen::gen_core::train::face_loss::synth;
+use gen_core_train::face_loss::synth;
 use mlx_rs::Array;
 
 /// The synthetic tensor `key` with `shape`.

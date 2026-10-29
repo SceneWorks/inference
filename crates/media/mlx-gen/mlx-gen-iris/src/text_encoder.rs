@@ -3,7 +3,7 @@
 //! * The chat-template prefix, the caption and the suffix are tokenized **separately**
 //!   (`add_special_tokens=False`) and concatenated; the caption alone is cut to
 //!   `max_length − len(suffix)` so the assistant-turn marker always survives
-//!   ([`gen_core::iris::assemble_window`]).
+//!   ([`gen_core_iris::assemble_window`]).
 //! * The language tower is the shared generic decoder [`mlx_llm::CausalLm`] (the `qwen3_vl`
 //!   architecture: GQA, per-head q/k RMSNorm, SwiGLU, θ = 5e6; interleaved mRoPE collapses to 1-D
 //!   for a text-only prompt). It runs in its own compute dtype (bf16), matching the release's
@@ -20,11 +20,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use gen_core::iris::{
-    assemble_window, TextEncoderConfig, TextWindow, PROMPT_PREFIX, PROMPT_SUFFIX,
-};
 use gen_core::safetensors_shards::{resolve_indexed_safetensors_shards, snapshot_shard_roots};
-use gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
+use gen_core_iris::{assemble_window, TextEncoderConfig, TextWindow, PROMPT_PREFIX, PROMPT_SUFFIX};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::gen_core;
 use mlx_gen::{Error, Quant, Result};
 use mlx_llm::primitives::projection::{QuantGrid, QuantSpec};
@@ -92,11 +90,11 @@ pub struct IrisTextEncoder {
     overflow: CaptionOverflowPolicy,
 }
 
-use gen_core::iris::apply_caption_overflow_policy;
-/// The `on_caption_overflow: warn` message for one window — backend-neutral, shared with the
-/// Candle twin through [`gen_core::iris`].
-pub use gen_core::iris::caption_overflow_warning;
 use gen_core::CaptionOverflowPolicy;
+use gen_core_iris::apply_caption_overflow_policy;
+/// The `on_caption_overflow: warn` message for one window — backend-neutral, shared with the
+/// Candle twin through [`gen_core_iris`].
+pub use gen_core_iris::caption_overflow_warning;
 
 fn from_llm(e: mlx_llm::Error) -> Error {
     match e {

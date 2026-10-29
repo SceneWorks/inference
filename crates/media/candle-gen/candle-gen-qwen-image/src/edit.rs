@@ -26,12 +26,12 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     AdapterSpec, GenerationMemory, Image, MemoryProviderContract, MemoryRunContext, OffloadPolicy,
     PreviewSink, Progress, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
+use gen_core_tokenizer::TextTokenizer;
 
 use crate::config::{TextEncoderConfig, TransformerConfig, NEGATIVE_FALLBACK};
 use crate::image_processor::{ImageInput, QwenImageProcessor};

@@ -1,7 +1,7 @@
 //! Candle executor for **SceneWorks fx-program** checkpoints (`sceneworks-fx-program/1`, epic 2123
 //! sc-24831) — the MediaPipe FaceMesh-v2 landmark detector of the face-landmark loss; the twin of
 //! `mlx-gen-face`'s `program`. The structure is parsed once, backend-neutrally, by
-//! [`candle_gen::gen_core::fx_program`]; this interpreter runs it NCHW (candle's native layout, the
+//! [`gen_core_family::fx_program`]; this interpreter runs it NCHW (candle's native layout, the
 //! program's own semantics) and is **differentiable in the input** (parameters are plain tensors,
 //! never `Var`s, so backprop only reaches the input).
 //!
@@ -15,9 +15,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::fx_program::{BinaryOp, Op, Operand, ProgramSpec, FORMAT};
 use candle_gen::gen_core::weightsmeta;
 use candle_gen::{CandleError, Result};
+use gen_core_family::fx_program::{BinaryOp, Op, Operand, ProgramSpec, FORMAT};
 
 fn err(m: impl Into<String>) -> CandleError {
     CandleError::Msg(format!("fx-program: {}", m.into()))

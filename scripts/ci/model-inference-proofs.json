@@ -212875,12 +212875,12 @@
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs",
             "case_source_sha256": "43501123bccc67e569bbbb06d99c9a9794aa191f6820ae40c0eb087dee4e8e83",
-            "writer": "REQUIRED SOURCE SLOT generated-subject-mask-files / crates/contracts/gen-core/src/train/subject_mask.rs::SubjectMask::load/image::open\nCURRENT FORMATTED SAME-CASE WRITE/READ CALLER:\n    fn subject_mask_weight_is_resampled_per_bucket() {\n        let root = tiny_snapshot();\n        let tmp = tempfile::tempdir().unwrap();\n        let left_half_mask = |name: &str, width: u32, height: u32| {\n            let img = image::GrayImage::from_fn(width, height, |x, _| {\n                image::Luma([if x < width / 2 { 255 } else { 0 }])\n            });\n            let path = tmp.path().join(name);\n            img.save(&path).unwrap();\n            path\n        };\n        let mut captioned = TrainingItem::captioned(\n            write_png(tmp.path(), \"sq.png\", 160, 160, 3),\n            \"a swatch\".into(),\n        );\n        captioned.subject_mask_path = Some(left_half_mask(\"sq_mask.png\", 160, 160));\n        let mut edit = TrainingItem::edit_pair(\n            write_png(tmp.path(), \"wide.png\", 256, 128, 5),\n            \"widen it\".into(),\n            vec![write_png(tmp.path(), \"ref.png\", 64, 64, 9)],\n        );\n        edit.subject_mask_path = Some(left_half_mask(\"wide_mask.png\", 256, 128));\n        let cfg = gen_core::SubjectMaskLoss {\n            background_weight: 0.0,\n            subject_weight: 1.0,\n        };\n        let vae = loader::load_vae(&root).unwrap();\n        let edges = [64u32, 128];\n        for item in [captioned, edit] {\n            let targets = encode_item_targets(&vae, &item, &edges, Some(&cfg)).unwrap();\n            assert_eq!(targets.len(), 2);\n            for (b, (&edge, (x0, weight))) in edges.iter().zip(&targets).enumerate() {\n                let weight = weight.as_ref().expect(\"mask loss on \u21d2 a weight\");\n                assert_eq!(weight.shape(), x0.shape(), \"bucket {b} (edge {edge})\");\n                let (w, _) = edit_target_size(&item, edge).unwrap();\n                let gw = (w / 16) as usize;\n                let channels = x0.shape()[2] as usize;\n                let flat = weight.reshape(&[-1]).unwrap();\n                let flat = flat.as_slice::<f32>();\n                for (token, cells) in flat.chunks(channels).enumerate() {\n                    let gx = token % gw;\n                    let want = if (gx + 1) * 2 <= gw {\n                        1.0\n                    } else if gx * 2 >= gw {\n                        0.0\n                    } else {\n                        continue;\n                    };\n                    assert!(\n                        cells.iter().all(|&v| (v - want).abs() < 1e-5),\n                        \"bucket {b} (edge {edge}) token {token}: {cells:?} want {want}\"\n                    );\n                }\n            }\n        }\n        crate::model_inference_device::record_model_inference_device();\n        println!(\"MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_is_resampled_per_bucket\");\n    }\nSOURCE-BOUND HELPER/ASSET CHAIN RETAINED FROM PRIOR VERIFIED DATA:\n    fn subject_mask_weight_is_resampled_per_bucket() {\n        let root = tiny_snapshot();\n        let tmp = tempfile::tempdir().unwrap();\n        let left_half_mask = |name: &str, width: u32, height: u32| {\n            let img = image::GrayImage::from_fn(width, height, |x, _| {\n                image::Luma([if x < width / 2 { 255 } else { 0 }])\n            });\n            let path = tmp.path().join(name);\n            img.save(&path).unwrap();\n            path\n        };\n        let mut captioned = TrainingItem::captioned(\n            write_png(tmp.path(), \"sq.png\", 160, 160, 3),\n            \"a swatch\".into(),\n        );\n        captioned.subject_mask_path = Some(left_half_mask(\"sq_mask.png\", 160, 160));\n        let mut edit = TrainingItem::edit_pair(\n            write_png(tmp.path(), \"wide.png\", 256, 128, 5),\n            \"widen it\".into(),\n            vec![write_png(tmp.path(), \"ref.png\", 64, 64, 9)],\n        );\n        edit.subject_mask_path = Some(left_half_mask(\"wide_mask.png\", 256, 128));\n        let cfg = gen_core::SubjectMaskLoss {\n            background_weight: 0.0,\n            subject_weight: 1.0,\n        };\n        let vae = loader::load_vae(&root).unwrap();\n        let edges = [64u32, 128];\n        for item in [captioned, edit] {\n            let targets = encode_item_targets(&vae, &item, &edges, Some(&cfg)).unwrap();\n            assert_eq!(targets.len(), 2);\n            for (b, (&edge, (x0, weight))) in edges.iter().zip(&targets).enumerate() {\n                let weight = weight.as_ref().expect(\"mask loss on \u21d2 a weight\");\n                assert_eq!(weight.shape(), x0.shape(), \"bucket {b} (edge {edge})\");\n                let (w, _) = edit_target_size(&item, edge).unwrap();\n                let gw = (w / 16) as usize;\n                let channels = x0.shape()[2] as usize;\n                let flat = weight.reshape(&[-1]).unwrap();\n                let flat = flat.as_slice::<f32>();\n                for (token, cells) in flat.chunks(channels).enumerate() {\n                    let gx = token % gw;\n                    let want = if (gx + 1) * 2 <= gw {\n                        1.0\n                    } else if gx * 2 >= gw {\n                        0.0\n                    } else {\n                        continue;\n                    };\n                    assert!(\n                        cells.iter().all(|&v| (v - want).abs() < 1e-5),\n                        \"bucket {b} (edge {edge}) token {token}: {cells:?} want {want}\"\n                    );\n                }\n            }\n        }\n        crate::model_inference_device::record_model_inference_device();\n        println!(\"MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_is_resampled_per_bucket\");\n    }\nSAME-CASE NUMERIC WRITER HELPERS:\n    fn write_png(dir: &Path, name: &str, width: u32, height: u32, phase: u32) -> PathBuf {\n        let img = image::RgbImage::from_fn(width, height, |x, y| {\n            image::Rgb([\n                ((x * 5 + phase) % 256) as u8,\n                ((y * 3 + 2 * phase) % 256) as u8,\n                (((x + y) * 7 + phase) % 256) as u8,\n            ])\n        });\n        let path = dir.join(name);\n        img.save(&path).unwrap();\n        path\n    }"
+            "writer": "REQUIRED SOURCE SLOT generated-subject-mask-files / crates/contracts/gen-core-train/src/subject_mask.rs::SubjectMask::load/image::open\nCURRENT FORMATTED SAME-CASE WRITE/READ CALLER:\n    fn subject_mask_weight_is_resampled_per_bucket() {\n        let root = tiny_snapshot();\n        let tmp = tempfile::tempdir().unwrap();\n        let left_half_mask = |name: &str, width: u32, height: u32| {\n            let img = image::GrayImage::from_fn(width, height, |x, _| {\n                image::Luma([if x < width / 2 { 255 } else { 0 }])\n            });\n            let path = tmp.path().join(name);\n            img.save(&path).unwrap();\n            path\n        };\n        let mut captioned = TrainingItem::captioned(\n            write_png(tmp.path(), \"sq.png\", 160, 160, 3),\n            \"a swatch\".into(),\n        );\n        captioned.subject_mask_path = Some(left_half_mask(\"sq_mask.png\", 160, 160));\n        let mut edit = TrainingItem::edit_pair(\n            write_png(tmp.path(), \"wide.png\", 256, 128, 5),\n            \"widen it\".into(),\n            vec![write_png(tmp.path(), \"ref.png\", 64, 64, 9)],\n        );\n        edit.subject_mask_path = Some(left_half_mask(\"wide_mask.png\", 256, 128));\n        let cfg = gen_core::SubjectMaskLoss {\n            background_weight: 0.0,\n            subject_weight: 1.0,\n        };\n        let vae = loader::load_vae(&root).unwrap();\n        let edges = [64u32, 128];\n        for item in [captioned, edit] {\n            let targets = encode_item_targets(&vae, &item, &edges, Some(&cfg)).unwrap();\n            assert_eq!(targets.len(), 2);\n            for (b, (&edge, (x0, weight))) in edges.iter().zip(&targets).enumerate() {\n                let weight = weight.as_ref().expect(\"mask loss on \u21d2 a weight\");\n                assert_eq!(weight.shape(), x0.shape(), \"bucket {b} (edge {edge})\");\n                let (w, _) = edit_target_size(&item, edge).unwrap();\n                let gw = (w / 16) as usize;\n                let channels = x0.shape()[2] as usize;\n                let flat = weight.reshape(&[-1]).unwrap();\n                let flat = flat.as_slice::<f32>();\n                for (token, cells) in flat.chunks(channels).enumerate() {\n                    let gx = token % gw;\n                    let want = if (gx + 1) * 2 <= gw {\n                        1.0\n                    } else if gx * 2 >= gw {\n                        0.0\n                    } else {\n                        continue;\n                    };\n                    assert!(\n                        cells.iter().all(|&v| (v - want).abs() < 1e-5),\n                        \"bucket {b} (edge {edge}) token {token}: {cells:?} want {want}\"\n                    );\n                }\n            }\n        }\n        crate::model_inference_device::record_model_inference_device();\n        println!(\"MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_is_resampled_per_bucket\");\n    }\nSOURCE-BOUND HELPER/ASSET CHAIN RETAINED FROM PRIOR VERIFIED DATA:\n    fn subject_mask_weight_is_resampled_per_bucket() {\n        let root = tiny_snapshot();\n        let tmp = tempfile::tempdir().unwrap();\n        let left_half_mask = |name: &str, width: u32, height: u32| {\n            let img = image::GrayImage::from_fn(width, height, |x, _| {\n                image::Luma([if x < width / 2 { 255 } else { 0 }])\n            });\n            let path = tmp.path().join(name);\n            img.save(&path).unwrap();\n            path\n        };\n        let mut captioned = TrainingItem::captioned(\n            write_png(tmp.path(), \"sq.png\", 160, 160, 3),\n            \"a swatch\".into(),\n        );\n        captioned.subject_mask_path = Some(left_half_mask(\"sq_mask.png\", 160, 160));\n        let mut edit = TrainingItem::edit_pair(\n            write_png(tmp.path(), \"wide.png\", 256, 128, 5),\n            \"widen it\".into(),\n            vec![write_png(tmp.path(), \"ref.png\", 64, 64, 9)],\n        );\n        edit.subject_mask_path = Some(left_half_mask(\"wide_mask.png\", 256, 128));\n        let cfg = gen_core::SubjectMaskLoss {\n            background_weight: 0.0,\n            subject_weight: 1.0,\n        };\n        let vae = loader::load_vae(&root).unwrap();\n        let edges = [64u32, 128];\n        for item in [captioned, edit] {\n            let targets = encode_item_targets(&vae, &item, &edges, Some(&cfg)).unwrap();\n            assert_eq!(targets.len(), 2);\n            for (b, (&edge, (x0, weight))) in edges.iter().zip(&targets).enumerate() {\n                let weight = weight.as_ref().expect(\"mask loss on \u21d2 a weight\");\n                assert_eq!(weight.shape(), x0.shape(), \"bucket {b} (edge {edge})\");\n                let (w, _) = edit_target_size(&item, edge).unwrap();\n                let gw = (w / 16) as usize;\n                let channels = x0.shape()[2] as usize;\n                let flat = weight.reshape(&[-1]).unwrap();\n                let flat = flat.as_slice::<f32>();\n                for (token, cells) in flat.chunks(channels).enumerate() {\n                    let gx = token % gw;\n                    let want = if (gx + 1) * 2 <= gw {\n                        1.0\n                    } else if gx * 2 >= gw {\n                        0.0\n                    } else {\n                        continue;\n                    };\n                    assert!(\n                        cells.iter().all(|&v| (v - want).abs() < 1e-5),\n                        \"bucket {b} (edge {edge}) token {token}: {cells:?} want {want}\"\n                    );\n                }\n            }\n        }\n        crate::model_inference_device::record_model_inference_device();\n        println!(\"MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_is_resampled_per_bucket\");\n    }\nSAME-CASE NUMERIC WRITER HELPERS:\n    fn write_png(dir: &Path, name: &str, width: u32, height: u32, phase: u32) -> PathBuf {\n        let img = image::RgbImage::from_fn(width, height, |x, y| {\n            image::Rgb([\n                ((x * 5 + phase) % 256) as u8,\n                ((y * 3 + 2 * phase) % 256) as u8,\n                (((x + y) * 7 + phase) % 256) as u8,\n            ])\n        });\n        let path = dir.join(name);\n        img.save(&path).unwrap();\n        path\n    }"
           },
           "minimum_collections": 2,
           "minimum_items": 1,
           "readers": [
-            "crates/contracts/gen-core/src/train/subject_mask.rs::SubjectMask::load/image::open"
+            "crates/contracts/gen-core-train/src/subject_mask.rs::SubjectMask::load/image::open"
           ],
           "required_grade": "reader-binding",
           "role": "reference",
@@ -237034,7 +237034,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -237050,7 +237050,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -237066,7 +237066,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -237082,7 +237082,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         }
@@ -238762,7 +238762,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -238778,7 +238778,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -238794,7 +238794,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -238810,7 +238810,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         }
@@ -238864,7 +238864,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -238880,7 +238880,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -238896,7 +238896,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -238912,7 +238912,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         }
@@ -238966,7 +238966,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -238982,7 +238982,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -238998,7 +238998,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -239014,7 +239014,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         },
@@ -239030,7 +239030,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-image-encoder-weights\", \"written_paths\": [\"<tmp>/<component written for ip-image-encoder-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-image-encoder-weights\"}"
           }
         },
@@ -239046,7 +239046,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-adapter-weights\", \"written_paths\": [\"<tmp>/<component written for ip-adapter-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-adapter-weights\"}"
           }
         }
@@ -239100,7 +239100,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-vae-fp16-fix-file\", \"written_paths\": [\"<tmp>/vae_fp16_fix/diffusion_pytorch_model.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"written-vae-fp16-fix-file\"}"
           }
         }
@@ -239154,7 +239154,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -239170,7 +239170,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -239186,7 +239186,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -239202,7 +239202,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         }
@@ -239256,7 +239256,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -239272,7 +239272,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -239288,7 +239288,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -239304,7 +239304,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         },
@@ -239320,7 +239320,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-image-encoder-weights\", \"written_paths\": [\"<tmp>/<component written for ip-image-encoder-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-image-encoder-weights\"}"
           }
         },
@@ -239336,7 +239336,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-adapter-weights\", \"written_paths\": [\"<tmp>/<component written for ip-adapter-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-adapter-weights\"}"
           }
         }
@@ -239390,7 +239390,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -239406,7 +239406,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -239422,7 +239422,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -239438,7 +239438,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         },
@@ -239454,7 +239454,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"controlnet-weights\", \"written_paths\": [\"<tmp>/<component written for controlnet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"controlnet-weights\"}"
           }
         }
@@ -239508,7 +239508,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -239524,7 +239524,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -239540,7 +239540,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -239556,7 +239556,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         },
@@ -239572,7 +239572,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"controlnet-weights\", \"written_paths\": [\"<tmp>/<component written for controlnet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"controlnet-weights\"}"
           }
         },
@@ -239588,7 +239588,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-image-encoder-weights\", \"written_paths\": [\"<tmp>/<component written for ip-image-encoder-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-image-encoder-weights\"}"
           }
         },
@@ -239604,7 +239604,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-adapter-weights\", \"written_paths\": [\"<tmp>/<component written for ip-adapter-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-adapter-weights\"}"
           }
         }
@@ -239658,7 +239658,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -239674,7 +239674,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -239690,7 +239690,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -239706,7 +239706,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         }
@@ -239760,7 +239760,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -239776,7 +239776,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -239792,7 +239792,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -239808,7 +239808,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         },
@@ -239824,7 +239824,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"controlnet-weights\", \"written_paths\": [\"<tmp>/<component written for controlnet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"controlnet-weights\"}"
           }
         }
@@ -239878,7 +239878,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-packed-unet-file\", \"written_paths\": [\"<tmp>/unet/diffusion_pytorch_model.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"written-packed-unet-file\"}"
           }
         }
@@ -239932,7 +239932,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -239948,7 +239948,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -239964,7 +239964,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -239980,7 +239980,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         }
@@ -240034,7 +240034,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -240050,7 +240050,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -240066,7 +240066,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -240082,7 +240082,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         },
@@ -240098,7 +240098,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"controlnet-weights\", \"written_paths\": [\"<tmp>/<component written for controlnet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"controlnet-weights\"}"
           }
         },
@@ -240114,7 +240114,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-image-encoder-weights\", \"written_paths\": [\"<tmp>/<component written for ip-image-encoder-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-image-encoder-weights\"}"
           }
         },
@@ -240130,7 +240130,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-adapter-weights\", \"written_paths\": [\"<tmp>/<component written for ip-adapter-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-adapter-weights\"}"
           }
         }
@@ -240217,7 +240217,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -240233,7 +240233,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -240249,7 +240249,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -240265,7 +240265,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         },
@@ -240281,7 +240281,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-image-encoder-weights\", \"written_paths\": [\"<tmp>/<component written for ip-image-encoder-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-image-encoder-weights\"}"
           }
         },
@@ -240297,7 +240297,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-adapter-weights\", \"written_paths\": [\"<tmp>/<component written for ip-adapter-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-adapter-weights\"}"
           }
         }
@@ -240351,7 +240351,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-1-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-1-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-1-weights\"}"
           }
         },
@@ -240367,7 +240367,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"text-encoder-2-weights\", \"written_paths\": [\"<tmp>/<component written for text-encoder-2-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"text-encoder-2-weights\"}"
           }
         },
@@ -240383,7 +240383,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"unet-weights\", \"written_paths\": [\"<tmp>/<component written for unet-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"unet-weights\"}"
           }
         },
@@ -240399,7 +240399,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"vae-fp16-fix-weights\", \"written_paths\": [\"<tmp>/<component written for vae-fp16-fix-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"vae-fp16-fix-weights\"}"
           }
         },
@@ -240415,7 +240415,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-image-encoder-weights\", \"written_paths\": [\"<tmp>/<component written for ip-image-encoder-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-image-encoder-weights\"}"
           }
         },
@@ -240431,7 +240431,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"ip-adapter-weights\", \"written_paths\": [\"<tmp>/<component written for ip-adapter-weights>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"ip-adapter-weights\"}"
           }
         }
@@ -240485,7 +240485,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-text-encoder-1-file\", \"written_paths\": [\"<tmp>/text_encoder/model.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"written-text-encoder-1-file\"}"
           }
         },
@@ -240501,7 +240501,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-text-encoder-2-file\", \"written_paths\": [\"<tmp>/text_encoder_2/model.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"written-text-encoder-2-file\"}"
           }
         },
@@ -240517,7 +240517,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-unet-file\", \"written_paths\": [\"<tmp>/unet/diffusion_pytorch_model.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"written-unet-file\"}"
           }
         },
@@ -240533,7 +240533,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-vae-file\", \"written_paths\": [\"<tmp>/vae_fp16_fix/diffusion_pytorch_model.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"written-vae-file\"}"
           }
         },
@@ -240549,7 +240549,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-ip-image-encoder-file\", \"written_paths\": [\"<tmp>/ip/<IP_ADAPTER_IMAGE_ENCODER_FILE>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"written-ip-image-encoder-file\"}"
           }
         },
@@ -240565,7 +240565,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"SN_SDXL_SNAPSHOT\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-ip-adapter-file\", \"written_paths\": [\"<tmp>/ip/<IP_ADAPTER_WEIGHT_FILES[1]>\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"build_with_text\", \"line\": 124, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [5130, 9643]}, \"writes\": \"Array::save_safetensors per component into tempfile::tempdir (inline in build_with_text)\"}, \"slot\": \"written-ip-adapter-file\"}"
           }
         }
@@ -240619,7 +240619,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"STREAM_PRICING_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-transformer-stack-file\", \"written_paths\": [\"<tmp>/stack.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"streamed_block_quantum_tracks_its_measured_peak\", \"line\": 1183, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [44184, 47260]}}, \"slot\": \"written-transformer-stack-file\"}"
           }
         }
@@ -240673,7 +240673,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"TP_PRIOR_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-text-encoder-1-file\", \"written_paths\": [\"<tmp>/tp-proof-prior.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"tp_proof_prior\", \"line\": 3416, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [142796, 143409]}}, \"slot\": \"written-text-encoder-1-file\"}"
           }
         },
@@ -240689,7 +240689,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"TP_PRIOR_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-text-encoder-2-file\", \"written_paths\": [\"<tmp>/tp-proof-prior.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"tp_proof_prior\", \"line\": 3416, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [142796, 143409]}}, \"slot\": \"written-text-encoder-2-file\"}"
           }
         },
@@ -240705,7 +240705,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"TP_PRIOR_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-unet-file\", \"written_paths\": [\"<tmp>/tp-proof-prior.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"tp_proof_prior\", \"line\": 3416, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [142796, 143409]}}, \"slot\": \"written-unet-file\"}"
           }
         },
@@ -240721,7 +240721,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"TP_PRIOR_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-vae-file\", \"written_paths\": [\"<tmp>/tp-proof-prior.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"tp_proof_prior\", \"line\": 3416, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [142796, 143409]}}, \"slot\": \"written-vae-file\"}"
           }
         },
@@ -240737,7 +240737,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"TP_PRIOR_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-tp-proof-prior-adapter\", \"written_paths\": [\"<tmp>/tp-proof-prior.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"tp_proof_prior\", \"line\": 3416, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [142796, 143409]}}, \"slot\": \"written-tp-proof-prior-adapter\"}"
           }
         }
@@ -240791,7 +240791,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"TP_PRIOR_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-text-encoder-1-file\", \"written_paths\": [\"<tmp>/tp-proof-prior.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"tp_proof_prior\", \"line\": 3416, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [142796, 143409]}}, \"slot\": \"written-text-encoder-1-file\"}"
           }
         },
@@ -240807,7 +240807,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"TP_PRIOR_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-text-encoder-2-file\", \"written_paths\": [\"<tmp>/tp-proof-prior.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"tp_proof_prior\", \"line\": 3416, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [142796, 143409]}}, \"slot\": \"written-text-encoder-2-file\"}"
           }
         },
@@ -240823,7 +240823,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"TP_PRIOR_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-unet-file\", \"written_paths\": [\"<tmp>/tp-proof-prior.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"tp_proof_prior\", \"line\": 3416, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [142796, 143409]}}, \"slot\": \"written-unet-file\"}"
           }
         },
@@ -240839,7 +240839,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"TP_PRIOR_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-vae-file\", \"written_paths\": [\"<tmp>/tp-proof-prior.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"tp_proof_prior\", \"line\": 3416, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [142796, 143409]}}, \"slot\": \"written-vae-file\"}"
           }
         },
@@ -240855,7 +240855,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-            "case_source_sha256": "ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215",
+            "case_source_sha256": "e5b027526376f6c77ba13ccd4ac87ab16e417aa32be43a301c5717738fc09831",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"TP_PRIOR_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-tp-proof-prior-adapter\", \"written_paths\": [\"<tmp>/tp-proof-prior.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"tp_proof_prior\", \"line\": 3416, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs\", \"source_sha256\": \"ff14e4a7e6599ca83a43a87f91ff15bf7e27624bc8eaee273e6029ac9bda8215\", \"span_bytes\": [142796, 143409]}}, \"slot\": \"written-tp-proof-prior-adapter\"}"
           }
         }
@@ -241305,7 +241305,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs",
-            "case_source_sha256": "411fce2ebc5c8308befa0d64f5a8c8efd18481a949da75c8cb0dfeb559d44037",
+            "case_source_sha256": "1d0f61c5a951126bc4d5a90a56742624e0ec041cb3a4729e7dae1160eecdd4e5",
             "writer": "{\"exact_mapper_slot_anchor\": {\"grade\": \"reader-binding\", \"group\": \"STREAM_U_SDXL\", \"reader\": \"mlx-gen::Weights::from_file\", \"role\": \"model-weights\", \"slot\": \"written-unet-fixture\", \"written_paths\": [\"<tmp>/unet.safetensors\"]}, \"exact_mapper_writer_read_group\": {\"writer\": {\"function\": \"streamed_transformer_blocks_are_checked_before_materialization\", \"line\": 654, \"source\": \"crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs\", \"source_sha256\": \"411fce2ebc5c8308befa0d64f5a8c8efd18481a949da75c8cb0dfeb559d44037\", \"span_bytes\": [24993, 30267]}}, \"slot\": \"written-unet-fixture\"}"
           }
         }
@@ -264295,7 +264295,7 @@
           "slot": "subject-mask-images",
           "role": "reference",
           "readers": [
-            "crates/contracts/gen-core/src/train/subject_mask.rs::SubjectMask::load/image::open"
+            "crates/contracts/gen-core-train/src/subject_mask.rs::SubjectMask::load/image::open"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -264310,7 +264310,7 @@
       ],
       "case_generated_inputs": true,
       "reader_roles": {
-        "crates/contracts/gen-core/src/train/subject_mask.rs::SubjectMask::load/image::open": "reference",
+        "crates/contracts/gen-core-train/src/subject_mask.rs::SubjectMask::load/image::open": "reference",
         "mlx-gen::Weights::from_file": "model-weights"
       }
     }

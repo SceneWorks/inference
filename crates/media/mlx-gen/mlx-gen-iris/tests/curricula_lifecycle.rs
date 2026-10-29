@@ -8,12 +8,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::train::repa::{TeacherArch, TEACHER_COMPONENT, TEACHER_WEIGHTS_FILE};
-use mlx_gen::gen_core::iris::train::upstream::stage_preset_config;
-use mlx_gen::gen_core::iris::train::{
+use gen_core_iris::train::repa::{TeacherArch, TEACHER_COMPONENT, TEACHER_WEIGHTS_FILE};
+use gen_core_iris::train::upstream::stage_preset_config;
+use gen_core_iris::train::{
     checkpoint_root, latest_checkpoint, read_checkpoint_state, HostRng, OPTIONS_KEY,
 };
-use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use mlx_gen::gen_core::{LrSchedule, Trainer, TrainingConfig, TrainingItem, TrainingRequest};
 use mlx_gen::{LoadSpec, WeightsSource};
 use mlx_rs::{Array, Dtype};

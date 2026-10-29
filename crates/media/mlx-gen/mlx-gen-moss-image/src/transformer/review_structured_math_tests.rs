@@ -1,6 +1,7 @@
 use super::author_fixture_tests::*;
 use super::*;
-use mlx_gen::gen_core::{moss_image::MossImageVariant, moss_image_training as contract};
+use gen_core_moss_image::moss_image_training as contract;
+use mlx_gen::gen_core::moss_image::MossImageVariant;
 use std::collections::{BTreeMap, HashMap};
 fn values(rows: usize, cols: usize, phase: f32) -> Vec<f32> {
     (0..rows * cols)

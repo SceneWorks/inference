@@ -1,8 +1,7 @@
 //! Independent frozen upstream data, never expected values calculated by the native implementation.
 use super::*;
-use candle_gen::gen_core::{
-    moss_image::*, moss_image_edit::edit_request, GenerationRequest, Progress,
-};
+use candle_gen::gen_core::{GenerationRequest, Progress};
+use gen_core_moss_image::{moss_image::*, moss_image_edit::edit_request};
 use serde_json::Value;
 fn fixture(name: &str) -> Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

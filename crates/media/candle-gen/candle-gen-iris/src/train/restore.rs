@@ -1,6 +1,6 @@
 //! Native Candle **Iris-3B restoration training** (story sc-25688) — the twin of
 //! `mlx_gen_iris::train::restore`: the paper's one-step restoration recipe (following HYPIR) over
-//! the backend-neutral contract [`gen_core::iris::restoration_train`]. Generator windows train
+//! the backend-neutral contract [`gen_core_iris::restoration_train`]. Generator windows train
 //! `x̂ = x_lq − σ·v` on `λ₂·mse + λ_lpips·LPIPS + λ_gan·D_G`, critic windows train the
 //! spectral-normalized head on the frozen OpenCLIP ConvNeXt-XXL trunk; one of each is a step. The
 //! checkpoint, resume, export (the `upscaler/` layout, adapters merged) and positional randomness
@@ -11,38 +11,43 @@
 //! 0.01 for generator and critic, constant LR; a LoRA/LoKr adapter (HYPIR's own arm) trains only
 //! when the request asks for one.
 //!
-//! [`gen_core::iris::restoration_train`]: candle_gen::gen_core::iris::restoration_train
-//! [`recipe_training_config`]: candle_gen::gen_core::iris::restoration_train::recipe_training_config
+//! [`gen_core_iris::restoration_train`]: gen_core_iris::restoration_train
+//! [`recipe_training_config`]: gen_core_iris::restoration_train::recipe_training_config
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
-use candle_gen::gen_core::iris::restoration::RestorationResources;
-use candle_gen::gen_core::iris::restoration_train::{
-    self as contract, base_identity, check_resume, critic_head_init, export_metadata, phase_of,
-    read_checkpoint_state, training_pair, validate_item, write_export_sidecars, ConvNextConfig,
-    LossWindow, Phase, RestoreArtifact, RestoreCheckpointState, RestoreTrainPlan,
-    RestoreTrainResources, TrainPair, WindowClose, CKPT_CRITIC, CKPT_CRITIC_OPTIMIZER,
-    CRITIC_HEAD_WIDTH, TRAINER_ID,
+use candle_gen::gen_core::train::{
+    Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
-use candle_gen::gen_core::iris::train::{
+use candle_gen::gen_core::{self, LoadSpec, Modality};
+use candle_gen::train::lora::reconstruct_lokr_delta;
+use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::restoration::RestorationResources;
+use gen_core_iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
+use gen_core_iris::train::{
     adapter_param_route, checkpoint_root, checkpoint_staging_dir, file_stem, full_param_route,
     latest_checkpoint, linear_paths_from_keys, lr_factor, mix_seed, prune_checkpoints,
     publish_checkpoint, DataWalk, HostRng, MixedPrecision, MuonAdjustLr, OptimizerKind,
     OptimizerPlan, ParamRoute, ResumeDataPolicy, WeightsSelect, CKPT_EMA, CKPT_OPTIMIZER,
     CKPT_STATE, CKPT_TRAINABLE, TECHNIQUES,
 };
-use candle_gen::gen_core::iris::FAMILY;
-use candle_gen::gen_core::train::{
-    refuse_reference_control_model_options, refuse_trainer_load_overlays, validate_control_request,
-    validate_edit_request, validate_full_finetune_request, validate_training_techniques, Trainer,
-    TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+use gen_core_iris::FAMILY;
+use gen_core_iris::{
+    restoration_train as contract,
+    restoration_train::{
+        base_identity, check_resume, critic_head_init, export_metadata, phase_of,
+        read_checkpoint_state, training_pair, validate_item, write_export_sidecars, ConvNextConfig,
+        LossWindow, Phase, RestoreArtifact, RestoreCheckpointState, RestoreTrainPlan,
+        RestoreTrainResources, TrainPair, WindowClose, CKPT_CRITIC, CKPT_CRITIC_OPTIMIZER,
+        CRITIC_HEAD_WIDTH, TRAINER_ID,
+    },
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality};
-use candle_gen::train::lora::reconstruct_lokr_delta;
-use candle_gen::{CandleError as Error, Result};
+use gen_core_train::{
+    refuse_reference_control_model_options, refuse_trainer_load_overlays, validate_control_request,
+    validate_edit_request, validate_full_finetune_request, validate_training_techniques,
+};
 
 use super::critic::{
     head_from_host, head_from_tensors, multilevel_loss, power_iteration, ConvNextTrunk, Critic,
@@ -562,7 +567,7 @@ impl Run {
         let adapter_compute = (!req.config.full_finetune).then_some(compute);
         let source = load_source(&init_weights, adapter_compute, &device)?;
         check_backbone_keys(&config.model, &source, "the generator weights")?;
-        let shapes = candle_gen::gen_core::iris::train::backbone_tensor_shapes(&config.model);
+        let shapes = gen_core_iris::train::backbone_tensor_shapes(&config.model);
         let linear_paths =
             linear_paths_from_keys(shapes.iter().map(|(k, s)| (k.as_str(), s.len())));
         let plan = trainer.plan(req, &linear_paths)?;
@@ -676,7 +681,7 @@ impl Run {
         if let Some(w) = walk.unused_tail_warning() {
             eprintln!("{w}");
         }
-        let total_steps = candle_gen::gen_core::iris::train::total_optimizer_steps(
+        let total_steps = gen_core_iris::train::total_optimizer_steps(
             walk.batches_per_epoch(),
             plan.micro_per_step(),
             plan.num_epochs,
@@ -1027,7 +1032,7 @@ impl Run {
             &staging.join(CKPT_CRITIC_OPTIMIZER),
             &self.critic_opt.state_tensors()?,
         )?;
-        candle_gen::gen_core::iris::train::atomic_write(
+        gen_core_iris::train::atomic_write(
             &staging.join(CKPT_STATE),
             serde_json::to_string_pretty(&self.state(boundary).to_json())
                 .map_err(|e| Error::Msg(e.to_string()))?
@@ -1091,12 +1096,12 @@ impl Run {
         publish_export_dir(&dir, |stage: &Path| -> Result<()> {
             write_export_sidecars(&self.export, stage)?;
             save_safetensors_atomic(
-                &stage.join(candle_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                &stage.join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
                 &list,
                 &meta,
             )
         })?;
-        Ok(dir.join(candle_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE))
+        Ok(dir.join(gen_core_iris::BACKBONE_WEIGHTS_FILE))
     }
 
     fn render_preview(

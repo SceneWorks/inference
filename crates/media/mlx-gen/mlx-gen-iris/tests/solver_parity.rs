@@ -5,7 +5,7 @@
 //! Tolerance: FP32 integration state on both sides with identical f32 coefficients; 1e-5 of peak
 //! covers MLX vs torch elementwise rounding. The 100-step default grid is compared in f64.
 
-use mlx_gen::gen_core::iris::{dpm_solver_plan, time_grid, Prediction};
+use gen_core_iris::{dpm_solver_plan, time_grid, Prediction};
 use mlx_gen::CancelFlag;
 use mlx_gen_iris::solver::{cfg_combine, sample};
 use mlx_rs::ops::{stack_axis, tanh};

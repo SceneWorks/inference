@@ -39,12 +39,12 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
 use candle_gen::gen_core::{
     CancelFlag, LoadSpec, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
     WeightsSource,
 };
 use candle_gen::testkit::VramProbe;
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 
 /// The selected card must be idle before the load: a resident tenant contaminates a device-level
 /// peak. The CUDA box's free card idles at 0.2-0.9 GB (WDDM desktop residency).
@@ -214,7 +214,7 @@ fn real_training_memory_probe() {
 
     let (engine, spec, items, config) = match task.as_str() {
         "generation" => {
-            use candle_gen::gen_core::iris::train::OPTIONS_KEY;
+            use gen_core_iris::train::OPTIONS_KEY;
             let items = (0..2)
                 .map(|i| {
                     let p = data.join(format!("g{i}.png"));
@@ -253,8 +253,8 @@ fn real_training_memory_probe() {
             ("iris_3b", spec, items, config)
         }
         "depth" => {
-            use candle_gen::gen_core::iris::train::depth::ITEM_DEPTH_KEY;
-            use candle_gen::gen_core::iris::train::OPTIONS_KEY;
+            use gen_core_iris::train::depth::ITEM_DEPTH_KEY;
+            use gen_core_iris::train::OPTIONS_KEY;
             let rgb = data.join("d.png");
             write_rgb(&rgb, size, 0);
             let depth = data.join("d.npy");
@@ -289,7 +289,7 @@ fn real_training_memory_probe() {
             ("iris_3b_depth", spec, vec![item], config)
         }
         "restoration" => {
-            use candle_gen::gen_core::iris::restoration_train::{
+            use gen_core_iris::restoration_train::{
                 recipe_training_config, CRITIC_TRUNK_COMPONENT, LPIPS_LIN_COMPONENT, OPTIONS_KEY,
                 VGG16_COMPONENT,
             };

@@ -3307,10 +3307,10 @@ expected_files = [
 ]
 
 # Epic sc-24212 (stories sc-24214, sc-24217): native Supra2-IMG on Candle/CUDA and MLX. The three
-# revision-pinned inputs of `gen_core::supra2` (SUPRA2_SOURCE / FLAN_T5_BASE / SD_VAE), restricted
+# revision-pinned inputs of `gen_core_checkpoint::supra2` (SUPRA2_SOURCE / FLAN_T5_BASE / SD_VAE), restricted
 # to the files the converter and the provider read. Both `supra2`-profile lanes (`candle-supra2`,
 # `mlx-supra2`) materialize these same keys and convert the checkpoint into a bundle in RUNNER_TEMP
-# (`sceneworks-gen-core --example supra2_convert`, which re-verifies every SHA-256).
+# (`sceneworks-gen-core-checkpoint --example supra2_convert`, which re-verifies every SHA-256).
 [[models]]
 key = "supra2-img-cuda"
 repository = "SupraLabs/Supra2-IMG"

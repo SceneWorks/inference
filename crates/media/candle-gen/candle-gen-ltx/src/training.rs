@@ -13,7 +13,6 @@ use std::sync::Arc;
 use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
     TrainingReport, TrainingRequest,
@@ -35,6 +34,7 @@ use candle_gen::train::perceptual::{
 };
 use candle_gen::train::taehv::{TaehvConfig, TaehvDecoder};
 use candle_gen::{CandleError, Result};
+use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
 
 use crate::config::{
     compute_audio_frames, AvConfig, ConnectorConfig, GemmaConfig, DEFAULT_FPS, LATENT_CHANNELS,
@@ -52,8 +52,8 @@ use crate::tokenizer::Ltx25Tokenizer;
 use crate::transformer::AvDiT;
 use crate::vae::LtxVideoVae;
 use crate::MODEL_25_ID;
-use candle_gen::gen_core::ltx_checkpoint::{LtxBundle, LtxCheckpointLayout, LtxComponent};
 use candle_gen::train::lora::{LoraHost, LoraLinear};
+use gen_core_ltx::ltx_checkpoint::{LtxBundle, LtxCheckpointLayout, LtxComponent};
 
 const LABEL: &str = "ltx trainer";
 const SAMPLE_PROMPT_CAP: usize = 4;
@@ -1387,7 +1387,7 @@ fn refuse_ltx25_subject_mask_loss(req: &TrainingRequest) -> Result<()> {
         )));
     }
     // sc-24832: the subject-restricted normal loss reads the same (absent) aligned mask.
-    if candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::needed(&req.config) {
+    if gen_core_train::subject_mask::PerceptualSubjectMasks::needed(&req.config) {
         return Err(CandleError::Unsupported(format!(
             "{MODEL_25_ID} trainer: the normal loss restricted to the subject is unsupported — every \
              item trains on a prepared latent bundle with no decodable image aligned to the latent, \
@@ -1811,12 +1811,12 @@ impl Trainer for LtxTrainer {
             // trainer does — the 2.5 reason wins over the generic "not supported" one.
             return validate_ltx25_training_request(req).map_err(Into::into);
         }
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         validate_ltx_request(req, self.label()).map_err(Into::into)
     }
 
@@ -1842,7 +1842,7 @@ impl Trainer for LtxTrainer {
             refuse_ltx25_subject_mask_loss(req)?;
             refuse_ltx25_depth_anchoring(req)?;
         }
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
         let mut warnings = Vec::new();
         let output = run_flow_match_training(self, req, on_progress, &mut warnings)?;
@@ -2327,14 +2327,14 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     // The shared floors keep their typed variant across the seam (`?` maps
     // `gen_core::Error::Unsupported` 1:1): a capability gap must stay `Unsupported` for the worker,
     // never be flattened to a message (sc-24161).
-    gen_core::train::validate_control_request(&descriptor, req)?;
-    gen_core::train::validate_full_finetune_request(&descriptor, req)?;
-    gen_core::train::validate_edit_request(&descriptor, req)?;
+    gen_core_train::validate_control_request(&descriptor, req)?;
+    gen_core_train::validate_full_finetune_request(&descriptor, req)?;
+    gen_core_train::validate_edit_request(&descriptor, req)?;
     refuse_ltx25_subject_mask_loss(req)?;
     refuse_ltx25_depth_anchoring(req)?;
     // Epic 2123 E3: refuse an undeclared technique (weight noise, resolution buckets) here too, so
     // the public preflight matches the `train` entry floor.
-    gen_core::train::validate_training_techniques(&descriptor, req)?;
+    gen_core_train::validate_training_techniques(&descriptor, req)?;
     validate_ltx_request(req, MODEL_25_ID)?;
     if !req.config.alpha.is_finite() || req.config.alpha <= 0.0 {
         return Err(CandleError::Msg(

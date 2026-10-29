@@ -73,7 +73,7 @@ use serde_json::Value;
 use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
 use candle_gen::candle_nn::ops::{rms_norm, silu, softmax_last_dim};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata;
+use gen_core_ltx::ltx_checkpoint::LtxCheckpointMetadata;
 
 use crate::vae::{patchify, unpatchify};
 

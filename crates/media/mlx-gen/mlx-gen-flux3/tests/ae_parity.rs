@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use mlx_gen::gen_core::flux3::latent_ids;
+use gen_core_flux3::latent_ids;
 use mlx_gen::weights::Weights;
 use mlx_gen_flux3::autoencoder::DOWNSAMPLING_RATIO;
 use mlx_gen_flux3::Flux3AutoEncoder;
@@ -87,7 +87,7 @@ fn token_order_is_row_major_latent_ids() {
 }
 
 /// The oracle's ids are `latent_ids(h, w)`; the port emits tokens in that order (proven by the
-/// value parity above) and `gen_core::flux3::latent_ids` reproduces the same table, so the DiT's
+/// value parity above) and `gen_core_flux3::latent_ids` reproduces the same table, so the DiT's
 /// positional ids and the autoencoder's token order agree.
 fn token_order_is_row_major_latent_ids_body() {
     let g = golden();

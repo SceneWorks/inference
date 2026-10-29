@@ -10,11 +10,11 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::train::{
+use gen_core_iris::train::{
     checkpoint_root, latest_checkpoint, list_checkpoints, read_checkpoint_state, AdapterMetadata,
     WeightsSelect, OPTIONS_KEY,
 };
-use mlx_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{
     LrSchedule, NetworkType, Trainer, TrainingConfig, TrainingItem, TrainingProgress,
     TrainingRequest,
@@ -495,7 +495,7 @@ fn adapter_round_trip(network: NetworkType, compute: Dtype) {
                 2.0,
                 cfg.flow.shift,
                 1000,
-                mlx_gen::gen_core::iris::train::Prediction::Velocity,
+                gen_core_iris::train::Prediction::Velocity,
                 16,
                 (&c.states, &c.mask),
                 Some((&u.states, &u.mask)),
@@ -813,7 +813,7 @@ fn random_init_x_prediction_trains_and_its_export_records_the_objective_body() {
         )
         .unwrap()
     };
-    use mlx_gen::gen_core::iris::train::Prediction;
+    use gen_core_iris::train::Prediction;
     assert_eq!(ours(Prediction::Clean).pixels, provider.pixels);
     assert_ne!(ours(Prediction::Velocity).pixels, provider.pixels);
 }
@@ -968,7 +968,7 @@ fn preview_renderer_matches_the_provider_body() {
         2.0,
         cfg.flow.shift,
         1000,
-        mlx_gen::gen_core::iris::train::Prediction::Velocity,
+        gen_core_iris::train::Prediction::Velocity,
         16,
         (&c.states, &c.mask),
         Some((&u.states, &u.mask)),

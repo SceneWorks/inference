@@ -44,7 +44,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use mlx_gen::gen_core::{
     CancelFlag, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
 };
@@ -140,7 +140,7 @@ fn real_training_memory_probe() {
 
     let (engine, spec, items, config) = match task.as_str() {
         "generation" => {
-            use mlx_gen::gen_core::iris::train::OPTIONS_KEY;
+            use gen_core_iris::train::OPTIONS_KEY;
             let items = (0..2)
                 .map(|i| {
                     let p = data.join(format!("g{i}.png"));
@@ -179,8 +179,8 @@ fn real_training_memory_probe() {
             ("iris_3b", spec, items, config)
         }
         "depth" => {
-            use mlx_gen::gen_core::iris::train::depth::ITEM_DEPTH_KEY;
-            use mlx_gen::gen_core::iris::train::OPTIONS_KEY;
+            use gen_core_iris::train::depth::ITEM_DEPTH_KEY;
+            use gen_core_iris::train::OPTIONS_KEY;
             let rgb = data.join("d.png");
             write_rgb(&rgb, size, 0);
             let depth = data.join("d.npy");
@@ -215,7 +215,7 @@ fn real_training_memory_probe() {
             ("iris_3b_depth", spec, vec![item], config)
         }
         "restoration" => {
-            use mlx_gen::gen_core::iris::restoration_train::{
+            use gen_core_iris::restoration_train::{
                 recipe_training_config, CRITIC_TRUNK_COMPONENT, LPIPS_LIN_COMPONENT, OPTIONS_KEY,
                 VGG16_COMPONENT,
             };

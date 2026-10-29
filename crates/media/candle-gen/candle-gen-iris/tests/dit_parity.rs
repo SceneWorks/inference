@@ -12,8 +12,8 @@
 //!   holds the real bf16 kernels to the same fixture.
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::iris::IrisConfig;
 use candle_gen_iris::{load_backbone, TextBatch};
+use gen_core_iris::IrisConfig;
 
 use crate::common::{assert_close, cpu, device, fixture, host_i32, tiny_backbone};
 

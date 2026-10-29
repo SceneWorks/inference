@@ -32,6 +32,8 @@ serde_json = { workspace = true }
 # Decode training-dataset images (LoRA/LoKr training, sc-5148) — the trainer center-crops + hands the
 # Image to the Flux.2 VAE preprocess. PNG + JPEG cover the SceneWorks dataset formats (mirrors z-image).
 image = { workspace = true }
+sceneworks-gen-core-family = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [dev-dependencies]
 # Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
@@ -56,4 +58,4 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["mlx-gen-perceptual/model-inference-proof", "mlx-gen/model-inference-proof", "mlx-gen-flux2/model-inference-proof", "mlx-gen-pid/model-inference-proof", "mlx-llm/model-inference-proof"]
+model-inference-proof = ["mlx-gen-perceptual/model-inference-proof", "mlx-gen/model-inference-proof", "mlx-gen-flux2/model-inference-proof", "mlx-gen-pid/model-inference-proof", "mlx-llm/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]

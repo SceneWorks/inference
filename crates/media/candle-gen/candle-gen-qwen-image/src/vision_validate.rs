@@ -16,9 +16,9 @@
 //! ```
 
 use candle_gen::candle_core::Tensor;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::WeightsSource;
 use candle_gen::testkit::{env_path, read_ppm};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 use crate::config::TextEncoderConfig;
 use crate::image_processor::{ImageInput, QwenImageProcessor};

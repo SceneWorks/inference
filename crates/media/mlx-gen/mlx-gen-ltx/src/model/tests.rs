@@ -466,7 +466,7 @@ fn ltx25_dfr_request_plan_drives_temporal_and_generated_slot_execution() {
         .expect("generated keyframes must select DFR");
     assert_eq!(generated_plan.keyframe_positions, vec![30, 60, 90]);
     assert_eq!(
-        mlx_gen::gen_core::ltx_dfr::dfr_target_frames(
+        gen_core_ltx::ltx_dfr::dfr_target_frames(
             i64::from(temporal_plan.requested_frames),
             temporal_plan.temporal_upsample_rounds,
         ),

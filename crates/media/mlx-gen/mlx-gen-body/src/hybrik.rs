@@ -8,7 +8,7 @@ use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
 use mlx_rs::ops::{add, maximum, multiply};
 use mlx_rs::Array;
 
-use mlx_gen::gen_core::train::body::{
+use gen_core_train::body::{
     hybrik_encode_crop, hybrik_square_crop, HybrikConfig, HYBRIK_MEAN, HYBRIK_STD,
 };
 

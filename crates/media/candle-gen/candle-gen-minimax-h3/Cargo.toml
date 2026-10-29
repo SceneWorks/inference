@@ -20,6 +20,8 @@ candle-gen = { path = "../candle-gen" }
 candle-gen-boogu = { path = "../candle-gen-boogu" }
 # Opt-in H3 terminal telemetry (host RSS sampling), moved out of gen-core with its FFI (sc-27316).
 sceneworks-gen-core-telemetry = { workspace = true }
+sceneworks-gen-core-h3 = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
 # `RgbImage` + `Lanczos3` for the `fl2va` keyframe fit, and the RGB8 round-trip the video VAE's
 # pixel normalization runs on. The reference resizes with PIL's Lanczos; this is the same a=3
 # windowed sinc, and the parity boundary is drawn AFTER the resize (see `keyframe`).
@@ -47,7 +49,7 @@ serde_json = { workspace = true }
 tracing = "0.1"
 
 [features]
-model-inference-proof = ["candle-gen-boogu/model-inference-proof", "candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen-boogu/model-inference-proof", "candle-gen/model-inference-proof", "sceneworks-gen-core-h3/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]

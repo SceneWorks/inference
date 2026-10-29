@@ -94,11 +94,9 @@ fn subject_mask_loss_is_ltx23_only_and_ltx25_refuses_it_by_name() {
         other => panic!("expected a typed Unsupported, got {other:?}"),
     }
     // The 2.3 descriptor passes the shared technique floor with the mask on.
-    assert!(mlx_gen::gen_core::train::validate_training_techniques(
-        &super::trainer_descriptor(),
-        &masked
-    )
-    .is_ok());
+    assert!(
+        gen_core_train::validate_training_techniques(&super::trainer_descriptor(), &masked).is_ok()
+    );
 }
 
 /// sc-24828: the LTX-2.3 weight is built on the unpatchified `(1, C, 1, le, le)` latent and run

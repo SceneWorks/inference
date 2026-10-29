@@ -55,6 +55,12 @@ IOS_BOUND_PATHS = (
     "crates/bundles/runtime-catalog",
     "crates/contracts/core-llm",
     "crates/contracts/gen-core",
+    "crates/contracts/gen-core-checkpoint",
+    "crates/contracts/gen-core-family",
+    "crates/contracts/gen-core-iris",
+    "crates/contracts/gen-core-memory-wan",
+    "crates/contracts/gen-core-tokenizer",
+    "crates/contracts/gen-core-train",
     "crates/llm/mlx-llm",
     "crates/media/mlx-gen/mlx-gen-anima",
     "crates/media/mlx-gen/mlx-gen-ios-catalog",
@@ -182,15 +188,27 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             )
             continue
 
-        # gen-core's sibling contract crates (sc-27316: the Iris TCP transport and the H3 host
-        # telemetry) are consumed by the same backends, so they select the same lanes.
+        # gen-core's sibling contract crates (sc-27316: the Iris TCP transport, the H3 host
+        # telemetry, and the family/feature crates split out of gen-core) are consumed by the same
+        # backends, so they select the same lanes.
         if any(
             _under(path, f"crates/contracts/{crate}")
             for crate in (
                 "gen-core",
                 "gen-core-testkit",
+                "gen-core-checkpoint",
                 "gen-core-dist",
+                "gen-core-family",
+                "gen-core-flux3",
+                "gen-core-h3",
+                "gen-core-image",
+                "gen-core-iris",
+                "gen-core-ltx",
+                "gen-core-memory-wan",
+                "gen-core-moss-image",
                 "gen-core-telemetry",
+                "gen-core-tokenizer",
+                "gen-core-train",
             )
         ):
             lanes.update(

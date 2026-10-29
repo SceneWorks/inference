@@ -12,10 +12,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use gen_core::iris::restoration_train::{
+use gen_core_iris::restoration_train::{
     lpips_lin_keys, vgg_slices, VggOp, LPIPS_NORM_EPS, LPIPS_SCALE, LPIPS_SHIFT, VGG16_WIDTHS,
 };
-use mlx_gen::gen_core;
 use mlx_gen::nn::conv2d;
 use mlx_gen::{Error, Result};
 use mlx_rs::ops::{maximum, sqrt};

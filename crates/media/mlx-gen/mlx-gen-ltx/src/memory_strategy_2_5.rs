@@ -43,7 +43,7 @@ use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core;
 
 use crate::memory_strategy::{decode_tile_edges, DECODE_OVERLAP};
-use mlx_gen::gen_core::ltx_checkpoint::LtxComponent;
+use gen_core_ltx::ltx_checkpoint::LtxComponent;
 
 /// Architecture axes for the LTX-2.5 route (epic SC-22657, E2; SC-22667 follow-up).
 ///

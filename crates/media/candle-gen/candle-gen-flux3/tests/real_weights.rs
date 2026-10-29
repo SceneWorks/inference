@@ -20,16 +20,16 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::flux3::{
-    resolve_checkpoint, text_ids, GenerationParams, DISTILLED_AUTOENCODER_SHA256,
-    DISTILLED_DIT_SHA256,
-};
 use candle_gen::gen_core::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, Precision, Progress, WeightsSource,
 };
 use candle_gen::testkit::{probe_gpu, used_mib, VramProbe};
 use candle_gen_flux3::{
     denoise_flow_map, load_autoencoder, load_dit, Flux3TextEncoder, SampleTokens,
+};
+use gen_core_flux3::{
+    resolve_checkpoint, text_ids, GenerationParams, DISTILLED_AUTOENCODER_SHA256,
+    DISTILLED_DIT_SHA256,
 };
 
 use crate::common::{
@@ -79,7 +79,7 @@ fn vram_probe() -> Option<VramProbe> {
 }
 
 /// The pinned package parses, validates and agrees with the source constants, and its two
-/// weight files ARE the pinned revision's (the sha256 pins of `gen_core::flux3`).
+/// weight files ARE the pinned revision's (the sha256 pins of `gen_core_flux3`).
 #[test]
 #[ignore = "needs the pinned package (FLUX3_PACKAGE_DIR)"]
 fn real_package_config_is_the_release() {
@@ -376,8 +376,8 @@ fn real_distilled_text_to_image_renders() {
     let record = serde_json::json!({
         "model": "flux3_klein",
         "backend": "candle",
-        "package_revision": candle_gen::gen_core::flux3::DISTILLED_WEIGHTS_REVISION,
-        "upstream_commit": candle_gen::gen_core::flux3::UPSTREAM_CODE_REVISION,
+        "package_revision": gen_core_flux3::DISTILLED_WEIGHTS_REVISION,
+        "upstream_commit": gen_core_flux3::UPSTREAM_CODE_REVISION,
         "prompt": prompt,
         "width": size,
         "height": size,

@@ -17,16 +17,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::iris::downstream::{TaskExport, EMPTY_PROMPT_FILE};
-use candle_gen::gen_core::iris::restoration::RestorationResources;
-use candle_gen::gen_core::iris::restoration_train::{
-    self as contract, ConvNextConfig, RestoreTrainPlan, RestoreTrainResources, CKPT_CRITIC,
-    CKPT_CRITIC_OPTIMIZER, ITEM_DEGRADED_KEY, OPTIONS_KEY,
-};
-use candle_gen::gen_core::iris::train::{
-    checkpoint_root, latest_checkpoint, CKPT_EMA, CKPT_OPTIMIZER, CKPT_TRAINABLE,
-};
-use candle_gen::gen_core::iris::{GenerationResources, IrisTask, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::{
     Image, InputSizing, LoadSpec, Precision, TargetSize, Transform, TransformRequest, WeightsSource,
 };
@@ -39,6 +29,19 @@ use candle_gen_iris::train::lpips::Lpips;
 use candle_gen_iris::train::optim::snapshot;
 use candle_gen_iris::train::restore::{generator_grads, FrozenNets, IrisRestoreTrainer, PairBatch};
 use candle_gen_iris::IrisRestorer;
+use gen_core_iris::downstream::{TaskExport, EMPTY_PROMPT_FILE};
+use gen_core_iris::restoration::RestorationResources;
+use gen_core_iris::train::{
+    checkpoint_root, latest_checkpoint, CKPT_EMA, CKPT_OPTIMIZER, CKPT_TRAINABLE,
+};
+use gen_core_iris::{
+    restoration_train as contract,
+    restoration_train::{
+        ConvNextConfig, RestoreTrainPlan, RestoreTrainResources, CKPT_CRITIC,
+        CKPT_CRITIC_OPTIMIZER, ITEM_DEGRADED_KEY, OPTIONS_KEY,
+    },
+};
+use gen_core_iris::{GenerationResources, IrisTask, TEXT_ENCODER_COMPONENT};
 use serde_json::json;
 
 use crate::common::{fixture, fixtures, host_f32};

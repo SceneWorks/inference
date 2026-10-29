@@ -15,9 +15,9 @@ use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::Image;
 use candle_gen::{CandleError, Result};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 use crate::config::TextEncoderConfig;
 use crate::text_encoder::QwenTextEncoder;

@@ -1,11 +1,9 @@
 //! Frozen `Pipeline.encode_references`: independent AE image_cond rows, never noisy-state init.
 use crate::autoencoder::Flux3AutoEncoder;
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::{
-    flux3::references::{conditioning_ids, PreparedReferences},
-    CancelFlag,
-};
+use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError as Error, Result};
+use gen_core_flux3::references::{conditioning_ids, PreparedReferences};
 
 pub struct ReferenceConditioning {
     pub tokens: Tensor,

@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 # on the committed config fixtures.
 sha2 = { workspace = true }
 image = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 # RESOLVED (sc-14104) — **no new dependency.** The scaffold left this open because bit-exact
 # watermark parity needs two RNG streams the reference mixes: `np.random.default_rng(key)`
@@ -60,4 +61,4 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["mlx-gen-perceptual/model-inference-proof", "mlx-gen/model-inference-proof", "mlx-gen-boogu/model-inference-proof"]
+model-inference-proof = ["mlx-gen-perceptual/model-inference-proof", "mlx-gen/model-inference-proof", "mlx-gen-boogu/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]

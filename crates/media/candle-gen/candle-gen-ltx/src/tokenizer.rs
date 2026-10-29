@@ -6,7 +6,7 @@
 //! [`Ltx25Tokenizer::from_packed_te_file`] reads them with a header parse plus two seeks and needs
 //! no other file.
 //!
-//! Both generations run the same `gen_core::tokenizer::ensure_single_leading_bos` policy, because
+//! Both generations run the same `gen_core_tokenizer::ensure_single_leading_bos` policy, because
 //! they break in opposite directions: the Gemma 4 `tokenizer.json` post-processor emits **no**
 //! `<bos>` (measured on the shipped 2.5 tokenizer — a `TemplateProcessing` whose `single` is a bare
 //! `$A`), while Gemma 3's emits one and would be double-BOSed by an unconditional prepend.
@@ -16,16 +16,16 @@
 use std::path::Path;
 
 use candle_gen::candle_core::{Device, Tensor};
-use candle_gen::gen_core::gemma_assets::LtxGemmaTokenizer;
-use candle_gen::gen_core::tokenizer::ensure_single_leading_bos;
 use candle_gen::{CandleError, Result as CResult};
+use gen_core_ltx::gemma_assets::LtxGemmaTokenizer;
+use gen_core_tokenizer::ensure_single_leading_bos;
 
 /// The backend-neutral packed-asset layer, re-exported so the 2.5 **weight** loader reaches the
 /// same unpacked config/sidecars and the same key canonicalization this tokenizer used, rather than
 /// re-deriving them. [`GemmaTeKeyMap`] accepts the ComfyUI-flattened and the legacy HF tower
 /// spellings and turns every missed lookup into an error — the strict counterpart to the non-strict
 /// load that once left 11 tower tensors at random init.
-pub use candle_gen::gen_core::gemma_assets::{
+pub use gen_core_ltx::gemma_assets::{
     flatten_gemma4_unified_key, is_gemma_asset_key, GemmaAssets, GemmaTeKeyMap,
 };
 

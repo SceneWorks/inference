@@ -1,0 +1,23 @@
+[package]
+name = "sceneworks-gen-core-memory-wan"
+version = "0.1.0"
+edition = "2021"
+description = "The tensor-free Wan I2V memory planner (routes, inventory, receipts, calibration fingerprints) on top of gen-core."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["wan", "memory", "generative"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_memory_wan::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_memory_wan"
+
+[dependencies]
+# The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
+# never depends on them (sc-27316). Tensor-free, like gen-core.
+sceneworks-gen-core = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

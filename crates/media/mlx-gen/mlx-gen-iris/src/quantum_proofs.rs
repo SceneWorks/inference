@@ -12,8 +12,8 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::gen_core::iris::downstream::TaskExport;
-use mlx_gen::gen_core::iris::{DpmStep, DpmUpdate, IrisConfig, IrisTask, Prediction};
+use gen_core_iris::downstream::TaskExport;
+use gen_core_iris::{DpmStep, DpmUpdate, IrisConfig, IrisTask, Prediction};
 use mlx_gen::ios_quantum::{
     assert_tracks_measured, measured_peak_bytes, with_cpu_diagnostic_headroom,
 };
@@ -727,7 +727,7 @@ fn rewrite_backbone_window_dtypes(
 /// ample-headroom load is the positive control; refusal alone is not successful coverage.
 fn packed_tower_affine_root_checks(
     dir: &std::path::Path,
-    text_config: &mlx_gen::gen_core::iris::TextEncoderConfig,
+    text_config: &gen_core_iris::TextEncoderConfig,
     quant: mlx_gen::Quant,
 ) {
     use mlx_gen::ios_quantum::{take_refusal, PROCESS_RESERVE_BYTES};

@@ -9,9 +9,10 @@ repository = "https://github.com/michaeltrefry/candle-gen"
 [dependencies]
 # Core crate — re-exports gen_core + candle, so this crate links exactly one gen-core / candle build.
 candle-gen = { path = "../candle-gen" }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]

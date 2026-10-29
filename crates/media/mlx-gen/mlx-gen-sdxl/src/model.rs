@@ -23,9 +23,9 @@ use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::Dtype;
 use std::path::Path;
 
+use gen_core_family::sdxl_ldm::SdxlComponent as SdxlLdmComponent;
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::sampling::{vp_capture_plan, VpCapturePlan};
-use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as SdxlLdmComponent;
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 
 use crate::config::{DiffusionConfig, UNetConfig};
@@ -1982,7 +1982,7 @@ fn fused_ldm_component_footprint(
     file: &Path,
     quantize: Option<Quant>,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    use mlx_gen::gen_core::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
+    use gen_core_family::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
 
     let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(file)?;
     if headers.is_empty() {

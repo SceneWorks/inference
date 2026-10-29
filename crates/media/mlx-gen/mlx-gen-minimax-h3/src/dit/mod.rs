@@ -56,12 +56,12 @@ pub mod rope;
 pub use adaln::{AdaLnCache, AdaLnResidency, ScheduleKey, TimestepSchedule};
 pub use block::{AdaLnModulation, AdaLnProjection, DitBlock};
 pub use config::{MiniMaxH3DitConfig, MODALITY_NUM, MODULATION_PARAMS};
+pub use gen_core_h3::pruned_adaln::PruningIdentity;
 pub use heads::{
     timestep_sincos, AdaLayerNormOut, DitProjections, LinearBias, NormOutModulation,
     TimestepEmbedder,
 };
 pub use layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
-pub use mlx_gen::gen_core::pruned_adaln::PruningIdentity;
 pub use model::{JointDit, MiniMaxH3Dit, PUBLISHED_DIT_TENSORS};
 pub use positions::{
     audio_position_ids, frame_grid, keyframe_anchor_time, keyframe_position_ids, spatial_axis_grid,

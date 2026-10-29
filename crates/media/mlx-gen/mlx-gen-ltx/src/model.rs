@@ -52,7 +52,7 @@ use std::rc::Rc;
 
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::gen_core::ltx_checkpoint::{
+use gen_core_ltx::ltx_checkpoint::{
     layout_for_declared_version, LtxBundle, LtxCheckpointLayout, LtxComponent,
 };
 use mlx_gen::gen_core::{reject_unknown_components, ArtifactSeal};
@@ -362,7 +362,7 @@ pub fn descriptor_25() -> ModelDescriptor {
     out.capabilities.supports_auto_duration = true;
     out.capabilities.supports_generated_keyframes = true;
     out.capabilities.max_temporal_upsample_rounds =
-        mlx_gen::gen_core::ltx_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS;
+        gen_core_ltx::ltx_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS;
     out.capabilities.supports_diffusion_decoder = true;
     // The catalog entry spans both packed transformer variants.  The loaded provider narrows this
     // union to the exact checkpoint identity in `descriptor_25_for_variant`, so a distilled load
@@ -539,7 +539,7 @@ fn apply_predicted_frames(
     predict_seconds: &mut dyn FnMut() -> Result<f32>,
 ) -> Result<GenerationRequest> {
     let mut core_predict = || predict_seconds().map_err(mlx_gen::gen_core::Error::from);
-    let frames = mlx_gen::gen_core::duration_head::resolve_request_num_frames(
+    let frames = gen_core_ltx::duration_head::resolve_request_num_frames(
         req.frames,
         req.auto_duration,
         fps,
@@ -566,7 +566,7 @@ fn plan_dfr_request(req: &GenerationRequest) -> Result<Option<DfrPlan>> {
     }
 
     let (canvas_frames, automatic_positions) = if temporal_upsample_rounds > 0 {
-        let (canvas, _, positions) = mlx_gen::gen_core::ltx_dfr::resolve_canvas(
+        let (canvas, _, positions) = gen_core_ltx::ltx_dfr::resolve_canvas(
             i64::from(requested_frames),
             i64::from(TEMPORAL_SCALE),
         )?;
@@ -575,7 +575,7 @@ fn plan_dfr_request(req: &GenerationRequest) -> Result<Option<DfrPlan>> {
         (requested_frames, Vec::new())
     };
     let keyframe_positions = if generated_count > 0 {
-        mlx_gen::gen_core::ltx_dfr::evenly_spaced_keyframe_positions(
+        gen_core_ltx::ltx_dfr::evenly_spaced_keyframe_positions(
             generated_count,
             i64::from(canvas_frames),
         )

@@ -98,13 +98,13 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use candle_core::Device;
-use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, OutputChannels, Precision, Progress, Quant, SizeFloor,
 };
 use candle_gen::residency::Residency;
 use candle_gen::{CandleError as Error, Result};
+use gen_core_tokenizer::TextTokenizer;
 
 pub mod adapters;
 pub mod config;

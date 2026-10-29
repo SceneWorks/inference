@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use mlx_gen::gen_core::flux3::{
+use gen_core_flux3::{
     resolve_checkpoint, text_ids, GenerationParams, DISTILLED_AUTOENCODER_SHA256,
     DISTILLED_DIT_SHA256,
 };
@@ -83,7 +83,7 @@ fn ids_of(a: &Array) -> Vec<[f32; 4]> {
 }
 
 /// The pinned package parses, validates and agrees with the source constants, and its two
-/// weight files ARE the pinned revision's (the sha256 pins of `gen_core::flux3`).
+/// weight files ARE the pinned revision's (the sha256 pins of `gen_core_flux3`).
 #[test]
 #[ignore = "needs the pinned package (FLUX3_PACKAGE_DIR)"]
 fn real_package_config_is_the_release() {
@@ -343,8 +343,8 @@ fn real_distilled_text_to_image_renders() {
     .unwrap();
     let record = serde_json::json!({
         "model": "flux3_klein",
-        "package_revision": mlx_gen::gen_core::flux3::DISTILLED_WEIGHTS_REVISION,
-        "upstream_commit": mlx_gen::gen_core::flux3::UPSTREAM_CODE_REVISION,
+        "package_revision": gen_core_flux3::DISTILLED_WEIGHTS_REVISION,
+        "upstream_commit": gen_core_flux3::UPSTREAM_CODE_REVISION,
         "prompt": prompt,
         "width": size,
         "height": size,
@@ -379,9 +379,12 @@ fn real_distilled_text_to_image_renders() {
 #[test]
 #[ignore = "needs the pinned upsampler package (FLUX3_PUP_DIR)"]
 fn real_prompt_upsampler_rewrites_the_readme_request() {
-    use mlx_gen::gen_core::flux3::pup::{
-        self, upsample, BoxSpec, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsamplePlan,
-        UpsamplerInput, UPSAMPLER_WEIGHTS_SHA256,
+    use gen_core_flux3::{
+        pup,
+        pup::{
+            upsample, BoxSpec, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsamplePlan,
+            UpsamplerInput, UPSAMPLER_WEIGHTS_SHA256,
+        },
     };
     use mlx_gen::gen_core::PromptEnhancementOutcome;
 
@@ -400,7 +403,7 @@ fn real_prompt_upsampler_rewrites_the_readme_request() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../contracts/gen-core/tests/fixtures/flux3_pup/golden.json")
+                .join("../../../contracts/gen-core-flux3/tests/fixtures/flux3_pup/golden.json")
         });
     let golden: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&golden_path).unwrap()).unwrap();

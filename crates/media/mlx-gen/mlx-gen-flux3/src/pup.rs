@@ -1,6 +1,6 @@
 //! The MLX half of the FLUX 3 **prompt upsampler** (sc-26238): load the separate
 //! `black-forest-labs/flux-3-image-klein-pup` package (a Qwen3.5-9B VLM) through the shared
-//! `mlx-llm` provider and run the tensor-neutral stage of [`gen_core::flux3::pup`] on it.
+//! `mlx-llm` provider and run the tensor-neutral stage of [`gen_core_flux3::pup`] on it.
 //!
 //! Everything that decides *what* the model is asked — the mode, the system prompt, the
 //! scaffolds, the box grammar, the reference policy, the window budget, the cancel bridge, the
@@ -15,18 +15,21 @@
 //! separately from the image model and its text encoder (its 18.8 GB of bf16 weights are a
 //! second model resident beside the DiT, as upstream's vLLM share of the GPU is).
 //!
-//! [`run_text_llm`]: gen_core::flux3::pup::run_text_llm
+//! [`run_text_llm`]: gen_core_flux3::pup::run_text_llm
 
 use std::path::{Path, PathBuf};
 
-use gen_core::flux3::pup::{
-    self, run_text_llm, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsampleOutcome,
-    UpsamplePackage, UpsamplePlan, UpsamplerInput,
+use gen_core_flux3::{
+    pup,
+    pup::{
+        run_text_llm, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsampleOutcome,
+        UpsamplePackage, UpsamplePlan, UpsamplerInput,
+    },
 };
 use mlx_gen::gen_core::core_llm::{self, ModelRequirements, TextLlm};
 use mlx_gen::{gen_core, CancelFlag, Error, GenerationRequest, LoadSpec, Progress, Result};
 
-pub use gen_core::flux3::pup::{
+pub use gen_core_flux3::pup::{
     UPSAMPLER_COMPONENT, UPSAMPLER_REPO, UPSAMPLER_REVISION, UPSAMPLER_WEIGHTS_SHA256,
 };
 
@@ -228,7 +231,7 @@ mod tests {
             flux3_layout: Some(gen_core::flux3::layouts::Layout::parse(r#"{"version":1,"boxes":[{"id":"cat","from":"ref_image_0","src_bbox":[0.1,0.2,0.6,0.7],"tgt_bbox":null}]}"#).unwrap()),
             ..Default::default()
         };
-        let input = gen_core::flux3::references::upsampler_input(&req).unwrap();
+        let input = gen_core_flux3::references::upsampler_input(&req).unwrap();
         let outcome =
             effective_prompt(None, &req, &input, &mut |_| panic!("bypass must not infer")).unwrap();
         assert_eq!(outcome.caption, "remove cat [{\"id\": \"cat\", \"from\": \"ref_image_0\", \"src_bbox\": [100, 200, 600, 700], \"tgt_bbox\": null, \"desc\": \"\"}]");
@@ -242,7 +245,7 @@ mod tests {
 
     #[test]
     fn near_limit_native_layout_caption_reaches_final_parameters_once() {
-        let config = gen_core::flux3::resolve_checkpoint(
+        let config = gen_core_flux3::resolve_checkpoint(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot"),
         )
         .unwrap();
@@ -252,23 +255,23 @@ mod tests {
             flux3_layout: Some(layout.clone()),
             ..Default::default()
         };
-        gen_core::flux3::validate_generation_request(
+        gen_core_flux3::validate_generation_request(
             gen_core::flux3::DISTILLED_MODEL_ID,
             &req,
             &config,
         )
         .unwrap();
-        let input = gen_core::flux3::references::upsampler_input(&req).unwrap();
+        let input = gen_core_flux3::references::upsampler_input(&req).unwrap();
         let bypass = effective_prompt(None, &req, &input, &mut |_| panic!("bypass")).unwrap();
         for caption in [
             bypass.caption.clone(),
             format!("{} {}", "enhanced ".repeat(300), bypass.caption),
         ] {
             let params =
-                gen_core::flux3::GenerationParams::resolve_caption(&req, caption.clone(), &config)
+                gen_core_flux3::GenerationParams::resolve_caption(&req, caption.clone(), &config)
                     .unwrap();
             assert_eq!(params.prompt, caption);
-            assert_eq!(params.seed, gen_core::flux3::prompt_seed(&caption));
+            assert_eq!(params.seed, gen_core_flux3::prompt_seed(&caption));
             assert_eq!(req.flux3_layout.as_ref(), Some(&layout));
         }
     }

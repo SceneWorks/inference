@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_gen::gen_core::supra2::{
+use gen_core_checkpoint::supra2::{
     Supra2Config, Supra2Tokenizer, PROMPT_TRUNCATED_WARNING, VAE_SCALE,
 };
 use mlx_gen::weights::Weights;

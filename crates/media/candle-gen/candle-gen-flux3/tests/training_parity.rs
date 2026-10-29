@@ -2,9 +2,9 @@
 use crate::common::{fixture, host_f32, ids_of, tiny_config, tiny_package};
 use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::flux3::training::lora_targets;
 use candle_gen::train::optim::TrainOptimizer;
 use candle_gen_flux3::{training::TrainingGraph, Flux3Dit, SampleTokens};
+use gen_core_flux3::training::lora_targets;
 use std::collections::BTreeMap;
 
 struct ScalarAdamState {

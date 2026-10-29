@@ -9,7 +9,7 @@
 //! Tolerance: the `e2e_parity` bound (6e-2 of peak) — the backbone and solver run FP32 on the MLX
 //! CPU stream, the text tower bf16 on both sides (1–2 bf16 ulps apart, amplified by CFG).
 
-use mlx_gen::gen_core::iris::{GenerationParams, IrisConfig};
+use gen_core_iris::{GenerationParams, IrisConfig};
 use mlx_gen::{CancelFlag, GenerationRequest, PreviewSink};
 use mlx_gen_iris::{denoise, encode, load_backbone, IrisTextEncoder};
 use mlx_rs::Dtype;
@@ -122,7 +122,7 @@ fn every_control_matches_upstream_on_the_miniature_body() {
             config.flow.prediction = case["prediction"].as_str().unwrap().to_owned();
             config.validate_supported().unwrap();
             let req = case_request(case, &config);
-            mlx_gen::gen_core::iris::validate_generation_request("iris_3b", &req, &config).unwrap();
+            gen_core_iris::validate_generation_request("iris_3b", &req, &config).unwrap();
             let params = GenerationParams::resolve(&req, 0, &config).unwrap();
             assert_eq!(
                 (

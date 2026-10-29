@@ -1,9 +1,9 @@
 //! Frozen MOSS graph. No FLUX DiT/scheduler or ordinary cast-down adapter abstraction is used.
 use crate::adapters::Lokr;
 use crate::precision::{attention_edit_bf16, attention_fp32, linear_fp32};
+use gen_core_moss_image::moss_image::{moss_time_features, MossImageConfig};
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::attention::slice_axis;
-use mlx_gen::gen_core::moss_image::{moss_time_features, MossImageConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::ops::{add, concatenate_axis, divide, multiply, rsqrt, sigmoid, tanh};

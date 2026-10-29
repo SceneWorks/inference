@@ -18,7 +18,7 @@
 //! module output joins the text context's dtype.
 use std::collections::BTreeMap;
 
-use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+use gen_core_family::sdxl_ldm::SdxlComponent as C;
 use mlx_gen::gen_core::LoadSpec;
 use mlx_gen::ios_pricing::IosPhase;
 use mlx_gen::Result;

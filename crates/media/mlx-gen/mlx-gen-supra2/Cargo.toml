@@ -16,6 +16,7 @@ mlx-gen-flux = { path = "../mlx-gen-flux" }
 mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
 # Component config.json geometry checks.
 serde_json = { workspace = true }
+sceneworks-gen-core-checkpoint = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }

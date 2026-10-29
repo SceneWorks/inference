@@ -21,14 +21,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use candle_gen::gen_core::iris::train::repa::TEACHER_COMPONENT;
-use candle_gen::gen_core::iris::train::upstream::stage_preset_config;
-use candle_gen::gen_core::iris::train::{
-    checkpoint_root, latest_checkpoint, read_checkpoint_state, OPTIONS_KEY,
-};
-use candle_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
 use candle_gen::gen_core::{LoadSpec, WeightsSource};
 use candle_gen::gen_core::{Trainer, TrainingConfig, TrainingItem, TrainingRequest};
+use gen_core_iris::train::repa::TEACHER_COMPONENT;
+use gen_core_iris::train::upstream::stage_preset_config;
+use gen_core_iris::train::{
+    checkpoint_root, latest_checkpoint, read_checkpoint_state, OPTIONS_KEY,
+};
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use serde_json::{json, Value as Json};
 
 const CAPTION: &str = "a photo of a dog sitting on grass";

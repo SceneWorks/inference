@@ -40,9 +40,12 @@ safetensors = "0.7"
 # The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath (depth anchoring
 # through TAEW2.1, the Qwen-Image VAE's tiny decoder).
 candle-gen-perceptual = { path = "../candle-gen-perceptual" }
+sceneworks-gen-core-family = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-boogu/model-inference-proof", "candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen-qwen-image/model-inference-proof", "candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen-boogu/model-inference-proof", "candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen-qwen-image/model-inference-proof", "candle-gen/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-qwen-image/metal", "candle-gen-boogu/metal", "candle-gen-pid/metal", "candle-gen-perceptual/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda", "candle-gen-boogu/cuda", "candle-gen-pid/cuda", "candle-gen-perceptual/cuda"]

@@ -26,7 +26,6 @@
 use std::collections::{BTreeMap, HashMap};
 
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::gen_core::iris::{check_adapter_identity, IrisTask};
 use candle_gen::gen_core::weightsmeta::{
     keys_contain_loha, keys_contain_lokr, kohya_table, resolve_kohya_stem, resolve_lokr_path,
     COMMON_LORA_PREFIXES, KOHYA_PREFIX, LOKR_SUFFIXES,
@@ -39,6 +38,7 @@ use candle_gen::train::merge::{
     AdapterFile, ThirdPartyLoha,
 };
 use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::{check_adapter_identity, IrisTask};
 
 use crate::nn::Residual;
 
@@ -586,8 +586,7 @@ pub fn adapter_footprint(
                  Iris adapter surface is LoRA / LoKr / LoHa low-rank factors"
             )));
         }
-        let meta = candle_gen::gen_core::iris::downstream::weights_metadata(&spec.path)?
-            .unwrap_or_default();
+        let meta = gen_core_iris::downstream::weights_metadata(&spec.path)?.unwrap_or_default();
         check_adapter_identity(&meta, task, base_model, &spec.path)?;
         let keys = || header.keys().map(String::as_str);
         let stamped_lokr = candle_gen::gen_core::weightsmeta::is_lokr_network_type(

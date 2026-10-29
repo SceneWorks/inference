@@ -4,7 +4,7 @@
 use std::fmt::{self, Write};
 use std::sync::OnceLock;
 
-use mlx_gen::gen_core::iris::depth::DepthRequest;
+use gen_core_iris::depth::DepthRequest;
 use mlx_gen::gen_core::{CancelFlag, GenerationRequest, TransformRequest};
 use sha2::{Digest, Sha256};
 

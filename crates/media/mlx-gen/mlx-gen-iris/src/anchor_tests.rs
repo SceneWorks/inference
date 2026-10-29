@@ -10,7 +10,7 @@
 //! own single-mode family: its host planes are outside MLX active memory, so it has no native
 //! certificate and `derive_certified` refuses it with its exact first-uncovered-class reason.
 
-use mlx_gen::gen_core::iris::{IrisTask, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::{IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{
     GenerationMemory, LoadShape, MemoryGeometry, MemoryMode, MemorySelection, MemoryStrategy,
     MemoryStrategySupport,
@@ -1132,7 +1132,7 @@ pub(crate) fn observe_generation_backbone(dit: &crate::dit::IrisDiT) {
 /// storage only; they never evaluate a lazy input to manufacture a retention claim.
 pub(crate) fn observe_solver_epoch(
     index: usize,
-    step: &mlx_gen::gen_core::iris::DpmStep,
+    step: &gen_core_iris::DpmStep,
     x: &mlx_rs::Array,
     previous: Option<&mlx_rs::Array>,
 ) {
@@ -1244,10 +1244,9 @@ fn run_generation_endpoint(
     assert_eq!(memory.stream_transformer_blocks, streamed);
     assert_eq!(memory.stage_residency, staged);
     assert_eq!(memory.chunk_attention, !resident);
-    let resources =
-        mlx_gen::gen_core::iris::GenerationResources::from_spec(spec, crate::model::MODEL_ID)
-            .map_err(mlx_gen::Error::from)?;
-    let config = mlx_gen::gen_core::iris::IrisConfig::from_dir(&resources.backbone_dir)
+    let resources = gen_core_iris::GenerationResources::from_spec(spec, crate::model::MODEL_ID)
+        .map_err(mlx_gen::Error::from)?;
+    let config = gen_core_iris::IrisConfig::from_dir(&resources.backbone_dir)
         .map_err(mlx_gen::Error::from)?;
     let recipe = crate::ios_pricing::resolved_generation_recipe(&config, request, 42)?;
     let shape = [
@@ -1858,7 +1857,7 @@ fn downstream_pricing(
     geometry: MemoryGeometry,
     actual: (
         Option<&TransformRequest>,
-        Option<&mlx_gen::gen_core::iris::depth::DepthRequest>,
+        Option<&gen_core_iris::depth::DepthRequest>,
     ),
 ) -> IosPricing {
     ios_pricing(&IosPricingRequest {
@@ -1879,7 +1878,7 @@ fn downstream_pricing(
 /// The downstream task's actual work context: a restoration transform or a depth request.
 struct DownstreamWork<'a> {
     transform: Option<&'a TransformRequest>,
-    depth: Option<&'a mlx_gen::gen_core::iris::depth::DepthRequest>,
+    depth: Option<&'a gen_core_iris::depth::DepthRequest>,
 }
 
 fn downstream_ctx<'a>(
@@ -1952,8 +1951,8 @@ fn measure_restoration(
     (run, geometry.unwrap())
 }
 
-fn depth_request(width: u32, height: u32) -> mlx_gen::gen_core::iris::depth::DepthRequest {
-    mlx_gen::gen_core::iris::depth::DepthRequest {
+fn depth_request(width: u32, height: u32) -> gen_core_iris::depth::DepthRequest {
+    gen_core_iris::depth::DepthRequest {
         image: Image {
             width,
             height,
@@ -1961,7 +1960,7 @@ fn depth_request(width: u32, height: u32) -> mlx_gen::gen_core::iris::depth::Dep
                 .map(|i| (i * 31 % 256) as u8)
                 .collect(),
         },
-        resolution: mlx_gen::gen_core::iris::depth::DepthResolution::Native,
+        resolution: gen_core_iris::depth::DepthResolution::Native,
         ..Default::default()
     }
 }
@@ -1977,12 +1976,9 @@ fn measure_depth(
         let depth = crate::depth::load_depth(spec)?;
         depth.assert_endpoint_ownership(streamed);
         let before = depth.endpoint_parameter_addresses();
-        let output = mlx_gen::gen_core::iris::depth::IrisDepthEstimator::estimate(
-            &depth,
-            &actual,
-            &mut |_| {},
-        )
-        .map_err(mlx_gen::Error::from)?;
+        let output =
+            gen_core_iris::depth::IrisDepthEstimator::estimate(&depth, &actual, &mut |_| {})
+                .map_err(mlx_gen::Error::from)?;
         assert_eq!((output.map.width, output.map.height), (width, height));
         assert_eq!(
             before,
@@ -2367,7 +2363,7 @@ fn resident_body() {
                 let live = live_at_checks(|| {
                     let depth = crate::depth::load_depth(&spec)?;
                     depth.assert_endpoint_ownership(expected_stream);
-                    mlx_gen::gen_core::iris::depth::IrisDepthEstimator::estimate(
+                    gen_core_iris::depth::IrisDepthEstimator::estimate(
                         &depth,
                         &actual_depth,
                         &mut |_| {},
@@ -2429,7 +2425,7 @@ fn the_priced_resident_accounts_for_the_live_set_at_every_check() {
 /// parent-embed fixture. Constructed only AFTER in_cpu_child selects CPU and traps Metal; no fixture
 /// Arrays survive into the before-model-load measurement coordinate.
 fn generation_anchor_adapter(root: &std::path::Path) -> mlx_gen::AdapterSpec {
-    use mlx_gen::gen_core::iris::adapter_provenance;
+    use gen_core_iris::adapter_provenance;
     use mlx_rs::{transforms::eval, Array};
 
     let path = root.join("anchor-patch-lora.safetensors");

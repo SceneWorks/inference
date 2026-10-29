@@ -255,7 +255,7 @@ impl Trainer for ZImageTurboTrainer {
     ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         let mut warnings = Vec::new();
         let output = self.train_impl(req, on_progress, &mut warnings)?;
         Ok(TrainingReport { output, warnings })
@@ -761,7 +761,7 @@ struct AuxStep<'a> {
 
 /// Build the epic-2123 perceptual path from the config: `None` when no aux loss is enabled (the
 /// default — nothing is loaded and every step is the plain diffusion step). The floor
-/// ([`gen_core::train::validate_training_techniques`]) has already required both directories.
+/// ([`gen_core_train::validate_training_techniques`]) has already required both directories.
 fn load_perceptual_path(cfg: &TrainingConfig) -> Result<Option<PerceptualPath>> {
     mlx_gen_perceptual::build_perceptual_path(cfg, &aux_loss_context())
 }

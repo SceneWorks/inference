@@ -2,7 +2,7 @@
 //! explicit path (nothing is downloaded or derived from a cache location):
 //!
 //! ```sh
-//! SUPRA2_BUNDLE=<converted bundle dir>            # gen_core::supra2::convert_pinned_checkpoint output
+//! SUPRA2_BUNDLE=<converted bundle dir>            # gen_core_checkpoint::supra2::convert_pinned_checkpoint output
 //! SUPRA2_T5_SNAPSHOT=<google/flan-t5-base @ 7bcac572…>
 //! SUPRA2_VAE_SNAPSHOT=<stabilityai/sd-vae-ft-mse @ 31f26fde…>
 //! SUPRA2_OUTPUT_DIR=<where PNGs are written>      # optional
@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mlx_gen::gen_core::supra2::{
+use gen_core_checkpoint::supra2::{
     image_seed, initial_noise, PROVIDER_ID, TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
 };
 use mlx_gen::gen_core::ProviderRegistryBuilder;
@@ -241,7 +241,7 @@ fn trajectories_match_torch_reference() {
         .collect();
     assert_eq!(
         z0, ours,
-        "reference z0 must be gen_core::supra2::initial_noise(seed 0, images 0..2)"
+        "reference z0 must be gen_core_checkpoint::supra2::initial_noise(seed 0, images 0..2)"
     );
 
     let stored = Supra2Image::load(&spec_for(&bundle)).unwrap();

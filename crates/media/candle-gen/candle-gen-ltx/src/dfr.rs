@@ -2,16 +2,16 @@
 //! in step. Generated keyframe slots, the full-resolution detailing pass, and tiled temporal
 //! upsampling rounds, ported from the reference `ltx_pipelines/dfr_pipeline.py` (Lightricks/LTX-2
 //! v1.2.0 @ `d1511477`) over this crate's token-native conditioning and denoise loops, with the
-//! shared integer geometry in [`candle_gen::gen_core::ltx_dfr`].
+//! shared integer geometry in [`gen_core_ltx::ltx_dfr`].
 //!
 //! [`run_temporal_rounds`] owns the round/tile/seam arithmetic behind injected closures (temporal
 //! upsampler + per-tile denoise) so the exact production code path is drivable by CPU tests
 //! without the 22B DiT; [`denoise_dfr_tile`] is the production tile closure body.
 
 use candle_gen::candle_core::{Error, Result, Tensor};
-use candle_gen::gen_core::ltx_dfr as gen_core_dfr;
-use candle_gen::gen_core::ltx_dfr::DfrTileRange;
 use candle_gen::gen_core::{CancelFlag, Progress};
+use gen_core_ltx::ltx_dfr as gen_core_dfr;
+use gen_core_ltx::ltx_dfr::DfrTileRange;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 

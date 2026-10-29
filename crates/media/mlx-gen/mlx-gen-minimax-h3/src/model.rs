@@ -737,7 +737,7 @@ pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2V
 /// Resolve the request's geometry: the canvas, and the frame count from `frames` (exact) or
 /// `duration` (aligned).
 pub(crate) fn request_geometry(req: &GenerationRequest) -> Result<RequestGeometry> {
-    // The shared resolver the Candle engine and allocation admission (`gen_core::veda::workspace`)
+    // The shared resolver the Candle engine and allocation admission (`gen_core_h3::veda::workspace`)
     // use, so the three can never resolve one request to different frame counts (sc-26691).
     let frames = mlx_gen::gen_core::h3_memory::resolve_request_frames(req.frames, req.duration)?;
     let frames = i32::try_from(frames)
@@ -1550,11 +1550,7 @@ impl MiniMaxH3 {
         let resize_mode = mlx_gen::gen_core::effective_reference_image_resize_mode(req);
         let num_frames = geometry.joint.num_frames as usize;
         let truncate = |a: &mlx_gen::media::AudioTrack| {
-            mlx_gen::gen_core::truncate_reference_audio(
-                a,
-                num_frames,
-                crate::denoise::MINIMAX_H3_FPS,
-            )
+            gen_core_h3::truncate_reference_audio(a, num_frames, crate::denoise::MINIMAX_H3_FPS)
         };
         let mut normalized: Vec<Ref2VaReference> = Vec::with_capacity(references.len());
         for r in references.as_slice() {

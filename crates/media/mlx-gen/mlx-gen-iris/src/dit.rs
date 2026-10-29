@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use gen_core::iris::{self, ModelConfig};
-use mlx_gen::gen_core;
+use gen_core_iris as iris;
+use gen_core_iris::ModelConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::nn::{gelu, sigmoid, silu};

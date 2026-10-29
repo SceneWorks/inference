@@ -9,8 +9,6 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::snapshot_inventory::hex_lower as hex;
 use candle_gen::gen_core::{
-    moss_image::*,
-    moss_image_edit::*,
     weightsmeta::{CheckpointMeta, Dtype as StoredDtype},
     PinnedWeightsFile,
 };
@@ -18,6 +16,7 @@ use candle_gen::gen_core::{CancelFlag, LoadSpec, Progress, WeightsSource};
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError as Error, Result};
 use candle_gen_flux2::vae::{Flux2Vae, Flux2VaeDecoderConfig};
+use gen_core_moss_image::{moss_image::*, moss_image_edit::*};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::Path};
 

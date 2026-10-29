@@ -1614,7 +1614,7 @@ fn engineering_unbound_iris_candidates_reach_real_metadata_pricing() {
                     image: image(),
                     ..Default::default()
                 }),
-                IRIS_DEPTH_ID => IosWork::Depth(mlx_gen::gen_core::iris::depth::DepthRequest {
+                IRIS_DEPTH_ID => IosWork::Depth(gen_core_iris::depth::DepthRequest {
                     image: image(),
                     ..Default::default()
                 }),

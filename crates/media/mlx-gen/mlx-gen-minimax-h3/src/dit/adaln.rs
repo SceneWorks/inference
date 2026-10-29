@@ -106,7 +106,7 @@ use std::collections::HashMap;
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
 
-use mlx_gen::gen_core::pruned_adaln::PruningIdentity;
+use gen_core_h3::pruned_adaln::PruningIdentity;
 use mlx_gen::{Error, Result};
 
 use crate::dit::block::{AdaLnModulation, DitBlock};

@@ -219,7 +219,7 @@ pub struct VideoTokenState {
     /// mirroring the reference `extend_keyframes_mask(marked=False)`.
     pub keyframes_mask: Option<Tensor>,
     /// Where the single contiguous run of generated-keyframe slot tokens sits (`None` = no slots).
-    pub generated_keyframe_layout: Option<candle_gen::gen_core::ltx_dfr::GeneratedKeyframeLayout>,
+    pub generated_keyframe_layout: Option<gen_core_ltx::ltx_dfr::GeneratedKeyframeLayout>,
 }
 
 impl VideoTokenState {
@@ -337,7 +337,7 @@ pub fn append_keyframe_clip(
 // Twin of mlx-gen-ltx/src/conditioning.rs — keep the two in step.
 // ===================================================================================================
 
-use candle_gen::gen_core::ltx_dfr::GeneratedKeyframeLayout;
+use gen_core_ltx::ltx_dfr::GeneratedKeyframeLayout;
 
 /// Extend the state's keyframe marker for `num_new` appended tokens (reference
 /// `mask_utils.extend_keyframes_mask`): `marked = false` keeps an absent mask absent; any present

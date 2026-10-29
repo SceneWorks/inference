@@ -32,10 +32,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use gen_core_flux3::artifacts::NativeDitStorage;
+use gen_core_flux3::quantization::DitFormat;
+use gen_core_flux3::{Flux3Config, GenerationResources};
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
-use mlx_gen::gen_core::flux3::artifacts::NativeDitStorage;
-use mlx_gen::gen_core::flux3::quantization::DitFormat;
-use mlx_gen::gen_core::flux3::{Flux3Config, GenerationResources};
 use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use mlx_gen::gen_core::{
     self, Error as CoreError, LoadShape, MemoryArchitectureFacts, MemoryAssetFacts,
@@ -290,7 +290,7 @@ pub(crate) fn generation_contract(
         // not a request variable: `count` still renders sequentially, so no BatchCount axis.
     }
     for adapter in &spec.adapters {
-        gen_core::flux3::adapters::inspect(adapter, &config.dit)?;
+        gen_core_flux3::adapters::inspect(adapter, &config.dit)?;
     }
 
     let storage = NativeDitStorage::from_package(&resources.package_dir)?;
@@ -316,8 +316,8 @@ pub(crate) fn generation_contract(
         decoder_bytes: decoder,
         overlay_bytes: 0,
     };
-    if let Some(dir) = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)? {
-        gen_core::flux3::pup::UpsamplePackage::check(&dir)?;
+    if let Some(dir) = gen_core_flux3::pup::UpsamplePackage::component_dir(spec)? {
+        gen_core_flux3::pup::UpsamplePackage::check(&dir)?;
         let llm_spec = gen_core::core_llm::LoadSpec::dense(dir.to_string_lossy().into_owned());
         let load_bound = mlx_llm::load_memory_required_bytes(&llm_spec).map_err(|e| {
             CoreError::Unsupported(format!(
@@ -395,7 +395,7 @@ pub(crate) fn upsampler_charge(
                 precomputed_in: gen_core::MemoryPhase::Conditioning,
                 retained_bytes: 0,
                 evidence: "mlx_gen_flux3::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest; \
-                           gen_core::flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
+                           gen_core_flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
                     .into(),
             },
         ),
@@ -425,7 +425,7 @@ fn account_upsampler(
             MemoryFormulaVariable::OverlayBytes,
         ],
         resident_components: vec![gen_core::MemoryResidentComponent {
-            id: gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+            id: gen_core_flux3::pup::UPSAMPLER_COMPONENT.into(),
             kind: gen_core::MemoryComponentKind::PromptUpsampler,
             resident_bytes: bytes,
             bounded_by: None,
@@ -486,7 +486,7 @@ fn native_dit_bytes(
     weights: &Path,
     precision: Precision,
     storage: NativeDitStorage,
-    cfg: &gen_core::flux3::DitConfig,
+    cfg: &gen_core_flux3::DitConfig,
 ) -> CoreResult<u64> {
     if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
         return dit_bytes(weights, precision);
@@ -558,7 +558,7 @@ fn route_gate(
     context: &MemoryRunContext,
     _loaded_tier: MemoryNumericTier,
 ) -> CoreResult<()> {
-    gen_core::flux3::references::validate_memory_route(
+    gen_core_flux3::references::validate_memory_route(
         &context.mode,
         context.geometry.reference_count,
     )?;
@@ -631,7 +631,7 @@ fn admitted_scope(
         },
     )?;
     Ok(Some(
-        gen_core::flux3::references::guard_memory_scope_with_resources(
+        gen_core_flux3::references::guard_memory_scope_with_resources(
             Box::new(mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
                 config,
                 mlx_gen::request_scope::MlxScopeCleanup::Device,
@@ -660,19 +660,19 @@ pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
 }
 
 /// PRE-FIT reference workspace of one request on the package `spec` names, through the shared
-/// formula ([`gen_core::flux3::reference_workspace`]) at this backend's compute width.
+/// formula ([`gen_core_flux3::reference_workspace`]) at this backend's compute width.
 fn reference_workspace_for(
     provider_id: &str,
     spec: &LoadSpec,
     facts: &gen_core::MemoryReferenceResourceFacts,
 ) -> CoreResult<u64> {
     refuse_unloadable_spec(spec)?;
-    let inputs = gen_core::flux3::reference_workspace::ReferenceWorkspaceInputs::from_spec(
+    let inputs = gen_core_flux3::reference_workspace::ReferenceWorkspaceInputs::from_spec(
         spec,
         provider_id,
         u64::from(compute_width(spec.precision)),
     )?;
-    gen_core::flux3::reference_workspace::reference_workspace_bytes(&inputs, Some(facts))
+    gen_core_flux3::reference_workspace::reference_workspace_bytes(&inputs, Some(facts))
 }
 
 /// `flux3_klein`'s pre-fit reference pricer.
@@ -770,15 +770,15 @@ mod tests {
         // encoder and autoencoder ride in as components.
         let mut spec = LoadSpec::new(WeightsSource::Dir(fixture.join("tiny-base-snapshot")));
         spec.components.insert(
-            gen_core::flux3::TEXT_ENCODER_COMPONENT.into(),
+            gen_core_flux3::TEXT_ENCODER_COMPONENT.into(),
             WeightsSource::Dir(fixture.join("tiny-snapshot/text_encoder")),
         );
         spec.components.insert(
-            gen_core::flux3::AUTOENCODER_COMPONENT.into(),
+            gen_core_flux3::AUTOENCODER_COMPONENT.into(),
             WeightsSource::File(fixture.join("tiny-snapshot/ae.safetensors")),
         );
         let config =
-            gen_core::flux3::resolve_checkpoint(&fixture.join("tiny-base-snapshot")).unwrap();
+            gen_core_flux3::resolve_checkpoint(&fixture.join("tiny-base-snapshot")).unwrap();
         assert!(!config.dit.flow_map);
         let resources =
             GenerationResources::from_spec(&spec, &config, gen_core::flux3::BASE_MODEL_ID).unwrap();
@@ -828,7 +828,7 @@ mod tests {
             );
         }
         spec.components.insert(
-            gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+            gen_core_flux3::pup::UPSAMPLER_COMPONENT.into(),
             WeightsSource::Dir(fixture.join("tiny-pup-snapshot")),
         );
         let both = generation_contract(&spec, &resources, &config).unwrap();
@@ -877,7 +877,7 @@ mod tests {
     /// (names, BF16 dtypes, shapes). No file and no tensor payload is read.
     fn declared_headers(
         storage: NativeDitStorage,
-        cfg: &gen_core::flux3::DitConfig,
+        cfg: &gen_core_flux3::DitConfig,
     ) -> Vec<SafetensorsTensorHeader> {
         storage
             .expected_tensors(cfg)
@@ -897,9 +897,9 @@ mod tests {
     /// default, and the explicit distilled flag refuses the base route.
     #[test]
     fn real_config_bodies_plan_by_catalog_route_not_label() {
-        let base_meta = gen_core::flux3::Flux3MetadataConfig::parse(REAL_BASE_CONFIG).unwrap();
+        let base_meta = gen_core_flux3::Flux3MetadataConfig::parse(REAL_BASE_CONFIG).unwrap();
         let distilled_meta =
-            gen_core::flux3::Flux3MetadataConfig::parse(REAL_DISTILLED_CONFIG).unwrap();
+            gen_core_flux3::Flux3MetadataConfig::parse(REAL_DISTILLED_CONFIG).unwrap();
         assert_eq!(base_meta.model, distilled_meta.model);
         assert_eq!(base_meta.dit.flow_map, None, "absent stays unresolved");
         assert_eq!(distilled_meta.dit.flow_map, Some(true));
@@ -954,7 +954,7 @@ mod tests {
                 (3072 * 256 + 3072 * 3072) as u64,
             ),
         ] {
-            let cfg = gen_core::flux3::Flux3MetadataConfig::parse(body)
+            let cfg = gen_core_flux3::Flux3MetadataConfig::parse(body)
                 .unwrap()
                 .for_model(id)
                 .unwrap()
@@ -1039,7 +1039,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(priced, codes + rest, "{id} {storage:?}");
             }
-            let base_cfg = gen_core::flux3::Flux3MetadataConfig::parse(REAL_BASE_CONFIG)
+            let base_cfg = gen_core_flux3::Flux3MetadataConfig::parse(REAL_BASE_CONFIG)
                 .unwrap()
                 .for_model(gen_core::flux3::BASE_MODEL_ID)
                 .unwrap()
@@ -1076,7 +1076,7 @@ mod tests {
                     .map(|h| h.element_count().unwrap())
                     .sum()
             };
-            let cfg = gen_core::flux3::resolve_checkpoint(&fixtures.join(dir))
+            let cfg = gen_core_flux3::resolve_checkpoint(&fixtures.join(dir))
                 .unwrap()
                 .dit;
             let vectors = headers.iter().filter(|h| h.shape.len() < 2).count();
@@ -1135,11 +1135,11 @@ mod tests {
             // The tiny base package ships only config + DiT; both routes take the distilled
             // package's encoder and autoencoder as components, as the generator tests do.
             spec.components.insert(
-                gen_core::flux3::TEXT_ENCODER_COMPONENT.into(),
+                gen_core_flux3::TEXT_ENCODER_COMPONENT.into(),
                 gen_core::WeightsSource::Dir(fixtures.join("tiny-snapshot/text_encoder")),
             );
             spec.components.insert(
-                gen_core::flux3::AUTOENCODER_COMPONENT.into(),
+                gen_core_flux3::AUTOENCODER_COMPONENT.into(),
                 gen_core::WeightsSource::File(fixtures.join("tiny-snapshot/ae.safetensors")),
             );
             assert_eq!(

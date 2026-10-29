@@ -14,15 +14,15 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::iris::train::lineage::prior_checkpoint_root;
-use candle_gen::gen_core::iris::train::{
-    checkpoint_root, latest_checkpoint, list_checkpoints, read_checkpoint_state, OPTIONS_KEY,
-};
-use candle_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
 use candle_gen::gen_core::{
     LoadSpec, LrSchedule, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
     WeightsSource,
 };
+use gen_core_iris::train::lineage::prior_checkpoint_root;
+use gen_core_iris::train::{
+    checkpoint_root, latest_checkpoint, list_checkpoints, read_checkpoint_state, OPTIONS_KEY,
+};
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use serde_json::json;
 
 use crate::common::{cpu, tiny_backbone, tiny_text_encoder};

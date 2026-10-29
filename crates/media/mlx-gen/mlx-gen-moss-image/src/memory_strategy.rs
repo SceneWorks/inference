@@ -1,5 +1,6 @@
 //! Structural resident admission. No unmeasured calibration or unused optimization lever.
 use crate::loader::Sources;
+use gen_core_moss_image::{moss_image, moss_image_edit};
 use mlx_gen::gen_core::moss_image::MossImageVariant;
 use mlx_gen::gen_core::*;
 

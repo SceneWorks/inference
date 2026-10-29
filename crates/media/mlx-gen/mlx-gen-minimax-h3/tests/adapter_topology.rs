@@ -32,8 +32,8 @@ use std::path::Path;
 use mlx_rs::ops::{multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
+use gen_core_h3::pruned_adaln::{interpolation_position, TABLE_KEY};
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::gen_core::pruned_adaln::{interpolation_position, TABLE_KEY};
 use mlx_gen::gen_core::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::adapters::convert_comfyui_key_space;
@@ -98,7 +98,7 @@ fn full_dit(cfg: &MiniMaxH3DitConfig) -> MiniMaxH3Dit {
 /// The committed tiny DiT's tensors transformed into the pruned coordinate-table topology: the
 /// full timestep MLP, the full-width per-block AdaLN projections and the final projection are
 /// removed and replaced by `adaln_t_table` plus the reduced operands
-/// `gen_core::pruned_adaln::inspect` requires — one entry per transformer block plus the final
+/// `gen_core_h3::pruned_adaln::inspect` requires — one entry per transformer block plus the final
 /// one. **Every body tensor is carried over byte-identically**, which is what makes the
 /// cross-topology delta comparison a one-variable experiment.
 fn pruned_fixture_map(cfg: &MiniMaxH3DitConfig) -> HashMap<String, Array> {

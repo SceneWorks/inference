@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_gen::gen_core::supra2::Supra2Config;
+use gen_core_checkpoint::supra2::Supra2Config;
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
 use mlx_gen_flux::text_encoder::{T5Geometry, T5TextEncoder};

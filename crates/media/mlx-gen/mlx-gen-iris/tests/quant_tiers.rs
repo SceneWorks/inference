@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::{GenerationParams, IrisTask, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::{GenerationParams, IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, PreviewSink, Quant, WeightsSource,
 };

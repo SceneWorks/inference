@@ -125,12 +125,12 @@ impl std::fmt::Debug for PreviewSink {
 /// One decoded HDR frame, handed to an [`HdrFrameSink`] as the render produces it (sc-18790).
 ///
 /// [`working`](Self::working) carries the VAE's decode output already mapped out of the `[-1, 1]`
-/// convention ([`from_vae_range`](crate::hdr::from_vae_range)) but **before** any transfer — the
+/// convention (`gen_core_image::hdr::from_vae_range`) but **before** any transfer — the
 /// compressed `[0, 1]` working-space signal. That is deliberately the earliest common ancestor of
 /// the two output sinks: a consumer derives the EXR payload with
-/// [`working_frame_to_exr_payload`](crate::hdr::working_frame_to_exr_payload) and the HLG master's
+/// `gen_core_image::hdr::working_frame_to_exr_payload` and the HLG master's
 /// scene-linear input with
-/// [`working_frame_to_hlg_linear`](crate::hdr::working_frame_to_hlg_linear). Emitting the working
+/// `gen_core_image::hdr::working_frame_to_hlg_linear`. Emitting the working
 /// signal once, rather than both derivations, keeps one frame in flight instead of two — and for
 /// [`HdrColorSpace::SrgbLinear`](crate::hdr::HdrColorSpace::SrgbLinear) the two derivations are
 /// the same pixels anyway.

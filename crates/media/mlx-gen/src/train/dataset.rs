@@ -22,7 +22,15 @@ pub fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    Ok(dynimg.to_rgb8().into())
+    // RGB8 is already `Image`'s layout. The `From<image::RgbImage>` impl left gen-core with its
+    // `image` dependency (sc-27316); this is its one conversion, unchanged.
+    let rgb = dynimg.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    Ok(Image {
+        width,
+        height,
+        pixels: rgb.into_raw(),
+    })
 }
 
 /// Floor `resolution` to a multiple of 32 (the training-resolution bucket). Mirrors the Python

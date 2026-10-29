@@ -1,10 +1,8 @@
 use super::author_fixture_tests::*;
 use super::*;
+use gen_core_moss_image::moss_image_training as contract;
 use mlx_gen::train::lora::{build_lokr_targets, build_lora_targets, TrainAdapter};
-use mlx_gen::{
-    gen_core::{moss_image::MossImageVariant, moss_image_training as contract},
-    NetworkType, TrainingConfig,
-};
+use mlx_gen::{gen_core::moss_image::MossImageVariant, NetworkType, TrainingConfig};
 #[test]
 #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn production_bf16_backbone_keeps_fp32_adapter_gradients_and_portable_reload() {

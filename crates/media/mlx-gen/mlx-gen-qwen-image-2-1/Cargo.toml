@@ -40,6 +40,9 @@ sha2 = { workspace = true }
 # sc-24159: the trainer decodes its dataset images (PNG/JPEG) itself, as every MLX family trainer
 # does; the ignored real-weight validation render also writes PNG through it.
 image = { workspace = true }
+sceneworks-gen-core-family = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
+sceneworks-gen-core-memory-wan = { workspace = true }
 
 [dev-dependencies]
 # Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
@@ -62,4 +65,4 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["mlx-gen-perceptual/model-inference-proof", "mlx-gen/model-inference-proof", "mlx-gen-z-image/model-inference-proof", "mlx-llm/model-inference-proof"]
+model-inference-proof = ["mlx-gen-perceptual/model-inference-proof", "mlx-gen/model-inference-proof", "mlx-gen-z-image/model-inference-proof", "mlx-llm/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]

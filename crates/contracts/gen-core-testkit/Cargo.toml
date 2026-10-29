@@ -17,6 +17,10 @@ name = "gen_core_testkit"
 # Backend-neutral contract plus JSON serialization for sparse architecture fixtures. The testkit
 # links no tensor library and builds on Linux as readily as macOS.
 sceneworks-gen-core = { workspace = true }
+sceneworks-gen-core-h3 = { workspace = true }
+sceneworks-gen-core-moss-image = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
+sceneworks-gen-core-memory-wan = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }

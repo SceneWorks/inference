@@ -8,7 +8,7 @@ resident; quantization, adapters, PiD, staging and deferred loading are refused.
 
 ## Install-time conversion (backend-neutral)
 
-`gen_core::supra2::convert_pinned_checkpoint(model_final_ema.pt, out_dir)` verifies the pinned
+`gen_core_checkpoint::supra2::convert_pinned_checkpoint(model_final_ema.pt, out_dir)` verifies the pinned
 checkpoint's SHA-256, validates the exact 237-tensor state dict (upstream's `ema`-else-`model`
 selection, `patch`/`ctx_len` config, finite values) and the stored unconditional embedding, and
 writes the bundle:
@@ -21,8 +21,8 @@ writes the bundle:
 ```
 
 `FLAN_T5_BASE.verify(dir)` / `SD_VAE.verify(dir)` check the component snapshots at install
-time (sizes + SHA-256). The same CLI: `cargo run --release -p sceneworks-gen-core --example
-supra2_convert -- <pt> <out> [<t5 dir> <vae dir>]`. Nothing is published or downloaded.
+time (sizes + SHA-256). The same CLI: `cargo run --release -p sceneworks-gen-core-checkpoint
+--example supra2_convert -- <pt> <out> [<t5 dir> <vae dir>]`. Nothing is published or downloaded.
 
 ## Load contract
 

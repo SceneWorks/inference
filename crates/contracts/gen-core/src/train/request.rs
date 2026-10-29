@@ -18,7 +18,7 @@ use super::*;
 ///   reference images the instruction refers to ("the first image", "the second image", …).
 ///   Order is semantic and is preserved end to end. Only a trainer whose descriptor advertises
 ///   [`TrainerDescriptor::max_reference_images`] `> 0` may train on edit pairs; every other trainer
-///   refuses them through the shared [`validate_edit_request`] floor.
+///   refuses them through the shared `gen_core_train::validate_edit_request` floor.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TrainingItem {
     /// The image the model learns to produce — for an edit pair, the edit's **target**.
@@ -44,7 +44,7 @@ pub struct TrainingItem {
     /// for every captioned / control item (the default), which every trainer treats exactly as
     /// before. Non-empty makes the item an edit pair, which only an edit-capable trainer
     /// ([`TrainerDescriptor::max_reference_images`] `> 0`) accepts — and then only up to that cap;
-    /// see [`validate_edit_request`].
+    /// see `gen_core_train::validate_edit_request`.
     pub reference_image_paths: Vec<PathBuf>,
     /// The item's **subject mask** (epic 2123, sc-24828): a single-channel image the same size as
     /// [`image_path`](Self::image_path), white (255) = subject, black (0) = background, with soft
@@ -206,7 +206,7 @@ pub struct TrainerDescriptor {
     /// Whether this trainer can train a ControlNet-style **control branch** (the sc-10163
     /// `control_type` / per-item `control_image_path` contract), as opposed to a plain LoRA/LoKr
     /// adapter. The worker reads this to know whether a control-training plan is serviceable, and the
-    /// shared [`validate_control_request`] floor uses it to decide whether a control request is a
+    /// shared `gen_core_train::validate_control_request` floor uses it to decide whether a control request is a
     /// capability gap (reject typed) or must be checked for per-item control images. `false` for every
     /// LoRA/LoKr-only trainer shipped today — they must *reject* a control request, not silently train
     /// a plain adapter (F-006 / F-055).
@@ -214,7 +214,7 @@ pub struct TrainerDescriptor {
     /// Whether this trainer can run a **full base fine-tune** (the sc-14056 / epic-14034
     /// [`TrainingConfig::full_finetune`] contract) — updating *every* base weight and emitting a full
     /// fine-tuned checkpoint — as opposed to injecting a LoRA/LoKr adapter. The shared
-    /// [`validate_full_finetune_request`] floor uses it to decide whether a `full_finetune` request is
+    /// `gen_core_train::validate_full_finetune_request` floor uses it to decide whether a `full_finetune` request is
     /// a capability gap (reject typed). `false` for every adapter-only trainer shipped today — they
     /// must *reject* a full-fine-tune request, not silently train a LoRA adapter and hand back
     /// something the caller did not ask for (F-006 / F-055, the same class the control floor guards).
@@ -222,13 +222,13 @@ pub struct TrainerDescriptor {
     /// The most **ordered reference images** one instruction-edit training item may carry
     /// (sc-24161) — the model's own reference cap, read from the same fact its render path
     /// enforces (Qwen-Image 2.1: 10), never a second hard-coded number. `0` means the trainer
-    /// cannot train on edit pairs at all: the shared [`validate_edit_request`] floor then refuses
+    /// cannot train on edit pairs at all: the shared `gen_core_train::validate_edit_request` floor then refuses
     /// any request carrying [`TrainingItem::reference_image_paths`] with a typed
     /// [`crate::Error::Unsupported`] instead of silently training a text-to-image adapter on the
     /// targets (the F-055 class). `0` for every trainer shipped before sc-24161.
     pub max_reference_images: u32,
     /// Which optional **training techniques** (epic 2123) this trainer actually implements. The
-    /// shared [`validate_training_techniques`] floor refuses a request that turns on a technique
+    /// shared `gen_core_train::validate_training_techniques` floor refuses a request that turns on a technique
     /// the trainer does not declare — a typed [`crate::Error::Unsupported`] before any work, never a
     /// silently ignored knob. [`TrainingTechniques::NONE`] for a trainer that implements none.
     pub techniques: TrainingTechniques,

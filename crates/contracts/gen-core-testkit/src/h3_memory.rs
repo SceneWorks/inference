@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use gen_core_h3::h3_memory::NativeAllocationFactsExt;
+
 /// Return exact resident operand bytes (excluding shared backend buffers) and the unique S4 groups.
 /// F32 heads remain F32, F16/BF16/F32 block companions follow the block compute width.
 pub fn write_native_component(dir: &Path, block_width: u64) -> (u64, Vec<u64>) {
@@ -381,7 +383,7 @@ pub fn assert_stereo_packing_bound(actual_target_rows: u64) {
         prompt: String::new(),
         ..Default::default()
     };
-    let base = gen_core::h3_memory::request_rows((&req).into(), 4).unwrap();
+    let base = gen_core_h3::h3_memory::request_rows((&req).into(), 4).unwrap();
     assert!(
         base.packed >= actual_target_rows,
         "target packed bound must cover the native stereo volume"
@@ -398,12 +400,12 @@ pub fn assert_stereo_packing_bound(actual_target_rows: u64) {
             },
             strength: None,
         });
-    let referenced = gen_core::h3_memory::request_rows((&req).into(), 4).unwrap();
+    let referenced = gen_core_h3::h3_memory::request_rows((&req).into(), 4).unwrap();
     // sc-26691: a reference soundtrack is truncated to the generated duration (345 / 24 s =
     // 14.375 s = 575 latent tokens per channel), so a 60 s clip prices as 14.375 s, not 60.
     assert_eq!(
         referenced.packed - base.packed,
-        575 * u64::from(gen_core::h3_memory::AUDIO_OUTPUT_CHANNELS),
+        575 * u64::from(gen_core_h3::h3_memory::AUDIO_OUTPUT_CHANNELS),
         "per-channel truncated duration becomes channel-major rows once, including a long \
          reference clip"
     );

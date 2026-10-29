@@ -209,7 +209,8 @@ mod conditioning;
 use crate::denoise::LEGAL_FRAME_COUNTS;
 use crate::model::{DIT_COMPONENT, MODEL_ID, TEXT_ENCODER_COMPONENT};
 use crate::pipeline::{CANVAS_MAX_PIXELS, SPATIAL_STRIDE};
-use mlx_gen::gen_core::pruned_adaln::{PrunedAdaLn, SourcePruneSizing, TABLE_KEY};
+use gen_core_h3::h3_memory::NativeAllocationFactsExt;
+use gen_core_h3::pruned_adaln::{PrunedAdaLn, SourcePruneSizing, TABLE_KEY};
 
 /// Calibration identity for this provider's measurements.
 ///
@@ -821,14 +822,14 @@ fn dit_allocation(
     path: &std::path::Path,
     precision: mlx_gen::Precision,
     pruned: bool,
-) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::h3_memory::NativeComponentAllocation> {
+) -> mlx_gen::gen_core::Result<gen_core_h3::h3_memory::NativeComponentAllocation> {
     let width = if precision == mlx_gen::Precision::Fp32 {
         4
     } else {
         2
     };
     let mut allocation =
-        mlx_gen::gen_core::h3_memory::component_allocation(path, native_backend(), width, |h| {
+        gen_core_h3::h3_memory::component_allocation(path, native_backend(), width, |h| {
             if pruned
                 && (h.name == TABLE_KEY
                     || h.name.contains(".adaln_proj.linear.")
@@ -2139,7 +2140,7 @@ pub const MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
 pub fn veda_workspace_bound(
     req: mlx_gen::gen_core::veda::workspace::Request<'_>,
 ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::veda::workspace::WorkspaceBound>> {
-    mlx_gen::gen_core::veda::workspace::for_video_request(
+    gen_core_h3::veda::workspace::for_video_request(
         req,
         mlx_gen::gen_core::veda::workspace::Backend::Mlx,
     )
@@ -2161,7 +2162,7 @@ pub fn veda_workspace_bound_for_contract(
         Some(native) => native.selected_patch(req)?,
         None => [1, 2, 2], // unresolved inventory only; no materialized source geometry exists
     };
-    mlx_gen::gen_core::veda::workspace::for_video_request_with_patch(
+    gen_core_h3::veda::workspace::for_video_request_with_patch(
         req,
         mlx_gen::gen_core::veda::workspace::Backend::Mlx,
         patch,

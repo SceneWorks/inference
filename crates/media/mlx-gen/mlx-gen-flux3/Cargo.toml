@@ -24,6 +24,9 @@ mlx-llm = { workspace = true }
 # Backend-neutral safetensors encoding for atomic native training snapshots/adapters.
 safetensors = { workspace = true }
 sha2 = { workspace = true }
+sceneworks-gen-core-flux3 = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [dev-dependencies]
 sceneworks-gen-core-testkit = { workspace = true }

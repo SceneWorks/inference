@@ -4,7 +4,7 @@
 //! The device code is `flux3_quant.cu` (nvrtc). Everything in this file outside `cuda` builds on
 //! every host: [`FLUX3_QUANT_SRC`] (so the workspace registry names it) and **bit-level CPU mirrors**
 //! of each device helper, transcribed operation for operation. Consumers test the mirrors against
-//! the backend-neutral oracles in `gen_core::flux3::quantization`; the device kernels are then held
+//! the backend-neutral oracles in `gen_core_flux3::quantization`; the device kernels are then held
 //! to the mirrors by the GPU functional test (one admitted tiny-kernel slot), so a kernel that
 //! drifts from the source recipe is caught twice, never assumed.
 //!

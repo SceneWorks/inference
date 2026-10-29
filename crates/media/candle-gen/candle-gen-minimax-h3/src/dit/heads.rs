@@ -600,7 +600,7 @@ impl DitProjections {
         let mut v = LinearBias::names("proj_in").to_vec();
         v.extend(LinearBias::names("audio_proj_in"));
         v.extend(LinearBias::names("context_embedder"));
-        v.push(candle_gen::gen_core::pruned_adaln::TABLE_KEY.to_string());
+        v.push(gen_core_h3::pruned_adaln::TABLE_KEY.to_string());
         v.extend(RmsNorm::names("norm_out.norm"));
         v.extend(LinearBias::names("norm_out.linear"));
         v.extend(LinearBias::names("proj_out"));

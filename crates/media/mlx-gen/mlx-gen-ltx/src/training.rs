@@ -80,7 +80,7 @@ use crate::text_encoder::LtxTextEncoder;
 use crate::tokenizer::{Ltx25Tokenizer, LtxTokenizer};
 use crate::transformer::{AvDiT, AvPerturbation, BlockLoraRef, LtxAdaptable, LtxDiT, Precision};
 use crate::vae::LtxVideoVae;
-use mlx_gen::gen_core::ltx_checkpoint::LtxComponent;
+use gen_core_ltx::ltx_checkpoint::LtxComponent;
 use mlx_gen::gen_core::BucketSchedule;
 
 // The trainer's concerns, split out of this file (sc-27342): the LTX-2.5 workflow / modality /
@@ -670,10 +670,10 @@ pub fn validate_ltx25_training_request(req: &TrainingRequest) -> Result<()> {
     // The shared floors keep their typed variant across the seam (`?` maps
     // `gen_core::Error::Unsupported` 1:1): a capability gap must stay `Unsupported` for the worker,
     // never be flattened to a message (sc-24161).
-    gen_core::train::validate_control_request(&descriptor, req)?;
-    gen_core::train::validate_full_finetune_request(&descriptor, req)?;
-    gen_core::train::validate_training_techniques(&descriptor, req)?;
-    gen_core::train::validate_edit_request(&descriptor, req)?;
+    gen_core_train::validate_control_request(&descriptor, req)?;
+    gen_core_train::validate_full_finetune_request(&descriptor, req)?;
+    gen_core_train::validate_training_techniques(&descriptor, req)?;
+    gen_core_train::validate_edit_request(&descriptor, req)?;
     validate_request(req, "ltx_2_5 trainer")?;
     validate_ltx25_adapter_scale(req.config.alpha)?;
     let plan = Ltx25TrainingPlan::from_request(req)?;
@@ -697,16 +697,16 @@ fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen
     // Shared control-training floor (F-006 / F-055): the LTX trainer has no control branch, so a
     // request carrying `control_type` / per-item control images is rejected (typed `Unsupported`)
     // rather than silently training a plain LoRA and reporting success.
-    gen_core::train::validate_control_request(descriptor, req)?;
+    gen_core_train::validate_control_request(descriptor, req)?;
     // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
     // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    gen_core_train::validate_full_finetune_request(descriptor, req)?;
     refuse_ltx25_subject_mask(descriptor.id, req)?;
     refuse_ltx25_depth_anchoring(descriptor.id, req)?;
     // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
     // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-    gen_core::train::validate_training_techniques(descriptor, req)?;
-    gen_core::train::validate_edit_request(descriptor, req)?;
+    gen_core_train::validate_training_techniques(descriptor, req)?;
+    gen_core_train::validate_edit_request(descriptor, req)?;
     if descriptor.id == MODEL_25_ID {
         validate_ltx25_training_request(req)?;
     } else {
@@ -758,7 +758,7 @@ impl Trainer for LtxTrainer {
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         refuse_ltx25_subject_mask(self.descriptor.id, req)?;
         refuse_ltx25_depth_anchoring(self.descriptor.id, req)?;
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         let mut warnings = Vec::new();
         let output = self.train_impl(req, on_progress, &mut warnings)?;
         Ok(TrainingReport { output, warnings })

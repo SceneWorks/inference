@@ -7,10 +7,10 @@ use mlx_gen::gen_core::{
     MemorySafetyDecision, MemoryStrategy,
 };
 
-pub use gen_core::wan_i2v_memory::{PreparedWanI2vMemory, WanI2vBackend};
+pub use gen_core_memory_wan::{PreparedWanI2vMemory, WanI2vBackend};
 
 pub fn prepare_load_spec(spec: &mut LoadSpec, provider_id: &str) -> gen_core::Result<()> {
-    gen_core::wan_i2v_memory::prepare_load_spec(spec, WanI2vBackend::Mlx, provider_id)
+    gen_core_memory_wan::prepare_load_spec(spec, WanI2vBackend::Mlx, provider_id)
 }
 
 /// Seal the MLX receipt for `provider_id` and stamp this crate's architecture axes onto it.
@@ -18,7 +18,7 @@ pub fn prepare_load_spec(spec: &mut LoadSpec, provider_id: &str) -> gen_core::Re
 /// The sealed `prepared.contract` is exactly what every Wan I2V generator returns from
 /// `Generator::memory_strategy_contract()`, so the axes must be stamped here rather than only on
 /// the per-request contract [`request_contract_for_mode`] builds — otherwise the loaded path
-/// publishes `gen_core::wan_i2v_memory`'s empty default (epic SC-22657, E2). The axes are read
+/// publishes `gen_core_memory_wan`'s empty default (epic SC-22657, E2). The axes are read
 /// from the sealed root's own config, the same parse the loader runs.
 pub fn prepare(spec: &LoadSpec, provider_id: &str) -> gen_core::Result<PreparedWanI2vMemory> {
     let prepared = PreparedWanI2vMemory::prepare(spec, WanI2vBackend::Mlx, provider_id)?;
@@ -30,7 +30,7 @@ pub fn request_evidence_revision(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
 ) -> gen_core::Result<String> {
-    gen_core::wan_i2v_memory::request_evidence_revision(prepared, request)
+    gen_core_memory_wan::request_evidence_revision(prepared, request)
 }
 
 thread_local! {
@@ -138,8 +138,8 @@ pub fn decode_tiling(
     let overlap = memory.decode_overlap.ok_or_else(|| {
         mlx_gen::Error::Unsupported("Wan BoundedDecode requires an overlap".to_owned())
     })?;
-    if !gen_core::wan_i2v_memory::DECODE_TILE_EDGES.contains(&edge)
-        || !gen_core::wan_i2v_memory::DECODE_OVERLAPS.contains(&overlap)
+    if !gen_core_memory_wan::DECODE_TILE_EDGES.contains(&edge)
+        || !gen_core_memory_wan::DECODE_OVERLAPS.contains(&overlap)
     {
         return Err(mlx_gen::Error::Unsupported(format!(
             "Wan decode pair {edge}/{overlap} is outside the sealed domain"
@@ -158,9 +158,7 @@ pub fn safety_check(
     prepared: &PreparedWanI2vMemory,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_validation(gen_core::wan_i2v_memory::validate_context(
-        prepared, context,
-    ))
+    MemorySafetyDecision::from_validation(gen_core_memory_wan::validate_context(prepared, context))
 }
 
 struct WanI2vRequestScope {
@@ -173,7 +171,7 @@ struct WanI2vRequestScope {
 
 impl MemoryRequestScope for WanI2vRequestScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        let actual = gen_core::wan_i2v_memory::validate_request_evidence(
+        let actual = gen_core_memory_wan::validate_request_evidence(
             &self.prepared,
             request,
             &self.selection,
@@ -193,7 +191,7 @@ impl MemoryRequestScope for WanI2vRequestScope {
 
 /// The trunk and autoencoder geometry each Wan I2V route actually runs (epic SC-22657, E2).
 ///
-/// `gen_core::wan_i2v_memory` builds one shared contract for all four routes and publishes
+/// `gen_core_memory_wan` builds one shared contract for all four routes and publishes
 /// [`gen_core::MemoryArchitectureFacts::default`] there, because it is backend-neutral and holds no
 /// model config. This crate does: the routes are the same two Wan trunks the rest of the crate is
 /// built from, so the axes are read off the same presets rather than restated as literals.
@@ -216,7 +214,7 @@ impl MemoryRequestScope for WanI2vRequestScope {
 /// rather than runs. Without a root (the weights-free surface) the preset is what the loader would
 /// start from anyway.
 pub fn architecture_facts(
-    route: gen_core::wan_i2v_memory::WanI2vRoute,
+    route: gen_core_memory_wan::WanI2vRoute,
     root: Option<&std::path::Path>,
 ) -> gen_core::MemoryArchitectureFacts {
     let wan = loader_config(route, root);
@@ -245,10 +243,10 @@ pub fn architecture_facts(
 
 /// The trunk config the loader for `route` builds from `root`, or the route preset without one.
 fn loader_config(
-    route: gen_core::wan_i2v_memory::WanI2vRoute,
+    route: gen_core_memory_wan::WanI2vRoute,
     root: Option<&std::path::Path>,
 ) -> crate::config::WanModelConfig {
-    use gen_core::wan_i2v_memory::WanI2vRoute;
+    use gen_core_memory_wan::WanI2vRoute;
 
     let preset = match route {
         WanI2vRoute::Ti2v5b => crate::config::WanModelConfig::wan22_ti2v_5b(),
@@ -283,12 +281,12 @@ fn loader_config(
 }
 
 /// The per-request contract for one public mode, with this crate's architecture axes published over
-/// the backend-neutral default `gen_core::wan_i2v_memory` can only supply.
+/// the backend-neutral default `gen_core_memory_wan` can only supply.
 pub fn request_contract_for_mode(
     prepared: &PreparedWanI2vMemory,
     mode: &str,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    let mut contract = gen_core::wan_i2v_memory::contract_for_mode_key(prepared, mode)?;
+    let mut contract = gen_core_memory_wan::contract_for_mode_key(prepared, mode)?;
     contract.architecture_facts = architecture_facts(prepared.route, Some(prepared.root()));
     Ok(contract)
 }
@@ -299,7 +297,7 @@ pub fn begin_request(
     prepared: &PreparedWanI2vMemory,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    gen_core::wan_i2v_memory::validate_context(prepared, context)?;
+    gen_core_memory_wan::validate_context(prepared, context)?;
     let request_contract = request_contract_for_mode(prepared, context.mode.as_key())?;
     let memory = request_contract.generation_memory(&context.selection);
     let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
@@ -307,14 +305,14 @@ pub fn begin_request(
         context.geometry,
         memory,
         false,
-        if prepared.route == gen_core::wan_i2v_memory::WanI2vRoute::Ti2v5b {
+        if prepared.route == gen_core_memory_wan::WanI2vRoute::Ti2v5b {
             30
         } else {
             40
         },
         |_pid, edge, overlap| {
-            if gen_core::wan_i2v_memory::DECODE_TILE_EDGES.contains(&edge)
-                && gen_core::wan_i2v_memory::DECODE_OVERLAPS.contains(&overlap)
+            if gen_core_memory_wan::DECODE_TILE_EDGES.contains(&edge)
+                && gen_core_memory_wan::DECODE_OVERLAPS.contains(&overlap)
             {
                 Ok(())
             } else {
@@ -346,7 +344,7 @@ pub fn begin_request(
 // already does.
 // ---------------------------------------------------------------------------------------------
 
-/// The isolated namespace [`gen_core::wan_i2v_memory::weights_free_calibration_fingerprint`] mints
+/// The isolated namespace [`gen_core_memory_wan::weights_free_calibration_fingerprint`] mints
 /// in. A contract carrying it describes a load that never happened.
 const WEIGHTS_FREE_INFIX: &str = "-weights-free-conformance-";
 
@@ -363,9 +361,9 @@ fn weights_free(contract: &gen_core::MemoryProviderContract) -> bool {
 }
 
 /// The route `provider_id` names, as a `MemoryRegistration` function pointer can obtain it.
-fn a14b_route(provider_id: &str) -> gen_core::Result<gen_core::wan_i2v_memory::WanI2vRoute> {
-    let route = gen_core::wan_i2v_memory::WanI2vRoute::for_provider(provider_id)?;
-    if gen_core::wan_i2v_memory::a14b_public_mode_key(route).is_none() {
+fn a14b_route(provider_id: &str) -> gen_core::Result<gen_core_memory_wan::WanI2vRoute> {
+    let route = gen_core_memory_wan::WanI2vRoute::for_provider(provider_id)?;
+    if gen_core_memory_wan::a14b_public_mode_key(route).is_none() {
         return Err(gen_core::Error::Unsupported(format!(
             "{provider_id}: not an A14B route"
         )));
@@ -385,7 +383,7 @@ fn a14b_contract(
 
 /// The weights-free contract, with this crate's route preset axes stamped on.
 ///
-/// `gen_core::wan_i2v_memory` holds no model config and can only publish
+/// `gen_core_memory_wan` holds no model config and can only publish
 /// `MemoryArchitectureFacts::default()`, which the shared facts conformance refuses; the axes are
 /// read from the same preset [`architecture_facts`] uses without a root.
 fn a14b_weights_free_contract(
@@ -394,7 +392,7 @@ fn a14b_weights_free_contract(
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     let route = a14b_route(provider_id)?;
     let mut contract =
-        gen_core::wan_i2v_memory::weights_free_contract(provider_id, WanI2vBackend::Mlx, spec)?;
+        gen_core_memory_wan::weights_free_contract(provider_id, WanI2vBackend::Mlx, spec)?;
     contract.architecture_facts = architecture_facts(route, None);
     Ok(contract)
 }
@@ -407,7 +405,7 @@ fn a14b_tier(
     provider_id: &'static str,
 ) -> gen_core::Result<gen_core::MemoryNumericTier> {
     if weights_free(contract) {
-        gen_core::wan_i2v_memory::spec_numeric_tier(spec, WanI2vBackend::Mlx)
+        gen_core_memory_wan::spec_numeric_tier(spec, WanI2vBackend::Mlx)
     } else {
         Ok(prepare(spec, provider_id)?.tier)
     }
@@ -420,7 +418,7 @@ fn a14b_safety_check(
     provider_id: &'static str,
 ) -> MemorySafetyDecision {
     let decision = if weights_free(contract) {
-        gen_core::wan_i2v_memory::validate_weights_free_context(
+        gen_core_memory_wan::validate_weights_free_context(
             provider_id,
             WanI2vBackend::Mlx,
             spec,
@@ -429,14 +427,14 @@ fn a14b_safety_check(
         )
     } else {
         prepare(spec, provider_id)
-            .and_then(|prepared| gen_core::wan_i2v_memory::validate_context(&prepared, context))
+            .and_then(|prepared| gen_core_memory_wan::validate_context(&prepared, context))
     };
     MemorySafetyDecision::from_validation(decision)
 }
 
 /// The provider-owned valid contexts for one implemented optimized rung.
 ///
-/// The geometry is [`gen_core::wan_i2v_memory::A14B_FIXTURE_GEOMETRY`], which that module asserts
+/// The geometry is [`gen_core_memory_wan::A14B_FIXTURE_GEOMETRY`], which that module asserts
 /// against the route's own bucket list and rate menu, and the decode pair is the first of the
 /// route's own sealed decode domain — never a literal restated here.
 fn a14b_valid_fixtures(
@@ -455,9 +453,9 @@ fn a14b_valid_fixtures(
         return Ok(Vec::new());
     }
     let tier = a14b_tier(spec, contract, provider_id)?;
-    let mode_key = gen_core::wan_i2v_memory::a14b_public_mode_key(route)
-        .expect("a14b_route admitted the route");
-    let reference_count = u32::from(route == gen_core::wan_i2v_memory::WanI2vRoute::I2v14b);
+    let mode_key =
+        gen_core_memory_wan::a14b_public_mode_key(route).expect("a14b_route admitted the route");
+    let reference_count = u32::from(route == gen_core_memory_wan::WanI2vRoute::I2v14b);
     let mut context = gen_core::standard_memory_behavior_context(
         contract,
         strategy,
@@ -470,15 +468,15 @@ fn a14b_valid_fixtures(
             overlay: None,
         },
     )?;
-    let (width, height, frames) = gen_core::wan_i2v_memory::A14B_FIXTURE_GEOMETRY;
+    let (width, height, frames) = gen_core_memory_wan::A14B_FIXTURE_GEOMETRY;
     context.geometry.width = width;
     context.geometry.height = height;
     context.geometry.frames = frames;
     if contract.engages(strategy, MemoryStrategy::BoundedDecode) {
         context.selection.parameters.decode_tile_edge =
-            gen_core::wan_i2v_memory::DECODE_TILE_EDGES.first().copied();
+            gen_core_memory_wan::DECODE_TILE_EDGES.first().copied();
         context.selection.parameters.decode_overlap =
-            gen_core::wan_i2v_memory::DECODE_OVERLAPS.first().copied();
+            gen_core_memory_wan::DECODE_OVERLAPS.first().copied();
     }
     contract.validate_selection(&context.selection)?;
     let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
@@ -496,7 +494,7 @@ fn a14b_begin_request(
         let prepared = prepare(spec, provider_id)?;
         return begin_request(&prepared, context);
     }
-    gen_core::wan_i2v_memory::validate_weights_free_context(
+    gen_core_memory_wan::validate_weights_free_context(
         provider_id,
         WanI2vBackend::Mlx,
         spec,
@@ -513,8 +511,8 @@ fn a14b_begin_request(
         // preset rather than restated.
         loader_config(route, None).num_layers,
         |_pid, edge, overlap| {
-            if gen_core::wan_i2v_memory::DECODE_TILE_EDGES.contains(&edge)
-                && gen_core::wan_i2v_memory::DECODE_OVERLAPS.contains(&overlap)
+            if gen_core_memory_wan::DECODE_TILE_EDGES.contains(&edge)
+                && gen_core_memory_wan::DECODE_OVERLAPS.contains(&overlap)
             {
                 Ok(())
             } else {
@@ -637,10 +635,10 @@ mod tests {
     /// T2V leg is the carrier-free one (`text_to_video`, no conditioning), the I2V leg carries the
     /// single full-strength Reference its mode requires.
     fn a14b_public_request(
-        route: gen_core::wan_i2v_memory::WanI2vRoute,
+        route: gen_core_memory_wan::WanI2vRoute,
         selection: gen_core::MemorySelection,
     ) -> GenerationRequest {
-        let (width, height, frames) = gen_core::wan_i2v_memory::A14B_FIXTURE_GEOMETRY;
+        let (width, height, frames) = gen_core_memory_wan::A14B_FIXTURE_GEOMETRY;
         let memory = gen_core::GenerationMemory {
             stage_residency: selection.strategy == MemoryStrategy::StagedResidency,
             tile_vae_decode: selection.strategy == MemoryStrategy::BoundedDecode,
@@ -648,7 +646,7 @@ mod tests {
             decode_overlap: selection.parameters.decode_overlap,
             ..Default::default()
         };
-        let image_to_video = route == gen_core::wan_i2v_memory::WanI2vRoute::I2v14b;
+        let image_to_video = route == gen_core_memory_wan::WanI2vRoute::I2v14b;
         GenerationRequest {
             prompt: "a slow dolly across an empty room".to_owned(),
             width,
@@ -657,7 +655,7 @@ mod tests {
             seed: Some(17),
             steps: Some(40),
             frames: Some(frames),
-            fps: Some(gen_core::wan_i2v_memory::A14B_PUBLIC_FPS),
+            fps: Some(gen_core_memory_wan::A14B_PUBLIC_FPS),
             video_mode: Some(
                 if image_to_video {
                     "image_to_video"
@@ -699,7 +697,7 @@ mod tests {
     /// assertion removed the safety-check and scope assertions fire in turn.
     #[test]
     fn every_registered_a14b_route_publishes_and_reaches_its_contract_once_loaded() {
-        use gen_core::wan_i2v_memory::WanI2vRoute;
+        use gen_core_memory_wan::WanI2vRoute;
 
         let registry = crate::provider_registry().unwrap();
         for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
@@ -742,7 +740,7 @@ mod tests {
                     // shared behavior route; the sealed receipt keys on its own request identity,
                     // so both are re-derived from the request the route would actually run — the
                     // same pre-pass the capture arm does before it calls the loaded provider.
-                    context.geometry = gen_core::wan_i2v_memory::geometry_from_request(&request);
+                    context.geometry = gen_core_memory_wan::geometry_from_request(&request);
                     context.has_reference = context.geometry.reference_count > 0;
                     context.overlay = Some(prepared.adapter_identity.clone());
                     context.evidence_revision =
@@ -780,8 +778,8 @@ mod tests {
     /// selector's tile instead of the sealed 256/32 pair.
     #[test]
     fn bounded_decode_reaches_the_sealed_tile_pair_without_an_image_to_video_mode() {
-        let edge = gen_core::wan_i2v_memory::DECODE_TILE_EDGES[0];
-        let overlap = gen_core::wan_i2v_memory::DECODE_OVERLAPS[0];
+        let edge = gen_core_memory_wan::DECODE_TILE_EDGES[0];
+        let overlap = gen_core_memory_wan::DECODE_OVERLAPS[0];
         for mode in ["text_to_video", "image_to_video"] {
             let request = GenerationRequest {
                 video_mode: Some(mode.to_owned()),
@@ -806,14 +804,14 @@ mod tests {
     }
 
     /// AC (SC-22662, review follow-up): the three 14B I2V routes publish the A14B trunk's axes, not
-    /// `MemoryArchitectureFacts::default()`. `gen_core::wan_i2v_memory` has no model config, so its
+    /// `MemoryArchitectureFacts::default()`. `gen_core_memory_wan` has no model config, so its
     /// shared contract can only publish the empty default; this crate overlays the real geometry.
     ///
     /// The scale pair is asserted against the provider's own assigned VAE tiling rather than
     /// against literals, exactly as `memory_strategy.rs` does for the z48 route — so a VAE
     /// reassignment cannot leave the published axes describing the old autoencoder.
     /// Feature-end review (SC-22667, blocker): the contract a **loaded** generator publishes is the
-    /// sealed `prepared.contract`, and `gen_core::wan_i2v_memory` can only seal the empty default
+    /// sealed `prepared.contract`, and `gen_core_memory_wan` can only seal the empty default
     /// axes into it. Every route's `prepare` must therefore hand back a receipt whose contract
     /// already carries this crate's facts — the per-request overlay in `request_contract_for_mode`
     /// is not enough, because `Generator::memory_strategy_contract()` never goes through it.
@@ -823,7 +821,7 @@ mod tests {
     /// `has_declared_architecture_axis` assertion fires for all four.
     #[test]
     fn the_sealed_contract_every_loaded_route_publishes_carries_the_trunk_and_vae_axes() {
-        use gen_core::wan_i2v_memory::WanI2vRoute;
+        use gen_core_memory_wan::WanI2vRoute;
 
         for route in [
             WanI2vRoute::Ti2v5b,
@@ -878,7 +876,7 @@ mod tests {
     /// review) — the mutated depths below then read back as the preset's 30 / 40.
     #[test]
     fn materialized_i2v_axes_come_from_the_loader_parse_of_the_root() {
-        use gen_core::wan_i2v_memory::WanI2vRoute;
+        use gen_core_memory_wan::WanI2vRoute;
 
         // TI2V-5B / I2V-14B: the native `config.json` `WanModelConfig::from_model_dir` reads.
         for (route, model_type, dim, mutated_layers) in [
@@ -936,7 +934,7 @@ mod tests {
 
     #[test]
     fn every_i2v_route_publishes_its_trunk_and_vae_axes() {
-        use gen_core::wan_i2v_memory::WanI2vRoute;
+        use gen_core_memory_wan::WanI2vRoute;
 
         let ti2v = architecture_facts(WanI2vRoute::Ti2v5b, None);
         assert_eq!(

@@ -1,0 +1,29 @@
+[package]
+name = "sceneworks-gen-core-checkpoint"
+version = "0.1.0"
+edition = "2021"
+description = "Tensor-free checkpoint readers and converters (the torch .pth zip/pickle reader and the Supra2 converter) on top of gen-core."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["checkpoint", "pickle", "conversion", "generative"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_checkpoint::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_checkpoint"
+
+[dependencies]
+# The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
+# never depends on them (sc-27316). Tensor-free, like gen-core.
+sceneworks-gen-core = { workspace = true }
+# The tensor-free torch `.pth`/`.pt` reader (`pth`, sc-24213): STORED zip entries only, no
+# inflater compiled in.
+zip = { version = "9", default-features = false }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

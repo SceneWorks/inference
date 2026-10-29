@@ -9,6 +9,9 @@ autotests = false
 [dependencies]
 # Opt-in cross-crate development fixtures; no runtime bundle enables this feature.
 sceneworks-gen-core-testkit = { workspace = true, optional = true }
+sceneworks-gen-core-moss-image = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 candle-gen = { path = "../candle-gen" }
 candle-gen-flux2 = { path = "../candle-gen-flux2" }
 candle-llm = { workspace = true }
@@ -20,7 +23,7 @@ rand = { workspace = true }
 image = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 default = []
 test-support = ["dep:sceneworks-gen-core-testkit", "candle-gen-flux2/test-support", "candle-llm/test-support"]
 cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-llm/cuda"]

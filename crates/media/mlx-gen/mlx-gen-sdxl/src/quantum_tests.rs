@@ -1463,7 +1463,7 @@ fn fused_checkpoint_floor_counts_only_the_phase_components() {
     if !cpu_child("fused_checkpoint_floor_counts_only_the_phase_components") {
         return;
     }
-    use mlx_gen::gen_core::sdxl_ldm::SdxlComponent;
+    use gen_core_family::sdxl_ldm::SdxlComponent;
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("fused.safetensors");
     let mut g = Gen::new(900);

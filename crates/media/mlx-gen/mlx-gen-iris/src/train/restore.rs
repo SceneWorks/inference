@@ -1,6 +1,6 @@
 //! Native MLX **Iris-3B restoration training** (story sc-25688): the paper's one-step restoration
 //! recipe (arXiv 2610.09450v1 §5.3, following HYPIR) over the backend-neutral contract
-//! [`gen_core::iris::restoration_train`].
+//! [`gen_core_iris::restoration_train`].
 //!
 //! Each micro-batch builds its training pairs host-side (a seeded second-order Real-ESRGAN
 //! degradation of a clean crop, or an aligned degraded/clean pair), then trains **one** network:
@@ -23,7 +23,7 @@
 //! `iris_3b_restore` with no training-only dependency.
 //!
 //! Every hyper-parameter comes from the request. The documented default request is
-//! [`gen_core::iris::restoration_train::recipe_training_config`] — the paper's **full** fine-tune,
+//! [`gen_core_iris::restoration_train::recipe_training_config`] — the paper's **full** fine-tune,
 //! AdamW at lr 1e-5 with weight decay 0.01 for generator and critic, constant LR; a LoRA/LoKr
 //! adapter (HYPIR's own arm) trains only when the request asks for one.
 
@@ -31,26 +31,31 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use gen_core::iris::restoration_train::{
-    self as contract, base_identity, check_resume, critic_head_init, export_metadata, phase_of,
-    read_checkpoint_state, training_pair, validate_item, write_export_sidecars, ConvNextConfig,
-    LossWindow, Phase, RestoreArtifact, RestoreCheckpointState, RestoreTrainPlan,
-    RestoreTrainResources, TrainPair, WindowClose, CKPT_CRITIC, CKPT_CRITIC_OPTIMIZER,
-    CRITIC_HEAD_WIDTH, TRAINER_ID,
+use gen_core::train::{
+    Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use gen_core::iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
-use gen_core::iris::train::{
+use gen_core_iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
+use gen_core_iris::train::{
     adapter_param_route, checkpoint_root, checkpoint_staging_dir, file_stem, full_param_route,
     latest_checkpoint, linear_paths_from_keys, lr_factor, mix_seed, prune_checkpoints,
     publish_checkpoint, DataWalk, MixedPrecision, MuonAdjustLr, OptimizerKind, OptimizerPlan,
     ParamRoute, ResumeDataPolicy, WeightsSelect, CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE,
     CKPT_TRAINABLE, TECHNIQUES,
 };
-use gen_core::iris::{IrisConfig, FAMILY};
-use gen_core::train::{
+use gen_core_iris::{
+    restoration_train as contract,
+    restoration_train::{
+        base_identity, check_resume, critic_head_init, export_metadata, phase_of,
+        read_checkpoint_state, training_pair, validate_item, write_export_sidecars, ConvNextConfig,
+        LossWindow, Phase, RestoreArtifact, RestoreCheckpointState, RestoreTrainPlan,
+        RestoreTrainResources, TrainPair, WindowClose, CKPT_CRITIC, CKPT_CRITIC_OPTIMIZER,
+        CRITIC_HEAD_WIDTH, TRAINER_ID,
+    },
+};
+use gen_core_iris::{IrisConfig, FAMILY};
+use gen_core_train::{
     refuse_reference_control_model_options, refuse_trainer_load_overlays, validate_control_request,
-    validate_edit_request, validate_full_finetune_request, validate_training_techniques, Trainer,
-    TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+    validate_edit_request, validate_full_finetune_request, validate_training_techniques,
 };
 use mlx_gen::adapters::reconstruct_lokr_delta;
 use mlx_gen::gen_core;
@@ -459,7 +464,7 @@ struct Run {
     ckpt_root: PathBuf,
     base_identity: String,
     dataset_fingerprint: String,
-    export: gen_core::iris::restoration::RestorationResources,
+    export: gen_core_iris::restoration::RestorationResources,
     init_weights: PathBuf,
     // position / counters
     step: u64,
@@ -607,7 +612,7 @@ impl Run {
         let adapter_compute = (!req.config.full_finetune).then_some(compute);
         let source = load_source(&init_weights, adapter_compute)?;
         check_backbone_keys(&config.model, &source, "the generator weights")?;
-        let shapes = gen_core::iris::train::backbone_tensor_shapes(&config.model);
+        let shapes = gen_core_iris::train::backbone_tensor_shapes(&config.model);
         let linear_paths =
             linear_paths_from_keys(shapes.iter().map(|(k, s)| (k.as_str(), s.len())));
         let plan = trainer.plan(req, &linear_paths)?;
@@ -721,7 +726,7 @@ impl Run {
         if let Some(w) = walk.unused_tail_warning() {
             eprintln!("{w}");
         }
-        let total_steps = gen_core::iris::train::total_optimizer_steps(
+        let total_steps = gen_core_iris::train::total_optimizer_steps(
             walk.batches_per_epoch(),
             plan.micro_per_step(),
             plan.num_epochs,
@@ -1063,7 +1068,7 @@ impl Run {
         self.opt.save(&staging.join(CKPT_OPTIMIZER))?;
         save_params(&staging.join(CKPT_CRITIC), &self.critic_tensors())?;
         self.critic_opt.save(&staging.join(CKPT_CRITIC_OPTIMIZER))?;
-        gen_core::iris::train::atomic_write(
+        gen_core_iris::train::atomic_write(
             &staging.join(CKPT_STATE),
             serde_json::to_string_pretty(&self.state(boundary).to_json())
                 .map_err(|e| Error::Msg(e.to_string()))?
@@ -1132,12 +1137,12 @@ impl Run {
         publish_export_dir(&dir, |stage: &Path| -> Result<()> {
             write_export_sidecars(&self.export, stage)?;
             save_safetensors_atomic(
-                &stage.join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                &stage.join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
                 &list,
                 &meta,
             )
         })?;
-        Ok(dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE))
+        Ok(dir.join(gen_core_iris::BACKBONE_WEIGHTS_FILE))
     }
 
     /// Restore the first item's (epoch-1) degraded input with the preview weights.

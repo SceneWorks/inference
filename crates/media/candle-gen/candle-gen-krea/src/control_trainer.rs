@@ -317,11 +317,11 @@ impl Trainer for KreaControlTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
         // adapter the caller did not ask for (F-006/F-055).
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         self.validate_inner(req).map_err(Into::into)
     }
 
@@ -332,7 +332,7 @@ impl Trainer for KreaControlTrainer {
     ) -> gen_core::Result<TrainingOutput> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         // Every other `validate` floor too (full fine-tune / edit / the control preconditions), so
         // a caller that skips `validate` cannot train a request it would refuse.
         self.validate(req)?;

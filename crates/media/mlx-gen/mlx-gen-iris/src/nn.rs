@@ -16,8 +16,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
+use gen_core_iris as iris;
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::gen_core::iris;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Quant, Result};
 use mlx_rs::fast::rms_norm;
@@ -567,7 +567,7 @@ impl Rope {
     }
 
     /// [`Self::grid_2d`] under `model.rope_aspect` (`square = true`: each axis normalized to
-    /// `[0, scale]` on its own — `gen_core::iris::rope_2d_angles_aspect`).
+    /// `[0, scale]` on its own — `gen_core_iris::rope_2d_angles_aspect`).
     pub fn grid_2d_aspect(
         head_dim: usize,
         height: usize,
