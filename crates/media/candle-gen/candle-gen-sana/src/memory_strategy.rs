@@ -395,8 +395,33 @@ const fn route_label(variant: SanaVariant) -> &'static str {
 /// The lane loads exactly one tier (`validate_load_spec` refuses `quantize = Some(_)`), so the
 /// tier is spelled `dense` rather than carried as an axis.
 pub fn production_calibration_fingerprint(variant: SanaVariant) -> String {
-    format!("sana-candle-dense-{}-full-ladder-v1", route_label(variant))
+    let Some(table) = MEMORY_PROFILE.fingerprint else {
+        unreachable!("the Candle SANA profile declares its fingerprint table")
+    };
+    table.render(route_label(variant), "dense")
 }
+
+/// The Candle SANA production fingerprint spelling: one dense tier per route.
+const FINGERPRINTS: gen_core::MemoryFingerprintTable = gen_core::MemoryFingerprintTable {
+    template: "sana-candle-{tier}-{route}-full-ladder-v1",
+    routes: &[
+        (crate::MODEL_ID, route_label(SanaVariant::Base)),
+        (crate::SPRINT_MODEL_ID, route_label(SanaVariant::Sprint)),
+    ],
+    pins: &[],
+};
+
+/// The Candle SANA memory profile (sc-27307). Admission, fixtures and `begin_request` stay
+/// provider-owned: they run through the sealed snapshot and the stateful [`AdmissionRegistry`],
+/// which the profile's contract/context/tier hooks cannot carry. The profile owns the fingerprint
+/// spelling and the snapshot-guarded architecture facts.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    fingerprint: Some(FINGERPRINTS),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
 
 /// The weights-free registry-conformance identity: the same route in a namespace that can never
 /// collide with [`production_calibration_fingerprint`], so a fixture contract can never be mistaken
@@ -454,6 +479,14 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// autoencoder with no temporal axis, and a structurally absent axis is declared absent, never
 /// zero (E2).
 fn architecture_facts(variant: SanaVariant, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    gen_core::standard_architecture_facts(&MEMORY_PROFILE, variant.provider_id(), spec)
+}
+
+fn architecture_facts_from_snapshot(
+    provider_id: &str,
+    _root: &std::path::Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
     /// The config fields are `i32`; a negative or zero value is not an axis.
@@ -461,14 +494,12 @@ fn architecture_facts(variant: SanaVariant, spec: &LoadSpec) -> gen_core::Memory
         usize::try_from(value).ok().and_then(af::declared)
     }
 
-    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
-    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
-    if af::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
-    let dit = match variant {
-        SanaVariant::Base => crate::config::SanaTransformerConfig::sana_1600m(),
-        SanaVariant::Sprint => crate::config::SanaTransformerConfig::sana_sprint_1600m(),
+    // The profile's snapshot guard has already resolved a pipeline; `provider_id` is one of this
+    // crate's two variant ids.
+    let dit = if provider_id == SanaVariant::Sprint.provider_id() {
+        crate::config::SanaTransformerConfig::sana_sprint_1600m()
+    } else {
+        crate::config::SanaTransformerConfig::sana_1600m()
     };
     let dc_ae = crate::config::DcAeConfig::sana_f32c32();
     gen_core::MemoryArchitectureFacts {
@@ -1701,6 +1732,20 @@ mod tests {
         assert_eq!(
             safety_check(&seal, &admission, &context),
             MemorySafetyDecision::Accept
+        );
+    }
+
+    /// sc-27307: every production calibration fingerprint, byte for byte, pinned before the table
+    /// conversion and after it.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        assert_eq!(
+            production_calibration_fingerprint(SanaVariant::Base),
+            "sana-candle-dense-base-full-ladder-v1"
+        );
+        assert_eq!(
+            production_calibration_fingerprint(SanaVariant::Sprint),
+            "sana-candle-dense-sprint-full-ladder-v1"
         );
     }
 }

@@ -552,22 +552,34 @@ pub(crate) fn safety_check(
     )
 }
 
-fn registered_safety_check(
+/// Whether `contract` is exactly the contract this registration resolves for `spec`: the
+/// weights-free registry witness when it carries the registry calibration, otherwise the
+/// production contract. Registry admission and `begin_request` share this one predicate
+/// (sc-27307): `begin_request` used to accept only the weights-free witness, so a production
+/// contract the registry safety check admitted was refused when its scope began.
+fn registered_contract_matches(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
-    context: &MemoryRunContext,
-) -> MemorySafetyDecision {
+) -> gen_core::Result<bool> {
     let fixture = contract
         .calibration
         .as_ref()
         .is_some_and(|identity| identity.fingerprint == CANDLE_REGISTRY_CALIBRATION_FINGERPRINT);
     let expected = if fixture {
-        weights_free_contract(spec)
+        weights_free_contract(spec)?
     } else {
-        memory_strategy_contract(spec)
+        memory_strategy_contract(spec)?
     };
-    match expected {
-        Ok(expected) if expected == *contract => match resolved_numeric_tier(spec) {
+    Ok(expected == *contract)
+}
+
+fn registered_safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    match registered_contract_matches(spec, contract) {
+        Ok(true) => match resolved_numeric_tier(spec) {
             Ok(tier) => safety_check(
                 contract,
                 tier,
@@ -576,7 +588,7 @@ fn registered_safety_check(
             ),
             Err(error) => MemorySafetyDecision::rejected(error),
         },
-        Ok(_) => MemorySafetyDecision::Reject {
+        Ok(false) => MemorySafetyDecision::Reject {
             reason: format!(
                 "{LTX_2_5_DISTILLED_MODEL_ID}: caller contract differs from the exact registered load contract"
             ),
@@ -636,15 +648,15 @@ fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    match weights_free_contract(spec) {
-        Ok(expected) if expected == *contract => begin(
+    match registered_contract_matches(spec, contract) {
+        Ok(true) => begin(
             contract,
             resolved_numeric_tier(spec)?,
             gen_core::adapter_stack_identity(&spec.adapters).as_deref(),
             Device::Cpu,
             context,
         ),
-        Ok(_) => Err(gen_core::Error::Unsupported(format!(
+        Ok(false) => Err(gen_core::Error::Unsupported(format!(
             "{LTX_2_5_DISTILLED_MODEL_ID}: caller contract differs from the exact registered load contract"
         ))),
         Err(error) => Err(error),
@@ -1214,6 +1226,43 @@ mod tests {
                 Some(Quant::Q8)
             );
         }
+    }
+
+    /// sc-27307: registry admission and `begin_request` decide a production contract the same way.
+    /// `begin_request` accepted only the weights-free witness, so a production contract the registry
+    /// safety check admitted was refused when its scope began.
+    #[test]
+    fn registered_begin_request_admits_the_production_contract_registry_safety_admits() {
+        let directory = tempfile::tempdir().unwrap();
+        let load = physical_spec(directory.path(), false, true);
+        let contract = memory_strategy_contract(&load).unwrap();
+        let context = gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::BoundedAttention,
+            resolved_numeric_tier(&load).unwrap(),
+            MemoryBehaviorRoute {
+                mode: MemoryMode::Other("text_to_video".into()),
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            registered_safety_check(&load, &contract, &context),
+            MemorySafetyDecision::Accept
+        );
+        assert!(registered_begin_request(&load, &contract, &context)
+            .unwrap()
+            .is_some());
+        let mut crossed = contract.clone();
+        crossed.provider_id.push_str("-mutated");
+        assert!(matches!(
+            registered_safety_check(&load, &crossed, &context),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        assert!(registered_begin_request(&load, &crossed, &context).is_err());
     }
 
     #[test]

@@ -956,43 +956,53 @@ pub(crate) fn validate_geometry(
     Ok(())
 }
 
+/// The Wan TI2V-5B MLX memory profile (sc-27307): the calibrated plain-T2V route gate inside the
+/// shared pipeline, with the registry tier [`registered_tier`] reads off the contract (the
+/// weights-free fixture vs a real snapshot). The fixture (an explicit minimum production geometry
+/// and an observable 448 decode cap) and the request scope stay provider-owned.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(registered_tier),
+    gates: gen_core::MemoryProfileGates::within(route_gate),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    if context.mode.as_key() != "text_to_video"
+        || context.geometry.reference_count != 0
+        || context.has_reference
+        || context.use_pid
+        || context.has_phases
+        || context.overlay.is_some()
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: calibrated memory route is plain single-phase text_to_video without references, PiD, or overlays"
+        )));
+    }
+    validate_geometry(
+        context.geometry.width,
+        context.geometry.height,
+        context.geometry.frames,
+        context.geometry.batch,
+    )?;
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        validate_decode(
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        if context.mode.as_key() != "text_to_video"
-            || context.geometry.reference_count != 0
-            || context.has_reference
-            || context.use_pid
-            || context.has_phases
-            || context.overlay.is_some()
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: calibrated memory route is plain single-phase text_to_video without references, PiD, or overlays"
-            )));
-        }
-        validate_geometry(
-            context.geometry.width,
-            context.geometry.height,
-            context.geometry.frames,
-            context.geometry.batch,
-        )?;
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            validate_decode(
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            )?;
-        }
-        Ok(())
-    };
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier),
-        Some(&route_gate),
-    )
+    gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, loaded_tier)
 }
 
 pub(crate) fn registered_safety_check(
@@ -1000,10 +1010,7 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match registered_tier(spec, contract) {
-        Ok(tier) => safety_check(contract, tier, context),
-        Err(error) => MemorySafetyDecision::rejected(error),
-    }
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn registered_valid_fixtures(
@@ -1169,9 +1176,26 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        MODEL_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     begin_with_cleanup(
         contract,
-        registered_tier(spec, contract)?,
+        loaded_tier,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )

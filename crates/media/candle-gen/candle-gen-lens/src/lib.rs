@@ -990,12 +990,13 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
 /// A weights-free contract — the registry's sentinel surface path, or a single-file import —
 /// publishes `MemoryArchitectureFacts::default()`: nothing that *would* be loaded is resolved
 /// there, so no axis is knowable.
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    _root: &Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    if af::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
     // The exact preset the DiT builder receives; Lens and Lens-Turbo share one geometry.
     let dit = crate::transformer::LensDitConfig::lens();
     gen_core::MemoryArchitectureFacts {
@@ -1413,7 +1414,11 @@ fn build_lens_memory_strategy_contract_with_eligibility(
 
     MemoryProviderContract {
         phase_facts: None,
-        architecture_facts: architecture_facts(spec),
+        architecture_facts: gen_core::standard_architecture_facts(
+            &LENS_MEMORY_PROFILE,
+            provider_id,
+            spec,
+        ),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -2321,16 +2326,29 @@ pub fn production_calibration_fingerprint(
     provider_id: &str,
     artifact_tier: Option<Quant>,
 ) -> Option<String> {
-    let tier = Quant::affine_tier_label(artifact_tier)?;
-    match (provider_id, artifact_tier) {
-        // The one measured Candle/CUDA cell, preserved byte-for-byte at exactly the cell the
-        // SC-15800 end-to-end result measured.
-        (MODEL_ID_TURBO, Some(Quant::Q4)) => Some(MEMORY_CALIBRATION_FINGERPRINT.to_owned()),
-        (MODEL_ID_BASE, _) => Some(format!("lens-base-{tier}-candle-cuda-shared-ladder-v1")),
-        (MODEL_ID_TURBO, _) => Some(format!("lens-turbo-{tier}-candle-cuda-shared-ladder-v1")),
-        _ => None,
-    }
+    LENS_MEMORY_PROFILE
+        .fingerprint?
+        .fingerprint(provider_id, Quant::affine_tier_label(artifact_tier)?)
 }
+
+/// The Candle Lens memory profile (sc-27307): the fingerprint spelling and the snapshot-gated
+/// preset geometry both routes share. The one measured Candle/CUDA cell (turbo, q4) keeps its
+/// SC-15800 identity byte for byte as a pin.
+const LENS_MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    fingerprint: Some(gen_core::MemoryFingerprintTable {
+        template: "{route}-{tier}-candle-cuda-shared-ladder-v1",
+        routes: &[(MODEL_ID_BASE, "lens-base"), (MODEL_ID_TURBO, "lens-turbo")],
+        pins: &[gen_core::MemoryFingerprintPin {
+            route: "lens-turbo",
+            tier: "q4",
+            fingerprint: MEMORY_CALIBRATION_FINGERPRINT,
+        }],
+    }),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
 
 /// The identity a loaded Lens route publishes, bound to the artifact it opens.
 ///
@@ -4689,5 +4707,60 @@ mod integration_tests {
             }
         )
         .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    /// sc-27307: every production calibration fingerprint the Candle Lens routes publish, pinned
+    /// byte for byte before the spelling moved into a `MemoryFingerprintTable`.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        let cells = [
+            (
+                MODEL_ID_BASE,
+                None,
+                Some("lens-base-bf16-candle-cuda-shared-ladder-v1"),
+            ),
+            (
+                MODEL_ID_BASE,
+                Some(Quant::Q4),
+                Some("lens-base-q4-candle-cuda-shared-ladder-v1"),
+            ),
+            (
+                MODEL_ID_BASE,
+                Some(Quant::Q8),
+                Some("lens-base-q8-candle-cuda-shared-ladder-v1"),
+            ),
+            (MODEL_ID_BASE, Some(Quant::Nvfp4), None),
+            (MODEL_ID_BASE, Some(Quant::Fp8Rowwise), None),
+            (
+                MODEL_ID_TURBO,
+                None,
+                Some("lens-turbo-bf16-candle-cuda-shared-ladder-v1"),
+            ),
+            (
+                MODEL_ID_TURBO,
+                Some(Quant::Q4),
+                Some(MEMORY_CALIBRATION_FINGERPRINT),
+            ),
+            (
+                MODEL_ID_TURBO,
+                Some(Quant::Q8),
+                Some("lens-turbo-q8-candle-cuda-shared-ladder-v1"),
+            ),
+            (MODEL_ID_TURBO, Some(Quant::Nvfp4), None),
+            ("lens_unknown", None, None),
+            ("lens_unknown", Some(Quant::Q4), None),
+        ];
+        for (provider_id, tier, expected) in cells {
+            assert_eq!(
+                production_calibration_fingerprint(provider_id, tier).as_deref(),
+                expected,
+                "{provider_id} {tier:?}"
+            );
+        }
     }
 }

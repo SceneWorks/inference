@@ -94,11 +94,26 @@ pub fn production_calibration_fingerprint(
 ) -> Option<String> {
     let variant = MageVariant::from_id(provider_id)?;
     let tier = calibration_tier_label(artifact_tier)?;
-    Some(format!(
-        "mage-flow-{}-{tier}-mlx-shared-ladder-v1",
-        variant.route_label()
-    ))
+    Some(
+        MAGE_MEMORY_PROFILE
+            .fingerprint?
+            .render(variant.route_label(), tier),
+    )
 }
+
+/// The Mage-Flow MLX memory profile (sc-27307). Mage's admission is its own resident fit gate
+/// (`memory_strategy_safety_check_for`), so the profile carries only the fingerprint spelling: the
+/// route label is the variant's own [`MageVariant::route_label`], which already reads `mage-flow…`,
+/// so every published identity spells `mage-flow` twice. Identities are never respelled.
+const MAGE_MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        fingerprint: Some(mlx_gen::gen_core::MemoryFingerprintTable {
+            template: "mage-flow-{route}-{tier}-mlx-shared-ladder-v1",
+            routes: &[],
+            pins: &[],
+        }),
+        ..mlx_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
 
 /// The weights-free registry-conformance identity for one (provider, tier) surface: the same route
 /// and tier in the [`STATIC_BEHAVIOR_FINGERPRINT`] namespace. Never a production string.
@@ -4197,5 +4212,48 @@ mod tests {
                 MemorySafetyDecision::Reject { .. }
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    /// sc-27307: every production calibration fingerprint the six Mage-Flow routes publish, pinned
+    /// byte for byte before the spelling moved into a `MemoryFingerprintTable`. The `route_label`
+    /// already carries `mage-flow`, so the published identity spells it twice; an identity is never
+    /// respelled, so the pin keeps the doubled form.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        for (provider_id, route) in [
+            ("mage_flow", "mage-flow"),
+            ("mage_flow_base", "mage-flow-base"),
+            ("mage_flow_turbo", "mage-flow-turbo"),
+            ("mage_flow_edit", "mage-flow-edit"),
+            ("mage_flow_edit_base", "mage-flow-edit-base"),
+            ("mage_flow_edit_turbo", "mage-flow-edit-turbo"),
+        ] {
+            for (tier, label) in [
+                (None, "bf16"),
+                (Some(Quant::Q4), "q4"),
+                (Some(Quant::Q8), "q8"),
+            ] {
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, tier),
+                    Some(format!("mage-flow-{route}-{label}-mlx-shared-ladder-v1"))
+                );
+            }
+            for tier in [Some(Quant::Nvfp4), Some(Quant::Fp8Rowwise)] {
+                assert_eq!(production_calibration_fingerprint(provider_id, tier), None);
+            }
+        }
+        assert_eq!(
+            production_calibration_fingerprint("mage_flow_unknown", None),
+            None
+        );
+        assert_eq!(
+            production_calibration_fingerprint("mage_flow_edit", Some(Quant::Q4)).as_deref(),
+            Some("mage-flow-mage-flow-edit-q4-mlx-shared-ladder-v1")
+        );
     }
 }

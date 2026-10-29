@@ -247,12 +247,7 @@ impl Generator for FluxGenerator {
         let Some(contract) = self.memory_strategy.as_ref() else {
             return gen_core::MemorySafetyDecision::Accept;
         };
-        memory_strategy::admission_safety_check(
-            self.variant.model_id(),
-            contract,
-            context,
-            self.loaded_quant,
-        )
+        memory_strategy::admission_safety_check(contract, context, self.loaded_quant)
     }
 
     fn begin_memory_strategy_request(
@@ -262,12 +257,7 @@ impl Generator for FluxGenerator {
         let Some(contract) = self.memory_strategy.as_ref() else {
             return Ok(None);
         };
-        memory_strategy::validate_context(
-            self.variant.model_id(),
-            contract,
-            context,
-            self.loaded_quant,
-        )?;
+        memory_strategy::validate_context(contract, context, self.loaded_quant)?;
         Ok(Some(Box::new(memory_strategy::FluxMemoryScope::new(
             self.variant.model_id(),
             self.pipe.device().clone(),

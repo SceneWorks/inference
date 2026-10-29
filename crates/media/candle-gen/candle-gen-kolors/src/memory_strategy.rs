@@ -892,12 +892,20 @@ pub fn production_calibration_fingerprint(
     provider_id: &str,
     artifact_tier: Option<Quant>,
 ) -> Option<String> {
-    let route = route_token(provider_id)?;
-    let tier = Quant::affine_tier_label(artifact_tier)?;
-    Some(format!(
-        "kolors-candle-{route}-{tier}-staged-chatglm-unet-f32-vae-v1"
-    ))
+    MEMORY_PROFILE
+        .fingerprint?
+        .fingerprint(provider_id, Quant::affine_tier_label(artifact_tier)?)
 }
+
+const FINGERPRINTS: gen_core::MemoryFingerprintTable = gen_core::MemoryFingerprintTable {
+    template: "kolors-candle-{route}-{tier}-staged-chatglm-unet-f32-vae-v1",
+    routes: &[
+        (crate::MODEL_ID, "kolors"),
+        (IP_PROVIDER_ID, "ipadapter"),
+        (CONTROL_PROVIDER_ID, "control"),
+    ],
+    pins: &[],
+};
 
 /// The identity a sealed Kolors contract publishes, bound to the artifact it opened.
 ///
@@ -1180,10 +1188,26 @@ pub fn physical_tier(root: &Path) -> gen_core::Result<MemoryNumericTier> {
     })
 }
 
-pub fn validate_context(
+/// The Candle Kolors memory profile (sc-27307): the evidence-revision/PiD/overlay receipt binding
+/// refuses before the shared pipeline and the T2I/one-reference route gate runs inside it, as the
+/// hand-rolled gate ordered them. The registry tier stays provider-owned: it is the physical load
+/// seal's, which a spec-only tier resolver cannot reproduce.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(registered_tier),
+    rejection: gen_core::MemoryRejectionRendering::ValidationError,
+    gates: gen_core::MemoryProfileGates {
+        before: Some(receipt_gate),
+        within: Some(route_gate),
+        after: None,
+    },
+    fingerprint: Some(FINGERPRINTS),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn receipt_gate(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
-    tier: MemoryNumericTier,
+    _tier: MemoryNumericTier,
 ) -> gen_core::Result<()> {
     if context.evidence_revision != REQUEST_EVIDENCE_REVISION {
         return Err(gen_core::Error::Unsupported(format!(
@@ -1205,7 +1229,15 @@ pub fn validate_context(
             "kolors: crossed registered ordered-adapter/PiD receipt".into(),
         ));
     }
-    let route = || match context.mode {
+    Ok(())
+}
+
+fn route_gate(
+    _contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    match context.mode {
         MemoryMode::TextToImage
             if !context.has_reference && context.geometry.reference_count == 0 =>
         {
@@ -1219,13 +1251,25 @@ pub fn validate_context(
         _ => Err(gen_core::Error::Unsupported(
             "kolors: memory evidence is bound only to base T2I or one-reference edit".into(),
         )),
-    };
-    candle_gen::request_scope::admit(gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(tier),
-        Some(&route),
-    ))
+    }
+}
+
+pub fn validate_context(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    gen_core::standard_validate_context(&MEMORY_PROFILE, contract, context, tier)
+}
+
+/// [`validate_context`] as a decision: the shared pipeline's reason is reported once, not
+/// re-rendered through a second `unsupported: ` prefix.
+pub fn safety_check(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    tier: MemoryNumericTier,
+) -> MemorySafetyDecision {
+    gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, tier)
 }
 
 pub fn validate_bespoke_context(
@@ -1436,14 +1480,22 @@ pub fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let result = registered_seal(spec).and_then(|seal| match seal {
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+/// The registry tier: the physical load seal's (re-checked unchanged), or the requested bf16 tier
+/// for a weights-free contract surface with no snapshot on disk.
+fn registered_tier(
+    spec: &LoadSpec,
+    _contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    match registered_seal(spec)? {
         Some(seal) => {
             seal.ensure_unchanged()?;
-            validate_context(contract, context, seal.tier())
+            Ok(seal.tier())
         }
-        None => validate_context(contract, context, weights_free_tier(spec)),
-    });
-    MemorySafetyDecision::from_validation(result)
+        None => Ok(weights_free_tier(spec)),
+    }
 }
 
 pub fn registered_valid_fixtures(
@@ -1484,15 +1536,25 @@ pub fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope>>> {
-    match registered_seal(spec)? {
-        Some(seal) => {
-            seal.ensure_unchanged()?;
-            validate_context(contract, context, seal.tier())?;
-        }
-        None => validate_context(contract, context, weights_free_tier(spec))?,
-    }
-    Ok(Some(Box::new(route_request_scope(
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
         crate::MODEL_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope>>> {
+    Ok(Some(Box::new(route_request_scope(
+        provider_id,
         candle_gen::candle_core::Device::Cpu,
         contract,
         context,
@@ -3094,5 +3156,45 @@ mod tests {
         let token = admission.begin(&contract, &run).unwrap();
         admission.abandon(token);
         admission.approve(&run).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    /// sc-27307: every production calibration fingerprint this lane publishes, pinned byte for byte
+    /// before the spelling moved into a `MemoryFingerprintTable`.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        for (provider_id, route) in [
+            (crate::MODEL_ID, "kolors"),
+            (IP_PROVIDER_ID, "ipadapter"),
+            (CONTROL_PROVIDER_ID, "control"),
+        ] {
+            for (quant, tier) in [
+                (None, "bf16"),
+                (Some(Quant::Q4), "q4"),
+                (Some(Quant::Q8), "q8"),
+            ] {
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, quant).as_deref(),
+                    Some(
+                        format!("kolors-candle-{route}-{tier}-staged-chatglm-unet-f32-vae-v1")
+                            .as_str()
+                    )
+                );
+            }
+            for quant in [Quant::Nvfp4, Quant::Fp8Rowwise] {
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, Some(quant)),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            production_calibration_fingerprint("kolors_unknown", None),
+            None
+        );
     }
 }

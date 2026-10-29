@@ -405,16 +405,25 @@ fn canonical_artifact_path(root: &Path, tier: QuantTier) -> bool {
 /// `artifact_tier` is the tier of the DiT **on disk**, never [`LoadSpec::quantize`], so a tier this
 /// family does not ship is unnameable rather than collapsed onto a neighbour.
 pub fn production_calibration_fingerprint(artifact_tier: Option<Quant>) -> Option<String> {
-    let tier = match artifact_tier {
-        None => "bf16",
-        Some(Quant::Q8) => "q8",
-        Some(Quant::Q4) => "q4",
-        Some(_) => return None,
-    };
-    Some(format!(
-        "scail2-14b-{tier}-{CALIBRATION_BACKEND}-{CALIBRATION_LOAD_COMPOSITION}-v1"
+    let tier = Quant::affine_tier_label(artifact_tier)?;
+    Some(FINGERPRINT_PROFILE.fingerprint?.render(
+        &format!("{CALIBRATION_BACKEND}-{CALIBRATION_LOAD_COMPOSITION}"),
+        tier,
     ))
 }
+
+/// The SCAIL-2 fingerprint spelling (sc-27307). The family serves one route, so the table's route
+/// slot carries the realization coordinate (`{backend}-{load composition}`) the string is keyed on.
+/// The safety check stays provider-owned: it re-verifies the prepared artifact receipt and the
+/// prepared context identity, state a contract-and-context profile gate does not hold.
+const FINGERPRINT_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    fingerprint: Some(gen_core::MemoryFingerprintTable {
+        template: "scail2-14b-{tier}-{route}-v1",
+        routes: &[],
+        pins: &[],
+    }),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
 
 /// Proves, from the artifact on disk alone, which shipped SCAIL-2 tier `spec` opens.
 ///
@@ -1813,5 +1822,29 @@ mod tests {
                 assert_ne!(left, right);
             }
         }
+    }
+}
+
+/// sc-27307: every production calibration fingerprint this family can publish, pinned byte for
+/// byte across the move to a [`gen_core::MemoryFingerprintTable`].
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        let seen: Vec<_> = [None, Some(Quant::Q4), Some(Quant::Q8), Some(Quant::Nvfp4)]
+            .into_iter()
+            .map(production_calibration_fingerprint)
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                Some("scail2-14b-bf16-mlx-resident-eager-v1".to_owned()),
+                Some("scail2-14b-q4-mlx-resident-eager-v1".to_owned()),
+                Some("scail2-14b-q8-mlx-resident-eager-v1".to_owned()),
+                None,
+            ]
+        );
     }
 }

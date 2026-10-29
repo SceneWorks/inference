@@ -59,13 +59,14 @@
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
-    MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
-    Result as CoreResult, TransformerComponent,
+    Error as CoreError, MemoryBackendRealization, MemoryBehaviorFixture, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryFingerprintPin, MemoryFingerprintTable, MemoryFixturePhases,
+    MemoryFixtureRoute, MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities,
+    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProfileFixtures,
+    MemoryProfileGates, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, ProviderMemoryProfile, ResidentRequestMemory, Result as CoreResult,
+    TransformerComponent,
 };
 use mlx_gen::request_scope::loaded_tier;
 use mlx_gen::tiling::TilingConfig;
@@ -574,17 +575,12 @@ pub fn production_calibration_fingerprint(
     provider_id: &str,
     artifact_tier: Option<mlx_gen::Quant>,
 ) -> Option<String> {
-    if provider_id != crate::MODEL_ID {
-        return None;
-    }
-    match artifact_tier {
-        // The measured cell, preserved verbatim.
-        Some(mlx_gen::Quant::Q4) => Some(MEMORY_CALIBRATION_FINGERPRINT.to_owned()),
-        Some(mlx_gen::Quant::Q8) => Some("kolors-q8-mlx-shared-ladder-v1".to_owned()),
-        None => Some("kolors-bf16-mlx-shared-ladder-v1".to_owned()),
-        // A tier this family does not ship is unnameable rather than collapsed onto a neighbour.
-        Some(mlx_gen::Quant::Nvfp4 | mlx_gen::Quant::Fp8Rowwise) => None,
-    }
+    // `affine_tier_label` names `bf16`/`q4`/`q8` and nothing for a tier this family does not ship,
+    // which stays unnameable rather than collapsed onto a neighbour. The measured q4 cell is a pin.
+    MEMORY_PROFILE.fingerprint?.fingerprint(
+        provider_id,
+        mlx_gen::Quant::affine_tier_label(artifact_tier)?,
+    )
 }
 
 /// Whether this load is a **clean base** load: the three base components and nothing else.
@@ -1188,65 +1184,85 @@ pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        // Kolors advertises txt2img, img2img, ControlNet-pose, IP-Adapter and the combined
-        // strict-pose tier, so the mode axis is deliberately permissive. What is NOT permissive is
-        // the geometry.
-        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode)
-            && contract
-                .capability(MemoryStrategy::BoundedDecode)
-                .is_none_or(|capability| capability.parameters.decode_geometry_policies.is_empty())
-        {
-            return Err(refuse_decode(
-                &contract.provider_id,
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            ));
-        }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+/// The Kolors MLX memory profile (sc-27307): the requested tier, the geometry/rung gate, one staged
+/// text-to-image fixture per implemented optimized rung, and the production fingerprint spelling.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    gates: MemoryProfileGates::within(route_gate),
+    fixtures: MemoryProfileFixtures::routes(&[
+        MemoryFixtureRoute::TEXT_TO_IMAGE.with_phases(MemoryFixturePhases::Always)
+    ])
+    .implemented_only(),
+    fingerprint: Some(MemoryFingerprintTable {
+        template: "{route}-{tier}-mlx-shared-ladder-v1",
+        routes: &[(crate::MODEL_ID, "kolors")],
+        pins: &[MemoryFingerprintPin {
+            route: "kolors",
+            tier: "q4",
+            fingerprint: MEMORY_CALIBRATION_FINGERPRINT,
+        }],
+    }),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+) -> CoreResult<()> {
+    // Kolors advertises txt2img, img2img, ControlNet-pose, IP-Adapter and the combined
+    // strict-pose tier, so the mode axis is deliberately permissive. What is NOT permissive is
+    // the geometry.
+    if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode)
+        && contract
+            .capability(MemoryStrategy::BoundedDecode)
+            .is_none_or(|capability| capability.parameters.decode_geometry_policies.is_empty())
+    {
+        return Err(refuse_decode(
+            &contract.provider_id,
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        ));
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
+        return Err(CoreError::Unsupported(format!(
+            "{}: bounded attention is not selectable on this provider (rung 3 is declared \
+             Missing): it moves the peak 0.00% at both measured scopes (the request and the \
+             U-Net seam), and the query-row chunking axis is not bit-exact on Metal, which an \
+             fp16 chaos-sensitive schedule amplifies to a different image — see \
+             memory_strategy::ATTENTION_SUPPORT",
+            contract.provider_id
+        )));
+    }
+    if contract.engages(
+        context.selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    ) {
+        if !contract.lifecycle.transformer_window_materialization {
             return Err(CoreError::Unsupported(format!(
-                "{}: bounded attention is not selectable on this provider (rung 3 is declared \
-                 Missing): it moves the peak 0.00% at both measured scopes (the request and the \
-                 U-Net seam), and the query-row chunking axis is not bit-exact on Metal, which an \
-                 fp16 chaos-sensitive schedule amplifies to a different image — see \
-                 memory_strategy::ATTENTION_SUPPORT",
+                "{}: bounded transformer residency requires a DeferredMaterialization load over \
+                 a snapshot directory whose U-Net AND ChatGLM3 blocks stay lazy and whose \
+                 adapters (if any) are replayable — see memory_strategy::streamable",
                 contract.provider_id
             )));
         }
-        if contract.engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        ) {
-            if !contract.lifecycle.transformer_window_materialization {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: bounded transformer residency requires a DeferredMaterialization load over \
-                     a snapshot directory whose U-Net AND ChatGLM3 blocks stay lazy and whose \
-                     adapters (if any) are replayable — see memory_strategy::streamable",
-                    contract.provider_id
-                )));
-            }
-            // The scope AND the size are checked here as well as by the shared parameter validator,
-            // so a request that reached the provider by another path still cannot ask for a scope
-            // this family does not implement or a cadence it never measured.
-            let component = context.selection.parameters.window_component();
-            if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: transformer window component {component:?} is not implemented",
-                    contract.provider_id
-                )));
-            }
-            if let Some(size) = context.selection.parameters.transformer_window_size {
-                validate_window(size)?;
-            }
+        // The scope AND the size are checked here as well as by the shared parameter validator,
+        // so a request that reached the provider by another path still cannot ask for a scope
+        // this family does not implement or a cadence it never measured.
+        let component = context.selection.parameters.window_component();
+        if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
+            return Err(CoreError::Unsupported(format!(
+                "{}: transformer window component {component:?} is not implemented",
+                contract.provider_id
+            )));
         }
-        Ok(())
-    };
-    standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier(spec)),
-        Some(&route_gate),
-    )
+        if let Some(size) = context.selection.parameters.transformer_window_size {
+            validate_window(size)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -1254,33 +1270,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<MemoryBehaviorFixture>> {
-    if !strategy.is_optimized()
-        || !matches!(
-            contract.capability(strategy).map(|c| &c.support),
-            Some(MemoryStrategySupport::Implemented)
-        )
-    {
-        return Ok(Vec::new());
-    }
-    let tier = loaded_tier(spec);
-    let route = |use_pid| MemoryBehaviorRoute {
-        mode: MemoryMode::TextToImage,
-        reference_count: 0,
-        use_pid,
-        // Rung 1 is request-scoped, and every optimized selection engages it by cost order — which
-        // is also rung 4's declared prerequisite.
-        has_phases: true,
-        overlay: None,
-    };
-    let fixtures = vec![MemoryBehaviorFixture::new(
-        mlx_gen::gen_core::standard_memory_behavior_context(
-            contract,
-            strategy,
-            tier,
-            route(false),
-        )?,
-    )];
-    Ok(fixtures)
+    mlx_gen::gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub(crate) fn registered_begin_request(
@@ -1288,6 +1278,23 @@ pub(crate) fn registered_begin_request(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_with_cleanup(
         provider_id,
@@ -2797,6 +2804,43 @@ mod tests {
         for fingerprint in production_fingerprint_set() {
             assert!(fingerprint.starts_with("kolors-"));
             assert_ne!(fingerprint, "sdxl-mlx-unet-shared-ladder-v2");
+        }
+    }
+}
+
+/// sc-27307: every published production calibration fingerprint, byte for byte, so moving the
+/// spelling onto the shared `MemoryFingerprintTable` cannot restamp a record.
+#[cfg(test)]
+mod sc27307_fingerprint_pins {
+    use super::*;
+
+    #[test]
+    fn every_fingerprint_cell_is_pinned() {
+        use mlx_gen::Quant;
+        for (provider, quant, expected) in [
+            (
+                crate::MODEL_ID,
+                None,
+                Some("kolors-bf16-mlx-shared-ladder-v1"),
+            ),
+            (
+                crate::MODEL_ID,
+                Some(Quant::Q4),
+                Some("kolors-mlx-chatglm3-sdxl-unet-ladder-v1"),
+            ),
+            (
+                crate::MODEL_ID,
+                Some(Quant::Q8),
+                Some("kolors-q8-mlx-shared-ladder-v1"),
+            ),
+            (crate::MODEL_ID, Some(Quant::Nvfp4), None),
+            (crate::MODEL_ID, Some(Quant::Fp8Rowwise), None),
+            ("kolors_unknown", Some(Quant::Q4), None),
+        ] {
+            assert_eq!(
+                production_calibration_fingerprint(provider, quant).as_deref(),
+                expected
+            );
         }
     }
 }

@@ -9,12 +9,12 @@ use candle_gen::gen_core::{
     self, GenerationMemory, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
     MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
-    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    MemoryWindowMaterialization, PerComponentBytes, Precision, Quant, TransformerComponent,
-    WeightsSource,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryPrerequisiteScope, MemoryProfileGates, MemoryProfileTier, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, MemoryWindowMaterialization, PerComponentBytes, Precision,
+    ProviderMemoryProfile, Quant, TransformerComponent, WeightsSource,
 };
 
 pub const DECODE_TILE_EDGE: u32 = 512;
@@ -328,14 +328,17 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// [`candle_gen::architecture_facts::patch_size_from_channels`] recovers the packing edge from that
 /// pair. `vae_temporal_scale` stays `None` — FLUX.1 ships the image `AutoencoderKL`, which has no
 /// temporal axis at all, and a structurally absent axis is declared absent rather than zero (E2).
-fn architecture_facts(provider_id: &str, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+///
+/// A weights-free contract surface names a sentinel path that is deliberately not on disk: no
+/// pipeline has been resolved there, so no axis is knowable and every one stays `None` — the guard
+/// [`gen_core::standard_architecture_facts`] applies before calling this derivation.
+fn architecture_facts_from_snapshot(
+    provider_id: &str,
+    root: &std::path::Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
-    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
-    let Some(root) = af::snapshot_root(spec) else {
-        return gen_core::MemoryArchitectureFacts::default();
-    };
     // The variant this provider id names, not a pinned `Dev`. A bespoke identity route built on
     // this shared backbone (`reference_backbone_contract`) carries its own id and runs the dev
     // trunk, which is what the fallback covers.
@@ -435,7 +438,11 @@ pub fn reference_backbone_contract(
 
     Ok(MemoryProviderContract {
         phase_facts: None,
-        architecture_facts: architecture_facts(provider_id, spec),
+        architecture_facts: gen_core::standard_architecture_facts(
+            &MEMORY_PROFILE,
+            provider_id,
+            spec,
+        ),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -557,15 +564,41 @@ pub(crate) fn evidence_identity_and_tier(
     Ok((calibration, resolved_numeric_tier(spec, provider_id)?))
 }
 
-pub(crate) fn validate_context(
-    provider_id: &str,
+/// The Candle FLUX.1 memory profile (sc-27307): the artifact's packed transformer width names the
+/// tier, the native-VAE refusals run after the shared pipeline admits, and the geometry is derived
+/// from a resolved snapshot.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    tier: MemoryProfileTier::Resolved(profile_tier),
+    rejection: gen_core::MemoryRejectionRendering::ValidationError,
+    gates: MemoryProfileGates::after(native_route_gate),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn profile_tier(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    let provider_id = contract.provider_id.as_str();
+    resolved_numeric_tier(spec, provider_id)
+}
+
+fn loaded_tier(loaded_quant: Option<Quant>) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: loaded_quant,
+        component_precision_floors: &[],
+    }
+}
+
+fn native_route_gate(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
-    loaded_quant: Option<Quant>,
+    _loaded_tier: MemoryNumericTier,
 ) -> gen_core::Result<()> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, context, loaded_quant) {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
+    let provider_id = &contract.provider_id;
     if context.has_phases {
         return Err(gen_core::Error::Unsupported(format!(
             "{provider_id}: optimized memory strategies do not cover multi-phase denoise"
@@ -579,35 +612,45 @@ pub(crate) fn validate_context(
     Ok(())
 }
 
-pub(crate) fn safety_check(
+pub(crate) fn validate_context(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
-) -> MemorySafetyDecision {
-    gen_core::standard_memory_strategy_safety_check(
+) -> gen_core::Result<()> {
+    gen_core::standard_validate_context(
+        &MEMORY_PROFILE,
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant: loaded_quant,
-            component_precision_floors: &[],
-        }),
-        None,
+        loaded_tier(loaded_quant),
     )
 }
 
 pub(crate) fn admission_safety_check(
-    provider_id: &str,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_validation(validate_context(
-        provider_id,
+    gen_core::standard_safety_check(
+        &MEMORY_PROFILE,
         contract,
         context,
-        loaded_quant,
-    ))
+        loaded_tier(loaded_quant),
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    Ok(Some(Box::new(FluxMemoryScope::new(
+        provider_id,
+        Device::Cpu,
+        contract,
+        context,
+    ))))
 }
 
 pub(crate) struct FluxMemoryScope {
@@ -794,10 +837,7 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match snapshot_quant_tier(spec, &contract.provider_id) {
-        Ok(quant) => admission_safety_check(&contract.provider_id, contract, context, quant),
-        Err(error) => MemorySafetyDecision::rejected(error),
-    }
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -805,22 +845,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
-        return Ok(Vec::new());
-    }
-    let context = gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        resolved_numeric_tier(spec, &contract.provider_id)?,
-        gen_core::MemoryBehaviorRoute {
-            mode: MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        },
-    )?;
-    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+    gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub(crate) fn registered_begin_request(
@@ -829,14 +854,14 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    let quant = snapshot_quant_tier(spec, provider_id)?;
-    validate_context(provider_id, contract, context, quant)?;
-    Ok(Some(Box::new(FluxMemoryScope::new(
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
         provider_id,
-        Device::Cpu,
+        spec,
         contract,
         context,
-    ))))
+        registered_scope,
+    )
 }
 
 #[cfg(test)]

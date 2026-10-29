@@ -561,20 +561,16 @@ mlx_gen::register_generators! {
 
 /// The shared memory-strategy contract registration (SC-15449) — resolvable before any weights load, so
 /// the worker can select a strategy from the static declaration plus its own measured evidence.
-pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
-    mlx_gen::gen_core::MemoryRegistration {
-        provider_id: MODEL_ID,
-        contract: |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
-        safety_check: crate::memory_strategy::registered_safety_check,
-    };
-pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
-    mlx_gen::gen_core::MemoryBehaviorRegistration {
-        provider_id: MODEL_ID,
-        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
-        begin_request: |spec, contract, context| {
-            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
-        },
-    };
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration = mlx_gen::gen_core::profile_memory_registration!(
+    crate::memory_strategy::CONTROL_MEMORY_PROFILE,
+    MODEL_ID,
+    |spec| crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec),
+);
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration = mlx_gen::gen_core::profile_memory_behavior_registration!(
+    crate::memory_strategy::CONTROL_MEMORY_PROFILE,
+    MODEL_ID,
+    crate::memory_strategy::registered_scope,
+);
 
 #[cfg(test)]
 mod tests {

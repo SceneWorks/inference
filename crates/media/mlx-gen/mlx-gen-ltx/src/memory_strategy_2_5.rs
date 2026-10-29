@@ -778,50 +778,81 @@ pub(crate) fn validate_request_memory(
     })
 }
 
+/// The LTX-2.5 MLX memory profile (sc-27307): the tier the split bundle proves
+/// ([`resolved_numeric_tier`]) and the published-decode-domain gate inside the shared pipeline.
+const LTX_2_5_MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(profile_tier),
+    gates: gen_core::MemoryProfileGates::within(decode_gate),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn profile_tier(
+    spec: &LoadSpec,
+    _contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    resolved_numeric_tier(spec)
+}
+
+fn decode_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode) {
+        validate_decode(
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode) {
-            validate_decode(
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            )?;
-        }
-        Ok(())
-    };
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier),
-        Some(&route_gate),
-    )
+    gen_core::standard_safety_check(&LTX_2_5_MEMORY_PROFILE, contract, context, loaded_tier)
 }
+
+/// Whether `contract` is exactly the contract this registration resolves for `spec`: the
+/// weights-free declaration when it carries the static calibration, otherwise the production
+/// contract. Registry admission and `begin_request` share this one predicate (sc-27307):
+/// `begin_request` used to check no identity at all, so it opened a scope for a crossed contract
+/// the registry safety check refused.
+fn registered_contract_matches(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> gen_core::Result<bool> {
+    let fixture = contract
+        .calibration
+        .as_ref()
+        .is_some_and(|identity| identity.fingerprint == STATIC_CALIBRATION_FINGERPRINT);
+    let expected = if fixture {
+        weights_free_memory_strategy_contract(spec)?
+    } else {
+        memory_strategy_contract(spec)?
+    };
+    Ok(expected == *contract)
+}
+
+const CROSSED_CONTRACT: &str =
+    "ltx_2_5: caller contract differs from the exact registered load contract";
 
 fn registered_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let fixture = contract
-        .calibration
-        .as_ref()
-        .is_some_and(|identity| identity.fingerprint == STATIC_CALIBRATION_FINGERPRINT);
-    let expected = if fixture {
-        weights_free_memory_strategy_contract(spec)
-    } else {
-        memory_strategy_contract(spec)
-    };
-    match expected {
-        Ok(expected) if expected == *contract => match resolved_numeric_tier(spec) {
-            Ok(tier) => safety_check(contract, tier, context),
-            Err(error) => MemorySafetyDecision::rejected(error),
-        },
-        Ok(_) => MemorySafetyDecision::Reject {
-            reason: "ltx_2_5: caller contract differs from the exact registered load contract"
-                .to_owned(),
+    match registered_contract_matches(spec, contract) {
+        Ok(true) => gen_core::standard_registered_safety_check(
+            &LTX_2_5_MEMORY_PROFILE,
+            spec,
+            contract,
+            context,
+        ),
+        Ok(false) => MemorySafetyDecision::Reject {
+            reason: CROSSED_CONTRACT.to_owned(),
         },
         Err(error) => MemorySafetyDecision::rejected(error),
     }
@@ -879,9 +910,29 @@ fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    if !registered_contract_matches(spec, contract)? {
+        return Err(gen_core::Error::Unsupported(CROSSED_CONTRACT.to_owned()));
+    }
+    gen_core::standard_begin_request(
+        &LTX_2_5_MEMORY_PROFILE,
+        LTX_2_5_MODEL_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     begin_with_cleanup(
         contract,
-        resolved_numeric_tier(spec)?,
+        loaded_tier,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )
@@ -1546,6 +1597,33 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// sc-27307: `begin_request` refuses the crossed contract registry admission refuses. It used
+    /// to check no contract identity, so it opened a scope the safety check would not admit.
+    #[test]
+    fn registered_begin_request_rejects_a_contract_not_built_for_the_load() {
+        let spec = spec(LoadShape::DeferredMaterialization);
+        let contract = weights_free_memory_strategy_contract(&spec).unwrap();
+        let fixture = registered_valid_fixtures(
+            &spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        assert!(registered_begin_request(&spec, &contract, &fixture.context)
+            .unwrap()
+            .is_some());
+        let mut forged = contract.clone();
+        forged.provider_id = crate::MODEL_ID.to_owned();
+        assert!(matches!(
+            registered_safety_check(&spec, &forged, &fixture.context),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        assert!(registered_begin_request(&spec, &forged, &fixture.context).is_err());
     }
 
     #[test]

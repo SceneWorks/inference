@@ -3013,3 +3013,34 @@ fn source_pruned_retained_bound_covers_nondefault_scheduler_shifts() {
     );
     assert_eq!(contract.evicted_component_bytes(), 0);
 }
+
+/// sc-27307: every production calibration fingerprint this family can publish, pinned byte for
+/// byte across the move to a `MemoryFingerprintTable`.
+#[test]
+fn production_calibration_fingerprints_are_pinned() {
+    let mut seen = Vec::new();
+    for bits in [None, Some(4), Some(8)] {
+        let root = minimax_tier_root(bits);
+        for quant in [None, Some(mlx_gen::Quant::Q4), Some(mlx_gen::Quant::Q8)] {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
+            spec.quantize = quant;
+            seen.push(production_calibration_fingerprint(&spec));
+        }
+    }
+    let some = |s: &str| Some(s.to_owned());
+    assert_eq!(
+        seen,
+        vec![
+            some("minimax-h3-mlx-staged-joint-av-eager-abi3-v1"),
+            None,
+            None,
+            some("minimax-h3-q4-mlx-staged-joint-av-eager-abi3-v1"),
+            some("minimax-h3-q4-mlx-staged-joint-av-eager-abi3-v1"),
+            None,
+            some("minimax-h3-q8-mlx-staged-joint-av-eager-abi3-v1"),
+            None,
+            some("minimax-h3-q8-mlx-staged-joint-av-eager-abi3-v1"),
+        ]
+    );
+    assert_eq!(production_calibration_fingerprint(&weightless_spec()), None);
+}

@@ -6,8 +6,9 @@
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, LoadSpec, MemoryNumericTier, MemoryProviderContract, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, Precision, Quant, WeightsSource,
+    self, LoadSpec, MemoryNumericTier, MemoryProfileGates, MemoryProfileTier,
+    MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemoryStrategy, Precision,
+    ProviderMemoryProfile, Quant, WeightsSource,
 };
 use candle_gen::gen_core::{
     LoadShape, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
@@ -91,12 +92,13 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// publishes `MemoryArchitectureFacts::default()`: no pipeline has been resolved there. The gate is
 /// [`candle_gen::architecture_facts::snapshot_root`], an existing directory, rather than a bare
 /// `WeightsSource::Dir` match.
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    _root: &std::path::Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    if af::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
     // Exactly the presets `pipeline.rs` hands to the DiT and `AutoEncoderKL` builders.
     let dit = DitConfig::z_image_turbo();
     let vae = VaeConfig::z_image();
@@ -1006,7 +1008,11 @@ pub(crate) fn provider_contract(
             overlay_bytes: reference_encoder,
         },
         phase_facts: None,
-        architecture_facts: architecture_facts(spec),
+        architecture_facts: gen_core::standard_architecture_facts(
+            &MEMORY_PROFILE,
+            provider_id,
+            spec,
+        ),
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     })
 }
@@ -1111,17 +1117,52 @@ pub(crate) fn request_scope(
     ))
 }
 
-pub(crate) fn validate_context(
-    provider_id: &str,
+/// The Candle Z-Image memory profile (sc-27307): the snapshot's packed transformer width names the
+/// tier, the native-VAE refusals run after the shared pipeline admits, and the architecture facts
+/// are the DiT/VAE presets once a snapshot is resolved.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    tier: MemoryProfileTier::Resolved(profile_tier),
+    rejection: gen_core::MemoryRejectionRendering::ValidationError,
+    gates: MemoryProfileGates::after(native_vae_route_gate),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+/// The control routes' profile: the same skeletons with a single-reference image-to-image behavior
+/// fixture.
+#[cfg(any(feature = "cuda", test))]
+const CONTROL_MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    fixtures: gen_core::MemoryProfileFixtures::routes(&[gen_core::MemoryFixtureRoute::new(
+        gen_core::MemoryFixtureMode::ImageToImage,
+        1,
+    )]),
+    ..MEMORY_PROFILE
+};
+
+fn profile_tier(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    let provider_id = contract.provider_id.as_str();
+    Ok(bf16_tier(snapshot_quant_tier(spec, provider_id)?))
+}
+
+fn bf16_tier(loaded_quant: Option<Quant>) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: loaded_quant,
+        component_precision_floors: &[],
+    }
+}
+
+fn native_vae_route_gate(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
-    loaded_quant: Option<Quant>,
+    _loaded_tier: MemoryNumericTier,
 ) -> gen_core::Result<()> {
-    if let MemorySafetyDecision::Reject { reason } =
-        safety_check(provider_id, contract, context, loaded_quant)
-    {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
+    let provider_id = &contract.provider_id;
     if context.has_phases {
         return Err(gen_core::Error::Unsupported(format!(
             "{provider_id}: optimized memory strategies do not cover multi-phase denoise"
@@ -1136,39 +1177,41 @@ pub(crate) fn validate_context(
     Ok(())
 }
 
+pub(crate) fn validate_context(
+    _provider_id: &str,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_quant: Option<Quant>,
+) -> gen_core::Result<()> {
+    gen_core::standard_validate_context(&MEMORY_PROFILE, contract, context, bf16_tier(loaded_quant))
+}
+
 /// The complete pre-request admission predicate shared by loaded generators and the weights-free
 /// registry. Keep this as the decision-form adapter over [`validate_context`] so neither route can
 /// admit a context that [`registered_begin_request`] (or a loaded generator's begin hook) rejects.
 pub(crate) fn admission_safety_check(
-    provider_id: &str,
+    _provider_id: &str,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_validation(validate_context(
-        provider_id,
-        contract,
-        context,
-        loaded_quant,
-    ))
+    gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, bf16_tier(loaded_quant))
 }
 
+/// The shared pipeline alone, without the native-VAE refusals.
+#[cfg(test)]
 pub(crate) fn safety_check(
     _provider_id: &str,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant: loaded_quant,
-            component_precision_floors: &[],
-        }),
-        None,
-    )
+    let shared = ProviderMemoryProfile {
+        gates: MemoryProfileGates::NONE,
+        rejection: gen_core::MemoryRejectionRendering::Reason,
+        ..MEMORY_PROFILE
+    };
+    gen_core::standard_safety_check(&shared, contract, context, bf16_tier(loaded_quant))
 }
 
 pub(crate) fn snapshot_quant_tier(
@@ -1184,15 +1227,14 @@ pub(crate) fn snapshot_quant_tier(
     candle_gen::quant::packed_quant_tier(packed, provider_id, "transformer")
 }
 
+/// The weights-free twin of [`admission_safety_check`]: the decision is the rendering of
+/// [`validate_context`]'s error, so the registry and a loaded generator refuse with the same text.
 pub(crate) fn registered_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match snapshot_quant_tier(spec, &contract.provider_id) {
-        Ok(quant) => admission_safety_check(&contract.provider_id, contract, context, quant),
-        Err(error) => MemorySafetyDecision::rejected(error),
-    }
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -1201,31 +1243,12 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
-        return Ok(Vec::new());
-    }
-    let is_control = contract.provider_id.ends_with("_control");
-    let context = gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant: snapshot_quant_tier(spec, &contract.provider_id)?,
-            component_precision_floors: &[],
-        },
-        gen_core::MemoryBehaviorRoute {
-            mode: if is_control {
-                gen_core::MemoryMode::ImageToImage
-            } else {
-                gen_core::MemoryMode::TextToImage
-            },
-            reference_count: u32::from(is_control),
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        },
-    )?;
-    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+    let profile = if contract.provider_id.ends_with("_control") {
+        &CONTROL_MEMORY_PROFILE
+    } else {
+        &MEMORY_PROFILE
+    };
+    gen_core::standard_registered_valid_fixture(profile, spec, contract, strategy)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -1235,8 +1258,24 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    let quant = snapshot_quant_tier(spec, provider_id)?;
-    validate_context(provider_id, contract, context, quant)?;
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     Ok(Some(Box::new(request_scope(
         provider_id,
         Device::Cpu,

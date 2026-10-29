@@ -59,15 +59,18 @@ use mlx_gen::gen_core::iris::depth::DepthInputPlan;
 use mlx_gen::gen_core::iris::downstream::TaskExport;
 use mlx_gen::gen_core::iris::restoration::{RestorationPlan, RestorationResources};
 use mlx_gen::gen_core::iris::{GenerationResources, IrisConfig, IrisTask};
+#[cfg(test)]
+use mlx_gen::gen_core::MemoryBehaviorRoute;
 use mlx_gen::gen_core::{
     self, adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError, LoadShape,
     MemoryArchitectureFacts, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
-    MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind, MemoryContractSurfaceSpec,
-    MemoryContractSurfaceTier, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryContractSurfaceSpec,
+    MemoryContractSurfaceTier, MemoryFixtureMode, MemoryFixtureOverlay, MemoryFixturePhases,
+    MemoryFixtureRoute, MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities,
+    MemoryMode, MemoryNumericTier, MemoryPhase, MemoryProfileFixtures, MemoryProfileGates,
     MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Precision, ResidentRequestMemory,
-    Result as CoreResult,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Precision, ProviderMemoryProfile,
+    ResidentRequestMemory, Result as CoreResult,
 };
 use mlx_gen::gen_core::{GenerationRequest, MemoryGeometry, MemoryRunOutcome};
 use mlx_gen::LoadSpec;
@@ -943,7 +946,7 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check_at(mlx_gen::request_scope::loaded_tier(spec), contract, context)
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 /// [`safety_check`] for an already-loaded encoder-free model (`IrisDepth`, `IrisRestorer`), which
@@ -962,47 +965,89 @@ fn safety_check_at(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        let task = task_of(&contract.provider_id)?;
-        let id = provider_id(task);
-        if context.mode != memory_mode(task) {
-            return Err(CoreError::Unsupported(format!(
-                "{id}: this route's request surface is {:?}; got {:?}",
-                memory_mode(task).as_key(),
-                context.mode.as_key()
-            )));
-        }
-        if context.geometry.reference_count > 0 {
-            return Err(CoreError::Unsupported(format!(
-                "{id}: the route takes no reference images"
-            )));
-        }
-        if context.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{id}: there is no PiD decoder on this route"
-            )));
-        }
-        if context.geometry.frames > 1 {
-            return Err(CoreError::Unsupported(format!(
-                "{id}: a still-image route cannot admit {} frames",
-                context.geometry.frames
-            )));
-        }
-        // Depth estimates and restores one image per request; only generation batches.
-        if !task.uses_text_encoder() && context.geometry.batch != 1 {
-            return Err(CoreError::Unsupported(format!(
-                "{id}: one image per request, got a batch of {}",
-                context.geometry.batch
-            )));
-        }
-        Ok(())
-    };
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(tier),
-        Some(&route_gate),
+    gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, tier)
+}
+
+/// The Iris-3B MLX memory profile (sc-27307) of the generation route: the requested tier, the
+/// per-task route gate every route shares, and one staged text-to-image fixture (keyed apart when
+/// the load carries an adapter stack) per implemented optimized rung.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    gates: MemoryProfileGates::within(route_gate),
+    fixtures: MemoryProfileFixtures::routes(&[MemoryFixtureRoute::TEXT_TO_IMAGE
+        .with_phases(MemoryFixturePhases::Always)
+        .with_overlay(MemoryFixtureOverlay::WhenAdapters(ADAPTER_OVERLAY_KEY))])
+    .implemented_only(),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+/// The depth route's profile: the same gate, its own single-phase request surface.
+const DEPTH_MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    fixtures: MemoryProfileFixtures::routes(&[MemoryFixtureRoute::new(
+        MemoryFixtureMode::Other(DEPTH_MEMORY_MODE),
+        0,
     )
+    .with_overlay(MemoryFixtureOverlay::WhenAdapters(ADAPTER_OVERLAY_KEY))])
+    .implemented_only(),
+    ..MEMORY_PROFILE
+};
+
+/// The restoration route's profile: the same gate, its own single-phase request surface.
+const RESTORE_MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    fixtures: MemoryProfileFixtures::routes(&[MemoryFixtureRoute::new(
+        MemoryFixtureMode::Other(RESTORE_MEMORY_MODE),
+        0,
+    )
+    .with_overlay(MemoryFixtureOverlay::WhenAdapters(ADAPTER_OVERLAY_KEY))])
+    .implemented_only(),
+    ..MEMORY_PROFILE
+};
+
+fn task_profile(task: IrisTask) -> &'static ProviderMemoryProfile {
+    match task {
+        IrisTask::Generation => &MEMORY_PROFILE,
+        IrisTask::Depth => &DEPTH_MEMORY_PROFILE,
+        IrisTask::Restoration => &RESTORE_MEMORY_PROFILE,
+    }
+}
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    let task = task_of(&contract.provider_id)?;
+    let id = provider_id(task);
+    if context.mode != memory_mode(task) {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: this route's request surface is {:?}; got {:?}",
+            memory_mode(task).as_key(),
+            context.mode.as_key()
+        )));
+    }
+    if context.geometry.reference_count > 0 {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: the route takes no reference images"
+        )));
+    }
+    if context.use_pid {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: there is no PiD decoder on this route"
+        )));
+    }
+    if context.geometry.frames > 1 {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: a still-image route cannot admit {} frames",
+            context.geometry.frames
+        )));
+    }
+    // Depth estimates and restores one image per request; only generation batches.
+    if !task.uses_text_encoder() && context.geometry.batch != 1 {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: one image per request, got a batch of {}",
+            context.geometry.batch
+        )));
+    }
+    Ok(())
 }
 
 /// The geometry a depth request is admitted at: the grid the model actually runs on (the source
@@ -1050,30 +1095,20 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<MemoryBehaviorFixture>> {
-    if !strategy.is_optimized()
-        || !matches!(
-            contract.capability(strategy).map(|c| &c.support),
-            Some(MemoryStrategySupport::Implemented)
-        )
-    {
-        return Ok(Vec::new());
+    // An unknown route publishes nothing for a strategy the profile gates out, and is refused
+    // otherwise — the order the hand-rolled copy had (gate first, then the route lookup).
+    match task_of(&contract.provider_id) {
+        Ok(task) => gen_core::standard_registered_valid_fixture(
+            task_profile(task),
+            spec,
+            contract,
+            strategy,
+        ),
+        Err(error) => {
+            gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
+                .and_then(|fixtures| fixtures.is_empty().then_some(fixtures).ok_or(error))
+        }
     }
-    let task = task_of(&contract.provider_id)?;
-    let context = gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        mlx_gen::request_scope::loaded_tier(spec),
-        MemoryBehaviorRoute {
-            mode: memory_mode(task),
-            reference_count: 0,
-            use_pid: false,
-            has_phases: task.uses_text_encoder(),
-            // The loaded adapter stack is part of the route identity, so a fixture for an adapted
-            // load is keyed apart from a plain one (the key the Candle twin uses).
-            overlay: (!spec.adapters.is_empty()).then(|| ADAPTER_OVERLAY_KEY.to_owned()),
-        },
-    )?;
-    Ok(vec![MemoryBehaviorFixture::new(context)])
 }
 
 /// The overlay identity of a behavior fixture built for a spec that loads an adapter stack.
@@ -1126,7 +1161,25 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    mlx_gen::request_scope::admit(safety_check(spec, contract, context))?;
+    // The requested tier names no route, and the scope derives its route from the contract, so the
+    // family id stands in for the three route ids here.
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        MODEL_ID,
+        spec,
+        contract,
+        context,
+        admitted_scope,
+    )
+}
+
+fn admitted_scope(
+    _family_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     let task = task_of(&contract.provider_id)?;
     let windowed = context.selection.strategy == MemoryStrategy::BoundedTransformerResidency;
     // The encoder-free routes take no `GenerationRequest`: their only request-scoped lever is the

@@ -193,15 +193,14 @@
 //! conservatively retains the dense companion's full floor. Pure dense/stock sizing is unchanged.
 
 use mlx_gen::gen_core::{
-    safetensors_path_bytes, standard_memory_behavior_context,
-    standard_memory_strategy_safety_check, AdapterResidencyMode, Error as CoreError, LoadShape,
-    LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
-    MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport, ResidentRequestMemory,
-    TransformerComponent, WeightsSource,
+    safetensors_path_bytes, standard_memory_behavior_context, AdapterResidencyMode,
+    Error as CoreError, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
+    MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind,
+    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
+    ResidentRequestMemory, TransformerComponent, WeightsSource,
 };
 
 mod adapters;
@@ -304,11 +303,7 @@ pub fn production_calibration_fingerprint(spec: &LoadSpec) -> Option<String> {
         return None;
     }
     let tier = calibration_tier_label(resolved)?;
-    Some(if tier == CALIBRATED_TIER {
-        MEMORY_CALIBRATION_FINGERPRINT.to_owned()
-    } else {
-        format!("minimax-h3-{tier}-mlx-staged-joint-av-eager-abi3-v1")
-    })
+    Some(MEMORY_PROFILE.fingerprint?.render("", tier))
 }
 
 /// The DiT block count, mirrored from `MiniMaxH3DitConfig::default().num_layers`.
@@ -1923,12 +1918,34 @@ pub fn safety_check_at_tier(
     tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(tier),
-        Some(&|| route_gate(context)),
-    )
+    mlx_gen::gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, tier)
+}
+
+/// The MiniMax-H3 MLX memory profile (sc-27307): requested tier, the joint-AV route gate inside the
+/// shared pipeline, and the per-tier fingerprint spelling with the measured bf16 cell pinned. The
+/// behavior fixture stays provider-owned (the shared default geometry is off this family's frame
+/// lattice, so each route's context carries the `FIXTURE_*` geometry).
+const MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        gates: mlx_gen::gen_core::MemoryProfileGates::within(profile_route_gate),
+        fingerprint: Some(mlx_gen::gen_core::MemoryFingerprintTable {
+            template: "minimax-h3-{tier}-mlx-staged-joint-av-eager-abi3-v1",
+            routes: &[],
+            pins: &[mlx_gen::gen_core::MemoryFingerprintPin {
+                route: "",
+                tier: CALIBRATED_TIER,
+                fingerprint: MEMORY_CALIBRATION_FINGERPRINT,
+            }],
+        }),
+        ..mlx_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
+
+fn profile_route_gate(
+    _contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _tier: MemoryNumericTier,
+) -> mlx_gen::gen_core::Result<()> {
+    route_gate(context)
 }
 
 /// The spec-taking admission check — the [`MEMORY_REGISTRATION`] entry point, which probes
@@ -1945,7 +1962,7 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check_at_tier(contract, numeric_tier(spec), context)
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 /// Weights-free executable fixtures for one implemented optimized rung — one per render route.
@@ -2043,9 +2060,26 @@ pub fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        MODEL_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    tier: MemoryNumericTier,
+) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
         contract,
-        numeric_tier(spec),
+        tier,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )

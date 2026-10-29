@@ -175,14 +175,15 @@
 use std::path::Path;
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+#[cfg(test)]
+use mlx_gen::gen_core::MemoryBehaviorRoute;
 use mlx_gen::gen_core::{
     self, adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, PrefixKvCacheMode,
-    ResidentRequestMemory, Result as CoreResult,
+    MemoryBackendRealization, MemoryBehaviorFixture, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities,
+    MemoryMode, MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategySupport, PrefixKvCacheMode, ResidentRequestMemory, Result as CoreResult,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
 
@@ -1926,6 +1927,59 @@ fn validate_decode(id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreRes
     Ok(())
 }
 
+/// The Qwen-Image-2.1 MLX memory profile (sc-27307): requested tier, this route's own gate inside
+/// the shared pipeline, and one phased text-to-image fixture per implemented optimized rung.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    gates: gen_core::MemoryProfileGates::within(route_gate),
+    fixtures: gen_core::MemoryProfileFixtures::routes(&[
+        gen_core::MemoryFixtureRoute::TEXT_TO_IMAGE
+            .with_phases(gen_core::MemoryFixturePhases::Always),
+    ])
+    .implemented_only(),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: gen_core::MemoryNumericTier,
+) -> CoreResult<()> {
+    // E3 (sc-25909): the id the contract was priced for — the base or the Turbo one.
+    let id = contract.provider_id.as_str();
+    if !matches!(context.mode, MemoryMode::TextToImage) {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: this story's route is text-to-image; got {:?}",
+            context.mode
+        )));
+    }
+    // References are PRICED, not refused: sc-24110 advertises Reference/MultiReference on this
+    // route, and each condition image is an extra joint-sequence block worth
+    // `derived::REFERENCE_FIT_TOKENS`. The only reference gate here is the count the joint
+    // layout can express; the per-image validation (geometry, grid agreement, the 1..=10 bound
+    // as a request error) is `crate::reference`'s, and it must stay there so a bad reference is
+    // a request refusal rather than a memory refusal.
+    if context.geometry.reference_count as usize > MAX_REFERENCE_IMAGES {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
+             can express",
+            context.geometry.reference_count
+        )));
+    }
+    if context.use_pid {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: there is no PiD decoder on this route"
+        )));
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        validate_decode(
+            id,
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        )?;
+    }
+    Ok(())
+}
+
 /// The provider safety check: the shared handshake, then this route's own gate. It can reject,
 /// never swap in a different strategy or tier.
 pub fn safety_check(
@@ -1933,48 +1987,7 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    // E3 (sc-25909): the id the contract was priced for — the base or the Turbo one.
-    let id = contract.provider_id.as_str();
-    let route_gate = || {
-        if !matches!(context.mode, MemoryMode::TextToImage) {
-            return Err(CoreError::Unsupported(format!(
-                "{id}: this story's route is text-to-image; got {:?}",
-                context.mode
-            )));
-        }
-        // References are PRICED, not refused: sc-24110 advertises Reference/MultiReference on this
-        // route, and each condition image is an extra joint-sequence block worth
-        // `derived::REFERENCE_FIT_TOKENS`. The only reference gate here is the count the joint
-        // layout can express; the per-image validation (geometry, grid agreement, the 1..=10 bound
-        // as a request error) is `crate::reference`'s, and it must stay there so a bad reference is
-        // a request refusal rather than a memory refusal.
-        if context.geometry.reference_count as usize > MAX_REFERENCE_IMAGES {
-            return Err(CoreError::Unsupported(format!(
-                "{id}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
-                 can express",
-                context.geometry.reference_count
-            )));
-        }
-        if context.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{id}: there is no PiD decoder on this route"
-            )));
-        }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            validate_decode(
-                id,
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            )?;
-        }
-        Ok(())
-    };
-    mlx_gen::gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(mlx_gen::request_scope::loaded_tier(spec)),
-        Some(&route_gate),
-    )
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -1982,27 +1995,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<MemoryBehaviorFixture>> {
-    if !strategy.is_optimized()
-        || !matches!(
-            contract.capability(strategy).map(|c| &c.support),
-            Some(MemoryStrategySupport::Implemented)
-        )
-    {
-        return Ok(Vec::new());
-    }
-    let context = mlx_gen::gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        mlx_gen::request_scope::loaded_tier(spec),
-        MemoryBehaviorRoute {
-            mode: MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            has_phases: true,
-            overlay: None,
-        },
-    )?;
-    Ok(vec![MemoryBehaviorFixture::new(context)])
+    gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub(crate) fn registered_begin_request(
@@ -2010,7 +2003,14 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    begin_request_for(MODEL_ID, spec, contract, context)
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        MODEL_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
 }
 
 /// [`registered_begin_request`] for the distilled Turbo id (sc-25900).
@@ -2019,7 +2019,24 @@ pub(crate) fn registered_begin_turbo_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    begin_request_for(TURBO_MODEL_ID, spec, contract, context)
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        TURBO_MODEL_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: gen_core::MemoryNumericTier,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    begin_request_for(provider_id, spec, contract, context)
 }
 
 /// The executable admission seam both engine ids share; `provider_id` only labels the scope.

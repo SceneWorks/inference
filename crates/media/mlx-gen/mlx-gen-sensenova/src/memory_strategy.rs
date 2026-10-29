@@ -744,11 +744,7 @@ pub fn requested_tier(spec: &LoadSpec) -> Option<Quant> {
 pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
     let route = route_label(spec_route(provider_id, spec))?;
     let tier = calibration_tier_label(requested_tier(spec))?;
-    Some(match (route, tier) {
-        ("quality", "q8") => QUALITY_CALIBRATION_FINGERPRINT.to_owned(),
-        ("fast", "q8") => FAST_CALIBRATION_FINGERPRINT.to_owned(),
-        _ => format!("sensenova-u1-{route}-{tier}-mlx-shared-ladder-v1"),
-    })
+    Some(MEMORY_PROFILE.fingerprint?.render(route, tier))
 }
 
 /// The identity a PRODUCTION load publishes: the (route, tier) string from
@@ -1164,130 +1160,170 @@ pub fn verified_runner_artifact(provider_id: &str, spec: &LoadSpec) -> CoreResul
     Ok(artifact.digest().to_owned())
 }
 
+/// The SenseNova MLX memory profile (sc-27307): a bf16 compute tier at the requested
+/// quantization, the structural/measured-envelope route gate inside the shared pipeline, the two
+/// calibrated behavior fixtures (text-to-image and single-reference edit, only for a calibrated
+/// contract), and the (route, tier) fingerprint spelling with the two measured q8 cells pinned.
+const MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        tier: mlx_gen::gen_core::MemoryProfileTier::FixedPrecision(mlx_gen::Precision::Bf16),
+        gates: mlx_gen::gen_core::MemoryProfileGates::within(route_gate),
+        fixtures: mlx_gen::gen_core::MemoryProfileFixtures::routes(&[
+            mlx_gen::gen_core::MemoryFixtureRoute::TEXT_TO_IMAGE,
+            mlx_gen::gen_core::MemoryFixtureRoute::new(
+                mlx_gen::gen_core::MemoryFixtureMode::Edit,
+                1,
+            ),
+        ])
+        .calibrated_only()
+        .with_prompt("weights-free SenseNova memory behavior"),
+        fingerprint: Some(mlx_gen::gen_core::MemoryFingerprintTable {
+            template: "sensenova-u1-{route}-{tier}-mlx-shared-ladder-v1",
+            // The route label comes from the spec's resolved catalog route ([`route_label`]).
+            routes: &[],
+            pins: &[
+                mlx_gen::gen_core::MemoryFingerprintPin {
+                    route: "quality",
+                    tier: "q8",
+                    fingerprint: QUALITY_CALIBRATION_FINGERPRINT,
+                },
+                mlx_gen::gen_core::MemoryFingerprintPin {
+                    route: "fast",
+                    tier: "q8",
+                    fingerprint: FAST_CALIBRATION_FINGERPRINT,
+                },
+            ],
+        }),
+        ..mlx_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    // sc-20569: this gate describes what the 2026-08-03 calibration campaign MEASURED — clean
+    // 1024x1024 text-to-image (and the single-reference edit) at batch 1, one frame. That is a
+    // statement about which evidence exists, not about what the engine can render. The shipped
+    // manifest advertises seven geometries from 1152 to 2048 per side, counts 1/2/4, and a
+    // `character_image` (image-to-image) route; the measured cell is not among them, so an
+    // unconditional refusal here rejected EVERY product-legal SenseNova request in production.
+    //
+    // Envelope clauses therefore DEGRADE instead of refusing. A context whose authority is
+    // `Estimated` or `Resident` has already been told by the caller that it is not riding the
+    // measured ladder — that is exactly `AdmissionPath::Legacy` in the SceneWorks fit gate,
+    // which routes an out-of-envelope or stale-identity request to the legacy estimator rather
+    // than killing it. Only a `Calibrated` claim ("grade me against the measured ladder") is
+    // held to the measured cell, because admitting THAT off-cell would grade a request against
+    // evidence captured at a different geometry — the false green this gate exists to stop.
+    //
+    // The structural clauses below are NOT envelope statements and stay unconditional: no
+    // amount of estimate authority makes SenseNova grow a PiD seam or a multi-phase trajectory.
+    let claims_measured_evidence =
+        context.optimization_authority == MemoryOptimizationAuthority::Calibrated;
+    let structurally_supported = match (&context.mode, context.geometry.reference_count) {
+        (MemoryMode::TextToImage, 0) => true,
+        (MemoryMode::Edit | MemoryMode::ImageToImage, 1..=5) => true,
+        (MemoryMode::Other(mode), 1..=5) if mode == "edit_image" || mode == "character_image" => {
+            true
+        }
+        (MemoryMode::Other(mode), 1)
+            if contract.provider_id == crate::MODEL_ID && mode == "vqa" =>
+        {
+            true
+        }
+        (MemoryMode::Other(mode), 0..=10)
+            if contract.provider_id == crate::MODEL_ID && mode == "interleave" =>
+        {
+            true
+        }
+        _ => false,
+    };
+    if !structurally_supported {
+        return Err(CoreError::Msg(format!(
+            "{}: unsupported SenseNova route {}/{} references",
+            contract.provider_id,
+            context.mode.as_key(),
+            context.geometry.reference_count
+        )));
+    }
+    if matches!(&context.mode, MemoryMode::Other(mode) if mode == "interleave")
+        && !(1..=10).contains(&context.geometry.batch)
+    {
+        return Err(CoreError::Msg(format!(
+            "{}: interleave generated-image count must be 1..=10, got {}",
+            contract.provider_id, context.geometry.batch
+        )));
+    }
+    if matches!(&context.mode, MemoryMode::Other(mode) if mode == "vqa")
+        && context.selection.strategy == MemoryStrategy::BoundedTransformerResidency
+    {
+        return Err(CoreError::Msg(format!(
+            "{}: bounded transformer residency is structurally not applicable to VQA understanding",
+            contract.provider_id
+        )));
+    }
+    // Every refusal below is built with `CoreError::Msg`, not `CoreError::Unsupported`. The
+    // shared pipeline stringifies a route-gate error into `MemorySafetyDecision::Reject`
+    // immediately (`error.to_string()`), so nothing downstream can read the type, while
+    // `begin_request` types the surviving string as `Unsupported` once at the request boundary.
+    // Building `Unsupported` here too is what printed `unsupported: unsupported: …` in the
+    // production log (sc-20569).
+    if claims_measured_evidence
+        && !matches!(
+            (&context.mode, context.geometry.reference_count),
+            (MemoryMode::TextToImage, 0) | (MemoryMode::Edit, 1)
+        )
+    {
+        return Err(CoreError::Msg(format!(
+            "{}: calibrated memory routes are exactly TextToImage with zero references and Edit with one reference",
+            contract.provider_id
+        )));
+    }
+    if context.use_pid || context.overlay.is_some() {
+        return Err(CoreError::Msg(format!(
+            "{}: SenseNova has no PiD or overlay seam",
+            contract.provider_id
+        )));
+    }
+    // `GenerationRequest::phases` is read only by the Krea MLX family; SenseNova's denoise
+    // threads one AR trajectory through a per-step-mutated KV cache and ignores the field
+    // entirely. A phase-bearing context would therefore be admitted against evidence for a
+    // trajectory the engine never runs, so it fails closed here.
+    if context.has_phases {
+        return Err(CoreError::Msg(format!(
+            "{}: SenseNova runs one single-phase trajectory and ignores request phases",
+            contract.provider_id
+        )));
+    }
+    if claims_measured_evidence
+        && (context.geometry.width != 1024
+            || context.geometry.height != 1024
+            || context.geometry.batch != 1
+            || context.geometry.frames != 1)
+    {
+        return Err(CoreError::Msg(format!(
+            "{}: calibrated memory geometry is exactly 1024x1024, batch 1, and one frame",
+            contract.provider_id
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     quant: Option<Quant>,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        // sc-20569: this gate describes what the 2026-08-03 calibration campaign MEASURED — clean
-        // 1024x1024 text-to-image (and the single-reference edit) at batch 1, one frame. That is a
-        // statement about which evidence exists, not about what the engine can render. The shipped
-        // manifest advertises seven geometries from 1152 to 2048 per side, counts 1/2/4, and a
-        // `character_image` (image-to-image) route; the measured cell is not among them, so an
-        // unconditional refusal here rejected EVERY product-legal SenseNova request in production.
-        //
-        // Envelope clauses therefore DEGRADE instead of refusing. A context whose authority is
-        // `Estimated` or `Resident` has already been told by the caller that it is not riding the
-        // measured ladder — that is exactly `AdmissionPath::Legacy` in the SceneWorks fit gate,
-        // which routes an out-of-envelope or stale-identity request to the legacy estimator rather
-        // than killing it. Only a `Calibrated` claim ("grade me against the measured ladder") is
-        // held to the measured cell, because admitting THAT off-cell would grade a request against
-        // evidence captured at a different geometry — the false green this gate exists to stop.
-        //
-        // The structural clauses below are NOT envelope statements and stay unconditional: no
-        // amount of estimate authority makes SenseNova grow a PiD seam or a multi-phase trajectory.
-        let claims_measured_evidence =
-            context.optimization_authority == MemoryOptimizationAuthority::Calibrated;
-        let structurally_supported = match (&context.mode, context.geometry.reference_count) {
-            (MemoryMode::TextToImage, 0) => true,
-            (MemoryMode::Edit | MemoryMode::ImageToImage, 1..=5) => true,
-            (MemoryMode::Other(mode), 1..=5)
-                if mode == "edit_image" || mode == "character_image" =>
-            {
-                true
-            }
-            (MemoryMode::Other(mode), 1)
-                if contract.provider_id == crate::MODEL_ID && mode == "vqa" =>
-            {
-                true
-            }
-            (MemoryMode::Other(mode), 0..=10)
-                if contract.provider_id == crate::MODEL_ID && mode == "interleave" =>
-            {
-                true
-            }
-            _ => false,
-        };
-        if !structurally_supported {
-            return Err(CoreError::Msg(format!(
-                "{}: unsupported SenseNova route {}/{} references",
-                contract.provider_id,
-                context.mode.as_key(),
-                context.geometry.reference_count
-            )));
-        }
-        if matches!(&context.mode, MemoryMode::Other(mode) if mode == "interleave")
-            && !(1..=10).contains(&context.geometry.batch)
-        {
-            return Err(CoreError::Msg(format!(
-                "{}: interleave generated-image count must be 1..=10, got {}",
-                contract.provider_id, context.geometry.batch
-            )));
-        }
-        if matches!(&context.mode, MemoryMode::Other(mode) if mode == "vqa")
-            && context.selection.strategy == MemoryStrategy::BoundedTransformerResidency
-        {
-            return Err(CoreError::Msg(format!(
-                "{}: bounded transformer residency is structurally not applicable to VQA understanding",
-                contract.provider_id
-            )));
-        }
-        // Every refusal below is built with `CoreError::Msg`, not `CoreError::Unsupported`. The
-        // shared pipeline stringifies a route-gate error into `MemorySafetyDecision::Reject`
-        // immediately (`error.to_string()`), so nothing downstream can read the type, while
-        // `begin_request` types the surviving string as `Unsupported` once at the request boundary.
-        // Building `Unsupported` here too is what printed `unsupported: unsupported: …` in the
-        // production log (sc-20569).
-        if claims_measured_evidence
-            && !matches!(
-                (&context.mode, context.geometry.reference_count),
-                (MemoryMode::TextToImage, 0) | (MemoryMode::Edit, 1)
-            )
-        {
-            return Err(CoreError::Msg(format!(
-                "{}: calibrated memory routes are exactly TextToImage with zero references and Edit with one reference",
-                contract.provider_id
-            )));
-        }
-        if context.use_pid || context.overlay.is_some() {
-            return Err(CoreError::Msg(format!(
-                "{}: SenseNova has no PiD or overlay seam",
-                contract.provider_id
-            )));
-        }
-        // `GenerationRequest::phases` is read only by the Krea MLX family; SenseNova's denoise
-        // threads one AR trajectory through a per-step-mutated KV cache and ignores the field
-        // entirely. A phase-bearing context would therefore be admitted against evidence for a
-        // trajectory the engine never runs, so it fails closed here.
-        if context.has_phases {
-            return Err(CoreError::Msg(format!(
-                "{}: SenseNova runs one single-phase trajectory and ignores request phases",
-                contract.provider_id
-            )));
-        }
-        if claims_measured_evidence
-            && (context.geometry.width != 1024
-                || context.geometry.height != 1024
-                || context.geometry.batch != 1
-                || context.geometry.frames != 1)
-        {
-            return Err(CoreError::Msg(format!(
-                "{}: calibrated memory geometry is exactly 1024x1024, batch 1, and one frame",
-                contract.provider_id
-            )));
-        }
-        Ok(())
-    };
-    mlx_gen::gen_core::standard_memory_strategy_safety_check(
+    mlx_gen::gen_core::standard_safety_check(
+        &MEMORY_PROFILE,
         contract,
         context,
-        Some(MemoryNumericTier {
+        MemoryNumericTier {
             precision: mlx_gen::Precision::Bf16,
             quant,
             component_precision_floors: &[],
-        }),
-        Some(&route_gate),
+        },
     )
 }
 
@@ -1296,7 +1332,7 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, spec.quantize, context)
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn validate_direct_operation_identity(
@@ -1360,35 +1396,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() || contract.calibration.is_none() {
-        return Ok(Vec::new());
-    }
-    let tier = mlx_gen::request_scope::loaded_tier(spec);
-    [
-        mlx_gen::gen_core::MemoryBehaviorRoute {
-            mode: MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        },
-        mlx_gen::gen_core::MemoryBehaviorRoute {
-            mode: MemoryMode::Edit,
-            reference_count: 1,
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        },
-    ]
-    .into_iter()
-    .map(|route| {
-        let mut fixture = mlx_gen::gen_core::MemoryBehaviorFixture::new(
-            mlx_gen::gen_core::standard_memory_behavior_context(contract, strategy, tier, route)?,
-        );
-        fixture.request.prompt = "weights-free SenseNova memory behavior".into();
-        Ok(fixture)
-    })
-    .collect()
+    mlx_gen::gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub(crate) fn registered_begin_request(
@@ -1397,10 +1405,27 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_request(
         provider_id,
         contract,
-        spec.quantize,
+        loaded_tier.quant,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )
@@ -4068,6 +4093,66 @@ mod selected_companion_alias_tests {
         );
         assert!(
             selected_base_names(inventory, Some(vec!["model.safetensors".into()]), None).is_none()
+        );
+    }
+}
+
+/// sc-27307: every production calibration fingerprint this family can publish, pinned byte for
+/// byte across the move to a [`mlx_gen::gen_core::MemoryFingerprintTable`].
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+    use mlx_gen::WeightsSource;
+
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        let routes = [
+            ("sensenova_u1_8b", "quality"),
+            ("sensenova_u1_8b_fast", "fast"),
+            ("sensenova_u1_8b_infographic_v2", "infographic2"),
+            ("sensenova_u1_8b_infographic_v2_fast", "infographic2-fast"),
+            ("sensenova_u1_8b_infographic_v3", "infographic3"),
+            ("sensenova_u1_8b_infographic_v3_fast", "infographic3-fast"),
+        ];
+        for (route, label) in routes {
+            for (quant, tier) in [
+                (None, "bf16"),
+                (Some(Quant::Q4), "q4"),
+                (Some(Quant::Q8), "q8"),
+            ] {
+                let mut spec = LoadSpec::new(WeightsSource::Dir("/sc-27307-absent".into()));
+                spec.quantize = quant;
+                spec.resolved_route = Some(route.to_owned());
+                let expected = match (label, tier) {
+                    ("quality", "q8") => {
+                        "sensenova-u1-quality-q8-mlx-shared-ladder-2026-08-03-v1".to_owned()
+                    }
+                    ("fast", "q8") => {
+                        "sensenova-u1-fast-q8-mlx-shared-ladder-2026-08-03-v1".to_owned()
+                    }
+                    _ => format!("sensenova-u1-{label}-{tier}-mlx-shared-ladder-v1"),
+                };
+                assert_eq!(
+                    production_calibration_fingerprint(crate::MODEL_ID, &spec),
+                    Some(expected)
+                );
+            }
+            let mut packed = LoadSpec::new(WeightsSource::Dir("/sc-27307-absent".into()));
+            packed.quantize = Some(Quant::Nvfp4);
+            packed.resolved_route = Some(route.to_owned());
+            assert_eq!(
+                production_calibration_fingerprint(crate::MODEL_ID, &packed),
+                None
+            );
+        }
+        let plain = LoadSpec::new(WeightsSource::Dir("/sc-27307-absent".into()));
+        assert_eq!(
+            production_calibration_fingerprint(crate::MODEL_ID_FAST, &plain).as_deref(),
+            Some("sensenova-u1-fast-bf16-mlx-shared-ladder-v1")
+        );
+        assert_eq!(
+            production_calibration_fingerprint("not_sensenova", &plain),
+            None
         );
     }
 }

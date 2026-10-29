@@ -374,11 +374,27 @@ impl PreparedSvdMemory {
 /// A weights-free contract — no materialized snapshot directory — publishes
 /// `MemoryArchitectureFacts::default()`.
 fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    gen_core::standard_architecture_facts(&MEMORY_PROFILE, crate::MODEL_ID, spec)
+}
+
+/// The Candle SVD memory profile (sc-27307). Admission stays provider-owned: [`safety_check`]
+/// validates against the [`PreparedSvdMemory`] receipt (its sealed tier and identity), which the
+/// profile's contract/context/tier hooks cannot carry. The profile owns the snapshot-guarded
+/// architecture facts.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    _root: &std::path::Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    if af::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
     let unet = crate::config::UnetConfig::default();
     let vae = crate::config::VaeConfig::default();
     let mut per_stage = unet

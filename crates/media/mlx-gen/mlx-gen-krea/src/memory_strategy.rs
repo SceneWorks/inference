@@ -36,11 +36,13 @@ use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::MemoryGeometry;
 use mlx_gen::gen_core::{
     Error as CoreError, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
-    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
-    MemoryRunContext, MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFixtureMode,
+    MemoryFixtureOverlay, MemoryFixtureRoute, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProfileFixtures, MemoryProfileGates, MemoryProfileTier, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRuntimeSemantics,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
+    ProviderMemoryProfile, Result as CoreResult, TransformerComponent,
 };
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
@@ -687,38 +689,68 @@ pub fn safety_check(
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        // The Krea pose-control composition deliberately has no PiD decoder (its heavy bundle is the
-        // base VAE plus the pose branch). Reject the flag explicitly instead of letting the residency
-        // seam ignore it and execute a native decode under a PiD-labelled request.
-        if context.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{}: PiD decode is not implemented for pose control",
-                contract.provider_id
-            )));
-        }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            let routes = decode_routes(&contract.provider_id)?;
-            routes
-                .validate(
-                    false,
-                    context.selection.parameters.decode_tile_edge,
-                    context.selection.parameters.decode_overlap,
-                )
-                .map_err(CoreError::Unsupported)?;
-        }
-        Ok(())
-    };
-    mlx_gen::gen_core::standard_memory_strategy_safety_check(
+    mlx_gen::gen_core::standard_safety_check(
+        &MEMORY_PROFILE,
         contract,
         context,
-        Some(MemoryNumericTier {
+        MemoryNumericTier {
             precision,
             quant,
             component_precision_floors: &[],
-        }),
-        Some(&route_gate),
+        },
     )
+}
+
+/// The Krea pose-control MLX memory profile (sc-27307): the base snapshot's effective quant tier,
+/// the PiD/decode-route gate, and one single-reference pose-control fixture per optimized rung.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    tier: MemoryProfileTier::Resolved(profile_tier),
+    gates: MemoryProfileGates::within(route_gate),
+    fixtures: MemoryProfileFixtures::routes(&[MemoryFixtureRoute::new(
+        MemoryFixtureMode::ImageToImage,
+        1,
+    )
+    .with_overlay(MemoryFixtureOverlay::Fixed("pose-control"))]),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn profile_tier(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> CoreResult<MemoryNumericTier> {
+    let provider_id = contract.provider_id.as_str();
+    Ok(MemoryNumericTier {
+        precision: spec.precision,
+        quant: crate::model::effective_base_quant_tier(spec, provider_id)?,
+        component_precision_floors: &[],
+    })
+}
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    // The Krea pose-control composition deliberately has no PiD decoder (its heavy bundle is the
+    // base VAE plus the pose branch). Reject the flag explicitly instead of letting the residency
+    // seam ignore it and execute a native decode under a PiD-labelled request.
+    if context.use_pid {
+        return Err(CoreError::Unsupported(format!(
+            "{}: PiD decode is not implemented for pose control",
+            contract.provider_id
+        )));
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        let routes = decode_routes(&contract.provider_id)?;
+        routes
+            .validate(
+                false,
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap,
+            )
+            .map_err(CoreError::Unsupported)?;
+    }
+    Ok(())
 }
 
 pub fn registered_safety_check(
@@ -726,8 +758,20 @@ pub fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    // Resolved here rather than through `standard_registered_safety_check`: an unresolvable tier
+    // is refused with the backend error's own rendering, which `MEMORY_PROFILE`'s tier hook (typed
+    // as the backend-neutral error) would re-render for an MLX/safetensors I/O failure.
     match crate::model::effective_base_quant_tier(spec, &contract.provider_id) {
-        Ok(quant) => safety_check(contract, spec.precision, quant, context),
+        Ok(quant) => mlx_gen::gen_core::standard_safety_check(
+            &MEMORY_PROFILE,
+            contract,
+            context,
+            MemoryNumericTier {
+                precision: spec.precision,
+                quant,
+                component_precision_floors: &[],
+            },
+        ),
         Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
@@ -737,27 +781,7 @@ pub fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
-        return Ok(Vec::new());
-    }
-    let quant = crate::model::effective_base_quant_tier(spec, &contract.provider_id)?;
-    let context = mlx_gen::gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant,
-            component_precision_floors: &[],
-        },
-        mlx_gen::gen_core::MemoryBehaviorRoute {
-            mode: mlx_gen::gen_core::MemoryMode::ImageToImage,
-            reference_count: 1,
-            use_pid: false,
-            has_phases: false,
-            overlay: Some("pose-control".to_owned()),
-        },
-    )?;
-    Ok(vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(context)])
+    mlx_gen::gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub fn registered_begin_request(
@@ -766,11 +790,28 @@ pub fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
         provider_id,
         contract,
-        spec.precision,
-        crate::model::effective_base_quant_tier(spec, provider_id)?,
+        loaded_tier.precision,
+        loaded_tier.quant,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )

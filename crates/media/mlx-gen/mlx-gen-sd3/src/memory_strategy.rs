@@ -51,11 +51,11 @@
 //! production string.
 
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryPhase, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, TransformerComponent,
+    Error as CoreError, LoadShape, LoadSpec, MemoryBackendRealization, MemoryCalibrationIdentity,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryPhase,
+    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy};
@@ -272,12 +272,8 @@ pub fn production_calibration_fingerprint(
     artifact_tier: Option<mlx_gen::Quant>,
     calibrated: bool,
 ) -> Option<String> {
-    let route = match provider_id {
-        crate::MODEL_ID => "large",
-        crate::TURBO_MODEL_ID => "large-turbo",
-        crate::MEDIUM_MODEL_ID => "medium",
-        _ => return None,
-    };
+    let table = MEMORY_PROFILE.fingerprint?;
+    table.route(provider_id)?;
     let tier = calibration_tier_label(artifact_tier)?;
     match (calibrated, provider_id, artifact_tier) {
         // The one measured cell. Its evidence is bf16 Large and nothing else.
@@ -285,7 +281,7 @@ pub fn production_calibration_fingerprint(
         // A content-pinned snapshot is not a shipped turnkey, so it may never borrow a turnkey
         // string; any other calibrated shape is unnameable and fails closed.
         (true, _, _) => None,
-        (false, _, _) => Some(format!("sd3-5-{route}-{tier}-mlx-shared-ladder-v1")),
+        (false, _, _) => table.fingerprint(provider_id, tier),
     }
 }
 
@@ -400,54 +396,82 @@ pub(crate) fn weights_free_contract(
     )
 }
 
+/// The SD3.5 MLX memory profile (sc-27307): requested tier, the route gate inside the shared
+/// pipeline, text-to-image and single-reference img2img fixtures (phased under `Sequential`) per
+/// implemented rung, and the turnkey fingerprint spelling.
+const MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        gates: mlx_gen::gen_core::MemoryProfileGates::within(route_gate),
+        fixtures: mlx_gen::gen_core::MemoryProfileFixtures::routes(&[
+            mlx_gen::gen_core::MemoryFixtureRoute::TEXT_TO_IMAGE
+                .with_phases(mlx_gen::gen_core::MemoryFixturePhases::WhenSequentialOffload),
+            mlx_gen::gen_core::MemoryFixtureRoute::new(
+                mlx_gen::gen_core::MemoryFixtureMode::ImageToImage,
+                1,
+            )
+            .with_phases(mlx_gen::gen_core::MemoryFixturePhases::WhenSequentialOffload),
+        ])
+        .implemented_only(),
+        fingerprint: Some(mlx_gen::gen_core::MemoryFingerprintTable {
+            template: "sd3-5-{route}-{tier}-mlx-shared-ladder-v1",
+            routes: &[
+                (crate::MODEL_ID, "large"),
+                (crate::TURBO_MODEL_ID, "large-turbo"),
+                (crate::MEDIUM_MODEL_ID, "medium"),
+            ],
+            pins: &[],
+        }),
+        ..mlx_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+) -> mlx_gen::gen_core::Result<()> {
+    let route_ok = matches!(context.mode, MemoryMode::TextToImage)
+        && context.geometry.reference_count == 0
+        || matches!(context.mode, MemoryMode::ImageToImage)
+            && context.geometry.reference_count == 1;
+    if !route_ok {
+        return Err(CoreError::Unsupported(
+            "sd3 memory route must be text-to-image or single-reference img2img".to_owned(),
+        ));
+    }
+    if context.use_pid {
+        return Err(CoreError::Unsupported(
+            "sd3 does not implement PiD decode".to_owned(),
+        ));
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        match (
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        ) {
+            (Some(edge), Some(overlap)) => validate_decode(edge, overlap)?,
+            _ => return Err(decode_domain_error()),
+        }
+    }
+    if contract.engages(
+        context.selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    ) && (!context.has_phases || !contract.lifecycle.transformer_window_materialization)
+    {
+        return Err(CoreError::Unsupported(
+            "sd3 transformer streaming requires a staged Sequential + DeferredMaterialization \
+             route over an admitted, unchanging transformer snapshot subtree"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        let route_ok = matches!(context.mode, MemoryMode::TextToImage)
-            && context.geometry.reference_count == 0
-            || matches!(context.mode, MemoryMode::ImageToImage)
-                && context.geometry.reference_count == 1;
-        if !route_ok {
-            return Err(CoreError::Unsupported(
-                "sd3 memory route must be text-to-image or single-reference img2img".to_owned(),
-            ));
-        }
-        if context.use_pid {
-            return Err(CoreError::Unsupported(
-                "sd3 does not implement PiD decode".to_owned(),
-            ));
-        }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            match (
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            ) {
-                (Some(edge), Some(overlap)) => validate_decode(edge, overlap)?,
-                _ => return Err(decode_domain_error()),
-            }
-        }
-        if contract.engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        ) && (!context.has_phases || !contract.lifecycle.transformer_window_materialization)
-        {
-            return Err(CoreError::Unsupported(
-                "sd3 transformer streaming requires a staged Sequential + DeferredMaterialization \
-                 route over an admitted, unchanging transformer snapshot subtree"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
-    };
-    standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(mlx_gen::request_scope::loaded_tier(spec)),
-        Some(&route_gate),
-    )
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn registered_fixture(
@@ -455,34 +479,7 @@ pub(crate) fn registered_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> mlx_gen::gen_core::Result<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
-        return Ok(Vec::new());
-    }
-    if contract
-        .capability(strategy)
-        .is_none_or(|capability| capability.support != MemoryStrategySupport::Implemented)
-    {
-        return Ok(Vec::new());
-    }
-    let tier = mlx_gen::request_scope::loaded_tier(spec);
-    [(MemoryMode::TextToImage, 0), (MemoryMode::ImageToImage, 1)]
-        .into_iter()
-        .map(|(mode, reference_count)| {
-            mlx_gen::gen_core::standard_memory_behavior_context(
-                contract,
-                strategy,
-                tier,
-                mlx_gen::gen_core::MemoryBehaviorRoute {
-                    mode,
-                    reference_count,
-                    use_pid: false,
-                    has_phases: spec.offload_policy == OffloadPolicy::Sequential,
-                    overlay: None,
-                },
-            )
-            .map(mlx_gen::gen_core::MemoryBehaviorFixture::new)
-        })
-        .collect()
+    mlx_gen::gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 fn begin_request_with_cleanup(
@@ -516,6 +513,23 @@ pub(crate) fn registered_begin_request(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_static(&contract.provider_id)?,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
         spec,
@@ -1402,5 +1416,58 @@ mod tests {
                 .support,
             MemoryStrategySupport::Missing
         );
+    }
+}
+
+/// sc-27307: every production calibration fingerprint this family can publish, pinned byte for
+/// byte across the move to a [`mlx_gen::gen_core::MemoryFingerprintTable`].
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        let mut seen = Vec::new();
+        for calibrated in [false, true] {
+            for provider in [
+                crate::MODEL_ID,
+                crate::TURBO_MODEL_ID,
+                crate::MEDIUM_MODEL_ID,
+                "not_sd3",
+            ] {
+                for quant in [
+                    None,
+                    Some(mlx_gen::Quant::Q4),
+                    Some(mlx_gen::Quant::Q8),
+                    Some(mlx_gen::Quant::Nvfp4),
+                ] {
+                    seen.push(production_calibration_fingerprint(
+                        provider, quant, calibrated,
+                    ));
+                }
+            }
+        }
+        let some = |s: &str| Some(s.to_owned());
+        let mut expected = vec![
+            some("sd3-5-large-bf16-mlx-shared-ladder-v1"),
+            some("sd3-5-large-q4-mlx-shared-ladder-v1"),
+            some("sd3-5-large-q8-mlx-shared-ladder-v1"),
+            None,
+            some("sd3-5-large-turbo-bf16-mlx-shared-ladder-v1"),
+            some("sd3-5-large-turbo-q4-mlx-shared-ladder-v1"),
+            some("sd3-5-large-turbo-q8-mlx-shared-ladder-v1"),
+            None,
+            some("sd3-5-medium-bf16-mlx-shared-ladder-v1"),
+            some("sd3-5-medium-q4-mlx-shared-ladder-v1"),
+            some("sd3-5-medium-q8-mlx-shared-ladder-v1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        expected.push(some("sd3-5-large-bf16-mlx-shared-ladder-2026-08-03-v1"));
+        expected.extend(std::iter::repeat_n(None, 15));
+        assert_eq!(seen, expected);
     }
 }

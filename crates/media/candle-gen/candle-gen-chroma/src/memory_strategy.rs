@@ -934,15 +934,24 @@ pub fn production_calibration_fingerprint(
     provider_id: &str,
     tier: Option<Quant>,
 ) -> Option<String> {
-    let route = route_identity(provider_id).ok()?.provider.replace('_', "-");
-    let tier = Quant::affine_tier_label(tier)?;
-    Some(format!("{route}-{tier}-cuda-{CANDLE_LADDER_REVISION}"))
+    MEMORY_PROFILE
+        .fingerprint?
+        .fingerprint(provider_id, Quant::affine_tier_label(tier)?)
 }
 
-/// The shape of the Candle Chroma ladder every identity above names: the request-scoped
-/// Resident/Staged surface SC-20788 sealed. Bump it when that shape changes, which is what makes
-/// every Chroma anchor recaptured rather than silently re-bound.
-const CANDLE_LADDER_REVISION: &str = "request-scoped-staged-residency-v1";
+/// The spelling of the identities above: `{route}-{tier}-cuda-{ladder revision}`, the route being
+/// the provider id with dashes. The revision names the shape of the Candle Chroma ladder: the
+/// request-scoped Resident/Staged surface SC-20788 sealed. Bump it when that shape changes, which
+/// is what makes every Chroma anchor recaptured rather than silently re-bound.
+const FINGERPRINTS: gen_core::MemoryFingerprintTable = gen_core::MemoryFingerprintTable {
+    template: "{route}-{tier}-cuda-request-scoped-staged-residency-v1",
+    routes: &[
+        (crate::CHROMA1_HD_ID, "chroma1-hd"),
+        (crate::CHROMA1_BASE_ID, "chroma1-base"),
+        (crate::CHROMA1_FLASH_ID, "chroma1-flash"),
+    ],
+    pins: &[],
+};
 
 #[cfg(test)]
 pub(crate) fn uncalibrated_contract(
@@ -1069,15 +1078,18 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// `vae_temporal_scale` stays `None`: Chroma decodes through the FLUX.1 image `AutoencoderKL`,
 /// which has no temporal axis at all, and a structurally absent axis is declared absent, never
 /// zero (E2).
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+///
+/// Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+/// pipeline has been resolved there, so no axis is knowable and every one stays `None` (the
+/// profile's snapshot guard). Chroma's real snapshot root is a tier subdirectory (`q4` / `q8` /
+/// `bf16`); the gate is the same.
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    _root: &Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
-    // pipeline has been resolved there, so no axis is knowable and every one stays `None`. Chroma's
-    // real snapshot root is a tier subdirectory (`q4` / `q8` / `bf16`); the gate is the same.
-    if af::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
     let dit = crate::config::ChromaTransformerConfig::default();
     gen_core::MemoryArchitectureFacts {
         attention_heads: af::declared(dit.num_attention_heads),
@@ -1128,7 +1140,11 @@ fn build_contract(
         .collect();
     MemoryProviderContract {
         phase_facts: None,
-        architecture_facts: architecture_facts(spec),
+        architecture_facts: gen_core::standard_architecture_facts(
+            &MEMORY_PROFILE,
+            provider_id,
+            spec,
+        ),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1253,11 +1269,32 @@ fn validate_route(
     Ok(())
 }
 
-pub(crate) fn validate_context(
-    provider_id: &str,
+/// The Candle Chroma memory profile (sc-27307): the structural-estimate handshake refuses before the
+/// shared pipeline and the exact-route/overlay gate ([`validate_route`]) after it, as the
+/// hand-rolled gate ordered them. The registry tier, begin-request and fixtures stay
+/// provider-owned: they re-seal the artifact receipt against the caller's contract and synthesize
+/// an exact turnkey load spec, which the profile cannot express.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(registered_tier),
+    rejection: gen_core::MemoryRejectionRendering::ValidationError,
+    gates: gen_core::MemoryProfileGates {
+        before: Some(estimate_handshake_gate),
+        within: None,
+        after: Some(route_gate),
+    },
+    fingerprint: Some(FINGERPRINTS),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+/// The shared pipeline checks the handshake only against a calibration identity; a structural
+/// estimate (no identity) must carry an empty one, which this gate pins.
+fn estimate_handshake_gate(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
-    tier: Option<Quant>,
+    _tier: MemoryNumericTier,
 ) -> gen_core::Result<()> {
     if contract.calibration.is_none()
         && (context.calibration_abi != 0
@@ -1265,32 +1302,45 @@ pub(crate) fn validate_context(
             || context.load_shape != contract.load_shape)
     {
         return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id}: structural-estimate handshake crossed ABI, fingerprint, or load shape"
+            "{}: structural-estimate handshake crossed ABI, fingerprint, or load shape",
+            contract.provider_id
         )));
     }
-    if let MemorySafetyDecision::Reject { reason } = gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant: tier,
-            component_precision_floors: &[],
-        }),
-        None,
-    ) {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
-    validate_route(provider_id, contract, context)?;
     Ok(())
 }
 
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    validate_route(&contract.provider_id, contract, context)
+}
+
+fn loaded_tier(tier: Option<Quant>) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: tier,
+        component_precision_floors: &[],
+    }
+}
+
+pub(crate) fn validate_context(
+    _provider_id: &str,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    tier: Option<Quant>,
+) -> gen_core::Result<()> {
+    gen_core::standard_validate_context(&MEMORY_PROFILE, contract, context, loaded_tier(tier))
+}
+
 pub(crate) fn safety_check(
-    provider_id: &str,
+    _provider_id: &str,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
     tier: Option<Quant>,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_validation(validate_context(provider_id, contract, context, tier))
+    gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, loaded_tier(tier))
 }
 
 pub(crate) fn registered_safety_check(
@@ -1298,10 +1348,16 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match registered_tier_and_contract(spec, contract) {
-        Ok(tier) => safety_check(&contract.provider_id, contract, context, tier),
-        Err(error) => MemorySafetyDecision::rejected(error),
-    }
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+/// The registry tier: the bf16 compute tier at the quantization the contract-bound load receipt
+/// (or the registry witness) proves.
+fn registered_tier(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    registered_tier_and_contract(spec, contract).map(loaded_tier)
 }
 
 fn registered_tier_and_contract(
@@ -1635,8 +1691,23 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    let tier = registered_tier_and_contract(spec, contract)?;
-    validate_context(provider_id, contract, context, tier)?;
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     Ok(Some(Box::new(request_scope(
         provider_id,
         Device::Cpu,
@@ -2511,5 +2582,44 @@ mod tests {
             crossed.selection.tier.quant = Some(Quant::Q8);
             assert!(validate_context(provider, &contract, &crossed, Some(Quant::Q4)).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    /// sc-27307: every production calibration fingerprint this lane publishes, pinned byte for byte
+    /// before the spelling moved into a `MemoryFingerprintTable`.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        for (provider_id, route) in [
+            (crate::CHROMA1_HD_ID, "chroma1-hd"),
+            (crate::CHROMA1_BASE_ID, "chroma1-base"),
+            (crate::CHROMA1_FLASH_ID, "chroma1-flash"),
+        ] {
+            for (quant, tier) in [
+                (None, "bf16"),
+                (Some(Quant::Q4), "q4"),
+                (Some(Quant::Q8), "q8"),
+            ] {
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, quant).as_deref(),
+                    Some(
+                        format!("{route}-{tier}-cuda-request-scoped-staged-residency-v1").as_str()
+                    )
+                );
+            }
+            for quant in [Quant::Nvfp4, Quant::Fp8Rowwise] {
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, Some(quant)),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            production_calibration_fingerprint("chroma1_unknown", None),
+            None
+        );
     }
 }

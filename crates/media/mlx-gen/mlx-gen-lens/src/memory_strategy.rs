@@ -40,11 +40,13 @@
 //! gap needs a new `lens_turbo` measurement, not a wider declaration.
 
 use mlx_gen::gen_core::{
-    Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+    Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFingerprintPin,
+    MemoryFingerprintTable, MemoryFixturePhases, MemoryFixtureRoute, MemoryFormulaKind,
     MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    Result as CoreResult, TransformerComponent,
+    MemoryPrerequisiteScope, MemoryProfileFixtures, MemoryProfileGates, MemoryProviderContract,
+    MemoryRequestScope, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyPrerequisite, MemoryStrategySupport, ProviderMemoryProfile, Result as CoreResult,
+    TransformerComponent,
 };
 #[cfg(test)]
 use mlx_gen::{gen_core::MemoryGeometry, GenerationRequest};
@@ -297,23 +299,11 @@ pub fn production_calibration_fingerprint(
     provider_id: &str,
     artifact_tier: Option<mlx_gen::Quant>,
 ) -> Option<String> {
-    let tier = match artifact_tier {
-        None => "bf16",
-        Some(mlx_gen::Quant::Q4) => "q4",
-        Some(mlx_gen::Quant::Q8) => "q8",
-        Some(_) => return None,
-    };
-    match (provider_id, artifact_tier) {
-        // The one measured MLX cell, preserved byte-for-byte at exactly the cell it measured.
-        (crate::registry::MODEL_ID_BASE, Some(mlx_gen::Quant::Q4)) => {
-            Some(MEMORY_CALIBRATION_FINGERPRINT.to_owned())
-        }
-        (crate::registry::MODEL_ID_BASE, _) => Some(format!("lens-{tier}-mlx-shared-ladder-v1")),
-        (crate::registry::MODEL_ID_TURBO, _) => {
-            Some(format!("lens-turbo-{tier}-mlx-shared-ladder-v1"))
-        }
-        _ => None,
-    }
+    // The one measured MLX cell, (base, q4), keeps its retained string as a pin.
+    MEMORY_PROFILE.fingerprint?.fingerprint(
+        provider_id,
+        mlx_gen::Quant::affine_tier_label(artifact_tier)?,
+    )
 }
 
 /// The identity a loaded Lens route publishes, bound to the artifact it opens.
@@ -593,47 +583,76 @@ pub(crate) fn safety_check(
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        if context.use_pid
-            || contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode)
-        {
-            let routes = decode_routes(&contract.provider_id)?;
-            routes
-                .validate(
-                    context.use_pid,
-                    context.selection.parameters.decode_tile_edge,
-                    context.selection.parameters.decode_overlap,
-                )
-                .map_err(|reason| {
-                    let detail = if context.use_pid {
-                        "the Lens rung-4 calibration covers native VAE decode only, not the PiD/Gemma overlay"
-                    } else {
-                        "Lens decode route validation failed"
-                    };
-                    CoreError::Unsupported(format!(
-                        "{}: {detail}: {reason}",
-                        contract.provider_id
-                    ))
-                })?;
-        }
-        if context.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{}: the Lens rung-4 calibration covers native VAE decode only, not the PiD/Gemma overlay",
-                contract.provider_id
-            )));
-        }
-        Ok(())
-    };
-    mlx_gen::gen_core::standard_memory_strategy_safety_check(
+    mlx_gen::gen_core::standard_safety_check(
+        &MEMORY_PROFILE,
         contract,
         context,
-        Some(MemoryNumericTier {
+        MemoryNumericTier {
             precision,
             quant,
             component_precision_floors: &[],
-        }),
-        Some(&route_gate),
+        },
     )
+}
+
+/// The Lens MLX memory profile (sc-27307): the requested tier, the native-VAE decode-route gate,
+/// one text-to-image fixture per optimized rung (staged exactly when the selection engages rung 1:
+/// a fixture claiming no phases there would be rejected by the very gate it exercises), and the
+/// production fingerprint spelling.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    gates: MemoryProfileGates::within(route_gate),
+    fixtures: MemoryProfileFixtures::routes(&[
+        MemoryFixtureRoute::TEXT_TO_IMAGE.with_phases(MemoryFixturePhases::WhenStaged)
+    ]),
+    fingerprint: Some(MemoryFingerprintTable {
+        template: "{route}-{tier}-mlx-shared-ladder-v1",
+        routes: &[
+            (crate::registry::MODEL_ID_BASE, "lens"),
+            (crate::registry::MODEL_ID_TURBO, "lens-turbo"),
+        ],
+        pins: &[MemoryFingerprintPin {
+            route: "lens",
+            tier: "q4",
+            fingerprint: MEMORY_CALIBRATION_FINGERPRINT,
+        }],
+    }),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    if context.use_pid
+        || contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode)
+    {
+        let routes = decode_routes(&contract.provider_id)?;
+        routes
+            .validate(
+                context.use_pid,
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap,
+            )
+            .map_err(|reason| {
+                let detail = if context.use_pid {
+                    "the Lens rung-4 calibration covers native VAE decode only, not the PiD/Gemma overlay"
+                } else {
+                    "Lens decode route validation failed"
+                };
+                CoreError::Unsupported(format!(
+                    "{}: {detail}: {reason}",
+                    contract.provider_id
+                ))
+            })?;
+    }
+    if context.use_pid {
+        return Err(CoreError::Unsupported(format!(
+            "{}: the Lens rung-4 calibration covers native VAE decode only, not the PiD/Gemma overlay",
+            contract.provider_id
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn registered_safety_check(
@@ -641,7 +660,7 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, spec.precision, spec.quantize, context)
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -649,25 +668,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
-        return Ok(Vec::new());
-    }
-    let context = mlx_gen::gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        mlx_gen::request_scope::loaded_tier(spec),
-        mlx_gen::gen_core::MemoryBehaviorRoute {
-            mode: mlx_gen::gen_core::MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            // Derived from the contract this fixture is built for, not from a measured-route key:
-            // a fixture that claimed no phases while the selection engages staged residency would
-            // be rejected by the very safety gate it exists to exercise.
-            has_phases: contract.engages(strategy, MemoryStrategy::StagedResidency),
-            overlay: None,
-        },
-    )?;
-    Ok(vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(context)])
+    mlx_gen::gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub(crate) fn registered_begin_request(
@@ -676,11 +677,28 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
         provider_id,
         contract,
-        spec.precision,
-        spec.quantize,
+        loaded_tier.precision,
+        loaded_tier.quant,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )
@@ -1718,5 +1736,54 @@ mod tests {
             MemorySafetyDecision::Reject { reason } if reason.contains("native VAE decode only")
         ));
         std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// sc-27307: every published production calibration fingerprint, byte for byte, so moving the
+/// spelling onto the shared `MemoryFingerprintTable` cannot restamp a record.
+#[cfg(test)]
+mod sc27307_fingerprint_pins {
+    use super::*;
+
+    #[test]
+    fn every_fingerprint_cell_is_pinned() {
+        use crate::registry::{MODEL_ID_BASE, MODEL_ID_TURBO};
+        use mlx_gen::Quant;
+        for (provider, quant, expected) in [
+            (MODEL_ID_BASE, None, Some("lens-bf16-mlx-shared-ladder-v1")),
+            (
+                MODEL_ID_BASE,
+                Some(Quant::Q4),
+                Some("lens-mlx-shared-ladder-2026-08-03-v1"),
+            ),
+            (
+                MODEL_ID_BASE,
+                Some(Quant::Q8),
+                Some("lens-q8-mlx-shared-ladder-v1"),
+            ),
+            (MODEL_ID_BASE, Some(Quant::Nvfp4), None),
+            (
+                MODEL_ID_TURBO,
+                None,
+                Some("lens-turbo-bf16-mlx-shared-ladder-v1"),
+            ),
+            (
+                MODEL_ID_TURBO,
+                Some(Quant::Q4),
+                Some("lens-turbo-q4-mlx-shared-ladder-v1"),
+            ),
+            (
+                MODEL_ID_TURBO,
+                Some(Quant::Q8),
+                Some("lens-turbo-q8-mlx-shared-ladder-v1"),
+            ),
+            (MODEL_ID_TURBO, Some(Quant::Fp8Rowwise), None),
+            ("lens_unknown", Some(Quant::Q4), None),
+        ] {
+            assert_eq!(
+                production_calibration_fingerprint(provider, quant).as_deref(),
+                expected
+            );
+        }
     }
 }

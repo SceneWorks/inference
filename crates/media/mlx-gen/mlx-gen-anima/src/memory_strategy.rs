@@ -101,14 +101,15 @@
 //! depth: it can reject a selection, never substitute one.
 
 use mlx_gen::gen_core::{
-    adapter_stack_resident_bytes, standard_memory_strategy_safety_check, AdapterResidencyMode,
-    Error as CoreError, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryParameterRanges,
-    MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope,
+    adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError,
+    MemoryBackendRealization, MemoryBehaviorFixture, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryComponentResidency, MemoryFixturePhases, MemoryFixtureRoute,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
+    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProfileFixtures, MemoryProfileGates, MemoryProviderContract, MemoryRequestScope,
     MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
-    TransformerComponent,
+    MemoryStrategyPrerequisite, MemoryStrategySupport, ProviderMemoryProfile,
+    ResidentRequestMemory, Result as CoreResult, TransformerComponent,
 };
 // Aliased so the module docs' `GenerationMemory` intra-doc links keep their explicit targets.
 use mlx_gen::gen_core::GenerationMemory as RequestMemory;
@@ -574,65 +575,77 @@ pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        // Anima advertises no reference/control conditioning, so text-to-image with zero references
-        // is the only route that exists. Admitting anything else would record evidence for a route
-        // the generator would reject at `validate` anyway.
-        if !matches!(context.mode, MemoryMode::TextToImage) || context.geometry.reference_count != 0
-        {
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+/// The Anima MLX memory profile (sc-27307): the requested tier, this provider's route gate, and one
+/// staged text-to-image behavior fixture per implemented optimized rung.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    gates: MemoryProfileGates::within(route_gate),
+    // Rung 1 is request-scoped, and every optimized selection engages it by cost order — which is
+    // also rung 4's declared prerequisite.
+    fixtures: MemoryProfileFixtures::routes(&[
+        MemoryFixtureRoute::TEXT_TO_IMAGE.with_phases(MemoryFixturePhases::Always)
+    ])
+    .implemented_only(),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    // Anima advertises no reference/control conditioning, so text-to-image with zero references
+    // is the only route that exists. Admitting anything else would record evidence for a route
+    // the generator would reject at `validate` anyway.
+    if !matches!(context.mode, MemoryMode::TextToImage) || context.geometry.reference_count != 0 {
+        return Err(CoreError::Unsupported(format!(
+            "{}: anima is text-to-image only; got {:?} with {} references",
+            contract.provider_id, context.mode, context.geometry.reference_count
+        )));
+    }
+    // SC-15839 review defect: a Resident+PiD admission. Anima has no PiD student at all — the
+    // heavy loader ignores `use_pid` — so a PiD selection would silently execute the ordinary
+    // native decode, i.e. a different strategy than the selector chose. Reject at admission
+    // rather than degrade.
+    if context.use_pid {
+        return Err(CoreError::Unsupported(format!(
+            "{}: anima has no PiD decoder; the overlay is not implementable on this provider",
+            contract.provider_id
+        )));
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        validate_decode(
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        )?;
+    }
+    if contract.engages(
+        context.selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    ) {
+        if !contract.lifecycle.transformer_window_materialization {
             return Err(CoreError::Unsupported(format!(
-                "{}: anima is text-to-image only; got {:?} with {} references",
-                contract.provider_id, context.mode, context.geometry.reference_count
-            )));
-        }
-        // SC-15839 review defect: a Resident+PiD admission. Anima has no PiD student at all — the
-        // heavy loader ignores `use_pid` — so a PiD selection would silently execute the ordinary
-        // native decode, i.e. a different strategy than the selector chose. Reject at admission
-        // rather than degrade.
-        if context.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{}: anima has no PiD decoder; the overlay is not implementable on this provider",
+                "{}: bounded transformer residency requires a DeferredMaterialization load",
                 contract.provider_id
             )));
         }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            validate_decode(
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            )?;
+        // The scope AND the size are checked here as well as by the shared parameter validator,
+        // so a request that reached the provider by another path still cannot ask for a scope
+        // this family does not implement or a cadence it never measured.
+        let component = context.selection.parameters.window_component();
+        if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
+            return Err(CoreError::Unsupported(format!(
+                "{}: transformer window component {component:?} is not implemented",
+                contract.provider_id
+            )));
         }
-        if contract.engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        ) {
-            if !contract.lifecycle.transformer_window_materialization {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: bounded transformer residency requires a DeferredMaterialization load",
-                    contract.provider_id
-                )));
-            }
-            // The scope AND the size are checked here as well as by the shared parameter validator,
-            // so a request that reached the provider by another path still cannot ask for a scope
-            // this family does not implement or a cadence it never measured.
-            let component = context.selection.parameters.window_component();
-            if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: transformer window component {component:?} is not implemented",
-                    contract.provider_id
-                )));
-            }
-            if let Some(size) = context.selection.parameters.transformer_window_size {
-                validate_window(size)?;
-            }
+        if let Some(size) = context.selection.parameters.transformer_window_size {
+            validate_window(size)?;
         }
-        Ok(())
-    };
-    standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(mlx_gen::request_scope::loaded_tier(spec)),
-        Some(&route_gate),
-    )
+    }
+    Ok(())
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -640,29 +653,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<MemoryBehaviorFixture>> {
-    if !strategy.is_optimized()
-        || !matches!(
-            contract.capability(strategy).map(|c| &c.support),
-            Some(MemoryStrategySupport::Implemented)
-        )
-    {
-        return Ok(Vec::new());
-    }
-    let context = mlx_gen::gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        mlx_gen::request_scope::loaded_tier(spec),
-        MemoryBehaviorRoute {
-            mode: MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            // Rung 1 is request-scoped, and every optimized selection engages it by cost order —
-            // which is also rung 4's declared prerequisite.
-            has_phases: true,
-            overlay: None,
-        },
-    )?;
-    Ok(vec![MemoryBehaviorFixture::new(context)])
+    mlx_gen::gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub(crate) fn registered_begin_request(
@@ -670,6 +661,23 @@ pub(crate) fn registered_begin_request(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_with_cleanup(
         provider_id,
