@@ -53,7 +53,7 @@ use mlx_rs::Array;
 use common::is_materialized;
 
 use mlx_gen::{CancelFlag, Result};
-use mlx_gen_minimax_h3::denoise::{JointStep, JointVelocity, PackedLayout};
+use mlx_gen_minimax_h3::denoise::{JointStep, JointVelocity, PackedLayout, SigmaScheduleStep};
 use mlx_gen_minimax_h3::{
     initial_latents, render_latents, resolve_geometry, JointSchedule, RequestGeometry,
     LEGAL_FRAME_COUNTS, PATCH_SIZE, SMALLEST_LEGAL_FRAMES,

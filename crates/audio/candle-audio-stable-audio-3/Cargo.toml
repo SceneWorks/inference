@@ -18,7 +18,7 @@ candle-nn = { workspace = true }
 core-llm = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 # Audio-lane side of the intentional 0.21/0.22 split enforced by check-workspace.py.

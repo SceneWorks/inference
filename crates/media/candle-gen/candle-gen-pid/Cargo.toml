@@ -19,7 +19,7 @@ candle-gen = { path = "../candle-gen" }
 # `seeded_*` helpers take matches.
 rand = { workspace = true }
 # Encode the e2e real-weight smoke output to PNG (mirrors mlx-gen-pid / candle-gen-krea test IO).
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { workspace = true }
 
 [dev-dependencies]
 # Backend-neutral gen-core contract conformance floor (sc-4481); weight-gated (#[ignore]).

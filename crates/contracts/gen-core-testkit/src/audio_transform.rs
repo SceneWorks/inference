@@ -140,18 +140,12 @@ pub fn check_audio_transform_registry(
     registry: &gen_core::ProviderRegistry,
     t: &dyn AudioTransform,
 ) -> Result<(), String> {
-    let id = t.descriptor().id;
-    if registry
-        .audio_transforms()
-        .any(|registration| (registration.descriptor)().id == id)
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "registry[{id}]: descriptor id not found in the explicit provider registry (gen-core {})",
-            gen_core::VERSION
-        ))
-    }
+    crate::check_registry_ids(
+        registry
+            .audio_transforms()
+            .map(|registration| (registration.descriptor)().id),
+        t.descriptor().id,
+    )
 }
 
 /// Run the full audio-transform conformance suite against a freshly-`make`d transform. Panics with
@@ -171,14 +165,12 @@ pub fn audio_transform_conformance(
     .into_iter()
     .filter_map(|r| r.err())
     .collect();
-    if !failures.is_empty() {
-        panic!(
-            "gen-core audio-transform conformance FAILED for `{}` (gen-core {}):\n  - {}",
-            t.descriptor().id,
-            gen_core::VERSION,
-            failures.join("\n  - ")
-        );
-    }
+    crate::panic_on_failures(
+        "gen-core audio-transform conformance",
+        t.descriptor().id,
+        None,
+        &failures,
+    );
 }
 
 #[cfg(test)]

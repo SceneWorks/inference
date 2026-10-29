@@ -17,7 +17,7 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
-MODULE_PATH = Path(__file__).with_name("yue2_app_precision_profile.py")
+MODULE_PATH = Path(__file__).resolve().parents[1] / "ci" / "yue2_app_precision_profile.py"
 spec = importlib.util.spec_from_file_location("yue2_app_precision_profile", MODULE_PATH)
 control = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(control)

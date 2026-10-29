@@ -1157,7 +1157,9 @@ fn track() -> mlx_gen::media::AudioTrack {
 
 fn clip_ref() -> Conditioning {
     Conditioning::ReferenceVideo {
-        frames: vec![image(64, 64)],
+        // 24, not 1: at 24 fps source == kept, and `MIN_REFERENCE_CLIP_FRAMES` is 22, so a
+        // shorter clip is refused by `validate` (sc-27256).
+        frames: vec![image(64, 64); 24],
         fps: 24.0,
         audio: None,
     }
@@ -1281,6 +1283,35 @@ fn an_in_context_video_clip_is_refused_as_unsupported() {
     );
 }
 
+/// **`validate` refuses exactly the clips `generate` would refuse** (sc-27256): the shared
+/// `MIN_REFERENCE_CLIP_FRAMES` floor applies at the boundary, on the normalized count.
+#[test]
+fn validate_refuses_a_clip_shorter_than_the_vae_chunk_floor() {
+    use crate::reference::MIN_REFERENCE_CLIP_FRAMES;
+
+    let caps = descriptor().capabilities;
+    let clip = |frames: usize, fps: f32| {
+        with(vec![Conditioning::ReferenceVideo {
+            frames: vec![image(64, 64); frames],
+            fps,
+            audio: None,
+        }])
+    };
+    for (frames, fps) in [(4usize, 24.0f32), (21, 24.0), (4, 30.0), (26, 30.0)] {
+        let e = validate_request(&caps, &clip(frames, fps))
+            .expect_err("a clip normalizing below the floor must be refused by validate")
+            .to_string();
+        assert!(
+            e.contains(&format!("{MIN_REFERENCE_CLIP_FRAMES}-frame floor")),
+            "{frames}@{fps}: {e}"
+        );
+    }
+    for (frames, fps) in [(22usize, 24.0f32), (24, 24.0), (28, 30.0)] {
+        validate_request(&caps, &clip(frames, fps))
+            .unwrap_or_else(|e| panic!("{frames}@{fps} clears the floor: {e}"));
+    }
+}
+
 /// A reference clip carries **its own frame rate**, and the rate survives the mapping.
 ///
 /// This is the hole the old `VideoClip` carrier could not close: it had no rate, so the mapping
@@ -1290,7 +1321,8 @@ fn an_in_context_video_clip_is_refused_as_unsupported() {
 #[test]
 fn a_reference_clip_carries_its_own_frame_rate() {
     let req = with(vec![Conditioning::ReferenceVideo {
-        frames: vec![image(64, 64)],
+        // 30 frames at 30 fps normalize to 24 at 24 fps, clearing the 22-frame floor.
+        frames: vec![image(64, 64); 30],
         fps: 30.0,
         audio: None,
     }]);
@@ -1319,7 +1351,7 @@ fn a_reference_clip_carries_its_own_frame_rate() {
 #[test]
 fn a_reference_clips_own_soundtrack_rides_the_clip() {
     let req = with(vec![Conditioning::ReferenceVideo {
-        frames: vec![image(64, 64)],
+        frames: vec![image(64, 64); 24],
         fps: 24.0,
         audio: Some(track()),
     }]);

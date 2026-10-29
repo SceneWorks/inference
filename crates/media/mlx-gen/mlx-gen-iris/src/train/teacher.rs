@@ -41,14 +41,7 @@ pub struct Teacher {
     w: HashMap<String, Array>,
 }
 
-/// Resolve a teacher resource path: a directory holding `model.safetensors`, or the file.
-pub fn teacher_file(path: &Path) -> std::path::PathBuf {
-    if path.is_dir() {
-        path.join(contract::TEACHER_WEIGHTS_FILE)
-    } else {
-        path.to_path_buf()
-    }
-}
+pub use mlx_gen::gen_core::iris::train::repa::teacher_file;
 
 impl Teacher {
     /// Load `arch`'s tensors from a hub `state_dict` or a Hugging Face `Dinov2Model` safetensors,

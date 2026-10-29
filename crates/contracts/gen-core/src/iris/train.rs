@@ -2746,6 +2746,65 @@ pub const CHECKPOINT_FORMAT: &str = "iris-train-checkpoint-v1";
 /// File names inside one checkpoint directory.
 pub const CKPT_STATE: &str = "state.json";
 pub const CKPT_TRAINABLE: &str = "trainable.safetensors";
+/// The REPA projector's checkpoint member.
+pub const CKPT_REPA: &str = "repa_projector.safetensors";
+
+/// Identity + capabilities of the Iris generation trainer on `backend` — the MLX and Candle
+/// trainers are identical field for field except this one (hoisted, sc-27256).
+pub fn trainer_descriptor_for(backend: &'static str) -> crate::train::TrainerDescriptor {
+    crate::train::TrainerDescriptor {
+        id: TRAINER_ID,
+        family: super::FAMILY,
+        backend,
+        modality: crate::Modality::Image,
+        supports_lora: true,
+        supports_lokr: true,
+        supports_control: false,
+        supports_full_finetune: true,
+        max_reference_images: 0,
+        techniques: TECHNIQUES,
+    }
+}
+
+/// The `shard_*.safetensors` members of a `dcp` checkpoint directory, sorted (an unreadable
+/// directory yields none; the caller's member check refuses it).
+pub fn dcp_shards(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("shard_") && n.ends_with(".safetensors"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// The gradient-norm group of a trained tensor (`_grad_groups`): the REPA projector, one group per
+/// transformer block (`blocks.NN`), one per pixel block, else the tensor's top-level module.
+pub fn grad_group(key: &str) -> String {
+    if key.starts_with(repa::PROJECTOR_PREFIX) {
+        return "repa_projector".into();
+    }
+    let mut parts = key.split('.');
+    let head = parts.next().unwrap_or(key);
+    match head {
+        "blocks" => format!(
+            "blocks.{:02}",
+            parts
+                .next()
+                .and_then(|i| i.parse::<usize>().ok())
+                .unwrap_or(0)
+        ),
+        "pixel_blocks" => format!("pixel_blocks.{}", parts.next().unwrap_or("0")),
+        other => other.to_string(),
+    }
+}
 pub const CKPT_EMA: &str = "ema.safetensors";
 pub const CKPT_OPTIMIZER: &str = "optimizer.safetensors";
 /// The pointer file naming the newest complete checkpoint (`latest.pth` upstream).

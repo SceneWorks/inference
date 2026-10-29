@@ -19,7 +19,7 @@ candle-audio-catalog = { workspace = true, optional = true }
 mlx-llm = { workspace = true }
 libc = { workspace = true, optional = true }
 mlx-rs = { workspace = true, optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
+serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }

@@ -28,6 +28,8 @@ use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConf
 use candle_gen::gen_core::WeightsSource;
 use candle_gen::{CandleError as Error, Result};
 
+use crate::config::ConfigFile;
+
 use crate::config::{
     SavedSigmaSchedule, SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig, Variant,
     VisionConfig,
@@ -342,7 +344,7 @@ pub fn load_saved_sigma_schedule(root: &Path) -> Result<SavedSigmaSchedule> {
         &root.join("scheduler").join("scheduler_config.json"),
     )?
     .unwrap_or_else(|| serde_json::json!({}));
-    SavedSigmaSchedule::from_values(&model_index, &scheduler)
+    Ok(SavedSigmaSchedule::from_values(&model_index, &scheduler)?)
 }
 
 /// Refuse a snapshot that is not the one `variant` serves (sc-25901), **before** any weight is

@@ -490,7 +490,25 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 
     // The geometry gate itself — the same call `generate` makes, so `validate` and the render agree
     // by construction rather than by two copies of the lattice arithmetic.
-    request_geometry(req).map(|_| ())
+    let geometry = request_geometry(req)?;
+
+    // The clip-length floor (sc-27256, the shared `reference` module's
+    // `MIN_REFERENCE_CLIP_FRAMES`): the surviving frame count depends on the request's
+    // `num_frames`, so it is checked here against the resolved geometry. Without it `validate`
+    // would admit a clip `normalize_reference_clip` then refuses inside `generate`.
+    if let Some(references) = &references {
+        for r in references.as_slice() {
+            if let Ref2VaReference::Video(v) = r {
+                crate::reference::normalized_clip_frame_count(
+                    v.frames.len(),
+                    v.fps,
+                    geometry.joint.num_frames.max(0) as usize,
+                    crate::denoise::MINIMAX_H3_FPS,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Map a request's keyframes onto MiniMax-H3's two anchor slots, in packed order.
@@ -713,7 +731,7 @@ pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2V
     if refs.is_empty() {
         return Ok(None);
     }
-    Ref2VaReferences::new(refs).map(Some)
+    Ok(Some(Ref2VaReferences::new(refs)?))
 }
 
 /// Resolve the request's geometry: the canvas, and the frame count from `frames` (exact) or
@@ -1627,8 +1645,21 @@ impl MiniMaxH3 {
                     }
                     Ref2VaReference::Video(v) => {
                         // Snap DOWN to the VAE's `17n + 5` lattice so nothing is padded.
+                        // The `.min` keeps a clip from being over-read, and is safe only because
+                        // `normalize_reference_clip` refuses a normalized clip shorter than
+                        // `MIN_REFERENCE_CLIP_FRAMES`; a shorter one would reach the VAE off the
+                        // `17n + 5` lattice. A hard refusal, not a `debug_assert!`, so release
+                        // builds keep it.
                         let keep = crate::conditioning::snap_reference_frames_down(v.frames.len())
                             .min(v.frames.len());
+                        if keep < crate::reference::MIN_REFERENCE_CLIP_FRAMES {
+                            return Err(Error::Msg(format!(
+                                "{MODEL_ID}: reference {i} snapped to {keep} frames, below the \
+                                 {}-frame `17n + 5` floor — the normalized clip reached the \
+                                 encoder off the lattice",
+                                crate::reference::MIN_REFERENCE_CLIP_FRAMES
+                            )));
+                        }
                         let pixels = reference_clip_to_vae_pixels(&v.frames[..keep])?;
                         let c =
                             encode_reference_condition(&vae, &pixels, &KeyframeNoise::Seeded, i)?;

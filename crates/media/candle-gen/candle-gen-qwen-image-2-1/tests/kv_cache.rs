@@ -38,9 +38,9 @@ use candle_gen::gen_core::{CancelFlag, Progress};
 use candle_gen::run_flow_sampler;
 use candle_gen_qwen_image_2_1::{
     denoise_reported, joint_images, load_scheduler_config, load_transformer, scheduler, text_rows,
-    DenoiseInputs, DenoiseReport, EvaluationPath, JointLayout, KvCacheMode, KvCachePath,
-    ModelEvaluation, PrefixKvCache, PromptBranch, QwenImage21Transformer, ReferenceConditioning,
-    Segment, TransformerConfig,
+    ConfigFile, DenoiseInputs, DenoiseReport, EvaluationPath, JointLayout, KvCacheMode,
+    KvCachePath, ModelEvaluation, PrefixKvCache, PromptBranch, QwenImage21Transformer,
+    ReferenceConditioning, Segment, TransformerConfig,
 };
 
 use crate::common::{assert_close, device, host_f32, tiny_snapshot, Fixture};

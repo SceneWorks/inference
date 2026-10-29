@@ -139,10 +139,10 @@ pub const UPSTREAM_LICENSE_NOTICE: &str = "Qwen is licensed under the Qwen RESEA
     Reserved.";
 
 pub use config::{
-    SavedSigmaSchedule, SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig,
-    VaeConfig, Variant, VisionConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, IMAGE_TOKENS_PER_SLOT,
-    MAX_REFERENCE_IMAGES, OUTPUT_RESOLUTION, PRESETS, SIZE_MULTIPLE, SYSTEM_PROMPT,
-    VAE_SCALE_FACTOR, VISION_MERGE_SIZE, VISION_PATCH_SIZE,
+    ConfigFile, SavedSigmaSchedule, SchedulerConfig, SizePreset, TextEncoderConfig,
+    TransformerConfig, VaeConfig, Variant, VisionConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG,
+    IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES, OUTPUT_RESOLUTION, PRESETS, SIZE_MULTIPLE,
+    SYSTEM_PROMPT, VAE_SCALE_FACTOR, VISION_MERGE_SIZE, VISION_PATCH_SIZE,
 };
 pub use loader::{
     check_snapshot_variant, load_saved_sigma_schedule, load_scheduler_config, load_text_encoder,
@@ -627,9 +627,7 @@ pub(crate) fn resolve_turbo_run_params(
     schedule: &SavedSigmaSchedule,
     req: &GenerationRequest,
 ) -> Result<RunParams> {
-    let steps = req
-        .steps
-        .map_or(schedule.default_steps(), |steps| steps as usize);
+    let steps = req.steps.unwrap_or(schedule.default_steps()) as usize;
     let native = scheduler::resample_saved_sigmas(&schedule.sample_sigmas, steps)?;
     let sigmas = candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
     Ok(run_params_over(sigmas, req))

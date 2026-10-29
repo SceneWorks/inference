@@ -25,7 +25,7 @@ serde_json = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity; the same StdRng draw the LTX/wan crates use).
 rand = { workspace = true }
 # Frame → RGB `Image` conversion at the pipeline tail.
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 
 [features]
 model-inference-proof = ["candle-gen-flux/model-inference-proof", "candle-gen/model-inference-proof"]

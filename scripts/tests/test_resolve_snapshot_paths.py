@@ -8,7 +8,7 @@ import yaml
 from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
 from scripts.release.resolve_snapshot_paths import resolve
 from scripts.tests.test_manual_model_workflow_relocation import (
-    CURRENT_STEP_DIGESTS, digest,
+    CURRENT_STEP_DIGESTS, REPINNED_UPLOAD_ARTIFACT, digest, receipt_upload_pin,
 )
 
 
@@ -302,6 +302,11 @@ FIXTURE_ROUTES = {
     ('windows', CURRENT_STEP_DIGESTS['synthetic-w4a8-cuda']):
         "github.event_name == 'workflow_dispatch' && (inputs.profile == 'synthetic-w4a8-cuda' || inputs.profile == 'synthetic-w4a8-both')",
 }
+REPINNED_FIXTURE_ROUTES = {
+    (platform, receipt): route
+    for (platform, receipt), route in FIXTURE_ROUTES.items()
+    if receipt in {CURRENT_STEP_DIGESTS[name] for name in REPINNED_UPLOAD_ARTIFACT}
+}
 
 
 def committed_fixture_route(job, platform):
@@ -316,6 +321,9 @@ def committed_fixture_route(job, platform):
             if 'run' in step:
                 step['run'] = command.replace('python3.12 ', 'python3 ')
     expected = FIXTURE_ROUTES.get((platform, digest(steps)))
+    if expected is None:
+        # sc-27365: only the MOSS receipts predate the upload-artifact repin.
+        expected = REPINNED_FIXTURE_ROUTES.get((platform, digest(receipt_upload_pin(steps))))
     return expected is not None and job.get('if') == expected
 
 

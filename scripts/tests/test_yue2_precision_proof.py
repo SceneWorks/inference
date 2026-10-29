@@ -983,6 +983,10 @@ class PrecisionControlTests(unittest.TestCase):
             self.assertIn(f"{IDLE.BASELINE_ENGINE_SHA}-control-{IDLE.BASELINE_CONTROL_SHA}-{IDLE.RUN_ID}-1", workflow)
             self.assertNotIn("-36956986577-1", workflow)
             self.assertIn("run-id: ${{ inputs.idle_cuda_context_run_id }}", workflow)
+            # sc-27367: the free-form run id reaches scripts only through env, never interpolated.
+            self.assertNotIn("'${{ inputs.idle_cuda_context_run_id }}'", workflow)
+        self.assertIn("IDLE_CUDA_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}", source)
+        self.assertIn("if ($env:IDLE_CUDA_CONTEXT_RUN_ID -notmatch '^([1-9][0-9]*)?$')", source)
         self.assertIn('CUDA_VISIBLE_DEVICES: "0"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID', workflow)
         self.assertEqual(source.count('CUDA_VISIBLE_DEVICES: "1"\n      CUDA_DEVICE_ORDER: PCI_BUS_ID'), 2)
 

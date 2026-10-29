@@ -111,18 +111,12 @@ pub fn check_audio_embedder_registry(
     registry: &gen_core::ProviderRegistry,
     e: &dyn AudioEmbedder,
 ) -> Result<(), String> {
-    let id = e.descriptor().id;
-    if registry
-        .audio_embedders()
-        .any(|registration| (registration.descriptor)().id == id)
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "registry[{id}]: descriptor id not found in the explicit provider registry (gen-core {})",
-            gen_core::VERSION
-        ))
-    }
+    crate::check_registry_ids(
+        registry
+            .audio_embedders()
+            .map(|registration| (registration.descriptor)().id),
+        e.descriptor().id,
+    )
 }
 
 /// Run the full audio-embedder conformance suite against a freshly-`make`d embedder. Panics with
@@ -138,14 +132,12 @@ pub fn audio_embedder_conformance(
         .into_iter()
         .filter_map(|r| r.err())
         .collect();
-    if !failures.is_empty() {
-        panic!(
-            "gen-core audio-embedder conformance FAILED for `{}` (gen-core {}):\n  - {}",
-            e.descriptor().id,
-            gen_core::VERSION,
-            failures.join("\n  - ")
-        );
-    }
+    crate::panic_on_failures(
+        "gen-core audio-embedder conformance",
+        e.descriptor().id,
+        None,
+        &failures,
+    );
 }
 
 #[cfg(test)]
