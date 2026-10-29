@@ -56,33 +56,32 @@
 //!   the toggle) before the minutes-long caching, converting an uncatchable SIGKILL into an actionable
 //!   error.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::media::Image;
-use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
-use mlx_gen::train::lora::{
-    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
-    build_lora_targets, LoraParams, TrainAdapter,
-};
+use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
     combine_step_loss, step_sample, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
-use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::tae::TinyDecoderSpec;
+use mlx_gen::train::trainer_loop::{
+    adapter_optimizer, adapter_stem, block_local_targets, build_adapter, mae_loss, run_train_loop,
+    train_dtype_is_bf16, AdapterSaver, CheckpointAt, LoopStart, LossTypeFold, PreviewSink,
+    TrainLoopFamily,
+};
 use mlx_gen::train::vocab::{
     apply_timestep_bias, check_vocab, clamp_unit_timestep, normalize_cfg, sample_unit_timestep,
     validate_run_shape, LOSS_TYPES, TIMESTEP_BIASES,
 };
 use mlx_gen::{
-    Error, LoadSpec, Modality, NetworkType, Precision, Result, TrainOptimizer, Trainer,
-    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    Error, LoadSpec, Modality, NetworkType, Precision, Result, Trainer, TrainerDescriptor,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -411,14 +410,122 @@ impl Sd3LoraTrainer {
             )
             .into());
         }
+        let want_bf16 = self.check_train_dtype(cfg)?;
+        let compute_dtype = self.dtype;
+        // bf16 mixed precision: cast the folded LoRA residual to the activation dtype so the adapted
+        // Linear stays bf16 (else it silently re-promotes the chain to f32). f32 → no cast.
+        let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
 
-        // The MMDiT compute dtype is fixed at load (`spec.precision`); enforce `train_dtype` against
-        // it (never a silent no-op). The common case (config default bf16 + LoadSpec default Bf16)
-        // matches, so this only fires on an explicit f32-vs-bf16 mismatch.
-        let want_bf16 = {
-            let t = cfg.train_dtype.trim();
-            t.eq_ignore_ascii_case("bf16") || t.eq_ignore_ascii_case("bfloat16")
+        on_progress(TrainingProgress::Preparing);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). The pre-flight guard sizes for the largest (epic 2123 E7).
+        let edges = bucket_edges(cfg);
+        let edge = preflight_edge(&edges);
+        self.preflight(req, &edges, edge, want_bf16)?;
+
+        // Epic 2123 depth anchoring: load the frozen decoder + aux models before the caching pass,
+        // so a missing/corrupt aux checkpoint fails fast.
+        let mut perceptual = load_perceptual_path(cfg)?;
+
+        // --- prepare → load → cache: VAE-latents + triple-TE conditioning into memory ---
+        on_progress(TrainingProgress::LoadingModel); // base is already resident from load_trainer
+        let cache = self.cache_dataset(req, &edges, on_progress)?;
+        if cache.is_empty() {
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            return Err("sd3 trainer: no usable dataset items".into());
+        }
+
+        // Epic 2123 E8: each (item, bucket) entry's perceptual reference is computed exactly once
+        // per job, by the `AuxDriver` before the loop.
+        if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "sd3 trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
+        }
+
+        // Every caption is cached now — free the three encoders (T5-XXL dominates) and evict buffers
+        // before the train loop, reclaiming that resident for the 8.1B MMDiT working set.
+        self.encoders = None;
+        mlx_rs::memory::clear_cache();
+
+        // --- adapter targets + params (LoRA or LoKr) + optimizer ---
+        let (adapter, params) = build_adapter(&mut self.transformer, &target_paths, cfg)?;
+        // T2 — gradient checkpointing. Collect, per joint block, the adapter-routable LOCAL paths
+        // trained on it (e.g. `"attn.to_q"`), in trained-file order — the factors a checkpoint
+        // segment threads as explicit inputs. Only `transformer_blocks.*` targets are checkpointed;
+        // any global targets (`context_embedder`/`proj_out`) train dense through `self`.
+        let block_local_targets = block_local_targets(
+            &target_paths,
+            "transformer_blocks.",
+            self.transformer.num_blocks(),
+        );
+        // Opt-in OPTION (the SceneWorks "Gradient Checkpointing" toggle), never auto-forced — a run
+        // that would OOM is caught instead by the pre-flight guard above. LoRA only — LoKr falls back
+        // to the dense path.
+        let use_checkpoint =
+            matches!(adapter, TrainAdapter::Lora { .. }) && cfg.gradient_checkpointing;
+        // SDPA-segment checkpointing is ALWAYS on in training. When whole-block checkpointing is on,
+        // the per-block SDPA flag goes OFF (the block recompute already covers attention).
+        self.transformer.set_sdpa_checkpoint(!use_checkpoint);
+
+        // --- resume (F-125): continue from the latest snapshot of THIS adapter in output_dir, if any ---
+        let stem = adapter_stem(&req.file_name, "lora");
+        let start = LoopStart::fresh(adapter_optimizer(cfg)?, params).resume_latest(
+            cfg,
+            &req.output_dir,
+            &stem,
+            |meta| {
+                eprintln!(
+                    "[F-125] resuming from step {} (optimizer update {})",
+                    meta.step, meta.update_idx
+                )
+            },
+        )?;
+
+        // --- train loop ---
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items for
+        // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
+        // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
+        // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
+        // replay.
+        let accum = cfg.gradient_accumulation.max(1);
+        let aux_driver = match perceptual {
+            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, &req.cancel)?),
+            None => None,
         };
+        let mut family = Sd3Loop {
+            req,
+            transformer: &mut self.transformer,
+            adapter: &adapter,
+            cfg,
+            cache: &cache,
+            schedule: &schedule,
+            aux_driver,
+            mae: mae_loss(&cfg.loss_type, LossTypeFold::Lowercase),
+            compute_dtype,
+            lora_dtype,
+            checkpoint_blocks: use_checkpoint.then_some(block_local_targets.as_slice()),
+        };
+        // No preview cadence on this trainer, so the loop never reports a preview warning.
+        run_train_loop(&mut family, req, &stem, start, on_progress, &mut Vec::new())
+    }
+
+    /// The MMDiT compute dtype is fixed at load (`spec.precision`); enforce `train_dtype` against it
+    /// (never a silent no-op). The common case (config default bf16 + LoadSpec default Bf16)
+    /// matches, so this only fires on an explicit f32-vs-bf16 mismatch. Returns whether bf16 is
+    /// wanted.
+    fn check_train_dtype(&self, cfg: &TrainingConfig) -> Result<bool> {
+        let want_bf16 = train_dtype_is_bf16(&cfg.train_dtype);
         let loaded_bf16 = self.dtype == Dtype::Bfloat16;
         if want_bf16 != loaded_bf16 {
             return Err(format!(
@@ -434,23 +541,23 @@ impl Sd3LoraTrainer {
             )
             .into());
         }
-        let compute_dtype = self.dtype;
-        // bf16 mixed precision: cast the folded LoRA residual to the activation dtype so the adapted
-        // Linear stays bf16 (else it silently re-promotes the chain to f32). f32 → no cast.
-        let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
+        Ok(want_bf16)
+    }
 
-        on_progress(TrainingProgress::Preparing);
-        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
-        // off). The pre-flight guard sizes for the largest (epic 2123 E7).
-        let edges = bucket_edges(cfg);
-        let edge = preflight_edge(&edges);
-
-        // T2 — fail-fast pre-flight memory guard (the Krea/z-image analog). The dense
-        // (non-block-checkpointed) first step materializes the whole forward graph in one MLX `eval`;
-        // at high resolution that working set can exceed unified memory and the OS hard-kills the
-        // worker with an UNCATCHABLE SIGKILL. We predict it and refuse up front with a catchable,
-        // actionable error BEFORE the (minutes-long) latent caching, UNLESS the run will
-        // block-checkpoint (LoRA + the toggle). LoKr always takes the dense path, so it is guarded.
+    /// T2 — fail-fast pre-flight memory guard (the Krea/z-image analog). The dense
+    /// (non-block-checkpointed) first step materializes the whole forward graph in one MLX `eval`;
+    /// at high resolution that working set can exceed unified memory and the OS hard-kills the
+    /// worker with an UNCATCHABLE SIGKILL. We predict it and refuse up front with a catchable,
+    /// actionable error BEFORE the (minutes-long) latent caching, UNLESS the run will
+    /// block-checkpoint (LoRA + the toggle). LoKr always takes the dense path, so it is guarded.
+    fn preflight(
+        &self,
+        req: &TrainingRequest,
+        edges: &[u32],
+        edge: u32,
+        want_bf16: bool,
+    ) -> Result<()> {
+        let cfg = &req.config;
         let will_checkpoint =
             matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
         // F-035: select the preflight constants by variant — Medium (2.5B/24-block) was refused via
@@ -465,18 +572,21 @@ impl Sd3LoraTrainer {
         // budget on BOTH paths; one cached reference per (item, bucket) entry, sized at the largest
         // edge. A checkpointed run with no aux models stays unguarded (see the guard).
         let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len());
-        preflight_memory_guard(cfg, edge, want_bf16, variant, aux_gb, will_checkpoint)?;
+        preflight_memory_guard(cfg, edge, want_bf16, variant, aux_gb, will_checkpoint)
+    }
 
-        // Epic 2123 depth anchoring: load the frozen decoder + aux models before the caching pass,
-        // so a missing/corrupt aux checkpoint fails fast.
-        let mut perceptual = load_perceptual_path(cfg)?;
-
-        // --- prepare → load → cache: VAE-latents + triple-TE conditioning into memory ---
-        on_progress(TrainingProgress::LoadingModel); // base is already resident from load_trainer
+    /// Cache the dataset item-major: `cache[item * edges.len() + bucket]` (sc-2127). Each entry:
+    /// clean latent, triple-TE conditioning, and (subject-masked loss, sc-24828) that bucket's
+    /// latent loss-weight map — `None` when the technique is off. Stops (leaving what is cached)
+    /// at a cancel.
+    fn cache_dataset(
+        &self,
+        req: &TrainingRequest,
+        edges: &[u32],
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> Result<Vec<CacheEntry>> {
+        let cfg = &req.config;
         let total = req.items.len() as u32;
-        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). Each entry: clean latent,
-        // triple-TE conditioning, and (subject-masked loss, sc-24828) that bucket's latent
-        // loss-weight map — `None` when the technique is off.
         let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
@@ -508,7 +618,7 @@ impl Sd3LoraTrainer {
             eval([&cond.context, &cond.pooled])?;
             // The caption conditioning is resolution-independent: encode it once, then one latent per
             // bucket edge (the MMDiT derives its patch grid from the latent's own shape).
-            for (x0, mask_weight) in encode_buckets(&edges, mask.as_ref(), |edge| {
+            for (x0, mask_weight) in encode_buckets(edges, mask.as_ref(), |edge| {
                 encode_init_latents(&self.vae, &img, edge) // [1, 16, edge/8, edge/8]
             })? {
                 let cond = Sd3Conditioning {
@@ -518,221 +628,75 @@ impl Sd3LoraTrainer {
                 cache.push((x0, cond, mask_weight));
             }
         }
-        if cache.is_empty() {
-            if req.cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            return Err("sd3 trainer: no usable dataset items".into());
+        Ok(cache)
+    }
+}
+
+/// The SD3 family's side of the shared trainer loop ([`run_train_loop`]): its micro-step and its
+/// diffusers/PEFT adapter saves. It renders no previews.
+struct Sd3Loop<'a> {
+    req: &'a TrainingRequest,
+    transformer: &'a mut Sd3Transformer,
+    adapter: &'a TrainAdapter,
+    cfg: &'a TrainingConfig,
+    cache: &'a [CacheEntry],
+    schedule: &'a BucketSchedule,
+    aux_driver: Option<AuxDriver>,
+    mae: bool,
+    compute_dtype: Dtype,
+    lora_dtype: Option<Dtype>,
+    checkpoint_blocks: Option<&'a [Vec<String>]>,
+}
+
+impl Sd3Loop<'_> {
+    /// The diffusers/PEFT format the inference apply path loads (no key prefix, no provenance).
+    fn saver(&self) -> AdapterSaver<'_> {
+        AdapterSaver {
+            adapter: self.adapter,
+            cfg: self.cfg,
+            provenance: &[],
         }
+    }
+}
 
-        // Epic 2123 E8: each (item, bucket) entry's perceptual reference is computed exactly once
-        // per job, by the `AuxDriver` before the loop.
-        if let Some(path) = perceptual.as_mut() {
-            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
-            // cropped like the image and resampled onto its decoded size.
-            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
-                "sd3 trainer",
-                &req.items,
-                cfg,
-                edges.len(),
-                CropBox::center_square,
-            )?);
-        }
-
-        // Every caption is cached now — free the three encoders (T5-XXL dominates) and evict buffers
-        // before the train loop, reclaiming that resident for the 8.1B MMDiT working set.
-        self.encoders = None;
-        mlx_rs::memory::clear_cache();
-
-        // --- adapter targets + params (LoRA or LoKr) + optimizer ---
-        let rank = cfg.rank as f32;
-        let (adapter, mut params) = match cfg.network_type {
-            NetworkType::Lora => {
-                let (targets, params) = build_lora_targets(
-                    &mut self.transformer,
-                    &target_paths,
-                    cfg.rank as i32,
-                    cfg.seed,
-                )?;
-                (TrainAdapter::Lora { targets }, params)
-            }
-            NetworkType::Lokr => {
-                let (targets, params) = build_lokr_targets(
-                    &mut self.transformer,
-                    &target_paths,
-                    cfg.rank as i32,
-                    cfg.decompose_factor,
-                    cfg.seed,
-                )?;
-                (TrainAdapter::Lokr { targets }, params)
-            }
-        };
-        let alpha = cfg.alpha;
-        let mae = {
-            let lt = cfg.loss_type.to_ascii_lowercase();
-            lt == "mae" || lt == "l1"
-        };
-
-        // T2 — gradient checkpointing. Collect, per joint block, the adapter-routable LOCAL paths
-        // trained on it (e.g. `"attn.to_q"`), in trained-file order — the factors a checkpoint segment
-        // threads as explicit inputs. Only `transformer_blocks.*` targets are checkpointed; any global
-        // targets (`context_embedder`/`proj_out`) train dense through `self`.
-        let n_layers = self.transformer.num_blocks();
-        let mut block_local_targets: Vec<Vec<String>> = vec![Vec::new(); n_layers];
-        for path in &target_paths {
-            if let Some((idx, local)) = path
-                .strip_prefix("transformer_blocks.")
-                .and_then(|rest| rest.split_once('.'))
-            {
-                if let Ok(i) = idx.parse::<usize>() {
-                    if i < n_layers {
-                        block_local_targets[i].push(local.to_string());
-                    }
-                }
-            }
-        }
-        // Opt-in OPTION (the SceneWorks "Gradient Checkpointing" toggle), never auto-forced — a run
-        // that would OOM is caught instead by the pre-flight guard above. LoRA only — LoKr falls back
-        // to the dense path.
-        let use_checkpoint =
-            matches!(adapter, TrainAdapter::Lora { .. }) && cfg.gradient_checkpointing;
-        let checkpoint_blocks: Option<&[Vec<String>]> = if use_checkpoint {
-            Some(&block_local_targets)
-        } else {
-            None
-        };
-        // SDPA-segment checkpointing is ALWAYS on in training. When whole-block checkpointing is on,
-        // the per-block SDPA flag goes OFF (the block recompute already covers attention).
-        self.transformer.set_sdpa_checkpoint(!use_checkpoint);
-
-        // AdamW with wd=0 is identical to Adam, so the one optimizer covers both choices.
-        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
-            0.0
-        } else {
-            cfg.weight_decay
-        };
-        let mut opt = TrainOptimizer::from_config(&cfg.optimizer, cfg.learning_rate, weight_decay)?;
-
-        let accum = cfg.gradient_accumulation.max(1);
-        let (total_updates, warmup_updates) =
-            schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
-        let stem = Path::new(&req.file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("lora")
-            .to_string();
-
-        // --- resume (F-125): continue from the latest snapshot of THIS adapter in output_dir, if any ---
-        let mut update_idx: u32 = 0;
-        let mut start_step: u32 = 0;
-        if cfg.resume {
-            if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
-                let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut opt)?;
-                params = loaded;
-                start_step = meta.step;
-                update_idx = meta.update_idx;
-                eprintln!(
-                    "[F-125] resuming from step {start_step} (optimizer update {update_idx})"
-                );
-            }
-        }
-
-        // --- train loop ---
-        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items for
-        // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
-        let schedule =
-            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
-        // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
-        // replay.
-        let mut aux_driver = match perceptual {
-            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, &req.cancel)?),
-            None => None,
-        };
-        let mut accumulated: Option<LoraParams> = None;
-        let mut last_loss = 0.0f32;
-        let mut steps_run = start_step;
-        for step in start_step + 1..=cfg.steps {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            let (losses, grads) = run_train_step(
-                &mut self.transformer,
-                &params,
-                &adapter,
-                cfg,
-                &cache,
-                &schedule,
-                aux_driver.as_mut(),
-                step,
-                mae,
-                compute_dtype,
-                lora_dtype,
-                checkpoint_blocks,
-            )?;
-            last_loss = losses.total;
-            steps_run = step;
-            accumulate_grads(&mut accumulated, grads)?;
-
-            if step % accum == 0 || step == cfg.steps {
-                let mult =
-                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
-                opt.set_lr_scaled(mult);
-                let window = if step % accum == 0 {
-                    accum
-                } else {
-                    step % accum
-                };
-                let avg = average_grads(
-                    accumulated
-                        .take()
-                        .expect("an update fires only after accumulation"),
-                    window,
-                )?;
-                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
-                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
-                update_idx += 1;
-            }
-
-            on_progress(TrainingProgress::Training {
-                step,
-                total: cfg.steps,
-                loss: last_loss,
-            });
-
-            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
-                std::fs::create_dir_all(&req.output_dir)?;
-                let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
-                adapter.save(&params, alpha, rank, cfg.decompose_factor, "", &ckpt)?;
-                checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
-                on_progress(TrainingProgress::Checkpoint { step });
-            }
-        }
-
-        // Cancelled before a single step completed (`steps == 0` is rejected by `validate`): the
-        // factors are still the `B = 0` no-op init. Surface the cancellation rather than writing a
-        // valid-looking identity adapter as a trained artifact.
-        if steps_run == 0 {
-            return Err(Error::Canceled);
-        }
-
-        // --- save final adapter (the diffusers/PEFT format the inference apply path loads) ---
-        on_progress(TrainingProgress::Saving);
-        std::fs::create_dir_all(&req.output_dir)?;
-        let adapter_path = req.output_dir.join(&req.file_name);
-        adapter.save(
-            &params,
-            alpha,
-            rank,
-            cfg.decompose_factor,
-            "",
-            &adapter_path,
+impl TrainLoopFamily for Sd3Loop<'_> {
+    fn micro_step(&mut self, step: u32, params: &LoraParams) -> Result<(f32, LoraParams)> {
+        let (losses, grads) = run_train_step(
+            self.transformer,
+            params,
+            self.adapter,
+            self.cfg,
+            self.cache,
+            self.schedule,
+            self.aux_driver.as_mut(),
+            step,
+            self.mae,
+            self.compute_dtype,
+            self.lora_dtype,
+            self.checkpoint_blocks,
         )?;
-        Ok(TrainingOutput {
-            adapter_path,
-            steps: steps_run,
-            final_loss: last_loss,
-        })
+        Ok((losses.total, grads))
+    }
+
+    fn save_checkpoint(&mut self, at: CheckpointAt<'_>) -> Result<()> {
+        self.saver().save_checkpoint(&at)
+    }
+
+    fn previews_enabled(&self) -> bool {
+        false
+    }
+
+    fn render_previews(
+        &mut self,
+        _step: u32,
+        _params: &LoraParams,
+        _sink: &mut PreviewSink<'_>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn save_final(&mut self, params: &LoraParams) -> Result<PathBuf> {
+        self.saver().save_final(self.req, params)
     }
 }
 
@@ -1303,6 +1267,7 @@ fn encode_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::train::lora::build_lora_targets;
     use mlx_gen::CancelFlag;
     use std::path::PathBuf;
 
@@ -1847,6 +1812,7 @@ mod tests {
 #[cfg(test)]
 mod real_weight_repro {
     use super::*;
+    use mlx_gen::train::lora::build_lora_targets;
     use std::path::PathBuf;
 
     /// The `stabilityai/stable-diffusion-3.5-large` snapshot root from the required `SD3_LARGE_DIR`
@@ -2397,6 +2363,7 @@ mod real_weight_repro {
 #[cfg(test)]
 mod depth_anchoring_tests {
     use super::*;
+    use mlx_gen::train::lora::build_lora_targets;
     use mlx_gen::train::perceptual::AuxLossSchedule;
     use mlx_rs::transforms::eval;
 
