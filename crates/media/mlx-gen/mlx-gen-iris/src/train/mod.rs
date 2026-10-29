@@ -615,6 +615,625 @@ fn read_checkpoint_members(dir: &Path, saved: &CheckpointState) -> Result<CkptPa
     })
 }
 
+/// The run's collective, wrapped so a distributed failure is recorded for `Trainer::train`'s
+/// typed error (the rendezvous happens before anything heavy loads).
+fn connect_collective(
+    pre: &IrisTrainPlan,
+    req: &TrainingRequest,
+    failure: &Rc<RefCell<Option<DistError>>>,
+) -> Result<Box<dyn Collective>> {
+    let coll = match make_collective(&pre.dist.world, &req.cancel) {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(d) = dist_error(&e) {
+                *failure.borrow_mut() = Some(d.clone());
+            }
+            return Err(e.into());
+        }
+    };
+    let coll: Box<dyn Collective> = Box::new(Recording {
+        inner: coll,
+        slot: failure.clone(),
+    });
+    if pre.dist.world.world_size > 1 {
+        eprintln!(
+            "[world] rank={}/{} local_rank={}/{} node={}/{} transport={} | {}",
+            pre.dist.world.rank,
+            pre.dist.world.world_size,
+            pre.dist.world.local_rank,
+            pre.dist.world.local_world_size,
+            pre.dist.world.node_rank,
+            pre.dist.world.num_nodes,
+            pre.dist.world.transport,
+            pre.dist.summary()
+        );
+    }
+    Ok(coll)
+}
+
+/// The tensors the run initializes from: the backbone, a `load_from` source (a checkpoint's
+/// trainable file, a backbone directory or a file), or none for a random init.
+fn load_init_source(
+    trainer: &IrisTrainer,
+    init: &InitMode,
+    adapter_compute: Option<Dtype>,
+) -> Result<Option<HashMap<String, Array>>> {
+    let weights_path = trainer
+        .backbone_dir
+        .join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    Ok(match init {
+        InitMode::Weights => Some(load_source(&weights_path, adapter_compute)?),
+        InitMode::Random => None,
+        InitMode::LoadFrom(p) => {
+            let file = if p.join(CKPT_STATE).is_file() {
+                p.join(CKPT_TRAINABLE)
+            } else if p.is_dir() {
+                p.join(gen_core::iris::BACKBONE_WEIGHTS_FILE)
+            } else {
+                p.clone()
+            };
+            Some(load_source(&file, adapter_compute)?)
+        }
+    })
+}
+
+/// The trained model and its fresh parameters: the whole backbone (from `source`, else a random
+/// init) or an adapter over the plan's targets on the frozen `source` backbone.
+fn build_model(
+    cfg: &gen_core::iris::ModelConfig,
+    compute: Dtype,
+    plan: &IrisTrainPlan,
+    source: Option<HashMap<String, Array>>,
+    adaln_zero_init: bool,
+) -> Result<(TrainModel, Params)> {
+    let (kind, targets) = match &plan.artifact {
+        ArtifactPlan::Full => {
+            let params = match source {
+                Some(src) => rc_map(src),
+                None => random_init(cfg, plan.seed, adaln_zero_init)?,
+            };
+            return Ok((
+                TrainModel {
+                    cfg: cfg.clone(),
+                    compute,
+                    trainable: Trainable::Full,
+                },
+                params,
+            ));
+        }
+        ArtifactPlan::Lora {
+            rank,
+            alpha,
+            targets,
+        } => (
+            AdapterKind::Lora {
+                rank: *rank,
+                alpha: *alpha,
+            },
+            targets,
+        ),
+        ArtifactPlan::Lokr {
+            rank,
+            alpha,
+            decompose_factor,
+            targets,
+        } => (
+            AdapterKind::Lokr {
+                rank: *rank,
+                alpha: *alpha,
+                factor: *decompose_factor,
+            },
+            targets,
+        ),
+    };
+    let src = source
+        .ok_or_else(|| Error::Msg("iris training: adapter runs need backbone weights".into()))?;
+    adapter_model(cfg, compute, kind, targets, src, plan.seed)
+}
+
+/// An adapter run: the targets' shapes from the backbone, the frozen backbone at its provider
+/// dtype (materialized one tensor at a time) and the adapter's fresh factors.
+fn adapter_model(
+    cfg: &gen_core::iris::ModelConfig,
+    compute: Dtype,
+    kind: AdapterKind,
+    targets_paths: &[String],
+    src: HashMap<String, Array>,
+    seed: u64,
+) -> Result<(TrainModel, Params)> {
+    let mut targets = Vec::with_capacity(targets_paths.len());
+    for p in targets_paths {
+        let w = &src[&format!("{p}.weight")];
+        targets.push(AdapterTarget {
+            path: p.clone(),
+            out_f: w.shape()[0],
+            in_f: w.shape()[1],
+        });
+    }
+    let mut base = HashMap::with_capacity(src.len());
+    for (k, a) in src {
+        let a = provider_dtype(&k, &a, compute)?;
+        eval([&a])?;
+        base.insert(k, a);
+    }
+    let params = init_adapter(kind, &targets, seed)?;
+    Ok((
+        TrainModel {
+            cfg: cfg.clone(),
+            compute,
+            trainable: Trainable::Adapter {
+                kind,
+                targets,
+                base,
+            },
+        },
+        params,
+    ))
+}
+
+/// This rank's rows of every trained tensor, the optimizer over them (each tensor routed to its
+/// Muon / AdamW group) and the EMA of the core rows.
+fn build_optimizer(
+    plan: &IrisTrainPlan,
+    cfg: &gen_core::iris::ModelConfig,
+    model: &TrainModel,
+    params: &Params,
+    topo: &Topology,
+) -> Result<(Params, IrisOptimizer, Option<Params>)> {
+    let cfg_model = cfg.clone();
+    let kind = plan.optimizer.kind;
+    let adapter_targets: HashMap<String, String> = match &model.trainable {
+        Trainable::Adapter {
+            kind: ak, targets, ..
+        } => targets
+            .iter()
+            .flat_map(|t| t.factor_keys(*ak).into_iter().map(|k| (k, t.path.clone())))
+            .collect(),
+        Trainable::Full => HashMap::new(),
+    };
+    let route = |k: &str, nd: usize| -> ParamRoute {
+        if k.starts_with(PROJECTOR_PREFIX) {
+            // `build_muon_param_groups`' `aux` group (and plain AdamW's single group).
+            return ParamRoute::AdamW;
+        }
+        match adapter_targets.get(k) {
+            Some(target) => adapter_param_route(target, nd, kind),
+            None => full_param_route(k, nd, kind, &cfg_model),
+        }
+    };
+    // A sharded run persists only its rows of every tensor.
+    let sharded = plan.dist.sharded();
+    let mut rows = Params::with_capacity(params.len());
+    let mut full_rows: HashMap<Rc<str>, usize> = HashMap::new();
+    for (k, v) in params {
+        rows.insert(k.clone(), topo.shard_of(k, v)?);
+        if sharded && v.ndim() >= 1 {
+            full_rows.insert(k.clone(), v.shape()[0] as usize);
+        }
+    }
+    let opt = IrisOptimizer::new_sharded(&plan.optimizer, &rows, &full_rows, route)?;
+    let core_ema = |m: &Params| -> Params {
+        m.iter()
+            .filter(|(k, _)| !k.starts_with(PROJECTOR_PREFIX))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    let ema = plan.ema.map(|_| core_ema(&rows));
+    Ok((rows, opt, ema))
+}
+
+/// The run's text conditioning: the source over the loaded encoder, the null and preview
+/// encodings, and the dataset pass.
+struct PreparedText {
+    text: TextSource,
+    null: Encoded,
+    preview: Vec<(String, Encoded)>,
+    preview_negative: Option<Encoded>,
+}
+
+/// Load the text encoder, encode the null and (main rank) preview prompts, walk the dataset
+/// ([`cache_captions`]) and, with cached conditioning, free the encoder.
+fn prepare_text(
+    trainer: &IrisTrainer,
+    config: &IrisConfig,
+    plan: &IrisTrainPlan,
+    topo: &Topology,
+    req: &TrainingRequest,
+    on_progress: &mut dyn FnMut(TrainingProgress),
+) -> Result<PreparedText> {
+    let mut te_cfg: TextEncoderConfig = config.text_encoder.clone();
+    te_cfg.on_caption_overflow = plan.on_caption_overflow.clone();
+    let encoder = IrisTextEncoder::load(&trainer.text_encoder_dir, &te_cfg)?;
+    let mut text = TextSource {
+        encoder: Some(encoder),
+        memo: HashMap::new(),
+        policy: plan.on_caption_overflow.clone(),
+        max_length: config.text_encoder.max_length,
+    };
+    let null = text.encode("")?;
+    let mut preview = Vec::new();
+    let mut preview_negative = None;
+    if plan.preview.every > 0 && topo.is_main() {
+        for p in &plan.preview.prompts {
+            preview.push((p.clone(), text.encode(p)?));
+        }
+        if plan.preview.cfg_scale != 1.0 {
+            preview_negative = Some(text.encode(&plan.preview.negative_prompt)?);
+        }
+    }
+    cache_captions(&mut text, plan, req, on_progress)?;
+    if plan.text_conditioning == TextConditioningMode::Cached {
+        text.encoder = None;
+        mlx_rs::memory::clear_cache();
+    }
+    Ok(PreparedText {
+        text,
+        null,
+        preview,
+        preview_negative,
+    })
+}
+
+/// The dataset pass (one `Caching` event per item): every image must decode as an image, every
+/// caption variant must be selectable, and — with `text_conditioning: cached` — every distinct
+/// caption is encoded once into the memo.
+fn cache_captions(
+    text: &mut TextSource,
+    plan: &IrisTrainPlan,
+    req: &TrainingRequest,
+    on_progress: &mut dyn FnMut(TrainingProgress),
+) -> Result<()> {
+    let total = req.items.len() as u32;
+    for (i, item) in req.items.iter().enumerate() {
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        image::image_dimensions(&item.image_path).map_err(|e| {
+            Error::Msg(format!(
+                "iris training: item {} is not a readable image: {e}",
+                item.image_path.display()
+            ))
+        })?;
+        let variants =
+            contract::item_caption_variants(item, &plan.caption_field, &plan.caption_fields);
+        if variants.is_empty() {
+            return Err(Error::Msg(format!(
+                "iris training: item {} carries no caption field {:?}",
+                item.image_path.display(),
+                plan.caption_field
+            )));
+        }
+        if plan.text_conditioning == TextConditioningMode::Cached {
+            for c in &variants {
+                text.remember(c)?;
+            }
+        }
+        on_progress(TrainingProgress::Caching {
+            current: i as u32 + 1,
+            total,
+        });
+    }
+    if req.cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    Ok(())
+}
+
+/// This rank's data plan and the run's schedule, checkpoint root and dataset identity.
+struct DataPlan {
+    pipeline: DataPipeline,
+    holdout_sizes: Vec<(usize, usize)>,
+    total_steps: u64,
+    schedule: TrainSchedule,
+    ckpt_root: PathBuf,
+    dataset_fingerprint: String,
+}
+
+/// The data plan of this rank: its shape batches, agreed across ranks to the global minimum
+/// (`_agree_batch_count`), its holdout sizes and the run's step count.
+fn prepare_data(
+    req: &TrainingRequest,
+    plan: &IrisTrainPlan,
+    topo: &mut Topology,
+) -> Result<DataPlan> {
+    let world = plan.dist.world.clone();
+    let mut pipeline = DataPipeline::new(
+        &req.items,
+        plan.shape.clone(),
+        plan.batch_size,
+        world.rank,
+        world.world_size,
+    )?;
+    if let Some(warning) = pipeline.unused_tail_warning() {
+        eprintln!("{warning}");
+    }
+    // `_agree_batch_count`: every rank walks the global minimum of shape batches.
+    let mut local = [pipeline.epoch_batches() as f64];
+    topo.reduce_scalars(&mut local, ReduceOp::Min)?;
+    pipeline.set_epoch_batches(local[0] as usize)?;
+    let holdout_sizes = pipeline.holdout_sizes(&req.items)?;
+    let total_steps = contract::total_optimizer_steps(
+        pipeline.epoch_batches(),
+        plan.grad_accum,
+        plan.num_epochs,
+        plan.max_steps,
+    );
+    let schedule = TrainSchedule::new(plan.flow.num_train_timesteps, plan.flow.shift);
+    let ckpt_root = checkpoint_root(&req.output_dir, &req.file_name);
+    let dataset_fingerprint = dataset_fingerprint(req)?;
+    Ok(DataPlan {
+        pipeline,
+        holdout_sizes,
+        total_steps,
+        schedule,
+        ckpt_root,
+        dataset_fingerprint,
+    })
+}
+
+/// The run's starting position: fresh, or restored from one agreed checkpoint.
+struct Resumed {
+    rows: Params,
+    step: u64,
+    sched_step: u64,
+    lr: f64,
+    nan_count: u32,
+    last_loss: f64,
+    first_epoch: u32,
+    position: Option<JsonValue>,
+    scaler: Option<GradScaler>,
+    writes_checkpoints: bool,
+}
+
+/// Resume (sc-25690): every rank resumes from one agreed checkpoint; one writer per storage; the
+/// checkpoints that are not this run's lineage move aside before its first publish.
+#[allow(clippy::too_many_arguments)]
+fn resume_run(
+    plan: &IrisTrainPlan,
+    topo: &mut Topology,
+    data: &mut DataPlan,
+    rows: Params,
+    ema: &mut Option<Params>,
+    opt: &mut IrisOptimizer,
+    base_identity: &str,
+    failure: &Rc<RefCell<Option<DistError>>>,
+) -> Result<Resumed> {
+    let mut resumed = Resumed {
+        rows,
+        step: 0,
+        sched_step: 0,
+        lr: plan.optimizer.lr,
+        nan_count: 0,
+        last_loss: f64::NAN,
+        first_epoch: 1,
+        position: None,
+        scaler: (plan.mixed_precision == MixedPrecision::Fp16).then(GradScaler::default),
+        writes_checkpoints: false,
+    };
+    let ckpt_root = &data.ckpt_root;
+    let resume_dir = match (&plan.resume_from, plan.resume) {
+        (Some(p), _) => {
+            let dir = if p.join(CKPT_STATE).is_file() {
+                p.clone()
+            } else {
+                latest_checkpoint(p).ok_or_else(|| {
+                    Error::Msg(format!(
+                        "iris resume: {} holds no complete checkpoint",
+                        p.display()
+                    ))
+                })?
+            };
+            Some(dir)
+        }
+        (None, true) => latest_checkpoint(ckpt_root),
+        (None, false) => None,
+    };
+    let search_root = match (&plan.resume_from, plan.resume) {
+        (Some(p), _) if !p.join(CKPT_STATE).is_file() => Some(p.clone()),
+        (None, true) => Some(ckpt_root.clone()),
+        _ => None,
+    };
+    let resume_dir = match agree_resume(topo.coll.as_mut(), resume_dir, search_root.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            // typed at `Trainer::train`, like every other distributed failure
+            if let Some(d) = dist_error(&e) {
+                failure.borrow_mut().get_or_insert(d.clone());
+            }
+            return Err(e.into());
+        }
+    };
+    let writes_checkpoints =
+        elect_checkpoint_writer(topo.coll.as_mut(), plan.dist.checkpoint_io, ckpt_root)?;
+    let resume_src = resume_dir.clone();
+    if let Some(dir) = resume_dir {
+        let saved = read_checkpoint_state(&dir)?;
+        check_resume(&saved, plan, &data.dataset_fingerprint, base_identity)?;
+        let payload = read_checkpoint_members(&dir, &saved)?;
+        restore_checkpoint(
+            plan,
+            topo,
+            &mut data.pipeline,
+            &saved,
+            &payload,
+            ema,
+            opt,
+            &mut resumed,
+        )?;
+    }
+    // sc-25690: the root's checkpoints that are not this run's lineage move aside before its
+    // first publish, and only once the resume source was validated and loaded (a refused resume
+    // leaves the root as it was).
+    if writes_checkpoints {
+        retire_foreign_checkpoints(ckpt_root, resume_src.as_deref())?;
+    }
+    if plan.dist.world.world_size > 1 {
+        topo.coll.barrier("checkpoint lineage")?;
+    }
+    resumed.writes_checkpoints = writes_checkpoints;
+    Ok(resumed)
+}
+
+/// Restore one validated checkpoint's tensors, optimizer slots, counters and data position.
+#[allow(clippy::too_many_arguments)]
+fn restore_checkpoint(
+    plan: &IrisTrainPlan,
+    topo: &Topology,
+    pipeline: &mut DataPipeline,
+    saved: &CheckpointState,
+    payload: &CkptPayload,
+    ema: &mut Option<Params>,
+    opt: &mut IrisOptimizer,
+    resumed: &mut Resumed,
+) -> Result<()> {
+    let projector_carries = restore_tensors(plan, topo, saved, payload, &mut resumed.rows, ema)?;
+    restore_optimizer(topo, payload, projector_carries, opt)?;
+    resumed.step = saved.step;
+    resumed.sched_step = saved.scheduler_step;
+    resumed.lr = if plan.override_lr_on_resume {
+        plan.optimizer.lr
+    } else {
+        saved.lr
+    };
+    resumed.nan_count = saved.nan_count;
+    resumed.last_loss = saved.last_loss;
+    if let (Some(s), Some(g)) = (resumed.scaler.as_mut(), saved.grad_scaler.as_ref()) {
+        *s = g.clone();
+    }
+    let position = resume_data_position(plan, saved, pipeline)?;
+    resumed.first_epoch = position
+        .get("epoch")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(1) as u32;
+    resumed.position = Some(position);
+    Ok(())
+}
+
+/// The checkpoint's trainable tensors (which must match this run's), its projector when it
+/// carries over, and its EMA — each sliced to this rank's rows. Returns whether the projector
+/// carried.
+fn restore_tensors(
+    plan: &IrisTrainPlan,
+    topo: &Topology,
+    saved: &CheckpointState,
+    payload: &CkptPayload,
+    run_rows: &mut Params,
+    ema: &mut Option<Params>,
+) -> Result<bool> {
+    let core_keys: Vec<Rc<str>> = run_rows
+        .keys()
+        .filter(|k| !k.starts_with(PROJECTOR_PREFIX))
+        .cloned()
+        .collect();
+    if payload.trainable.len() != core_keys.len()
+        || core_keys
+            .iter()
+            .any(|k| !payload.trainable.contains_key(k.as_ref()))
+    {
+        return Err(Error::Msg(
+            "iris resume: the checkpoint's trainable tensors do not match this run".into(),
+        ));
+    }
+    for (k, v) in &payload.trainable {
+        let key: Rc<str> = Rc::from(k.as_str());
+        let r = topo.shard_of(&key, v)?;
+        run_rows.insert(key, r);
+    }
+    // The projector carries over when it matches; `resume_optimizer: core` starts a new one cold
+    // (its fresh init stays).
+    let projector_carries = plan
+        .repa
+        .as_ref()
+        .is_some_and(|r| saved.repa_projector.as_deref() == Some(r.projector_identity().as_str()));
+    if projector_carries {
+        let pj = payload.projector.as_ref().ok_or_else(|| {
+            Error::Msg("iris resume: the checkpoint names a projector it lacks".into())
+        })?;
+        for (k, v) in pj {
+            let key: Rc<str> = Rc::from(k.as_str());
+            let r = topo.shard_of(&key, v)?;
+            run_rows.insert(key, r);
+        }
+    }
+    if let Some(e) = ema.as_mut() {
+        let saved_ema = payload
+            .ema
+            .as_ref()
+            .ok_or_else(|| Error::Msg("iris resume: the checkpoint carries no EMA".into()))?;
+        for (k, v) in saved_ema {
+            let key: Rc<str> = Rc::from(k.as_str());
+            let r = topo.shard_of(&key, v)?;
+            e.insert(key, r);
+        }
+    }
+    Ok(projector_carries)
+}
+
+/// Optimizer slots: full tensors sliced to this rank's rows; under `core` only the backbone's
+/// survive (a projector's moments restart from the live optimizer's fresh zero slots).
+fn restore_optimizer(
+    topo: &Topology,
+    payload: &CkptPayload,
+    projector_carries: bool,
+    opt: &mut IrisOptimizer,
+) -> Result<()> {
+    let mut slots: HashMap<String, Array> = HashMap::new();
+    for (name, v) in &payload.optimizer {
+        if name == "__t" {
+            slots.insert(name.clone(), v.clone());
+            continue;
+        }
+        let key = name.split("::").next().unwrap_or(name);
+        if key.starts_with(PROJECTOR_PREFIX) && !projector_carries {
+            continue;
+        }
+        slots.insert(name.clone(), topo.shard_of(key, v)?);
+    }
+    if !projector_carries {
+        // fill the fresh projector's zero slots from the live optimizer
+        for (name, v) in opt.state_tensors() {
+            if name.starts_with(PROJECTOR_PREFIX) {
+                slots.insert(name, v);
+            }
+        }
+    }
+    opt.load_state(&slots)
+}
+
+/// `_resolve_resume_data_position`: `new_phase` starts the current dataset fresh; `exact`
+/// continues at the checkpoint's data position (or its legacy batch identity).
+fn resume_data_position(
+    plan: &IrisTrainPlan,
+    saved: &CheckpointState,
+    pipeline: &mut DataPipeline,
+) -> Result<JsonValue> {
+    Ok(match plan.resume_data_policy {
+        ResumeDataPolicy::NewPhase => {
+            eprintln!(
+                "iris training: resume_data_policy=new_phase: retained checkpoint step {} and \
+                 model/EMA/optimizer/scheduler state; starting the current dataset at epoch 1 \
+                 with zero consumed batches",
+                saved.step
+            );
+            pipeline.fresh_position()?
+        }
+        ResumeDataPolicy::Exact => match &saved.data_position {
+            Some(p) => p.clone(),
+            None => {
+                let (batch, _) = saved.legacy_batch().ok_or_else(|| {
+                    Error::Msg(
+                        "iris resume: the checkpoint has neither a data_position nor a legacy \
+                         batch identity; resume_data_policy new_phase starts the current dataset \
+                         fresh"
+                            .into(),
+                    )
+                })?;
+                pipeline.legacy_position(saved.epoch, saved.batches_consumed, batch)?
+            }
+        },
+    })
+}
+
 /// A boundary of an ended pass and the data position captured when that pass ended.
 struct Settled {
     boundary: (u32, usize, usize, usize),
@@ -641,52 +1260,11 @@ impl Run {
         };
 
         // ---- the topology (rendezvous before anything heavy loads) ----------------------
-        let coll = match make_collective(&pre.dist.world, &req.cancel) {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(d) = dist_error(&e) {
-                    *failure.borrow_mut() = Some(d.clone());
-                }
-                return Err(e.into());
-            }
-        };
-        let coll: Box<dyn Collective> = Box::new(Recording {
-            inner: coll,
-            slot: failure.clone(),
-        });
-        if pre.dist.world.world_size > 1 {
-            eprintln!(
-                "[world] rank={}/{} local_rank={}/{} node={}/{} transport={} | {}",
-                pre.dist.world.rank,
-                pre.dist.world.world_size,
-                pre.dist.world.local_rank,
-                pre.dist.world.local_world_size,
-                pre.dist.world.node_rank,
-                pre.dist.world.num_nodes,
-                pre.dist.world.transport,
-                pre.dist.summary()
-            );
-        }
+        let coll = connect_collective(&pre, req, &failure)?;
 
         on_progress(TrainingProgress::LoadingModel);
-        let weights_path = trainer
-            .backbone_dir
-            .join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
         let adapter_compute = (!req.config.full_finetune).then_some(compute);
-        let source: Option<HashMap<String, Array>> = match &pre.init {
-            InitMode::Weights => Some(load_source(&weights_path, adapter_compute)?),
-            InitMode::Random => None,
-            InitMode::LoadFrom(p) => {
-                let file = if p.join(CKPT_STATE).is_file() {
-                    p.join(CKPT_TRAINABLE)
-                } else if p.is_dir() {
-                    p.join(gen_core::iris::BACKBONE_WEIGHTS_FILE)
-                } else {
-                    p.clone()
-                };
-                Some(load_source(&file, adapter_compute)?)
-            }
-        };
+        let source = load_init_source(trainer, &pre.init, adapter_compute)?;
         if let Some(src) = &source {
             check_backbone_keys(&config.model, src, "the source weights")?;
         }
@@ -697,82 +1275,8 @@ impl Run {
         let base_identity = backbone_identity(&trainer.backbone_dir, source.is_some())?;
         let adaln_zero_init = trainer.flow_defaults.adaln_zero_init;
 
-        let (model, mut params) = match &plan.artifact {
-            ArtifactPlan::Full => {
-                let params = match source {
-                    Some(src) => rc_map(src),
-                    None => random_init(&config.model, plan.seed, adaln_zero_init)?,
-                };
-                (
-                    TrainModel {
-                        cfg: config.model.clone(),
-                        compute,
-                        trainable: Trainable::Full,
-                    },
-                    params,
-                )
-            }
-            art => {
-                let src = source.ok_or_else(|| {
-                    Error::Msg("iris training: adapter runs need backbone weights".into())
-                })?;
-                let (kind, targets_paths) = match art {
-                    ArtifactPlan::Lora {
-                        rank,
-                        alpha,
-                        targets,
-                    } => (
-                        AdapterKind::Lora {
-                            rank: *rank,
-                            alpha: *alpha,
-                        },
-                        targets,
-                    ),
-                    ArtifactPlan::Lokr {
-                        rank,
-                        alpha,
-                        decompose_factor,
-                        targets,
-                    } => (
-                        AdapterKind::Lokr {
-                            rank: *rank,
-                            alpha: *alpha,
-                            factor: *decompose_factor,
-                        },
-                        targets,
-                    ),
-                    ArtifactPlan::Full => unreachable!(),
-                };
-                let mut targets = Vec::with_capacity(targets_paths.len());
-                for p in targets_paths {
-                    let w = &src[&format!("{p}.weight")];
-                    targets.push(AdapterTarget {
-                        path: p.clone(),
-                        out_f: w.shape()[0],
-                        in_f: w.shape()[1],
-                    });
-                }
-                let mut base = HashMap::with_capacity(src.len());
-                for (k, a) in src {
-                    let a = provider_dtype(&k, &a, compute)?;
-                    eval([&a])?;
-                    base.insert(k, a);
-                }
-                let params = init_adapter(kind, &targets, plan.seed)?;
-                (
-                    TrainModel {
-                        cfg: config.model.clone(),
-                        compute,
-                        trainable: Trainable::Adapter {
-                            kind,
-                            targets,
-                            base,
-                        },
-                    },
-                    params,
-                )
-            }
-        };
+        let (model, mut params) =
+            build_model(&config.model, compute, &plan, source, adaln_zero_init)?;
         if let Some(r) = &plan.repa {
             params.extend(init_projector(r, plan.seed)?);
         }
@@ -789,108 +1293,11 @@ impl Run {
             coll,
             shapes: full_shapes.clone(),
         };
-
-        let cfg_model = config.model.clone();
-        let kind = plan.optimizer.kind;
-        let adapter_targets: HashMap<String, String> = match &model.trainable {
-            Trainable::Adapter {
-                kind: ak, targets, ..
-            } => targets
-                .iter()
-                .flat_map(|t| t.factor_keys(*ak).into_iter().map(|k| (k, t.path.clone())))
-                .collect(),
-            Trainable::Full => HashMap::new(),
-        };
-        let route = |k: &str, nd: usize| -> ParamRoute {
-            if k.starts_with(PROJECTOR_PREFIX) {
-                // `build_muon_param_groups`' `aux` group (and plain AdamW's single group).
-                return ParamRoute::AdamW;
-            }
-            match adapter_targets.get(k) {
-                Some(target) => adapter_param_route(target, nd, kind),
-                None => full_param_route(k, nd, kind, &cfg_model),
-            }
-        };
-        // A sharded run persists only its rows of every tensor.
-        let sharded = plan.dist.sharded();
-        let mut rows = Params::with_capacity(params.len());
-        let mut full_rows: HashMap<Rc<str>, usize> = HashMap::new();
-        for (k, v) in &params {
-            rows.insert(k.clone(), topo.shard_of(k, v)?);
-            if sharded && v.ndim() >= 1 {
-                full_rows.insert(k.clone(), v.shape()[0] as usize);
-            }
-        }
-        let mut opt = IrisOptimizer::new_sharded(&plan.optimizer, &rows, &full_rows, route)?;
-        let core_ema = |m: &Params| -> Params {
-            m.iter()
-                .filter(|(k, _)| !k.starts_with(PROJECTOR_PREFIX))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        };
-        let mut ema = plan.ema.map(|_| core_ema(&rows));
+        let (rows, mut opt, mut ema) =
+            build_optimizer(&plan, &config.model, &model, &params, &topo)?;
 
         // ---- text conditioning -------------------------------------------------------------
-        let mut te_cfg: TextEncoderConfig = config.text_encoder.clone();
-        te_cfg.on_caption_overflow = plan.on_caption_overflow.clone();
-        let encoder = IrisTextEncoder::load(&trainer.text_encoder_dir, &te_cfg)?;
-        let mut text = TextSource {
-            encoder: Some(encoder),
-            memo: HashMap::new(),
-            policy: plan.on_caption_overflow.clone(),
-            max_length: config.text_encoder.max_length,
-        };
-        let null = text.encode("")?;
-        let mut preview = Vec::new();
-        let mut preview_negative = None;
-        if plan.preview.every > 0 && topo.is_main() {
-            for p in &plan.preview.prompts {
-                preview.push((p.clone(), text.encode(p)?));
-            }
-            if plan.preview.cfg_scale != 1.0 {
-                preview_negative = Some(text.encode(&plan.preview.negative_prompt)?);
-            }
-        }
-        // The dataset pass (one `Caching` event per item): every image must decode as an image,
-        // every caption variant must be selectable, and — with `text_conditioning: cached` — every
-        // distinct caption is encoded once into the memo.
-        let total = req.items.len() as u32;
-        for (i, item) in req.items.iter().enumerate() {
-            if req.cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            image::image_dimensions(&item.image_path).map_err(|e| {
-                Error::Msg(format!(
-                    "iris training: item {} is not a readable image: {e}",
-                    item.image_path.display()
-                ))
-            })?;
-            let variants =
-                contract::item_caption_variants(item, &plan.caption_field, &plan.caption_fields);
-            if variants.is_empty() {
-                return Err(Error::Msg(format!(
-                    "iris training: item {} carries no caption field {:?}",
-                    item.image_path.display(),
-                    plan.caption_field
-                )));
-            }
-            if plan.text_conditioning == TextConditioningMode::Cached {
-                for c in &variants {
-                    text.remember(c)?;
-                }
-            }
-            on_progress(TrainingProgress::Caching {
-                current: i as u32 + 1,
-                total,
-            });
-        }
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        if plan.text_conditioning == TextConditioningMode::Cached {
-            text.encoder = None;
-            mlx_rs::memory::clear_cache();
-        }
+        let text = prepare_text(trainer, &config, &plan, &topo, req, on_progress)?;
 
         // ---- the REPA teacher (frozen, fp32) --------------------------------------------------
         let teacher = match &plan.repa {
@@ -902,233 +1309,51 @@ impl Run {
         };
 
         // ---- the data plan of this rank -------------------------------------------------------
-        let world = plan.dist.world.clone();
-        let mut pipeline = DataPipeline::new(
-            &req.items,
-            plan.shape.clone(),
-            plan.batch_size,
-            world.rank,
-            world.world_size,
-        )?;
-        if let Some(warning) = pipeline.unused_tail_warning() {
-            eprintln!("{warning}");
-        }
-        // `_agree_batch_count`: every rank walks the global minimum of shape batches.
-        let mut local = [pipeline.epoch_batches() as f64];
-        topo.reduce_scalars(&mut local, ReduceOp::Min)?;
-        pipeline.set_epoch_batches(local[0] as usize)?;
-        let holdout_sizes = pipeline.holdout_sizes(&req.items)?;
-        let total_steps = contract::total_optimizer_steps(
-            pipeline.epoch_batches(),
-            plan.grad_accum,
-            plan.num_epochs,
-            plan.max_steps,
-        );
-        let schedule = TrainSchedule::new(plan.flow.num_train_timesteps, plan.flow.shift);
-        let ckpt_root = checkpoint_root(&req.output_dir, &req.file_name);
-        let dataset_fingerprint = dataset_fingerprint(req)?;
+        let mut data = prepare_data(req, &plan, &mut topo)?;
 
         // ---- resume -------------------------------------------------------------------------
-        let mut run_rows = rows;
-        let (mut step, mut sched_step, mut lr, mut nan_count, mut last_loss) =
-            (0u64, 0u64, plan.optimizer.lr, 0u32, f64::NAN);
-        let mut first_epoch = 1u32;
-        let mut resume_position = None;
-        let mut scaler = (plan.mixed_precision == MixedPrecision::Fp16).then(GradScaler::default);
-        let resume_dir = match (&plan.resume_from, plan.resume) {
-            (Some(p), _) => {
-                let dir = if p.join(CKPT_STATE).is_file() {
-                    p.clone()
-                } else {
-                    latest_checkpoint(p).ok_or_else(|| {
-                        Error::Msg(format!(
-                            "iris resume: {} holds no complete checkpoint",
-                            p.display()
-                        ))
-                    })?
-                };
-                Some(dir)
-            }
-            (None, true) => latest_checkpoint(&ckpt_root),
-            (None, false) => None,
-        };
-        // sc-25690: every rank resumes from one agreed checkpoint; one writer per storage; the
-        // checkpoints that are not this run's lineage move aside before its first publish.
-        let search_root = match (&plan.resume_from, plan.resume) {
-            (Some(p), _) if !p.join(CKPT_STATE).is_file() => Some(p.clone()),
-            (None, true) => Some(ckpt_root.clone()),
-            _ => None,
-        };
-        let resume_dir = match agree_resume(topo.coll.as_mut(), resume_dir, search_root.as_deref())
-        {
-            Ok(d) => d,
-            Err(e) => {
-                // typed at `Trainer::train`, like every other distributed failure
-                if let Some(d) = dist_error(&e) {
-                    failure.borrow_mut().get_or_insert(d.clone());
-                }
-                return Err(e.into());
-            }
-        };
-        let writes_checkpoints =
-            elect_checkpoint_writer(topo.coll.as_mut(), plan.dist.checkpoint_io, &ckpt_root)?;
-        let resume_src = resume_dir.clone();
-        if let Some(dir) = resume_dir {
-            let saved = read_checkpoint_state(&dir)?;
-            check_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
-            let payload = read_checkpoint_members(&dir, &saved)?;
-            let core_keys: Vec<Rc<str>> = run_rows
-                .keys()
-                .filter(|k| !k.starts_with(PROJECTOR_PREFIX))
-                .cloned()
-                .collect();
-            if payload.trainable.len() != core_keys.len()
-                || core_keys
-                    .iter()
-                    .any(|k| !payload.trainable.contains_key(k.as_ref()))
-            {
-                return Err(Error::Msg(
-                    "iris resume: the checkpoint's trainable tensors do not match this run".into(),
-                ));
-            }
-            for (k, v) in &payload.trainable {
-                let key: Rc<str> = Rc::from(k.as_str());
-                let r = topo.shard_of(&key, v)?;
-                run_rows.insert(key, r);
-            }
-            // The projector carries over when it matches; `resume_optimizer: core` starts a new
-            // one cold (its fresh init stays).
-            let projector_carries = plan.repa.as_ref().is_some_and(|r| {
-                saved.repa_projector.as_deref() == Some(r.projector_identity().as_str())
-            });
-            if projector_carries {
-                let pj = payload.projector.as_ref().ok_or_else(|| {
-                    Error::Msg("iris resume: the checkpoint names a projector it lacks".into())
-                })?;
-                for (k, v) in pj {
-                    let key: Rc<str> = Rc::from(k.as_str());
-                    let r = topo.shard_of(&key, v)?;
-                    run_rows.insert(key, r);
-                }
-            }
-            if let Some(e) = ema.as_mut() {
-                let saved_ema = payload.ema.as_ref().ok_or_else(|| {
-                    Error::Msg("iris resume: the checkpoint carries no EMA".into())
-                })?;
-                for (k, v) in saved_ema {
-                    let key: Rc<str> = Rc::from(k.as_str());
-                    let r = topo.shard_of(&key, v)?;
-                    e.insert(key, r);
-                }
-            }
-            // Optimizer slots: full tensors sliced to this rank's rows; under `core` only the
-            // backbone's survive (a projector's moments restart).
-            let mut slots: HashMap<String, Array> = HashMap::new();
-            for (name, v) in &payload.optimizer {
-                if name == "__t" {
-                    slots.insert(name.clone(), v.clone());
-                    continue;
-                }
-                let key = name.split("::").next().unwrap_or(name);
-                if key.starts_with(PROJECTOR_PREFIX) && !projector_carries {
-                    continue;
-                }
-                slots.insert(name.clone(), topo.shard_of(key, v)?);
-            }
-            if !projector_carries {
-                // fill the fresh projector's zero slots from the live optimizer
-                for (name, v) in opt.state_tensors() {
-                    if name.starts_with(PROJECTOR_PREFIX) {
-                        slots.insert(name, v);
-                    }
-                }
-            }
-            opt.load_state(&slots)?;
-            step = saved.step;
-            sched_step = saved.scheduler_step;
-            lr = if plan.override_lr_on_resume {
-                plan.optimizer.lr
-            } else {
-                saved.lr
-            };
-            nan_count = saved.nan_count;
-            last_loss = saved.last_loss;
-            if let (Some(s), Some(g)) = (scaler.as_mut(), saved.grad_scaler.as_ref()) {
-                *s = g.clone();
-            }
-            // `_resolve_resume_data_position`
-            let position = match plan.resume_data_policy {
-                ResumeDataPolicy::NewPhase => {
-                    eprintln!(
-                        "iris training: resume_data_policy=new_phase: retained checkpoint step {} \
-                         and model/EMA/optimizer/scheduler state; starting the current dataset at \
-                         epoch 1 with zero consumed batches",
-                        saved.step
-                    );
-                    pipeline.fresh_position()?
-                }
-                ResumeDataPolicy::Exact => match &saved.data_position {
-                    Some(p) => p.clone(),
-                    None => {
-                        let (batch, _) = saved.legacy_batch().ok_or_else(|| {
-                            Error::Msg(
-                                "iris resume: the checkpoint has neither a data_position nor a \
-                                 legacy batch identity; resume_data_policy new_phase starts the \
-                                 current dataset fresh"
-                                    .into(),
-                            )
-                        })?;
-                        pipeline.legacy_position(saved.epoch, saved.batches_consumed, batch)?
-                    }
-                },
-            };
-            first_epoch = position
-                .get("epoch")
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(1) as u32;
-            resume_position = Some(position);
-        }
-        // sc-25690: the root's checkpoints that are not this run's lineage move aside before its
-        // first publish, and only once the resume source was validated and loaded (a refused
-        // resume leaves the root as it was).
-        if writes_checkpoints {
-            retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
-        }
-        if plan.dist.world.world_size > 1 {
-            topo.coll.barrier("checkpoint lineage")?;
-        }
+        let resumed = resume_run(
+            &plan,
+            &mut topo,
+            &mut data,
+            rows,
+            &mut ema,
+            &mut opt,
+            &base_identity,
+            &failure,
+        )?;
         let run = Self {
             plan,
             config,
             adaln_zero_init,
             model,
             extras,
-            params: run_rows,
+            params: resumed.rows,
             full: None,
             ema,
             opt,
-            text,
-            null,
-            preview,
-            preview_negative,
-            pipeline,
-            holdout_sizes,
-            schedule,
-            total_steps,
-            ckpt_root,
+            text: text.text,
+            null: text.null,
+            preview: text.preview,
+            preview_negative: text.preview_negative,
+            pipeline: data.pipeline,
+            holdout_sizes: data.holdout_sizes,
+            schedule: data.schedule,
+            total_steps: data.total_steps,
+            ckpt_root: data.ckpt_root,
             base_identity,
-            dataset_fingerprint,
+            dataset_fingerprint: data.dataset_fingerprint,
             teacher,
             topo,
-            scaler,
-            step,
-            sched_step,
-            lr,
-            nan_count,
-            last_loss,
-            first_epoch,
-            resume_position,
-            writes_checkpoints,
+            scaler: resumed.scaler,
+            step: resumed.step,
+            sched_step: resumed.sched_step,
+            lr: resumed.lr,
+            nan_count: resumed.nan_count,
+            last_loss: resumed.last_loss,
+            first_epoch: resumed.first_epoch,
+            resume_position: resumed.position,
+            writes_checkpoints: resumed.writes_checkpoints,
             log_window: Vec::new(),
         };
         if run.topo.is_main() {
