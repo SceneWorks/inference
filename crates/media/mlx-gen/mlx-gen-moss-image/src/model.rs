@@ -398,370 +398,14 @@ impl MossImage {
             .lock()
             .map_err(|_| Error::Msg("MOSS edit receipt lock poisoned".into()))?;
         state.begin_request(&self.custom_pins, &mut edit_report)?;
-        let result = (|| {
-            check(&request.cancel)?;
-            self.sources.ensure_unchanged()?;
-            let (resolved, count) = self.validate_inputs(request, inputs)?;
-            let sources = self.selected_sources(resolved.acceleration)?;
-            sources.ensure_unchanged()?;
-            let peak = self
-                .estimated_request_peak(request, inputs)?
-                .checked_add(
-                    edit.map(|edit| crate::edit::extra_peak(edit, request))
-                        .transpose()?
-                        .unwrap_or(0),
-                )
-                .ok_or_else(|| Error::Unsupported("MOSS edit peak overflow".into()))?;
-            let edit_assets = edit
-                .map(|_| crate::edit::EditAssets::prepare(&self.spec))
-                .transpose()?;
-            if let Some(cap) = self.sources.working_set_budget()? {
-                if peak > cap {
-                    return Err(Error::Unsupported(format!("MOSS structural resident peak {peak} exceeds admitted MLX working set {cap}; choose a supported geometry/batch or a larger admitted device")));
-                }
-            }
-            // Only the selected immutable renderer may overlap conditioning activations.
-            if state.release_for_request(resolved.acceleration, edit.is_some()) {
-                self.sources.drain_cache()?;
-            }
-            let batch = inputs
-                .positive
-                .map_or(request.prompt_batch.len().max(1), |e| e.batch);
-            let mut positive = Vec::new();
-            let mut negative = Vec::new();
-            let mut conditioning = Vec::new();
-            for row in 0..batch {
-                check(&request.cancel)?;
-                let (pos, pos_receipt) = if let Some(e) = inputs.positive {
-                    supplied(e, row)?
-                } else {
-                    let text = if request.prompt_batch.is_empty() {
-                        request.prompt.as_str()
-                    } else {
-                        &request.prompt_batch[row]
-                    };
-                    self.encoder
-                        .encode(text, resolved.max_sequence_length, &request.cancel)?
-                };
-                let neg = if resolved.acceleration == MossImageAcceleration::Off
-                    && resolved.guidance != 1.0
-                {
-                    Some(if let Some(e) = inputs.negative {
-                        supplied(e, row)?
-                    } else {
-                        let text = inputs
-                            .negative_prompts
-                            .map(|p| p[row].as_str())
-                            .unwrap_or(request.negative_prompt.as_deref().unwrap_or(""));
-                        self.encoder
-                            .encode(text, resolved.max_sequence_length, &request.cancel)?
-                    })
-                } else {
-                    None
-                };
-                for _ in 0..request.count {
-                    positive.push(pos.clone());
-                    if let Some((array, _)) = &neg {
-                        negative.push(array.clone());
-                    }
-                }
-                conditioning.push(MossImageConditioningReceipt {
-                    positive: pos_receipt,
-                    negative: neg.map(|(_, receipt)| receipt),
-                });
-            }
-            check(&request.cancel)?;
-            let mut edit_renderer = None;
-            let mut edit_references = None;
-            if let (Some(edit), Some(assets)) = (edit, edit_assets.as_ref()) {
-                let mut renderer = sources.transformer(resolved.acceleration, &request.cancel)?;
-                let custom_reports = crate::adapters::apply_pinned(
-                    &mut renderer,
-                    self.variant,
-                    &self.spec.adapters,
-                    &self.custom_pins,
-                )?;
-                renderer.custom_reports = custom_reports;
-                assets.install(&mut renderer, &request.cancel)?;
-                edit_references = Some(crate::edit::encode_references(
-                    &sources,
-                    edit,
-                    &request.cancel,
-                )?);
-                edit_renderer = Some(renderer);
-                progress(Progress::ConditioningComplete);
-                check(&request.cancel)?;
-            } else {
-                state.select(resolved.acceleration, || {
-                    self.sources.drain_cache()?;
-                    let mut transformer =
-                        sources.transformer(resolved.acceleration, &request.cancel)?;
-                    let custom_reports = crate::adapters::apply_pinned(
-                        &mut transformer,
-                        self.variant,
-                        &self.spec.adapters,
-                        &self.custom_pins,
-                    )?;
-                    transformer.custom_reports = custom_reports;
-                    Ok(transformer)
-                })?;
-            }
-            let shape = [
-                count as i32,
-                128,
-                (request.height / 16) as i32,
-                (request.width / 16) as i32,
-            ];
-            let per_image = 128usize
-                .checked_mul(request.height as usize / 16)
-                .and_then(|n| n.checked_mul(request.width as usize / 16))
-                .ok_or_else(|| Error::Unsupported("MOSS noise shape overflow".into()))?;
-            let total = per_image
-                .checked_mul(count)
-                .ok_or_else(|| Error::Unsupported("MOSS noise allocation overflow".into()))?;
-            let mut noise_values = Vec::with_capacity(total);
-            let mut samples = Vec::new();
-            let first_seed = request.seed.unwrap_or_else(mlx_gen::default_seed);
-            for index in 0..count {
-                check(&request.cancel)?;
-                let (values, seed) = if let Some(noise) = inputs.noise {
-                    (
-                        noise[index * per_image..(index + 1) * per_image].to_vec(),
-                        None,
-                    )
-                } else {
-                    let seed = first_seed.wrapping_add(index as u64);
-                    (normal(seed, per_image), Some(seed))
-                };
-                samples.push(MossImageSampleReceipt {
-                    seed,
-                    noise_sha256: digest_f32(&values),
-                });
-                noise_values.extend(values);
-            }
-            let noise = Array::from_slice(&noise_values, &shape);
-            drop(noise_values);
-            let assets = sources.mode_assets(resolved.acceleration)?;
-            let dataspace = if resolved.acceleration != MossImageAcceleration::Off {
-                let weights = read_weights(
-                    assets
-                        .iter()
-                        .copied()
-                        .filter(|a| a.role == MossImageAssetRole::DmdDataspace),
-                    |_| true,
-                    &request.cancel,
-                )?;
-                let values = fp32_map(&weights)?;
-                let q = weights.require("latent_mix.Q")?.clone();
-                let codes = values
-                    .get("step_codes")
-                    .ok_or_else(|| Error::MissingTensor("step_codes".into()))?
-                    .clone();
-                let matrix = values
-                    .get("latent_mix.Q")
-                    .ok_or_else(|| Error::MissingTensor("latent_mix.Q".into()))?;
-                Some((q, codes, digest_f32(matrix)))
-            } else {
-                None
-            };
-            let renderer = match edit_renderer.as_ref() {
-                Some(renderer) => renderer,
-                None => {
-                    &state
-                        .renderer
-                        .as_ref()
-                        .ok_or_else(|| Error::Msg("MOSS renderer missing".into()))?
-                        .1
-                }
-            };
-            let latents =
-                if let (Some(edit), Some((references, _))) = (edit, edit_references.as_ref()) {
-                    crate::edit::EditSampling {
-                        transformer: renderer,
-                        resolved: &resolved,
-                        positive: &positive,
-                        negative: &negative,
-                        references,
-                        use_cache: edit.use_kv_cache,
-                    }
-                    .run(&noise, &request.cancel, progress)?
-                } else {
-                    Sampling {
-                        transformer: renderer,
-                        resolved: &resolved,
-                        positive: &positive,
-                        negative: &negative,
-                        dataspace: dataspace
-                            .as_ref()
-                            .map(|(q, codes, _)| (q, codes.as_slice())),
-                    }
-                    .run(&noise, &request.cancel, progress)?
-                };
-            check(&request.cancel)?;
-            mlx_rs::transforms::eval([&latents])?;
-            let output = match inputs.output {
-                MossImageOutputKind::Latents => {
-                    let values = crate::pipeline::logical_f32_readback(&latents)?;
-                    if values.iter().any(|v| !v.is_finite()) {
-                        return Err(Error::Msg("nonfinite MOSS latent output".into()));
-                    }
-                    MossImageAdvancedOutput::Latents {
-                        values,
-                        shape: [
-                            count,
-                            128,
-                            request.height as usize / 16,
-                            request.width as usize / 16,
-                        ],
-                    }
-                }
-                MossImageOutputKind::Images => {
-                    progress(Progress::Decoding);
-                    let mut images = Vec::new();
-                    for i in 0..count {
-                        check(&request.cancel)?;
-                        let packed = mlx_gen::attention::slice_axis(&latents, 0, i as i32, 1)?
-                            .transpose_axes(&[0, 2, 3, 1])?;
-                        let decoded = self.vae.decode_packed_latents(&packed)?;
-                        mlx_rs::transforms::eval([&decoded])?;
-                        check(&request.cancel)?;
-                        let values = decoded
-                            .try_as_slice::<f32>()
-                            .map_err(|e| Error::Msg(e.to_string()))?;
-                        if values.iter().any(|v| !v.is_finite()) {
-                            return Err(Error::Msg("nonfinite MOSS VAE pixels".into()));
-                        }
-                        images.push(mlx_gen::image::decoded_to_image(
-                            &decoded.transpose_axes(&[0, 3, 1, 2])?,
-                        )?);
-                        check(&request.cancel)?;
-                    }
-                    MossImageAdvancedOutput::Images(images)
-                }
-            };
-            let asset_receipts = assets
-                .iter()
-                .map(|a| a.receipt())
-                .collect::<Result<Vec<_>>>()?;
-            let sampling = if let Some((_, codes, digest)) = &dataspace {
-                MossImageSamplingReceipt::Dmd {
-                    step_codes: codes[..resolved.steps as usize].to_vec(),
-                    mix_matrix_sha256: digest.clone(),
-                }
-            } else {
-                MossImageSamplingReceipt::Euler {
-                    sigmas: moss_image_schedule(
-                        resolved.steps,
-                        resolved.shift,
-                        resolved.training_shift,
-                    )?,
-                }
-            };
-            let mut dtypes: BTreeMap<String, MossImageDtype> = [
-                ("transformer", MossImageDtype::Bf16),
-                ("text_encoder", MossImageDtype::Bf16),
-                ("vae", MossImageDtype::F32),
-                ("latents", MossImageDtype::F32),
-                ("time_embedding", MossImageDtype::Bf16),
-                ("shared_block_modulation", MossImageDtype::Bf16),
-                ("video_head_modulation", MossImageDtype::Bf16),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.into(), v))
-            .collect();
-            let mut apply_reports = renderer.custom_reports.clone();
-            // This sealed source receipt records the published DMD installation only.
-            let mut adapter_reports = Vec::new();
-            if resolved.acceleration != MossImageAcceleration::Off {
-                for key in [
-                    "time_embedding",
-                    "shared_block_modulation",
-                    "video_head_modulation",
-                ] {
-                    dtypes.insert(key.into(), MossImageDtype::F32);
-                }
-                if resolved.acceleration == MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32) {
-                    dtypes.insert("transformer".into(), MossImageDtype::F32);
-                } else {
-                    dtypes.insert("lora_residual".into(), MossImageDtype::F32);
-                    let path = assets
-                        .iter()
-                        .find(|a| a.role == MossImageAssetRole::DmdLora)
-                        .ok_or_else(|| Error::Msg("adapter receipt source missing".into()))?
-                        .pin
-                        .loader_path()
-                        .to_path_buf();
-                    adapter_reports.push(gen_core::AdapterApplyReport {
-                        adapter_path: path,
-                        applied: 252,
-                        skipped: vec![],
-                    });
-                }
-            }
-            sources.ensure_unchanged()?;
-            check(&request.cancel)?;
-            apply_reports.extend(adapter_reports.iter().cloned());
-            #[cfg(feature = "test-support")]
-            if self.sources.is_fixture() {
-                check(&request.cancel)?;
-                // No sealed author receipt is manufactured for generated synthetic source bytes.
-                state.report = None;
-                state.apply_reports = apply_reports;
-                return Ok(output);
-            }
-            let report = MossImageExecutionReport::new(MossImageExecutionData {
-                execution_device: MossImageExecutionDevice::Mlx,
-                resolved,
-                assets: asset_receipts,
-                sampling,
-                samples,
-                conditioning,
-                images_per_prompt: request.count,
-                latent_shape: [
-                    count,
-                    128,
-                    request.height as usize / 16,
-                    request.width as usize / 16,
-                ],
-                output_kind: inputs.output,
-                component_dtypes: dtypes,
-                adapter_reports,
-            })?;
-            check(&request.cancel)?;
-            if let (Some(edit), Some(assets), Some((_, references))) =
-                (edit, edit_assets.as_ref(), edit_references)
-            {
-                assets.ensure_unchanged()?;
-                check(&request.cancel)?;
-                *edit_report = Some(MossImageEditExecutionReport {
-                    base: report,
-                    adapter_path: assets.path().to_path_buf(),
-                    edit_contract: EDIT_CONTRACT.into(),
-                    adapter_repository: EDIT_REPOSITORY.into(),
-                    adapter_revision: EDIT_REVISION.into(),
-                    adapter_sha256: EDIT_WEIGHTS_SHA256.into(),
-                    config_sha256: EDIT_CONFIG_SHA256.into(),
-                    applied_projections: 252,
-                    references,
-                    reference_max_edge: edit.reference_max_edge,
-                    use_kv_cache: edit.use_kv_cache,
-                });
-                edit_report
-                    .as_ref()
-                    .expect("just published edit receipt")
-                    .validate()?;
-                let receipt = edit_report.as_ref().expect("just validated edit receipt");
-                apply_reports.push(gen_core::AdapterApplyReport {
-                    adapter_path: receipt.adapter_path.clone(),
-                    applied: receipt.applied_projections,
-                    skipped: vec![],
-                });
-            } else {
-                state.report = Some(report);
-            }
-            state.apply_reports = apply_reports;
-            Ok(output)
-        })();
+        let result = self.execute_attempt(
+            &mut state,
+            &mut edit_report,
+            request,
+            inputs,
+            progress,
+            edit,
+        );
         if result.is_err() {
             *edit_report = None;
             state.failed();
@@ -771,6 +415,511 @@ impl MossImage {
         }
         result
     }
+
+    /// One attempt under the lifecycle lock: admit, encode, select the renderer, sample, render
+    /// the output and publish the completed receipt. Every value the attempt builds lives until it
+    /// returns, as the inline attempt body held them.
+    fn execute_attempt(
+        &self,
+        state: &mut State,
+        edit_report: &mut Option<MossImageEditExecutionReport>,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+        progress: &mut dyn FnMut(Progress),
+        edit: Option<MossImageEditInputs<'_>>,
+    ) -> Result<MossImageAdvancedOutput> {
+        check(&request.cancel)?;
+        self.sources.ensure_unchanged()?;
+        let (resolved, count, sources, edit_assets) = self.admit(request, inputs, edit)?;
+        // Only the selected immutable renderer may overlap conditioning activations.
+        if state.release_for_request(resolved.acceleration, edit.is_some()) {
+            self.sources.drain_cache()?;
+        }
+        let (positive, negative, conditioning) =
+            self.encode_conditioning(request, inputs, &resolved)?;
+        check(&request.cancel)?;
+        let (edit_renderer, edit_references) = self.prepare_renderer(
+            state,
+            &sources,
+            &resolved,
+            edit.zip(edit_assets.as_ref()),
+            &request.cancel,
+            progress,
+        )?;
+        let (noise, samples) = draw_noise(request, inputs, count)?;
+        let assets = sources.mode_assets(resolved.acceleration)?;
+        let dataspace = load_dataspace(&assets, &resolved, &request.cancel)?;
+        let renderer = match edit_renderer.as_ref() {
+            Some(renderer) => renderer,
+            None => {
+                &state
+                    .renderer
+                    .as_ref()
+                    .ok_or_else(|| Error::Msg("MOSS renderer missing".into()))?
+                    .1
+            }
+        };
+        let latents = if let (Some(edit), Some((references, _))) = (edit, edit_references.as_ref())
+        {
+            crate::edit::EditSampling {
+                transformer: renderer,
+                resolved: &resolved,
+                positive: &positive,
+                negative: &negative,
+                references,
+                use_cache: edit.use_kv_cache,
+            }
+            .run(&noise, &request.cancel, progress)?
+        } else {
+            Sampling {
+                transformer: renderer,
+                resolved: &resolved,
+                positive: &positive,
+                negative: &negative,
+                dataspace: dataspace
+                    .as_ref()
+                    .map(|(q, codes, _)| (q, codes.as_slice())),
+            }
+            .run(&noise, &request.cancel, progress)?
+        };
+        check(&request.cancel)?;
+        mlx_rs::transforms::eval([&latents])?;
+        let output = self.render_output(&latents, inputs.output, count, request, progress)?;
+        let receipts = execution_receipts(&assets, &resolved, dataspace.as_ref(), renderer)?;
+        sources.ensure_unchanged()?;
+        check(&request.cancel)?;
+        let ExecutionReceipts {
+            asset_receipts,
+            sampling,
+            dtypes,
+            mut apply_reports,
+            adapter_reports,
+        } = receipts;
+        apply_reports.extend(adapter_reports.iter().cloned());
+        #[cfg(feature = "test-support")]
+        if self.sources.is_fixture() {
+            check(&request.cancel)?;
+            // No sealed author receipt is manufactured for generated synthetic source bytes.
+            state.report = None;
+            state.apply_reports = apply_reports;
+            return Ok(output);
+        }
+        let report = MossImageExecutionReport::new(MossImageExecutionData {
+            execution_device: MossImageExecutionDevice::Mlx,
+            resolved,
+            assets: asset_receipts,
+            sampling,
+            samples,
+            conditioning,
+            images_per_prompt: request.count,
+            latent_shape: [
+                count,
+                128,
+                request.height as usize / 16,
+                request.width as usize / 16,
+            ],
+            output_kind: inputs.output,
+            component_dtypes: dtypes,
+            adapter_reports,
+        })?;
+        check(&request.cancel)?;
+        if let (Some(edit), Some(assets), Some((_, references))) =
+            (edit, edit_assets.as_ref(), edit_references)
+        {
+            publish_edit_report(
+                edit_report,
+                &mut apply_reports,
+                report,
+                edit,
+                assets,
+                references,
+                &request.cancel,
+            )?;
+        } else {
+            state.report = Some(report);
+        }
+        state.apply_reports = apply_reports;
+        Ok(output)
+    }
+
+    /// Validate the request, select its immutable sources and check the structural peak (plus
+    /// any edit's extra peak) against the admitted working set.
+    #[allow(clippy::type_complexity)]
+    fn admit(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+        edit: Option<MossImageEditInputs<'_>>,
+    ) -> Result<(
+        MossImageResolved,
+        usize,
+        Sources,
+        Option<crate::edit::EditAssets>,
+    )> {
+        let (resolved, count) = self.validate_inputs(request, inputs)?;
+        let sources = self.selected_sources(resolved.acceleration)?;
+        sources.ensure_unchanged()?;
+        let peak = self
+            .estimated_request_peak(request, inputs)?
+            .checked_add(
+                edit.map(|edit| crate::edit::extra_peak(edit, request))
+                    .transpose()?
+                    .unwrap_or(0),
+            )
+            .ok_or_else(|| Error::Unsupported("MOSS edit peak overflow".into()))?;
+        let edit_assets = edit
+            .map(|_| crate::edit::EditAssets::prepare(&self.spec))
+            .transpose()?;
+        if let Some(cap) = self.sources.working_set_budget()? {
+            if peak > cap {
+                return Err(Error::Unsupported(format!("MOSS structural resident peak {peak} exceeds admitted MLX working set {cap}; choose a supported geometry/batch or a larger admitted device")));
+            }
+        }
+        Ok((resolved, count, sources, edit_assets))
+    }
+
+    /// Encode (or take the supplied) positive and CFG-negative conditioning per prompt row,
+    /// repeated `count` times per row, with each row's receipt.
+    #[allow(clippy::type_complexity)]
+    fn encode_conditioning(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+        resolved: &MossImageResolved,
+    ) -> Result<(Vec<Array>, Vec<Array>, Vec<MossImageConditioningReceipt>)> {
+        let batch = inputs
+            .positive
+            .map_or(request.prompt_batch.len().max(1), |e| e.batch);
+        let mut positive = Vec::new();
+        let mut negative = Vec::new();
+        let mut conditioning = Vec::new();
+        for row in 0..batch {
+            check(&request.cancel)?;
+            let (pos, pos_receipt) = if let Some(e) = inputs.positive {
+                supplied(e, row)?
+            } else {
+                let text = if request.prompt_batch.is_empty() {
+                    request.prompt.as_str()
+                } else {
+                    &request.prompt_batch[row]
+                };
+                self.encoder
+                    .encode(text, resolved.max_sequence_length, &request.cancel)?
+            };
+            let neg = if resolved.acceleration == MossImageAcceleration::Off
+                && resolved.guidance != 1.0
+            {
+                Some(if let Some(e) = inputs.negative {
+                    supplied(e, row)?
+                } else {
+                    let text = inputs
+                        .negative_prompts
+                        .map(|p| p[row].as_str())
+                        .unwrap_or(request.negative_prompt.as_deref().unwrap_or(""));
+                    self.encoder
+                        .encode(text, resolved.max_sequence_length, &request.cancel)?
+                })
+            } else {
+                None
+            };
+            for _ in 0..request.count {
+                positive.push(pos.clone());
+                if let Some((array, _)) = &neg {
+                    negative.push(array.clone());
+                }
+            }
+            conditioning.push(MossImageConditioningReceipt {
+                positive: pos_receipt,
+                negative: neg.map(|(_, receipt)| receipt),
+            });
+        }
+        Ok((positive, negative, conditioning))
+    }
+
+    /// An edit builds its own adapted renderer and encodes its references; an ordinary request
+    /// selects (building on a mode change) the cached renderer for its acceleration mode.
+    #[allow(clippy::type_complexity)]
+    fn prepare_renderer(
+        &self,
+        state: &mut State,
+        sources: &Sources,
+        resolved: &MossImageResolved,
+        edit: Option<(MossImageEditInputs<'_>, &crate::edit::EditAssets)>,
+        cancel: &CancelFlag,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<(
+        Option<Transformer>,
+        Option<(Vec<Array>, Vec<MossImageEditReferenceReceipt>)>,
+    )> {
+        if let Some((edit, assets)) = edit {
+            let mut renderer = sources.transformer(resolved.acceleration, cancel)?;
+            let custom_reports = crate::adapters::apply_pinned(
+                &mut renderer,
+                self.variant,
+                &self.spec.adapters,
+                &self.custom_pins,
+            )?;
+            renderer.custom_reports = custom_reports;
+            assets.install(&mut renderer, cancel)?;
+            let references = crate::edit::encode_references(sources, edit, cancel)?;
+            progress(Progress::ConditioningComplete);
+            check(cancel)?;
+            return Ok((Some(renderer), Some(references)));
+        }
+        state.select(resolved.acceleration, || {
+            self.sources.drain_cache()?;
+            let mut transformer = sources.transformer(resolved.acceleration, cancel)?;
+            let custom_reports = crate::adapters::apply_pinned(
+                &mut transformer,
+                self.variant,
+                &self.spec.adapters,
+                &self.custom_pins,
+            )?;
+            transformer.custom_reports = custom_reports;
+            Ok(transformer)
+        })?;
+        Ok((None, None))
+    }
+
+    /// The requested output: the finite latents read back, or each image decoded through the VAE.
+    fn render_output(
+        &self,
+        latents: &Array,
+        kind: MossImageOutputKind,
+        count: usize,
+        request: &GenerationRequest,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<MossImageAdvancedOutput> {
+        Ok(match kind {
+            MossImageOutputKind::Latents => {
+                let values = crate::pipeline::logical_f32_readback(latents)?;
+                if values.iter().any(|v| !v.is_finite()) {
+                    return Err(Error::Msg("nonfinite MOSS latent output".into()));
+                }
+                MossImageAdvancedOutput::Latents {
+                    values,
+                    shape: [
+                        count,
+                        128,
+                        request.height as usize / 16,
+                        request.width as usize / 16,
+                    ],
+                }
+            }
+            MossImageOutputKind::Images => {
+                progress(Progress::Decoding);
+                let mut images = Vec::new();
+                for i in 0..count {
+                    check(&request.cancel)?;
+                    let packed = mlx_gen::attention::slice_axis(latents, 0, i as i32, 1)?
+                        .transpose_axes(&[0, 2, 3, 1])?;
+                    let decoded = self.vae.decode_packed_latents(&packed)?;
+                    mlx_rs::transforms::eval([&decoded])?;
+                    check(&request.cancel)?;
+                    let values = decoded
+                        .try_as_slice::<f32>()
+                        .map_err(|e| Error::Msg(e.to_string()))?;
+                    if values.iter().any(|v| !v.is_finite()) {
+                        return Err(Error::Msg("nonfinite MOSS VAE pixels".into()));
+                    }
+                    images.push(mlx_gen::image::decoded_to_image(
+                        &decoded.transpose_axes(&[0, 3, 1, 2])?,
+                    )?);
+                    check(&request.cancel)?;
+                }
+                MossImageAdvancedOutput::Images(images)
+            }
+        })
+    }
+}
+
+/// The request's initial noise — the supplied values, or one seeded draw per output — with each
+/// output's seed + noise digest receipt.
+fn draw_noise(
+    request: &GenerationRequest,
+    inputs: MossImageAdvancedInputs<'_>,
+    count: usize,
+) -> Result<(Array, Vec<MossImageSampleReceipt>)> {
+    let shape = [
+        count as i32,
+        128,
+        (request.height / 16) as i32,
+        (request.width / 16) as i32,
+    ];
+    let per_image = 128usize
+        .checked_mul(request.height as usize / 16)
+        .and_then(|n| n.checked_mul(request.width as usize / 16))
+        .ok_or_else(|| Error::Unsupported("MOSS noise shape overflow".into()))?;
+    let total = per_image
+        .checked_mul(count)
+        .ok_or_else(|| Error::Unsupported("MOSS noise allocation overflow".into()))?;
+    let mut noise_values = Vec::with_capacity(total);
+    let mut samples = Vec::new();
+    let first_seed = request.seed.unwrap_or_else(mlx_gen::default_seed);
+    for index in 0..count {
+        check(&request.cancel)?;
+        let (values, seed) = if let Some(noise) = inputs.noise {
+            (
+                noise[index * per_image..(index + 1) * per_image].to_vec(),
+                None,
+            )
+        } else {
+            let seed = first_seed.wrapping_add(index as u64);
+            (normal(seed, per_image), Some(seed))
+        };
+        samples.push(MossImageSampleReceipt {
+            seed,
+            noise_sha256: digest_f32(&values),
+        });
+        noise_values.extend(values);
+    }
+    let noise = Array::from_slice(&noise_values, &shape);
+    drop(noise_values);
+    Ok((noise, samples))
+}
+
+/// The DMD dataspace `(latent_mix.Q, step_codes, mix-matrix digest)` an accelerated request
+/// samples through; `None` with acceleration off.
+fn load_dataspace(
+    assets: &[&crate::loader::Asset],
+    resolved: &MossImageResolved,
+    cancel: &CancelFlag,
+) -> Result<Option<(Array, Vec<f32>, String)>> {
+    if resolved.acceleration == MossImageAcceleration::Off {
+        return Ok(None);
+    }
+    let weights = read_weights(
+        assets
+            .iter()
+            .copied()
+            .filter(|a| a.role == MossImageAssetRole::DmdDataspace),
+        |_| true,
+        cancel,
+    )?;
+    let values = fp32_map(&weights)?;
+    let q = weights.require("latent_mix.Q")?.clone();
+    let codes = values
+        .get("step_codes")
+        .ok_or_else(|| Error::MissingTensor("step_codes".into()))?
+        .clone();
+    let matrix = values
+        .get("latent_mix.Q")
+        .ok_or_else(|| Error::MissingTensor("latent_mix.Q".into()))?;
+    Ok(Some((q, codes, digest_f32(matrix))))
+}
+
+/// The receipt parts of a completed attempt, before publication.
+struct ExecutionReceipts {
+    asset_receipts: Vec<MossImageAssetReceipt>,
+    sampling: MossImageSamplingReceipt,
+    dtypes: BTreeMap<String, MossImageDtype>,
+    apply_reports: Vec<gen_core::AdapterApplyReport>,
+    adapter_reports: Vec<gen_core::AdapterApplyReport>,
+}
+
+/// The assets', sampler's, component dtypes' and adapters' receipts for a completed attempt.
+fn execution_receipts(
+    assets: &[&crate::loader::Asset],
+    resolved: &MossImageResolved,
+    dataspace: Option<&(Array, Vec<f32>, String)>,
+    renderer: &Transformer,
+) -> Result<ExecutionReceipts> {
+    let asset_receipts = assets
+        .iter()
+        .map(|a| a.receipt())
+        .collect::<Result<Vec<_>>>()?;
+    let sampling = if let Some((_, codes, digest)) = dataspace {
+        MossImageSamplingReceipt::Dmd {
+            step_codes: codes[..resolved.steps as usize].to_vec(),
+            mix_matrix_sha256: digest.clone(),
+        }
+    } else {
+        MossImageSamplingReceipt::Euler {
+            sigmas: moss_image_schedule(resolved.steps, resolved.shift, resolved.training_shift)?,
+        }
+    };
+    let mut dtypes: BTreeMap<String, MossImageDtype> = [
+        ("transformer", MossImageDtype::Bf16),
+        ("text_encoder", MossImageDtype::Bf16),
+        ("vae", MossImageDtype::F32),
+        ("latents", MossImageDtype::F32),
+        ("time_embedding", MossImageDtype::Bf16),
+        ("shared_block_modulation", MossImageDtype::Bf16),
+        ("video_head_modulation", MossImageDtype::Bf16),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.into(), v))
+    .collect();
+    let apply_reports = renderer.custom_reports.clone();
+    // This sealed source receipt records the published DMD installation only.
+    let mut adapter_reports = Vec::new();
+    if resolved.acceleration != MossImageAcceleration::Off {
+        for key in [
+            "time_embedding",
+            "shared_block_modulation",
+            "video_head_modulation",
+        ] {
+            dtypes.insert(key.into(), MossImageDtype::F32);
+        }
+        if resolved.acceleration == MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32) {
+            dtypes.insert("transformer".into(), MossImageDtype::F32);
+        } else {
+            dtypes.insert("lora_residual".into(), MossImageDtype::F32);
+            let path = assets
+                .iter()
+                .find(|a| a.role == MossImageAssetRole::DmdLora)
+                .ok_or_else(|| Error::Msg("adapter receipt source missing".into()))?
+                .pin
+                .loader_path()
+                .to_path_buf();
+            adapter_reports.push(gen_core::AdapterApplyReport {
+                adapter_path: path,
+                applied: 252,
+                skipped: vec![],
+            });
+        }
+    }
+    Ok(ExecutionReceipts {
+        asset_receipts,
+        sampling,
+        dtypes,
+        apply_reports,
+        adapter_reports,
+    })
+}
+
+/// Publish (and validate) a completed edit's receipt, crediting its adapter in `apply_reports`.
+fn publish_edit_report(
+    edit_report: &mut Option<MossImageEditExecutionReport>,
+    apply_reports: &mut Vec<gen_core::AdapterApplyReport>,
+    report: MossImageExecutionReport,
+    edit: MossImageEditInputs<'_>,
+    assets: &crate::edit::EditAssets,
+    references: Vec<MossImageEditReferenceReceipt>,
+    cancel: &CancelFlag,
+) -> Result<()> {
+    assets.ensure_unchanged()?;
+    check(cancel)?;
+    let receipt = edit_report.insert(MossImageEditExecutionReport {
+        base: report,
+        adapter_path: assets.path().to_path_buf(),
+        edit_contract: EDIT_CONTRACT.into(),
+        adapter_repository: EDIT_REPOSITORY.into(),
+        adapter_revision: EDIT_REVISION.into(),
+        adapter_sha256: EDIT_WEIGHTS_SHA256.into(),
+        config_sha256: EDIT_CONFIG_SHA256.into(),
+        applied_projections: 252,
+        references,
+        reference_max_edge: edit.reference_max_edge,
+        use_kv_cache: edit.use_kv_cache,
+    });
+    receipt.validate()?;
+    apply_reports.push(gen_core::AdapterApplyReport {
+        adapter_path: receipt.adapter_path.clone(),
+        applied: receipt.applied_projections,
+        skipped: vec![],
+    });
+    Ok(())
 }
 impl MossImageAdvancedGenerator for MossImage {
     fn generate_moss_advanced(
