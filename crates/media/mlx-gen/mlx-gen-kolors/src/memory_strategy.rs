@@ -1005,7 +1005,7 @@ fn contract_with_asset_facts(
 ) -> CoreResult<MemoryProviderContract> {
     let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
         mlx_gen::gen_core::MemoryBackend::Mlx,
-        mlx_gen_sdxl::memory_strategy::loaded_tier(spec),
+        loaded_tier(spec),
     )?;
     let geometry_decode = decode_policies.iter().any(|policy| {
         matches!(
@@ -1244,7 +1244,7 @@ pub(crate) fn safety_check(
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(mlx_gen_sdxl::memory_strategy::loaded_tier(spec)),
+        Some(loaded_tier(spec)),
         Some(&route_gate),
     )
 }
@@ -1262,7 +1262,7 @@ pub(crate) fn registered_valid_fixture(
     {
         return Ok(Vec::new());
     }
-    let tier = mlx_gen_sdxl::memory_strategy::loaded_tier(spec);
+    let tier = loaded_tier(spec);
     let route = |use_pid| MemoryBehaviorRoute {
         mode: MemoryMode::TextToImage,
         reference_count: 0,
