@@ -14,6 +14,7 @@ pub mod batch;
 pub mod cancel;
 pub mod continuous;
 pub mod engine;
+pub mod observe;
 pub mod prefix;
 pub mod proposers;
 pub mod speculative;
@@ -52,7 +53,9 @@ pub use stream::{
 // The receipt producer is deliberately crate-private: ordinary callers must not install campaign
 // observers on a production decode.
 pub(crate) use stream::generate_with_observer;
+#[cfg(feature = "campaign")]
 pub(crate) use stream::{forced_greedy_decode, forced_greedy_decode_from, ForcedDecode};
+#[cfg(feature = "campaign")]
 pub(crate) use stream::{generate_from_prefill_observed, generate_with_cache_observed};
 
 /// Generated tokens between releases of MLX's freed-buffer cache during decode. The KV block size

@@ -664,9 +664,7 @@ fn registered_safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     if let Err(error) = registered_contract_identity(spec, contract) {
-        return MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        };
+        return MemorySafetyDecision::rejected(error);
     }
     safety_check(contract, context)
 }

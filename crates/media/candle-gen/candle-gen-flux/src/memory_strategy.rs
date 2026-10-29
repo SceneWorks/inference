@@ -610,12 +610,12 @@ pub(crate) fn admission_safety_check(
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    match validate_context(provider_id, contract, context, loaded_quant) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(validate_context(
+        provider_id,
+        contract,
+        context,
+        loaded_quant,
+    ))
 }
 
 pub(crate) struct FluxMemoryScope {
@@ -804,9 +804,7 @@ pub(crate) fn registered_safety_check(
 ) -> MemorySafetyDecision {
     match snapshot_quant_tier(spec, &contract.provider_id) {
         Ok(quant) => admission_safety_check(&contract.provider_id, contract, context, quant),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 

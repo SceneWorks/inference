@@ -178,11 +178,11 @@ use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
     self, adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError, MemoryAssetFacts,
     MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
-    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
-    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategySupport, PrefixKvCacheMode, ResidentRequestMemory, Result as CoreResult,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, PrefixKvCacheMode,
+    ResidentRequestMemory, Result as CoreResult,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
 
@@ -1628,18 +1628,12 @@ fn resident_overlay_components(
 /// Record one adapter overlay, skipping a zero: the shared validator refuses a declared component
 /// with zero bytes, and a component that measured zero is not evidence of residency anyway.
 fn push_overlay(into: &mut Vec<MemoryResidentComponent>, id: &str, resident_bytes: u64) {
-    if resident_bytes == 0 {
-        return;
-    }
-    into.push(MemoryResidentComponent {
-        id: id.to_owned(),
-        kind: MemoryComponentKind::AdapterStack,
+    mlx_gen::request_scope::push_unbounded_overlay(
+        into,
+        id,
+        MemoryComponentKind::AdapterStack,
         resident_bytes,
-        // No rung bounds an adapter: it is installed on the DiT `load_heavy` builds and lives as
-        // long as that DiT does.
-        bounded_by: None,
-        residency: MemoryComponentResidency::WholeRender,
-    });
+    );
 }
 
 /// Bytes of the full `[out, in]` bf16 deltas the shared LyCORIS install materializes for the adapter
@@ -1763,18 +1757,6 @@ fn resolved_tier(spec: &LoadSpec, root: &Path) -> CoreResult<Tier> {
             ))
         }),
         installed => Ok(installed),
-    }
-}
-
-/// The numeric tier this generator actually runs.
-///
-/// `component_precision_floors` is **empty and stays empty**: a tier is a whole-pipeline contract
-/// here, so there is no component resident above the selected width for a receipt to record.
-fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
     }
 }
 
@@ -1990,7 +1972,7 @@ pub fn safety_check(
     mlx_gen::gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(loaded_tier(spec)),
+        Some(mlx_gen::request_scope::loaded_tier(spec)),
         Some(&route_gate),
     )
 }
@@ -2011,7 +1993,7 @@ pub(crate) fn registered_valid_fixture(
     let context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        loaded_tier(spec),
+        mlx_gen::request_scope::loaded_tier(spec),
         MemoryBehaviorRoute {
             mode: MemoryMode::TextToImage,
             reference_count: 0,
@@ -2047,30 +2029,27 @@ pub(crate) fn begin_request_for(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        crate::config::TransformerConfig::production().num_layers,
-        move |use_pid, edge, overlap| {
-            if use_pid {
-                return Err(CoreError::Unsupported(format!(
-                    "{provider_id}: there is no PiD decoder on this route"
-                )));
-            }
-            validate_decode(provider_id, Some(edge), Some(overlap))
+    mlx_gen::request_scope::begin_scope(
+        safety_check(spec, contract, context),
+        mlx_gen::request_scope::MlxScopeCleanup::Device,
+        move || {
+            mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                provider_id,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                crate::config::TransformerConfig::production().num_layers,
+                move |use_pid, edge, overlap| {
+                    if use_pid {
+                        return Err(CoreError::Unsupported(format!(
+                            "{provider_id}: there is no PiD decoder on this route"
+                        )));
+                    }
+                    validate_decode(provider_id, Some(edge), Some(overlap))
+                },
+            )
         },
-    )?;
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
-            config,
-            mlx_gen::request_scope::MlxScopeCleanup::Device,
-        ),
-    )))
+    )
 }
 
 /// The shared-ladder registration pair this provider publishes.
@@ -2497,7 +2476,7 @@ mod tests {
             let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
                 &contract,
                 strategy,
-                loaded_tier(&spec),
+                mlx_gen::request_scope::loaded_tier(&spec),
                 MemoryBehaviorRoute {
                     mode: MemoryMode::TextToImage,
                     reference_count: 0,
@@ -2763,7 +2742,9 @@ mod tests {
                 spec = spec.with_quant(quant);
             }
             assert!(
-                loaded_tier(&spec).component_precision_floors.is_empty(),
+                mlx_gen::request_scope::loaded_tier(&spec)
+                    .component_precision_floors
+                    .is_empty(),
                 "{quant:?}: a whole-pipeline tier promotes nothing"
             );
         }

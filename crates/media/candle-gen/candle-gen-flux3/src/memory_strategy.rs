@@ -191,13 +191,11 @@ fn tensor_bytes(header: &SafetensorsTensorHeader, float_width: u64) -> CoreResul
 }
 
 fn checked_sum(id: &str, parts: impl Iterator<Item = CoreResult<u64>>) -> CoreResult<u64> {
-    let mut sum = 0_u64;
-    for part in parts {
-        sum = sum
-            .checked_add(part?)
-            .ok_or_else(|| CoreError::Msg(format!("{id}: component byte sum overflow")))?;
-    }
-    Ok(sum)
+    candle_gen::gen_core::checked_byte_total(
+        id,
+        "component",
+        parts.collect::<CoreResult<Vec<_>>>()?,
+    )
 }
 
 /// Resident bytes of the DiT as [`crate::model::load_dit`] holds it: every tensor of rank two or

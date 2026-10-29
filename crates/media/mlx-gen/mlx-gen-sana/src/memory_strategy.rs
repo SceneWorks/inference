@@ -42,10 +42,10 @@ use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, GenerationMemory,
     MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
     MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    ResidentRequestMemory, Result as CoreResult, TransformerComponent,
+    MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
+    Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
 
@@ -758,11 +758,7 @@ pub(crate) fn safety_check(
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(mlx_gen::request_scope::loaded_tier(spec)),
         Some(&route_gate),
     )
 }
@@ -784,11 +780,7 @@ pub(crate) fn registered_valid_fixture(
     let context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        },
+        mlx_gen::request_scope::loaded_tier(spec),
         MemoryBehaviorRoute {
             mode: mlx_gen::gen_core::MemoryMode::TextToImage,
             reference_count: 0,
@@ -837,51 +829,48 @@ fn begin_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let routes = decode_routes(provider_id)?;
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        crate::config::SanaTransformerConfig::sana_1600m().num_layers as usize,
-        move |use_pid, edge, overlap| {
-            if use_pid {
-                return Err(CoreError::Unsupported(format!(
-                    "{provider_id}: SANA has no PiD decoder"
-                )));
-            }
-            routes
-                .validate(false, Some(edge), Some(overlap))
-                .map_err(CoreError::Unsupported)
-        },
-    )?;
-    config.attention_chunk_size = contract
-        .engages(context.selection.strategy, MemoryStrategy::BoundedAttention)
-        .then(|| {
-            context
-                .selection
-                .parameters
-                .attention_chunk_size
-                .unwrap_or(ATTENTION_CHUNK_SIZE)
-        });
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then(|| {
-            context
-                .selection
-                .parameters
-                .transformer_window_size
-                .unwrap_or(TRANSFORMER_WINDOW_SIZE)
-        });
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
+        let routes = decode_routes(provider_id)?;
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider_id,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            context.use_pid,
+            crate::config::SanaTransformerConfig::sana_1600m().num_layers as usize,
+            move |use_pid, edge, overlap| {
+                if use_pid {
+                    return Err(CoreError::Unsupported(format!(
+                        "{provider_id}: SANA has no PiD decoder"
+                    )));
+                }
+                routes
+                    .validate(false, Some(edge), Some(overlap))
+                    .map_err(CoreError::Unsupported)
+            },
+        )?;
+        config.attention_chunk_size = contract
+            .engages(context.selection.strategy, MemoryStrategy::BoundedAttention)
+            .then(|| {
+                context
+                    .selection
+                    .parameters
+                    .attention_chunk_size
+                    .unwrap_or(ATTENTION_CHUNK_SIZE)
+            });
+        config.transformer_window = contract
+            .engages(
+                context.selection.strategy,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .then(|| {
+                context
+                    .selection
+                    .parameters
+                    .transformer_window_size
+                    .unwrap_or(TRANSFORMER_WINDOW_SIZE)
+            });
+        Ok(config)
+    })
 }
 
 pub fn declared_parameters() -> mlx_gen::gen_core::MemoryStrategyParameters {
@@ -1855,11 +1844,7 @@ mod tests {
                     model_family: "sana".to_owned(),
                     resolved_route: crate::MODEL_ID.to_owned(),
                     backend: MemoryBackend::Mlx,
-                    tier: MemoryNumericTier {
-                        precision: spec.precision,
-                        quant: spec.quantize,
-                        component_precision_floors: &[],
-                    },
+                    tier: mlx_gen::request_scope::loaded_tier(&spec),
                     load_shape: spec.load_shape,
                     mode: mlx_gen::gen_core::MemoryMode::TextToImage,
                     reference_shape: mlx_gen::gen_core::MemoryReferenceShape::None,

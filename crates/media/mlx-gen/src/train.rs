@@ -15,6 +15,7 @@ pub mod perceptual;
 pub mod tae;
 pub mod taehv;
 pub mod vae_anchor;
+pub mod vocab;
 
 /// The pure LR-schedule policy (`LrSchedule`, `lr_multiplier`, `schedule_updates`) moved to
 /// gen-core; re-exported here so `mlx_gen::train::schedule::…` keeps resolving for the family

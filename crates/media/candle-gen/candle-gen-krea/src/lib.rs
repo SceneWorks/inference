@@ -2869,9 +2869,7 @@ fn registered_krea_safety_check(
 ) -> gen_core::MemorySafetyDecision {
     match actual_quant_tier(spec, &contract.provider_id) {
         Ok(quant) => krea_memory_strategy_safety_check(contract, quant, context),
-        Err(error) => gen_core::MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => gen_core::MemorySafetyDecision::rejected(error),
     }
 }
 

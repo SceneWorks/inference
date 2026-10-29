@@ -1319,10 +1319,8 @@ fn resident_request_scope(
     )?;
     let mut config = config;
     config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = (context.selection.strategy
-        == MemoryStrategy::BoundedTransformerResidency)
-        .then_some(())
-        .and(context.selection.parameters.transformer_window_size);
+    config.transformer_window =
+        mlx_gen::request_scope::selected_transformer_window(contract, context);
     Ok(mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
         config, cleanup,
     ))
@@ -1408,24 +1406,15 @@ fn memory_strategy_safety_check_for(
     }
     let safe_gb = match crate::memory::production_safe_budget_gb() {
         Ok(safe_gb) => safe_gb,
-        Err(error) => {
-            return MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            }
-        }
+        Err(error) => return MemorySafetyDecision::rejected(error),
     };
-    match crate::memory::ensure_generation_fits(
+    MemorySafetyDecision::from_validation(crate::memory::ensure_generation_fits(
         tier,
         context.geometry.width,
         context.geometry.height,
         context.geometry.batch,
         safe_gb,
-    ) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    ))
 }
 
 impl Generator for MageFlow {

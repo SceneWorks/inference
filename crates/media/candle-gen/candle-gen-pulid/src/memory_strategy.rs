@@ -146,11 +146,7 @@ pub fn safety_check(
 ) -> MemorySafetyDecision {
     let tier = match resolved_numeric_tier(paths) {
         Ok(tier) => tier,
-        Err(error) => {
-            return MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            }
-        }
+        Err(error) => return MemorySafetyDecision::rejected(error),
     };
     if let MemorySafetyDecision::Reject { reason } =
         gen_core::standard_memory_strategy_safety_check(contract, context, Some(tier), None)
@@ -187,10 +183,7 @@ pub fn validate_context(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<()> {
-    match safety_check(paths, contract, context) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    candle_gen::request_scope::admit(safety_check(paths, contract, context))
 }
 
 /// Revalidate the context without filesystem reads after the exact contract has been retained by a

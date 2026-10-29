@@ -356,15 +356,12 @@ pub fn validate_context(
             prepared.route.provider_id()
         )));
     }
-    match crate::standard_memory_strategy_safety_check(
+    crate::admit_memory_safety(crate::standard_memory_strategy_safety_check(
         &request_contract,
         context,
         Some(prepared.tier),
         None,
-    ) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(crate::Error::Unsupported(reason)),
-    }
+    ))
 }
 
 /// Reconstruct the exact selection carried by an executing request and verify that no request

@@ -267,9 +267,7 @@ pub fn safety_check(
             contract,
             context,
         ),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 

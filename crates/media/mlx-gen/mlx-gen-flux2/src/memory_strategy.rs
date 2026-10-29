@@ -8,7 +8,6 @@
 //! the exact provider route and tier, then delegates the canonical budget comparison to `gen-core`;
 //! calibration coefficients never live in a provider.
 
-use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, AdapterResidencyMode, Error as CoreError, LoadShape,
     LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
@@ -491,9 +490,7 @@ pub fn registered_dev_safety_check(
 ) -> MemorySafetyDecision {
     match crate::model::effective_dev_memory_numeric_tier(spec, FLUX2_DEV_EDIT_ID) {
         Ok(tier) => safety_check(contract, context, tier),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 
@@ -510,9 +507,7 @@ pub fn registered_dev_t2i_safety_check(
 ) -> MemorySafetyDecision {
     match crate::model::effective_dev_memory_numeric_tier(spec, FLUX2_DEV_ID) {
         Ok(tier) => dev_t2i_safety_check(contract, context, tier),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 
@@ -532,15 +527,11 @@ pub fn registered_dev_control_safety_check(
         FLUX2_DEV_CONTROL_ID,
         "FLUX.2-dev-Fun-Controlnet-Union",
     ) {
-        return MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        };
+        return MemorySafetyDecision::rejected(error);
     }
     match crate::model::effective_dev_memory_numeric_tier(spec, FLUX2_DEV_CONTROL_ID) {
         Ok(tier) => dev_control_safety_check(contract, context, tier),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 
@@ -694,9 +685,7 @@ pub(crate) fn begin_dev_request(
             reason: format!("unknown FLUX.2 Dev memory provider {provider}"),
         },
     };
-    if let MemorySafetyDecision::Reject { reason } = decision {
-        return Err(CoreError::Unsupported(reason));
-    }
+    mlx_gen::request_scope::admit(decision)?;
     if !context.selection.strategy.is_optimized() {
         return Ok(None);
     }
@@ -1304,9 +1293,7 @@ pub(crate) fn registered_klein_safety_check(
 ) -> MemorySafetyDecision {
     match klein_expected_tier(&contract.provider_id, spec) {
         Ok(tier) => klein_safety_check(spec, contract, context, tier),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 
@@ -1420,77 +1407,59 @@ fn begin_klein_request_with_cleanup(
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     let expected_tier = klein_expected_tier(&contract.provider_id, spec)?;
-    if let MemorySafetyDecision::Reject { reason } =
-        klein_safety_check(spec, contract, context, expected_tier)
-    {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let routes = klein_decode_routes(&contract.provider_id)?;
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        klein_provider_static(&contract.provider_id)?,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        32,
-        move |use_pid, edge, overlap| {
-            routes
-                .validate(use_pid, Some(edge), Some(overlap))
-                .map_err(CoreError::Unsupported)
+    mlx_gen::request_scope::begin_scope(
+        klein_safety_check(spec, contract, context, expected_tier),
+        cleanup,
+        move || {
+            let routes = klein_decode_routes(&contract.provider_id)?;
+            let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                klein_provider_static(&contract.provider_id)?,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                32,
+                move |use_pid, edge, overlap| {
+                    routes
+                        .validate(use_pid, Some(edge), Some(overlap))
+                        .map_err(CoreError::Unsupported)
+                },
+            )?;
+            config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+            config.transformer_window =
+                mlx_gen::request_scope::selected_transformer_window(contract, context);
+            Ok(config)
         },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    )
 }
 
-pub(crate) fn attention_plan(req: &GenerationRequest) -> AttentionPlan<'_> {
-    match req.memory {
-        Some(memory) if memory.chunk_attention => {
-            AttentionPlan::budgeted(AttentionBudget::CONSTRAINED).with_cancel(&req.cancel)
-        }
-        _ => AttentionPlan::UNBOUNDED,
-    }
-}
+/// Rung 3: the shared constrained-budget plan (an unselected request keeps the exact historical
+/// unbounded, uncancellable plan).
+pub(crate) use mlx_gen::request_scope::constrained_attention_plan as attention_plan;
 
 pub(crate) fn transformer_window(req: &GenerationRequest) -> mlx_gen::Result<Option<usize>> {
-    let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
-        return Ok(None);
-    };
-    if memory
-        .transformer_window_component
-        .unwrap_or(TransformerComponent::Dit)
-        != TransformerComponent::Dit
-    {
-        return Err(mlx_gen::Error::Unsupported(
-            "flux2 Klein supports only the DiT transformer window component".to_owned(),
-        ));
-    }
-    Ok(Some(
-        memory
-            .transformer_window_size
-            .unwrap_or(TRANSFORMER_WINDOW_SIZE) as usize,
-    ))
+    mlx_gen::request_scope::requested_transformer_window(
+        "flux2 Klein",
+        req.memory,
+        TransformerComponent::Dit,
+        &[TransformerComponent::Dit],
+        TRANSFORMER_WINDOW_SIZE,
+        |_| Ok(()),
+    )
 }
 
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<TilingConfig>> {
-    let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
-        return Ok(None);
-    };
-    if req.cancel.is_cancelled() {
-        return Err(mlx_gen::Error::Canceled);
-    }
-    Ok(Some(TilingConfig::spatial_only(
-        memory.decode_tile_edge.unwrap_or(DECODE_TILE_EDGE) as i32,
-        memory.decode_overlap.unwrap_or(DECODE_OVERLAP) as i32,
-    )))
+    mlx_gen::request_scope::requested_decode_tiling(
+        req.memory,
+        DECODE_TILE_EDGE,
+        DECODE_OVERLAP,
+        |_, _| {
+            if req.cancel.is_cancelled() {
+                Err(mlx_gen::Error::Canceled)
+            } else {
+                Ok(())
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2686,11 +2655,7 @@ mod tests {
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization);
         let contract = weights_free_klein_contract(crate::FLUX2_KLEIN_9B_ID, &spec).unwrap();
-        let tier = MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        };
+        let tier = mlx_gen::request_scope::loaded_tier(&spec);
         let route = mlx_gen::gen_core::MemoryBehaviorRoute {
             mode: MemoryMode::TextToImage,
             reference_count: 0,

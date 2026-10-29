@@ -51,7 +51,12 @@ mod model_input_macros;
 #[path = "../../../contracts/gen-core/src/model_input_proof.rs"]
 pub mod model_input_proof;
 
+// Measurement-campaign harness (sc-20671/20676/20677): ticket-named evidence tooling used only by
+// the `sc2067x` bins and their tests. It ships behind the non-default `campaign` feature so no
+// runtime consumer compiles or links it (sc-27303, sc-27312).
+#[cfg(feature = "campaign")]
 pub mod campaign;
+#[cfg(feature = "campaign")]
 pub mod campaign_supervisor;
 pub mod config;
 pub mod decode;
@@ -59,6 +64,7 @@ pub mod error;
 pub mod gguf;
 pub mod image;
 pub mod joycaption;
+#[cfg(feature = "campaign")]
 pub mod kv_capture;
 mod kv_policy;
 pub mod layer_gate;
@@ -71,6 +77,7 @@ pub mod prism_gguf;
 mod prism_vision_gguf;
 pub mod provider;
 pub mod residency;
+#[cfg(feature = "campaign")]
 pub mod sc20676_evidence;
 pub mod snapshot;
 pub mod starvector_1b;

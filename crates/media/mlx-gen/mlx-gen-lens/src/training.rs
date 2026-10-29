@@ -74,6 +74,7 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::tae::TinyDecoderSpec;
+use mlx_gen::train::vocab::{sample_timestep, validate_common_request};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Error, LoadSpec, Modality, NetworkType, Precision, Quant, Result, TrainOptimizer, Trainer,
@@ -111,23 +112,6 @@ const TRAINER_ENCODER_QUANT: Option<Quant> = Some(Quant::Q8);
 /// dual-stream joint-attention projections. `to_out` is an `nn.ModuleList([Linear, Identity])`, so the
 /// trainable Linear is `to_out.0` (sc-2218); `img_qkv`/`txt_qkv` are the fused per-stream QKV.
 const DEFAULT_TARGET_MODULES: [&str; 4] = ["img_qkv", "txt_qkv", "to_out.0", "to_add_out"];
-
-/// Recognized `timestep_type` values [`sample_sigma`] branches on (plus the `sigmoid` default).
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values [`sample_sigma`] branches on (plus the neutral default).
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` → MAE, `mse`/`l2` → the MSE default.
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
 
 /// `(x_t, target)` for a single sample at flow-match `t`: `x_t = (1−t)·x0 + t·noise`,
 /// `target = noise − x0` (the velocity the **raw** Lens DiT output is regressed onto; the transformer
@@ -266,12 +250,6 @@ mlx_gen::register_trainer! {
     pub(crate) const TRAINER_REGISTRATION = trainer_descriptor => load_trainer
 }
 
-/// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,
-/// `-`/space → `_`) so validation accepts exactly the spellings the run would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
 /// Capability-free training-request validation, factored out so it can be unit-tested without a loaded
 /// trainer. Rejects an empty dataset, zero rank, **zero steps** (a 0-step run would write a no-op
 /// `B = 0` identity adapter), an unsupported optimizer, and an unrecognized
@@ -279,49 +257,7 @@ fn normalize_cfg(s: &str) -> String {
 /// `gradient_checkpointing` is now a supported toggle (sc-5170) — the checkpointed DiT forward + the
 /// fail-fast OOM preflight guard are wired in [`LensTrainer::train_impl`].
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    let cfg = &req.config;
-    if req.items.is_empty() {
-        return Err("lens trainer: dataset is empty".into());
-    }
-    if cfg.rank == 0 {
-        return Err("lens trainer: rank must be > 0".into());
-    }
-    if cfg.steps == 0 {
-        return Err("lens trainer: steps must be > 0".into());
-    }
-    if !TrainOptimizer::is_supported(&cfg.optimizer) {
-        return Err(format!(
-            "lens trainer: optimizer '{}' is not available on MLX training (supported: adamw, adam, \
-             rose, prodigy)",
-            cfg.optimizer
-        )
-        .into());
-    }
-    if !TIMESTEP_TYPES.contains(&normalize_cfg(&cfg.timestep_type).as_str()) {
-        return Err(format!(
-            "lens trainer: timestep_type '{}' is not recognized (supported: {})",
-            cfg.timestep_type,
-            TIMESTEP_TYPES.join(", ")
-        )
-        .into());
-    }
-    if !TIMESTEP_BIASES.contains(&normalize_cfg(&cfg.timestep_bias).as_str()) {
-        return Err(format!(
-            "lens trainer: timestep_bias '{}' is not recognized (supported: {})",
-            cfg.timestep_bias,
-            TIMESTEP_BIASES.join(", ")
-        )
-        .into());
-    }
-    if !LOSS_TYPES.contains(&normalize_cfg(&cfg.loss_type).as_str()) {
-        return Err(format!(
-            "lens trainer: loss_type '{}' is not recognized (supported: {})",
-            cfg.loss_type,
-            LOSS_TYPES.join(", ")
-        )
-        .into());
-    }
-    Ok(())
+    validate_common_request("lens trainer", req)
 }
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
@@ -1003,13 +939,7 @@ fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// Encode a center-cropped square image into a Lens training latent `[1, latent·latent, 128]` — the
@@ -1089,38 +1019,6 @@ fn encode_caption(
         .collect::<Result<Vec<_>>>()?;
     let mask = ones::<f32>(&[1, l - offset])?;
     Ok((features, mask))
-}
-
-/// Sample a normalized flow-match timestep (interpolation coefficient) `t ∈ [1e-3, 1−1e-3]` — a
-/// faithful port of the SceneWorks `sample_training_timestep` (identical to the Z-Image trainer):
-/// `sigmoid(randn)` by default, `uniform` for linear, `(uniform + sigmoid(randn))/2` for weighted;
-/// bias `high` → `√t`, `low` → `t²`. Deterministic in `seed`.
-fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let ttype = timestep_type.trim().to_ascii_lowercase().replace('-', "_");
-    let t = match ttype.as_str() {
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            let k2 = random::key(seed ^ 0x9E37_79B9)?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
-    };
-    let bias = timestep_bias
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '-'], "_");
-    let t = match bias.as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    Ok(t.clamp(1e-3, 1.0 - 1e-3))
 }
 
 /// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr), run the
@@ -1403,7 +1301,7 @@ fn run_train_step(
     let sample = step_sample(perceptual, step, schedule);
     let entry = sample.entry;
     let (x0, features, mask, latent, mask_weight) = &cache[entry];
-    let mut t = sample_sigma(
+    let mut t = sample_timestep(
         &cfg.timestep_type,
         &cfg.timestep_bias,
         cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
@@ -2529,8 +2427,8 @@ mod tests {
     fn sample_sigma_is_deterministic_and_in_range() {
         for kind in ["sigmoid", "linear", "weighted"] {
             for bias in ["balanced", "high", "low"] {
-                let a = sample_sigma(kind, bias, 42).unwrap();
-                let b = sample_sigma(kind, bias, 42).unwrap();
+                let a = sample_timestep(kind, bias, 42).unwrap();
+                let b = sample_timestep(kind, bias, 42).unwrap();
                 assert_eq!(a, b, "{kind}/{bias} must be deterministic in seed");
                 assert!(
                     (1e-3..=1.0 - 1e-3).contains(&a),
@@ -2540,8 +2438,8 @@ mod tests {
         }
         // high-noise bias (√t) lifts the value vs low-noise bias (t²) for the same draw.
         assert!(
-            sample_sigma("sigmoid", "high", 7).unwrap()
-                > sample_sigma("sigmoid", "low", 7).unwrap()
+            sample_timestep("sigmoid", "high", 7).unwrap()
+                > sample_timestep("sigmoid", "low", 7).unwrap()
         );
     }
 }
@@ -2830,7 +2728,7 @@ mod depth_anchoring_tests {
             aux_driver(path_with(window), &cache, &schedule, 1, &Default::default()).unwrap();
         step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, false);
         let (depth, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 2, false);
-        let raw = sample_sigma(
+        let raw = sample_timestep(
             &cfg.timestep_type,
             &cfg.timestep_bias,
             cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(2),
@@ -2946,7 +2844,7 @@ mod depth_anchoring_tests {
             // Recompute the step against the SCHEDULED entry's latent and reference.
             let k = (n - 1) as usize;
             let (item, entry) = (schedule.sample(k).0, schedule.cache_index(k));
-            let raw = sample_sigma(
+            let raw = sample_timestep(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
                 cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(n as u64),
@@ -3019,7 +2917,7 @@ mod depth_anchoring_tests {
         let (off, g_off) = step(&mut f, &off_cfg, &cache, &schedule, None, 1, false);
         assert_eq!(off.aux, None);
         let (x0, feats, mask, g, _) = &cache[0];
-        let t = sample_sigma(
+        let t = sample_timestep(
             &off_cfg.timestep_type,
             &off_cfg.timestep_bias,
             off_cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),

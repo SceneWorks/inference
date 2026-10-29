@@ -14,9 +14,9 @@ use crate::{
     AdapterKind, Conditioning, GenerationRequest, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
-    MemoryPhase, MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemorySelection,
-    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport,
-    MoeExpert, OffloadPolicy, Precision, Quant, ResidentRequestMemory, WeightsSource,
+    MemoryPhase, MemoryProviderContract, MemoryRunContext, MemorySelection, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport, MoeExpert,
+    OffloadPolicy, Precision, Quant, ResidentRequestMemory, WeightsSource,
 };
 
 mod receipts;

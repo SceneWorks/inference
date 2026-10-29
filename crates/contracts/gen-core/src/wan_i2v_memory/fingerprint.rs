@@ -233,10 +233,12 @@ pub fn validate_weights_free_context(
             "{provider_id}: crossed weights-free Wan A14B memory context"
         )));
     }
-    match crate::standard_memory_strategy_safety_check(contract, context, Some(tier), None) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(crate::Error::Unsupported(reason)),
-    }
+    crate::admit_memory_safety(crate::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(tier),
+        None,
+    ))
 }
 
 /// A geometry every A14B cell admits, for a weights-free behavior fixture: the manifest's own

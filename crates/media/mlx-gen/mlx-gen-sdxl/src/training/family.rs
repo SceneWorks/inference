@@ -700,13 +700,7 @@ fn decode_image(path: &Path) -> Result<mlx_gen::media::Image> {
         &[path]
     )
     .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(mlx_gen::media::Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// The subject-masked loss weight (sc-24828) for one cached latent whose shape is the family's
