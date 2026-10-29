@@ -29,7 +29,10 @@ pub(crate) fn scaled_lora(
     scale: f64,
 ) -> candle_core::Result<Tensor> {
     let rank = apply_factor(x, down)?;
-    if x.dtype() == DType::F32 && down.dim(1)? < up.dim(1)? && scale.is_finite() {
+    if scale == 1.0 {
+        // The common alpha == rank convention needs no scaling kernel at any dtype.
+        apply_factor(&rank, up)
+    } else if x.dtype() == DType::F32 && down.dim(1)? < up.dim(1)? && scale.is_finite() {
         apply_factor(&(rank * scale)?, up)
     } else {
         apply_factor(&rank, up)? * scale
@@ -312,6 +315,42 @@ mod tests {
                         .max_all()?
                         .to_scalar::<f32>()?
                         < 2e-5
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "raw half-precision matmul requires explicitly admitted CUDA numerical proof lane"]
+    fn half_precision_keeps_output_scale_rounding() -> candle_core::Result<()> {
+        let device = Device::new_cuda(0)?;
+        for dtype in [DType::BF16, DType::F16] {
+            let x = Tensor::arange(0f32, 24f32, &device)?
+                .reshape((2, 3, 4))?
+                .affine(0.03, -0.2)?
+                .to_dtype(dtype)?;
+            let down = Tensor::arange(0f32, 8f32, &device)?
+                .reshape((4, 2))?
+                .affine(0.1, -0.2)?
+                .to_dtype(dtype)?;
+            let up = Tensor::arange(0f32, 12f32, &device)?
+                .reshape((2, 6))?
+                .affine(0.1, -0.3)?
+                .to_dtype(dtype)?;
+            for scale in [1.0, 0.125, -1.7] {
+                let reference = (apply_factor(&apply_factor(&x, &down)?, &up)? * scale)?;
+                let actual = scaled_lora(&x, &down, &up, scale)?;
+                assert_eq!(
+                    actual
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    reference
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?
                 );
             }
         }
