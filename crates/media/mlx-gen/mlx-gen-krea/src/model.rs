@@ -1267,6 +1267,38 @@ impl Krea {
         // Loud-reject a multi-phase request on a diff-patch model (sc-13884): its baked `.diff` delta
         // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
+        let request = self.resolve_request(req)?;
+
+        // Phase A: prompt → context(s) (sc-11101; sc-11125). Under `Sequential` the shared seam loads
+        // the Qwen3-VL-4B text phase, encodes, materializes, then DROPS it + `clear_cache()` so its
+        // ~4 GB frees before the DiT/VAE load below — the peak-bounding win. Under `Resident` it borrows
+        // the warm text phase. Edit grounds on ALL source images (scene + person), F-071.
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |text: &KreaText| self.encode_phase(text, &request),
+            // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
+            // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
+            |ctx: Option<&KreaContexts>| {
+                let Some(ctx) = ctx else { return Ok(()) };
+                match &ctx.neg {
+                    Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
+                    None => mlx_rs::transforms::eval([&ctx.pos])?,
+                }
+                Ok(())
+            },
+            // Phase B: heavy render components (DiT + VAE + PiD). The render dispatch runs
+            // identically for both residencies.
+            |heavy_owned, ctx, on_progress| {
+                self.render_phase(heavy_owned.as_ref(), &ctx, &request, on_progress)
+            },
+        )
+    }
+
+    /// Everything the request resolves before the residency lifecycle: the variant's render path,
+    /// steps, schedule and PiD capture, the reference roles, the CFG knobs and the multi-phase plan.
+    fn resolve_request<'r>(&self, req: &'r GenerationRequest) -> Result<KreaRequest<'r>> {
         let transformer_window_size = resolve_transformer_window(req, self.streamable_transformer)?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Variant read back off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu);
@@ -1288,8 +1320,9 @@ impl Krea {
             DEFAULT_STEPS
         }) as usize;
         // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): resolve the achieved degrade σ + the
-        // truncation `keep` from the (seed-independent) schedule; the PiD decoder itself is built below
-        // (it needs the heavy phase's PiD engine). Raw/edit use the resolution-dynamic schedule.
+        // truncation `keep` from the (seed-independent) schedule; the PiD decoder itself is built in
+        // the render phase (it needs the heavy phase's PiD engine). Raw/edit use the
+        // resolution-dynamic schedule.
         let sigmas = if is_raw {
             base_schedule(steps, req.width, req.height, req.scheduler.as_deref())
         } else {
@@ -1317,14 +1350,18 @@ impl Krea {
         // (no benefit) and otherwise returns a `keep` (into the full schedule) whose `sigmas[keep-1]`
         // matches the `render_*_img2img_from` truncation `sigmas[start..keep]` — so `capture_sigma`
         // always names the σ of the latent actually handed to PiD. t2i / edit / control denoise the
-        // whole schedule from pure noise → `start = 0` (the reference-less default).
-        let img2img_strength = reference.map(|(_, ref_strength)| {
-            ref_strength
-                .or(req.strength)
-                .unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
+        // whole schedule from pure noise → `start = 0` (the reference-less default). The init image
+        // and its strength are carried together so the render can never see one without the other.
+        let img2img = reference.map(|(init, ref_strength)| {
+            (
+                init,
+                ref_strength
+                    .or(req.strength)
+                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH),
+            )
         });
-        let start_step = img2img_strength
-            .map(|s| init_time_step(steps, Some(s)).min(sigmas.len().saturating_sub(1)))
+        let start_step = img2img
+            .map(|(_, s)| init_time_step(steps, Some(s)).min(sigmas.len().saturating_sub(1)))
             .unwrap_or(0);
         let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, start_step);
         // Raw CFG knobs: guidance defaults to the reference Raw preset, an empty/absent negative → ""
@@ -1338,14 +1375,40 @@ impl Krea {
             req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE)
         };
         let negative = req.negative_prompt.clone().unwrap_or_default();
+        let multiphase = self.resolve_multiphase(req, guidance)?;
+        Ok(KreaRequest {
+            req,
+            transformer_window_size,
+            base_seed,
+            is_turbo_edit,
+            is_edit,
+            is_raw,
+            steps,
+            edit_sources,
+            img2img,
+            capture_sigma,
+            keep,
+            guidance,
+            negative,
+            multiphase,
+        })
+    }
 
-        // Multi-phase denoise (epic 13879, sc-13884): resolve the phase list ONCE up-front so both the
-        // text-encode phase (whether the unconditional context is needed) and the render phase drive
-        // from the same plan. `validate_phases` has already gated this to the Raw t2i variant (no
-        // reference/PiD, non-empty, ≥1-step); here we resolve the contiguous schedule slices, per-phase
-        // guidance, and per-phase adapter sets (indices bounds-checked against `self.adapters`). `None`
-        // ⇒ the ordinary single-phase render below.
-        let mp_resolved: Option<Vec<ResolvedPhase>> = match req.phases.as_deref() {
+    /// Multi-phase denoise (epic 13879, sc-13884): resolve the phase list ONCE up-front so both the
+    /// text-encode phase (whether the unconditional context is needed) and the render phase drive
+    /// from the same plan. `validate_phases` has already gated this to the Raw t2i variant (no
+    /// reference/PiD, non-empty, ≥1-step); here we resolve the contiguous schedule slices, per-phase
+    /// guidance, and per-phase adapter sets (indices bounds-checked against `self.adapters`). The
+    /// multi-phase schedule is ONE global Raw schedule for the TOTAL step budget (the sum of the
+    /// phases' steps); every phase runs a contiguous slice of it — the crux that keeps the sigma
+    /// trajectory continuous across boundaries (no per-phase recompute / reset).
+    ///
+    /// The returned guidance gates the text encode's unconditional context: built iff ANY phase
+    /// runs CFG (guidance > 0). A single positive value suffices for `encode_contexts`' neg-gate (it
+    /// consults `guidance` only as `guidance > 0`, never in the combine — the per-phase guidance
+    /// drives the actual CFG combine). `None` phases ⇒ the ordinary single-phase render.
+    fn resolve_multiphase(&self, req: &GenerationRequest, guidance: f32) -> Result<KreaMultiphase> {
+        let resolved: Option<Vec<ResolvedPhase>> = match req.phases.as_deref() {
             Some(list) if !list.is_empty() => {
                 let default_guidance = req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE);
                 Some(multiphase::resolve_phases(
@@ -1357,296 +1420,350 @@ impl Krea {
             }
             _ => None,
         };
-        // The multi-phase schedule is ONE global Raw schedule for the TOTAL step budget (the sum of the
-        // phases' steps); every phase runs a contiguous slice of it — the crux that keeps the sigma
-        // trajectory continuous across boundaries (no per-phase recompute / reset).
-        let mp_sigmas = mp_resolved.as_ref().map(|resolved| {
+        let sigmas = resolved.as_ref().map(|resolved| {
             let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
             base_schedule(total, req.width, req.height, req.scheduler.as_deref())
         });
-        // The text encode builds the unconditional context iff ANY phase runs CFG (guidance > 0). A
-        // single positive value suffices for `encode_contexts`' neg-gate (it consults `guidance` only as
-        // `guidance > 0`, never in the combine — the per-phase guidance drives the actual CFG combine).
-        let encode_guidance = match &mp_resolved {
+        let encode_guidance = match &resolved {
             Some(resolved) if multiphase::any_phase_uses_cfg(resolved) => 1.0,
             Some(_) => 0.0,
             None => guidance,
         };
+        Ok(KreaMultiphase {
+            phases: resolved.zip(sigmas),
+            encode_guidance,
+        })
+    }
 
-        // Phase A: prompt → context(s) (sc-11101; sc-11125). Under `Sequential` the shared seam loads
-        // the Qwen3-VL-4B text phase, encodes, materializes, then DROPS it + `clear_cache()` so its
-        // ~4 GB frees before the DiT/VAE load below — the peak-bounding win. Under `Resident` it borrows
-        // the warm text phase. Edit grounds on ALL source images (scene + person), F-071.
-        self.residency.run(
-            &req.cancel,
-            req.use_pid,
-            on_progress,
-            |text: &KreaText| {
-                let ctx = self.encode_contexts(
-                    text,
-                    req,
-                    is_raw,
-                    is_edit,
-                    encode_guidance,
-                    &negative,
-                    &edit_sources,
-                )?;
-                // SC-15449/sc-22738: the conditioning phase physically completes here. `Residency::run`
-                // materializes only under `Sequential`, so an armed fault evaluates the contexts itself
-                // — the boundary is then identical under both residencies, and an ordinary render (both
-                // controls unset) keeps its laziness untouched.
-                if crate::memory_strategy::calibration_fault_armed(
-                    req.memory,
-                    mlx_gen::gen_core::MemoryPhase::Conditioning,
-                ) {
-                    match &ctx.neg {
-                        Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
-                        None => mlx_rs::transforms::eval([&ctx.pos])?,
-                    }
-                    crate::memory_strategy::calibration_fault(
-                        req,
-                        mlx_gen::gen_core::MemoryPhase::Conditioning,
-                        self.descriptor.id,
-                    )?;
-                }
-                Ok(ctx)
-            },
-            // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
-            // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
-            |ctx: Option<&KreaContexts>| {
-                let Some(ctx) = ctx else { return Ok(()) };
-                match &ctx.neg {
-                    Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
-                    None => mlx_rs::transforms::eval([&ctx.pos])?,
-                }
-                Ok(())
-            },
-            // Phase B: heavy render components (DiT + VAE + PiD). The render dispatch below runs
-            // identically for both residencies.
-            |heavy_owned, ctx, on_progress| {
-                let heavy = heavy_owned.as_ref();
+    /// Phase A: encode the context(s), with the conditioning-phase calibration fault boundary.
+    fn encode_phase(&self, text: &KreaText, request: &KreaRequest<'_>) -> Result<KreaContexts> {
+        let req = request.req;
+        let ctx = self.encode_contexts(
+            text,
+            req,
+            request.is_raw,
+            request.is_edit,
+            request.multiphase.encode_guidance,
+            &request.negative,
+            &request.edit_sources,
+        )?;
+        // SC-15449/sc-22738: the conditioning phase physically completes here. `Residency::run`
+        // materializes only under `Sequential`, so an armed fault evaluates the contexts itself — the
+        // boundary is then identical under both residencies, and an ordinary render (both controls
+        // unset) keeps its laziness untouched.
+        if crate::memory_strategy::calibration_fault_armed(
+            req.memory,
+            mlx_gen::gen_core::MemoryPhase::Conditioning,
+        ) {
+            match &ctx.neg {
+                Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
+                None => mlx_rs::transforms::eval([&ctx.pos])?,
+            }
+            crate::memory_strategy::calibration_fault(
+                req,
+                mlx_gen::gen_core::MemoryPhase::Conditioning,
+                self.descriptor.id,
+            )?;
+        }
+        Ok(ctx)
+    }
 
-                // PiD decode overlay (sc-7845): one decoder serves the whole count loop (same prompt → same
-                // caption). Errors if `req.use_pid` but the model wasn't loaded with `LoadSpec::pid`; `None`
-                // → the native VAE. Resolved against the heavy phase's PiD engine.
-                let pid_decoder = resolve_pid_decoder_at_sigma(
-                    heavy.pid,
-                    req,
-                    base_seed,
-                    self.descriptor.id,
-                    capture_sigma,
-                )?;
-                let decoder = pid_decoder
-                    .as_ref()
+    /// Phase B: mint the decoder, then render every image — multi-phase, or through the
+    /// single-phase plan built once for the count loop.
+    fn render_phase(
+        &self,
+        heavy: KreaHeavyRef<'_>,
+        ctx: &KreaContexts,
+        request: &KreaRequest<'_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let req = request.req;
+        // PiD decode overlay (sc-7845): one decoder serves the whole count loop (same prompt → same
+        // caption). Errors if `req.use_pid` but the model wasn't loaded with `LoadSpec::pid`; `None`
+        // → the native VAE. Resolved against the heavy phase's PiD engine.
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            heavy.pid,
+            req,
+            request.base_seed,
+            self.descriptor.id,
+            request.capture_sigma,
+        )?;
+        let decoder = pid_decoder
+            .as_ref()
+            .map(|decoder| decoder as &dyn LatentDecoder)
+            .or_else(|| {
+                heavy
+                    .alternate_decoder
                     .map(|decoder| decoder as &dyn LatentDecoder)
-                    .or_else(|| {
-                        heavy
-                            .alternate_decoder
-                            .map(|decoder| decoder as &dyn LatentDecoder)
-                    });
+            });
 
-                // Multi-phase render (epic 13879, sc-13884): drive the resolved phases over the ONE
-                // global schedule — per-phase guidance selecting the true-CFG (two-forward) or CFG-off
-                // (single-forward) body, AND per-phase adapters toggled on that phase's own job-local
-                // DiT clone — sharing the latent + sigma trajectory across every boundary. The per-phase
-                // plans (clone + adapters + prep) are built ONCE here (`prep_neg` present per phase iff
-                // that phase uses CFG, backed by the `encode_guidance` neg-context gate) and reused
-                // across the count loop (one image per seed). Returns before the single-phase dispatch.
-                if let (Some(resolved), Some(full)) = (mp_resolved.as_ref(), mp_sigmas.as_ref()) {
-                    let plans = self.file_pin_spec.read_files_unchanged(
-                        self.adapters.iter().map(|adapter| &adapter.path),
-                        || {
-                            heavy.heavy.prepare_multiphase(
-                                resolved,
-                                &self.adapters,
-                                &ctx.pos,
-                                ctx.neg.as_ref(),
-                                req.width,
-                                req.height,
-                            )
-                        },
-                    )?;
-                    let mut images = Vec::with_capacity(req.count as usize);
-                    for n in 0..req.count {
-                        let opts = TurboOptions {
-                            width: req.width,
-                            height: req.height,
-                            steps: full.len().saturating_sub(1),
-                            seed: base_seed.wrapping_add(n as u64),
-                            sampler: req.sampler.clone(),
-                            scheduler: req.scheduler.clone(),
-                            transformer_window_size,
-                            memory: req.memory.unwrap_or_default(),
-                            provider_id: self.descriptor.id,
-                        };
-                        // sc-22738: the Denoise + Decode phase EXITS live inside the render body
-                        // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and
-                        // decoded image actually exist; `opts` above carries the request-scoped
-                        // `memory` + `provider_id` those hooks read.
-                        images.push(heavy.heavy.render_multiphase(
-                            &plans,
-                            full,
-                            &opts,
-                            decoder,
-                            &req.cancel,
-                            &req.preview,
-                            on_progress,
-                        )?);
-                    }
-                    return Ok(GenerationOutput::Images(images));
-                }
+        if let Some((resolved, full)) = &request.multiphase.phases {
+            return self.render_multiphase(
+                &heavy,
+                ctx,
+                request,
+                resolved,
+                full,
+                decoder,
+                on_progress,
+            );
+        }
 
-                // Hoist the count-invariant work OUT of the per-image loop (F-073): the reference/pose
-                // VAE encodes and the step-invariant text-fusion + host-RoPE prep depend only on the
-                // (shared) context + target geometry, NOT the per-seed noise. Build the plan ONCE here;
-                // each seed below reuses it via the `render_*_from` seam (byte-identical to the pre-hoist
-                // per-seed build — the prep only ever read the latent *shape*). An 8-count two-source
-                // edit thus does 2 VAE encodes + 2 preps total, not 16 + 16.
-                let plan = if is_edit {
-                    // Kontext-style edit (epic 10871): the source image(s) are kept as in-context
-                    // conditioning (VAE tokens + the Qwen3-VL grounding baked into `ctx`) — NOT a noised
-                    // img2img init. `edit_sources` is the ordered slice the pipeline VAE-encodes at
-                    // successive RoPE frames; the `krea2_identity_edit` LoRA in `spec.adapters` steers it.
-                    KreaRenderPlan::Edit(heavy.heavy.prepare_edit_plan(
-                        &ctx.pos,
-                        ctx.neg.as_ref(),
-                        &edit_sources,
-                        req.width,
-                        req.height,
-                    )?)
-                } else if let Some((init, _)) = reference {
-                    // Reference fidelity strength — resolved ONCE above (sc-10121) so the `start` the
-                    // capture `keep` was resolved against equals the one `render_*_img2img_from`
-                    // truncates on. `Some` here exactly when a reference is present.
-                    let strength = img2img_strength
-                        .expect("img2img_strength is Some whenever a reference is present");
-                    let img2img = heavy.heavy.prepare_img2img(
-                        &ctx.pos,
-                        ctx.neg.as_ref(),
-                        init,
-                        req.width,
-                        req.height,
-                    )?;
-                    // img2img dispatch splits by variant: Raw takes the true-CFG entrypoint (guidance +
-                    // negative prompt honored, sc-10224); Turbo the CFG-free distilled one (sc-10135).
-                    if is_raw {
-                        KreaRenderPlan::Img2ImgRaw {
-                            plan: img2img,
-                            strength,
-                        }
-                    } else {
-                        KreaRenderPlan::Img2ImgTurbo {
-                            plan: img2img,
-                            strength,
-                        }
-                    }
-                } else if is_raw {
-                    KreaRenderPlan::BaseCfg(heavy.heavy.prepare_t2i(
-                        &ctx.pos,
-                        ctx.neg.as_ref(),
-                        req.width,
-                        req.height,
-                    )?)
-                } else {
-                    // Turbo t2i is CFG-free (`ctx.neg` is always `None` here).
-                    KreaRenderPlan::Turbo(
-                        heavy
-                            .heavy
-                            .prepare_t2i(&ctx.pos, None, req.width, req.height)?,
-                    )
-                };
+        let plan = self.build_render_plan(&heavy, ctx, request)?;
+        let mut images = Vec::with_capacity(req.count as usize);
+        for n in 0..req.count {
+            let opts = self.turbo_options(request, request.steps, n);
+            // sc-22738: the Denoise + Decode phase EXITS live inside the render body
+            // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and decoded image
+            // actually exist; `opts` above carries the request-scoped `memory` + `provider_id` those
+            // hooks read. The one render body per path (sc-11101): the same
+            // `KreaHeavy::render_*_from` for both residencies, so a Sequential job (text phase
+            // already dropped) is byte-identical to Resident.
+            images.push(render_one(
+                heavy.heavy,
+                &plan,
+                request,
+                &opts,
+                decoder,
+                on_progress,
+            )?);
+        }
+        Ok(GenerationOutput::Images(images))
+    }
 
-                let mut images = Vec::with_capacity(req.count as usize);
-                for n in 0..req.count {
-                    let opts = TurboOptions {
-                        width: req.width,
-                        height: req.height,
-                        steps,
-                        seed: base_seed.wrapping_add(n as u64),
-                        sampler: req.sampler.clone(),
-                        scheduler: req.scheduler.clone(),
-                        transformer_window_size,
-                        memory: req.memory.unwrap_or_default(),
-                        provider_id: self.descriptor.id,
-                    };
-                    // sc-22738: the Denoise + Decode phase EXITS live inside the render body
-                    // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and
-                    // decoded image actually exist; `opts` above carries the request-scoped `memory`
-                    // + `provider_id` those hooks read.
-                    // The one render body per path (sc-11101): the same `KreaHeavy::render_*_from` for
-                    // both residencies, so a Sequential job (text phase already dropped) is byte-identical
-                    // to Resident.
-                    let img = match &plan {
-                        KreaRenderPlan::Edit(p) => heavy.heavy.render_edit_from(
-                            p,
-                            guidance,
-                            // Distilled Turbo edit → few-step `turbo_schedule`; Raw edit → dynamic-mu
-                            // `base_schedule`. Matches the capture-σ `sigmas` selector above (`is_raw`).
-                            is_turbo_edit,
-                            &opts,
-                            decoder,
-                            // Honor the PiD `from_ldm` early-stop on the edit path (F-069): `keep`
-                            // truncates the schedule so the decoder built at `capture_sigma` receives the
-                            // partially-denoised latent it expects, instead of the σ=0 clean one.
-                            keep,
-                            &req.cancel,
-                            &req.preview,
-                            on_progress,
-                        )?,
-                        KreaRenderPlan::Img2ImgRaw { plan, strength } => {
-                            heavy.heavy.render_base_img2img_from(
-                                plan,
-                                guidance,
-                                *strength,
-                                &opts,
-                                decoder,
-                                // from_ldm early-stop (sc-10121): `keep` truncates the img2img-sliced
-                                // schedule so the decoder built at `capture_sigma` gets the matching
-                                // partially-denoised latent; `sigmas.len()` (no capture) runs the tail.
-                                keep,
-                                &req.cancel,
-                                &req.preview,
-                                on_progress,
-                            )?
-                        }
-                        KreaRenderPlan::Img2ImgTurbo { plan, strength } => {
-                            heavy.heavy.render_turbo_img2img_from(
-                                plan,
-                                *strength,
-                                &opts,
-                                decoder,
-                                // from_ldm early-stop (sc-10121): see the Raw arm above.
-                                keep,
-                                &req.cancel,
-                                &req.preview,
-                                on_progress,
-                            )?
-                        }
-                        KreaRenderPlan::BaseCfg(p) => heavy.heavy.render_base_from(
-                            p,
-                            guidance,
-                            &opts,
-                            decoder,
-                            keep,
-                            &req.cancel,
-                            &req.preview,
-                            on_progress,
-                        )?,
-                        KreaRenderPlan::Turbo(p) => heavy.heavy.render_turbo_from(
-                            p,
-                            &opts,
-                            decoder,
-                            keep,
-                            &req.cancel,
-                            &req.preview,
-                            on_progress,
-                        )?,
-                    };
-                    images.push(img);
-                }
-                Ok(GenerationOutput::Images(images))
+    /// Multi-phase render (epic 13879, sc-13884): drive the resolved phases over the ONE global
+    /// schedule — per-phase guidance selecting the true-CFG (two-forward) or CFG-off
+    /// (single-forward) body, AND per-phase adapters toggled on that phase's own job-local DiT clone
+    /// — sharing the latent + sigma trajectory across every boundary. The per-phase plans (clone +
+    /// adapters + prep) are built ONCE here (`prep_neg` present per phase iff that phase uses CFG,
+    /// backed by the encode-guidance neg-context gate) and reused across the count loop (one image
+    /// per seed).
+    #[allow(clippy::too_many_arguments)]
+    fn render_multiphase(
+        &self,
+        heavy: &KreaHeavyRef<'_>,
+        ctx: &KreaContexts,
+        request: &KreaRequest<'_>,
+        resolved: &[ResolvedPhase],
+        full: &[f32],
+        decoder: Option<&dyn LatentDecoder>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let req = request.req;
+        let plans = self.file_pin_spec.read_files_unchanged(
+            self.adapters.iter().map(|adapter| &adapter.path),
+            || {
+                heavy.heavy.prepare_multiphase(
+                    resolved,
+                    &self.adapters,
+                    &ctx.pos,
+                    ctx.neg.as_ref(),
+                    req.width,
+                    req.height,
+                )
             },
-        )
+        )?;
+        let mut images = Vec::with_capacity(req.count as usize);
+        for n in 0..req.count {
+            let opts = self.turbo_options(request, full.len().saturating_sub(1), n);
+            // sc-22738: the Denoise + Decode phase EXITS live inside the render body
+            // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and decoded image
+            // actually exist; `opts` above carries the request-scoped `memory` + `provider_id` those
+            // hooks read.
+            images.push(heavy.heavy.render_multiphase(
+                &plans,
+                full,
+                &opts,
+                decoder,
+                &req.cancel,
+                &req.preview,
+                on_progress,
+            )?);
+        }
+        Ok(GenerationOutput::Images(images))
+    }
+
+    /// Hoist the count-invariant work OUT of the per-image loop (F-073): the reference/pose VAE
+    /// encodes and the step-invariant text-fusion + host-RoPE prep depend only on the (shared)
+    /// context + target geometry, NOT the per-seed noise. The plan is built ONCE; each seed reuses
+    /// it via the `render_*_from` seam (byte-identical to the pre-hoist per-seed build — the prep
+    /// only ever read the latent *shape*). An 8-count two-source edit thus does 2 VAE encodes + 2
+    /// preps total, not 16 + 16.
+    fn build_render_plan(
+        &self,
+        heavy: &KreaHeavyRef<'_>,
+        ctx: &KreaContexts,
+        request: &KreaRequest<'_>,
+    ) -> Result<KreaRenderPlan> {
+        let req = request.req;
+        Ok(if request.is_edit {
+            // Kontext-style edit (epic 10871): the source image(s) are kept as in-context
+            // conditioning (VAE tokens + the Qwen3-VL grounding baked into `ctx`) — NOT a noised
+            // img2img init. `edit_sources` is the ordered slice the pipeline VAE-encodes at
+            // successive RoPE frames; the `krea2_identity_edit` LoRA in `spec.adapters` steers it.
+            KreaRenderPlan::Edit(heavy.heavy.prepare_edit_plan(
+                &ctx.pos,
+                ctx.neg.as_ref(),
+                &request.edit_sources,
+                req.width,
+                req.height,
+            )?)
+        } else if let Some((init, strength)) = request.img2img {
+            // Reference fidelity strength — resolved ONCE up front (sc-10121) so the `start` the
+            // capture `keep` was resolved against equals the one `render_*_img2img_from` truncates
+            // on.
+            let img2img = heavy.heavy.prepare_img2img(
+                &ctx.pos,
+                ctx.neg.as_ref(),
+                init,
+                req.width,
+                req.height,
+            )?;
+            // img2img dispatch splits by variant: Raw takes the true-CFG entrypoint (guidance +
+            // negative prompt honored, sc-10224); Turbo the CFG-free distilled one (sc-10135).
+            if request.is_raw {
+                KreaRenderPlan::Img2ImgRaw {
+                    plan: img2img,
+                    strength,
+                }
+            } else {
+                KreaRenderPlan::Img2ImgTurbo {
+                    plan: img2img,
+                    strength,
+                }
+            }
+        } else if request.is_raw {
+            KreaRenderPlan::BaseCfg(heavy.heavy.prepare_t2i(
+                &ctx.pos,
+                ctx.neg.as_ref(),
+                req.width,
+                req.height,
+            )?)
+        } else {
+            // Turbo t2i is CFG-free (`ctx.neg` is always `None` here).
+            KreaRenderPlan::Turbo(
+                heavy
+                    .heavy
+                    .prepare_t2i(&ctx.pos, None, req.width, req.height)?,
+            )
+        })
+    }
+
+    /// One image's render options at seed `base_seed + n`.
+    fn turbo_options(&self, request: &KreaRequest<'_>, steps: usize, n: u32) -> TurboOptions {
+        let req = request.req;
+        TurboOptions {
+            width: req.width,
+            height: req.height,
+            steps,
+            seed: request.base_seed.wrapping_add(n as u64),
+            sampler: req.sampler.clone(),
+            scheduler: req.scheduler.clone(),
+            transformer_window_size: request.transformer_window_size,
+            memory: req.memory.unwrap_or_default(),
+            provider_id: self.descriptor.id,
+        }
+    }
+}
+
+/// The request-level Krea plan resolved before the residency lifecycle (sc-27336).
+struct KreaRequest<'r> {
+    req: &'r GenerationRequest,
+    transformer_window_size: Option<usize>,
+    base_seed: u64,
+    is_turbo_edit: bool,
+    is_edit: bool,
+    is_raw: bool,
+    steps: usize,
+    edit_sources: Vec<&'r Image>,
+    /// The img2img init image and its resolved fidelity strength.
+    img2img: Option<(&'r Image, f32)>,
+    capture_sigma: f32,
+    keep: usize,
+    guidance: f32,
+    negative: String,
+    multiphase: KreaMultiphase,
+}
+
+/// The multi-phase plan (epic 13879): the resolved phases with their one global schedule, and the
+/// guidance that gates the text encode's unconditional context.
+struct KreaMultiphase {
+    phases: Option<(Vec<ResolvedPhase>, Vec<f32>)>,
+    encode_guidance: f32,
+}
+
+/// One image through the single-phase plan's render body.
+fn render_one(
+    heavy: &KreaHeavy,
+    plan: &KreaRenderPlan,
+    request: &KreaRequest<'_>,
+    opts: &TurboOptions,
+    decoder: Option<&dyn LatentDecoder>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Image> {
+    let req = request.req;
+    let (guidance, keep) = (request.guidance, request.keep);
+    match plan {
+        KreaRenderPlan::Edit(p) => heavy.render_edit_from(
+            p,
+            guidance,
+            // Distilled Turbo edit → few-step `turbo_schedule`; Raw edit → dynamic-mu
+            // `base_schedule`. Matches the capture-σ schedule selector (`is_raw`).
+            request.is_turbo_edit,
+            opts,
+            decoder,
+            // Honor the PiD `from_ldm` early-stop on the edit path (F-069): `keep` truncates the
+            // schedule so the decoder built at `capture_sigma` receives the partially-denoised
+            // latent it expects, instead of the σ=0 clean one.
+            keep,
+            &req.cancel,
+            &req.preview,
+            on_progress,
+        ),
+        KreaRenderPlan::Img2ImgRaw { plan, strength } => heavy.render_base_img2img_from(
+            plan,
+            guidance,
+            *strength,
+            opts,
+            decoder,
+            // from_ldm early-stop (sc-10121): `keep` truncates the img2img-sliced schedule so the
+            // decoder built at `capture_sigma` gets the matching partially-denoised latent;
+            // `sigmas.len()` (no capture) runs the tail.
+            keep,
+            &req.cancel,
+            &req.preview,
+            on_progress,
+        ),
+        KreaRenderPlan::Img2ImgTurbo { plan, strength } => heavy.render_turbo_img2img_from(
+            plan,
+            *strength,
+            opts,
+            decoder,
+            // from_ldm early-stop (sc-10121): see the Raw arm above.
+            keep,
+            &req.cancel,
+            &req.preview,
+            on_progress,
+        ),
+        KreaRenderPlan::BaseCfg(p) => heavy.render_base_from(
+            p,
+            guidance,
+            opts,
+            decoder,
+            keep,
+            &req.cancel,
+            &req.preview,
+            on_progress,
+        ),
+        KreaRenderPlan::Turbo(p) => heavy.render_turbo_from(
+            p,
+            opts,
+            decoder,
+            keep,
+            &req.cancel,
+            &req.preview,
+            on_progress,
+        ),
     }
 }
 
