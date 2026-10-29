@@ -344,7 +344,7 @@ Future inference work should preserve these rules:
   or `File`); resolving, fetching, and cache placement are the consumer's job, so
   a user-supplied model at an arbitrary path must load and a missing component is
   a load-time contract error, never a mid-render fetch. The
-  [`WeightsSource`](../../crates/contracts/gen-core/src/runtime.rs) enum carries no
+  [`WeightsSource`](../../crates/contracts/gen-core/src/runtime/source.rs) enum carries no
   hub-fetch variant (the sc-2340 direction is permanently rejected). This is
   enforced by `scripts/check-workspace.py`: no network/HTTP client
   (`hf-hub`, `reqwest`, `ureq`, `curl`, `git2`, `hyper`, …) may resolve in the
