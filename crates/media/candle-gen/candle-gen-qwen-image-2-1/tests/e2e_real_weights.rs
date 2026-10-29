@@ -847,7 +847,7 @@ fn turbo_validation_renders(steps: &[Option<u32>]) {
                 }
             },
         );
-        let ran = steps.unwrap_or(saved.default_steps() as u32);
+        let ran = steps.unwrap_or(saved.default_steps());
         assert_eq!(
             totals,
             vec![ran; ran as usize],
@@ -1364,7 +1364,7 @@ fn turbo_validation_render_reference_edit() {
     let root = turbo_snapshot();
     let saved = candle_gen_qwen_image_2_1::load_saved_sigma_schedule(&root)
         .unwrap()
-        .default_steps() as u32;
+        .default_steps();
     assert_eq!(saved, 8, "the pinned Turbo revision saves eight sigmas");
     reference_edit_renders(
         &Target::dense(
@@ -1484,7 +1484,7 @@ fn turbo_validation_prefix_kv_cache_velocity() {
     let out_dir = out_dir();
     let stem = "qwen_image_2_1_turbo_candle";
     let saved = candle_gen_qwen_image_2_1::load_saved_sigma_schedule(&root).unwrap();
-    let steps = saved.default_steps();
+    let steps = saved.default_steps() as usize;
     assert_eq!(steps, 8, "the pinned Turbo revision saves eight sigmas");
     let sigmas = resample_saved_sigmas(&saved.sample_sigmas, steps).unwrap();
 
@@ -3069,7 +3069,7 @@ fn turbo_validation_render_installed_tiers() {
     let tiers = turbo_tier_snapshot();
     let saved = candle_gen_qwen_image_2_1::load_saved_sigma_schedule(&tiers.join("q8"))
         .unwrap()
-        .default_steps() as u32;
+        .default_steps();
     assert_eq!(saved, 8, "the pinned Turbo revision saves eight sigmas");
     turbo_installed_tier_renders_in(
         &tiers,
@@ -3343,7 +3343,7 @@ fn turbo_validation_render_transparency() {
     let root = turbo_snapshot();
     let saved = candle_gen_qwen_image_2_1::load_saved_sigma_schedule(&root)
         .unwrap()
-        .default_steps() as u32;
+        .default_steps();
     assert_eq!(saved, 8, "the pinned Turbo revision saves eight sigmas");
     transparency_renders(
         candle_gen_qwen_image_2_1::TURBO_MODEL_ID,

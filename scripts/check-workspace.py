@@ -1116,6 +1116,130 @@ def check_ios_host_shared_workspace(root: Path) -> None:
 
 
 
+# sc-27276: a member that names a `[workspace.dependencies]` package must inherit it
+# (`{ workspace = true, ... }`) instead of re-declaring a version or path, or the workspace pin
+# silently stops being the single source. Only these deliberate version splits may stay inline:
+INLINE_VERSION_SPLITS = {
+    # The intentional 0.21/0.22 split `check_graph` pins: the 0.21 users stay inline.
+    "tokenizers": "0.21",
+    # The workspace pin is 0.4 (gen-core, the MLX crates and Candle's own `ug` dependency resolve
+    # 0.4.5); the Candle providers need 0.7 and declare it inline until the pin is unified.
+    "safetensors": "0.7",
+}
+# Exact (manifest, key) entries that cannot inherit: the CLIP certificate's vendored regex is a
+# path + exact-version pin (see REGEX_CERTIFICATE_PACKAGES).
+INLINE_DEPENDENCY_EXCEPTIONS = {
+    ("crates/media/mlx-gen/mlx-gen-sdxl/Cargo.toml", "regex"),
+}
+
+
+def _manifest_dependency_tables(manifest: dict) -> list[tuple[str, dict]]:
+    sections = ("dependencies", "dev-dependencies", "build-dependencies")
+    tables = [(section, manifest.get(section, {})) for section in sections]
+    for target, body in manifest.get("target", {}).items():
+        tables.extend((f"target.{target}.{section}", body.get(section, {})) for section in sections)
+    return tables
+
+
+def workspace_dependency_inheritance_errors(
+    workspace_dependencies: dict, manifests: dict[str, dict]
+) -> list[str]:
+    """Inline declarations of a workspace-declared dependency, keyed by repo-relative manifest."""
+    errors = []
+    for relative, manifest in sorted(manifests.items()):
+        for section, table in _manifest_dependency_tables(manifest):
+            for key, spec in table.items():
+                package = spec.get("package", key) if isinstance(spec, dict) else key
+                if key not in workspace_dependencies and package not in workspace_dependencies:
+                    continue
+                if isinstance(spec, dict) and spec.get("workspace") is True:
+                    continue
+                if isinstance(spec, dict) and package != key:
+                    # A renamed dependency cannot inherit (inheritance cannot rename the key).
+                    continue
+                if isinstance(spec, dict) and spec.get("path") == ".":
+                    # A crate's dev-dependency on itself to enable test-only features.
+                    continue
+                if (relative, key) in INLINE_DEPENDENCY_EXCEPTIONS:
+                    continue
+                version = spec if isinstance(spec, str) else spec.get("version")
+                if INLINE_VERSION_SPLITS.get(package) == version and "path" not in spec:
+                    continue
+                errors.append(
+                    f"{relative} [{section}] {key} re-declares a [workspace.dependencies] entry; "
+                    "use `{ workspace = true }` (add features/optional beside it)"
+                )
+    return errors
+
+
+def check_workspace_dependency_inheritance(metadata: dict, root: Path) -> None:
+    workspace_dependencies = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))[
+        "workspace"
+    ]["dependencies"]
+    packages = {package["id"]: package for package in metadata["packages"]}
+    manifests = {}
+    for member_id in metadata["workspace_members"]:
+        path = Path(packages[member_id]["manifest_path"]).resolve()
+        if root.resolve() / "crates" not in path.parents:
+            continue  # the ios-host device harness keeps its own reviewed manifest
+        manifests[path.relative_to(root.resolve()).as_posix()] = tomllib.loads(
+            path.read_text(encoding="utf-8")
+        )
+    errors = workspace_dependency_inheritance_errors(workspace_dependencies, manifests)
+    if errors:
+        fail("; ".join(errors))
+
+
+# sc-27415: provider crates may depend on sibling providers (the lateral tier documented in
+# docs/architecture/inference-rearchitecture.md), but only on the same backend, and nothing below
+# the composition roots may depend on a catalog or bundle. Cargo already rejects cycles among
+# normal dependencies.
+PROVIDER_PREFIXES = ("mlx-gen-", "candle-gen-", "candle-audio-")
+
+
+def _is_provider(name: str) -> bool:
+    return name.startswith(PROVIDER_PREFIXES) and not name.endswith("-catalog")
+
+
+def _backend(name: str) -> str | None:
+    if name.startswith("mlx-"):
+        return "mlx"
+    if name.startswith("candle-"):
+        return "candle"
+    return None
+
+
+def provider_tier_edge_errors(metadata: dict) -> list[str]:
+    packages = {package["id"]: package for package in metadata["packages"]}
+    members = [packages[member_id] for member_id in metadata["workspace_members"]]
+    member_names = {package["name"] for package in members}
+    composition = {
+        package["name"]
+        for package in members
+        if package["name"].endswith("-catalog") or "/crates/bundles/" in package["manifest_path"]
+    }
+    errors = []
+    for package in members:
+        name = package["name"]
+        if not _is_provider(name):
+            continue
+        for dependency in package["dependencies"]:
+            target = dependency["name"]
+            if dependency.get("kind") is not None or target not in member_names:
+                continue
+            if target in composition:
+                errors.append(f"provider {name} depends on composition root {target}")
+            elif _backend(target) is not None and _backend(target) != _backend(name):
+                errors.append(f"provider {name} depends across backends on {target}")
+    return errors
+
+
+def check_provider_tier_edges(metadata: dict) -> None:
+    errors = provider_tier_edge_errors(metadata)
+    if errors:
+        fail("; ".join(errors))
+
+
 # Published upstream lockfiles are retained as archive/source provenance, NOT independent
 # active workspace locks. Register only these exact excluded package paths and versions;
 # arbitrary nested locks, including any other vendor lock, remain errors.
@@ -3373,6 +3497,8 @@ def main() -> int:
         metadata = cargo_metadata(args.offline)
         check_graph(metadata)
         check_network_clients(metadata)
+        check_workspace_dependency_inheritance(metadata, ROOT)
+        check_provider_tier_edges(metadata)
         check_ios_graph(args.offline)
         check_rust_sources(ROOT)
         check_pid_decode_route_adoption(metadata, ROOT)
@@ -3387,7 +3513,8 @@ def main() -> int:
     print(
         "workspace gate: OK "
         f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
-        "intentional tokenizer split, no network clients, no trainers in the iOS graph, "
+        "intentional tokenizer split, inherited workspace dependencies, same-backend provider "
+        "edges, no network clients, no trainers in the iOS graph, "
         "no HF-cache references, "
         "no $HOME-derived snapshot paths, no audio hub-layout re-derivations, "
         "no unguarded test temp roots, "

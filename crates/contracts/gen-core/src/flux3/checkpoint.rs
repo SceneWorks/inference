@@ -13,7 +13,10 @@ use crate::{Error, Result, SafetensorsTensorHeader};
 use super::{Flux3Config, Flux3MetadataConfig, DIT_WEIGHTS_FILE};
 
 const INDEX_FILE: &str = "model.safetensors.index.json";
-const MAX_HEADER_BYTES: u64 = 16 * 1024 * 1024;
+/// FLUX3's family header cap, deliberately tighter than the crate-wide
+/// [`crate::weightsmeta::MAX_SAFETENSORS_HEADER`]: no legitimate FLUX3 transformer or LoRA header
+/// approaches it. Checked before the shared bounded read so the 16 MiB refusal stays distinct.
+pub(super) const MAX_HEADER_BYTES: u64 = 16 * 1024 * 1024;
 const FLOW_MAP_KEY: &str = "ref_time_in.in_layer.weight";
 const FLOW_MAP_OUT_KEY: &str = "ref_time_in.out_layer.weight";
 

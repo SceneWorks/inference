@@ -28,7 +28,7 @@ sha2 = { workspace = true }
 tempfile = { workspace = true }
 # `face_cosine` example (epic 10871 P4.2 identity scoring, sc-10886) loads PNG/JPG inputs. Mirrors the
 # `mlx-gen-face` dev-dep; PNG + JPEG so it can score either the person ref or an edit output.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { workspace = true }
 
 [features]
 model-inference-proof = ["candle-gen/model-inference-proof", "candle-core/model-inference-proof"]

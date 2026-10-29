@@ -3924,9 +3924,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Toolchain and hardware versions
         shell: cmd
@@ -3975,9 +3974,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Toolchain and hardware versions
         shell: cmd
@@ -4029,9 +4027,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Toolchain and hardware versions
         shell: cmd
@@ -4099,9 +4096,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Toolchain and hardware versions
         shell: cmd
@@ -4185,9 +4181,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Toolchain and hardware versions
         shell: cmd
@@ -4250,9 +4245,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Toolchain and hardware versions
         shell: cmd
@@ -4298,9 +4292,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Materialize and verify immutable snapshots
         shell: cmd
@@ -4338,9 +4331,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Require and verify the operator-provisioned immutable Mage snapshot
         shell: cmd
@@ -4396,9 +4388,8 @@ jobs:
       - name: Validate runner-provisioned CPython 3.14 x64
         shell: powershell
         run: . ./scripts/ci/real-weights/candle-scail2-shared/validate-runner-provisioned-cpython-3-14-x64.ps1
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Provision the exact public shared bf16 package
         shell: powershell
@@ -4458,9 +4449,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Require reviewed CPython 3.12
         shell: cmd
@@ -4524,9 +4514,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Configure runner-local SDXL validation paths
         shell: cmd
@@ -4604,9 +4593,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Configure runner-local MMAudio output paths
         shell: cmd
@@ -4791,9 +4779,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: Require operator-provided MiniMax-H3 snapshot
         shell: cmd
@@ -5026,9 +5013,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: rustfmt, clippy
       # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in this repo);
       # its daemon resets mid-build on heavy Candle/CUDA graphs ("An existing connection was forcibly
@@ -5140,9 +5126,7 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: 1.96.0
+      - uses: ./.github/actions/setup-rust
       # The runner service exports RUSTC_WRAPPER=sccache globally; its daemon resets mid-build on heavy
       # Candle/CUDA graphs — see `candle-qwen-image-2-1`. Clear it for this job only.
       - name: Disable unstable sccache wrapper for the heavy Candle lane
@@ -5224,9 +5208,7 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: 1.96.0
+      - uses: ./.github/actions/setup-rust
       - name: Disable unstable sccache wrapper for the heavy Candle lane
         shell: powershell
         run: |
@@ -5387,9 +5369,7 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: 1.96.0
+      - uses: ./.github/actions/setup-rust
       # The runner service exports RUSTC_WRAPPER=sccache, whose daemon resets mid-build on heavy
       # Candle/CUDA graphs — see `candle-qwen-image-2-1`. Clear it for this job only.
       - name: Disable unstable sccache wrapper for the heavy Candle lane
@@ -5475,9 +5455,7 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: 1.96.0
+      - uses: ./.github/actions/setup-rust
       # The runner service exports RUSTC_WRAPPER=sccache, whose daemon resets mid-build on heavy
       # Candle/CUDA graphs — see `candle-qwen-image-2-1`. Clear it for this job only.
       - name: Disable unstable sccache wrapper for the heavy Candle lane
@@ -6295,9 +6273,7 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: 1.96.0
+      - uses: ./.github/actions/setup-rust
       # The runner service exports RUSTC_WRAPPER=sccache, whose daemon resets mid-build on heavy
       # Candle/CUDA graphs — see `candle-qwen-image-2-1`. Clear it for this job only.
       - name: Disable unstable sccache wrapper for the heavy Candle lane
@@ -6375,9 +6351,7 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: 1.96.0
+      - uses: ./.github/actions/setup-rust
       # As `candle-iris`: clear the unstable sccache wrapper for this heavy Candle/CUDA lane.
       - name: Disable unstable sccache wrapper for the heavy Candle lane
         shell: powershell
@@ -6457,9 +6431,7 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: 1.96.0
+      - uses: ./.github/actions/setup-rust
       # As `candle-iris`: clear the unstable sccache wrapper for this heavy Candle/CUDA lane.
       - name: Disable unstable sccache wrapper for the heavy Candle lane
         shell: powershell
@@ -6537,9 +6509,8 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.96.0
           components: clippy
       - name: Claim idle physical GPU, build/lint exact source, and execute bounded S3 gates
         shell: cmd
@@ -6995,7 +6966,7 @@ jobs:
           "%REVIEWED_PYTHON%" -m scripts.ci.moss_edit_cuda
       - name: Preserve bounded numerical and owned-process receipts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: moss-edit-cuda-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -7020,7 +6991,7 @@ jobs:
       - name: Compile and list the exact oracle without allocating a Metal device
         run: python3.12 scripts/ci/moss_edit_metal.py prepare
       - name: Publish prepared source, runtime, binary, and test identities
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: moss-metal-prepared-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -7032,7 +7003,7 @@ jobs:
         run: python3.12 scripts/ci/moss_edit_metal.py execute
       - name: Preserve numerical and owned-process receipts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: moss-metal-result-${{ github.run_id }}-${{ github.run_attempt }}
           path: |

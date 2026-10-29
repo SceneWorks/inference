@@ -467,8 +467,8 @@ fn attention_branch_matches_the_reference() {
     let attn = CausalAttention::from_weights(
         &mut w,
         "pre_block.attn",
-        cfg.bigvgan.num_mels,
-        cfg.latent_channels,
+        cfg.bigvgan.num_mels as i32,
+        cfg.latent_channels as i32,
         FIXTURE_HEADS,
         Dtype::Float32,
     )
@@ -492,8 +492,8 @@ fn attention_branch_matches_the_reference() {
     let pre = AttnProjection::from_weights(
         &mut w,
         "pre_block",
-        cfg.bigvgan.num_mels,
-        cfg.latent_channels,
+        cfg.bigvgan.num_mels as i32,
+        cfg.latent_channels as i32,
         FIXTURE_HEADS,
         Dtype::Float32,
     )
@@ -689,7 +689,7 @@ fn a_mismatched_configuration_is_rejected() {
     let hidden = w0.shape()[0];
     assert_eq!(
         hidden,
-        cfg.latent_channels * 2,
+        cfg.latent_channels as i32 * 2,
         "the published GeGLU hidden width is latent_channels * MLP_RATIO"
     );
     w.insert(
@@ -1367,8 +1367,8 @@ fn attention_does_not_look_ahead() {
     let pre = AttnProjection::from_weights(
         &mut w,
         "pre_block",
-        cfg.bigvgan.num_mels,
-        cfg.latent_channels,
+        cfg.bigvgan.num_mels as i32,
+        cfg.latent_channels as i32,
         FIXTURE_HEADS,
         Dtype::Float32,
     )
@@ -1431,8 +1431,8 @@ fn head_count_is_load_bearing() {
         AttnProjection::from_weights(
             &mut w,
             "pre_block",
-            cfg.bigvgan.num_mels,
-            cfg.latent_channels,
+            cfg.bigvgan.num_mels as i32,
+            cfg.latent_channels as i32,
             heads,
             Dtype::Float32,
         )
@@ -1454,8 +1454,8 @@ fn head_count_is_load_bearing() {
     assert!(AttnProjection::from_weights(
         &mut w,
         "pre_block",
-        cfg.bigvgan.num_mels,
-        cfg.latent_channels,
+        cfg.bigvgan.num_mels as i32,
+        cfg.latent_channels as i32,
         7,
         Dtype::Float32
     )

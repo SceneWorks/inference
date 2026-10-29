@@ -22,7 +22,7 @@ core-llm = { workspace = true }
 # intentional tokenizers 0.21/0.22 split (check-workspace.py).
 tokenizers = { workspace = true }
 # Config parsing (config.json: the flat MOSS-TTSD config — Qwen3 backbone dims + channel/speech ids).
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

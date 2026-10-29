@@ -50,6 +50,26 @@ REVIEWED_STORAGE_STEP_DIGESTS = {
 }
 CURRENT_STEP_DIGESTS = {**STEP_DIGESTS, **REPAIRED_H3_STEP_DIGESTS, **REVIEWED_STORAGE_STEP_DIGESTS}
 
+# sc-27365 repins only the receipt-upload action of these jobs from the drifted v7.0.1 SHA to
+# the v4 SHA every other workflow step uses. The receipts above stay authoritative: the test maps
+# exactly that `uses:` value back and requires the complete step list to match unchanged.
+UPLOAD_ARTIFACT_V4 = 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'
+UPLOAD_ARTIFACT_RECEIPT = 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
+REPINNED_UPLOAD_ARTIFACT = ('moss-edit-cuda', 'moss-edit-metal')
+
+
+def receipt_upload_pin(steps):
+    """Copy of `steps` with the sc-27365 v4 upload pin mapped back to the receipt's SHA."""
+    steps = copy.deepcopy(steps)
+    for step in steps:
+        if step.get('uses') == UPLOAD_ARTIFACT_V4:
+            step['uses'] = UPLOAD_ARTIFACT_RECEIPT
+    return steps
+
+
+def receipt_steps(name, steps):
+    return receipt_upload_pin(steps) if name in REPINNED_UPLOAD_ARTIFACT else steps
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
@@ -98,7 +118,7 @@ class ManualModelWorkflowRelocationTests(unittest.TestCase):
                 # Same reviewed interpreter convention as every macOS real-weight job.
                 for step in steps:
                     if 'run' in step: step['run'] = step['run'].replace('python3.12 ', 'python3 ')
-            self.assertEqual(digest(steps), CURRENT_STEP_DIGESTS[name], name)
+            self.assertEqual(digest(receipt_steps(name, steps)), CURRENT_STEP_DIGESTS[name], name)
         hosted = self.manual['jobs']['h3-pruned-hosted-metal']
         step = next(step for step in hosted['steps'] if step.get('name', '').startswith('Check H3 precise'))
         self.assertEqual(digest(step), STEP_DIGESTS['h3-pruned-hosted-metal'])

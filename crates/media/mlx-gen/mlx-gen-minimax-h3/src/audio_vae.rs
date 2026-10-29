@@ -198,7 +198,7 @@ fn load_activation(
         Dtype::Float32,
     )?;
     for (tag, f) in [("upsample", &up), ("downsample", &down)] {
-        if f.shape() != [1, 1, ACTIVATION_KERNEL_SIZE] {
+        if f.shape() != [1, 1, ACTIVATION_KERNEL_SIZE as i32] {
             return Err(Error::Msg(format!(
                 "minimax-h3 audio vae: {prefix}.{tag} filter is {:?}, expected \
                  [1, 1, {ACTIVATION_KERNEL_SIZE}]",
@@ -208,8 +208,8 @@ fn load_activation(
     }
     Ok(Activation1d::new(
         SnakeBeta::new(alpha, beta, logscale)?,
-        UpSample1d::from_filter(up.as_dtype(dtype)?, ACTIVATION_RESAMPLE_RATIO)?,
-        LowPassFilter1d::from_filter(down.as_dtype(dtype)?, ACTIVATION_RESAMPLE_RATIO)?,
+        UpSample1d::from_filter(up.as_dtype(dtype)?, ACTIVATION_RESAMPLE_RATIO as i32)?,
+        LowPassFilter1d::from_filter(down.as_dtype(dtype)?, ACTIVATION_RESAMPLE_RATIO as i32)?,
     ))
 }
 
@@ -239,16 +239,17 @@ impl AmpBlock1 {
     pub fn from_weights(
         w: &mut Weights,
         prefix: &str,
-        kernel: i32,
-        dilations: &[i32],
+        kernel: usize,
+        dilations: &[usize],
         logscale: bool,
         dtype: Dtype,
     ) -> Result<Self> {
+        let kernel = kernel as i32;
         let mut convs1 = Vec::with_capacity(dilations.len());
         let mut convs2 = Vec::with_capacity(dilations.len());
         let mut acts1 = Vec::with_capacity(dilations.len());
         let mut acts2 = Vec::with_capacity(dilations.len());
-        for (i, &d) in dilations.iter().enumerate() {
+        for (i, d) in dilations.iter().map(|&d| d as i32).enumerate() {
             convs1.push(Conv1d::weight_normed(
                 w,
                 &format!("{prefix}.convs1.{i}"),
@@ -289,7 +290,7 @@ impl AmpBlock1 {
         })
     }
 
-    fn names(prefix: &str, dilations: &[i32]) -> Vec<String> {
+    fn names(prefix: &str, dilations: &[usize]) -> Vec<String> {
         let mut out = Vec::new();
         for i in 0..dilations.len() {
             out.extend(Conv1d::names(&format!("{prefix}.convs1.{i}"), true));
@@ -351,8 +352,8 @@ impl BigVgan {
             ups.push(ConvTranspose1d::weight_normed(
                 w,
                 &format!("{prefix}.ups.{i}.0"),
-                rate,
-                (kernel - rate) / 2,
+                rate as i32,
+                ((kernel - rate) / 2) as i32,
                 dtype,
             )?);
         }
@@ -488,17 +489,18 @@ impl MiniMaxH3AudioVae {
         let shape = dec_in.shape().to_vec();
         // `nn.Conv1d(latent_channels, latent_dim, 1)`: a 1x1 conv is a pointwise linear, so the
         // trailing kernel axis is squeezed rather than convolved.
-        if shape != [cfg.bigvgan.num_mels, cfg.latent_channels, 1] {
+        let (num_mels, latent_channels) = (cfg.bigvgan.num_mels as i32, cfg.latent_channels as i32);
+        if shape != [num_mels, latent_channels, 1] {
             return Err(Error::Msg(format!(
                 "minimax-h3 audio vae: dec_in_proj.weight is {shape:?}, expected [{}, {}, 1]",
                 cfg.bigvgan.num_mels, cfg.latent_channels
             )));
         }
-        let dec_in_w = dec_in.reshape(&[cfg.bigvgan.num_mels, cfg.latent_channels])?;
+        let dec_in_w = dec_in.reshape(&[num_mels, latent_channels])?;
         let dec_in_b = to_dtype(w.require("dec_in_proj.bias")?, dtype)?;
         let decoder = BigVgan::from_weights(w, "decoder", cfg, dtype)?;
 
-        let n = cfg.latent_channels;
+        let n = latent_channels;
         let latents_mean = Array::from_slice(&cfg.latents_mean, &[1, 1, n]).as_dtype(dtype)?;
         let latents_std = Array::from_slice(&cfg.latents_std, &[1, 1, n]).as_dtype(dtype)?;
         Ok(Self {
@@ -530,7 +532,7 @@ impl MiniMaxH3AudioVae {
             )));
         }
         let channels = z.shape()[rank - 2];
-        if channels != self.cfg.latent_channels {
+        if channels != self.cfg.latent_channels as i32 {
             return Err(Error::Msg(format!(
                 "minimax-h3 audio vae: latent has {channels} channels, config declares {}",
                 self.cfg.latent_channels
@@ -549,7 +551,7 @@ impl MiniMaxH3AudioVae {
     /// Reference-exact — **no** de-normalization (see [`Self::denormalize`]).
     pub fn decode(&self, z: &Array) -> Result<Array> {
         let shape = z.shape();
-        if shape.len() != 3 || shape[1] != self.cfg.latent_channels {
+        if shape.len() != 3 || shape[1] != self.cfg.latent_channels as i32 {
             return Err(Error::Msg(format!(
                 "minimax-h3 audio vae decode: expected [B, {}, T], got {shape:?}",
                 self.cfg.latent_channels
@@ -578,7 +580,8 @@ impl MiniMaxH3AudioVae {
     pub fn decode_stereo(&self, z: &Array) -> Result<Array> {
         let shape = z.shape().to_vec();
         let channels = i32::from(self.cfg.output_channels);
-        if shape.len() != 4 || shape[1] != channels || shape[2] != self.cfg.latent_channels {
+        let latent_channels = self.cfg.latent_channels as i32;
+        if shape.len() != 4 || shape[1] != channels || shape[2] != latent_channels {
             return Err(Error::Msg(format!(
                 "minimax-h3 audio vae decode_stereo: expected [B, {channels}, {}, T], got \
                  {shape:?}",
@@ -586,7 +589,7 @@ impl MiniMaxH3AudioVae {
             )));
         }
         let (b, t) = (shape[0], shape[3]);
-        let folded = z.reshape(&[b * channels, self.cfg.latent_channels, t])?;
+        let folded = z.reshape(&[b * channels, latent_channels, t])?;
         let waves = self.decode(&folded)?;
         let samples = waves.shape()[2];
         Ok(waves.reshape(&[b, channels, samples])?)

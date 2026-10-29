@@ -14,10 +14,6 @@ use serde_json::{json, Map, Value};
 
 use crate::{Error, Result};
 
-/// Refuse a header larger than this: no legitimate FLUX3 header approaches it, and an unbounded
-/// length field would otherwise drive an unbounded allocation.
-const MAX_HEADER_BYTES: u64 = 100 * 1024 * 1024;
-
 fn invalid(detail: impl std::fmt::Display) -> Error {
     Error::Unsupported(format!("flux3 safetensors: {detail}"))
 }
@@ -71,20 +67,17 @@ impl SafetensorsSource {
         let mut file =
             File::open(path).map_err(|e| invalid(format!("open {}: {e}", path.display())))?;
         let file_len = file.metadata()?.len();
-        let mut len = [0u8; 8];
-        file.read_exact(&mut len)?;
-        let header_len = u64::from_le_bytes(len);
-        if header_len > MAX_HEADER_BYTES || header_len.saturating_add(8) > file_len {
-            return Err(invalid(format!(
-                "{}: invalid header length",
-                path.display()
-            )));
-        }
-        let mut header = vec![0u8; header_len as usize];
-        file.read_exact(&mut header)?;
+        // The crate-wide bounded header read (sc-27314); a bound violation keeps this module's
+        // `Unsupported` refusal.
+        let (header, data_start) = crate::weightsmeta::read_safetensors_header(
+            &mut file, file_len, path,
+        )
+        .map_err(|error| match error {
+            Error::Msg(message) => invalid(message),
+            other => other,
+        })?;
         let header: Map<String, Value> = serde_json::from_slice(&header)
             .map_err(|e| invalid(format!("{}: header JSON: {e}", path.display())))?;
-        let data_start = 8 + header_len;
         let mut tensors = BTreeMap::new();
         let mut ranges = Vec::new();
         for (name, entry) in &header {

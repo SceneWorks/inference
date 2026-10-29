@@ -49,25 +49,27 @@ use candle_gen::gen_core::iris::train::lineage::{
     agree_resume, elect_checkpoint_writer, publish_export_dir, retire_foreign_checkpoints,
 };
 use candle_gen::gen_core::iris::train::pipeline::DataPipeline;
-use candle_gen::gen_core::iris::train::repa::{RepaPlan, PROJECTOR_PREFIX, TEACHER_COMPONENT};
+use candle_gen::gen_core::iris::train::repa::{
+    resolve_teacher_path, RepaPlan, PROJECTOR_PREFIX, TEACHER_COMPONENT,
+};
 use candle_gen::gen_core::iris::train::shapes::preprocess_file_to_shape;
 use candle_gen::gen_core::iris::train::{
     self as contract, adapter_param_route, backbone_identity, batch_seed_rank, caption_seed,
-    check_resume, checkpoint_root, checkpoint_staging_dir, dataset_fingerprint, draw_batch,
-    export_config_yaml, file_stem, full_model_metadata, full_param_route, latest_checkpoint,
-    linear_paths_from_keys, prune_checkpoints, publish_checkpoint, read_checkpoint_state,
-    select_caption, AdapterMetadata, ArtifactPlan, CheckpointState, GradScaler, HostRng, InitMode,
-    IrisTrainPlan, MixedPrecision, ParamRoute, Prediction, ResumeDataPolicy, TextConditioningMode,
-    TrainFlowDefaults, TrainSchedule, WeightsSelect, CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE,
-    CKPT_TRAINABLE, TECHNIQUES, TRAINER_ID,
+    check_resume, checkpoint_root, checkpoint_staging_dir, dataset_fingerprint, dcp_shards,
+    draw_batch, export_config_yaml, file_stem, full_model_metadata, full_param_route, grad_group,
+    latest_checkpoint, linear_paths_from_keys, prune_checkpoints, publish_checkpoint,
+    read_checkpoint_state, select_caption, AdapterMetadata, ArtifactPlan, CheckpointState,
+    GradScaler, HostRng, InitMode, IrisTrainPlan, MixedPrecision, ParamRoute, Prediction,
+    ResumeDataPolicy, TextConditioningMode, TrainFlowDefaults, TrainSchedule, WeightsSelect,
+    CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE, CKPT_TRAINABLE, TRAINER_ID,
 };
-use candle_gen::gen_core::iris::{IrisConfig, TextEncoderConfig, FAMILY, TEXT_ENCODER_COMPONENT};
+use candle_gen::gen_core::iris::{IrisConfig, TextEncoderConfig, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::train::{
     refuse_reference_control_model_options, refuse_trainer_load_overlays, validate_control_request,
     validate_edit_request, validate_full_finetune_request, validate_training_techniques, Trainer,
     TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, CancelFlag, Image, LoadSpec, Modality, WeightsSource};
+use candle_gen::gen_core::{self, CancelFlag, Image, LoadSpec, WeightsSource};
 use candle_gen::{CandleError as Error, Result};
 use serde_json::{json, Value as JsonValue};
 
@@ -90,24 +92,11 @@ use teacher::{spatial_normalize, Teacher};
 /// The backend this trainer stamps into its checkpoints.
 const BACKEND: &str = "candle";
 
-/// The REPA projector's checkpoint member (the MLX twin's name).
-pub const CKPT_REPA: &str = "repa_projector.safetensors";
+pub use candle_gen::gen_core::iris::train::CKPT_REPA;
 
-/// Identity + capabilities of the Candle Iris generation trainer (the MLX trainer's, field for
-/// field, on `backend = "candle"`).
+/// Identity + capabilities of the Candle Iris generation trainer.
 pub fn trainer_descriptor() -> TrainerDescriptor {
-    TrainerDescriptor {
-        id: TRAINER_ID,
-        family: FAMILY,
-        backend: BACKEND,
-        modality: Modality::Image,
-        supports_lora: true,
-        supports_lokr: true,
-        supports_control: false,
-        supports_full_finetune: true,
-        max_reference_images: 0,
-        techniques: TECHNIQUES,
-    }
+    candle_gen::gen_core::iris::train::trainer_descriptor_for(BACKEND)
 }
 
 /// The resolved resources of a training load: the backbone directory, the Qwen3-VL snapshot and
@@ -264,7 +253,7 @@ impl IrisTrainer {
             )));
         }
         if let Some(r) = &plan.repa {
-            teacher_path(&self.teacher_dir, r)?;
+            resolve_teacher_path(&self.teacher_dir, r)?;
         }
         Ok(())
     }
@@ -272,43 +261,6 @@ impl IrisTrainer {
 
 /// The REPA teacher resource of a run: `repa.teacher_weights` when set, else the `repa_teacher`
 /// load component — refused when neither names an existing resource, never fetched.
-fn teacher_path(component: &Option<PathBuf>, repa: &RepaPlan) -> Result<PathBuf> {
-    let path = match (&repa.teacher_weights, component) {
-        (Some(w), _) if w.contains("://") => {
-            return Err(Error::Unsupported(format!(
-                "{TRAINER_ID} trainer: repa.teacher_weights {w:?} is a URL; the teacher is a \
-                 provisioned resource (nothing is downloaded during training)"
-            )))
-        }
-        (Some(w), Some(c)) if Path::new(w) != c.as_path() => {
-            return Err(Error::Msg(format!(
-                "{TRAINER_ID} trainer: repa.teacher_weights {w:?} and the '{TEACHER_COMPONENT}' \
-                 component {} name different teachers",
-                c.display()
-            )))
-        }
-        (Some(w), _) => PathBuf::from(w),
-        (None, Some(c)) => c.clone(),
-        (None, None) => {
-            return Err(Error::Msg(format!(
-                "{TRAINER_ID} trainer: repa.weight > 0 needs the frozen {} teacher — stage it as \
-                 the '{TEACHER_COMPONENT}' component (facebook/dinov2-base @ {} for the release \
-                 teacher dinov2_vitb14)",
-                repa.teacher.entrypoint,
-                gen_core::iris::train::repa::DINOV2_BASE_HF_REVISION
-            )))
-        }
-    };
-    let file = teacher::teacher_file(&path);
-    if !file.is_file() {
-        return Err(Error::Msg(format!(
-            "{TRAINER_ID} trainer: the REPA teacher resource {} is missing",
-            file.display()
-        )));
-    }
-    Ok(path)
-}
-
 impl Trainer for IrisTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
@@ -592,23 +544,6 @@ struct CkptPayload {
     optimizer: HashMap<String, Tensor>,
 }
 
-fn dcp_shards(dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|it| {
-            it.filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("shard_") && n.ends_with(".safetensors"))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    v.sort();
-    v
-}
-
 /// Read a checkpoint's members: the consolidated files, or (`dcp`) every shard reassembled.
 fn read_checkpoint_members(
     dir: &Path,
@@ -695,26 +630,6 @@ enum WindowOutcome {
         repa: Option<f64>,
         skipped_by_scaler: bool,
     },
-}
-
-/// The gradient-norm group of a trained tensor (`_grad_groups`).
-fn block_group(key: &str) -> String {
-    if key.starts_with(PROJECTOR_PREFIX) {
-        return "repa_projector".into();
-    }
-    let mut parts = key.split('.');
-    let head = parts.next().unwrap_or(key);
-    match head {
-        "blocks" => format!(
-            "blocks.{:02}",
-            parts
-                .next()
-                .and_then(|i| i.parse::<usize>().ok())
-                .unwrap_or(0)
-        ),
-        "pixel_blocks" => format!("pixel_blocks.{}", parts.next().unwrap_or("0")),
-        other => other.to_string(),
-    }
 }
 
 fn mkdir(p: &Path) -> Result<()> {
@@ -1035,7 +950,7 @@ impl Run {
 
         let teacher = match &plan.repa {
             Some(r) => Some(Teacher::load(
-                &teacher_path(&trainer.teacher_dir, r)?,
+                &resolve_teacher_path(&trainer.teacher_dir, r)?,
                 r.teacher.clone(),
                 &device,
             )?),
@@ -1779,7 +1694,7 @@ impl Run {
         let mut groups: std::collections::BTreeMap<String, f64> = Default::default();
         for (k, g) in grads {
             let v = to_host(g)?;
-            *groups.entry(block_group(k)).or_insert(0.0) +=
+            *groups.entry(grad_group(k)).or_insert(0.0) +=
                 v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
         }
         let mut rec = serde_json::Map::new();

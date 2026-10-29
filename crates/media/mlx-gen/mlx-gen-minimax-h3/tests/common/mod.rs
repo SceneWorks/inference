@@ -117,23 +117,23 @@ pub const SHARED_FIXTURE_AUDIO_SAMPLE_RATE: u32 = 32_000;
 /// Audio-VAE output channels.
 pub const SHARED_FIXTURE_AUDIO_OUTPUT_CHANNELS: u16 = 2;
 /// Audio-VAE latent channels — the shipped 32.
-pub const SHARED_FIXTURE_AUDIO_LATENT_CHANNELS: i32 = 32;
+pub const SHARED_FIXTURE_AUDIO_LATENT_CHANNELS: usize = 32;
 /// Audio-VAE encoder width.
-pub const SHARED_FIXTURE_AUDIO_ENCODER_DIM: i32 = 8;
+pub const SHARED_FIXTURE_AUDIO_ENCODER_DIM: usize = 8;
 /// Audio-VAE encoder strides.
-pub const SHARED_FIXTURE_AUDIO_ENCODER_RATES: [i32; 2] = [2, 2];
+pub const SHARED_FIXTURE_AUDIO_ENCODER_RATES: [usize; 2] = [2, 2];
 /// Audio-VAE decoder strides — the shipped seven upsample stages.
-pub const SHARED_FIXTURE_AUDIO_DECODER_RATES: [i32; 7] = [5, 5, 2, 2, 2, 2, 2];
+pub const SHARED_FIXTURE_AUDIO_DECODER_RATES: [usize; 7] = [5, 5, 2, 2, 2, 2, 2];
 /// Audio-VAE decoder width, shrunk to the smallest that survives all seven halvings.
-pub const SHARED_FIXTURE_AUDIO_DECODER_DIM: i32 = 128;
+pub const SHARED_FIXTURE_AUDIO_DECODER_DIM: usize = 128;
 /// Audio-VAE attention projection.
 pub const SHARED_FIXTURE_AUDIO_ATTN_PROJ: bool = true;
 /// Audio-VAE decoder branch.
 pub const SHARED_FIXTURE_AUDIO_DECODER_TYPE: &str = "bigvgan";
 /// BigVGAN mel bands the fixture was dumped with.
-pub const SHARED_FIXTURE_AUDIO_BIGVGAN_NUM_MELS: i32 = 64;
+pub const SHARED_FIXTURE_AUDIO_BIGVGAN_NUM_MELS: usize = 64;
 /// BigVGAN decoder width the fixture was dumped with.
-pub const SHARED_FIXTURE_AUDIO_BIGVGAN_DECODER_DIM: i32 = 128;
+pub const SHARED_FIXTURE_AUDIO_BIGVGAN_DECODER_DIM: usize = 128;
 
 /// The committed video-VAE parity fixture, produced by `tools/dump_minimax_h3_video_vae.py`
 /// running the **official diffusers** `AutoencoderKLMiniMaxH3` — the converted-checkpoint layout

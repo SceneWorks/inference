@@ -371,9 +371,9 @@ class RealWorkspaceTests(unittest.TestCase):
         self.assertIn("crates", self.test_reads[reader])
 
     def test_a_cross_backend_file_read_selects_the_reader(self) -> None:
-        # candle-gen-minimax-h3 checks its port against mlx-gen-minimax-h3's reference source.
-        affected = self.affected("crates/media/mlx-gen/mlx-gen-minimax-h3/src/reference.rs")
-        self.assertIn("candle-gen-minimax-h3", affected)
+        # candle-gen-sana reads mlx-gen-sana's text-encoder source through `include_str!`.
+        affected = self.affected("crates/media/mlx-gen/mlx-gen-sana/src/text_encoder.rs")
+        self.assertIn("candle-gen-sana", affected)
 
     def test_committed_reference_artifacts_select_their_reader(self) -> None:
         affected = self.affected("docs/migration/sa3-reference/same-s-same.safetensors")

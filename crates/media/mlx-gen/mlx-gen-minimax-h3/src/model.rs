@@ -490,7 +490,25 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 
     // The geometry gate itself — the same call `generate` makes, so `validate` and the render agree
     // by construction rather than by two copies of the lattice arithmetic.
-    request_geometry(req).map(|_| ())
+    let geometry = request_geometry(req)?;
+
+    // The clip-length floor (sc-27256, the shared `reference` module's
+    // `MIN_REFERENCE_CLIP_FRAMES`): the surviving frame count depends on the request's
+    // `num_frames`, so it is checked here against the resolved geometry. Without it `validate`
+    // would admit a clip `normalize_reference_clip` then refuses inside `generate`.
+    if let Some(references) = &references {
+        for r in references.as_slice() {
+            if let Ref2VaReference::Video(v) = r {
+                crate::reference::normalized_clip_frame_count(
+                    v.frames.len(),
+                    v.fps,
+                    geometry.joint.num_frames.max(0) as usize,
+                    crate::denoise::MINIMAX_H3_FPS,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Map a request's keyframes onto MiniMax-H3's two anchor slots, in packed order.
@@ -713,7 +731,7 @@ pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2V
     if refs.is_empty() {
         return Ok(None);
     }
-    Ref2VaReferences::new(refs).map(Some)
+    Ok(Some(Ref2VaReferences::new(refs)?))
 }
 
 /// Resolve the request's geometry: the canvas, and the frame count from `frames` (exact) or
@@ -1627,8 +1645,21 @@ impl MiniMaxH3 {
                     }
                     Ref2VaReference::Video(v) => {
                         // Snap DOWN to the VAE's `17n + 5` lattice so nothing is padded.
+                        // The `.min` keeps a clip from being over-read, and is safe only because
+                        // `normalize_reference_clip` refuses a normalized clip shorter than
+                        // `MIN_REFERENCE_CLIP_FRAMES`; a shorter one would reach the VAE off the
+                        // `17n + 5` lattice. A hard refusal, not a `debug_assert!`, so release
+                        // builds keep it.
                         let keep = crate::conditioning::snap_reference_frames_down(v.frames.len())
                             .min(v.frames.len());
+                        if keep < crate::reference::MIN_REFERENCE_CLIP_FRAMES {
+                            return Err(Error::Msg(format!(
+                                "{MODEL_ID}: reference {i} snapped to {keep} frames, below the \
+                                 {}-frame `17n + 5` floor — the normalized clip reached the \
+                                 encoder off the lattice",
+                                crate::reference::MIN_REFERENCE_CLIP_FRAMES
+                            )));
+                        }
                         let pixels = reference_clip_to_vae_pixels(&v.frames[..keep])?;
                         let c =
                             encode_reference_condition(&vae, &pixels, &KeyframeNoise::Seeded, i)?;
@@ -3303,7 +3334,9 @@ pub(crate) mod tests {
 
     fn clip_ref() -> Conditioning {
         Conditioning::ReferenceVideo {
-            frames: vec![image(64, 64)],
+            // 24, not 1: at 24 fps source == kept, and `MIN_REFERENCE_CLIP_FRAMES` is 22, so a
+            // shorter clip is refused by `validate` (sc-27256).
+            frames: vec![image(64, 64); 24],
             fps: 24.0,
             audio: None,
         }
@@ -3427,6 +3460,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// **`validate` refuses exactly the clips `generate` would refuse** (sc-27256): the shared
+    /// `MIN_REFERENCE_CLIP_FRAMES` floor applies at the boundary, on the normalized count.
+    #[test]
+    fn validate_refuses_a_clip_shorter_than_the_vae_chunk_floor() {
+        use crate::reference::MIN_REFERENCE_CLIP_FRAMES;
+
+        let caps = descriptor().capabilities;
+        let clip = |frames: usize, fps: f32| {
+            with(vec![Conditioning::ReferenceVideo {
+                frames: vec![image(64, 64); frames],
+                fps,
+                audio: None,
+            }])
+        };
+        for (frames, fps) in [(4usize, 24.0f32), (21, 24.0), (4, 30.0), (26, 30.0)] {
+            let e = validate_request(&caps, &clip(frames, fps))
+                .expect_err("a clip normalizing below the floor must be refused by validate")
+                .to_string();
+            assert!(
+                e.contains(&format!("{MIN_REFERENCE_CLIP_FRAMES}-frame floor")),
+                "{frames}@{fps}: {e}"
+            );
+        }
+        for (frames, fps) in [(22usize, 24.0f32), (24, 24.0), (28, 30.0)] {
+            validate_request(&caps, &clip(frames, fps))
+                .unwrap_or_else(|e| panic!("{frames}@{fps} clears the floor: {e}"));
+        }
+    }
+
     /// A reference clip carries **its own frame rate**, and the rate survives the mapping.
     ///
     /// This is the hole the old `VideoClip` carrier could not close: it had no rate, so the mapping
@@ -3436,7 +3498,8 @@ pub(crate) mod tests {
     #[test]
     fn a_reference_clip_carries_its_own_frame_rate() {
         let req = with(vec![Conditioning::ReferenceVideo {
-            frames: vec![image(64, 64)],
+            // 30 frames at 30 fps normalize to 24 at 24 fps, clearing the 22-frame floor.
+            frames: vec![image(64, 64); 30],
             fps: 30.0,
             audio: None,
         }]);
@@ -3465,7 +3528,7 @@ pub(crate) mod tests {
     #[test]
     fn a_reference_clips_own_soundtrack_rides_the_clip() {
         let req = with(vec![Conditioning::ReferenceVideo {
-            frames: vec![image(64, 64)],
+            frames: vec![image(64, 64); 24],
             fps: 24.0,
             audio: Some(track()),
         }]);
