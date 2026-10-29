@@ -280,12 +280,14 @@ jobs:
           cargo clippy --locked
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
+          -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
           --all-targets -- -D warnings
       - name: Test contracts
         run: >-
           python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
+          -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
 
   # The NTFS half of the job above. The testkit's fixture writers size a fixture's tensor payload
   # like the real checkpoint it stands in for and then leave it unwritten, which is free on APFS and
@@ -405,6 +407,7 @@ jobs:
           cargo doc --locked --no-deps
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
+          -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
           -p runtime-cpu -p runtime-catalog
       # The three guards ride the lint job rather than a test job: `check-lock-poison.sh` shells out
@@ -796,6 +799,7 @@ jobs:
         run: >-
           python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core
+          -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
           --all-targets -- -D warnings
       - name: Compile and lint opt-in MOSS model tests without execution
         run: cargo clippy --locked --all-targets -j 1 -p mlx-gen-moss-image --features test-support -- -D warnings
@@ -863,7 +867,7 @@ jobs:
           TEST_SUITE_DEADLINE_SECONDS: 3600
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
-          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core)
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry)
           read -r -a packages <<< "$args"
           if [[ ${#packages[@]} -eq 0 ]]; then
             echo "No package in this step's set is affected by the change; nothing to test."

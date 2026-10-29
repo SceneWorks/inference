@@ -29,6 +29,9 @@ serde = { workspace = true }
 mlx-sys = { workspace = true, optional = true }
 # Header-only image validation in the training dataset pass (decode lives in gen_core::iris::train).
 image = { workspace = true, optional = true }
+# The host TCP side channel of MLX distributed training (rendezvous + bounded barriers), moved out
+# of gen-core with its socket FFI (sc-27316). Training-only, like mlx-sys.
+sceneworks-gen-core-dist = { workspace = true, optional = true }
 
 [features]
 model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-llm/model-inference-proof"]
@@ -37,7 +40,7 @@ model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-llm/model-inferen
 # Default-on, so every existing consumer is unchanged; an inference-only graph (the iOS bundle)
 # depends with `default-features = false` and compiles and links no trainer (sc-26265).
 default = ["training"]
-training = ["dep:cc", "dep:image", "dep:mlx-sys"]
+training = ["dep:cc", "dep:image", "dep:mlx-sys", "dep:sceneworks-gen-core-dist"]
 
 [build-dependencies]
 # build.rs links MLX's libjaccl.a (or compiles the JACCL-absent shim for a prebuilt MLX without it)
