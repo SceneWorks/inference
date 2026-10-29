@@ -1281,7 +1281,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
-            samplers: vec!["uni_pc", "euler", "unipc"],
+            samplers: vec!["uni_pc", "euler", "dpmpp_2m", "unipc", "dpmpp2m"],
             min_size: 16,
             max_size: 1280,
             max_count: 1,

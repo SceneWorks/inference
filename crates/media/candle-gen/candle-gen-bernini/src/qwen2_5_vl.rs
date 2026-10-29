@@ -20,6 +20,7 @@ use candle_gen::quant::AdaptLinear as QLinear;
 use candle_gen::{CandleError, Result as CResult};
 
 use crate::nn::rms_norm;
+use candle_gen::attention::repeat_kv_bshd;
 
 /// Text-decoder config for the Qwen2.5-VL-7B planner backbone (the LLM half of `mllm/config.json`).
 #[derive(Clone, Debug)]
@@ -289,17 +290,6 @@ impl Qwen25VlText {
         Ok((x.broadcast_mul(&cos)? + rotate_half(x)?.broadcast_mul(&sin)?)?)
     }
 
-    /// Expand `[B,L,Hkv,D]` → `[B,L,Hkv*groups,D]` (GQA repeat).
-    fn repeat_kv(x: &Tensor, groups: usize) -> CResult<Tensor> {
-        if groups == 1 {
-            return Ok(x.clone());
-        }
-        let (b, l, hkv, d) = x.dims4()?;
-        let x = x.unsqueeze(3)?; // [B,L,Hkv,1,D]
-        let x = x.broadcast_as((b, l, hkv, groups, d))?;
-        Ok(x.reshape((b, l, hkv * groups, d))?.contiguous()?)
-    }
-
     /// Eager attention with an external additive 4D `mask` (`[1,1,L,L]` broadcast): q/k/v project →
     /// reshape to heads → MRoPE q,k → GQA → `softmax(q·kᵀ/√d + mask)·v` → o_proj.
     fn attention(
@@ -322,10 +312,10 @@ impl Qwen25VlText {
 
         let groups = nh / nkv;
         let q = q.permute((0, 2, 1, 3))?.contiguous()?; // [B,H,L,D]
-        let k = Self::repeat_kv(&k, groups)?
+        let k = repeat_kv_bshd(&k, groups)?
             .permute((0, 2, 1, 3))?
             .contiguous()?;
-        let v = Self::repeat_kv(&v, groups)?
+        let v = repeat_kv_bshd(&v, groups)?
             .permute((0, 2, 1, 3))?
             .contiguous()?;
 

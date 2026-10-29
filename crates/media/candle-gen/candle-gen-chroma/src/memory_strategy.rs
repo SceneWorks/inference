@@ -993,12 +993,7 @@ pub fn production_calibration_fingerprint(
     tier: Option<Quant>,
 ) -> Option<String> {
     let route = route_identity(provider_id).ok()?.provider.replace('_', "-");
-    let tier = match tier {
-        None => "bf16",
-        Some(Quant::Q4) => "q4",
-        Some(Quant::Q8) => "q8",
-        Some(_) => return None,
-    };
+    let tier = Quant::affine_tier_label(tier)?;
     Some(format!("{route}-{tier}-cuda-{CANDLE_LADDER_REVISION}"))
 }
 

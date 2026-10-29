@@ -490,30 +490,6 @@ impl ZImageControlTransformer {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
-    fn forward_control(
-        &self,
-        x: &Tensor,
-        t: &Tensor,
-        cap_feats: &Tensor,
-        cap_mask: &Tensor,
-        control_context: &Tensor,
-        scale: f64,
-        memory: GenerationMemory,
-        cancel: &CancelFlag,
-    ) -> Result<Tensor> {
-        let prepared = self.prepare_control_conditioning(
-            x,
-            cap_feats,
-            cap_mask,
-            control_context,
-            memory,
-            cancel,
-        )?;
-        self.forward_control_prepared(x, t, &prepared, scale, memory, cancel)
-    }
-
     /// Dual-injection control forward — re-walks the base DiT's embed → refiner → main phases (the
     /// vendored [`ZImageTransformer2DModel`] internals) while interleaving the parallel control stack
     /// and adding its scaled hints. Returns the **raw** velocity `(B, C, F, H, W)` (the caller negates,
@@ -1285,7 +1261,7 @@ impl ZImageControl {
         // against the shared step-keyed counter — over the same `steps` it reports as `Progress::Step
         // { total }`. Emitted at the TOP of the iteration, on the latent ENTERING step `step_i`, which
         // is where the shared drivers emit (`candle-gen/src/sampler.rs`). The 33-channel control
-        // context is a closure capture inside `forward_control`, never part of `latents`.
+        // context is a closure capture inside `forward_control_prepared`, never part of `latents`.
         let preview_counter = crate::preview::bespoke_counter(steps);
         for step_i in 0..steps {
             if req.cancel.is_cancelled() {

@@ -621,6 +621,7 @@ pub fn synthetic_taehv_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::tensor_max_abs_diff as max_abs_diff;
     use candle_core::Var;
 
     fn tiny(cfg: TaehvConfig) -> TaehvConfig {
@@ -636,19 +637,6 @@ mod tests {
             cfg.clone(),
         )
         .unwrap()
-    }
-
-    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
     }
 
     #[test]

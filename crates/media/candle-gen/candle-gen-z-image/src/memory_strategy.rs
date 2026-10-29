@@ -1179,16 +1179,9 @@ pub(crate) fn snapshot_quant_tier(
         WeightsSource::Dir(root) => root,
         WeightsSource::File(_) => return Ok(None),
     };
-    crate::pipeline::packed_config_at(root, "transformer")
-        .map_err(gen_core::Error::backend)?
-        .map(|packed| match packed.bits {
-            4 => Ok(Quant::Q4),
-            8 => Ok(Quant::Q8),
-            bits => Err(gen_core::Error::Unsupported(format!(
-                "{provider_id}: transformer declares unsupported packed quantization width {bits}"
-            ))),
-        })
-        .transpose()
+    let packed =
+        crate::pipeline::packed_config_at(root, "transformer").map_err(gen_core::Error::backend)?;
+    candle_gen::quant::packed_quant_tier(packed, provider_id, "transformer")
 }
 
 pub(crate) fn registered_safety_check(

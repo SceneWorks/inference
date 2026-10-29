@@ -50,6 +50,8 @@ pub use candle_quant_kernels::{cublaslt, nvfp4, nvfp4_linear, nvfp4_outlier};
 // ComfyUI Kitchen NVFP4 import (sc-20641): the one NVFP4 seam that reads gen-core's `to_blocked`
 // swizzle, kept beside the media checkpoint readers so the codec stays gen-core-free (sc-24135).
 pub mod nvfp4_kitchen;
+// The real-activation outlier probe the NVFP4 DiT plans attach to a denoise (sc-11045, sc-27413).
+pub mod act_probe;
 
 // The shared forward-time additive (unmerged) LoRA/LoKr seam (sc-11091, epic 10765): [`AdaptLinear`]
 // — a frozen dense/packed base plus stacked residuals `y = base(x) + Σ scale·((x·A)·B)`, memory-free
@@ -254,6 +256,27 @@ pub fn mlx_packed_qtensor_resident_bytes(
                 weight.name
             ))
         })
+}
+
+/// The numeric tier a packed component declares (sc-27285: the shared tail of the flux /
+/// qwen-image / z-image `snapshot_quant_tier` copies). `None` (no `quantization` block) is the dense
+/// tier; a declared width of 4 / 8 bits is [`Quant::Q4`] / [`Quant::Q8`]; any other width is an
+/// [`gen_core::Error::Unsupported`] naming `provider_id` and `component`. Each provider keeps its own
+/// `WeightsSource` match and config read, so a single-file source stays a per-provider decision.
+pub fn packed_quant_tier(
+    packed: Option<PackedConfig>,
+    provider_id: &str,
+    component: &str,
+) -> gen_core::Result<Option<Quant>> {
+    packed
+        .map(|packed| match packed.bits {
+            4 => Ok(Quant::Q4),
+            8 => Ok(Quant::Q8),
+            bits => Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: {component} declares unsupported packed quantization width {bits}"
+            ))),
+        })
+        .transpose()
 }
 
 /// A component's `quantization` manifest block — the candle twin of `mlx_gen_flux2::config::Flux2Quant`
@@ -1469,22 +1492,12 @@ mod tests {
     use super::*;
     use candle_core::safetensors::MmapedSafetensors;
 
-    // ---- helpers -----------------------------------------------------------------------------
-
     /// Cosine similarity over all elements (f64), the quant-parity metric.
     fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
-        let b = b.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
-        let a = a.to_vec1::<f32>().unwrap();
-        let b = b.to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(b.iter()) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
+        crate::testkit::tensor_cosine(a, b) as f32
     }
+
+    // ---- helpers -----------------------------------------------------------------------------
 
     /// Test-side MLX packer: per-element 4-bit codes → MLX u32 words (LSB-first nibbles).
     fn pack_mlx_q4(codes: &[u8]) -> Vec<u32> {

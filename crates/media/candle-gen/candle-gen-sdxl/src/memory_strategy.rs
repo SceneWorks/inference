@@ -453,12 +453,8 @@ impl SdxlArtifactSeal {
                 spec.quantize, tier.quant
             )));
         }
-        let tier_name = match tier.quant {
-            Some(Quant::Q4) => "q4",
-            Some(Quant::Q8) => "q8",
-            None => "bf16",
-            _ => unreachable!(),
-        };
+        let tier_name = Quant::affine_tier_label(tier.quant)
+            .unwrap_or_else(|| unreachable!("sdxl ships no {:?} tier", tier.quant));
         if !path_has_snapshot(&root, route, tier_name) {
             return Err(gen_core::Error::Unsupported(format!(
                 "sdxl: {} must resolve from exact {}@{}/{}",

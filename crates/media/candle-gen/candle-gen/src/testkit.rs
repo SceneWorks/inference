@@ -21,8 +21,6 @@
 //! dev-dependency feature: `candle-gen = { path = "...", features = ["testkit"] }` under
 //! `[dev-dependencies]`, or `candle-gen/testkit` in a test-only feature.
 
-#![allow(dead_code)]
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -341,6 +339,201 @@ pub fn write_ppm(path: &Path, img: &Image) {
     std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
+/// SHA-256 of a file's bytes as lowercase hex, streamed (sc-27389: the real-weight tests' former
+/// per-file `sha256_of` copies).
+pub fn sha256_file(path: &Path) -> String {
+    let mut file =
+        std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .unwrap_or_else(|e| panic!("hash {}: {e}", path.display()));
+    format!("{:x}", hasher.finalize())
+}
+
+/// Write packed RGB8 `pixels` (`width×height`) as a PNG at `path`, creating its parent directory
+/// (sc-27389: the shared body of the real-weight tests' `save_png` helpers).
+pub fn save_rgb8_png(path: &Path, pixels: &[u8], width: u32, height: u32) {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    }
+    let buf: image::RgbImage = image::ImageBuffer::from_raw(width, height, pixels.to_vec())
+        .expect("frame buffer matches its dimensions");
+    buf.save(path)
+        .unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+}
+
+/// [`save_rgb8_png`] for an RGB8 [`Image`].
+pub fn save_image_png(path: &Path, img: &Image) {
+    save_rgb8_png(path, &img.pixels, img.width, img.height);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Preview real-weight harness scaffolding (sc-27413)
+// ---------------------------------------------------------------------------------------------------
+//
+// The per-provider `tests/preview_real_weights.rs` harnesses each carried their own copy of these, and
+// the copies had drifted in exactly the places a gate must not: one input reader skipped where the
+// others failed, one integer knob silently fell back on a typo, one correlation returned NaN on a flat
+// frame. One copy now.
+
+/// An input a real-weight row cannot run without. Missing means **fail**, not skip: a row that
+/// early-returns on an unset variable still reports SUCCESS, and a skipped gate is indistinguishable in
+/// a log from one that ran and proved something.
+pub fn required_path(name: &str) -> PathBuf {
+    env_path_opt(name).unwrap_or_else(|| {
+        panic!(
+            "{name} must be set for this row — skipping it would report success while proving \
+             nothing"
+        )
+    })
+}
+
+/// An optional integer knob: `fallback` when unset, a **panic** when set but unparsable (a typo must
+/// not silently run the default and report it as the requested configuration).
+pub fn env_u32(name: &str, fallback: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} must parse as an integer, got {value:?}"))
+        })
+        .unwrap_or(fallback)
+}
+
+/// Where a harness writes its review artifacts: `$var` when set, else `temp_dir()/fallback`.
+pub fn artifact_dir_or_temp(var: &str, fallback: &str) -> PathBuf {
+    env_path_opt(var).unwrap_or_else(|| std::env::temp_dir().join(fallback))
+}
+
+/// The single image of a one-image render.
+pub fn one_image(out: crate::gen_core::GenerationOutput) -> Image {
+    let crate::gen_core::GenerationOutput::Images(mut images) = out else {
+        panic!("expected GenerationOutput::Images");
+    };
+    assert_eq!(images.len(), 1, "these rows render a single image");
+    images.pop().expect("one image")
+}
+
+/// A [`PreviewSink`](crate::gen_core::PreviewSink) that records every frame, plus the shared handle
+/// to read them back.
+pub fn collecting_sink() -> (
+    crate::gen_core::PreviewSink,
+    std::sync::Arc<Mutex<Vec<crate::gen_core::PreviewFrame>>>,
+) {
+    let frames = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let captured = std::sync::Arc::clone(&frames);
+    let sink =
+        crate::gen_core::PreviewSink::new(move |frame| crate::lock_recover(&captured).push(frame));
+    (sink, frames)
+}
+
+/// Mean absolute per-channel distance between two equal-length RGB8 buffers.
+pub fn mean_abs_delta(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len(), "compared buffers must match in length");
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| (x as f64 - y as f64).abs())
+        .sum::<f64>()
+        / a.len() as f64
+}
+
+/// Pearson correlation between two equal-length RGB8 buffers over all channels; `0` when either is
+/// flat (a constant frame correlates with nothing, rather than poisoning a gate with NaN).
+pub fn correlation(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len(), "compared buffers must match in length");
+    let n = a.len() as f64;
+    let (ma, mb) = (
+        a.iter().map(|&v| v as f64).sum::<f64>() / n,
+        b.iter().map(|&v| v as f64).sum::<f64>() / n,
+    );
+    let (mut num, mut da, mut db) = (0.0, 0.0, 0.0);
+    for (&x, &y) in a.iter().zip(b) {
+        let (dx, dy) = (x as f64 - ma, y as f64 - mb);
+        num += dx * dy;
+        da += dx * dx;
+        db += dy * dy;
+    }
+    if da == 0.0 || db == 0.0 {
+        return 0.0;
+    }
+    num / (da.sqrt() * db.sqrt())
+}
+
+/// Area-average (box) downsample of a raw RGB8 buffer to `(w, h)`: each target pixel is the integer
+/// mean of the source pixels its cell covers (at least one).
+pub fn downsample_box_raw(pixels: &[u8], src_w: u32, src_h: u32, w: u32, h: u32) -> Vec<u8> {
+    let (sw, sh) = (src_w as usize, src_h as usize);
+    let (tw, th) = (w as usize, h as usize);
+    let mut out = vec![0u8; tw * th * 3];
+    for ty in 0..th {
+        for tx in 0..tw {
+            let (x0, x1) = (tx * sw / tw, ((tx + 1) * sw / tw).max(tx * sw / tw + 1));
+            let (y0, y1) = (ty * sh / th, ((ty + 1) * sh / th).max(ty * sh / th + 1));
+            for c in 0..3 {
+                let (mut sum, mut n) = (0u32, 0u32);
+                for y in y0..y1.min(sh) {
+                    for x in x0..x1.min(sw) {
+                        sum += pixels[(y * sw + x) * 3 + c] as u32;
+                        n += 1;
+                    }
+                }
+                out[(ty * tw + tx) * 3 + c] = (sum / n.max(1)) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// [`downsample_box_raw`] of an [`Image`].
+pub fn downsample_box(img: &Image, w: u32, h: u32) -> Vec<u8> {
+    downsample_box_raw(&img.pixels, img.width, img.height, w, h)
+}
+
+/// Nearest-neighbour resample of a raw RGB8 buffer to `(w, h)`.
+pub fn downsample_nearest_raw(pixels: &[u8], src_w: u32, src_h: u32, w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let sx = (x as u64 * src_w as u64 / w as u64) as u32;
+            let sy = (y as u64 * src_h as u64 / h as u64) as u32;
+            let idx = ((sy * src_w + sx) * 3) as usize;
+            out.extend_from_slice(&pixels[idx..idx + 3]);
+        }
+    }
+    out
+}
+
+/// [`downsample_nearest_raw`] of an [`Image`].
+pub fn downsample_nearest(img: &Image, w: u32, h: u32) -> Vec<u8> {
+    downsample_nearest_raw(&img.pixels, img.width, img.height, w, h)
+}
+
+/// Lay preview `frames` out side by side as one horizontal RGB8 contact sheet `(pixels, width,
+/// height)`, so a reviewer sees the progression at a glance. Every frame must share the first's size.
+pub fn preview_strip_sheet(frames: &[crate::gen_core::PreviewFrame]) -> (Vec<u8>, u32, u32) {
+    assert!(!frames.is_empty(), "an empty strip cannot be written");
+    let (w, h) = (
+        frames[0].image.width as usize,
+        frames[0].image.height as usize,
+    );
+    let strip_w = w * frames.len();
+    let mut strip = vec![0u8; strip_w * h * 3];
+    for (i, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            (frame.image.width as usize, frame.image.height as usize),
+            (w, h),
+            "every strip frame must share one size"
+        );
+        for y in 0..h {
+            let src = &frame.image.pixels[y * w * 3..(y + 1) * w * 3];
+            let x0 = (y * strip_w + i * w) * 3;
+            strip[x0..x0 + w * 3].copy_from_slice(src);
+        }
+    }
+    (strip, strip_w as u32, h as u32)
+}
+
 /// Mean absolute per-byte difference between two equal-size RGB renders (the
 /// injection-changes-the-output sanity metric). Panics on a size mismatch.
 pub fn mean_abs_diff(a: &Image, b: &Image) -> f32 {
@@ -371,6 +564,17 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Largest absolute elementwise difference between two same-shape f32 tensors (sc-27381).
+pub fn tensor_max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+    assert_eq!(a.dims(), b.dims(), "max_abs_diff needs same-shape tensors");
+    (a - b)
+        .and_then(|d| d.abs())
+        .and_then(|d| d.flatten_all())
+        .and_then(|d| d.max(0))
+        .and_then(|d| d.to_scalar::<f32>())
+        .expect("f32 tensors")
+}
+
 /// Bare dot product of two equal-length vectors — the cosine metric when both inputs are already
 /// L2-normalized (the SDXL / Kolors / FLUX IP-adapter feature extractors normalize before comparing).
 pub fn cosine_dot(a: &[f32], b: &[f32]) -> f32 {
@@ -378,10 +582,17 @@ pub fn cosine_dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Cosine similarity for Candle tensors, accumulated in `f64` to keep quantization fixture
-/// comparisons stable. The tensors are flattened and converted from `f32` on the CPU.
+/// comparisons stable. The tensors are cast to `f32`, flattened and read back on the CPU; `+1e-12` in
+/// the denominator makes two zero tensors `0`. The provider unit tests' shared parity metric
+/// (sc-27381).
 pub fn tensor_cosine(a: &Tensor, b: &Tensor) -> f64 {
-    let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-    let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let flat = |t: &Tensor| {
+        t.to_dtype(crate::candle_core::DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .expect("tensor reads back as f32")
+    };
+    let (a, b) = (flat(a), flat(b));
     let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
     for (x, y) in a.iter().zip(&b) {
         dot += (*x as f64) * (*y as f64);
@@ -454,6 +665,73 @@ where
         Tensor::from_vec(biases, (out_dim, groups_per_row), &dev).unwrap(),
         grid,
     )
+}
+
+#[cfg(test)]
+mod preview_harness_tests {
+    use super::*;
+    use crate::gen_core::PreviewFrame;
+
+    fn frame(current: u32, width: u32, height: u32, fill: u8) -> PreviewFrame {
+        PreviewFrame {
+            current,
+            total: 2,
+            image: Image {
+                width,
+                height,
+                pixels: (0..width * height * 3)
+                    .map(|i| fill.wrapping_add(i as u8))
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn strip_sheet_places_each_frame_row_beside_the_last() {
+        let (a, b) = (frame(1, 2, 2, 0), frame(2, 2, 2, 100));
+        let (sheet, w, h) = preview_strip_sheet(&[a.clone(), b.clone()]);
+        assert_eq!((w, h), (4, 2));
+        for y in 0..2usize {
+            assert_eq!(
+                &sheet[y * 12..y * 12 + 6],
+                &a.image.pixels[y * 6..y * 6 + 6]
+            );
+            assert_eq!(
+                &sheet[y * 12 + 6..y * 12 + 12],
+                &b.image.pixels[y * 6..y * 6 + 6]
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_and_resamplers_behave_at_their_edges() {
+        assert_eq!(mean_abs_delta(&[0, 10, 255], &[5, 0, 250]), 20.0 / 3.0);
+        assert_eq!(
+            correlation(&[7, 7, 7], &[1, 2, 3]),
+            0.0,
+            "flat input is 0, not NaN"
+        );
+        assert!((correlation(&[1, 2, 3], &[2, 4, 6]) - 1.0).abs() < 1e-12);
+        // A 2×1 → 1×1 box average is the integer mean; nearest takes the first sample.
+        let px = [10u8, 20, 30, 20, 40, 60];
+        assert_eq!(downsample_box_raw(&px, 2, 1, 1, 1), vec![15, 30, 45]);
+        assert_eq!(downsample_nearest_raw(&px, 2, 1, 1, 1), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn integer_knobs_fail_on_garbage_instead_of_running_the_default() {
+        let name = "CANDLE_GEN_TESTKIT_ENV_U32_PROBE";
+        {
+            let _unset = EnvVarGuard::set(name, None);
+            assert_eq!(env_u32(name, 7), 7);
+        }
+        {
+            let _set = EnvVarGuard::set(name, Some("12"));
+            assert_eq!(env_u32(name, 7), 12);
+        }
+        let _bad = EnvVarGuard::set(name, Some("1two"));
+        assert!(std::panic::catch_unwind(|| env_u32(name, 7)).is_err());
+    }
 }
 
 #[cfg(test)]

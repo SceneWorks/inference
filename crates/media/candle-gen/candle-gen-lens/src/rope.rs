@@ -5,30 +5,23 @@
 //! (`axes_dims_rope = (8, 28, 28)`, Σ = 64 = `head_dim`, Σ/2 = 32 complex pairs vs Qwen's 16/56/56).
 //! θ = 10000, `scale_rope = True` (height/width positions are centered). Frequencies and angles are
 //! computed **host-side** in f32; application is **interleaved** (lanes `2i`/`2i+1` are the real/imag
-//! pair) via candle's [`rope_i`], reproducing the reference's complex `view_as_complex · freqs_cis`.
+//! pair) via candle's `rope_i`, reproducing the reference's complex `view_as_complex · freqs_cis`.
 //!
 //! - **Image tokens** at grid `(f, h, w)`: the frame axis uses position `f`, height/width use
 //!   **centered** positions `h − (lat_h − lat_h/2)` / `w − (lat_w − lat_w/2)`.
 //! - **Text tokens** at index `t`: a single scalar position `txt_base + t`
 //!   (`txt_base = max(lat_h/2, lat_w/2)`) applied across **all 32** pair-frequencies.
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::candle_nn::rotary_emb::rope_i;
+use candle_gen::candle_core::{Device, Result, Tensor};
+use candle_gen::rope::AxialRope3;
 
-/// Lens 3-axis RoPE table builder. `θ = 10000`, `axes_dim = (8, 28, 28)`.
-pub struct LensRope {
-    theta: f32,
-    axes_dim: [usize; 3],
-    half: usize,
-}
+/// Lens 3-axis RoPE table builder. `θ = 10000`, `axes_dim = (8, 28, 28)`: the shared [`AxialRope3`]
+/// (the builder Qwen-Image uses with its own axes, sc-27286).
+pub struct LensRope(AxialRope3);
 
 impl LensRope {
     pub fn new(theta: f32, axes_dim: [usize; 3]) -> Self {
-        Self {
-            theta,
-            axes_dim,
-            half: axes_dim.iter().sum::<usize>() / 2,
-        }
+        Self(AxialRope3::new(theta, axes_dim))
     }
 
     /// The Lens default: θ=10000, axes `(8, 28, 28)` (Σ = 64 = head_dim, Σ/2 = 32 pairs).
@@ -36,19 +29,8 @@ impl LensRope {
         Self::new(10_000.0, [8, 28, 28])
     }
 
-    /// The 32-wide concatenated frequency vector `[ω_frame(4), ω_h(14), ω_w(14)]`,
-    /// `ω_d[k] = θ^{-(2k)/d}`.
-    fn omega(&self) -> Vec<f32> {
-        let mut all = Vec::with_capacity(self.half);
-        for &dim in &self.axes_dim {
-            for k in 0..dim / 2 {
-                all.push(1.0f32 / self.theta.powf((2 * k) as f32 / dim as f32));
-            }
-        }
-        all
-    }
-
-    /// Image-token `(cos, sin)` `[frame·lat_h·lat_w, 32]` (row-major over the grid).
+    /// Image-token `(cos, sin)` `[frame·lat_h·lat_w, 32]` (row-major over the grid, frame-major): frame
+    /// `f` takes frame position `f` — the shared multi-grid builder over `frame` copies of the grid.
     pub fn img_cos_sin(
         &self,
         frame: usize,
@@ -56,40 +38,8 @@ impl LensRope {
         lat_w: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
-        let omega = self.omega();
-        let (n_f, n_h) = (self.axes_dim[0] / 2, self.axes_dim[1] / 2); // 4, 14
-        let h_center = (lat_h - lat_h / 2) as i64;
-        let w_center = (lat_w - lat_w / 2) as i64;
-        let seq = frame * lat_h * lat_w;
-        let mut cos = vec![0f32; seq * self.half];
-        let mut sin = vec![0f32; seq * self.half];
-        for f in 0..frame {
-            for h in 0..lat_h {
-                let hp = h as i64 - h_center;
-                for w in 0..lat_w {
-                    let wp = w as i64 - w_center;
-                    let row = (f * lat_h * lat_w + h * lat_w + w) * self.half;
-                    for (j, &om) in omega.iter().enumerate() {
-                        // axis by frequency band: frame [0,n_f) → f, height [n_f, n_f+n_h) → hp,
-                        // width [n_f+n_h, half) → wp.
-                        let pos = if j < n_f {
-                            f as i64
-                        } else if j < n_f + n_h {
-                            hp
-                        } else {
-                            wp
-                        } as f32;
-                        let a = pos * om;
-                        cos[row + j] = a.cos();
-                        sin[row + j] = a.sin();
-                    }
-                }
-            }
-        }
-        Ok((
-            Tensor::from_vec(cos, (seq, self.half), device)?,
-            Tensor::from_vec(sin, (seq, self.half), device)?,
-        ))
+        self.0
+            .img_cos_sin_multi(&vec![(lat_h, lat_w); frame], device)
     }
 
     /// Text-token `(cos, sin)` `[txt_seq, 32]`: scalar position `max(lat_h/2, lat_w/2) + t` across
@@ -101,48 +51,18 @@ impl LensRope {
         lat_w: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
-        let omega = self.omega();
-        let txt_base = (lat_h / 2).max(lat_w / 2) as i64;
-        let mut cos = vec![0f32; txt_seq * self.half];
-        let mut sin = vec![0f32; txt_seq * self.half];
-        for t in 0..txt_seq {
-            let pos = (txt_base + t as i64) as f32;
-            for (j, &om) in omega.iter().enumerate() {
-                let a = pos * om;
-                cos[t * self.half + j] = a.cos();
-                sin[t * self.half + j] = a.sin();
-            }
-        }
-        Ok((
-            Tensor::from_vec(cos, (txt_seq, self.half), device)?,
-            Tensor::from_vec(sin, (txt_seq, self.half), device)?,
-        ))
+        self.0.txt_cos_sin_multi(txt_seq, &[(lat_h, lat_w)], device)
     }
 }
 
 /// Apply interleaved complex RoPE to `x` `[B, H, S, head_dim]` with `cos`/`sin` `[S, head_dim/2]`.
 /// The rotation is computed in f32 and cast back to `x`'s dtype.
-pub fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let dtype = x.dtype();
-    let xf = x.to_dtype(DType::F32)?.contiguous()?;
-    rope_i(&xf, cos, sin)?.to_dtype(dtype)
-}
+pub use candle_gen::rope::apply_interleaved_rope as apply_rope;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn omega_is_32_wide_with_band_layout() {
-        let r = LensRope::lens();
-        assert_eq!(r.half, 32);
-        let om = r.omega();
-        assert_eq!(om.len(), 32);
-        // First freq of each band is θ^0 = 1: frame band [0], height band [4], width band [18].
-        assert!((om[0] - 1.0).abs() < 1e-6, "frame band base");
-        assert!((om[4] - 1.0).abs() < 1e-6, "height band base");
-        assert!((om[18] - 1.0).abs() < 1e-6, "width band base");
-    }
+    use candle_gen::candle_core::DType;
 
     #[test]
     fn img_frame_axis_is_zero_angle_for_single_frame() {

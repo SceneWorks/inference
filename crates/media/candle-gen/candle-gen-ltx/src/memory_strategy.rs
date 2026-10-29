@@ -541,20 +541,13 @@ fn registered_contract_identity(
 }
 
 fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<()> {
-    let edge = edge.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!("{MODEL_ID}: bounded decode requires a tile edge"))
-    })?;
-    let overlap = overlap.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires a tile overlap"
-        ))
-    })?;
-    if !DECODE_TILE_EDGES.contains(&edge) || overlap != DECODE_OVERLAP {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: decode parameters are outside the released q4 LTX domain"
-        )));
-    }
-    Ok(())
+    gen_core::validate_bounded_decode_params(
+        MODEL_ID,
+        DECODE_TILE_EDGES,
+        DECODE_OVERLAP,
+        edge,
+        overlap,
+    )
 }
 
 fn route_gate(

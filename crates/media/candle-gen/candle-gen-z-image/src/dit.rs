@@ -192,23 +192,6 @@ impl ZImageAttention {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn forward(
-        &self,
-        hidden_states: &Tensor,
-        attention_mask: Option<&Tensor>,
-        cos: &Tensor,
-        sin: &Tensor,
-    ) -> Result<Tensor> {
-        into_candle_core(self.forward_with_attention_plan(
-            hidden_states,
-            attention_mask,
-            cos,
-            sin,
-            default_attention_plan(),
-        ))
-    }
-
     pub fn forward_with_attention_plan(
         &self,
         hidden_states: &Tensor,
@@ -460,10 +443,6 @@ pub struct ZImageTransformer2DModel {
     pub(crate) cap_embedder_linear: candle_nn::Linear,
     pub(crate) x_embedder: candle_nn::Linear,
     pub(crate) final_layer: FinalLayer,
-    #[allow(dead_code)]
-    x_pad_token: Tensor,
-    #[allow(dead_code)]
-    cap_pad_token: Tensor,
     pub(crate) noise_refiner: Vec<ZImageTransformerBlock>,
     pub(crate) context_refiner: Vec<ZImageTransformerBlock>,
     pub(crate) layers: Vec<ZImageTransformerBlock>,
@@ -535,8 +514,10 @@ impl ZImageTransformer2DModel {
         let final_layer =
             FinalLayer::new(cfg.dim, out_channels, vb.pp("all_final_layer").pp("2-1"))?;
 
-        let x_pad_token = vb.get((1, cfg.dim), "x_pad_token")?;
-        let cap_pad_token = vb.get((1, cfg.dim), "cap_pad_token")?;
+        // The pad tokens are never read by the forward (sc-27384): require them on load so a
+        // truncated checkpoint still fails here, but do not keep them resident.
+        vb.get((1, cfg.dim), "x_pad_token")?;
+        vb.get((1, cfg.dim), "cap_pad_token")?;
 
         let mut noise_refiner = Vec::with_capacity(cfg.n_refiner_layers);
         for i in 0..cfg.n_refiner_layers {
@@ -579,8 +560,6 @@ impl ZImageTransformer2DModel {
             cap_embedder_linear,
             x_embedder,
             final_layer,
-            x_pad_token,
-            cap_pad_token,
             noise_refiner,
             context_refiner,
             layers,

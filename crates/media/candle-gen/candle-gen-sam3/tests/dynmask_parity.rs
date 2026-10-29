@@ -8,22 +8,10 @@
 
 use std::path::Path;
 
+use crate::support::cosine;
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::default_device;
 use candle_gen_sam3::{Sam3Tracker, Weights};
-
-fn sum_scalar(t: Tensor) -> f32 {
-    t.sum_all().unwrap().to_scalar::<f32>().unwrap()
-}
-
-fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-    let a = a.flatten_all().unwrap();
-    let b = b.flatten_all().unwrap();
-    let dot = sum_scalar((&a * &b).unwrap());
-    let na = sum_scalar((&a * &a).unwrap()).sqrt();
-    let nb = sum_scalar((&b * &b).unwrap()).sqrt();
-    dot / (na * nb)
-}
 
 fn scalar(t: &Tensor) -> f32 {
     t.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0]

@@ -53,9 +53,7 @@
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
-use candle_gen::candle_nn::{
-    ops::softmax_last_dim, rms_norm, rotary_emb, Embedding, RmsNorm, VarBuilder,
-};
+use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Embedding, RmsNorm, VarBuilder};
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::{CandleError as Error, Result};
 use candle_llm::models::deepstack::{
@@ -67,6 +65,8 @@ use candle_llm::primitives::{apply_rope, Rope};
 use crate::config::{TextEncoderConfig, VisionConfig, SYSTEM_PROMPT};
 use crate::quant::{guard_dense, QLinear, GROUP_SIZE};
 use crate::reference::PreparedReference;
+use candle_gen::attention::repeat_kv;
+use candle_gen::grounding::Rotary;
 
 /// A bias-less, packed-detecting `[out, in]` projection — the seam that makes a pre-quantized
 /// Qwen-Image 2.1 tier installable on candle. Qwen3-VL text attention and its SwiGLU are bias-free
@@ -144,60 +144,6 @@ pub fn system_prompt_drop_count(tokenizer: &TextTokenizer) -> Result<usize> {
         ));
     }
     Ok(ids.len())
-}
-
-/// Precomputed 1-D RoPE table (`θ = rope_theta`), half-split as HF/Qwen3 applies it.
-struct Rotary {
-    cos: Tensor,
-    sin: Tensor,
-}
-
-impl Rotary {
-    /// The table is computed in f32 and cast to the tower's compute `dtype` once, so a bf16 tower
-    /// rotates bf16 queries with a bf16 table (candle's rope kernel wants one dtype throughout).
-    fn new(
-        head_dim: usize,
-        theta: f32,
-        max_len: usize,
-        dtype: DType,
-        device: &Device,
-    ) -> Result<Self> {
-        let inv: Vec<f32> = (0..head_dim)
-            .step_by(2)
-            .map(|i| 1f32 / theta.powf(i as f32 / head_dim as f32))
-            .collect();
-        let half = inv.len();
-        let inv = Tensor::from_vec(inv, (1, half), device)?;
-        let t = Tensor::arange(0u32, max_len as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((max_len, 1))?;
-        let freqs = t.matmul(&inv)?;
-        Ok(Self {
-            cos: freqs.cos()?.to_dtype(dtype)?,
-            sin: freqs.sin()?.to_dtype(dtype)?,
-        })
-    }
-
-    /// Apply to `q`/`k` shaped `[B, H, L, D]`.
-    fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        let len = q.dim(2)?;
-        let cos = self.cos.narrow(0, 0, len)?;
-        let sin = self.sin.narrow(0, 0, len)?;
-        Ok((
-            rotary_emb::rope(&q.contiguous()?, &cos, &sin)?,
-            rotary_emb::rope(&k.contiguous()?, &cos, &sin)?,
-        ))
-    }
-}
-
-fn repeat_kv(x: Tensor, n_rep: usize) -> candle_core::Result<Tensor> {
-    if n_rep == 1 {
-        return Ok(x);
-    }
-    let (b, kv_heads, len, head_dim) = x.dims4()?;
-    x.unsqueeze(2)?
-        .broadcast_as((b, kv_heads, n_rep, len, head_dim))?
-        .reshape((b, kv_heads * n_rep, len, head_dim))
 }
 
 struct Attention {
@@ -285,8 +231,8 @@ impl Attention {
                 (rotate(&q)?, rotate(&k)?)
             }
         };
-        let k = repeat_kv(k, self.kv_groups)?.contiguous()?;
-        let v = repeat_kv(v, self.kv_groups)?.contiguous()?;
+        let k = repeat_kv(&k, self.kv_groups)?.contiguous()?;
+        let v = repeat_kv(&v, self.kv_groups)?.contiguous()?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let ctx = attend(&q, &k, &v, mask, scale, candle_gen::ATTN_SCORES_BUDGET)?;
         let ctx = ctx
@@ -454,13 +400,17 @@ impl QwenImage21TextEncoder {
         // The compute dtype is the `VarBuilder`'s: whatever the loader materialized the weights at
         // is what the activations run at (bf16 on CUDA/Metal like upstream, f32 on CPU).
         let dtype = vb.dtype();
-        let rotary = Arc::new(Rotary::new(
-            cfg.head_dim,
-            cfg.rope_theta,
-            crate::loader::MAX_PROMPT_TOKENS,
-            dtype,
-            vb.device(),
-        )?);
+        // The table is computed in f32 and cast to the compute `dtype` once, so a bf16 tower rotates
+        // bf16 queries with a bf16 table (candle's rope kernel wants one dtype throughout).
+        let rotary = Arc::new(
+            Rotary::new(
+                cfg.head_dim,
+                cfg.rope_theta,
+                crate::loader::MAX_PROMPT_TOKENS,
+                vb.device(),
+            )?
+            .to_dtype(dtype)?,
+        );
         let vb_layers = tower.pp("layers");
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {

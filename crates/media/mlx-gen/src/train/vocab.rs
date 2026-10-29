@@ -10,7 +10,7 @@
 
 use mlx_rs::random;
 
-use super::{TrainOptimizer, TrainingConfig, TrainingRequest};
+use super::{TrainOptimizer, TrainerDescriptor, TrainingConfig, TrainingRequest};
 use crate::Result;
 
 /// Recognized `timestep_type` values (`sigmoid` is the fall-through default).
@@ -107,6 +107,20 @@ pub fn validate_sampling_vocab(
 pub fn validate_common_request(prefix: &str, req: &TrainingRequest) -> Result<()> {
     validate_run_shape(prefix, req)?;
     validate_sampling_vocab(prefix, &req.config, &TIMESTEP_TYPES)
+}
+
+/// The gen-core trainer floors every LoRA-only flow trainer runs ahead of its own request check: a
+/// control-branch request, a `full_finetune` request, an undeclared training technique, and an
+/// edit-pair request the descriptor does not declare are each a typed refusal, never silently
+/// trained as a plain adapter (sc-27413).
+pub fn validate_shared_floors(
+    descriptor: &TrainerDescriptor,
+    req: &TrainingRequest,
+) -> gen_core::Result<()> {
+    gen_core::train::validate_control_request(descriptor, req)?;
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)
 }
 
 /// Apply a `timestep_bias` to a unit timestep: `high` → `√t`, `low` → `t²`, anything else neutral.

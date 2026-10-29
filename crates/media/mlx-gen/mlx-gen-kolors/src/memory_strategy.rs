@@ -713,17 +713,8 @@ pub fn streamable(spec: &LoadSpec) -> bool {
 /// with a better message a moment later, and a contract builder is not the place to surface it
 /// first.
 pub fn load_leaves_blocks_lazy(spec: &LoadSpec) -> bool {
-    let Some(quant) = spec.quantize else {
-        // Dense fp16: `cast_all` is lazy, nothing packs.
-        return true;
-    };
-    let WeightsSource::Dir(root) = &spec.weights else {
-        return false;
-    };
-    matches!(
-        mlx_gen::quant::needs_load_time_quant(root, "unet", quant.bits(), crate::MODEL_ID),
-        Ok(false)
-    )
+    // The SDXL U-Net rule, verbatim: Kolors loads the same U-Net through the same packer (sc-27413).
+    mlx_gen_sdxl::memory_strategy::load_leaves_blocks_lazy(spec)
 }
 
 /// Whether this load leaves the **ChatGLM3-6B** blocks unmaterialized — the text-encoder half of
@@ -776,11 +767,7 @@ pub fn text_encoder_leaves_blocks_lazy(spec: &LoadSpec) -> bool {
 /// surface at that tier. It is still the right answer — SC-15521's alternative was rendering the
 /// base model and calling it a LoRA render.
 pub fn adapters_are_replayable(spec: &LoadSpec) -> bool {
-    if spec.adapters.is_empty() {
-        return true;
-    }
-    // A merge happens on a DENSE base. Only an already-packed snapshot pushes residuals.
-    spec.quantize.is_some() && load_leaves_blocks_lazy(spec)
+    mlx_gen_sdxl::memory_strategy::adapters_are_replayable(spec)
 }
 
 /// Build the Kolors MLX provider contract at this [`LoadSpec`].

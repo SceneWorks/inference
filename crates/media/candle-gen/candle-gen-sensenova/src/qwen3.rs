@@ -29,6 +29,7 @@ use candle_gen::Result;
 use crate::config::NeoChatConfig;
 use crate::distill::DistillLora;
 use crate::quant::{detect_linear, get_f32};
+use candle_gen::attention::repeat_kv;
 
 /// Disallowed-attention fill for the additive mask (a large finite negative, matching the candle
 /// Kolors slice — avoids `-inf` propagation through the softmax kernel).
@@ -304,19 +305,6 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CResult<Tensor> {
     let cos = cos.unsqueeze(2)?; // [1,S,1,dim]
     let sin = sin.unsqueeze(2)?;
     x.broadcast_mul(&cos)? + rot.broadcast_mul(&sin)?
-}
-
-/// Expand `[B,Hkv,S,D]` → `[B,Hkv·groups,S,D]` (GQA), repeating each kv head `groups` times (query
-/// head `i` uses KV head `i / groups`).
-fn repeat_kv_bhsd(x: &Tensor, groups: usize) -> CResult<Tensor> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let (b, hkv, s, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .broadcast_as((b, hkv, groups, s, d))?
-        .contiguous()?
-        .reshape((b, hkv * groups, s, d))
 }
 
 /// The dense dual-path Qwen3 backbone: token embeddings, the decoder stack, the dual final norm, and
@@ -710,8 +698,8 @@ impl Qwen3Backbone {
             cache.extend(layer_idx, &k, &v)?
         };
         let groups = self.num_heads / self.num_kv_heads;
-        let k_all = repeat_kv_bhsd(&k_all, groups)?;
-        let v_all = repeat_kv_bhsd(&v_all, groups)?;
+        let k_all = repeat_kv(&k_all, groups)?;
+        let v_all = repeat_kv(&v_all, groups)?;
 
         let scale = 1.0 / (hd as f64).sqrt();
         // i32-overflow guard (sc-11154 / F-081): an image-bearing VQA/interleave prefill can reach

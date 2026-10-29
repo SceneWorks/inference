@@ -67,13 +67,8 @@ const WEIGHTS_FREE_CALIBRATION_FINGERPRINT: &str = "scail2-14b-candle-weights-fr
 /// because the manifest ships ONE repository to both lanes and the two hold those bytes
 /// differently — see `CALIBRATION_BACKEND`.
 pub fn production_calibration_fingerprint(artifact_tier: MemoryNumericTier) -> Option<String> {
-    let tier = match artifact_tier.quant {
-        None => "bf16",
-        Some(gen_core::Quant::Q4) => "q4",
-        Some(gen_core::Quant::Q8) => "q8",
-        // No SCAIL-2 artifact can prove any other packing, so there is no cell to name.
-        Some(_) => return None,
-    };
+    // No SCAIL-2 artifact can prove any other packing, so there is no cell to name.
+    let tier = gen_core::Quant::affine_tier_label(artifact_tier.quant)?;
     Some(format!(
         "scail2-14b-{tier}-{CALIBRATION_BACKEND}-{CALIBRATION_LOAD_COMPOSITION}-v1"
     ))
@@ -399,12 +394,11 @@ impl ArtifactReceipt {
 
 /// The snapshot subdirectory the manifest ships each tier of `SceneWorks/scail2-mlx` under.
 const fn tier_directory(packed: Option<Quant>) -> &'static str {
-    match packed {
-        None => "bf16",
-        Some(Quant::Q4) => "q4",
-        Some(Quant::Q8) => "q8",
-        // Unreachable: `ArtifactReceipt::capture` refuses every other marker before this is asked.
-        Some(_) => "unsupported",
+    // `None` is unreachable: `ArtifactReceipt::capture` refuses every other marker before this is
+    // asked.
+    match Quant::affine_tier_label(packed) {
+        Some(directory) => directory,
+        None => "unsupported",
     }
 }
 

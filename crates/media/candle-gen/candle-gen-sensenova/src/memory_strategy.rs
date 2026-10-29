@@ -660,12 +660,7 @@ fn spec_route<'a>(provider_id: &'a str, spec: &'a LoadSpec) -> &'a str {
 /// Tier label of a SenseNova load: `bf16` for the dense turnkey, `q4`/`q8` for the two packed ones
 /// (`validate_load_spec` refuses anything else). `None` for a tier this family does not ship.
 pub fn calibration_tier_label(quant: Option<Quant>) -> Option<&'static str> {
-    match quant {
-        None => Some("bf16"),
-        Some(Quant::Q4) => Some("q4"),
-        Some(Quant::Q8) => Some("q8"),
-        Some(_) => None,
-    }
+    Quant::affine_tier_label(quant)
 }
 
 /// Production calibration identity table of the Candle SenseNova cells, keyed on **(route, tier)** —

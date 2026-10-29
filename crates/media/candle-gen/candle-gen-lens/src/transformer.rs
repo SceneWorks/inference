@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use crate::quant::QLinear;
 use crate::rope::{apply_rope, LensRope};
+use candle_gen::rope::GeometryCache;
 
 fn streamed_linear_detect(
     in_dim: usize,
@@ -181,20 +182,8 @@ fn attention(
 
 /// Sinusoidal timestep embedding `[1, dim]` from the raw sigma (diffusers `Timesteps(dim,
 /// flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)`): arg `= σ·1000·freq`, `[cos | sin]`.
-fn timestep_embedding(sigma: f32, dim: usize, device: &Device) -> Result<Tensor> {
-    let half = dim / 2;
-    let ln = 10000f32.ln();
-    let mut cos = vec![0f32; half];
-    let mut sin = vec![0f32; half];
-    for k in 0..half {
-        let freq = (-ln * k as f32 / half as f32).exp();
-        let arg = sigma * 1000.0 * freq;
-        cos[k] = arg.cos();
-        sin[k] = arg.sin();
-    }
-    let cos = Tensor::from_vec(cos, (1, half), device)?;
-    let sin = Tensor::from_vec(sin, (1, half), device)?;
-    Tensor::cat(&[&cos, &sin], D::Minus1)
+fn timestep_embedding(t: f32, dim: usize, device: &Device) -> Result<Tensor> {
+    candle_gen::rope::sinusoidal_timestep_embedding(t, dim, 1000.0, device)
 }
 
 /// `temb = linear_2(silu(linear_1(proj(t))))`, `[1] → [1, inner]`. Frozen + composable, so the
@@ -624,20 +613,10 @@ impl NormOut {
     }
 }
 
-/// Per-render RoPE-table cache (sc-8992 / F-012). The image/text `(cos, sin)` tables depend only on
-/// the fixed latent grid `(frame, h, w)` and `txt_len` — not on σ / the current latent — so they are
-/// identical across every denoise step (×2 under CFG). Cache them keyed on that geometry and rebuild
-/// only when it changes; hits Arc-clone the stored handles. Byte-identical to recomputing.
-struct LensRopeCache {
-    frame: usize,
-    h: usize,
-    w: usize,
-    txt_len: usize,
-    img_cos: Tensor,
-    img_sin: Tensor,
-    txt_cos: Tensor,
-    txt_sin: Tensor,
-}
+/// Per-render RoPE tables `(img_cos, img_sin, txt_cos, txt_sin)` (sc-8992), keyed on the
+/// fixed latent grid `(frame, h, w)` and `txt_len` — not on σ / the current latent — so they are
+/// identical across every denoise step (×2 under CFG); rebuilt only when that geometry changes.
+type LensRopeTables = (Tensor, Tensor, Tensor, Tensor);
 
 /// The Lens denoising DiT (`LensTransformer2DModel`).
 enum TransformerBlocks {
@@ -663,7 +642,7 @@ pub struct LensTransformer {
     device: Device,
     dtype: DType,
     /// `Mutex` (not `RefCell`): the DiT is shared as `Arc<LensTransformer>` and must stay `Send + Sync`.
-    rope_cache: std::sync::Mutex<Option<LensRopeCache>>,
+    rope_cache: GeometryCache<(usize, usize, usize, usize), LensRopeTables>,
 }
 
 impl LensTransformer {
@@ -729,7 +708,7 @@ impl LensTransformer {
             cfg: *cfg,
             device: vb.device().clone(),
             dtype: vb.dtype(),
-            rope_cache: std::sync::Mutex::new(None),
+            rope_cache: GeometryCache::new(1),
         })
     }
 
@@ -737,38 +716,18 @@ impl LensTransformer {
     /// (sc-8992). Recomputed only when `(frame, h, w, txt_len)` changes; otherwise the Arc-backed
     /// handles are cloned. Construction is identical to computing it inline, so every step is
     /// byte-identical.
-    #[allow(clippy::type_complexity)]
     fn rope_tables(
         &self,
         frame: usize,
         h: usize,
         w: usize,
         txt_len: usize,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-        let mut guard = candle_gen::lock_recover(&self.rope_cache);
-        if let Some(c) = guard.as_ref() {
-            if c.frame == frame && c.h == h && c.w == w && c.txt_len == txt_len {
-                return Ok((
-                    c.img_cos.clone(),
-                    c.img_sin.clone(),
-                    c.txt_cos.clone(),
-                    c.txt_sin.clone(),
-                ));
-            }
-        }
-        let (img_cos, img_sin) = self.rope.img_cos_sin(frame, h, w, &self.device)?;
-        let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_len, h, w, &self.device)?;
-        *guard = Some(LensRopeCache {
-            frame,
-            h,
-            w,
-            txt_len,
-            img_cos: img_cos.clone(),
-            img_sin: img_sin.clone(),
-            txt_cos: txt_cos.clone(),
-            txt_sin: txt_sin.clone(),
-        });
-        Ok((img_cos, img_sin, txt_cos, txt_sin))
+    ) -> Result<LensRopeTables> {
+        self.rope_cache.get_or_build((frame, h, w, txt_len), || {
+            let (img_cos, img_sin) = self.rope.img_cos_sin(frame, h, w, &self.device)?;
+            let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_len, h, w, &self.device)?;
+            Ok((img_cos, img_sin, txt_cos, txt_sin))
+        })
     }
 
     /// Fold the DiT's compute-heavy linears to Q4/Q8 in place (sc-5117): `img_in`, `txt_in`,

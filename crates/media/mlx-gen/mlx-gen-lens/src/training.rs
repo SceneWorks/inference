@@ -262,16 +262,7 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-    // request (typed `Unsupported`) rather than silently training a plain adapter.
-    gen_core::train::validate_control_request(descriptor, req)?;
-    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-    gen_core::train::validate_full_finetune_request(descriptor, req)?;
-    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-    gen_core::train::validate_training_techniques(descriptor, req)?;
-    gen_core::train::validate_edit_request(descriptor, req)?;
+    mlx_gen::train::vocab::validate_shared_floors(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }

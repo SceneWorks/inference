@@ -403,7 +403,7 @@ impl InstantId {
         let root = self.reload.paths.sdxl_base.as_path();
         let mut unet = load_unet_dtype(root, DTYPE)?;
         if !self.reload.paths.adapters.is_empty() {
-            let coverage = if std::env::var_os("SDXL_LORA_VENDORED").is_some() {
+            let coverage = if mlx_gen::gen_core::env_flag("SDXL_LORA_VENDORED") {
                 LoraCoverage::Vendored
             } else {
                 LoraCoverage::Complete
@@ -539,7 +539,7 @@ impl InstantId {
         // InstantID. A non-empty spec that matches nothing errors (it never renders an unadapted image
         // silently); the empty common case is a no-op.
         if !paths.adapters.is_empty() {
-            let coverage = if std::env::var_os("SDXL_LORA_VENDORED").is_some() {
+            let coverage = if mlx_gen::gen_core::env_flag("SDXL_LORA_VENDORED") {
                 LoraCoverage::Vendored
             } else {
                 LoraCoverage::Complete

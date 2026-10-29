@@ -1823,6 +1823,24 @@ impl Quant {
         }
     }
 
+    /// Tier label of an optional quant: `None` (the dense tier) is `"bf16"`, anything else is its
+    /// [`Self::key`] (sc-27254: the providers' shared `None => "bf16", Some(Q4) => "q4", …` arms).
+    pub const fn tier_label(quant: Option<Quant>) -> &'static str {
+        match quant {
+            None => "bf16",
+            Some(quant) => quant.key(),
+        }
+    }
+
+    /// [`Self::tier_label`] restricted to the dense and affine tiers (`"bf16"`, `"q4"`, `"q8"`):
+    /// `None` for a packed floating-point tier, which a provider shipping only those tiers cannot name.
+    pub const fn affine_tier_label(quant: Option<Quant>) -> Option<&'static str> {
+        match quant {
+            None | Some(Self::Q4 | Self::Q8) => Some(Self::tier_label(quant)),
+            Some(Self::Nvfp4 | Self::Fp8Rowwise) => None,
+        }
+    }
+
     pub fn from_key(key: &str) -> crate::Result<Self> {
         match key {
             "q4" => Ok(Self::Q4),
@@ -3712,6 +3730,19 @@ mod tests {
     use std::collections::HashSet;
     use std::io::Read;
     use std::sync::{Barrier, Mutex};
+
+    #[test]
+    fn quant_tier_labels_name_the_dense_tier_bf16_and_only_affine_tiers_partially() {
+        assert_eq!(Quant::tier_label(None), "bf16");
+        for quant in [Quant::Q4, Quant::Q8, Quant::Nvfp4, Quant::Fp8Rowwise] {
+            assert_eq!(Quant::tier_label(Some(quant)), quant.key());
+        }
+        assert_eq!(Quant::affine_tier_label(None), Some("bf16"));
+        assert_eq!(Quant::affine_tier_label(Some(Quant::Q4)), Some("q4"));
+        assert_eq!(Quant::affine_tier_label(Some(Quant::Q8)), Some("q8"));
+        assert_eq!(Quant::affine_tier_label(Some(Quant::Nvfp4)), None);
+        assert_eq!(Quant::affine_tier_label(Some(Quant::Fp8Rowwise)), None);
+    }
 
     #[test]
     fn artifact_seal_progress_reports_actual_cold_memo_and_partial_cancel_bytes() {

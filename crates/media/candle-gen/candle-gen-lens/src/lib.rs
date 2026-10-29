@@ -2321,12 +2321,7 @@ pub fn production_calibration_fingerprint(
     provider_id: &str,
     artifact_tier: Option<Quant>,
 ) -> Option<String> {
-    let tier = match artifact_tier {
-        None => "bf16",
-        Some(Quant::Q4) => "q4",
-        Some(Quant::Q8) => "q8",
-        Some(_) => return None,
-    };
+    let tier = Quant::affine_tier_label(artifact_tier)?;
     match (provider_id, artifact_tier) {
         // The one measured Candle/CUDA cell, preserved byte-for-byte at exactly the cell the
         // SC-15800 end-to-end result measured.

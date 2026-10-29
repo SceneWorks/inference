@@ -19,6 +19,7 @@ use candle_gen::quant::{linear_from_weights, QLinear};
 use candle_gen::{Result, Weights};
 
 use crate::nn::rms;
+use candle_gen::attention::repeat_kv;
 
 /// Gemma-2 decoder configuration.
 #[derive(Debug, Clone)]
@@ -185,17 +186,6 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let xc = x.broadcast_mul(&cos)?;
     let xs = rotate_half(x)?.broadcast_mul(&sin)?;
     Ok((xc + xs)?)
-}
-
-/// Repeat KV heads `n_rep×` along the head axis (`[B,nkv,L,D]` → `[B,nkv·n_rep,L,D]`).
-fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        return Ok(x.clone());
-    }
-    let (b, nkv, l, d) = x.dims4()?;
-    Ok(x.unsqueeze(2)?
-        .broadcast_as((b, nkv, n_rep, l, d))?
-        .reshape((b, nkv * n_rep, l, d))?)
 }
 
 struct Attention {

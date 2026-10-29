@@ -174,8 +174,6 @@ pub(crate) fn timestep_embedding(t: &Tensor, dim: usize, dtype: DType) -> Result
 
 #[derive(Debug, Clone)]
 pub(crate) struct EmbedNd {
-    #[allow(unused)]
-    dim: usize,
     theta: usize,
     axes_dim: Vec<usize>,
     #[cfg(test)]
@@ -183,9 +181,8 @@ pub(crate) struct EmbedNd {
 }
 
 impl EmbedNd {
-    pub(crate) fn new(dim: usize, theta: usize, axes_dim: Vec<usize>) -> Self {
+    pub(crate) fn new(theta: usize, axes_dim: Vec<usize>) -> Self {
         Self {
-            dim,
             theta,
             axes_dim,
             #[cfg(test)]
@@ -797,8 +794,7 @@ impl IpFlux {
         };
         let final_layer =
             LastLayer::new(cfg.hidden_size, 1, cfg.in_channels, vb.pp("final_layer"))?;
-        let pe_dim = cfg.hidden_size / cfg.num_heads;
-        let pe_embedder = EmbedNd::new(pe_dim, cfg.theta, cfg.axes_dim.to_vec());
+        let pe_embedder = EmbedNd::new(cfg.theta, cfg.axes_dim.to_vec());
         Ok(Self {
             img_in,
             txt_in,

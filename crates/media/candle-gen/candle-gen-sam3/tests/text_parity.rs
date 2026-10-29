@@ -13,36 +13,9 @@
 
 use std::path::Path;
 
-use candle_gen::candle_core::Tensor;
+use crate::support::cosine;
 use candle_gen::default_device;
 use candle_gen_sam3::{Sam3TextConfig, Sam3TextEncoder, Sam3Tokenizer, Weights};
-
-/// Cosine similarity between two tensors (flattened).
-fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-    let a = a.flatten_all().unwrap();
-    let b = b.flatten_all().unwrap();
-    let dot = (&a * &b)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    let na = (&a * &a)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-        .sqrt();
-    let nb = (&b * &b)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-        .sqrt();
-    dot / (na * nb)
-}
 
 #[test]
 #[ignore = "needs staged facebook/sam3 weights (SAM3_WEIGHTS) + SAM3_TEXT_FIXTURE — sc-6248"]

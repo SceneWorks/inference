@@ -72,39 +72,10 @@ type RopeGeom = (usize, usize, usize, Vec<(usize, usize)>);
 /// legs resident; the small headroom absorbs any incidental extra geometry.
 const ROPE_CACHE_CAP: usize = 4;
 
-/// A tiny bounded, geometry-keyed cache for the per-render RoPE tables (sc-8992 / F-012, sc-11201 /
-/// F-089). Holds up to [`ROPE_CACHE_CAP`] distinct geometries so both true-CFG legs stay resident
-/// across every denoise step instead of evicting each other on every forward. On a miss the value is
-/// built and inserted; on overflow the oldest entry is evicted (FIFO — with two alternating keys and
-/// `cap ≥ 2` no eviction ever happens once both are cached). Hits clone the (Arc-backed) `V`.
-/// `Mutex` (not `RefCell`): the DiT is shared as `Arc<…>` (`Send + Sync`).
-struct RopeCache<K, V> {
-    entries: std::sync::Mutex<Vec<(K, V)>>,
-    cap: usize,
-}
-
-impl<K: PartialEq, V: Clone> RopeCache<K, V> {
-    fn new(cap: usize) -> Self {
-        Self {
-            entries: std::sync::Mutex::new(Vec::new()),
-            cap,
-        }
-    }
-
-    /// Return the cached value for `key`, building + inserting it on a miss.
-    fn get_or_build(&self, key: K, build: impl FnOnce() -> Result<V>) -> Result<V> {
-        let mut guard = candle_gen::lock_recover(&self.entries);
-        if let Some((_, v)) = guard.iter().find(|(k, _)| *k == key) {
-            return Ok(v.clone());
-        }
-        let v = build()?;
-        if guard.len() >= self.cap {
-            guard.remove(0);
-        }
-        guard.push((key, v.clone()));
-        Ok(v)
-    }
-}
+/// The bounded geometry-keyed per-render RoPE cache (sc-8992, sc-11201), held at
+/// [`ROPE_CACHE_CAP`] so both true-CFG legs stay resident — the shared
+/// [`GeometryCache`](candle_gen::rope::GeometryCache) (sc-27286).
+type RopeCache<K, V> = candle_gen::rope::GeometryCache<K, V>;
 
 impl BooguTransformer {
     /// Build from a loaded `transformer/` weight set.
@@ -401,7 +372,7 @@ mod tests {
                 let v = cache
                     .get_or_build(cap, || {
                         builds += 1;
-                        Ok(cap as i32 * 10)
+                        Ok::<_, ()>(cap as i32 * 10)
                     })
                     .unwrap();
                 // Every hit returns exactly what a fresh build would (value keyed on geometry).
@@ -414,30 +385,5 @@ mod tests {
             builds, 2,
             "each CFG geometry built exactly once across all steps"
         );
-    }
-
-    #[test]
-    fn rope_cache_evicts_oldest_beyond_capacity() {
-        // With more distinct geometries than capacity, the oldest is evicted (FIFO) and a re-touch
-        // rebuilds — but the two-geometry CFG case (cap ≥ 2) never reaches this.
-        let cache: RopeCache<usize, i32> = RopeCache::new(2);
-        let builds = std::cell::Cell::new(0usize);
-        let build = |k: usize| {
-            cache
-                .get_or_build(k, || {
-                    builds.set(builds.get() + 1);
-                    Ok(k as i32)
-                })
-                .unwrap()
-        };
-        build(1);
-        build(2);
-        assert_eq!(builds.get(), 2);
-        build(1); // still cached
-        assert_eq!(builds.get(), 2);
-        build(3); // evicts key 1 (oldest)
-        assert_eq!(builds.get(), 3);
-        build(1); // 1 was evicted → rebuild
-        assert_eq!(builds.get(), 4);
     }
 }

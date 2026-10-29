@@ -947,13 +947,7 @@ pub fn production_calibration_fingerprint(
     artifact_tier: Option<Quant>,
 ) -> Option<String> {
     let route = route_token(provider_id)?;
-    let tier = match artifact_tier {
-        None => "bf16",
-        Some(Quant::Q4) => "q4",
-        Some(Quant::Q8) => "q8",
-        // A tier this family does not ship is unnameable rather than collapsed onto a neighbour.
-        _ => return None,
-    };
+    let tier = Quant::affine_tier_label(artifact_tier)?;
     Some(format!(
         "kolors-candle-{route}-{tier}-staged-chatglm-unet-f32-vae-v1"
     ))

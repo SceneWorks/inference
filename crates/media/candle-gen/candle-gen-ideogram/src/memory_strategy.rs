@@ -1049,13 +1049,7 @@ fn production_calibration_fingerprint(provider_id: &str, tier: Option<Quant>) ->
         MODEL_ID_TURBO => "turbo",
         _ => return None,
     };
-    let tier = match tier {
-        None => "bf16",
-        Some(Quant::Q4) => "q4",
-        Some(Quant::Q8) => "q8",
-        // A tier this family does not ship is unnameable rather than collapsed onto a neighbour.
-        Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => return None,
-    };
+    let tier = Quant::affine_tier_label(tier)?;
     Some(format!(
         "ideogram4-candle-request-scoped-staged-residency-v1-{route}-{tier}"
     ))

@@ -20,6 +20,9 @@ const _: fn() = || {
 
 // --- generated modules (do not edit) ---
 
+#[allow(dead_code)]
+mod support;
+
 #[path = "detr_parity.rs"]
 mod detr_parity;
 

@@ -673,10 +673,8 @@ pub struct ZImageTransformer2DModel {
     cap_embedder_linear: QLinear,
     x_embedder: QLinear,
     final_layer: FinalLayer,
-    #[allow(dead_code)]
+    /// Read only by [`Self::device`]; the forward never consumes it.
     x_pad_token: Tensor,
-    #[allow(dead_code)]
-    cap_pad_token: Tensor,
     noise_refiner: Vec<ZImageTransformerBlock>,
     context_refiner: Vec<ZImageTransformerBlock>,
     layers: TransformerLayers,
@@ -776,7 +774,8 @@ impl ZImageTransformer2DModel {
             FinalLayer::new(cfg.dim, out_channels, vb.pp("all_final_layer").pp("2-1"))?;
 
         let x_pad_token = vb.get((1, cfg.dim), "x_pad_token")?;
-        let cap_pad_token = vb.get((1, cfg.dim), "cap_pad_token")?;
+        // Never read by the forward (sc-27384): required on load, not kept resident.
+        vb.get((1, cfg.dim), "cap_pad_token")?;
 
         let mut noise_refiner = Vec::with_capacity(cfg.n_refiner_layers);
         for i in 0..cfg.n_refiner_layers {
@@ -829,7 +828,6 @@ impl ZImageTransformer2DModel {
             x_embedder,
             final_layer,
             x_pad_token,
-            cap_pad_token,
             noise_refiner,
             context_refiner,
             layers,

@@ -74,18 +74,9 @@ pub(crate) fn rms_scale_diff(x: &Tensor, weight_f32: &Tensor, eps: f64) -> Resul
     y.broadcast_mul(weight_f32)?.to_dtype(dt)
 }
 
-/// Repeat each kv head `groups` times consecutively (`[b,s,hkv,hd] → [b,s,hkv·groups,hd]`) — the
-/// composable `repeat_interleave` matching the inference block's `repeat_kv` (reference `enable_gqa`).
-pub(crate) fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let (b, s, hkv, hd) = x.dims4()?;
-    x.unsqueeze(3)?
-        .expand((b, s, hkv, groups, hd))?
-        .contiguous()?
-        .reshape((b, s, hkv * groups, hd))
-}
+/// The sequence-major GQA kv broadcast (`[b,s,hkv,hd] → [b,s,hkv·groups,hd]`) matching the inference
+/// block's (reference `enable_gqa`); shared with [`crate::control`] (sc-27283).
+pub(crate) use candle_gen::attention::repeat_kv_bshd as repeat_kv;
 
 /// The attention-scores element budget the Krea control **activation-chunking rung** (sc-11745) uses
 /// once the fit-gate engages it ([`Krea2ControlPaths::chunk_attention`](crate::control_provider)). At
@@ -1045,7 +1036,9 @@ mod tests {
         let builds = Cell::new(0usize);
         let build = || {
             builds.set(builds.get() + 1);
-            Ok(RopeTables::build_t2i(key.0, key.1, key.2, axes, 1000.0, &dev)?.joint())
+            Ok::<_, candle_gen::candle_core::Error>(
+                RopeTables::build_t2i(key.0, key.1, key.2, axes, 1000.0, &dev)?.joint(),
+            )
         };
 
         let first = cache.get_or_build(key, build)?;

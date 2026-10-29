@@ -609,13 +609,7 @@ const fn policy_label(policy: OffloadPolicy) -> &'static str {
 /// every selector the registry may hand it; [`production_calibration_fingerprint`] refuses the
 /// tiers this family does not ship rather than relying on this label to be partial.
 const fn tier_label(quant: Option<Quant>) -> &'static str {
-    match quant {
-        None => "bf16",
-        Some(Quant::Q4) => "q4",
-        Some(Quant::Q8) => "q8",
-        Some(Quant::Nvfp4) => "nvfp4",
-        Some(Quant::Fp8Rowwise) => "fp8r",
-    }
+    Quant::tier_label(quant)
 }
 
 /// **The production calibration TABLE, keyed on `(tier, offload_policy)` — not the binding.**
@@ -926,27 +920,13 @@ fn registered_tier(
 }
 
 fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<()> {
-    let edge = edge.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires a tile-edge cap"
-        ))
-    })?;
-    let overlap = overlap.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires a tile overlap"
-        ))
-    })?;
-    if !DECODE_TILE_EDGES.contains(&edge) {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: decode tile-edge cap {edge} is outside the production domain {DECODE_TILE_EDGES:?}"
-        )));
-    }
-    if overlap != DECODE_OVERLAP {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: decode overlap {overlap} is not the production overlap {DECODE_OVERLAP}"
-        )));
-    }
-    Ok(())
+    gen_core::validate_bounded_decode_params(
+        MODEL_ID,
+        DECODE_TILE_EDGES,
+        DECODE_OVERLAP,
+        edge,
+        overlap,
+    )
 }
 
 pub(crate) fn safety_check(
