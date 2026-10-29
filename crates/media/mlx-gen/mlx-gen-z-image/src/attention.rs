@@ -9,11 +9,9 @@
 //! mask to wire (see `transformer.rs`).
 
 use mlx_rs::{
-    error::Exception,
     fast::{rms_norm, scaled_dot_product_attention},
-    ops::{add, multiply, split, stack_axis, subtract},
+    ops::{split, stack_axis},
     transforms::checkpoint,
-    transforms::compile::{compile, compile_retained},
     Array, Dtype,
 };
 
@@ -21,42 +19,6 @@ use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
-
-const SITE_ROPE_ROTATE: &str = "z_image::attention::rope_rotate";
-
-fn rope_rotate_impl(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
-    let (xr, xi, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
-    let out_r = subtract(&multiply(xr, cos)?, &multiply(xi, sin)?)?;
-    let out_i = add(&multiply(xr, sin)?, &multiply(xi, cos)?)?;
-    Ok(vec![out_r, out_i])
-}
-
-thread_local! {
-    static RETAINED_ROPE_ROTATE: std::cell::RefCell<Option<mlx_gen::nn::RetainedSlice>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn retained_rope_rotate(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
-    mlx_gen::nn::prepare_retained_compilation_thread();
-    RETAINED_ROPE_ROTATE.with(|slot| {
-        slot.borrow_mut()
-            .get_or_insert_with(|| {
-                mlx_gen::nn::RetainedSlice::new(compile_retained(rope_rotate_impl, true))
-            })
-            .call(SITE_ROPE_ROTATE, args)
-    })
-}
-
-/// Exercise this module's production retained handle once for the release memory audit.
-#[doc(hidden)]
-pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
-    let args = [input.clone(), input.clone(), input.clone(), input.clone()];
-    let outputs = retained_rope_rotate(&args)?;
-    mlx_rs::transforms::eval(outputs.iter())?;
-    drop(outputs);
-    drop(args);
-    Ok(())
-}
 
 #[derive(Clone)]
 pub struct ZImageAttention {
@@ -259,37 +221,11 @@ impl ZImageAttention {
         let fp = split(&fc5, 2, 4)?;
         let cos = fp[0].reshape(&[1, s, 1, half])?;
         let sin = fp[1].reshape(&[1, s, 1, half])?;
-        let (out_r, out_i) = rope_rotate(&xr, &xi, &cos, &sin)?;
+        // The complex rotation is core's fused `rope_rotate` glue (sc-27453): this crate's private
+        // copy added `xr·sin + xi·cos` in the other order, which is bit-identical.
+        let (out_r, out_i) = mlx_gen::nn::rope_rotate(&xr, &xi, &cos, &sin)?;
         Ok(stack_axis(&[out_r, out_i], 4)?.reshape(&[b, s, h, hd])?)
     }
-}
-
-/// The complex RoPE rotation `(xr + xi·i)·(cos + sin·i)` → `(out_r, out_i)`. Fused into one kernel
-/// when the sc-2963 glue toggle is on (vs 6 eager ops, applied to q and k every block);
-/// dtype-preserving, bit-identical to the eager form.
-fn rope_rotate(xr: &Array, xi: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    let args = [xr.clone(), xi.clone(), cos.clone(), sin.clone()];
-    let out = if crate::compile_glue() {
-        if mlx_gen::nn::retained_compilation_requested() {
-            retained_rope_rotate(&args)?
-        } else {
-            mlx_gen::diagnostics::record_compile(
-                SITE_ROPE_ROTATE,
-                mlx_gen::diagnostics::CompileDisposition::OneShot,
-            );
-            compile(rope_rotate_impl, true)(&args)?
-        }
-    } else {
-        mlx_gen::diagnostics::record_fallback(SITE_ROPE_ROTATE, "compiled_glue_disabled");
-        rope_rotate_impl(&args)?
-    };
-    let [out_r, out_i]: [Array; 2] = out.try_into().map_err(|v: Vec<Array>| {
-        Error::Msg(format!(
-            "z-image rope_rotate: expected 2 rotated outputs, got {}",
-            v.len()
-        ))
-    })?;
-    Ok((out_r, out_i))
 }
 
 pub(crate) const ADAPTER_TARGET_PATHS: &[&str] = &["to_q", "to_k", "to_v", "to_out.0"];

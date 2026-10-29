@@ -11,18 +11,14 @@
 //!   cargo test -p mlx-gen-pid --release --test integration e2e_real_weights:: -- --ignored --nocapture
 //! ```
 
+use mlx_gen::testing::max_abs;
 use mlx_gen::weights::Weights;
 use mlx_gen_pid::{Gemma2, Gemma2Config, PidConfig, PidNet, Sampler, SamplerConfig};
-use mlx_rs::ops::{abs, max};
 use mlx_rs::{Array, Dtype};
 
 fn ckpt_path() -> String {
     std::env::var("PID_QWEN_SAFETENSORS")
         .unwrap_or_else(|_| "tools/golden/pid/qwenimage_2kto4k.safetensors".to_string())
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
 }
 
 /// bf16 dummy of `shape` (the reference runs the student in bf16).

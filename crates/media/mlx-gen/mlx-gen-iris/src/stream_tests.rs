@@ -16,8 +16,7 @@ use std::rc::Rc;
 
 use mlx_gen::gen_core::iris::{IrisConfig, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{
-    GenerationMemory, LoadShape, MemoryNumericTier, MemorySelection, MemoryStrategy,
-    TransformerComponent,
+    GenerationMemory, LoadShape, MemorySelection, MemoryStrategy, TransformerComponent,
 };
 use mlx_gen::ios_pricing::{IosPhase, IosPricingRequest};
 use mlx_gen::ios_quantum::{
@@ -384,11 +383,7 @@ fn selection(
     component: Option<TransformerComponent>,
 ) -> (MemorySelection, GenerationMemory) {
     let contract = crate::memory_strategy::memory_strategy_contract(provider, spec).unwrap();
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let tier = mlx_gen::request_scope::loaded_tier(spec);
     let space = contract.selection_space(strategy, tier, false).unwrap();
     let chosen = *space
         .iter()

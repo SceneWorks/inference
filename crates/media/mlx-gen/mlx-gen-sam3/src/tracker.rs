@@ -26,6 +26,7 @@ use mlx_rs::ops::{
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::array::slice_range;
 use mlx_gen::nn::{conv2d, conv2d_general, gelu_exact, linear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -39,12 +40,6 @@ use crate::vision::{quantize_backbone_rc, Backbone, FpnLayer};
 /// Take a single index `i` along `axis`, dropping that axis.
 fn take1(x: &Array, i: i32, axis: i32) -> Result<Array> {
     Ok(x.take_axis(Array::from_int(i), axis)?)
-}
-
-/// Slice `[start, end)` along `axis` (keeps the axis).
-fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[idx.len() as i32]), axis)?)
 }
 
 // --- fixed facebook/sam3 tracker hyperparameters (Sam3TrackerVideoMaskDecoderConfig) -------------
@@ -507,7 +502,7 @@ fn dynamic_multimask_via_stability(masks: &Array, ious: &Array) -> Result<(Array
     // best multimask candidate (tokens 1..) by predicted IoU.
     let best = 1 + argmax(&iou_v[1..]) as i32;
     // stability score of the single mask (token 0).
-    let single = slice_axis(masks, 1, 0, 1)?;
+    let single = slice_range(masks, 1, 0, 1)?;
     let sv = single
         .reshape(&[-1])?
         .as_dtype(Dtype::Float32)?
@@ -517,11 +512,11 @@ fn dynamic_multimask_via_stability(masks: &Array, ious: &Array) -> Result<(Array
     let area_u = sv.iter().filter(|&&x| x > -STABILITY_DELTA).count() as f32;
     let stability = if area_u > 0.0 { area_i / area_u } else { 1.0 };
     if stability >= STABILITY_THRESH {
-        Ok((single, slice_axis(ious, 1, 0, 1)?))
+        Ok((single, slice_range(ious, 1, 0, 1)?))
     } else {
         Ok((
-            slice_axis(masks, 1, best, best + 1)?,
-            slice_axis(ious, 1, best, best + 1)?,
+            slice_range(masks, 1, best, best + 1)?,
+            slice_range(ious, 1, best, best + 1)?,
         ))
     }
 }
@@ -616,7 +611,7 @@ impl MaskDecoder {
 
         let (hs, src) = self.transformer.forward(&img, &img_pe, &tokens)?;
         let iou_token_out = take1(&hs, 1, 1)?.reshape(&[1, HIDDEN])?;
-        let mask_tokens_out = slice_axis(&hs, 1, 2, 2 + NUM_MASK_TOKENS)?; // [1, 4, 256]
+        let mask_tokens_out = slice_range(&hs, 1, 2, 2 + NUM_MASK_TOKENS)?; // [1, 4, 256]
         let obj_score = self
             .obj_score_head
             .forward(&take1(&hs, 0, 1)?.reshape(&[1, HIDDEN])?)?; // [1, 1]
@@ -651,8 +646,8 @@ impl MaskDecoder {
 
         let (masks, ious) = if multimask_output {
             (
-                slice_axis(&masks, 1, 1, NUM_MASK_TOKENS)?,
-                slice_axis(&ious, 1, 1, NUM_MASK_TOKENS)?,
+                slice_range(&masks, 1, 1, NUM_MASK_TOKENS)?,
+                slice_range(&ious, 1, 1, NUM_MASK_TOKENS)?,
             )
         } else {
             // single-mask request (no-prompt video frames): dynamic_multimask_via_stability keeps
@@ -1016,7 +1011,7 @@ fn apply_rope_2d(
     let q_embed = add(&multiply(q, cos)?, &multiply(&rotate_pairwise(q)?, sin)?)?;
     let seq_k = k.shape()[2];
     let n_rot = seq_k - num_k_exclude;
-    let k_rot = slice_axis(k, 2, 0, n_rot)?;
+    let k_rot = slice_range(k, 2, 0, n_rot)?;
     let q_seq = q.shape()[2];
     let (cos_k, sin_k) = if repeat_freqs_k && n_rot != q_seq {
         // `repeat_interleave` builds `rf·q_seq` frequency rows; if `n_rot` isn't an exact multiple of
@@ -1041,7 +1036,7 @@ fn apply_rope_2d(
         &multiply(&rotate_pairwise(&k_rot)?, &sin_k)?,
     )?;
     let k_out = if num_k_exclude > 0 {
-        let k_pass = slice_axis(k, 2, n_rot, seq_k)?;
+        let k_pass = slice_range(k, 2, n_rot, seq_k)?;
         concatenate_axis(&[&k_embed, &k_pass], 2)?
     } else {
         k_embed

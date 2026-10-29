@@ -49,7 +49,7 @@ tempfile = { workspace = true }
 # The trainer e2e/conformance gates (tests/trainer_*.rs) write tiny PNG datasets and drive the gen-core
 # Trainer contract harness. Both are `#[ignore]` + `cfg(feature = "cuda")` (need the real Lens weights +
 # a GPU); the testkit lib name is `gen_core_testkit`.
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 # Shared test-support helpers (`candle_gen::testkit`: `sha256_file`, `save_rgb8_png`; sc-27389).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }

@@ -28,8 +28,7 @@ use std::path::PathBuf;
 
 use mlx_gen::gen_core::iris::restoration::{plan, Dims, RestorationOptions, TileGeometry};
 use mlx_gen::gen_core::{
-    GenerationMemory, LoadShape, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryStrategy,
-    TransformerComponent,
+    GenerationMemory, LoadShape, MemoryGeometry, MemoryMode, MemoryStrategy, TransformerComponent,
 };
 use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosPricingRequest};
 use mlx_gen::{LoadSpec, Quant, WeightsSource};
@@ -74,11 +73,7 @@ fn configure(
     // prices is emulated, so the dense release's own artifact checks do not apply.
     let contract =
         crate::memory_strategy::weights_free_memory_strategy_contract(provider, spec).unwrap();
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let tier = mlx_gen::request_scope::loaded_tier(spec);
     let space = contract.selection_space(strategy, tier, false).unwrap();
     let chosen = *space
         .iter()

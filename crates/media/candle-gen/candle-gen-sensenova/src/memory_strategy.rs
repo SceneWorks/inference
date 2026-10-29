@@ -941,7 +941,7 @@ pub(crate) fn safety_check(
     context: &MemoryRunContext,
     quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_result(validate_context(provider_id, contract, context, quant))
+    MemorySafetyDecision::from_validation(validate_context(provider_id, contract, context, quant))
 }
 
 pub(crate) fn request_scope(

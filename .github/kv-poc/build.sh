@@ -175,7 +175,7 @@ stage_binaries() {
   local bin_args=""
   for b in $BINS; do bin_args="$bin_args --bin $b"; done
   # shellcheck disable=SC2086  # deliberate word splitting of the --bin list
-  (cd "$INF" && rustc --version && cargo --version && cargo build --locked --release -p mlx-llm $bin_args)
+  (cd "$INF" && rustc --version && cargo --version && cargo build --locked --release -p mlx-llm --features campaign $bin_args)
   verify_tree "$INF" "$INFERENCE_URL" "$INFERENCE_SHA"
 
   mkdir -p "$F/policies" "$F/inputs"

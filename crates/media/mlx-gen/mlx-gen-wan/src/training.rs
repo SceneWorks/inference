@@ -58,11 +58,12 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
+use mlx_gen::train::vocab::sample_timestep;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     gen_core, CancelFlag, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
-    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport,
+    TrainingRequest, WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -467,10 +468,23 @@ impl Trainer for WanMoeTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -482,6 +496,7 @@ impl WanMoeTrainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         self.validate(req)?;
         let id = self.descriptor.id;
@@ -931,11 +946,18 @@ impl WanMoeTrainer {
                             prompt: prompt.clone(),
                             image,
                         }),
-                        Err(e) => eprintln!(
-                            "[sc-5637] {id} preview sample failed at step {step} (prompt {}): {e} \
-                             — skipping this preview, training continues",
-                            i + 1
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[sc-5637] {id} preview sample failed at step {step} (prompt {}): \
+                                 {e} — skipping this preview, training continues",
+                                i + 1
+                            );
+                            warnings.push(gen_core::train::preview_sample_failed(
+                                step,
+                                i as u32 + 1,
+                                &e,
+                            ));
+                        }
                     }
                 }
             }
@@ -1465,31 +1487,8 @@ fn sample_band_timestep(
     band: (f32, f32),
     seed: u64,
 ) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let ttype = timestep_type.trim().to_ascii_lowercase().replace('-', "_");
-    let t_unit = match ttype.as_str() {
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            let k2 = random::key(seed ^ 0x9E37_79B9)?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
-    };
-    let bias = timestep_bias
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '-'], "_");
-    let t_unit = match bias.as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t_unit.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t_unit * t_unit,
-        _ => t_unit,
-    };
-    let t_unit = t_unit.clamp(1e-3, 1.0 - 1e-3);
+    // The shared flow-match sampler (sc-27324), then this family's band remap.
+    let t_unit = sample_timestep(timestep_type, timestep_bias, seed)?;
     Ok(band.0 + t_unit * (band.1 - band.0))
 }
 
@@ -1653,13 +1652,7 @@ fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// One item's cached latents, one per bucket edge in `edges` order (the item-major layout

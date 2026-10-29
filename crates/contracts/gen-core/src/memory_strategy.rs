@@ -3856,6 +3856,23 @@ pub fn standard_memory_behavior_context(
     })
 }
 
+/// Sum resident-byte `values` for a memory contract, refusing `u64` overflow with a typed
+/// [`Error::Msg`] naming the `owner` (a provider id) and the `label` of the component being priced.
+///
+/// One definition for the per-provider `checked_sum` copies (sc-27341): every byte total a
+/// contract publishes must fail closed rather than wrap.
+pub fn checked_byte_total(
+    owner: &str,
+    label: &str,
+    values: impl IntoIterator<Item = u64>,
+) -> Result<u64> {
+    values.into_iter().try_fold(0_u64, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or_else(|| Error::Msg(format!("{owner}: {label} byte total overflows u64")))
+    })
+}
+
 /// Defense-in-depth result. It can accept or reject; it cannot replace the worker's selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemorySafetyDecision {
@@ -3864,14 +3881,20 @@ pub enum MemorySafetyDecision {
 }
 
 impl MemorySafetyDecision {
-    /// `Ok(())` accepts; an error rejects with the error's display text as the reason (sc-27254:
-    /// the shared form of the providers' `match … { Ok(()) => Accept, Err(e) => Reject { .. } }`).
-    pub fn from_result(result: Result<()>) -> Self {
+    /// A rejection whose reason is `error`'s rendering — the decision a provider's fallible
+    /// validation step produces when it fails (sc-27322).
+    pub fn rejected(error: impl std::fmt::Display) -> Self {
+        Self::Reject {
+            reason: error.to_string(),
+        }
+    }
+
+    /// The decision a provider's whole fallible validation produces: accept on `Ok`, reject with
+    /// the error's rendering otherwise. The inverse of [`admit_memory_safety`] (sc-27322).
+    pub fn from_validation<E: std::fmt::Display>(result: std::result::Result<(), E>) -> Self {
         match result {
             Ok(()) => Self::Accept,
-            Err(error) => Self::Reject {
-                reason: error.to_string(),
-            },
+            Err(error) => Self::rejected(error),
         }
     }
 }
@@ -3902,6 +3925,66 @@ pub fn validate_bounded_decode_params(
         )));
     }
     Ok(())
+}
+
+/// The one place a provider's refused safety decision becomes a typed error.
+///
+/// [`MemorySafetyDecision::Reject`] carries an already-rendered reason, so it is wrapped in
+/// [`Error::Unsupported`] exactly once, here, for every backend's request-scope admission
+/// (sc-27257, sc-27341).
+pub fn admit_memory_safety(decision: MemorySafetyDecision) -> Result<()> {
+    match decision {
+        MemorySafetyDecision::Accept => Ok(()),
+        MemorySafetyDecision::Reject { reason } => Err(Error::Unsupported(reason)),
+    }
+}
+
+/// Forward the five pure pass-through [`MemoryRequestScope`] hooks — `enter_phase`, `leave_phase`,
+/// `configure_decode`, `configure_attention` and `materialize_transformer_window` — to a wrapped
+/// scope field (sc-27424, sc-27341).
+///
+/// Invoke it inside an `impl MemoryRequestScope for Wrapper { .. }` block, naming the field that
+/// holds the backend's shared request-scope core (or any other `MemoryRequestScope`); the trait must
+/// be in scope at the call site, which implementing it by name already guarantees. The wrapper still
+/// writes `configure_request` and `finish` itself, since those are where wrappers add their checks.
+///
+/// It deliberately does **not** forward `configure_admitted_request`. That method has a refusing
+/// default, and forwarding it blindly would let the immutable admitted path bypass whatever the
+/// wrapper's `configure_request` checks (an evidence revision, an overlay or source receipt). A
+/// wrapper that supports the admitted path opts in by writing it.
+#[macro_export]
+macro_rules! delegate_memory_request_scope {
+    ($field:ident) => {
+        fn enter_phase(&mut self, phase: $crate::MemoryPhase) -> $crate::Result<()> {
+            self.$field.enter_phase(phase)
+        }
+
+        fn leave_phase(&mut self, phase: $crate::MemoryPhase) -> $crate::Result<()> {
+            self.$field.leave_phase(phase)
+        }
+
+        fn configure_decode(
+            &mut self,
+            tile_edge: u32,
+            overlap: u32,
+            geometry: $crate::MemoryGeometry,
+        ) -> $crate::Result<()> {
+            self.$field.configure_decode(tile_edge, overlap, geometry)
+        }
+
+        fn configure_attention(&mut self, chunk_size: u32) -> $crate::Result<()> {
+            self.$field.configure_attention(chunk_size)
+        }
+
+        fn materialize_transformer_window(
+            &mut self,
+            first_block: u32,
+            block_count: u32,
+        ) -> $crate::Result<()> {
+            self.$field
+                .materialize_transformer_window(first_block, block_count)
+        }
+    };
 }
 
 /// Terminal cleanup reason supplied to a request scope.
@@ -4595,20 +4678,6 @@ pub struct MemoryRejection {
 mod tests {
     use super::*;
     use crate::{LoadSpec, WeightsSource};
-
-    #[test]
-    fn safety_decision_from_result_accepts_ok_and_rejects_with_the_error_text() {
-        assert_eq!(
-            MemorySafetyDecision::from_result(Ok(())),
-            MemorySafetyDecision::Accept
-        );
-        let error = Error::Unsupported("route refused".into());
-        let reason = error.to_string();
-        assert_eq!(
-            MemorySafetyDecision::from_result(Err(error)),
-            MemorySafetyDecision::Reject { reason }
-        );
-    }
 
     #[test]
     fn bounded_decode_params_require_a_published_edge_and_the_exact_overlap() {
@@ -7708,5 +7777,15 @@ mod tests {
         slid.mode = "replacemen".to_owned();
         slid.carrier_shape = format!("t{}", base.carrier_shape);
         assert_ne!(scail2, evidence.evidence_revision(&slid).unwrap());
+    }
+
+    #[test]
+    fn checked_byte_total_sums_and_refuses_overflow() {
+        assert_eq!(checked_byte_total("p", "vae", [1, 2, 3]).unwrap(), 6);
+        assert_eq!(checked_byte_total("p", "vae", []).unwrap(), 0);
+        match checked_byte_total("p", "vae", [u64::MAX, 1]) {
+            Err(Error::Msg(message)) => assert_eq!(message, "p: vae byte total overflows u64"),
+            other => panic!("expected a typed overflow, got {other:?}"),
+        }
     }
 }

@@ -42,9 +42,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
-use mlx_rs::ops::{abs, max, subtract};
+use mlx_rs::ops::subtract;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::max_abs;
 use mlx_gen::weights::Weights;
 use mlx_gen_mochi::{
     load_vae_decoder, MochiVaeConfig, MochiVaeDecoder, DEFAULT_DECODE_CHUNK_FRAMES,
@@ -123,10 +124,6 @@ fn rnd(shape: &[i32], seed: u64) -> Array {
         })
         .collect();
     Array::from_slice(&data, shape)
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
 }
 
 /// `F` output frames ⇒ `T_lat` latent frames (`F = (T_lat − 1)·6 + 1`).

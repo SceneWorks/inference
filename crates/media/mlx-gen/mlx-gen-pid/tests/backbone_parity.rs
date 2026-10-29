@@ -9,19 +9,12 @@
 //! it). The fixture's non-square grid (H=8, W=12) + NTK ref grid 8×8 ≠ sampled 4×6 exercise the
 //! axis order and per-axis theta scaling that a port most often gets wrong.
 
+use mlx_gen::testing::{max_abs, max_abs_diff};
 use mlx_gen::weights::Weights;
 use mlx_gen_pid::backbone::{image_rope_table, sincos_2d_pos, text_rope_table};
 use mlx_gen_pid::{ConvPadding, PidConfig, PixDiT};
-use mlx_rs::ops::{abs, max, split, subtract};
+use mlx_rs::ops::split;
 use mlx_rs::Array;
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    max_abs(&subtract(a, b).unwrap())
-}
 
 /// The tiny config baked into `dump_pid_backbone.py`.
 fn tiny_cfg() -> PidConfig {

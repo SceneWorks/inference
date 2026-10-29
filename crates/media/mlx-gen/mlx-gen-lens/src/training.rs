@@ -63,9 +63,6 @@ use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
-use mlx_gen::train::flow::{
-    sample_unit_timestep as sample_sigma, validate_flow_match_request, validate_shared_floors,
-};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -77,11 +74,12 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::tae::TinyDecoderSpec;
+use mlx_gen::train::vocab::{sample_timestep, validate_common_request};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Error, LoadSpec, Modality, NetworkType, Precision, Quant, Result, TrainOptimizer, Trainer,
-    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport,
+    TrainingRequest, WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -259,12 +257,12 @@ mlx_gen::register_trainer! {
 /// `gradient_checkpointing` is now a supported toggle (sc-5170) — the checkpointed DiT forward + the
 /// fail-fast OOM preflight guard are wired in [`LensTrainer::train_impl`].
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    validate_flow_match_request(req, "lens trainer")
+    validate_common_request("lens trainer", req)
 }
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    validate_shared_floors(descriptor, req)?;
+    mlx_gen::train::vocab::validate_shared_floors(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }
@@ -294,10 +292,23 @@ impl Trainer for LensTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -308,6 +319,7 @@ impl LensTrainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         validate_request(req)?;
         let cfg = &req.config;
@@ -700,11 +712,18 @@ impl LensTrainer {
                             prompt: prompt.clone(),
                             image,
                         }),
-                        Err(e) => eprintln!(
-                            "[sc-5637] {MODEL_ID_BASE} preview sample failed at step {step} \
-                             (prompt {}): {e} — skipping this preview, training continues",
-                            i + 1
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[sc-5637] {MODEL_ID_BASE} preview sample failed at step {step} \
+                                 (prompt {}): {e} — skipping this preview, training continues",
+                                i + 1
+                            );
+                            warnings.push(gen_core::train::preview_sample_failed(
+                                step,
+                                i as u32 + 1,
+                                &e,
+                            ));
+                        }
                     }
                 }
             }
@@ -911,13 +930,7 @@ fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// Encode a center-cropped square image into a Lens training latent `[1, latent·latent, 128]` — the
@@ -1279,7 +1292,7 @@ fn run_train_step(
     let sample = step_sample(perceptual, step, schedule);
     let entry = sample.entry;
     let (x0, features, mask, latent, mask_weight) = &cache[entry];
-    let mut t = sample_sigma(
+    let mut t = sample_timestep(
         &cfg.timestep_type,
         &cfg.timestep_bias,
         cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
@@ -2405,8 +2418,8 @@ mod tests {
     fn sample_sigma_is_deterministic_and_in_range() {
         for kind in ["sigmoid", "linear", "weighted"] {
             for bias in ["balanced", "high", "low"] {
-                let a = sample_sigma(kind, bias, 42).unwrap();
-                let b = sample_sigma(kind, bias, 42).unwrap();
+                let a = sample_timestep(kind, bias, 42).unwrap();
+                let b = sample_timestep(kind, bias, 42).unwrap();
                 assert_eq!(a, b, "{kind}/{bias} must be deterministic in seed");
                 assert!(
                     (1e-3..=1.0 - 1e-3).contains(&a),
@@ -2416,8 +2429,8 @@ mod tests {
         }
         // high-noise bias (√t) lifts the value vs low-noise bias (t²) for the same draw.
         assert!(
-            sample_sigma("sigmoid", "high", 7).unwrap()
-                > sample_sigma("sigmoid", "low", 7).unwrap()
+            sample_timestep("sigmoid", "high", 7).unwrap()
+                > sample_timestep("sigmoid", "low", 7).unwrap()
         );
     }
 }
@@ -2706,7 +2719,7 @@ mod depth_anchoring_tests {
             aux_driver(path_with(window), &cache, &schedule, 1, &Default::default()).unwrap();
         step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, false);
         let (depth, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 2, false);
-        let raw = sample_sigma(
+        let raw = sample_timestep(
             &cfg.timestep_type,
             &cfg.timestep_bias,
             cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(2),
@@ -2822,7 +2835,7 @@ mod depth_anchoring_tests {
             // Recompute the step against the SCHEDULED entry's latent and reference.
             let k = (n - 1) as usize;
             let (item, entry) = (schedule.sample(k).0, schedule.cache_index(k));
-            let raw = sample_sigma(
+            let raw = sample_timestep(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
                 cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(n as u64),
@@ -2895,7 +2908,7 @@ mod depth_anchoring_tests {
         let (off, g_off) = step(&mut f, &off_cfg, &cache, &schedule, None, 1, false);
         assert_eq!(off.aux, None);
         let (x0, feats, mask, g, _) = &cache[0];
-        let t = sample_sigma(
+        let t = sample_timestep(
             &off_cfg.timestep_type,
             &off_cfg.timestep_bias,
             off_cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),

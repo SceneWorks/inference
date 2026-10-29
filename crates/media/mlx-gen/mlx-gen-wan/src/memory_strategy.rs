@@ -44,13 +44,7 @@ fn active_floors(quant: Option<Quant>) -> &'static [ComponentPrecisionFloor] {
 }
 
 fn checked_sum(label: &str, values: impl IntoIterator<Item = u64>) -> gen_core::Result<u64> {
-    values.into_iter().try_fold(0_u64, |total, value| {
-        total.checked_add(value).ok_or_else(|| {
-            gen_core::Error::Msg(format!(
-                "{MODEL_ID}: {label} resident byte total overflows u64"
-            ))
-        })
-    })
+    gen_core::checked_byte_total(MODEL_ID, label, values)
 }
 
 fn tensor_elements(component: &str, tensor: &SafetensorsTensorHeader) -> gen_core::Result<u64> {
@@ -1008,9 +1002,7 @@ pub(crate) fn registered_safety_check(
 ) -> MemorySafetyDecision {
     match registered_tier(spec, contract) {
         Ok(tier) => safety_check(contract, tier, context),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 
@@ -1127,36 +1119,7 @@ impl MemoryRequestScope for WanMemoryRequestScope {
         Self::validate_request(request)?;
         self.inner.configure_request(request)
     }
-
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.enter_phase(phase)
-    }
-
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.leave_phase(phase)
-    }
-
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        geometry: gen_core::MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.inner.configure_decode(tile_edge, overlap, geometry)
-    }
-
-    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
-        self.inner.configure_attention(chunk_size)
-    }
-
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> gen_core::Result<()> {
-        self.inner
-            .materialize_transformer_window(first_block, block_count)
-    }
+    mlx_gen::gen_core::delegate_memory_request_scope!(inner);
 
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         self.inner.finish(outcome)
@@ -1169,21 +1132,23 @@ fn begin_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, loaded_tier, context) {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        MODEL_ID,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        WanModelConfig::wan22_ti2v_5b().num_layers,
-        |_use_pid, edge, overlap| validate_decode(Some(edge), Some(overlap)),
+    let inner = mlx_gen::request_scope::MlxRequestScopeCore::begin(
+        safety_check(contract, loaded_tier, context),
+        cleanup,
+        move || {
+            let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                MODEL_ID,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                WanModelConfig::wan22_ti2v_5b().num_layers,
+                |_use_pid, edge, overlap| validate_decode(Some(edge), Some(overlap)),
+            )?;
+            config.default_frames = calibrated_default_frames()?;
+            Ok(config)
+        },
     )?;
-    config.default_frames = calibrated_default_frames()?;
-    Ok(Some(Box::new(WanMemoryRequestScope {
-        inner: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    })))
+    Ok(Some(Box::new(WanMemoryRequestScope { inner })))
 }
 
 pub(crate) fn begin_request(

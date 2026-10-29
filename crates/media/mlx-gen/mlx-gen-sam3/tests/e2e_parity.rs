@@ -7,27 +7,10 @@
 //!   SAM3_E2E_FIXTURE=scripts/spikes/sam3_oracle/e2e_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration e2e_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::iou;
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::Sam3ImageSegmenter;
-use mlx_rs::ops::{multiply, sum};
 use mlx_rs::Array;
-
-/// IoU of two binary `[h, w]` masks (uint8 0/1).
-fn iou(a: &Array, b: &Array) -> f32 {
-    let af = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-    let bf = b.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-    let inter = sum(multiply(&af, &bf).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let sa = sum(&af, None).unwrap().item::<f32>();
-    let sb = sum(&bf, None).unwrap().item::<f32>();
-    let union = sa + sb - inter;
-    if union <= 0.0 {
-        1.0
-    } else {
-        inter / union
-    }
-}
 
 #[test]
 #[ignore = "needs SAM3_WEIGHTS + SAM3_E2E_FIXTURE"]

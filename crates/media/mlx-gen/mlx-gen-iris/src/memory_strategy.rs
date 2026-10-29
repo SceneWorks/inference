@@ -62,8 +62,8 @@ use mlx_gen::gen_core::iris::{GenerationResources, IrisConfig, IrisTask};
 use mlx_gen::gen_core::{
     self, adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError, LoadShape,
     MemoryArchitectureFacts, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
-    MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency,
-    MemoryContractSurfaceSpec, MemoryContractSurfaceTier, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind, MemoryContractSurfaceSpec,
+    MemoryContractSurfaceTier, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Precision, ResidentRequestMemory,
@@ -180,17 +180,6 @@ pub fn memory_mode(task: IrisTask) -> MemoryMode {
         IrisTask::Generation => MemoryMode::TextToImage,
         IrisTask::Depth => MemoryMode::Other(DEPTH_MEMORY_MODE.to_owned()),
         IrisTask::Restoration => MemoryMode::Other(RESTORE_MEMORY_MODE.to_owned()),
-    }
-}
-
-/// The numeric tier a spec loads: the precision and the affine tier it names (only generation
-/// accepts one, and it packs the text tower and the backbone at that same width — sc-26266). No
-/// component is resident above the selected width.
-fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
     }
 }
 
@@ -880,17 +869,12 @@ fn adapter_overlay_components(
 /// Record one adapter overlay, skipping a zero: the shared validator refuses a declared component
 /// with zero bytes.
 fn push_overlay(into: &mut Vec<MemoryResidentComponent>, id: &str, resident_bytes: u64) {
-    if resident_bytes == 0 {
-        return;
-    }
-    into.push(MemoryResidentComponent {
-        id: id.to_owned(),
-        kind: MemoryComponentKind::AdapterStack,
+    mlx_gen::request_scope::push_unbounded_overlay(
+        into,
+        id,
+        MemoryComponentKind::AdapterStack,
         resident_bytes,
-        // No rung bounds an adapter: it lives exactly as long as the backbone it is installed on.
-        bounded_by: None,
-        residency: MemoryComponentResidency::WholeRender,
-    });
+    );
 }
 
 /// Full deltas after the SAME normalized loader graph has been validated by projection_loads.
@@ -959,7 +943,7 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check_at(loaded_tier(spec), contract, context)
+    safety_check_at(mlx_gen::request_scope::loaded_tier(spec), contract, context)
 }
 
 /// [`safety_check`] for an already-loaded encoder-free model (`IrisDepth`, `IrisRestorer`), which
@@ -1078,7 +1062,7 @@ pub(crate) fn registered_valid_fixture(
     let context = gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        loaded_tier(spec),
+        mlx_gen::request_scope::loaded_tier(spec),
         MemoryBehaviorRoute {
             mode: memory_mode(task),
             reference_count: 0,
@@ -1126,31 +1110,7 @@ impl MemoryRequestScope for GenerationRequestScope {
         }
         self.core.configure_request(request)
     }
-
-    fn enter_phase(&mut self, phase: MemoryPhase) -> CoreResult<()> {
-        self.core.enter_phase(phase)
-    }
-
-    fn leave_phase(&mut self, phase: MemoryPhase) -> CoreResult<()> {
-        self.core.leave_phase(phase)
-    }
-
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> CoreResult<()> {
-        self.core.configure_decode(edge, overlap, geometry)
-    }
-
-    fn configure_attention(&mut self, size: u32) -> CoreResult<()> {
-        self.core.configure_attention(size)
-    }
-
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> CoreResult<()> {
-        self.core.materialize_transformer_window(first, count)
-    }
+    mlx_gen::gen_core::delegate_memory_request_scope!(core);
 
     fn finish(&mut self, outcome: MemoryRunOutcome) -> CoreResult<()> {
         self.core.finish(outcome)
@@ -1166,9 +1126,7 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
+    mlx_gen::request_scope::admit(safety_check(spec, contract, context))?;
     let task = task_of(&contract.provider_id)?;
     let windowed = context.selection.strategy == MemoryStrategy::BoundedTransformerResidency;
     // The encoder-free routes take no `GenerationRequest`: their only request-scoped lever is the
@@ -1360,7 +1318,7 @@ mod tests {
         gen_core::standard_memory_behavior_context(
             contract,
             strategy,
-            loaded_tier(&sentinel()),
+            mlx_gen::request_scope::loaded_tier(&sentinel()),
             MemoryBehaviorRoute {
                 mode: memory_mode(task),
                 reference_count: 0,
@@ -1777,7 +1735,7 @@ mod tests {
                 let space = contract
                     .selection_space(
                         MemoryStrategy::BoundedTransformerResidency,
-                        loaded_tier(&sentinel()),
+                        mlx_gen::request_scope::loaded_tier(&sentinel()),
                         false,
                     )
                     .unwrap();
@@ -2143,7 +2101,7 @@ mod tests {
         let mut at = gen_core::standard_memory_behavior_context(
             &contract,
             MemoryStrategy::BoundedAttention,
-            loaded_tier(&spec),
+            mlx_gen::request_scope::loaded_tier(&spec),
             MemoryBehaviorRoute {
                 mode: MemoryMode::TextToImage,
                 reference_count: 0,
@@ -2578,7 +2536,7 @@ mod tests {
                 let context = gen_core::standard_memory_behavior_context(
                     &contract,
                     MemoryStrategy::Resident,
-                    loaded_tier(&at),
+                    mlx_gen::request_scope::loaded_tier(&at),
                     route(),
                 )
                 .unwrap();

@@ -8,8 +8,8 @@ use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
-    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
     MemoryStructuralResidentEvidence, MemoryWindowMaterialization, Precision, Quant,
     ResidentOnlyMemoryContractRegistration, ResidentRequestMemory, WeightsSource,
@@ -774,26 +774,8 @@ impl MemoryRequestScope for Scail2MemoryScope<'_> {
         self.inner.configure_request(request)?;
         validate_request_identity(self.memory, &self.context, request)
     }
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.enter_phase(phase)
-    }
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.leave_phase(phase)
-    }
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.inner.configure_decode(edge, overlap, geometry)
-    }
-    fn configure_attention(&mut self, size: u32) -> gen_core::Result<()> {
-        self.inner.configure_attention(size)
-    }
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
-        self.inner.materialize_transformer_window(first, count)
-    }
+
+    candle_gen::gen_core::delegate_memory_request_scope!(inner);
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         let result = self.inner.finish(outcome);
         *self
@@ -1068,17 +1050,19 @@ fn validate_route(
             "{PROVIDER_ID}: requires the exact one-character animation/replacement Resident route"
         )));
     }
-    match gen_core::standard_memory_strategy_safety_check(contract, context, Some(tier), None) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    candle_gen::request_scope::admit(gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(tier),
+        None,
+    ))
 }
 
 pub(crate) fn safety_check(
     memory: &PreparedMemory,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_result(
+    MemorySafetyDecision::from_validation(
         memory
             .artifact
             .ensure_unchanged()
@@ -1175,19 +1159,11 @@ pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
                 "{PROVIDER_ID}: caller contract does not match the sealed load receipt"
             ),
         },
-        // Kept textually identical to the `mlx-gen-scail2` twin (the cross-backend geometry gate
-        // compares this registration verbatim).
-        Ok(prepared) => match validate_context_identity(&prepared, context)
-            .and_then(|_| validate_route(&prepared.contract, prepared.tier, context))
-        {
-            Ok(()) => MemorySafetyDecision::Accept,
-            Err(error) => MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            },
-        },
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Ok(prepared) => MemorySafetyDecision::from_validation(
+            validate_context_identity(&prepared, context)
+                .and_then(|_| validate_route(&prepared.contract, prepared.tier, context)),
+        ),
+        Err(error) => MemorySafetyDecision::rejected(error),
     },
 };
 

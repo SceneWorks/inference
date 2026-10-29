@@ -4,8 +4,8 @@ use super::*;
 use crate::sdxl::tests::{admit_fixture_rows as admit_with_rows, budget, DEVICE};
 use mlx_gen::gen_core::iris::depth::{DepthOutput, IrisDepthEstimator};
 use mlx_gen::gen_core::{
-    GenerationOutput, Generator, Image, MemoryNumericTier, MemoryStrategy, Progress, Transform,
-    TransformDescriptor, WeightsSource,
+    GenerationOutput, Generator, Image, MemoryStrategy, Progress, Transform, TransformDescriptor,
+    WeightsSource,
 };
 use std::cell::Cell;
 use std::path::Path;
@@ -883,11 +883,7 @@ fn simulator_sana_tile_uses_the_served_provider_ladder() {
         .memory_strategy_contract("sana_1600m", &spec)
         .unwrap()
         .unwrap();
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let tier = mlx_gen::request_scope::loaded_tier(&spec);
     let mut selected = contract
         .representative_selection(MemoryStrategy::BoundedDecode, tier, false)
         .unwrap();

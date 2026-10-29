@@ -185,8 +185,8 @@ pub use config::{
 pub use decoder::ViT3dDecoder;
 pub use denoise::{
     adaln_schedule, denoise_av, DenoiseModality, JointGeometry, JointSchedule, JointStep,
-    JointVelocity, PackedLayout, RowClass, SigmaSchedule, AUDIO_SIGMA_SHIFT, LEGAL_FRAME_COUNTS,
-    NUM_ROW_CLASSES, VIDEO_SIGMA_SHIFT,
+    JointVelocity, PackedLayout, RowClass, SigmaSchedule, SigmaScheduleStep, AUDIO_SIGMA_SHIFT,
+    LEGAL_FRAME_COUNTS, NUM_ROW_CLASSES, VIDEO_SIGMA_SHIFT,
 };
 pub use dit::{
     release_device_memory, AdaLnCache, AdaLnResidency, DitBlock, JointDit, KeyframeAnchor,

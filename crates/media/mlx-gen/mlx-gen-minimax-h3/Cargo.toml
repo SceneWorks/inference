@@ -15,6 +15,8 @@ mlx-gen = { path = ".." }
 # boogu's in every field but `out_hidden_size` (5120 vs 4096), so the parity-critical tower is
 # consumed rather than duplicated — the same call boogu, krea, mage and bernini already make.
 mlx-gen-boogu = { path = "../mlx-gen-boogu" }
+# Opt-in H3 terminal telemetry (host RSS sampling), moved out of gen-core with its FFI (sc-27316).
+sceneworks-gen-core-telemetry = { workspace = true }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # `RgbImage` for the vision-reference hand-off to `boogu::vision::preprocess::preprocess_image`.
@@ -35,6 +37,8 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }
 # `_mlx_array_is_available` — mlx-c's accessor for `mlx::core::array::is_available()`, which
 # `tests/pipeline.rs` reads to observe DIRECTLY that the render's compute landed inside the
 # cancel-checked region, replacing a wall-clock ratio that moved with host load (sc-19452).

@@ -682,13 +682,9 @@ pub(super) fn selections(
         mlx_gen::gen_core::GenerationMemory,
     ),
 ) {
-    use mlx_gen::gen_core::{MemoryNumericTier, MemoryStrategy, MemoryStrategySupport};
+    use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
     let contract = crate::memory_strategy::memory_strategy_contract("sdxl", spec).unwrap();
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let tier = mlx_gen::request_scope::loaded_tier(spec);
     let deepest = [
         MemoryStrategy::BoundedTransformerResidency,
         MemoryStrategy::BoundedAttention,

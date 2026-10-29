@@ -2,6 +2,7 @@
 //! through the shared perceptual path, the no-person skip, and the real-weight parity harness.
 
 use super::*;
+use mlx_gen::testing::max_abs_diff;
 use mlx_gen::train::perceptual::X0Decoder;
 use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule, PerceptualPath};
 use mlx_rs::ops::matmul;
@@ -24,12 +25,6 @@ fn t(w: &Weights, k: &str) -> Array {
 /// NCHW fixture image → NHWC.
 fn nhwc(w: &Weights, k: &str) -> Array {
     t(w, k).transpose_axes(&[0, 2, 3, 1]).unwrap()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let d = subtract(a, b).unwrap().abs().unwrap().max(None).unwrap();
-    eval([&d]).unwrap();
-    d.item::<f32>()
 }
 
 fn scalar(a: &Array) -> f32 {

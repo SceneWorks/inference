@@ -394,9 +394,7 @@ impl Generator for BooguGenerator {
         };
         if let Err(error) = memory.receipt.ensure_unchanged() {
             self.memory_admission.clear_approval();
-            return gen_core::MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            };
+            return gen_core::MemorySafetyDecision::rejected(error);
         }
         match memory_strategy::safety_check(
             self.descriptor.id,
@@ -409,12 +407,9 @@ impl Generator for BooguGenerator {
             context,
         ) {
             gen_core::MemorySafetyDecision::Accept => {
-                match self.memory_admission.approve(context) {
-                    Ok(()) => gen_core::MemorySafetyDecision::Accept,
-                    Err(error) => gen_core::MemorySafetyDecision::Reject {
-                        reason: error.to_string(),
-                    },
-                }
+                gen_core::MemorySafetyDecision::from_validation(
+                    self.memory_admission.approve(context),
+                )
             }
             reject => {
                 self.memory_admission.clear_approval();

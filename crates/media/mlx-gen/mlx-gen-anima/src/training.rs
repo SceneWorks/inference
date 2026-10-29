@@ -57,7 +57,6 @@ use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint;
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
-use mlx_gen::train::flow::{normalize_cfg, validate_flow_match_request, validate_shared_floors};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, save_lokr, LoraParams, TrainAdapter,
@@ -70,9 +69,12 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
+use mlx_gen::train::vocab::{
+    clamp_unit_timestep, normalize_cfg, sample_unit_timestep, validate_common_request,
+};
 use mlx_gen::{
     LoadSpec, Modality, NetworkType, Precision, Result, TrainOptimizer, Trainer, TrainerDescriptor,
-    TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -143,7 +145,7 @@ fn build_batch(x0: &Array, noise: &Array, sigma: f32) -> Result<(Array, Array, f
 /// The non-empty target-module resolution is checked in [`Trainer::validate`], which has the loaded
 /// model to enumerate adaptable paths against.
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    validate_flow_match_request(req, "anima trainer")
+    validate_common_request("anima trainer", req)
 }
 
 /// Resolve the config's target modules to the full dotted-path set on the Anima adapter surface (DiT
@@ -378,7 +380,7 @@ mlx_gen::register_trainer! {
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    validate_shared_floors(descriptor, req)?;
+    mlx_gen::train::vocab::validate_shared_floors(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }
@@ -406,10 +408,23 @@ impl Trainer for AnimaTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -420,6 +435,7 @@ impl AnimaTrainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         self.validate(req)?;
         let cfg = &req.config;
@@ -820,11 +836,18 @@ impl AnimaTrainer {
                         // F-117: a cancelled preview denoise exits the preview loop (the outer loop's
                         // cancel check then unwinds the run); other failures skip one preview.
                         Err(mlx_gen::Error::Canceled) => break,
-                        Err(e) => eprintln!(
-                            "[sc-10641] anima preview sample failed at step {step} (prompt {}): {e} \
-                             — skipping this preview, training continues",
-                            i + 1
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[sc-10641] anima preview sample failed at step {step} (prompt \
+                                 {}): {e} — skipping this preview, training continues",
+                                i + 1
+                            );
+                            warnings.push(gen_core::train::preview_sample_failed(
+                                step,
+                                i as u32 + 1,
+                                &e,
+                            ));
+                        }
                     }
                 }
                 // sc-5567 — release the preview's transient forward+VAE-decode residency before
@@ -969,13 +992,7 @@ fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// Sample a normalised flow-match base timestep `σ ∈ [1e-3, 1−1e-3]` (a faithful port of the
@@ -983,29 +1000,9 @@ fn decode_image(path: &Path) -> Result<Image> {
 /// `(uniform + sigmoid(randn))/2` weighted; bias `high` → `√σ`, `low` → `σ²`), then run it through
 /// the static `shift = 3.0` warp the inference schedule uses. Deterministic in `seed`.
 fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let ttype = normalize_cfg(timestep_type);
-    let t = match ttype.as_str() {
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            let k2 = random::key(seed.wrapping_add(0x9E37_79B9))?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
-    };
-    let bias = normalize_cfg(timestep_bias);
-    let t = match bias.as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
+    let t = sample_unit_timestep(timestep_type, timestep_bias, seed)?;
     let shifted = apply_static_shift(t, SIGMA_SHIFT);
-    Ok(shifted.clamp(1e-3, 1.0 - 1e-3))
+    Ok(clamp_unit_timestep(shifted))
 }
 
 /// The cache entry the 1-based training `step` reads (sc-2127). One bucket ⇒ `(step - 1) % items`,
@@ -1445,6 +1442,7 @@ fn encode_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::testing::max_abs_diff;
     use mlx_gen::{TrainingItem, TrainingRequest};
     use std::path::PathBuf;
 
@@ -2325,17 +2323,6 @@ mod tests {
     // ======================================================================================
     // sc-10641 — in-training preview sampling
     // ======================================================================================
-
-    /// Max abs element-wise diff between two same-shape latents.
-    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-        a.subtract(b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item::<f32>()
-    }
 
     /// The interval contract, deterministically (no weights): previews are enabled only with a positive
     /// cadence + at least one prompt + not cancelled, and fire on EXACTLY the cadence multiples — nowhere

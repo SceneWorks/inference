@@ -32,6 +32,19 @@ impl Image {
     }
 }
 
+/// A decoded RGB8 buffer is already this type's layout: take its dimensions and raw pixels (the
+/// one conversion the trainers' `decode_image` reader sites share, sc-27332).
+impl From<image::RgbImage> for Image {
+    fn from(rgb: image::RgbImage) -> Self {
+        let (width, height) = rgb.dimensions();
+        Self {
+            width,
+            height,
+            pixels: rgb.into_raw(),
+        }
+    }
+}
+
 /// An 8-bit **RGBA** image, row-major interleaved, with `pixels.len() == width * height * 4`
 /// (sc-24111) — the four-channel sibling of [`Image`].
 ///

@@ -1380,18 +1380,13 @@ impl Generator for Flux2Generator {
         };
         if let Err(error) = memory_strategy::validate_registered_generator_context(context) {
             self.memory_admission.clear_approval();
-            return gen_core::MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            };
+            return gen_core::MemorySafetyDecision::rejected(error);
         }
         match memory_strategy::admission_safety_check(contract, context, self.loaded_quant) {
             gen_core::MemorySafetyDecision::Accept => {
-                match self.memory_admission.approve(context) {
-                    Ok(()) => gen_core::MemorySafetyDecision::Accept,
-                    Err(error) => gen_core::MemorySafetyDecision::Reject {
-                        reason: error.to_string(),
-                    },
-                }
+                gen_core::MemorySafetyDecision::from_validation(
+                    self.memory_admission.approve(context),
+                )
             }
             rejected @ gen_core::MemorySafetyDecision::Reject { .. } => {
                 self.memory_admission.clear_approval();

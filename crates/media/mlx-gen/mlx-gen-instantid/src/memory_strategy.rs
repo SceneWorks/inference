@@ -285,10 +285,7 @@ pub fn validate_context(
     identity: &InstantIdMemoryIdentity,
     context: &MemoryRunContext,
 ) -> gen_core::Result<()> {
-    match safety_check(contract, tier, identity, context) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    mlx_gen::request_scope::admit(safety_check(contract, tier, identity, context))
 }
 
 #[cfg(test)]

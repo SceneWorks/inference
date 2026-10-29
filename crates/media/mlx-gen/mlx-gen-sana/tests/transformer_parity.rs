@@ -19,7 +19,7 @@
 //! of magnitude; Metal's reduced-precision matmul (~1e-3/op) only nudges it. The committed tiny
 //! golden runs in f32, so the bar is tight (`mean_rel < 5e-3`).
 
-use mlx_rs::ops::{abs, max as max_op, subtract, sum};
+use mlx_rs::ops::{abs, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
@@ -31,6 +31,7 @@ use common::{tiny_config, tiny_sprint_config};
 
 #[cfg(target_os = "macos")]
 use crate::common::quantum_metal_guard;
+use mlx_gen::testing::peak_rel;
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -263,12 +264,6 @@ fn sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks() {
 
 fn f32(x: &Array) -> Array {
     x.as_dtype(Dtype::Float32).unwrap()
-}
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(f32(got), f32(want)).unwrap()).unwrap();
-    let denom = max_op(abs(f32(want)).unwrap(), None).unwrap().item::<f32>();
-    max_op(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 
 fn mean_rel(got: &Array, want: &Array) -> f32 {

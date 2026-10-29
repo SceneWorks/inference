@@ -32,7 +32,7 @@ use std::path::PathBuf;
 /// the `-2602` variant is the one the MLX engine loads, so it is the one we pack).
 #[allow(dead_code)] // retained as provenance; TODO(sc-13685)
 const OVERLAY_FILE: &str = "Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors";
-/// Codebase-default group size (== `crate::quant::GROUP_SIZE`).
+/// Codebase-default group size (== `mlx_gen::quant::DEFAULT_GROUP_SIZE`).
 const GROUP_SIZE: i32 = 64;
 
 /// Resolve the 2512-Fun `-2602` overlay from the required `SC9517_CONTROL`; `None` when unset so the

@@ -25,9 +25,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use gen_core::iris::train::dist::{
-    reduce_in_rank_order, Collective, DistError, DistPlan, Partition, Precision, ReduceOp,
-    TcpCollective, World,
+    reduce_in_rank_order, Collective, DistError, DistPlan, Partition, Precision, ReduceOp, World,
 };
+use gen_core_dist::TcpCollective;
 use mlx_gen::gen_core;
 use mlx_gen::gen_core::CancelFlag;
 use mlx_gen::{Error, Result};

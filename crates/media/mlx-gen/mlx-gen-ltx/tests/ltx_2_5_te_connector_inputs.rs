@@ -21,12 +21,13 @@
 //! `LTX25_TIER_DIR=/Volumes/Models/scratch-tiers-sc18775/tiers cargo test -p mlx-gen-ltx --release
 //!  --test integration -- ltx_2_5_te_connector_inputs:: --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max, subtract, sum};
+use mlx_rs::ops::{abs, max, sum};
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
 use mlx_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata;
 use mlx_gen::gen_core::OffloadPolicy;
+use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::gemma4_te::Ltx25TextEncoder;
@@ -195,15 +196,6 @@ fn connector_inputs_match_the_reference_geometry_and_are_well_formed() {
     );
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_te_connector_inputs::connector_inputs_match_the_reference_geometry_and_are_well_formed");
-}
-
-/// `max|got - want| / max|want|` — the peak-relative error the 2.3 TE sibling (`te_parity.rs`)
-/// asserts on, and the same bars are used below.
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let got = got.as_dtype(mlx_rs::Dtype::Float32).expect("f32");
-    let diff = abs(subtract(&got, want).unwrap()).unwrap();
-    let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 
 /// [`peak_rel`] restricted to token rows `[lo, hi)`, with the denominator taken over the same

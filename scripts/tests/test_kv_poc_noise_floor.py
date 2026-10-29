@@ -288,7 +288,7 @@ class NoiseFloorPhaseTests(unittest.TestCase):
         (repository, revision, path, bytes, sha256) rows for every scheduled family."""
         import re
 
-        source = (ROOT / "crates/llm/mlx-llm/src/campaign.rs").read_text(encoding="utf-8")
+        source = (ROOT / "crates/llm/mlx-llm/src/campaign/models.rs").read_text(encoding="utf-8")
         files = {
             name: re.findall(r'path: "([^"]+)",\s*bytes: ([\d_]+),\s*sha256: "([0-9a-f]{64})"', body)
             for name, body in re.findall(

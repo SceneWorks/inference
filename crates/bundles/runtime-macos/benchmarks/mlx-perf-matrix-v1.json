@@ -112,7 +112,7 @@
       "family": "wan_video",
       "provider": "wan2_2_ti2v_5b",
       "expectedP1CompileOperations": [
-        "wan::rope::rope_rotate",
+        "mlx_gen::nn::rope_rotate",
         "wan::transformer::gated",
         "wan::transformer::gelu_ffn",
         "wan::transformer::modulate"
@@ -145,7 +145,7 @@
       "family": "wan_video",
       "provider": "wan2_2_ti2v_5b",
       "expectedP1CompileOperations": [
-        "wan::rope::rope_rotate",
+        "mlx_gen::nn::rope_rotate",
         "wan::transformer::gated",
         "wan::transformer::gelu_ffn",
         "wan::transformer::modulate"
@@ -178,7 +178,7 @@
       "family": "wan_video",
       "provider": "wan2_2_ti2v_5b",
       "expectedP1CompileOperations": [
-        "wan::rope::rope_rotate",
+        "mlx_gen::nn::rope_rotate",
         "wan::transformer::gated",
         "wan::transformer::gelu_ffn",
         "wan::transformer::modulate"
@@ -211,7 +211,7 @@
       "family": "image_dit",
       "provider": "qwen_image",
       "expectedP1CompileOperations": [
-        "qwen_image::attention::rope_rotate",
+        "mlx_gen::nn::rope_rotate",
         "qwen_image::block::gated",
         "qwen_image::block::modulate",
         "qwen_image::feed_forward::gelu_ffn"
@@ -241,7 +241,7 @@
       "family": "image_dit",
       "provider": "qwen_image",
       "expectedP1CompileOperations": [
-        "qwen_image::attention::rope_rotate",
+        "mlx_gen::nn::rope_rotate",
         "qwen_image::block::gated",
         "qwen_image::block::modulate",
         "qwen_image::feed_forward::gelu_ffn"
@@ -271,7 +271,7 @@
       "family": "image_dit",
       "provider": "qwen_image",
       "expectedP1CompileOperations": [
-        "qwen_image::attention::rope_rotate",
+        "mlx_gen::nn::rope_rotate",
         "qwen_image::block::gated",
         "qwen_image::block::modulate",
         "qwen_image::feed_forward::gelu_ffn"

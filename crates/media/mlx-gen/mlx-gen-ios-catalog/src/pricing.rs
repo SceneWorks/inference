@@ -1244,8 +1244,8 @@ mod host_integration {
     #[test]
     fn sana_catalog_bounder_propagates_scope_and_analysis_budget() {
         use mlx_gen::gen_core::{
-            GenerationMemory, GenerationRequest, MemoryGeometry, MemoryMode, MemoryNumericTier,
-            MemorySelection, MemoryStrategy,
+            GenerationMemory, GenerationRequest, MemoryGeometry, MemoryMode, MemorySelection,
+            MemoryStrategy,
         };
         use mlx_gen::ios_pricing::{
             IosBoundRequest, IosExecutionFacts, IosExecutionStream, IosPricing, IosPricingRequest,
@@ -1256,11 +1256,7 @@ mod host_integration {
         let selection = MemorySelection {
             strategy: MemoryStrategy::Resident,
             parameters: Default::default(),
-            tier: MemoryNumericTier {
-                precision: spec.precision,
-                quant: spec.quantize,
-                component_precision_floors: &[],
-            },
+            tier: mlx_gen::request_scope::loaded_tier(&spec),
         };
         let execution = GenerationMemory::default();
         let mode = MemoryMode::TextToImage;
@@ -1366,8 +1362,7 @@ mod host_integration {
     fn iris_anchor_replay_resolves_only_its_own_token_and_no_roles() {
         use crate::sampling::IrisAnchorReplay;
         use mlx_gen::gen_core::{
-            GenerationMemory, MemoryGeometry, MemoryMode, MemoryNumericTier, MemorySelection,
-            MemoryStrategy,
+            GenerationMemory, MemoryGeometry, MemoryMode, MemorySelection, MemoryStrategy,
         };
         use mlx_gen::ios_pricing::{
             IosBoundRequest, IosExecutionFacts, IosExecutionStream, IosPricing, IosPricingRequest,
@@ -1391,11 +1386,7 @@ mod host_integration {
         let selection = MemorySelection {
             strategy: MemoryStrategy::Resident,
             parameters: Default::default(),
-            tier: MemoryNumericTier {
-                precision: spec.precision,
-                quant: spec.quantize,
-                component_precision_floors: &[],
-            },
+            tier: mlx_gen::request_scope::loaded_tier(&spec),
         };
         let execution = GenerationMemory::default();
         let mode = MemoryMode::TextToImage;
@@ -1461,8 +1452,7 @@ mod host_integration {
     #[test]
     fn anchor_replay_source_facts_reach_only_their_own_provider_type() {
         use mlx_gen::gen_core::{
-            GenerationMemory, MemoryGeometry, MemoryMode, MemoryNumericTier, MemorySelection,
-            MemoryStrategy,
+            GenerationMemory, MemoryGeometry, MemoryMode, MemorySelection, MemoryStrategy,
         };
         use mlx_gen::ios_pricing::{
             IosBoundRequest, IosExecutionFacts, IosExecutionStream, IosPricing, IosPricingRequest,
@@ -1474,11 +1464,7 @@ mod host_integration {
         let selection = MemorySelection {
             strategy: MemoryStrategy::Resident,
             parameters: Default::default(),
-            tier: MemoryNumericTier {
-                precision: spec.precision,
-                quant: spec.quantize,
-                component_precision_floors: &[],
-            },
+            tier: mlx_gen::request_scope::loaded_tier(&spec),
         };
         let execution = GenerationMemory::default();
         let mode = MemoryMode::TextToImage;

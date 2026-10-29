@@ -20,7 +20,7 @@ candle-audio = { path = "../candle-audio" }
 candle-nn = { workspace = true }
 # core-llm for the snapshot-preparer accommodation (the audio lane carries the candle preparer;
 # OpenVoice's converter/checkpoint.pth + converter/config.json layout needs its own probe).
-core-llm = { path = "../../contracts/core-llm" }
+core-llm = { workspace = true }
 # config.json validation (architecture-drift guard) + the preparer probe.
 serde_json = { workspace = true }
 

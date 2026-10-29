@@ -99,7 +99,7 @@ pub(crate) fn generate_batch_with_observer(
     requests: &[BatchRequest],
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(usize, StreamEvent),
-    mut observer: Option<&mut dyn crate::campaign::Observer>,
+    mut observer: Option<&mut dyn crate::decode::observe::Observer>,
 ) -> Result<Vec<GenerationOutput>> {
     if requests.is_empty() {
         return Err(Error::Msg("generate_batch: no requests".into()));
@@ -309,7 +309,7 @@ pub(crate) fn generate_batch_with_observer(
 fn observe_cache_events(
     cache: &mut dyn crate::primitives::kv_cache::KvCache,
     seen: &mut usize,
-    observer: &mut dyn crate::campaign::Observer,
+    observer: &mut dyn crate::decode::observe::Observer,
 ) -> Result<()> {
     let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
         return Ok(());
@@ -414,7 +414,7 @@ fn record_token_observed(
     lane: &mut Lane,
     tok: i32,
     on_event: &mut dyn FnMut(usize, StreamEvent),
-    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    observer: &mut Option<&mut dyn crate::decode::observe::Observer>,
     observed_first_token: &mut bool,
 ) -> LaneStep {
     let mut observed = |request_index, event| {

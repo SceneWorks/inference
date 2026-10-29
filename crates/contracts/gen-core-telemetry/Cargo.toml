@@ -1,0 +1,26 @@
+[package]
+name = "sceneworks-gen-core-telemetry"
+version = "0.1.0"
+edition = "2021"
+description = "Opt-in host telemetry (process RSS sampling) for the MiniMax-H3 terminal-telemetry request flag in gen-core."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["telemetry", "memory", "inference"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_telemetry::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_telemetry"
+
+[dependencies]
+# The per-step JSON report the collector builds. Moved out of gen-core with the host-RSS FFI in
+# sc-27316; gen-core keeps only the `GenerateRequest::h3_terminal_telemetry` flag.
+serde_json = { workspace = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+# Host process RSS: `proc_pidinfo(PROC_PIDTASKINFO)` on macOS, `sysconf(_SC_PAGESIZE)` on Linux.
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Host process RSS: `GetProcessMemoryInfo(GetCurrentProcess())`.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

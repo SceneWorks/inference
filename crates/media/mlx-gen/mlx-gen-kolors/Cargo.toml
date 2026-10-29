@@ -24,6 +24,8 @@ mlx-rs = { workspace = true }
 image = { workspace = true }
 
 [dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }
 # Epic 2123 auxiliary perceptual losses (sc-24830): the shared builder every trainer calls
 # (depth anchoring today). Depends only on core + the aux-model crates (acyclic).
 mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }

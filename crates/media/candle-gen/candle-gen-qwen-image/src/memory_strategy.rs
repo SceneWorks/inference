@@ -679,7 +679,7 @@ pub(crate) fn admission_safety_check(
     } else {
         validate_context(provider_id, contract, context, loaded_quant)
     };
-    MemorySafetyDecision::from_result(validated)
+    MemorySafetyDecision::from_validation(validated)
 }
 
 pub(crate) struct QwenMemoryScope {
@@ -892,15 +892,11 @@ pub(crate) fn registered_safety_check(
         let recipe = match crate::edit::validate_memory_artifact_recipe(spec) {
             Ok(recipe) => recipe,
             Err(error) => {
-                return MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                };
+                return MemorySafetyDecision::rejected(error);
             }
         };
         if let Err(error) = crate::edit::validate_memory_recipe_context(recipe, context) {
-            return MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            };
+            return MemorySafetyDecision::rejected(error);
         }
     }
     match snapshot_quant_tier(spec, &contract.provider_id) {
@@ -910,11 +906,9 @@ pub(crate) fn registered_safety_check(
             } else {
                 validate_context(&contract.provider_id, contract, context, quant)
             };
-            MemorySafetyDecision::from_result(result)
+            MemorySafetyDecision::from_validation(result)
         }
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 

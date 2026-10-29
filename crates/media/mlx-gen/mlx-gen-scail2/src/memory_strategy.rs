@@ -1,14 +1,13 @@
 //! Exact Resident-only memory contract for the public SCAIL-2 character-animation route.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use mlx_gen::gen_core::{
     self, AdapterKind, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
-    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
     MemoryStructuralResidentEvidence, Precision, Quant, ResidentOnlyMemoryContractRegistration,
     ResidentRequestMemory, WeightsSource, MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
@@ -125,23 +124,15 @@ impl AdapterReceipt {
         };
         pin.ensure_unchanged()?;
         let canonical_path = pin.canonical_target_path().to_path_buf();
-        let (digest, realization, physical_bytes, resident_bytes, transient_bytes) = pin
-            .read_unchanged(|path| {
+        // The seal's acquisition-time content digest: hashed once per file identity, not re-read.
+        let digest = pin.content_sha256_hex();
+        let (realization, physical_bytes, resident_bytes, transient_bytes) =
+            pin.read_unchanged(|path| {
                 let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
                 if headers.is_empty() {
                     return Err(gen_core::Error::Unsupported(format!(
                         "{PROVIDER_ID}: adapter {ordinal} contains no tensors"
                     )));
-                }
-                let mut file = std::fs::File::open(path)?;
-                let mut hasher = Sha256::new();
-                let mut buffer = [0_u8; 1024 * 1024];
-                loop {
-                    let read = file.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..read]);
                 }
                 let mut folded = 0_u64;
                 let mut residual = 0_u64;
@@ -170,13 +161,7 @@ impl AdapterReceipt {
                     (true, true) => AdapterRealization::Hybrid,
                     (false, false) => unreachable!("nonempty headers carry bytes"),
                 };
-                Ok::<_, gen_core::Error>((
-                    format!("{:x}", hasher.finalize()),
-                    realization,
-                    physical,
-                    residual,
-                    folded,
-                ))
+                Ok::<_, gen_core::Error>((realization, physical, residual, folded))
             })?;
         Ok(Self {
             ordinal,
@@ -711,26 +696,7 @@ impl MemoryRequestScope for Scail2MemoryScope<'_> {
         self.inner.configure_request(request)?;
         validate_request_identity(self.memory, &self.context, request)
     }
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.enter_phase(phase)
-    }
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.leave_phase(phase)
-    }
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.inner.configure_decode(edge, overlap, geometry)
-    }
-    fn configure_attention(&mut self, size: u32) -> gen_core::Result<()> {
-        self.inner.configure_attention(size)
-    }
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
-        self.inner.materialize_transformer_window(first, count)
-    }
+    mlx_gen::gen_core::delegate_memory_request_scope!(inner);
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         let result = self.inner.finish(outcome);
         *self
@@ -1037,27 +1003,25 @@ fn validate_route(
             "{PROVIDER_ID}: requires the exact one-character animation/replacement Resident route"
         )));
     }
-    match gen_core::standard_memory_strategy_safety_check(contract, context, Some(tier), None) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    mlx_gen::request_scope::admit(gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(tier),
+        None,
+    ))
 }
 
 pub(crate) fn safety_check(
     memory: &PreparedMemory,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match memory
-        .artifact
-        .ensure_unchanged()
-        .and_then(|_| validate_context_identity(memory, context))
-        .and_then(|_| validate_route(&memory.contract, memory.tier, context))
-    {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(
+        memory
+            .artifact
+            .ensure_unchanged()
+            .and_then(|_| validate_context_identity(memory, context))
+            .and_then(|_| validate_route(&memory.contract, memory.tier, context)),
+    )
 }
 
 /// A declared geometry backed by exactly `width * height * 3` RGB8 bytes.
@@ -1147,17 +1111,11 @@ pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
                 "{PROVIDER_ID}: caller contract does not match the sealed load receipt"
             ),
         },
-        Ok(prepared) => match validate_context_identity(&prepared, context)
-            .and_then(|_| validate_route(&prepared.contract, prepared.tier, context))
-        {
-            Ok(()) => MemorySafetyDecision::Accept,
-            Err(error) => MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            },
-        },
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Ok(prepared) => MemorySafetyDecision::from_validation(
+            validate_context_identity(&prepared, context)
+                .and_then(|_| validate_route(&prepared.contract, prepared.tier, context)),
+        ),
+        Err(error) => MemorySafetyDecision::rejected(error),
     },
 };
 

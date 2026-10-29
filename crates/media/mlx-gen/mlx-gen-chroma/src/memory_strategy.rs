@@ -60,15 +60,14 @@
 //! the rung-3 or rung-4 verdicts; rung 2 is now governed by SC-19753's sealed coordinate evidence.
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
-use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
     adapter_stack_resident_bytes, standard_memory_strategy_safety_check, AdapterResidencyMode,
     Error as CoreError, LoadShape, LoadSpec, MemoryBackendRealization, MemoryCalibrationIdentity,
-    MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
-    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
-    MemoryStrategySupport, ResidentRequestMemory, TransformerComponent,
+    MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities,
+    MemoryMode, MemoryNumericTier, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
+    TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};
@@ -340,7 +339,7 @@ fn resident_overlay_components(
             let student = projected_safetensors_bytes(checkpoint, |_| ResidentProjection::Stored)?;
             let caption =
                 projected_safetensors_bytes(&gemma_source, |_| ResidentProjection::Stored)?;
-            push_overlay(
+            mlx_gen::request_scope::push_unbounded_overlay(
                 &mut components,
                 PID_COMPONENT_ID,
                 // `AdapterStack` is the closest existing kind for an auxiliary network installed
@@ -362,7 +361,7 @@ fn resident_overlay_components(
                 )
             },
         )?;
-    push_overlay(
+    mlx_gen::request_scope::push_unbounded_overlay(
         &mut components,
         ADAPTER_COMPONENT_ID,
         MemoryComponentKind::AdapterStack,
@@ -370,28 +369,6 @@ fn resident_overlay_components(
     );
 
     Ok(components)
-}
-
-/// Record one overlay, skipping a zero: the shared validator refuses a declared component with zero
-/// bytes, and a component that measured zero is not evidence of residency anyway.
-fn push_overlay(
-    into: &mut Vec<MemoryResidentComponent>,
-    id: &str,
-    kind: MemoryComponentKind,
-    resident_bytes: u64,
-) {
-    if resident_bytes == 0 {
-        return;
-    }
-    into.push(MemoryResidentComponent {
-        id: id.to_owned(),
-        kind,
-        resident_bytes,
-        // No published rung bounds an overlay here: rung 4's window covers the DiT's two block
-        // sub-stacks (and, unpublished, the T5 encoder's), and nothing else.
-        bounded_by: None,
-        residency: MemoryComponentResidency::WholeRender,
-    });
 }
 
 fn variant_for(provider_id: &str) -> mlx_gen::gen_core::Result<ChromaVariant> {
@@ -983,36 +960,28 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let provider = provider_static(&contract.provider_id)?;
-    let routes = decode_routes(provider)?;
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        window_stack_depth(),
-        move |use_pid, edge, overlap| {
-            routes
-                .validate(use_pid, Some(edge), Some(overlap))
-                .map_err(CoreError::Unsupported)
-        },
-    )?;
-    config.load_shape = context.load_shape;
-    mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
+        let provider = provider_static(&contract.provider_id)?;
+        let routes = decode_routes(provider)?;
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            context.use_pid,
+            window_stack_depth(),
+            move |use_pid, edge, overlap| {
+                routes
+                    .validate(use_pid, Some(edge), Some(overlap))
+                    .map_err(CoreError::Unsupported)
+            },
+        )?;
+        config.load_shape = context.load_shape;
+        mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 pub(crate) fn registered_begin_request(
@@ -1043,15 +1012,9 @@ pub(crate) fn begin_request(
 
 // ── Request-local resolution of the selected parameters ──────────────────────────────────────────
 
-/// Rung 3's plan. An unselected request returns the exact historical unbounded/uncancellable plan.
-pub(crate) fn attention_plan(req: &GenerationRequest) -> AttentionPlan<'_> {
-    match req.memory {
-        Some(memory) if memory.chunk_attention => {
-            AttentionPlan::budgeted(AttentionBudget::CONSTRAINED).with_cancel(&req.cancel)
-        }
-        _ => AttentionPlan::UNBOUNDED,
-    }
-}
+/// Rung 3: the shared constrained-budget plan (an unselected request keeps the exact historical
+/// unbounded, uncancellable plan).
+pub(crate) use mlx_gen::request_scope::constrained_attention_plan as attention_plan;
 
 /// Rung 3's parameter domain check, on the same layer as its rung-2 and rung-4 siblings.
 pub(crate) fn validate_attention_chunk(
@@ -1149,49 +1112,18 @@ pub(crate) fn decode_tiling_for_contract(
     contract: &MemoryProviderContract,
 ) -> mlx_gen::Result<Option<TilingConfig>> {
     let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
-        mlx_gen::diagnostics::record_geometry_decode_decision(
-            mlx_gen::diagnostics::DecodePolicyDisposition::Unchanged,
-            mlx_gen::diagnostics::DecodePathDisposition::Dense,
-            None,
-        );
+        mlx_gen::request_scope::record_dense_decode();
         return Ok(None);
     };
     if req.cancel.is_cancelled() {
         return Err(mlx_gen::Error::Canceled);
     }
-    let has_quality_table = contract
-        .capability(MemoryStrategy::BoundedDecode)
-        .is_some_and(|capability| !capability.parameters.decode_geometry_policies.is_empty());
-    if !has_quality_table {
+    if !mlx_gen::request_scope::has_decode_geometry_table(contract) {
         return Err(mlx_gen::Error::Unsupported(format!(
             "{provider_id}: bounded decode is withheld until an exact production-latent geometry-quality row is packaged for this loaded route"
         )));
     }
-    let edge = memory.decode_tile_edge.ok_or_else(|| {
-        mlx_gen::Error::Unsupported(format!(
-            "{provider_id}: geometry-aware bounded decode requires an exact tile edge"
-        ))
-    })?;
-    let overlap = memory.decode_overlap.ok_or_else(|| {
-        mlx_gen::Error::Unsupported(format!(
-            "{provider_id}: geometry-aware bounded decode requires an exact overlap"
-        ))
-    })?;
-    let evidence = mlx_gen::request_scope::validate_geometry_decode_authorization(
-        provider_id,
-        req,
-        edge,
-        overlap,
-    )?;
-    mlx_gen::diagnostics::record_geometry_decode_decision(
-        mlx_gen::diagnostics::DecodePolicyDisposition::GeometryTiled,
-        mlx_gen::diagnostics::DecodePathDisposition::Tiled,
-        Some(&evidence),
-    );
-    Ok(Some(TilingConfig::spatial_only(
-        edge as i32,
-        overlap as i32,
-    )))
+    mlx_gen::request_scope::geometry_decode_tiling(provider_id, req, memory).map(Some)
 }
 
 /// Request-local conformance fault at a completed physical phase boundary (SC-15449). The shared
@@ -1217,6 +1149,7 @@ pub(crate) fn calibration_fault(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::attention::AttentionBudget;
     use mlx_gen::gen_core::GenerationMemory;
     use mlx_gen::{AdapterKind, AdapterSpec, Quant};
 

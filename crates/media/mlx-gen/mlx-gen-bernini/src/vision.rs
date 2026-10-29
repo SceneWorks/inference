@@ -28,7 +28,7 @@ use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, softmax_axis, split};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::nn::{gelu_exact, silu};
+use mlx_gen::nn::{gelu_exact, rotate_half, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -142,13 +142,6 @@ fn linear(w: &Weights, prefix: &str, bias: bool) -> Result<AdaptableLinear> {
         None
     };
     Ok(AdaptableLinear::dense(weight, b))
-}
-
-/// HF half-split rotary `rotate_half`: `cat(-x[d/2:], x[:d/2])` on the last axis.
-fn rotate_half(x: &Array) -> Result<Array> {
-    let ax = x.ndim() as i32 - 1;
-    let parts = split(x, 2, ax)?;
-    Ok(concatenate_axis(&[&parts[1].negative()?, &parts[0]], ax)?)
 }
 
 /// One vision block: pre-norm windowed/full attention + pre-norm SwiGLU MLP, both residual.

@@ -66,6 +66,8 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::config::ConfigFile;
+
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
 use mlx_gen::gen_core::{self, BucketSchedule};
@@ -74,7 +76,6 @@ use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
-use mlx_gen::train::flow::{normalize_cfg, validate_flow_match_request};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, factorization, LoraParams, TrainAdapter,
@@ -86,10 +87,11 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::tae::TinyDecoderSpec;
+use mlx_gen::train::vocab::{normalize_cfg, sample_timestep, validate_common_request};
 use mlx_gen::{
     CancelFlag, Error, Image, LoadSpec, Modality, NetworkType, Precision, Progress, Result,
     RgbaImage, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
-    TrainingOutput, TrainingProgress, TrainingRequest,
+    TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
@@ -906,7 +908,8 @@ impl QwenImage21Trainer {
 /// image on any item, and `model_options` that select reference / control conditioning — the same
 /// inputs, with the same messages, the candle twin refuses (sc-24163).
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    validate_flow_match_request(req, &format!("{TRAINER_ID} trainer"))?;
+    let prefix = format!("{TRAINER_ID} trainer");
+    validate_common_request(&prefix, req)?;
     if req
         .items
         .iter()
@@ -923,7 +926,7 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     // rather than silently trained without it; its *off* state (null, `[]`, `""`, `{}`, `false`,
     // `"none"`) selects nothing. The list, the off-value rule and the message are gen-core's, shared
     // with the candle twin, so the two backends cannot drift.
-    gen_core::train::refuse_reference_control_model_options(&format!("{TRAINER_ID} trainer"), req)?;
+    gen_core::train::refuse_reference_control_model_options(&prefix, req)?;
     Ok(())
 }
 
@@ -1034,13 +1037,7 @@ path,
 |__model_input_path| image::open(__model_input_path)
 )
     .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// Decode a reference image file as RGBA8 — upstream's `img.convert("RGBA")`: an RGB file is the
@@ -1453,33 +1450,6 @@ pub(crate) fn diagnostic_midpoint_batch(x0: &Array, noise: &Array) -> Result<(Ar
     build_batch(x0, noise, 0.5)
 }
 
-/// Sample a normalized flow-match timestep `t ∈ [1e-3, 1−1e-3]` — the SceneWorks
-/// `sample_training_timestep` the sibling trainers port: `sigmoid(randn)` by default, `uniform` for
-/// linear, `(uniform + sigmoid(randn))/2` for weighted; bias `high` → `√t`, `low` → `t²`.
-/// Deterministic in `seed`.
-fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let t = match normalize_cfg(timestep_type).as_str() {
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            let k2 = random::key(seed ^ 0x9E37_79B9)?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
-    };
-    let t = match normalize_cfg(timestep_bias).as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    Ok(t.clamp(1e-3, 1.0 - 1e-3))
-}
-
 /// The per-step inputs of one loss evaluation.
 struct StepInputs<'a> {
     x0: &'a Array,
@@ -1755,7 +1725,7 @@ fn run_train_step(
 ) -> Result<(StepLosses, LoraParams)> {
     let sample = step_sample(perceptual, step, schedule);
     let item = &cache[sample.entry];
-    let mut t = sample_sigma(
+    let mut t = sample_timestep(
         &cfg.timestep_type,
         &cfg.timestep_bias,
         cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
@@ -1931,6 +1901,17 @@ impl Trainer for QwenImage21Trainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
@@ -1938,7 +1919,9 @@ impl Trainer for QwenImage21Trainer {
         // caller that skips it cannot slip a control or full-tune request through as a plain
         // text-to-image run (the candle twin does the same).
         self.validate(req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -1948,6 +1931,7 @@ impl QwenImage21Trainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         validate_request(req)?;
         // Edit mode is a different training input, so its floor is re-checked here rather than
@@ -2544,11 +2528,18 @@ impl QwenImage21Trainer {
                             image,
                         }),
                         Err(Error::Canceled) => break,
-                        Err(e) => eprintln!(
-                            "[sc-24159] {TRAINER_ID} preview sample failed at step {step} (prompt \
-                             {}): {e} — skipping this preview, training continues",
-                            i + 1
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[sc-24159] {TRAINER_ID} preview sample failed at step {step} \
+                                 (prompt {}): {e} — skipping this preview, training continues",
+                                i + 1
+                            );
+                            warnings.push(gen_core::train::preview_sample_failed(
+                                step,
+                                i as u32 + 1,
+                                &e,
+                            ));
+                        }
                     }
                 }
                 mlx_rs::memory::clear_cache();
@@ -2752,14 +2743,14 @@ mod tests {
     fn sample_sigma_is_deterministic_and_in_range() {
         for kind in ["sigmoid", "linear", "weighted"] {
             for bias in ["balanced", "high", "low"] {
-                let a = sample_sigma(kind, bias, 42).unwrap();
-                assert_eq!(a, sample_sigma(kind, bias, 42).unwrap());
+                let a = sample_timestep(kind, bias, 42).unwrap();
+                assert_eq!(a, sample_timestep(kind, bias, 42).unwrap());
                 assert!((1e-3..=1.0 - 1e-3).contains(&a), "{kind}/{bias} t={a}");
             }
         }
         assert!(
-            sample_sigma("sigmoid", "high", 7).unwrap()
-                > sample_sigma("sigmoid", "low", 7).unwrap()
+            sample_timestep("sigmoid", "high", 7).unwrap()
+                > sample_timestep("sigmoid", "low", 7).unwrap()
         );
     }
 
@@ -3279,7 +3270,11 @@ mod tests {
         req.output_dir = out.path().to_path_buf();
         let mut events = Vec::new();
         let err = trainer
-            .train_impl(&req, &mut |p| events.push(format!("{p:?}")))
+            .train_impl(
+                &req,
+                &mut |p| events.push(format!("{p:?}")),
+                &mut Vec::new(),
+            )
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds"), "{err}");
@@ -3879,7 +3874,11 @@ mod tests {
         req.output_dir = out.path().to_path_buf();
         let mut events = Vec::new();
         let err = trainer
-            .train_impl(&req, &mut |p| events.push(format!("{p:?}")))
+            .train_impl(
+                &req,
+                &mut |p| events.push(format!("{p:?}")),
+                &mut Vec::new(),
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
         assert!(
@@ -3988,7 +3987,7 @@ mod tests {
         let mut losses = Vec::new();
         for step in 0..120u64 {
             let noise = randn(x0.shape(), 1_000 + step);
-            let t = sample_sigma("sigmoid", "balanced", 77 + step).unwrap();
+            let t = sample_timestep("sigmoid", "balanced", 77 + step).unwrap();
             let (loss, grads) = compute_loss_grads(
                 &mut dit,
                 &params,
@@ -5274,7 +5273,9 @@ mod adapter_noise_loop_tests {
             trigger_words: vec![],
             cancel: CancelFlag::new(),
         };
-        let result = trainer.train_impl(&req, &mut |_| {}).unwrap();
+        let result = trainer
+            .train_impl(&req, &mut |_| {}, &mut Vec::new())
+            .unwrap();
         assert_eq!(result.steps, steps);
         let saved = Array::load_safetensors(&result.adapter_path).unwrap();
         let params: LoraParams = saved
@@ -5625,7 +5626,7 @@ mod depth_anchoring_tests {
             aux_driver(path_with(window), &cache, &schedule, 1, &Default::default()).unwrap();
         step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 1, false);
         let (depth, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), 2, false);
-        let raw = sample_sigma(
+        let raw = sample_timestep(
             &cfg.timestep_type,
             &cfg.timestep_bias,
             cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(2),
@@ -5746,7 +5747,7 @@ mod depth_anchoring_tests {
             let (l, _) = step(&mut f, &cfg, &cache, &schedule, Some(&mut d), n, false);
             let k = (n - 1) as usize;
             let (item, entry) = (schedule.sample(k).0, schedule.cache_index(k));
-            let raw = sample_sigma(
+            let raw = sample_timestep(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
                 cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(n as u64),
@@ -5824,7 +5825,7 @@ mod depth_anchoring_tests {
         let (off, g_off) = step(&mut f, &off_cfg, &cache, &schedule, None, 1, false);
         assert_eq!(off.aux, None);
         let item = &cache[0];
-        let t = sample_sigma(
+        let t = sample_timestep(
             &off_cfg.timestep_type,
             &off_cfg.timestep_bias,
             off_cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),

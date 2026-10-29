@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 
+use mlx_gen::testing::{max_abs, max_abs_diff};
 use mlx_gen_krea_realtime::{
     build_block_causal_mask, load_krea_realtime_transformer, CausalKreaTransformer,
     KreaRealtimeConfig,
@@ -206,18 +207,6 @@ fn det_latent(c: i32, f: i32, h: i32, w: i32, seed: u64) -> Array {
         data.push((u as f32 - 0.5) * 2.0); // ~[-1, 1]
     }
     Array::from_slice(&data, &[c, f, h, w])
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let d = mlx_rs::ops::subtract(a, b).unwrap();
-    let ad = mlx_rs::ops::abs(&d).unwrap();
-    mlx_rs::ops::max(&ad, None).unwrap().item::<f32>()
-}
-
-fn max_abs(a: &Array) -> f32 {
-    mlx_rs::ops::max(mlx_rs::ops::abs(a).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
 }
 
 /// Load the tiny DiT + wrap it in the causal transformer, and build the per-prompt cross-attention KV.

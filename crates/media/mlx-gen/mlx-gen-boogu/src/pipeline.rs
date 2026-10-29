@@ -39,7 +39,7 @@ use mlx_gen::img2img::{
 use mlx_gen::media::Image;
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, GenerationRequest, LatentDecoder,
-    Progress, Result, TimestepConvention,
+    Progress, Result, SamplerRun, TimestepConvention,
 };
 
 use std::cell::RefCell;
@@ -640,13 +640,15 @@ impl BooguHeavy {
         let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
         let scale = opts.text_guidance_scale;
         let lat = run_flow_sampler(
-            opts.sampler.as_deref(),
+            SamplerRun {
+                sampler_name: opts.sampler.as_deref(),
+                sigmas,
+                seed: opts.seed,
+                cancel,
+                on_progress,
+            },
             TimestepConvention::OneMinusSigma,
-            sigmas,
             lat,
-            opts.seed,
-            cancel,
-            on_progress,
             |x, timestep| self.base_velocity(x, timestep, c, scale),
         )?;
         on_progress(Progress::Decoding);
@@ -676,13 +678,15 @@ impl BooguHeavy {
         let denoise_sigmas = &sigmas[start..];
         let scale = opts.text_guidance_scale;
         let lat = run_flow_sampler(
-            opts.sampler.as_deref(),
+            SamplerRun {
+                sampler_name: opts.sampler.as_deref(),
+                sigmas: denoise_sigmas,
+                seed: opts.seed,
+                cancel,
+                on_progress,
+            },
             TimestepConvention::OneMinusSigma,
-            denoise_sigmas,
             lat,
-            opts.seed,
-            cancel,
-            on_progress,
             |x, timestep| self.base_velocity(x, timestep, c, scale),
         )?;
         on_progress(Progress::Decoding);
@@ -710,13 +714,15 @@ impl BooguHeavy {
             let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
             let sigmas = resolve_flow_schedule(opts.scheduler.as_deref(), 0.0, opts.steps, &native);
             let lat = run_flow_sampler(
-                Some(sampler),
+                SamplerRun {
+                    sampler_name: Some(sampler),
+                    sigmas: &sigmas,
+                    seed: opts.seed,
+                    cancel,
+                    on_progress,
+                },
                 TimestepConvention::OneMinusSigma,
-                &sigmas,
                 lat,
-                opts.seed,
-                cancel,
-                on_progress,
                 |x, timestep| self.turbo_velocity(x, timestep, cond, mask),
             )?;
             on_progress(Progress::Decoding);
@@ -767,13 +773,15 @@ impl BooguHeavy {
             let lat = add_noise_by_interpolation(clean, &noise, full[start])?;
             let sigmas = &full[start..];
             let lat = run_flow_sampler(
-                Some(sampler),
+                SamplerRun {
+                    sampler_name: Some(sampler),
+                    sigmas,
+                    seed: opts.seed,
+                    cancel,
+                    on_progress,
+                },
                 TimestepConvention::OneMinusSigma,
-                sigmas,
                 lat,
-                opts.seed,
-                cancel,
-                on_progress,
                 |x, timestep| self.turbo_velocity(x, timestep, cond, mask),
             )?;
             on_progress(Progress::Decoding);
@@ -819,13 +827,15 @@ impl BooguHeavy {
         let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
         let scale = opts.text_guidance_scale;
         let lat = run_flow_sampler(
-            opts.sampler.as_deref(),
+            SamplerRun {
+                sampler_name: opts.sampler.as_deref(),
+                sigmas,
+                seed: opts.seed,
+                cancel,
+                on_progress,
+            },
             TimestepConvention::OneMinusSigma,
-            sigmas,
             lat,
-            opts.seed,
-            cancel,
-            on_progress,
             |x, timestep| self.edit_velocity(x, ref_latents, timestep, c, scale),
         )?;
         on_progress(Progress::Decoding);

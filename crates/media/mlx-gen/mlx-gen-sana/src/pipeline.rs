@@ -53,7 +53,7 @@ use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_in
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::{
     run_flow_sampler_with_latent_hook, CancelFlag, Error, FlowMatchEuler, Image, PreviewSink,
-    Progress, Result, StagedHeavy, TimestepConvention,
+    Progress, Result, SamplerRun, StagedHeavy, TimestepConvention,
 };
 use mlx_rs::ops::{add, divide, multiply, subtract};
 use mlx_rs::{random, Array};
@@ -254,13 +254,15 @@ pub(crate) fn denoise_cfg_with_memory(
     let sigmas = &scheduler.sigmas[start_step.min(scheduler.sigmas.len().saturating_sub(1))..];
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     run_flow_sampler_with_latent_hook(
-        sampler_name,
+        SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::Sigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         |latents, sigma| {
             crate::preview::emit_base_preview(preview, &previews, sigmas, sigma, latents);
         },

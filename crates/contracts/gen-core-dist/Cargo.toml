@@ -1,0 +1,32 @@
+[package]
+name = "sceneworks-gen-core-dist"
+version = "0.1.0"
+edition = "2021"
+description = "Host TCP collective transport for the backend-neutral Iris distributed-training contract in gen-core."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["training", "distributed", "collective", "contract"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_dist::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_dist"
+
+[dependencies]
+# The backend-neutral distributed contract this transport implements (`Collective`, `World`,
+# `DistError`, …) lives in gen-core's `iris::train::dist`; this crate holds only the `std::net`
+# transport and its socket FFI, moved out of gen-core in sc-27316. Tensor-free, like gen-core.
+sceneworks-gen-core = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# TCP keepalive socket options (`setsockopt`) on the transport sockets.
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# TCP keepalive socket options (`setsockopt`, `WSAIoctl(SIO_KEEPALIVE_VALS)`) on Windows.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }
+
+[dev-dependencies]
+# Self-removing fixture roots for the checkpoint-lineage-over-TCP tests.
+tempfile = { workspace = true }

@@ -9,9 +9,9 @@ use std::sync::Arc;
 use candle_gen::gen_core::{
     self, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
     MemoryContractSurfaceSelector, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier,
+    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyCapability, MemoryStrategySupport, Precision,
     ResidentOnlyMemoryContractRegistration, ResidentRequestMemory, WeightsSource,
 };
@@ -659,22 +659,19 @@ fn validate_context(
             crate::MODEL_ID
         )));
     }
-    match gen_core::standard_memory_strategy_safety_check(
+    candle_gen::request_scope::admit(gen_core::standard_memory_strategy_safety_check(
         &prepared.contract,
         context,
         Some(prepared.tier),
         None,
-    ) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    ))
 }
 
 pub fn safety_check(
     prepared: &PreparedSvdMemory,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_result(validate_context(prepared, context))
+    MemorySafetyDecision::from_validation(validate_context(prepared, context))
 }
 
 thread_local! {
@@ -740,26 +737,7 @@ impl MemoryRequestScope for SvdRequestScope {
         Ok(())
     }
 
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.enter_phase(phase)
-    }
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.leave_phase(phase)
-    }
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.core.configure_decode(edge, overlap, geometry)
-    }
-    fn configure_attention(&mut self, size: u32) -> gen_core::Result<()> {
-        self.core.configure_attention(size)
-    }
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
-        self.core.materialize_transformer_window(first, count)
-    }
+    candle_gen::gen_core::delegate_memory_request_scope!(core);
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         let result = self.core.finish(outcome);
         if self.armed {
@@ -810,9 +788,7 @@ pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
                 crate::MODEL_ID
             ),
         },
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     },
 };
 

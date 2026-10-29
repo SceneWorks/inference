@@ -338,17 +338,12 @@ impl Generator for MageEditGenerator {
             return gen_core::MemorySafetyDecision::Accept;
         };
         match memory_strategy::validate_context(contract, context, self.loaded_quant) {
-            Ok(()) => match self.memory_admission.approve(context) {
-                Ok(()) => gen_core::MemorySafetyDecision::Accept,
-                Err(error) => gen_core::MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                },
-            },
+            Ok(()) => gen_core::MemorySafetyDecision::from_validation(
+                self.memory_admission.approve(context),
+            ),
             Err(error) => {
                 self.memory_admission.clear_approval();
-                gen_core::MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                }
+                gen_core::MemorySafetyDecision::rejected(error)
             }
         }
     }
@@ -602,17 +597,12 @@ impl Generator for MageGenerator {
             return gen_core::MemorySafetyDecision::Accept;
         };
         match memory_strategy::validate_context(contract, context, self.loaded_quant) {
-            Ok(()) => match self.memory_admission.approve(context) {
-                Ok(()) => gen_core::MemorySafetyDecision::Accept,
-                Err(error) => gen_core::MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                },
-            },
+            Ok(()) => gen_core::MemorySafetyDecision::from_validation(
+                self.memory_admission.approve(context),
+            ),
             Err(error) => {
                 self.memory_admission.clear_approval();
-                gen_core::MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                }
+                gen_core::MemorySafetyDecision::rejected(error)
             }
         }
     }

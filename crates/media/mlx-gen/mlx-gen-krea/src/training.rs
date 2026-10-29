@@ -57,9 +57,6 @@ use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
-use mlx_gen::train::flow::{
-    sample_unit_timestep as sample_sigma, validate_flow_match_request, validate_shared_floors,
-};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -71,10 +68,12 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
+use mlx_gen::train::vocab::{sample_timestep, validate_common_request};
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Error, LoadSpec, Modality, NetworkType, Precision, Progress,
-    Result, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
-    TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
+    Result, SamplerRun, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
+    WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -253,12 +252,12 @@ mlx_gen::register_trainer! {
 /// `timestep_type`/`timestep_bias`/`loss_type`. `gradient_checkpointing` is a supported toggle (the
 /// checkpointed DiT forward + the OOM preflight guard are wired in [`KreaRawTrainer::train_impl`]).
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    validate_flow_match_request(req, "krea trainer")
+    validate_common_request("krea trainer", req)
 }
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    validate_shared_floors(descriptor, req)?;
+    mlx_gen::train::vocab::validate_shared_floors(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }
@@ -288,10 +287,23 @@ impl Trainer for KreaRawTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -302,6 +314,7 @@ impl KreaRawTrainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         validate_request(req)?;
         let cfg = &req.config;
@@ -581,7 +594,7 @@ impl KreaRawTrainer {
             let picked = step_sample(aux_driver.as_mut(), step, &schedule);
             let entry = picked.entry;
             let (x0, context, mask_weight) = &cache[entry];
-            let mut t = sample_sigma(
+            let mut t = sample_timestep(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
                 cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
@@ -705,11 +718,19 @@ impl KreaRawTrainer {
                             prompt: prompt.clone(),
                             image,
                         }),
-                        Err(e) => eprintln!(
-                            "[sc-5637] {KREA_2_RAW_TRAINER_ID} preview sample failed at step {step} \
-                             (prompt {}): {e} — skipping this preview, training continues",
-                            i + 1
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[sc-5637] {KREA_2_RAW_TRAINER_ID} preview sample failed at step \
+                                 {step} (prompt {}): {e} — skipping this preview, training \
+                                 continues",
+                                i + 1
+                            );
+                            warnings.push(gen_core::train::preview_sample_failed(
+                                step,
+                                i as u32 + 1,
+                                &e,
+                            ));
+                        }
                     }
                 }
             }
@@ -974,13 +995,7 @@ fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// Encode a center-cropped square image into a Krea training latent `[1, 16, edge/8, edge/8]` — the
@@ -1175,13 +1190,15 @@ fn render_sample(
     // F-077: honor the training request's cancel per denoise step. Previously a fresh
     // `CancelFlag::new()` here meant the preview render could never be cancelled mid-denoise.
     let lat = run_flow_sampler(
-        None,
+        SamplerRun {
+            sampler_name: None,
+            sigmas: &sigmas,
+            seed,
+            cancel,
+            on_progress: &mut |_: Progress| {},
+        },
         TimestepConvention::Sigma,
-        &sigmas,
         noise,
-        seed,
-        cancel,
-        &mut |_: Progress| {},
         |x, timestep| {
             let tt = Array::from_slice(&[timestep], &[1]);
             let v_cond = dit.forward_prepared(x, &tt, &prep_pos)?;
@@ -1416,8 +1433,8 @@ mod tests {
     fn sample_sigma_is_deterministic_and_in_range() {
         for kind in ["sigmoid", "linear", "weighted"] {
             for bias in ["balanced", "high", "low"] {
-                let a = sample_sigma(kind, bias, 42).unwrap();
-                let b = sample_sigma(kind, bias, 42).unwrap();
+                let a = sample_timestep(kind, bias, 42).unwrap();
+                let b = sample_timestep(kind, bias, 42).unwrap();
                 assert_eq!(a, b, "{kind}/{bias} must be deterministic in seed");
                 assert!(
                     (1e-3..=1.0 - 1e-3).contains(&a),
@@ -1426,8 +1443,8 @@ mod tests {
             }
         }
         assert!(
-            sample_sigma("sigmoid", "high", 7).unwrap()
-                > sample_sigma("sigmoid", "low", 7).unwrap()
+            sample_timestep("sigmoid", "high", 7).unwrap()
+                > sample_timestep("sigmoid", "low", 7).unwrap()
         );
     }
 

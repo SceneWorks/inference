@@ -22,7 +22,7 @@ cuda = ["candle-gen/cuda", "candle-gen-sdxl/cuda", "candle-transformers/cuda"]
 metal = ["candle-gen/metal", "candle-gen-sdxl/metal", "candle-transformers/metal"]
 
 [dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 

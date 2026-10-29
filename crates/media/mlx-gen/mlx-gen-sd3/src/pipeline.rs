@@ -19,7 +19,7 @@
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, FlowMatchEuler, Image,
-    PreviewSink, Progress, Result, TimestepConvention,
+    PreviewSink, Progress, Result, SamplerRun, TimestepConvention,
 };
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -171,13 +171,15 @@ fn denoise_over_sigmas(
     };
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     run_flow_sampler_with_latent_hook(
-        sampler_name,
+        SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::Sigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         |latents, sigma| {
             crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents);
         },
@@ -688,6 +690,23 @@ mod tests {
             matches!(resolve_clip_pad_id(&f_dir), Err(mlx_gen::Error::Io(_))),
             "a present unreadable config must preserve the typed IO error"
         );
+
+        // sc-27443: once a pad token is configured, the vocab must resolve it — no eos fallback.
+        let v_dir = synthetic_clip_tokenizer_dir(&tmp, "padv", "!");
+        let vocab_error = |dir: &std::path::Path, needle: &str| {
+            let error = resolve_clip_pad_id(dir).unwrap_err();
+            assert!(
+                matches!(error, mlx_gen::Error::Msg(ref message) if
+                message.contains("vocab.json") && message.contains(needle)),
+                "expected a contextual vocab error containing {needle:?}, got: {error}"
+            );
+        };
+        std::fs::write(v_dir.join("vocab.json"), "{").unwrap();
+        vocab_error(&v_dir, "parse");
+        std::fs::write(v_dir.join("vocab.json"), r#"{"<|endoftext|>": 49407}"#).unwrap();
+        vocab_error(&v_dir, "not in");
+        std::fs::remove_file(v_dir.join("vocab.json")).unwrap();
+        vocab_error(&v_dir, "read");
     }
 
     #[test]

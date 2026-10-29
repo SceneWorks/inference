@@ -73,7 +73,7 @@ jobs:
           if [ "$rc" != 0 ] && [ "$rc" != 1 ]; then exit "$rc"; fi
       - name: Run only registered exhaustive MLX cases
         run: |
-          python3 scripts/ci/test_suites.py --deadline-seconds 7200 exhaustive -- cargo test --locked --lib --tests -j 1 -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
+          python3 scripts/ci/test_suites.py --deadline-seconds 7200 exhaustive -- cargo test --locked --lib --tests -j 1 -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos --features mlx-llm/campaign
 
   candle-cuda:
     if: github.event_name == 'workflow_dispatch' && github.repository == 'SceneWorks/inference'

@@ -12,8 +12,8 @@
 
 use mlx_gen::gen_core::iris::{IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{
-    GenerationMemory, LoadShape, MemoryGeometry, MemoryMode, MemoryNumericTier, MemorySelection,
-    MemoryStrategy, MemoryStrategySupport,
+    GenerationMemory, LoadShape, MemoryGeometry, MemoryMode, MemorySelection, MemoryStrategy,
+    MemoryStrategySupport,
 };
 use mlx_gen::ios_anchor_law::{area, derive_certified, measure_phases, MeasuredRun, NotDerivable};
 use mlx_gen::ios_pricing::{IosAnchorObservation, IosPhase, IosPricing, IosPricingRequest};
@@ -54,11 +54,7 @@ fn proved_selections(
     GenerationMemory,
 )> {
     let contract = crate::memory_strategy::memory_strategy_contract(provider, spec).unwrap();
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let tier = mlx_gen::request_scope::loaded_tier(spec);
     let optimized = MemoryStrategy::ALL
         .into_iter()
         .rev()

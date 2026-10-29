@@ -34,20 +34,16 @@
 //! hand-computed literals — an architecture/formula reimplementation, **not** a line-for-line
 //! transcription of the reference's source structure.
 
-use mlx_rs::ops::{add, multiply, subtract};
+use mlx_rs::ops::{add, subtract};
 use mlx_rs::Array;
 
+// `x · f64`, the weak scalar rounded to the array's f32 dtype, is core's `fscale` (sc-27448).
+use mlx_gen::array::fscale;
 use mlx_gen::{Error, Result};
 
 /// Flow-matching training horizon (the reference's `num_train_timesteps`) — the resolution of the
 /// full sigma/timestep table a `denoising_step_list` timestep is looked up against.
 pub const NUM_TRAIN_TIMESTEPS: usize = 1000;
-
-/// Multiply a latent-dtype array by an `f64` scalar (rounded to the array's dtype), mirroring
-/// [`mlx_gen_wan::scheduler`]'s `fscale` — the weak scalar adopts the array dtype.
-fn fscale(a: &Array, c: f64) -> Result<Array> {
-    Ok(multiply(a, Array::from_f32(c as f32))?)
-}
 
 /// The Euler flow-matching `x0` estimate: `x0 = latents − σ_t · v`, where `v` is the model velocity
 /// (`noise_pred`) and `σ_t` is the current step's sigma. Exposed as a pure, testable unit.

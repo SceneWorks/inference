@@ -18,17 +18,13 @@ use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_exact, linear};
-use mlx_gen::weights::Weights;
+use mlx_gen::weights::{join, Weights};
 use mlx_gen::{Error, Result};
 
 /// nn.LayerNorm default epsilon (the IDFormer/PuLID modules; NOT the EVA 1e-6).
 const EPS: f32 = 1e-5;
 /// nn.LeakyReLU default negative slope.
 const LEAKY: f32 = 0.01;
-
-fn join(p: &str, leaf: &str) -> String {
-    format!("{p}.{leaf}")
-}
 
 fn leaky_relu(x: &Array) -> Result<Array> {
     Ok(maximum(

@@ -1,7 +1,7 @@
 //! Additive ignored current-donor trajectory observer. No production changes or acceptance.
 use super::*;
 use mlx_gen::gen_core::sampling::TimestepConvention;
-use mlx_gen::{run_flow_sampler_with_latent_hook, CancelFlag};
+use mlx_gen::{run_flow_sampler_with_latent_hook, CancelFlag, SamplerRun};
 #[path = "conditioning_trajectory_math.rs"]
 mod trajectory_math;
 
@@ -348,13 +348,15 @@ fn run() -> Result<()> {
             .collect::<Vec<_>>();
         let mut observed = Vec::new();
         let final_native = run_flow_sampler_with_latent_hook(
-            None,
+            SamplerRun {
+                sampler_name: None,
+                sigmas: &params.sigmas,
+                seed: 24163,
+                cancel: &cancel,
+                on_progress: &mut |_| {},
+            },
             TimestepConvention::Sigma,
-            &params.sigmas,
             noise.array(),
-            24163,
-            &cancel,
-            &mut |_| {},
             |_, _| {},
             |x, sigma| {
                 let step = observed.len();

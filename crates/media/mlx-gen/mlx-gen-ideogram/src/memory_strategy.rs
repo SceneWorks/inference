@@ -551,11 +551,7 @@ pub(crate) fn registered_valid_fixture(
     let context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        },
+        mlx_gen::request_scope::loaded_tier(spec),
         mlx_gen::gen_core::MemoryBehaviorRoute {
             mode: mlx_gen::gen_core::MemoryMode::TextToImage,
             reference_count: 0,
@@ -590,31 +586,30 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } =
-        safety_check(contract, precision, quant, context)
-    {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        Ideogram4DitConfig::v4().num_layers.max(0) as usize,
-        // Rung 2 is `Missing` (see [`DECODE_SUPPORT`]), so no tile geometry is ever in domain.
-        //
-        // Written as a brace-free closure over a named constructor, the shape
-        // `mlx-gen-kolors/src/memory_strategy.rs:1414` already ships. `scripts/check-workspace.py`'s
-        // `check_pid_decode_route_adoption` exempts a rung-2-`Missing` provider only when every
-        // decode validator it installs is one unconditional `Err(...)`, and its
-        // `_is_single_err_expression` reader rejects both a `{ … }` body and a macro inside the
-        // `Err` argument — a macro body is opaque to it, so `format!` there arms the gate.
-        move |_use_pid, edge, overlap| Err(refuse_decode(provider_id, edge, overlap)),
-    )?;
-    config.load_shape = contract.load_shape;
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(
+        safety_check(contract, precision, quant, context),
+        cleanup,
+        move || {
+            let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+                provider_id,
+                context.geometry,
+                contract.generation_memory(&context.selection),
+                context.use_pid,
+                Ideogram4DitConfig::v4().num_layers.max(0) as usize,
+                // Rung 2 is `Missing` (see [`DECODE_SUPPORT`]), so no tile geometry is ever in domain.
+                //
+                // Written as a brace-free closure over a named constructor, the shape
+                // `mlx-gen-kolors/src/memory_strategy.rs:1414` already ships. `scripts/check-workspace.py`'s
+                // `check_pid_decode_route_adoption` exempts a rung-2-`Missing` provider only when every
+                // decode validator it installs is one unconditional `Err(...)`, and its
+                // `_is_single_err_expression` reader rejects both a `{ … }` body and a macro inside the
+                // `Err` argument — a macro body is opaque to it, so `format!` there arms the gate.
+                move |_use_pid, edge, overlap| Err(refuse_decode(provider_id, edge, overlap)),
+            )?;
+            config.load_shape = contract.load_shape;
+            Ok(config)
+        },
+    )
 }
 
 pub(crate) fn registered_begin_request(

@@ -27,7 +27,6 @@ pub mod model_control;
 pub mod model_edit;
 pub mod pipeline;
 pub mod preview;
-pub mod quant;
 pub mod sampler;
 pub mod text_encoder;
 pub mod transformer;

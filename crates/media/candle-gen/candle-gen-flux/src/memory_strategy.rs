@@ -602,7 +602,7 @@ pub(crate) fn admission_safety_check(
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_result(validate_context(
+    MemorySafetyDecision::from_validation(validate_context(
         provider_id,
         contract,
         context,
@@ -796,9 +796,7 @@ pub(crate) fn registered_safety_check(
 ) -> MemorySafetyDecision {
     match snapshot_quant_tier(spec, &contract.provider_id) {
         Ok(quant) => admission_safety_check(&contract.provider_id, contract, context, quant),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 

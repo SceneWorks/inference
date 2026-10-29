@@ -98,17 +98,20 @@ jobs:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
           DIAGNOSTIC_PID: ${{ inputs.diagnostic_pid }}
+          CUDA_SCHEDULING_MODE: ${{ inputs.cuda_scheduling_mode }}
+          IDLE_CUDA_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
           GH_TOKEN: ${{ github.token }}
         run: |
           if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_engine_sha must be 40 lowercase hex' }
           if ($env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_control_sha must be 40 lowercase hex' }
           if ($env:DIAGNOSTIC_PID -notmatch '^(0|[1-9][0-9]*)$') { throw 'diagnostic_pid must be 0 or a positive decimal PID' }
+          if ($env:IDLE_CUDA_CONTEXT_RUN_ID -notmatch '^([1-9][0-9]*)?$') { throw 'idle_cuda_context_run_id must be empty or a positive decimal run id' }
           if ($env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA -or (git rev-parse HEAD).Trim() -cne $env:EXPECTED_CONTROL_SHA) { throw 'workflow control SHA mismatch' }
           if ((git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA) { throw 'engine SHA mismatch' }
           if (git status --porcelain --untracked-files=normal) { throw 'workflow control checkout is dirty' }
           if (git -C ../engine status --porcelain --untracked-files=normal) { throw 'engine checkout is dirty' }
-          if ('${{ inputs.cuda_scheduling_mode }}' -eq 'gpu0-with-reviewed-gpu1') {
-            if ($env:RUNNER_NAME -cne 'cuda-windows-2' -or '${{ inputs.idle_cuda_context_run_id }}' -ne '') { throw 'reviewed GPU1 diagnostic requires the other Windows listener and empty receipt' }
+          if ($env:CUDA_SCHEDULING_MODE -eq 'gpu0-with-reviewed-gpu1') {
+            if ($env:RUNNER_NAME -cne 'cuda-windows-2' -or $env:IDLE_CUDA_CONTEXT_RUN_ID -ne '') { throw 'reviewed GPU1 diagnostic requires the other Windows listener and empty receipt' }
             $jobs = gh api "repos/SceneWorks/inference/actions/runs/$env:GITHUB_RUN_ID/attempts/1/jobs?per_page=100" | ConvertFrom-Json
             $selected = @($jobs.jobs | Where-Object { $_.name -eq 'cuda_diagnostic' -and $_.status -eq 'in_progress' })
             if ($jobs.total_count -ne $jobs.jobs.Count -or $selected.Count -ne 1 -or $selected[0].runner_name -cne 'cuda-windows-2' -or $selected[0].runner_id -ne 2619 -or $selected[0].run_id -ne [int64]$env:GITHUB_RUN_ID -or $selected[0].head_sha -cne $env:EXPECTED_CONTROL_SHA) { throw 'reviewed GPU1 diagnostic runner/job identity differs' }

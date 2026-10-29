@@ -29,6 +29,7 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv2d_general, silu, upsample_nearest};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
@@ -57,10 +58,6 @@ fn quantum(
 fn nhwc(x: &Array) -> (u64, u64, u64, u64) {
     let s = x.shape();
     (s[0] as u64, s[1] as u64, s[2] as u64, s[3] as u64)
-}
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
 }
 
 fn relu(x: &Array) -> Result<Array> {

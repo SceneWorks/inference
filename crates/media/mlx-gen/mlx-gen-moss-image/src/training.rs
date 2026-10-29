@@ -269,9 +269,28 @@ impl MossImageTrainer {
     #[doc(hidden)]
     pub fn test_memory_plan(&self, req: &TrainingRequest) -> Result<serde_json::Value> {
         let estimate = self.prepare(req)?.estimate;
-        Ok(
-            serde_json::json!({"load_bytes":estimate.load,"cast_bytes":estimate.cast,"cache_bytes":estimate.cache,"backward_bytes":estimate.backward,"preview_bytes":estimate.preview,"checkpoint_bytes":estimate.checkpoint,"encoder_only_peak_bytes":admission::encoder_work(&self.facts.encoder_config,4096).map_err(admission_error)?.checked_add(self.facts.encoder_bytes).and_then(|n|n.checked_add(self.facts.largest_source_shard)).ok_or_else(||Error::Unsupported("encoder-only peak overflow".into()))?,"host_staging_peak_bytes":0,"unified_memory":true,"tensor_peak_bytes":estimate.peak(),"context_tokens":estimate.context_token_bound,"source_shard_bytes":self.facts.largest_source_shard,"encoder_resident_bytes":self.facts.encoder_bytes,"vae_resident_bytes":self.facts.vae_bytes,"trainable_elements":estimate.trainable_elements,"cache_bytes_persistent":estimate.cache_bytes}),
-        )
+        Ok(serde_json::json!({
+            "load_bytes": estimate.load,
+            "cast_bytes": estimate.cast,
+            "cache_bytes": estimate.cache,
+            "backward_bytes": estimate.backward,
+            "preview_bytes": estimate.preview,
+            "checkpoint_bytes": estimate.checkpoint,
+            "encoder_only_peak_bytes": admission::encoder_work(&self.facts.encoder_config, 4096)
+                .map_err(admission_error)?
+                .checked_add(self.facts.encoder_bytes)
+                .and_then(|n| n.checked_add(self.facts.largest_source_shard))
+                .ok_or_else(|| Error::Unsupported("encoder-only peak overflow".into()))?,
+            "host_staging_peak_bytes": 0,
+            "unified_memory": true,
+            "tensor_peak_bytes": estimate.peak(),
+            "context_tokens": estimate.context_token_bound,
+            "source_shard_bytes": self.facts.largest_source_shard,
+            "encoder_resident_bytes": self.facts.encoder_bytes,
+            "vae_resident_bytes": self.facts.vae_bytes,
+            "trainable_elements": estimate.trainable_elements,
+            "cache_bytes_persistent": estimate.cache_bytes
+        }))
     }
     pub fn set_memory_budget_override(&mut self, bytes: Option<u64>) {
         self.memory_budget_override = bytes;

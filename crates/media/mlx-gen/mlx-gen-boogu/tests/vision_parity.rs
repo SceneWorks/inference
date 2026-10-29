@@ -18,6 +18,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::require_env_path;
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::load_vision_tower;
 use mlx_gen_boogu::vision::preprocess::preprocess_image;
@@ -31,10 +32,6 @@ fn cosine(a: &Array, b: &Array) -> f32 {
     let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
     let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
     (dot / (na * nb)).item::<f32>()
-}
-
-fn snapshot_dir() -> PathBuf {
-    PathBuf::from(std::env::var("BOOGU_BASE_DIR").expect("set BOOGU_BASE_DIR to the snapshot root"))
 }
 
 fn golden_path() -> PathBuf {
@@ -62,7 +59,11 @@ fn grid_from_golden(g: &Weights) -> Vec<[i32; 3]> {
 #[ignore = "needs real weights + golden (dump_boogu_vision_golden.py)"]
 fn vision_tower_matches_reference() {
     let g = Weights::from_file(golden_path()).expect("golden — run dump_boogu_vision_golden.py");
-    let tower = load_vision_tower(snapshot_dir()).expect("load Qwen3-VL vision tower (f32)");
+    let tower = load_vision_tower(require_env_path(
+        "BOOGU_BASE_DIR",
+        "the Boogu snapshot root",
+    ))
+    .expect("load Qwen3-VL vision tower (f32)");
 
     let grid = grid_from_golden(&g);
     let pv = g

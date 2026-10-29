@@ -115,7 +115,7 @@ mask, geometry, dtype, snapshot/prompt digests, and inference revision, plus
 (child footprint cap, host reserve, deadline). One command captures and compares:
 
 ```sh
-cargo run --locked --release -p mlx-llm --bin sc20677_capture_kv -- parent \
+cargo run --locked --release -p mlx-llm --features campaign --bin sc20677_capture_kv -- parent \
   --snapshot <llama-4bit-snapshot> --prompt-file <prompt.txt> --tokens 8192 \
   --layers 0,mid,last --safety-policy <policy.json> --out /abs/sc20677-kv-llama && \
 cargo run --locked --release -p mlx-llm --bin sc20677_kv_candidates -- \

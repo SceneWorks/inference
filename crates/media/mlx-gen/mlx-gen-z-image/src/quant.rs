@@ -18,7 +18,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 /// Group size the converter writes — the codebase-wide `mlx_gen::quant::DEFAULT_GROUP_SIZE` (64).
-pub(crate) const GROUP_SIZE: i32 = 64;
+pub(crate) const GROUP_SIZE: i32 = mlx_gen::quant::DEFAULT_GROUP_SIZE;
 
 // Constructor policy, shared by the actual module loaders and header-only conversion pricing.
 // An authored sibling bias is not a module parameter when the corresponding flag is false.

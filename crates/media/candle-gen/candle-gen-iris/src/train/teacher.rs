@@ -5,7 +5,7 @@
 //! the same backend-neutral resampling matrices from `gen_core::iris::train::repa`.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
@@ -21,14 +21,7 @@ pub struct Teacher {
     w: HashMap<String, Tensor>,
 }
 
-/// Resolve a teacher resource path: a directory holding `model.safetensors`, or the file.
-pub fn teacher_file(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.join(contract::TEACHER_WEIGHTS_FILE)
-    } else {
-        path.to_path_buf()
-    }
-}
+pub use candle_gen::gen_core::iris::train::repa::teacher_file;
 
 fn mat(m: Vec<f32>, rows: usize, cols: usize, device: &Device) -> Result<Tensor> {
     Ok(Tensor::from_vec(m, (rows, cols), device)?)

@@ -1,21 +1,13 @@
 //! Qwen3 decoder block (pre-norm residual): `h += attn(input_ln(h))`, then `h += mlp(post_ln(h))`.
+//! The shared [`Qwen3TextDecoderLayer`] (sc-27326) over Boogu's packed-detect `lin` loads (group 32), upcast projections.
 
-use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::add;
 use mlx_rs::Array;
 
+use mlx_gen::text_decoder::{Qwen3TextConfig, Qwen3TextDecoderLayer};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::{join, Qwen3Attention, Qwen3Mlp};
-
-pub struct Qwen3DecoderLayer {
-    input_ln: Array,
-    post_ln: Array,
-    attn: Qwen3Attention,
-    mlp: Qwen3Mlp,
-    eps: f32,
-}
+pub struct Qwen3DecoderLayer(Qwen3TextDecoderLayer);
 
 impl Qwen3DecoderLayer {
     pub fn from_weights(
@@ -26,34 +18,27 @@ impl Qwen3DecoderLayer {
         head_dim: i32,
         eps: f32,
     ) -> Result<Self> {
-        Ok(Self {
-            input_ln: w.require(&join(prefix, "input_layernorm.weight"))?.clone(),
-            post_ln: w
-                .require(&join(prefix, "post_attention_layernorm.weight"))?
-                .clone(),
-            attn: Qwen3Attention::from_weights(
-                w,
-                &join(prefix, "self_attn"),
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                eps,
-            )?,
-            mlp: Qwen3Mlp::from_weights(w, &join(prefix, "mlp"))?,
+        let cfg = Qwen3TextConfig {
+            num_heads,
+            num_kv_heads,
+            head_dim,
             eps,
-        })
+            qk_norm: true,
+            upcast: true,
+        };
+        Ok(Self(Qwen3TextDecoderLayer::from_weights(
+            w,
+            prefix,
+            cfg,
+            |key| super::lin(w, key),
+        )?))
     }
 
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
-        let normed = rms_norm(x, &self.input_ln, self.eps)?;
-        let h = add(x, &self.attn.forward(&normed, cos, sin, mask)?)?;
-        let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
-        Ok(add(&h, &self.mlp.forward(&normed2)?)?)
+        self.0.forward(x, cos, sin, mask)
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.attn.quantize(bits)?;
-        self.mlp.quantize(bits)?;
-        Ok(())
+        self.0.quantize(bits, Some(crate::quant::GROUP_SIZE))
     }
 }

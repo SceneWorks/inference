@@ -6,18 +6,14 @@
 //! before construction so the caller can reject an impossible resident load instead of discovering
 //! it after Metal allocation has begun.
 
-use std::{
-    fs::File,
-    io::{BufReader, Read},
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use mlx_gen::gen_core::{
-    default_memory_strategy_safety_check, MemoryBackendRealization, MemoryCalibrationIdentity,
-    MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryPhase, MemoryProviderContract, MemoryRegistration,
-    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategySupport, ResidentOnlyMemoryContractRegistration,
+    default_memory_strategy_safety_check, ArtifactSeal, MemoryBackendRealization,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryPhase, MemoryProviderContract,
+    MemoryRegistration, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategySupport, ResidentOnlyMemoryContractRegistration,
 };
 use mlx_gen::{Error, LoadSpec, Result, WeightsSource};
 use sha2::{Digest, Sha256};
@@ -133,179 +129,44 @@ fn required_direct_files(root: &Path, resolved_tier: &str) -> Result<Vec<PathBuf
         .collect())
 }
 
-fn dtype_bytes(dtype: &str) -> Option<u64> {
-    Some(match dtype {
-        "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" => 1,
-        "I16" | "U16" | "F16" | "BF16" => 2,
-        "I32" | "U32" | "F32" => 4,
-        "I64" | "U64" | "F64" => 8,
-        _ => return None,
-    })
-}
-
-fn inspect_safetensors(path: &Path) -> Result<PhysicalFile> {
-    let mut file =
-        File::open(path).map_err(|error| Error::Msg(format!("{}: {error}", path.display())))?;
-    let size = file
-        .metadata()
-        .map_err(|error| Error::Msg(format!("{}: {error}", path.display())))?
-        .len();
-    let mut prefix = [0_u8; 8];
-    file.read_exact(&mut prefix).map_err(|error| {
+/// Logical tensor bytes of one safetensors file, from the shared header validation
+/// (`gen_core::weightsmeta`: bounded header, checked shape x dtype widths, contiguous payload that
+/// exactly covers the file). Krea additionally refuses an empty file and a zero-byte tensor.
+fn logical_bytes(path: &Path) -> Result<u64> {
+    let invalid = |reason: String| {
         Error::Unsupported(format!(
-            "{MODEL_ID}: invalid safetensors {}: {error}",
+            "{MODEL_ID}: invalid safetensors {}: {reason}",
             path.display()
         ))
-    })?;
-    let header_len = u64::from_le_bytes(prefix);
-    let header_len_usize = usize::try_from(header_len)
-        .map_err(|_| Error::Unsupported(format!("{MODEL_ID}: oversized safetensors header")))?;
-    if header_len == 0
-        || header_len > 100_000_000
-        || 8_u64.checked_add(header_len).is_none_or(|n| n > size)
-    {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: invalid safetensors header length in {}",
-            path.display()
-        )));
-    }
-    let mut header = vec![0_u8; header_len_usize];
-    file.read_exact(&mut header).map_err(|error| {
-        Error::Unsupported(format!(
-            "{MODEL_ID}: truncated safetensors header {}: {error}",
-            path.display()
-        ))
-    })?;
-    let value: serde_json::Value = serde_json::from_slice(&header).map_err(|error| {
-        Error::Unsupported(format!(
-            "{MODEL_ID}: invalid safetensors header {}: {error}",
-            path.display()
-        ))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        Error::Unsupported(format!(
-            "{MODEL_ID}: safetensors header is not an object: {}",
-            path.display()
-        ))
-    })?;
-    let mut tensors = Vec::new();
-    for (name, info) in object {
-        if name == "__metadata__" {
-            continue;
-        }
-        let dtype = info
-            .get("dtype")
-            .and_then(serde_json::Value::as_str)
-            .and_then(dtype_bytes)
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "{MODEL_ID}: invalid tensor dtype in {}",
-                    path.display()
-                ))
-            })?;
-        let elements = info
-            .get("shape")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "{MODEL_ID}: invalid tensor shape in {}",
-                    path.display()
-                ))
-            })?
+    };
+    let layout = mlx_gen::gen_core::weightsmeta::safetensors_file_tensor_locations(path)
+        .map_err(|error| invalid(error.to_string()))?;
+    if layout.tensors.is_empty()
+        || layout
+            .tensors
             .iter()
-            .try_fold(1_u64, |product, dim| product.checked_mul(dim.as_u64()?))
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "{MODEL_ID}: tensor shape overflow in {}",
-                    path.display()
-                ))
-            })?;
-        let offsets = info
-            .get("data_offsets")
-            .and_then(serde_json::Value::as_array)
-            .filter(|offsets| offsets.len() == 2)
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "{MODEL_ID}: invalid tensor offsets in {}",
-                    path.display()
-                ))
-            })?;
-        let start = offsets[0]
-            .as_u64()
-            .ok_or_else(|| Error::Unsupported(format!("{MODEL_ID}: invalid tensor offset")))?;
-        let end = offsets[1]
-            .as_u64()
-            .ok_or_else(|| Error::Unsupported(format!("{MODEL_ID}: invalid tensor offset")))?;
-        let logical = elements
-            .checked_mul(dtype)
-            .ok_or_else(|| Error::Unsupported(format!("{MODEL_ID}: tensor byte overflow")))?;
-        if end.checked_sub(start) != Some(logical) || logical == 0 {
-            return Err(Error::Unsupported(format!(
-                "{MODEL_ID}: tensor geometry does not match packed data in {}",
-                path.display()
-            )));
-        }
-        tensors.push((start, end, logical));
-    }
-    tensors.sort_by_key(|tensor| tensor.0);
-    if tensors.is_empty()
-        || tensors
-            .iter()
-            .scan(0_u64, |cursor, (start, end, _)| {
-                let valid = *start == *cursor;
-                *cursor = *end;
-                Some(valid)
-            })
-            .any(|valid| !valid)
+            .any(|tensor| tensor.header.data_bytes == 0)
     {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: empty or non-contiguous safetensors geometry in {}",
-            path.display()
-        )));
+        return Err(invalid("empty file or zero-byte tensor".to_owned()));
     }
-    let payload = tensors.last().map(|tensor| tensor.1).unwrap_or(0);
-    if 8_u64
-        .checked_add(header_len)
-        .and_then(|n| n.checked_add(payload))
-        != Some(size)
-    {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: safetensors inventory length does not match its header: {}",
-            path.display()
-        )));
-    }
-    let logical_bytes = tensors
+    layout
+        .tensors
         .iter()
-        .try_fold(0_u64, |sum, tensor| sum.checked_add(tensor.2))
-        .ok_or_else(|| Error::Unsupported(format!("{MODEL_ID}: logical tensor byte overflow")))?;
-    let content_digest = content_digest(path)?;
-    Ok(PhysicalFile {
-        logical_bytes,
-        content_digest,
-    })
+        .try_fold(0_u64, |sum, tensor| {
+            sum.checked_add(tensor.header.data_bytes)
+        })
+        .ok_or_else(|| Error::Unsupported(format!("{MODEL_ID}: logical tensor byte overflow")))
 }
 
+/// Whole-file SHA-256 through the shared [`ArtifactSeal`]: read once per file identity and
+/// reused (after a stat-level replacement check) by every later receipt of the same file.
 fn content_digest(path: &Path) -> Result<String> {
-    let file =
-        File::open(path).map_err(|error| Error::Msg(format!("{}: {error}", path.display())))?;
-    let mut reader = BufReader::new(file);
-    let mut digest = Sha256::new();
-    let mut chunk = [0_u8; 1024 * 1024];
-    loop {
-        let read = reader
-            .read(&mut chunk)
-            .map_err(|error| Error::Msg(format!("{}: {error}", path.display())))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&chunk[..read]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(ArtifactSeal::pin(path)?.content_sha256_hex())
 }
 
 fn inspect_file(path: &Path) -> Result<PhysicalFile> {
-    if path.extension().is_some_and(|ext| ext == "safetensors") {
-        inspect_safetensors(path)
+    let logical_bytes = if path.extension().is_some_and(|ext| ext == "safetensors") {
+        logical_bytes(path)?
     } else {
         let size = std::fs::metadata(path)
             .map_err(|error| Error::Msg(format!("{}: {error}", path.display())))?
@@ -316,11 +177,12 @@ fn inspect_file(path: &Path) -> Result<PhysicalFile> {
                 path.display()
             )));
         }
-        Ok(PhysicalFile {
-            logical_bytes: 0,
-            content_digest: content_digest(path)?,
-        })
-    }
+        0
+    };
+    Ok(PhysicalFile {
+        logical_bytes,
+        content_digest: content_digest(path)?,
+    })
 }
 
 fn tier(spec: &LoadSpec, root: &Path) -> Result<&'static str> {
@@ -470,10 +332,9 @@ fn canonical_artifact_identity_for_source(
     for adapter in &spec.adapters {
         let pin = spec.file_pin_for(&adapter.path)?;
         pin.verify_unchanged()?;
-        let physical = inspect_safetensors(&adapter.path)?;
         digest.update(pin.loader_path().to_string_lossy().as_bytes());
-        digest.update(physical.content_digest.as_bytes());
-        digest.update(physical.logical_bytes.to_le_bytes());
+        digest.update(pin.content_sha256_hex().as_bytes());
+        digest.update(logical_bytes(&adapter.path)?.to_le_bytes());
         digest.update(adapter.scale.to_bits().to_le_bytes());
         digest.update(
             format!(
@@ -502,11 +363,11 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> Result<MemoryProviderContrac
         })
         .try_fold(0_u64, |total, file| {
             total
-                .checked_add(inspect_safetensors(file)?.logical_bytes)
+                .checked_add(logical_bytes(file)?)
                 .ok_or_else(|| Error::Unsupported(format!("{MODEL_ID}: transformer byte overflow")))
         })?;
-    let conditioning_bytes = inspect_safetensors(&root.join(TEXT_ENCODER))?.logical_bytes;
-    let decoder_bytes = inspect_safetensors(&root.join(VAE))?.logical_bytes;
+    let conditioning_bytes = logical_bytes(&root.join(TEXT_ENCODER))?;
+    let decoder_bytes = logical_bytes(&root.join(VAE))?;
     let base_bytes = conditioning_bytes
         .checked_add(transformer_bytes)
         .and_then(|bytes| bytes.checked_add(decoder_bytes))
@@ -518,7 +379,7 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> Result<MemoryProviderContrac
     }
     let overlay_bytes = spec.adapters.iter().try_fold(0_u64, |total, adapter| {
         total
-            .checked_add(inspect_safetensors(&adapter.path)?.logical_bytes)
+            .checked_add(logical_bytes(&adapter.path)?)
             .ok_or_else(|| Error::Unsupported(format!("{MODEL_ID}: adapter byte overflow")))
     })?;
     // `calibration` names the anchor cell this load belongs to — the (provider, artifact tier)
@@ -526,8 +387,8 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> Result<MemoryProviderContrac
     // what makes the cell measurable at all: the capture arm reads the identity off the loaded
     // generator and refuses a contract without one. The immutable artifact receipt below is a
     // separate, finer-grained quantity and stays out of the identity: it changes with every byte
-    // on disk, while the anchor coordinate must be stable across snapshots of the same tier.
-    let _identity = canonical_artifact_identity(spec)?;
+    // on disk, while the anchor coordinate must be stable across snapshots of the same tier. The
+    // receipt itself is checked where a request is admitted ([`safety_check`]).
     contract_from_asset_facts(
         spec,
         production_calibration_identity(spec),
@@ -679,6 +540,23 @@ pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    checked_safety(
+        spec,
+        contract,
+        context,
+        canonical_artifact_identity(spec).is_ok(),
+    )
+}
+
+/// The request-admission checks shared by [`safety_check`] and [`loaded_safety_check`].
+/// `receipt_resolves` is whether [`canonical_artifact_identity`] still resolves; each caller
+/// computes it exactly once.
+fn checked_safety(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    receipt_resolves: bool,
+) -> MemorySafetyDecision {
     let Ok(expected) = memory_strategy_contract(spec) else {
         return MemorySafetyDecision::Reject {
             reason: format!("{MODEL_ID}: resident artifact receipt no longer resolves"),
@@ -700,7 +578,7 @@ pub(crate) fn safety_check(
         || !context
             .evidence_revision
             .starts_with(&sealed_request_prefix)
-        || canonical_artifact_identity(spec).is_err()
+        || !receipt_resolves
     {
         return MemorySafetyDecision::Reject {
             reason: format!("{MODEL_ID}: crossed resident artifact/mode/reference receipt"),
@@ -729,7 +607,7 @@ pub(crate) fn loaded_safety_check(
             reason: format!("{MODEL_ID}: crossed or mutated physical artifact receipt"),
         };
     }
-    safety_check(spec, contract, context)
+    checked_safety(spec, contract, context, true)
 }
 
 /// Registry entry point for [`MemoryRegistration::contract`].

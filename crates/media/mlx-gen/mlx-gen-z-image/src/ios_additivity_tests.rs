@@ -17,8 +17,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use mlx_gen::gen_core::{
-    GenerationMemory, LoadShape, LoadSpec, MemoryNumericTier, MemoryStrategy,
-    MemoryStrategySupport, OffloadPolicy,
+    GenerationMemory, LoadShape, LoadSpec, MemoryStrategy, MemoryStrategySupport, OffloadPolicy,
 };
 use mlx_gen::ios_anchor_law::{derive_certified, MeasuredAnchor, MeasuredRun};
 use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosWindowBound};
@@ -187,11 +186,7 @@ fn selections(
         );
         let contract =
             crate::memory_strategy::weights_free_memory_strategy_contract(provider, &spec).unwrap();
-        let tier = MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        };
+        let tier = mlx_gen::request_scope::loaded_tier(&spec);
         let strategy = if resident {
             MemoryStrategy::Resident
         } else {
@@ -973,11 +968,7 @@ fn deferred_full_cover_unstaged(provider: &str, tier: &Tier) -> (GenerationMemor
         contract.lifecycle.transformer_window_materialization,
         "the intermediate must really arm deferred windows"
     );
-    let numeric = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let numeric = mlx_gen::request_scope::loaded_tier(&spec);
     let selection = *contract
         .selection_space(MemoryStrategy::Resident, numeric, false)
         .unwrap()
@@ -2493,15 +2484,7 @@ mod three_root_point_lower {
             })
             .ok_or_else(|| unsupported("no actual optimized strategy"))?;
         let choices = contract
-            .selection_space(
-                strategy,
-                MemoryNumericTier {
-                    precision: spec.precision,
-                    quant: spec.quantize,
-                    component_precision_floors: &[],
-                },
-                false,
-            )
+            .selection_space(strategy, mlx_gen::request_scope::loaded_tier(spec), false)
             .map_err(|e| unsupported(e.to_string()))?;
         let selection = choices
             .last()

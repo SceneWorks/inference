@@ -46,13 +46,14 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
-use mlx_rs::ops::{abs, max as max_op, mean, multiply, subtract};
+use mlx_rs::ops::{mean, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::ltx_checkpoint::{
     discover_split_bundle, LatentUpsamplerMode, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
     LtxComponent,
 };
+use mlx_gen::testing::{max_abs, peak_rel};
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::audio_vae::AudioDecoder;
 use mlx_gen_ltx::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
@@ -208,22 +209,12 @@ fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
-fn max_abs(a: &Array) -> f32 {
-    max_op(abs(a).unwrap(), None).unwrap().item::<f32>()
-}
-
 fn psnr_db(got: &Array, want: &Array) -> f32 {
     let diff = subtract(got, want).unwrap();
     let mse = mean(multiply(&diff, &diff).unwrap(), None)
         .unwrap()
         .item::<f32>();
     20.0 * (2.0f32).log10() - 10.0 * mse.max(1e-20).log10()
-}
-
-/// Relative deviation of `got` from `want`, scaled by `want`'s own magnitude.
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = max_abs(&subtract(got, want).unwrap());
-    diff / max_abs(want).max(1e-12)
 }
 
 /// The same band-limited clip `ltx_2_5_vae_real_weights.rs` uses: white noise has nothing for a

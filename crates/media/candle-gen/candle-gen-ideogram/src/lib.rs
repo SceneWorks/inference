@@ -135,9 +135,7 @@ impl Generator for Ideogram4Generator {
         if let Some(receipt) = &self.load_receipt {
             if let Err(error) = receipt.ensure_unchanged() {
                 self.memory_admission.clear_approval();
-                return gen_core::MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                };
+                return gen_core::MemorySafetyDecision::rejected(error);
             }
         }
         match memory_strategy::validate_context(
@@ -155,17 +153,12 @@ impl Generator for Ideogram4Generator {
                     },
                 ),
         ) {
-            Ok(()) => match self.memory_admission.approve(context) {
-                Ok(()) => gen_core::MemorySafetyDecision::Accept,
-                Err(error) => gen_core::MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                },
-            },
+            Ok(()) => gen_core::MemorySafetyDecision::from_validation(
+                self.memory_admission.approve(context),
+            ),
             Err(error) => {
                 self.memory_admission.clear_approval();
-                gen_core::MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                }
+                gen_core::MemorySafetyDecision::rejected(error)
             }
         }
     }

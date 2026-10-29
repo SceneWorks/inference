@@ -1,26 +1,15 @@
 //! Qwen3 decoder block (pre-norm residual): `h += attn(input_ln(h))`, then `h += mlp(post_ln(h))`.
+//! The shared [`Qwen3TextDecoderLayer`] (sc-27326) over MiniMax-H3's packed-detect `lin` loads (group 64), upcast projections.
 
-use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::add;
 use mlx_rs::Array;
 
+use mlx_gen::text_decoder::{Qwen3TextConfig, Qwen3TextDecoderLayer};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::{join_key, Qwen3Attention, Qwen3Mlp};
-
-/// One Qwen3 decoder layer.
-pub struct Qwen3DecoderLayer {
-    input_ln: Array,
-    post_ln: Array,
-    attn: Qwen3Attention,
-    mlp: Qwen3Mlp,
-    eps: f32,
-}
+pub struct Qwen3DecoderLayer(Qwen3TextDecoderLayer);
 
 impl Qwen3DecoderLayer {
-    /// Load `{prefix}.input_layernorm.weight`, `{prefix}.post_attention_layernorm.weight`, plus the
-    /// `self_attn` and `mlp` submodules.
     pub fn from_weights(
         w: &Weights,
         prefix: &str,
@@ -29,55 +18,44 @@ impl Qwen3DecoderLayer {
         head_dim: i32,
         eps: f32,
     ) -> Result<Self> {
-        Ok(Self {
-            input_ln: w
-                .require(&join_key(prefix, "input_layernorm.weight"))?
-                .clone(),
-            post_ln: w
-                .require(&join_key(prefix, "post_attention_layernorm.weight"))?
-                .clone(),
-            attn: Qwen3Attention::from_weights(
-                w,
-                &join_key(prefix, "self_attn"),
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                eps,
-            )?,
-            mlp: Qwen3Mlp::from_weights(w, &join_key(prefix, "mlp"))?,
+        let cfg = Qwen3TextConfig {
+            num_heads,
+            num_kv_heads,
+            head_dim,
             eps,
-        })
+            qk_norm: true,
+            upcast: true,
+        };
+        Ok(Self(Qwen3TextDecoderLayer::from_weights(
+            w,
+            prefix,
+            cfg,
+            |key| super::lin(w, key),
+        )?))
     }
 
-    /// `x`: `[b, s, hidden]` → `[b, s, hidden]`.
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
-        let normed = rms_norm(x, &self.input_ln, self.eps)?;
-        let h = add(x, &self.attn.forward(&normed, cos, sin, mask)?)?;
-        let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
-        Ok(add(&h, &self.mlp.forward(&normed2)?)?)
+        self.0.forward(x, cos, sin, mask)
     }
 
-    /// Quantize both submodules in place.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.attn.quantize(bits)?;
-        self.mlp.quantize(bits)?;
-        Ok(())
+        self.0.quantize(bits, Some(super::GROUP_SIZE))
     }
 
-    /// The packed width of this layer's projections, or `None` if any of them loaded dense.
-    ///
-    /// `None` rather than a per-projection report: a layer's seven projections are packed by one
-    /// converter pass at one width, so a partially packed layer is a mis-built artifact and the
-    /// caller only needs to know it is not uniformly packed.
+    /// The packed width shared by all seven projections, or `None` if any loaded dense or they
+    /// disagree.
     pub fn packed_bits(&self) -> Option<i32> {
-        let a = self.attn.packed_bits()?;
-        let m = self.mlp.packed_bits()?;
-        (a == m).then_some(a)
+        super::uniform_packed_bits(self.0.projections())
     }
 
-    /// Device bytes this layer holds, including the two dense-by-policy norms — the layer's real
-    /// residency, not just its packable part.
+    /// Device bytes the block holds (norms + projections).
     pub fn nbytes(&self) -> usize {
-        self.input_ln.nbytes() + self.post_ln.nbytes() + self.attn.nbytes() + self.mlp.nbytes()
+        self.0.norm_weights().map(Array::nbytes).sum::<usize>()
+            + self
+                .0
+                .projections()
+                .into_iter()
+                .map(crate::quant::nbytes)
+                .sum::<usize>()
     }
 }

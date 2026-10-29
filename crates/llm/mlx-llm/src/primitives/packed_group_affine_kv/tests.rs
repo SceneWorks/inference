@@ -2579,7 +2579,7 @@ fn fused_reader_matches_independent_fp32_oracle_at_campaign_tolerance() {
             assert_eq!(errors.len(), 4 * 128 + 4 * 5 * 128 + 4 * 128);
             let max = errors.iter().copied().fold(0.0, f64::max);
             assert!(
-                max <= crate::campaign::COMPRESSED_PARITY_MAX_ERROR,
+                max <= crate::decode::observe::COMPRESSED_PARITY_MAX_ERROR,
                 "{family:?}: max parity error {max}"
             );
             eprintln!("campaign parity {bits:?} {family:?} D=128: max abs {max}");
@@ -2589,7 +2589,7 @@ fn fused_reader_matches_independent_fp32_oracle_at_campaign_tolerance() {
                 assert_eq!(errors.len(), (4 + 4 * 5 + 4) * width);
                 let max = errors.iter().copied().fold(0.0, f64::max);
                 assert!(
-                    max <= crate::campaign::COMPRESSED_PARITY_MAX_ERROR,
+                    max <= crate::decode::observe::COMPRESSED_PARITY_MAX_ERROR,
                     "{family:?} at {width}: max parity error {max}"
                 );
             }

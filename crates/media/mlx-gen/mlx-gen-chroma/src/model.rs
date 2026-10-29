@@ -23,7 +23,7 @@ use mlx_gen::{
     default_seed, resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec,
     ModelDescriptor, OffloadPolicy, Precision, PreviewSink, Progress, Residency, Result,
-    TimestepConvention, WeightsSource,
+    SamplerRun, TimestepConvention, WeightsSource,
 };
 use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
@@ -725,13 +725,15 @@ impl Chroma {
         // progress are handled inside `run_flow_sampler`.
         let previews = mlx_gen::preview::PreviewCounter::new(&sigmas);
         run_flow_sampler_with_latent_hook(
-            Some(sampler_name),
+            SamplerRun {
+                sampler_name: Some(sampler_name),
+                sigmas: &sigmas,
+                seed,
+                cancel,
+                on_progress,
+            },
             TimestepConvention::Sigma,
-            &sigmas,
             latents,
-            seed,
-            cancel,
-            on_progress,
             |latents, sigma| {
                 mlx_gen_flux::preview::emit_preview(
                     preview, &previews, &sigmas, sigma, latents, width, height,

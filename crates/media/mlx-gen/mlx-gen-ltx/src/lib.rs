@@ -147,8 +147,8 @@ mod vae_tiling_assignment_tests {
 // unchanged.
 //
 // The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
-// request/thread-local setting is shared with the FLUX family.
-pub(crate) use mlx_gen::nn::compile_glue;
+// request/thread-local setting is shared with the FLUX family. The glue dispatch itself is the
+// shared `mlx_gen::nn::DitGlue` (sc-27339), which reads core's toggle directly.
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
 /// Add the MLX LTX generator and trainer to an explicit media registry builder.
@@ -576,7 +576,8 @@ mod explicit_registry_tests {
 
 #[cfg(test)]
 mod compile_glue_guard_tests {
-    use super::{compile_glue, set_compile_glue, CompileGlueGuard};
+    use super::{set_compile_glue, CompileGlueGuard};
+    use mlx_gen::nn::compile_glue;
 
     #[test]
     fn guard_enables_then_restores_prior_value() {

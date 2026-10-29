@@ -64,7 +64,6 @@ use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
-use mlx_gen::train::flow::{normalize_cfg, validate_shared_floors, LOSS_TYPES, TIMESTEP_BIASES};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -76,6 +75,10 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::tae::TinyDecoderSpec;
+use mlx_gen::train::vocab::{
+    apply_timestep_bias, check_vocab, clamp_unit_timestep, normalize_cfg, sample_unit_timestep,
+    validate_run_shape, LOSS_TYPES, TIMESTEP_BIASES,
+};
 use mlx_gen::{
     Error, LoadSpec, Modality, NetworkType, Precision, Result, TrainOptimizer, Trainer,
     TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -152,7 +155,6 @@ const TIMESTEP_TYPES: [&str; 6] = [
     "uniform",
     "weighted",
 ];
-
 /// `(x_t, target)` for a single sample at flow-match `t`: `x_t = (1−t)·x0 + t·noise`,
 /// `target = noise − x0` (the velocity the **raw** SD3 MMDiT output is regressed onto — NO sign flip;
 /// the SAME sign as Krea, the OPPOSITE of z-image). The DiT timestep is scaled to `t·1000` by the
@@ -336,55 +338,25 @@ mlx_gen::register_trainer! {
 /// `timestep_type`/`timestep_bias`/`loss_type`. An EMPTY `timestep_type` is accepted (→ the SD3
 /// logit-normal default).
 fn validate_request(req: &TrainingRequest) -> Result<()> {
+    let prefix = "sd3 trainer";
+    validate_run_shape(prefix, req)?;
     let cfg = &req.config;
-    if req.items.is_empty() {
-        return Err("sd3 trainer: dataset is empty".into());
+    // An EMPTY `timestep_type` is the SD3 logit-normal default, so it is accepted here.
+    if !normalize_cfg(&cfg.timestep_type).is_empty() {
+        check_vocab(prefix, "timestep_type", &cfg.timestep_type, &TIMESTEP_TYPES)?;
     }
-    if cfg.rank == 0 {
-        return Err("sd3 trainer: rank must be > 0".into());
-    }
-    if cfg.steps == 0 {
-        return Err("sd3 trainer: steps must be > 0".into());
-    }
-    if !TrainOptimizer::is_supported(&cfg.optimizer) {
-        return Err(format!(
-            "sd3 trainer: optimizer '{}' is not available on MLX training (supported: adamw, adam, \
-             rose, prodigy)",
-            cfg.optimizer
-        )
-        .into());
-    }
-    let tt = normalize_cfg(&cfg.timestep_type);
-    if !tt.is_empty() && !TIMESTEP_TYPES.contains(&tt.as_str()) {
-        return Err(format!(
-            "sd3 trainer: timestep_type '{}' is not recognized (supported: {})",
-            cfg.timestep_type,
-            TIMESTEP_TYPES.join(", ")
-        )
-        .into());
-    }
-    if !TIMESTEP_BIASES.contains(&normalize_cfg(&cfg.timestep_bias).as_str()) {
-        return Err(format!(
-            "sd3 trainer: timestep_bias '{}' is not recognized (supported: {})",
-            cfg.timestep_bias,
-            TIMESTEP_BIASES.join(", ")
-        )
-        .into());
-    }
-    if !LOSS_TYPES.contains(&normalize_cfg(&cfg.loss_type).as_str()) {
-        return Err(format!(
-            "sd3 trainer: loss_type '{}' is not recognized (supported: {})",
-            cfg.loss_type,
-            LOSS_TYPES.join(", ")
-        )
-        .into());
-    }
-    Ok(())
+    check_vocab(
+        prefix,
+        "timestep_bias",
+        &cfg.timestep_bias,
+        &TIMESTEP_BIASES,
+    )?;
+    check_vocab(prefix, "loss_type", &cfg.loss_type, &LOSS_TYPES)
 }
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    validate_shared_floors(descriptor, req)?;
+    mlx_gen::train::vocab::validate_shared_floors(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }
@@ -933,13 +905,7 @@ fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// Encode a center-cropped square image into an SD3.5 training latent `[1, 16, edge/8, edge/8]` — the
@@ -958,8 +924,6 @@ fn encode_init_latents(vae: &Vae, image: &Image, edge: u32) -> Result<Array> {
 /// `sample_training_timestep`) remain for parity; bias `high` → `√t`, `low` → `t²`. Deterministic in
 /// `seed`. An empty / `"default"` `timestep_type` selects the logit-normal default.
 fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
     let ttype = {
         let n = normalize_cfg(timestep_type);
         if n.is_empty() || n == "default" {
@@ -968,31 +932,16 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
             n
         }
     };
-    let t = match ttype.as_str() {
-        "logit_normal" => {
-            // u ~ U(0,1) → t = σ(m + s·ndtri(u)); m=0, s=1 (= σ(N(0,1)), the standard logit-normal).
-            let u =
-                random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>() as f64;
-            logistic(0.0 + 1.0 * ndtri(u)) as f32
-        }
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            let k2 = random::key(seed ^ 0x9E37_79B9)?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
+    let t = if ttype == "logit_normal" {
+        // u ~ U(0,1) → t = σ(m + s·ndtri(u)); m=0, s=1 (= σ(N(0,1)), the standard logit-normal).
+        let k1 = random::key(seed)?;
+        let u = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>() as f64;
+        apply_timestep_bias(logistic(0.0 + 1.0 * ndtri(u)) as f32, timestep_bias)
+    } else {
+        // The cross-family samplers, shared with every MLX flow-match trainer (sc-27324).
+        sample_unit_timestep(&ttype, timestep_bias, seed)?
     };
-    let bias = normalize_cfg(timestep_bias);
-    let t = match bias.as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    Ok(t.clamp(1e-3, 1.0 - 1e-3))
+    Ok(clamp_unit_timestep(t))
 }
 
 /// Logistic (sigmoid) `σ(y) = 1/(1+e^-y)`. Ported from `mlx-gen-ideogram/src/scheduler.rs`.

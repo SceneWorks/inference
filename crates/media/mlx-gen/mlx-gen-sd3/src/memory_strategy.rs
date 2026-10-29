@@ -10,7 +10,7 @@
 //!   `max(triple-TE, MMDiT+VAE)` identically for Large, Large-Turbo, and Medium.
 //! * **BoundedDecode** — the 16-channel VAE is loaded by `loader::load_vae` with no variant
 //!   parameter at all; the decode tile domain is therefore literally the same object for all three.
-//! * **BoundedAttention** — `attention_plan` threads one [`AttentionPlan`] into
+//! * **BoundedAttention** — `attention_plan` threads one [`AttentionPlan`](mlx_gen::attention::AttentionPlan) into
 //!   `JointBlock::forward`, which applies it to the joint double-stream attention **and** to
 //!   Medium's MMDiT-X image-stream-only `attn2` branch. SD3.5 has no RoPE, and its per-head
 //!   qk-RMSNorm is applied after the BHSD reshape inside the attention itself, so chunking the
@@ -50,14 +50,12 @@
 //! registry conformance keeps its own [`STATIC_BEHAVIOR_FINGERPRINT`] family, which never equals a
 //! production string.
 
-use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    TransformerComponent,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy};
@@ -423,14 +421,12 @@ pub(crate) fn safety_check(
             ));
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            let edge = context.selection.parameters.decode_tile_edge;
-            let overlap = context.selection.parameters.decode_overlap;
-            if !edge.is_some_and(|edge| DECODE_TILE_EDGES.contains(&edge))
-                || overlap != Some(DECODE_OVERLAP)
-            {
-                return Err(CoreError::Unsupported(
-                    "sd3 decode tile geometry is outside the calibrated domain".to_owned(),
-                ));
+            match (
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap,
+            ) {
+                (Some(edge), Some(overlap)) => validate_decode(edge, overlap)?,
+                _ => return Err(decode_domain_error()),
             }
         }
         if contract.engages(
@@ -449,11 +445,7 @@ pub(crate) fn safety_check(
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(mlx_gen::request_scope::loaded_tier(spec)),
         Some(&route_gate),
     )
 }
@@ -472,11 +464,7 @@ pub(crate) fn registered_fixture(
     {
         return Ok(Vec::new());
     }
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let tier = mlx_gen::request_scope::loaded_tier(spec);
     [(MemoryMode::TextToImage, 0), (MemoryMode::ImageToImage, 1)]
         .into_iter()
         .map(|(mode, reference_count)| {
@@ -503,41 +491,25 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let provider = provider_static(&contract.provider_id)?;
-    let blocks = match variant_for(provider)? {
-        Sd3Variant::Large | Sd3Variant::LargeTurbo => LARGE_NUM_LAYERS,
-        Sd3Variant::Medium => MEDIUM_NUM_LAYERS,
-    };
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        false,
-        blocks,
-        |_use_pid, edge, overlap| {
-            if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
-                Ok(())
-            } else {
-                Err(CoreError::Unsupported(
-                    "sd3 decode tile geometry is outside the calibrated domain".to_owned(),
-                ))
-            }
-        },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
+        let provider = provider_static(&contract.provider_id)?;
+        let blocks = match variant_for(provider)? {
+            Sd3Variant::Large | Sd3Variant::LargeTurbo => LARGE_NUM_LAYERS,
+            Sd3Variant::Medium => MEDIUM_NUM_LAYERS,
+        };
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            false,
+            blocks,
+            |_use_pid, edge, overlap| validate_decode(edge, overlap),
+        )?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 pub(crate) fn registered_begin_request(
@@ -566,49 +538,106 @@ pub(crate) fn begin_request(
     )
 }
 
-pub(crate) fn attention_plan(req: &GenerationRequest) -> AttentionPlan<'_> {
-    match req.memory {
-        Some(memory) if memory.chunk_attention => {
-            AttentionPlan::budgeted(AttentionBudget::CONSTRAINED).with_cancel(&req.cancel)
-        }
-        _ => AttentionPlan::UNBOUNDED,
+/// Rung 3: the shared constrained-budget plan (an unselected request keeps the exact historical
+/// unbounded, uncancellable plan).
+pub(crate) use mlx_gen::request_scope::constrained_attention_plan as attention_plan;
+
+fn decode_domain_error() -> CoreError {
+    CoreError::Unsupported("sd3 decode tile geometry is outside the calibrated domain".to_owned())
+}
+
+/// The calibrated decode tiling domain, checked at admission (the safety check and the request
+/// scope) and again at execution ([`decode_tiling`]) — so a caller that bypasses admission cannot run
+/// a tile geometry whose peak was never measured (the sdxl/anima execution-time check).
+fn validate_decode(edge: u32, overlap: u32) -> mlx_gen::gen_core::Result<()> {
+    if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
+        Ok(())
+    } else {
+        Err(decode_domain_error())
     }
 }
 
 pub(crate) fn transformer_window(req: &GenerationRequest) -> mlx_gen::Result<Option<usize>> {
-    let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
-        return Ok(None);
-    };
-    if memory
-        .transformer_window_component
-        .unwrap_or(TransformerComponent::Dit)
-        != TransformerComponent::Dit
-    {
-        return Err(mlx_gen::Error::Unsupported(
-            "sd3 supports only the DiT transformer window component".to_owned(),
-        ));
-    }
-    Ok(Some(
-        memory
-            .transformer_window_size
-            .unwrap_or(TRANSFORMER_WINDOW_SIZE) as usize,
-    ))
+    mlx_gen::request_scope::requested_transformer_window(
+        "sd3",
+        req.memory,
+        TransformerComponent::Dit,
+        &[TransformerComponent::Dit],
+        TRANSFORMER_WINDOW_SIZE,
+        |size| {
+            mlx_gen::request_scope::validate_calibrated_window(
+                "sd3",
+                size,
+                &[TRANSFORMER_WINDOW_SIZE],
+            )
+        },
+    )
 }
 
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<TilingConfig>> {
-    let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
-        return Ok(None);
-    };
-    Ok(Some(TilingConfig::spatial_only(
-        memory.decode_tile_edge.unwrap_or(DECODE_TILE_EDGE) as i32,
-        memory.decode_overlap.unwrap_or(DECODE_OVERLAP) as i32,
-    )))
+    mlx_gen::request_scope::requested_decode_tiling(
+        req.memory,
+        DECODE_TILE_EDGE,
+        DECODE_OVERLAP,
+        |edge, overlap| validate_decode(edge, overlap).map_err(mlx_gen::Error::from),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::attention::AttentionBudget;
     use mlx_gen::gen_core::{MemoryOptimizationAuthority, MemoryStrategySupport};
+
+    /// sc-27440: the execution seams re-check the calibrated domain, so a request that bypassed
+    /// admission cannot run an unmeasured window or tile geometry; the defaults still pass.
+    #[test]
+    fn execution_seams_refuse_out_of_domain_window_and_tiling() {
+        let request = |memory: mlx_gen::gen_core::GenerationMemory| GenerationRequest {
+            memory: Some(memory),
+            ..Default::default()
+        };
+        let window = |size: Option<u32>| mlx_gen::gen_core::GenerationMemory {
+            stream_transformer_blocks: true,
+            transformer_window_size: size,
+            ..Default::default()
+        };
+        assert_eq!(
+            transformer_window(&request(window(None))).unwrap(),
+            Some(TRANSFORMER_WINDOW_SIZE as usize)
+        );
+        let err =
+            transformer_window(&request(window(Some(TRANSFORMER_WINDOW_SIZE + 1)))).unwrap_err();
+        assert!(
+            matches!(&err, mlx_gen::Error::Unsupported(m) if m.contains("calibrated domain")),
+            "{err:?}"
+        );
+
+        let tiling =
+            |edge: Option<u32>, overlap: Option<u32>| mlx_gen::gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: edge,
+                decode_overlap: overlap,
+                ..Default::default()
+            };
+        assert!(decode_tiling(&request(tiling(None, None)))
+            .unwrap()
+            .is_some());
+        for &edge in DECODE_TILE_EDGES {
+            assert!(
+                decode_tiling(&request(tiling(Some(edge), Some(DECODE_OVERLAP))))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        for (edge, overlap) in [(Some(1024), None), (None, Some(64))] {
+            let err = decode_tiling(&request(tiling(edge, overlap))).unwrap_err();
+            assert!(
+                matches!(&err, mlx_gen::Error::Unsupported(m) if m.contains("calibrated domain")),
+                "{edge:?}/{overlap:?}: {err:?}"
+            );
+        }
+    }
 
     /// Every registered SD3.5 route, so no test can silently cover only the calibrated variant.
     pub(crate) const PROVIDERS: [&str; 3] = [
@@ -846,13 +875,14 @@ mod tests {
     }
 
     /// A header-valid safetensors file with no weight body: `safetensors_header_shapes` reads the
-    /// header alone, so the tensor names are all a tier proof needs.
+    /// header alone, so the tensor names are all a tier proof needs. Each tensor is zero-element so
+    /// the shared parser's offset/size validation holds without a payload.
     fn write_header_only_safetensors(path: &std::path::Path, names: &[&str]) {
         let mut header = serde_json::Map::new();
         for name in names {
             header.insert(
                 (*name).to_owned(),
-                serde_json::json!({ "dtype": "BF16", "shape": [2, 2], "data_offsets": [0, 0] }),
+                serde_json::json!({ "dtype": "BF16", "shape": [0], "data_offsets": [0, 0] }),
             );
         }
         let encoded = serde_json::to_vec(&header).unwrap();

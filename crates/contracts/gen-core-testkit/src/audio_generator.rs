@@ -1380,15 +1380,12 @@ pub fn audio_conformance(make: impl Fn() -> Box<dyn Generator>, profile: &AudioP
         .into_iter()
         .filter_map(|f| f(g, profile).err())
         .collect();
-    if !failures.is_empty() {
-        panic!(
-            "gen-core audio conformance FAILED for `{}` ({} backend, gen-core {}):\n  - {}",
-            g.descriptor().id,
-            g.descriptor().backend,
-            gen_core::VERSION,
-            failures.join("\n  - ")
-        );
-    }
+    crate::panic_on_failures(
+        "gen-core audio conformance",
+        g.descriptor().id,
+        Some(g.descriptor().backend),
+        &failures,
+    );
 }
 
 #[cfg(test)]

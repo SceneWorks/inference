@@ -4,17 +4,14 @@
 //! the keep-one-extra-pad quirk exactly. The T5 *numeric* masked-encode parity rides on the e2e
 //! (sc-3839), where the real T5 weights load.
 
+use mlx_gen::testing::max_abs;
 use mlx_gen::weights::Weights;
 use mlx_gen_chroma::{loader, transformer_text_mask};
-use mlx_rs::ops::{abs, max, subtract};
+use mlx_rs::ops::subtract;
 use mlx_rs::Dtype;
 
 const PROMPTS: [&str; 2] = ["a photograph of an astronaut riding a horse", "a cat"];
 const MAX_LEN: usize = 64; // must match the dump script
-
-fn max_abs(a: &mlx_rs::Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
-}
 
 #[test]
 fn text_mask_matches_diffusers() {

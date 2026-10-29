@@ -542,6 +542,12 @@ mod tests {
                 "{short} frames must floor at ONE chunk (22), not at the lattice base 5"
             );
         }
+        // The floor is the shared reference floor: `normalize_reference_clip` refuses exactly the
+        // clips this would over-read (the binding the old source-text cross-backend test pinned).
+        assert_eq!(
+            snap_reference_frames_down(0),
+            crate::reference::MIN_REFERENCE_CLIP_FRAMES
+        );
         // Every result really is on the lattice.
         for n in 0usize..200 {
             let snapped = snap_reference_frames_down(n);

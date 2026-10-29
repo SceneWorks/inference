@@ -11,9 +11,10 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration adapter_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, array_eq, max, multiply, subtract, sum};
+use mlx_rs::ops::{array_eq, multiply, sum};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterKind, AdapterSpec};
 use mlx_gen_lens::adapters::apply_lens_adapters;
@@ -47,12 +48,6 @@ fn transformer_dir() -> std::path::PathBuf {
 
 fn meta_usize(g: &Weights, key: &str) -> usize {
     g.metadata(key).unwrap().parse().unwrap()
-}
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 
 fn cosine(got: &Array, want: &Array) -> f32 {

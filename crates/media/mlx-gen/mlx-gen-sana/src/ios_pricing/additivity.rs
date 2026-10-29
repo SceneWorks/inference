@@ -301,11 +301,7 @@ fn selections(
         });
         let contract =
             crate::memory_strategy::weights_free_memory_strategy_contract(provider, &spec).unwrap();
-        let tier = MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        };
+        let tier = mlx_gen::request_scope::loaded_tier(&spec);
         let strategy = if resident {
             MemoryStrategy::Resident
         } else {

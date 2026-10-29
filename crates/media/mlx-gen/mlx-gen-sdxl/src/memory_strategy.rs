@@ -182,13 +182,13 @@
 use mlx_gen::gen_core::{
     adapter_stack_resident_bytes, standard_memory_strategy_safety_check, AdapterResidencyMode,
     Error as CoreError, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
-    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
-    Result as CoreResult, TransformerComponent,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryParameterRanges, MemoryPhase,
+    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult, TransformerComponent,
 };
+use mlx_gen::request_scope::loaded_tier;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
 
@@ -854,7 +854,7 @@ fn resident_overlay_components(spec: &LoadSpec) -> CoreResult<Vec<MemoryResident
         let (WeightsSource::Dir(path) | WeightsSource::File(path)) = source;
         control_bytes = control_bytes.saturating_add(control_resident_bytes(path, control_bits)?);
     }
-    push_overlay(
+    mlx_gen::request_scope::push_unbounded_overlay(
         &mut components,
         CONTROL_COMPONENT_ID,
         MemoryComponentKind::ControlBranch,
@@ -874,7 +874,7 @@ fn resident_overlay_components(spec: &LoadSpec) -> CoreResult<Vec<MemoryResident
             Some(file) => projected_safetensors_bytes(file, compute_dtype)?,
             None => 0,
         };
-        push_overlay(
+        mlx_gen::request_scope::push_unbounded_overlay(
             &mut components,
             IP_ADAPTER_COMPONENT_ID,
             MemoryComponentKind::IpAdapter,
@@ -897,7 +897,7 @@ fn resident_overlay_components(spec: &LoadSpec) -> CoreResult<Vec<MemoryResident
             let student = projected_safetensors_bytes(checkpoint, |_| ResidentProjection::Stored)?;
             let caption =
                 projected_safetensors_bytes(&gemma_source, |_| ResidentProjection::Stored)?;
-            push_overlay(
+            mlx_gen::request_scope::push_unbounded_overlay(
                 &mut components,
                 PID_COMPONENT_ID,
                 // `AdapterStack` is the closest existing kind for an auxiliary network installed
@@ -924,7 +924,7 @@ fn resident_overlay_components(spec: &LoadSpec) -> CoreResult<Vec<MemoryResident
                     .to_owned(),
             )
         })?;
-    push_overlay(
+    mlx_gen::request_scope::push_unbounded_overlay(
         &mut components,
         ADAPTER_COMPONENT_ID,
         MemoryComponentKind::AdapterStack,
@@ -956,28 +956,6 @@ pub(crate) fn control_resident_bytes(path: &std::path::Path, bits: Option<i32>) 
             _ => ResidentProjection::Bfloat16,
         },
     )
-}
-
-/// Record one overlay, skipping a zero. The shared validator refuses a declared component with zero
-/// bytes, and a component that measured zero is not evidence of residency anyway.
-fn push_overlay(
-    into: &mut Vec<MemoryResidentComponent>,
-    id: &str,
-    kind: MemoryComponentKind,
-    resident_bytes: u64,
-) {
-    if resident_bytes == 0 {
-        return;
-    }
-    into.push(MemoryResidentComponent {
-        id: id.to_owned(),
-        kind,
-        resident_bytes,
-        // No published rung bounds an overlay on this family: rung 4's window covers the U-Net's
-        // `Transformer2D` sub-stacks and nothing else.
-        bounded_by: None,
-        residency: MemoryComponentResidency::WholeRender,
-    });
 }
 
 /// Declaration-equivalent contract used by weights-free registry conformance. Structure, parameter
@@ -1314,22 +1292,7 @@ fn refuse_decode(provider_id: &str, edge: Option<u32>, overlap: Option<u32>) -> 
 /// at a wider cadence than the declared domain **under**-predicts peak, and a selector that sized a
 /// fit off the published domain would then be handed a render that does not fit.
 fn validate_window(size: u32) -> CoreResult<()> {
-    if !TRANSFORMER_WINDOW_SIZES.contains(&size) {
-        return Err(CoreError::Unsupported(format!(
-            "sdxl transformer window {size} is outside the calibrated domain \
-             {TRANSFORMER_WINDOW_SIZES:?}"
-        )));
-    }
-    Ok(())
-}
-
-/// The numeric tier this generator actually runs (shared by the Kolors U-Net, sc-27413).
-pub fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    }
+    mlx_gen::request_scope::validate_calibrated_window("sdxl", size, TRANSFORMER_WINDOW_SIZES)
 }
 
 /// The provider safety check: the calibration handshake and tier match, then the shared contract's
@@ -1518,35 +1481,27 @@ fn begin_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let id = provider_id;
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        widest_transformer_stack(),
-        move |use_pid, edge, overlap| {
-            validate_route_blind_decode(id, use_pid, Some(edge), Some(overlap))
-        },
-    )?;
-    config.load_shape = context.load_shape;
-    mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
-    // Rung 2 is engaged by the route-blind domain (sc-26268) or by the exact policy authorization
-    // above. Rung 3 remains `Missing`, so attention chunking is never set.
-    config.attention_chunk_size = None;
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
+        let id = provider_id;
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider_id,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            context.use_pid,
+            widest_transformer_stack(),
+            move |use_pid, edge, overlap| {
+                validate_route_blind_decode(id, use_pid, Some(edge), Some(overlap))
+            },
+        )?;
+        config.load_shape = context.load_shape;
+        mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
+        // Rung 2 is engaged by the route-blind domain (sc-26268) or by the exact policy authorization
+        // above. Rung 3 remains `Missing`, so attention chunking is never set.
+        config.attention_chunk_size = None;
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 // ── Request-side resolution: the shared `GenerationMemory` signal → this provider's levers ────────
@@ -1555,25 +1510,14 @@ fn begin_with_cleanup(
 /// not implement — or a cadence outside the measured [`TRANSFORMER_WINDOW_SIZES`] — is a typed
 /// rejection rather than a silently narrowed (or silently *widened*) execution.
 pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Result<Option<usize>> {
-    let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
-        return Ok(None);
-    };
-    let component = memory
-        .transformer_window_component
-        .unwrap_or(TRANSFORMER_WINDOW_COMPONENT);
-    if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
-        return Err(mlx_gen::Error::Unsupported(format!(
-            "sdxl implements only the {TRANSFORMER_WINDOW_COMPONENT:?} transformer window \
-             component, got {component:?}"
-        )));
-    }
-    let size = memory
-        .transformer_window_size
-        .unwrap_or(TRANSFORMER_WINDOW_SIZE);
-    validate_window(size).map_err(|error| {
-        mlx_gen::Error::Unsupported(format!("sdxl transformer window rejected: {error}"))
-    })?;
-    Ok(Some(size as usize))
+    mlx_gen::request_scope::requested_transformer_window(
+        "sdxl",
+        req.memory,
+        TRANSFORMER_WINDOW_COMPONENT,
+        TRANSFORMER_WINDOW_COMPONENTS,
+        TRANSFORMER_WINDOW_SIZE,
+        validate_window,
+    )
 }
 
 /// Resolve rung 2 for this request: the sealed geometry row when the contract carries one, else the
@@ -1609,43 +1553,12 @@ fn decode_tiling_with_contract(
         return Ok(Some(control.tiling_config()));
     }
     let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
-        mlx_gen::diagnostics::record_geometry_decode_decision(
-            mlx_gen::diagnostics::DecodePolicyDisposition::Unchanged,
-            mlx_gen::diagnostics::DecodePathDisposition::Dense,
-            None,
-        );
+        mlx_gen::request_scope::record_dense_decode();
         return Ok(None);
     };
-    if contract.is_some_and(|contract| {
-        contract
-            .capability(MemoryStrategy::BoundedDecode)
-            .is_some_and(|capability| !capability.parameters.decode_geometry_policies.is_empty())
-    }) {
-        let edge = memory.decode_tile_edge.ok_or_else(|| {
-            mlx_gen::Error::Unsupported(
-                "sdxl: geometry-aware bounded decode requires an exact tile edge".to_owned(),
-            )
-        })?;
-        let overlap = memory.decode_overlap.ok_or_else(|| {
-            mlx_gen::Error::Unsupported(
-                "sdxl: geometry-aware bounded decode requires an exact overlap".to_owned(),
-            )
-        })?;
-        let evidence = mlx_gen::request_scope::validate_geometry_decode_authorization(
-            crate::MODEL_ID,
-            req,
-            edge,
-            overlap,
-        )?;
-        mlx_gen::diagnostics::record_geometry_decode_decision(
-            mlx_gen::diagnostics::DecodePolicyDisposition::GeometryTiled,
-            mlx_gen::diagnostics::DecodePathDisposition::Tiled,
-            Some(&evidence),
-        );
-        return Ok(Some(TilingConfig::spatial_only(
-            edge as i32,
-            overlap as i32,
-        )));
+    if contract.is_some_and(mlx_gen::request_scope::has_decode_geometry_table) {
+        return mlx_gen::request_scope::geometry_decode_tiling(crate::MODEL_ID, req, memory)
+            .map(Some);
     }
     if !matches!(DECODE_SUPPORT, MemoryStrategySupport::Implemented) {
         return Err(mlx_gen::Error::Unsupported(
@@ -1697,13 +1610,12 @@ pub(crate) fn attention_plan(
 
 /// Rung 1: whether this request stages its component residency. `default_staged` is the load-time
 /// [`OffloadPolicy`] verdict, which a request that names nothing keeps.
-pub fn stage_residency(req: &GenerationRequest, default_staged: bool) -> bool {
-    req.memory
-        .map_or(default_staged, |memory| memory.stage_residency)
+pub(crate) fn stage_residency(req: &GenerationRequest, default_staged: bool) -> bool {
+    mlx_gen::request_scope::requested_stage_residency(req.memory, default_staged)
 }
 
 /// The load-time default for `stage_residency`.
-pub fn default_stage_residency(spec: &LoadSpec) -> bool {
+pub(crate) fn default_stage_residency(spec: &LoadSpec) -> bool {
     matches!(spec.offload_policy, OffloadPolicy::Sequential)
 }
 

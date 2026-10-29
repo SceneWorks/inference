@@ -44,6 +44,7 @@ use mlx_gen_minimax_h3::{
 };
 
 use common::{dit_fixture_config, DIT_FIXTURE};
+use mlx_gen::testing::max_abs;
 
 /// The module the numeric arms probe — `[96, 64]` at the fixture geometry.
 const PROBE: &str = "transformer_blocks.0.attn.to_q";
@@ -298,16 +299,6 @@ fn probe_residual(
         .forward(x)
         .expect("adapted forward");
     subtract(&y1, &y0).expect("residual")
-}
-
-fn max_abs(a: &Array) -> f32 {
-    a.abs()
-        .unwrap()
-        .max(None)
-        .unwrap()
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .item::<f32>()
 }
 
 /// **AC1/AC2 (sc-26688):** the same body LoRA folds *bit-identically* on the full and the pruned

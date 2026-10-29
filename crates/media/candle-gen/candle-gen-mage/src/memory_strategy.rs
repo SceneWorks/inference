@@ -766,7 +766,7 @@ pub fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_result(
+    MemorySafetyDecision::from_validation(
         resolved_quant(spec).and_then(|quant| validate_context(contract, context, quant)),
     )
 }

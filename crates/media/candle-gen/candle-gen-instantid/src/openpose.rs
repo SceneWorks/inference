@@ -78,8 +78,9 @@ const COLORS: [[u8; 3]; 18] = [
     [255, 0, 85],
 ];
 
-/// The default stick width / joint radius (`openpose_skeleton.py` default `stickwidth=4`).
-pub const STICKWIDTH: i32 = 4;
+/// The default stick width / joint radius (`openpose_skeleton.py` default `stickwidth=4`), shared
+/// with the keypoint renderer in [`candle_gen::gen_core::instantid_kps`] (sc-27256).
+pub use candle_gen::gen_core::instantid_kps::STICKWIDTH;
 
 /// Centered-square placement for normalized `[0,1]` keypoints, returning `(side, offset_x,
 /// offset_y)`. Poses are stored square-canonical, so render them into the largest centered square of

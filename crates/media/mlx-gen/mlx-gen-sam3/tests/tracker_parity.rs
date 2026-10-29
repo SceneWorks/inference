@@ -7,29 +7,17 @@
 //!   SAM3_TRACKER_FIXTURE=scripts/spikes/sam3_oracle/tracker_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration tracker_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{cosine, item_f32};
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::Sam3Tracker;
-use mlx_rs::ops::{abs, max, maximum, multiply, sqrt, subtract, sum};
+use mlx_rs::ops::{abs, max, maximum, subtract};
 use mlx_rs::{Array, Dtype};
-
-fn scalar(a: &Array) -> f32 {
-    a.as_dtype(Dtype::Float32).unwrap().item::<f32>()
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.reshape(&[-1]).unwrap();
-    let b = b.reshape(&[-1]).unwrap();
-    let dot = scalar(&sum(multiply(&a, &b).unwrap(), None).unwrap());
-    let na = scalar(&sqrt(sum(multiply(&a, &a).unwrap(), None).unwrap()).unwrap());
-    let nb = scalar(&sqrt(sum(multiply(&b, &b).unwrap(), None).unwrap()).unwrap());
-    dot / (na * nb)
-}
 
 /// Max-abs error relative to the fixture's own dynamic range.
 fn max_rel(got: &Array, want: &Array) -> f32 {
     let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let max_abs = scalar(&max(&diff, None).unwrap());
-    let denom = scalar(
+    let max_abs = item_f32(&max(&diff, None).unwrap());
+    let denom = item_f32(
         &maximum(
             max(abs(want).unwrap(), None).unwrap(),
             Array::from_f32(1e-6),
@@ -89,7 +77,7 @@ fn tracker_single_frame_matches_oracle() {
         .unwrap()
         .as_slice::<f32>()
         .to_vec();
-    let want_obj = scalar(fx.require("object_score").unwrap());
+    let want_obj = item_f32(fx.require("object_score").unwrap());
     println!(
         "mask: cosine={c:.7} max_rel={r:.2e}  iou ours={:.4} oracle_best={:.4}  obj ours={:.3} oracle={:.3}",
         out.iou,

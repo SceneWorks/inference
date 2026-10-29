@@ -13,26 +13,33 @@ use std::cell::{OnceCell, RefCell};
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(any(test, feature = "campaign"))]
+use core_llm::Role;
+#[cfg(feature = "campaign")]
+use core_llm::ThinkingMode;
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
     JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults,
     ProposerCapabilities, ProposerKind, Quantize, ReasoningEffort, RenderOptions,
-    Result as CoreResult, Role, Sampling, SpeculativePlan, SpeculativeProposer, StopMatcher,
+    Result as CoreResult, Sampling, SpeculativePlan, SpeculativeProposer, StopMatcher,
     StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingMode, ThinkingSegmenter, Tokenizer, ToolCall, ToolCallSegmenter, Usage,
-    VideoRef,
+    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCall, ToolCallSegmenter, Usage, VideoRef,
 };
 
 use core_llm::DraftReport;
 
 use crate::config::{Architecture, ModelConfig};
+#[cfg(any(test, feature = "campaign"))]
+use crate::decode::CancelFlag;
+#[cfg(feature = "campaign")]
+use crate::decode::{generate_batch, BatchRequest, GenerationOutput};
 use crate::decode::{
-    generate_batch, generate_speculative, generate_with_observer, prefill_restored, BatchRequest,
-    Boundary, CancelFlag, ConstraintMask, Decode, DraftModelProposer, DynCacheTarget,
-    EngineOptions, FinishReason, GenerationConfig, GenerationOutput, MtpProposer, NgramProposer,
-    NoProposer, PrefixCache, PrefixPrefill, PrefixStats, Proposer, Qwen35MtpMultimodalPrompt,
-    RewindableConstraintMask, SpeculativePrompt, SpeculativeRun, SpeculativeTarget, StreamEvent,
+    generate_speculative, generate_with_observer, prefill_restored, Boundary, ConstraintMask,
+    Decode, DraftModelProposer, DynCacheTarget, EngineOptions, FinishReason, GenerationConfig,
+    MtpProposer, NgramProposer, NoProposer, PrefixCache, PrefixPrefill, PrefixStats, Proposer,
+    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, SpeculativePrompt, SpeculativeRun,
+    SpeculativeTarget, StreamEvent,
 };
 use crate::error::to_core;
 use crate::image::{Qwen35ImageProcessor, Qwen35Preprocess};
@@ -53,6 +60,7 @@ use mlx_rs::{Array, Dtype};
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "mlx-llama";
 
+#[cfg(feature = "campaign")]
 enum CapturedCacheLifecycle {
     Allocation(&'static str, &'static str, &'static str, u64),
     Snapshot(u64, u64, u64, u64),
@@ -63,13 +71,15 @@ enum CapturedCacheLifecycle {
     CompressedStorage(crate::primitives::CompressedCacheStorage),
 }
 
+#[cfg(feature = "campaign")]
 #[derive(Default)]
 struct CacheLifecycleCapture {
     events: Vec<CapturedCacheLifecycle>,
 }
 
+#[cfg(feature = "campaign")]
 impl CacheLifecycleCapture {
-    fn replay(self, observer: &mut dyn crate::campaign::Observer) {
+    fn replay(self, observer: &mut dyn crate::decode::observe::Observer) {
         for event in self.events {
             match event {
                 CapturedCacheLifecycle::Allocation(kind, role, lifetime, bytes) => {
@@ -98,7 +108,8 @@ impl CacheLifecycleCapture {
     }
 }
 
-impl crate::campaign::Observer for CacheLifecycleCapture {
+#[cfg(feature = "campaign")]
+impl crate::decode::observe::Observer for CacheLifecycleCapture {
     fn phase(&mut self, _name: &'static str) {}
 
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64) {
@@ -164,7 +175,7 @@ impl crate::campaign::Observer for CacheLifecycleCapture {
 /// than silently replacing the fused path.
 struct PackedCampaignDecoder<'a> {
     model: &'a CausalLm,
-    arm: &'a crate::campaign::CompressedKvArm,
+    arm: &'a crate::decode::observe::CompressedKvArm,
     selection_fallbacks: RefCell<Vec<String>>,
 }
 
@@ -192,12 +203,13 @@ impl Decode for PackedCampaignDecoder<'_> {
 /// [`LlamaProvider::campaign_steady_decode`] over an already-tokenized context. A compressed arm's
 /// measurement must run wholly on its fused compressed reader (selected cache, no fallback, no
 /// dense reconstruction): a timing that silently decoded dense would carry a compressed label.
+#[cfg(feature = "campaign")]
 fn campaign_steady_decode_on(
     model: &Decoder,
     prompt_ids: &[i32],
     tokens: usize,
     stop_tokens: &[i32],
-    compressed: Option<&crate::campaign::CompressedKvArm>,
+    compressed: Option<&crate::decode::observe::CompressedKvArm>,
 ) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
     let measured = campaign_forced_decode_on(
         model,
@@ -221,12 +233,13 @@ fn campaign_steady_decode_on(
 /// representation, optionally teacher-forced on `teacher_forced` and scored on its stream with
 /// `score` (see [`crate::decode::forced_greedy_decode`]). A compressed arm must run wholly on its
 /// fused compressed reader or the call fails closed.
+#[cfg(feature = "campaign")]
 fn campaign_forced_decode_on(
     model: &Decoder,
     prompt_ids: &[i32],
     tokens: usize,
     stop_tokens: &[i32],
-    compressed: Option<&crate::campaign::CompressedKvArm>,
+    compressed: Option<&crate::decode::observe::CompressedKvArm>,
     teacher_forced: Option<&[i32]>,
     score: bool,
 ) -> CoreResult<crate::decode::ForcedDecode> {
@@ -285,6 +298,7 @@ fn campaign_forced_decode_on(
 /// the computation order differs (projection row tiling, attention over the cached prefix instead
 /// of in-step K/V). Its agreement with — and likelihood of — the one-shot dense continuation is the
 /// dense arm's own numerical floor for the frozen greedy and perplexity thresholds.
+#[cfg(feature = "campaign")]
 fn campaign_chunked_prefill_decode_on(
     model: &Decoder,
     prompt_ids: &[i32],
@@ -322,6 +336,7 @@ fn campaign_chunked_prefill_decode_on(
 /// prompt retired a whole-history buffer into MLX's freed-buffer cache (run 37021783368: the
 /// 130k-token llama row's 64 growths reached a 73.8 GB footprint against a 68 GiB cap). Sized
 /// once, the chunked control holds what a one-shot dense run holds: one dense K/V history.
+#[cfg(feature = "campaign")]
 fn chunked_prefill_cache(model: &Decoder, positions: usize) -> CoreResult<ContiguousKvCache> {
     let block = i32::try_from(positions.max(1))
         .map_err(|_| CoreError::InvalidRequest("chunked prefill length overflows i32".into()))?;
@@ -338,6 +353,7 @@ fn chunked_prefill_cache(model: &Decoder, positions: usize) -> CoreResult<Contig
 
 /// Prefill `prompt_ids` into `cache` in `prefill_chunk`-token steps, evaluating each step and
 /// releasing MLX's freed-buffer cache after it, so no chunk's transients outlive it.
+#[cfg(feature = "campaign")]
 fn chunked_prefill(
     model: &Decoder,
     cache: &mut dyn KvCache,
@@ -361,6 +377,7 @@ fn chunked_prefill(
 
 /// The cache record of one prompt-cache turn: whether the lookup since `before` hit, and how many
 /// prompt tokens it reused.
+#[cfg(feature = "campaign")]
 fn prompt_cache_turn(
     before: crate::decode::PrefixStats,
     store: &crate::decode::PrefixCache,
@@ -950,7 +967,9 @@ pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
     /// Architecture parsed from the loaded snapshot. Campaign receipts use this product-owned
     /// identity instead of trusting the matrix row's caller-authored family label.
+    #[cfg_attr(not(feature = "campaign"), allow(dead_code))]
     architecture: Architecture,
+    #[cfg_attr(not(feature = "campaign"), allow(dead_code))]
     campaign_family: Option<&'static str>,
     /// The compressed-KV qualification family (sc-20679). Only a snapshot load names it, and only
     /// for a checkpoint whose config is a measured row's exact architecture
@@ -974,6 +993,7 @@ pub struct LlamaProvider {
     /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
     gemma4: Option<Gemma4Runtime>,
     /// Campaign-only prefix cache; ordinary serving never consults this state.
+    #[cfg_attr(not(feature = "campaign"), allow(dead_code))]
     campaign_prefix_cache: RefCell<Option<crate::decode::PrefixCache>>,
     /// At most two OWNED stream handles: load CPU and actual last execution.
     /// Fencing these orders execution; it does not evict model/cache ownership.
@@ -1167,6 +1187,7 @@ impl LlamaProvider {
 
     /// Frozen SC-20671 family identity for architectures that implement the campaign's contiguous
     /// cache controls. Other architectures fail closed instead of being mislabeled as Llama/Qwen.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_family(&self) -> CoreResult<&'static str> {
         self.campaign_family.ok_or_else(|| {
             CoreError::Unsupported(format!(
@@ -1176,6 +1197,7 @@ impl LlamaProvider {
         })
     }
 
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_context_window(&self) -> CoreResult<u64> {
         let Decoder::Causal(model) = &self.model else {
             return Err(CoreError::Unsupported(
@@ -1192,6 +1214,7 @@ impl LlamaProvider {
             })
     }
 
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_prompt_tokens(&self, prompt: &str) -> CoreResult<u64> {
         u64::try_from(self.tokenizer.encode(prompt, false)?.len())
             .map_err(|_| CoreError::Load("campaign prompt token count overflows u64".into()))
@@ -1199,6 +1222,7 @@ impl LlamaProvider {
 
     /// The `context_band` payload of at most `target` tokens (the coordinate's
     /// [`crate::campaign::family_band_target`]), which must fit the loaded window.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_context_band_measurement(
         &self,
         context_band: &str,
@@ -1215,6 +1239,7 @@ impl LlamaProvider {
     /// The multi-turn prompt-cache fixture's payload (contract v4): the band payload capped by
     /// [`crate::campaign::multi_turn_payload_target`], so turn 2 plus the full turn-2 forced
     /// continuation fits the native window. The row's coordinate operations keep the full band.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_multi_turn_payload(
         &self,
         context_band: &str,
@@ -1227,6 +1252,7 @@ impl LlamaProvider {
     }
 
     /// The largest `context_band` payload of at most `target` tokens.
+    #[cfg(feature = "campaign")]
     fn campaign_band_payload(
         &self,
         context_band: &str,
@@ -1259,6 +1285,7 @@ impl LlamaProvider {
     /// cannot substitute JSON-provided head/layer values for the actual provider configuration.
     /// SC-20677 K/V capture: the loaded causal decoder the campaign decodes through, and the
     /// snapshot's own tokenizer. Only campaign families (Llama/Qwen3) are accepted.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_causal_decoder(&self) -> CoreResult<(&CausalLm, &Tokenizer)> {
         self.campaign_family()?;
         match &self.model {
@@ -1269,7 +1296,8 @@ impl LlamaProvider {
         }
     }
 
-    pub(crate) fn campaign_geometry(&self) -> crate::campaign::ProductGeometry {
+    #[cfg(feature = "campaign")]
+    pub(crate) fn campaign_geometry(&self) -> crate::decode::observe::ProductGeometry {
         let (query_heads, kv_heads, head_dimension, layers) = match &self.model {
             Decoder::Causal(model) => {
                 let config = model.config();
@@ -1290,7 +1318,7 @@ impl LlamaProvider {
                 )
             }
         };
-        crate::campaign::ProductGeometry {
+        crate::decode::observe::ProductGeometry {
             query_heads: query_heads.max(0) as u64,
             kv_heads: kv_heads.max(0) as u64,
             head_dimension: head_dimension.max(0) as u64,
@@ -1303,6 +1331,7 @@ impl LlamaProvider {
     /// Exercise real contiguous-cache prefix reuse on the loaded causal decoder.  Hybrid Qwen3.6
     /// has a distinct cache contract and is rejected here rather than being mislabeled as a
     /// successful contiguous-cache observation.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_prefix_reuse(&self, prompt: &str) -> CoreResult<u64> {
         let ids = self
             .tokenizer
@@ -1346,6 +1375,7 @@ impl LlamaProvider {
     /// Seed the provider-owned prefix cache before a campaign opens its phase-local MLX peak
     /// window.  The observed cache-hit dispatch is deliberately separate so seed allocations and
     /// compile work cannot establish the peak used as measured prefill evidence.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_seed_prefix_reuse(&self, prompt: &str) -> CoreResult<f64> {
         let ids = self
             .tokenizer
@@ -1394,11 +1424,12 @@ impl LlamaProvider {
     /// attached. The caller must seed before resetting the phase-local peak; this method proves a
     /// new hit and emitted token before its output can be used as coordinate evidence. A
     /// `compressed` arm imports the reused prefix into its compressed cache.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_prefix_reuse_observed(
         &self,
         prompt: &str,
-        observer: &mut dyn crate::campaign::Observer,
-        compressed: Option<&crate::campaign::CompressedKvArm>,
+        observer: &mut dyn crate::decode::observe::Observer,
+        compressed: Option<&crate::decode::observe::CompressedKvArm>,
     ) -> CoreResult<(GenerationOutput, u64, u64)> {
         let ids = self
             .tokenizer
@@ -1460,16 +1491,19 @@ impl LlamaProvider {
     /// serving has no access to this cache; campaign workers must not let it retain MLX arrays and
     /// then claim that request-scoped cache memory was released.
     /// The stop tokens every product generation of this provider ends on.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_stop_tokens(&self) -> &[i32] {
         &self.stop_tokens
     }
 
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_release_cache_state(&self) {
         self.campaign_prefix_cache.borrow_mut().take();
     }
 
     /// Exercise the actual synchronous MLX batch decoder for the baseline's supported-batch arm.
     /// This is not emulated by serial `TextLlm` requests.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_supported_batch(&self, prompt: &str, batch: usize) -> CoreResult<u64> {
         if batch < 2 {
             return Err(CoreError::InvalidRequest(
@@ -1512,11 +1546,12 @@ impl LlamaProvider {
 
     /// Run the actual batched decoder while the receipt observer is attached to its prefill and
     /// decode path.  Ordinary scheduling continues to call [`Self::campaign_supported_batch`].
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_supported_batch_observed(
         &self,
         prompt: &str,
         batch: usize,
-        observer: &mut dyn crate::campaign::Observer,
+        observer: &mut dyn crate::decode::observe::Observer,
     ) -> CoreResult<(Vec<GenerationOutput>, u64)> {
         if batch < 2 {
             return Err(CoreError::InvalidRequest(
@@ -1569,10 +1604,11 @@ impl LlamaProvider {
     /// cleanup path rather than recording a pre-cancelled no-op request. This uses a dedicated
     /// no-tools prompt: a valid tool-only response is intentionally lifted out of the content
     /// stream, so reusing a structured-output fixture would never trigger a content-token cancel.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_cancel_after_first_token(
         &self,
-        observer: &mut dyn crate::campaign::Observer,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        observer: &mut dyn crate::decode::observe::Observer,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
     ) -> CoreResult<()> {
         let mut request = campaign_cancellation_probe_request();
         let cancel = crate::decode::CancelFlag::new();
@@ -1599,11 +1635,12 @@ impl LlamaProvider {
     /// stop token (see [`crate::decode::forced_greedy_decode`]). No observer is attached: this runs
     /// outside every coordinate's memory attribution, and its request-scoped cache is reset and
     /// MLX's buffer cache released before it returns.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_steady_decode(
         &self,
         prompt: &str,
         tokens: usize,
-        compressed: Option<&crate::campaign::CompressedKvArm>,
+        compressed: Option<&crate::decode::observe::CompressedKvArm>,
     ) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
         let ids = self
             .tokenizer
@@ -1631,11 +1668,12 @@ impl LlamaProvider {
     /// session's probability of every stream token is returned beside its choices, so both arms'
     /// likelihoods are measured on the same tokens. Runs outside every coordinate's memory
     /// attribution on a request-scoped cache.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_forced_continuation(
         &self,
         prompt: &str,
         tokens: usize,
-        compressed: Option<&crate::campaign::CompressedKvArm>,
+        compressed: Option<&crate::decode::observe::CompressedKvArm>,
         teacher_forced: Option<&[i32]>,
     ) -> CoreResult<crate::campaign::ScoredContinuation> {
         let ids = self
@@ -1678,6 +1716,7 @@ impl LlamaProvider {
     /// session teacher-forced on `stream` over the raw `prompt` prefilled in `prefill_chunk`-token
     /// steps, scored on that stream. Refused on a compressed session's provider path by
     /// construction: it always decodes the dense cache.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_chunked_prefill_continuation(
         &self,
         prompt: &str,
@@ -1722,12 +1761,14 @@ impl LlamaProvider {
     /// Campaign-only load which evaluates every tensor consumed by the product model constructor.
     /// Ordinary serving keeps MLX's lazy-load behavior; the sealed memory campaign needs an exact
     /// parameter-only materialization boundary before it samples `weights-loaded`.
+    #[cfg(feature = "campaign")]
     pub(crate) fn load_for_campaign(spec: &LoadSpec) -> CoreResult<Self> {
         Self::load_inner(spec, true).map(Self::pin_campaign_template_date)
     }
 
     /// Fix the chat template's `date_string` to the campaign constant, so every campaign render
     /// (turn 1, turn 2, fixtures) is the same prompt on any day.
+    #[cfg(feature = "campaign")]
     fn pin_campaign_template_date(mut self) -> Self {
         self.campaign_template_date = Some(crate::campaign::CAMPAIGN_CHAT_TEMPLATE_DATE_STRING);
         self
@@ -2550,6 +2591,7 @@ impl LlamaProvider {
     }
 }
 
+#[cfg(feature = "campaign")]
 fn campaign_cancellation_probe_request() -> TextLlmRequest {
     TextLlmRequest {
         messages: vec![Message::text(
@@ -2745,6 +2787,7 @@ fn load_chat_template(
 
 /// Match the text-only `generate_inner` rendering/tokenization path without loading weights.
 /// Campaign preflight uses this before MLX admission; the product still revalidates at dispatch.
+#[cfg(feature = "campaign")]
 pub(crate) fn campaign_preflight_request_tokens(
     snapshot: &Path,
     request: &TextLlmRequest,
@@ -2770,6 +2813,7 @@ pub(crate) fn campaign_preflight_request_tokens(
         })
 }
 
+#[cfg(feature = "campaign")]
 pub(crate) fn campaign_preflight_cancellation_tokens(snapshot: &Path) -> CoreResult<u64> {
     campaign_preflight_request_tokens(snapshot, &campaign_cancellation_probe_request())
 }
@@ -3379,12 +3423,13 @@ impl LlamaProvider {
     /// Campaign-only entrypoint. The observer is never installed on ordinary production calls.
     /// `packed` selects the compressed arm: the observed decode then runs on the packed
     /// group-affine cache with the retained fused reader (SC-20676 compressed rows).
+    #[cfg(feature = "campaign")]
     pub(crate) fn generate_observed(
         &self,
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
-        observer: &mut dyn crate::campaign::Observer,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        observer: &mut dyn crate::decode::observe::Observer,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
     ) -> CoreResult<TextLlmOutput> {
         self.generate_inner(req, on_event, Some(observer), packed, None)
     }
@@ -3426,6 +3471,7 @@ impl LlamaProvider {
     /// stored there for turn 2. Turn 1 is dense in every arm: the provider prefix store holds
     /// shared prefixes as dense K/V, and only a compressed cache hit imports one. Returns the
     /// answer, the turn's cache record, and its rendered prompt ids.
+    #[cfg(feature = "campaign")]
     fn campaign_turn_one(
         &self,
         turn1: &TextLlmRequest,
@@ -3451,6 +3497,7 @@ impl LlamaProvider {
     }
 
     /// Turn 2 of the multi-turn fixture: turn 1's conversation, its answer, then `follow_up`.
+    #[cfg(feature = "campaign")]
     fn campaign_turn_two_request(
         turn1: &TextLlmRequest,
         answer: &TextLlmOutput,
@@ -3466,6 +3513,7 @@ impl LlamaProvider {
 
     /// Turn 2 must be served by a prompt-cache hit reusing at least the prompt it shares with
     /// turn 1 (fail closed otherwise: the fixture would measure a cold prefill).
+    #[cfg(feature = "campaign")]
     fn require_turn_two_hit(
         turn: &crate::campaign::PromptCacheTurn,
         turn1_ids: &[i32],
@@ -3492,13 +3540,14 @@ impl LlamaProvider {
     /// `follow_up` and is served by the cache hit — a dense seed, or, with `packed`, the prefix
     /// imported into the compressed cache — with `observer` attached. Turn 2's output and both
     /// turns' cache records are returned; a turn 2 that missed is refused.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_multi_turn_observed(
         &self,
         turn1: &TextLlmRequest,
         follow_up: &str,
         on_event: &mut dyn FnMut(CoreEvent),
-        observer: &mut dyn crate::campaign::Observer,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        observer: &mut dyn crate::decode::observe::Observer,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
     ) -> CoreResult<(TextLlmOutput, crate::campaign::MultiTurnPromptCacheTurns)> {
         let mut store = crate::decode::PrefixCache::with_budget(u64::MAX);
         let (answer, turn1_cache, turn1_ids) = self.campaign_turn_one(turn1, &mut store)?;
@@ -3526,12 +3575,13 @@ impl LlamaProvider {
     /// for `min(tokens, context window - turn 2 prompt)` ids through every stop token. With
     /// `teacher_forced`, the decode is forced on that stream and the session's argmax at every
     /// position is returned. A compressed pass must run wholly on the fused reader.
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_multi_turn_forced_continuation(
         &self,
         turn1: &TextLlmRequest,
         follow_up: &str,
         tokens: usize,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
         teacher_forced: Option<&[i32]>,
     ) -> CoreResult<(Vec<i32>, crate::campaign::MultiTurnPromptCacheTurns)> {
         self.campaign_multi_turn_continuation(
@@ -3547,6 +3597,7 @@ impl LlamaProvider {
 
     /// [`Self::campaign_multi_turn_forced_continuation`], also scoring the session's probability
     /// of every turn-2 stream token (the SC-20669 dense multi-turn noise-floor control).
+    #[cfg(feature = "campaign")]
     pub(crate) fn campaign_multi_turn_scored_continuation(
         &self,
         turn1: &TextLlmRequest,
@@ -3560,12 +3611,13 @@ impl LlamaProvider {
         self.campaign_multi_turn_continuation(turn1, follow_up, tokens, None, teacher_forced, true)
     }
 
+    #[cfg(feature = "campaign")]
     fn campaign_multi_turn_continuation(
         &self,
         turn1: &TextLlmRequest,
         follow_up: &str,
         tokens: usize,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
         teacher_forced: Option<&[i32]>,
         score: bool,
     ) -> CoreResult<(
@@ -3743,8 +3795,8 @@ impl LlamaProvider {
         &self,
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
-        observer: Option<&mut dyn crate::campaign::Observer>,
-        packed: Option<&crate::campaign::CompressedKvArm>,
+        observer: Option<&mut dyn crate::decode::observe::Observer>,
+        packed: Option<&crate::decode::observe::CompressedKvArm>,
         prefix_cache: Option<&mut crate::decode::PrefixCache>,
     ) -> CoreResult<TextLlmOutput> {
         self.validate(req)?;

@@ -318,7 +318,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 990
+              "line": 992
             }
           ],
           "creation": [
@@ -379,7 +379,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 990
+              "line": 992
             }
           ],
           "creation": [
@@ -434,21 +434,21 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
               "symbol": "sc20686::register_cross_kv_set",
-              "line": 931
+              "line": 928
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 837
+              "line": 739
             }
           ],
           "release": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
               "symbol": "CacheSetGuard",
-              "line": 900
+              "line": 897
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
@@ -468,7 +468,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 507
+              "line": 524
             }
           ],
           "product_residency": "sequential",
@@ -483,21 +483,21 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
               "symbol": "sc20686::register_cross_kv_set",
-              "line": 931
+              "line": 928
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 837
+              "line": 739
             }
           ],
           "release": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
               "symbol": "CacheSetGuard",
-              "line": 900
+              "line": 897
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
@@ -517,7 +517,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1476
+              "line": 1512
             }
           ],
           "product_residency": "sequential",
@@ -541,21 +541,21 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
               "symbol": "sc20686::register_cross_kv_set",
-              "line": 931
+              "line": 928
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 837
+              "line": 739
             }
           ],
           "release": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
               "symbol": "CacheSetGuard",
-              "line": 900
+              "line": 897
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
@@ -575,7 +575,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1476
+              "line": 1512
             }
           ],
           "product_residency": "sequential",
@@ -599,14 +599,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::record_recomputed_kv",
-              "line": 207
+              "line": 203
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::begin_read",
-              "line": 213
+              "line": 209
             }
           ],
           "release": [
@@ -635,7 +635,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 469
+              "line": 488
             }
           ],
           "product_residency": "resident",
@@ -648,14 +648,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::record_recomputed_kv",
-              "line": 207
+              "line": 203
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::begin_read",
-              "line": 213
+              "line": 209
             }
           ],
           "release": [
@@ -684,7 +684,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 898
+              "line": 941
             }
           ],
           "product_residency": "sequential",

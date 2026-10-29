@@ -34,7 +34,6 @@ use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
-use mlx_gen::train::flow::{validate_flow_match_request, validate_shared_floors};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -49,10 +48,11 @@ pub use mlx_gen::train::lora::LoraTarget;
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::vocab::{sample_timestep, validate_common_request};
 use mlx_gen::{
     FlowMatchEuler, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
-    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport,
+    TrainingRequest, WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -211,12 +211,12 @@ mlx_gen::register_trainer! {
 /// `timestep_type` / `timestep_bias` / `loss_type`. The non-empty target-module resolution (also
 /// F-041) is checked in [`Trainer::validate`], which has the loaded DiT to match suffixes against.
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    validate_flow_match_request(req, "z_image_turbo trainer")
+    validate_common_request("z_image_turbo trainer", req)
 }
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    validate_shared_floors(descriptor, req)?;
+    mlx_gen::train::vocab::validate_shared_floors(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }
@@ -247,10 +247,23 @@ impl Trainer for ZImageTurboTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -261,6 +274,7 @@ impl ZImageTurboTrainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         self.validate(req)?;
         let cfg = &req.config;
@@ -681,11 +695,18 @@ impl ZImageTurboTrainer {
                             // F-117: a cancelled preview exits the preview loop (outer cancel check
                             // unwinds the run); other failures skip a single preview.
                             Err(mlx_gen::Error::Canceled) => break,
-                            Err(e) => eprintln!(
-                                "[sc-5637] {MODEL_ID} preview sample failed at step {step} \
-                                 (prompt {}): {e} — skipping this preview, training continues",
-                                i + 1
-                            ),
+                            Err(e) => {
+                                eprintln!(
+                                    "[sc-5637] {MODEL_ID} preview sample failed at step {step} \
+                                     (prompt {}): {e} — skipping this preview, training continues",
+                                    i + 1
+                                );
+                                warnings.push(gen_core::train::preview_sample_failed(
+                                    step,
+                                    i as u32 + 1,
+                                    &e,
+                                ));
+                            }
                         }
                     }
                     if let Some(merged) = &self.training_adapter {
@@ -943,7 +964,7 @@ fn run_train_step(
     let sample = step_sample(perceptual, step, schedule);
     let entry = sample.entry;
     let (x0, cap, mask_weight) = &cache[entry];
-    let mut sigma = sample_sigma(
+    let mut sigma = sample_timestep(
         &cfg.timestep_type,
         &cfg.timestep_bias,
         cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
@@ -1128,47 +1149,7 @@ fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
-}
-
-/// Sample a normalised flow-match timestep (interpolation coefficient) `σ ∈ [1e-3, 1-1e-3]` — a
-/// faithful port of the SceneWorks `sample_training_timestep`: `sigmoid(randn)` by default,
-/// `uniform` for linear, `(uniform + sigmoid(randn))/2` for weighted; bias `high` → `√σ`,
-/// `low` → `σ²`. Deterministic in `seed`.
-fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let ttype = timestep_type.trim().to_ascii_lowercase().replace('-', "_");
-    let t = match ttype.as_str() {
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            // wrapping_add (Fibonacci-hash mixing) rather than an XOR-sibling seed, whose two draws
-            // can correlate depending on `key()`'s splat (F-058).
-            let k2 = random::key(seed.wrapping_add(0x9E37_79B9))?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
-    };
-    let bias = timestep_bias
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '-'], "_");
-    let t = match bias.as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    Ok(t.clamp(1e-3, 1.0 - 1e-3))
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr), run the
@@ -2719,7 +2700,7 @@ mod depth_anchoring_tests {
             {
                 let key =
                     mlx_gen::train::perceptual::AuxAlternation::new(schedule.epoch_len(), 1).key(n);
-                let raw = sample_sigma(
+                let raw = sample_timestep(
                     &cfg.timestep_type,
                     &cfg.timestep_bias,
                     cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(n as u64),
@@ -2845,7 +2826,7 @@ mod depth_anchoring_tests {
 
         // The pre-sc-2125 `compute_loss_grads` body for step 1 (same item / sigma / noise).
         let (x0, cap, _) = &cache[0];
-        let sigma = sample_sigma(
+        let sigma = sample_timestep(
             &cfg.timestep_type,
             &cfg.timestep_bias,
             cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),
