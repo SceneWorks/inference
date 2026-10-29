@@ -61,7 +61,7 @@ use crate::spatial_tiling::SpatialTiling;
 pub const SPATIAL_STRIDE: u32 = mlx_gen::gen_core::h3_memory::SPATIAL_STRIDE;
 
 /// Short edge the released checkpoint generates on by default.
-pub const CANVAS_SHORT_EDGE: u32 = 768;
+pub const CANVAS_SHORT_EDGE: u32 = mlx_gen::gen_core::h3_memory::CANVAS_SHORT_EDGE;
 
 /// Area budget of the released checkpoint's canvas, `768 · 1344` = 1 032 192 px.
 ///

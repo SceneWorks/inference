@@ -12,6 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::Read,
+    path::Path,
 };
 
 #[derive(Clone, Debug)]
@@ -94,19 +95,29 @@ pub fn native_target(stem: &str, cfg: &DitConfig) -> Result<(String, usize, usiz
 pub fn inspect(spec: &AdapterSpec, cfg: &DitConfig) -> Result<Vec<Projection>> {
     let mut file =
         File::open(&spec.path).map_err(|e| unsupported(format!("{}: {e}", spec.path.display())))?;
-    let mut len = [0u8; 8];
-    file.read_exact(&mut len)
-        .map_err(|e| unsupported(format!("invalid safetensors header: {e}")))?;
-    let len = u64::from_le_bytes(len);
-    if len == 0 || len > 16 * 1024 * 1024 {
+    let file_len = file.metadata()?.len();
+    let header = read_header_json(&mut file, file_len, &spec.path)?;
+    inspect_header(spec, cfg, &header)
+}
+
+/// The crate-wide bounded header read (sc-27314), then the FLUX3 16 MiB family cap
+/// ([`super::checkpoint::MAX_HEADER_BYTES`]) before any header buffer is allocated.
+fn read_header_json(
+    reader: &mut impl Read,
+    file_len: u64,
+    path: &Path,
+) -> Result<serde_json::Value> {
+    let (len, _data_start) =
+        crate::weightsmeta::read_safetensors_header_len(reader, file_len, path)
+            .map_err(|e| unsupported(format!("invalid safetensors header: {e}")))?;
+    if len == 0 || len as u64 > super::checkpoint::MAX_HEADER_BYTES {
         return Err(unsupported("invalid/oversized safetensors header"));
     }
-    let mut header = vec![0; len as usize];
-    file.read_exact(&mut header)
+    let mut header = vec![0; len];
+    reader
+        .read_exact(&mut header)
         .map_err(|e| unsupported(format!("truncated header: {e}")))?;
-    let header: serde_json::Value = serde_json::from_slice(&header)
-        .map_err(|e| unsupported(format!("invalid header JSON: {e}")))?;
-    inspect_header(spec, cfg, &header)
+    serde_json::from_slice(&header).map_err(|e| unsupported(format!("invalid header JSON: {e}")))
 }
 
 /// Only plain additive LoRA: honor explicit native/PEFT alpha, never invent alpha=rank or
@@ -287,18 +298,7 @@ pub const ADMISSION_METADATA_KEYS: &[&str] = &[
 /// Admission over an in-memory safetensors buffer: the SAME bytes the caller then hands to its
 /// tensor loader, so the validated header and the installed tensors cannot diverge (no TOCTOU).
 pub fn inspect_bytes(spec: &AdapterSpec, cfg: &DitConfig, bytes: &[u8]) -> Result<Vec<Projection>> {
-    let len = bytes
-        .get(..8)
-        .map(|raw| u64::from_le_bytes(raw.try_into().expect("8 bytes")))
-        .ok_or_else(|| unsupported("invalid safetensors header: file shorter than 8 bytes"))?;
-    if len == 0 || len > 16 * 1024 * 1024 {
-        return Err(unsupported("invalid/oversized safetensors header"));
-    }
-    let body = bytes
-        .get(8..8 + len as usize)
-        .ok_or_else(|| unsupported("truncated header"))?;
-    let header: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|e| unsupported(format!("invalid header JSON: {e}")))?;
+    let header = read_header_json(&mut &bytes[..], bytes.len() as u64, &spec.path)?;
     inspect_header(spec, cfg, &header)
 }
 

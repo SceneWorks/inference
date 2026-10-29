@@ -36,7 +36,7 @@ candle-nn = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 # Parse the FLUX snapshot's `text_encoder_2/config.json` into candle's `t5::Config` (the backbone load).
-serde_json = "1"
+serde_json = { workspace = true }
 
 # Enable the shared test-support helpers (sc-9055 / F-069: `candle_gen::testkit`) for this crate's own
 # tests only. Cargo unifies this with the `[dependencies]` entry above but the `testkit` feature stays
@@ -49,7 +49,7 @@ tempfile = { workspace = true }
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # `tests/preview_real_weights.rs` (sc-16956) writes the frame strip + final render as PNG so a real GPU
 # run can be eyeballed. Not a library dependency (the worker owns asset writes).
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 
 [features]
 model-inference-proof = ["candle-gen-face/model-inference-proof", "candle-gen-flux/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof"]

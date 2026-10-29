@@ -66,6 +66,8 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::config::ConfigFile;
+
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
 use mlx_gen::gen_core::{self, BucketSchedule};

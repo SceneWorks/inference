@@ -335,7 +335,7 @@ impl FaceAnalysis {
         let crops: Vec<Vec<u8>> = dets
             .iter()
             .map(|d| align::norm_crop(img, h, w, &d.kps))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<mlx_gen::gen_core::Result<Vec<_>>>()?;
         let emb = self.arcface.forward(&align::to_arcface_input(&crops)?)?;
         let emb = emb
             .try_as_slice::<f32>()

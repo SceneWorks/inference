@@ -21,7 +21,7 @@ candle-gen-pid = { path = "../candle-gen-pid" }
 # Deterministic CPU-seeded initial noise (sc-3673 parity).
 rand = { workspace = true }
 rand_distr = { workspace = true }
-serde_json = "1"
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 # Read adapter `.safetensors` header metadata for the bundled TurboTime LoRA merge (turbo path).
 safetensors = "0.7"
@@ -39,5 +39,5 @@ cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-gen-pid/cuda"]
 tempfile = { workspace = true }
 # GPU examples use the phase-aware VRAM probe without exposing test support in the shipped provider.
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }

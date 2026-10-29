@@ -30,7 +30,7 @@ tokenizers = { workspace = true }
 candle-audio-chatterbox-ve = { path = "../candle-audio-chatterbox-ve" }
 # Config parsing (t3 / s3gen hyperparameters). serde is not a [workspace.dependencies] entry
 # (siblings use serde_json only); the version matches the workspace-resolved lockfile pin.
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 # Seeded RNG for the T3 autoregressive sampling and the S3Gen flow noise (the reproducibility law:
 # same request+seed ⇒ byte-identical samples). Same crates the media providers use.

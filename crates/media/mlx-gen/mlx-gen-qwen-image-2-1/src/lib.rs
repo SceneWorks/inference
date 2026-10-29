@@ -110,10 +110,10 @@ pub const UPSTREAM_LICENSE_NOTICE: &str = "Qwen is licensed under the Qwen RESEA
 
 pub use adapters::apply_qwen_image_2_1_adapters;
 pub use config::{
-    SavedSigmaSchedule, SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig,
-    VaeConfig, VisionConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, IMAGE_TOKENS_PER_SLOT,
-    MAX_REFERENCE_IMAGES, OUTPUT_RESOLUTION, PRESETS, SIZE_MULTIPLE, SYSTEM_PROMPT,
-    VAE_SCALE_FACTOR, VISION_MERGE_SIZE, VISION_PATCH_SIZE,
+    ConfigFile, SavedSigmaSchedule, SchedulerConfig, SizePreset, TextEncoderConfig,
+    TransformerConfig, VaeConfig, VisionConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG,
+    IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES, OUTPUT_RESOLUTION, PRESETS, SIZE_MULTIPLE,
+    SYSTEM_PROMPT, VAE_SCALE_FACTOR, VISION_MERGE_SIZE, VISION_PATCH_SIZE,
 };
 pub use loader::{
     load_model_index, load_saved_sigma_schedule, load_scheduler_config, load_text_encoder,

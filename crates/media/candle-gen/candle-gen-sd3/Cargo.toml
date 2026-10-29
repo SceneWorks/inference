@@ -56,7 +56,7 @@ sc9581-ab = []
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
 tempfile = { workspace = true }
 # `examples/sd3-txt2img.rs` smoke driver (C2) — encode the produced `gen_core::Image` (RGB8) to PNG.
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 # gen-core conformance suite — pinned to the SAME gen-core rev the workspace pins so it shares one
 # contract build. Used by cuda-gated, `#[ignore]`d real-weight tests (C2/C6).
 sceneworks-gen-core-testkit = { workspace = true }

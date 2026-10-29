@@ -109,6 +109,28 @@ MLX/Candle platform catalog (the shipped surface)
 application composition root (one immutable ProviderRegistry)
 ```
 
+### Lateral provider dependencies
+
+The provider-family tier is not flat. A provider crate may consume a sibling
+provider as a library — for example the shared PiD latent decoder and the
+perceptual-loss crates are depended on by many families — and these lateral
+edges are part of the design rather than a leak. They are allowed under three
+rules:
+
+- **same backend only**: an `mlx-gen-*` provider never depends on a Candle crate
+  (`candle-gen-*`, `candle-audio-*`, the Candle engines), and a Candle provider
+  never depends on an MLX crate; the only cross-backend seam is the audio lane
+  composed at the catalog/bundle level
+  ([audio backend strategy](audio-backend-strategy.md));
+- **never upward**: a provider never depends on a platform catalog or a runtime
+  bundle;
+- **acyclic**: Cargo already rejects cycles among normal dependencies.
+
+`scripts/check-workspace.py` enforces the first two rules over every normal
+dependency edge between workspace members. Extracting shared `*-common` crates to
+flatten the lateral tier is deliberately not done: its only demonstrated cost is
+rebuild fan-out, so revisit it only if build times make that cost material.
+
 ### One repository, one resolved graph
 
 The source repositories were not rewritten or force-pushed. Their histories were
@@ -297,6 +319,8 @@ Future inference work should preserve these rules:
 - provider registration is explicit—do not add `inventory` submissions or
   `force_link` anchors as a shortcut;
 - every shipped family is named in its platform catalog;
+- provider-to-provider dependencies stay on one backend and never point at a
+  catalog or bundle (see *Lateral provider dependencies*);
 - every supported product consumes one named runtime bundle rather than assembling
   backend crates;
 - LLM providers and snapshot preparers are added through explicit builders, not

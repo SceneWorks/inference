@@ -43,7 +43,7 @@ rand_distr = { workspace = true }
 safetensors = "0.7"
 # Detect a pre-quantized MLX-packed tier by the `quantization` block in a component's `config.json`
 # (sc-9408 packed-load — `candle_gen::quant::PackedConfig::from_config`). Same dep flux2 uses (sc-9087).
-serde_json = "1"
+serde_json = { workspace = true }
 
 [features]
 model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof"]
@@ -64,7 +64,7 @@ tempfile = { workspace = true }
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # `examples/z-image-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a
 # real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 sha2 = { workspace = true }
 # gen-core conformance suite (sc-4481): drives this provider through the public Generator contract
 # (cancel / progress / seed-determinism / capability honesty). Pinned to the SAME gen-core rev the

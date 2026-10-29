@@ -35,7 +35,7 @@ tempfile = { workspace = true }
 # feature (mirrors candle-gen-pid / candle-gen-krea test IO). The txt2img examples take an explicit
 # pre-downloaded snapshot dir (--snapshot / SANA_SNAPSHOT); inference never self-fetches (epic 13657).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 # Shared memory-contract conformance assertions (epic SC-22657): the architecture-facts honesty
 # rules live once in gen-core-testkit, so this crate's published axes are checked by the same gate
 # every other adopting provider runs.

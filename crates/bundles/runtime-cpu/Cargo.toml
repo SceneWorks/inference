@@ -14,6 +14,9 @@ candle-llm = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The registry-wide memory-contract facts walk over this bundle's contract surface (sc-27274),
+# the same acceptance test runtime-cuda runs.
+gen-core-testkit = { package = "sceneworks-gen-core-testkit", path = "../../contracts/gen-core-testkit" }
 
 [features]
 default = ["media", "audio"]
