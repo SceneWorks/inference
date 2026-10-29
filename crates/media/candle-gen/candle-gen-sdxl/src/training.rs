@@ -53,7 +53,7 @@ use candle_gen::gen_core::sampling::{
 use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
-    TrainingRequest,
+    TrainingReport, TrainingRequest,
 };
 use candle_gen::gen_core::{self, BucketSchedule, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
@@ -834,13 +834,26 @@ impl Trainer for SdxlTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         // Every other `validate` floor too (control / full fine-tune / edit), so a caller that
         // skips `validate` cannot train a request it would refuse.
         self.validate(req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -868,6 +881,7 @@ impl SdxlTrainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         self.validate_impl(req)?;
         let cfg = &req.config;
@@ -1165,11 +1179,18 @@ impl SdxlTrainer {
                                 prompt: prompt.clone(),
                                 image,
                             }),
-                            Err(e) => eprintln!(
-                                "[sc-8650] sdxl: preview sample failed at step {step} \
-                                 (prompt {}): {e} — skipping",
-                                i + 1
-                            ),
+                            Err(e) => {
+                                eprintln!(
+                                    "[sc-8650] sdxl: preview sample failed at step {step} \
+                                     (prompt {}): {e} — skipping",
+                                    i + 1
+                                );
+                                warnings.push(gen_core::train::preview_sample_failed(
+                                    step,
+                                    i as u32 + 1,
+                                    &e,
+                                ));
+                            }
                         }
                     }
                     let _ = unet.visit_lora_mut(&mut |ll| {

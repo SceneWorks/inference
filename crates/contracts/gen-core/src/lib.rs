@@ -47,25 +47,36 @@ pub mod control;
 pub mod convrot_int8;
 pub mod duration_head;
 pub mod encoder_contract;
+pub mod env_flag;
 pub mod error;
 pub mod execution_domains;
 pub mod exr_io;
 pub mod face;
+pub mod face_align;
 pub mod flux3;
 pub mod fx_program;
 pub mod gemma_assets;
 pub mod generator;
 pub mod guidance;
 pub mod h3_adapter_memory;
+pub mod h3_audio_config;
+pub mod h3_chunking;
 pub mod h3_conditioning_memory;
+pub mod h3_keyframe;
 pub mod h3_memory;
 pub mod h3_reference;
+pub mod h3_schedule;
 pub mod hdr;
+pub mod ideogram_scheduler;
 pub mod image_embed;
 pub mod imageops;
+pub mod instantid_kps;
 pub mod iris;
 pub mod json_constraint;
+pub mod krea_multiphase;
+pub mod krea_schedule;
 pub mod latent;
+pub mod lens_resolution;
 pub mod license;
 pub mod load_activity;
 pub mod ltx_checkpoint;
@@ -81,6 +92,7 @@ pub mod moss_image_training;
 pub mod numeric;
 pub mod pruned_adaln;
 pub mod pth;
+pub mod qwen_image_2_1;
 pub mod registry;
 pub mod residency;
 pub mod runtime;
@@ -90,6 +102,7 @@ pub mod sampling;
 pub mod sd3_encoder_artifacts;
 pub mod sd3_request;
 pub mod sdxl_ldm;
+pub mod seedvr2_video;
 pub mod supra2;
 pub mod text_embed;
 pub mod tier_integrity;
@@ -165,6 +178,7 @@ pub use encoder_contract::{
     TextEncoderPlanningFacts, TextEncoderSourceLayout, ValidatedEncoderSource,
     ValidatedTokenizerSource,
 };
+pub use env_flag::env_flag;
 pub use error::{Error, Result};
 pub use execution_domains::{
     CfgBatching, CfgBatchingDomain, ExecutionSurface, ExecutionValueDomain, FfnChunk,
@@ -225,8 +239,9 @@ pub use memory_phases::{
 };
 pub use memory_strategy::{
     adapter_stack_identity, adapter_stack_resident_bytes, adapter_stack_upcast_resident_bytes,
-    default_memory_strategy_safety_check, default_registered_memory_strategy_safety_check,
-    standard_memory_behavior_context, standard_memory_strategy_safety_check,
+    admit_memory_safety, checked_byte_total, default_memory_strategy_safety_check,
+    default_registered_memory_strategy_safety_check, standard_memory_behavior_context,
+    standard_memory_strategy_safety_check, validate_bounded_decode_params,
     validate_calibration_fingerprint, AdapterResidencyMode, LokrKroneckerDims,
     MemoryArchitectureFacts, MemoryAssetFacts, MemoryBackend, MemoryBackendRealization,
     MemoryBehaviorRoute, MemoryBudget, MemoryCacheSemantics, MemoryCacheState,
@@ -278,8 +293,9 @@ pub use runtime::{
     CancelFlag, FileStatFingerprint, HdrFrameSink, HdrOutputFrame, IdentityWeights, LoadPhase,
     LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy, PidWeights,
     PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress,
-    PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource,
-    Yue2ArMode, Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT,
+    PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,
+    ResolvedFileIdentity, SingleFlight, SingleFlightGuard, WeightsSource, Yue2ArMode,
+    Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT,
     COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT,
     VAE_COMPONENT,
 };
@@ -330,9 +346,9 @@ pub use train::{
     DepthModelSize, FaceLandmarkLossConfig, IdentityLossConfig, IdentityReferenceMode,
     LatentLpipsConfig, LatentLpipsFamily, LrSchedule, NetworkType, ResolutionBucket,
     SubjectMaskLoss, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput,
-    TrainingProgress, TrainingRequest, TrainingTechniques, VaeAnchorConfig, BODY_SURFACE_SCHEDULE,
-    LATENT_PERCEPTUAL_SCHEDULE, MAX_RESOLUTION_BUCKETS, PIXEL_PERCEPTUAL_SCHEDULE,
-    RESOLUTION_BUCKET_STRIDE,
+    TrainingProgress, TrainingReport, TrainingRequest, TrainingTechniques, VaeAnchorConfig,
+    BODY_SURFACE_SCHEDULE, LATENT_PERCEPTUAL_SCHEDULE, MAX_RESOLUTION_BUCKETS,
+    PIXEL_PERCEPTUAL_SCHEDULE, RESOLUTION_BUCKET_STRIDE,
 };
 pub use transcribe::{
     TimestampGranularity, TranscribeCapabilities, TranscribeFinishReason, TranscribeOptions,
@@ -349,7 +365,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod veda;
 pub use veda::{VedaBudget, VedaExecutionReport, VedaRequest};
-pub mod h3_terminal_telemetry;
 
 mod source_inventory;
 pub use source_inventory::SourceInventory;

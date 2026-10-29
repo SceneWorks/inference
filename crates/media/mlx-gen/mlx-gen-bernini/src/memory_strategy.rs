@@ -1520,22 +1520,14 @@ pub(crate) fn safety_check(
     } else {
         match resolved_numeric_tier(spec) {
             Ok(tier) => tier,
-            Err(error) => {
-                return MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                }
-            }
+            Err(error) => return MemorySafetyDecision::rejected(error),
         }
     };
     standard_memory_strategy_safety_check(contract, context, Some(loaded_tier), Some(&route_gate))
 }
 
 fn fixture_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    }
+    mlx_gen::request_scope::loaded_tier(spec)
 }
 
 fn quant_manifest(path: &std::path::Path) -> CoreResult<Option<(i32, usize)>> {
@@ -1967,9 +1959,7 @@ pub fn loaded_safety_check(
         MemoryStrategy::BoundedTransformerResidency,
     ) {
         if let Err(error) = check_loaded_expert_depth(provider_id, loaded_expert_blocks) {
-            return MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            };
+            return MemorySafetyDecision::rejected(error);
         }
     }
     safety_check(spec, contract, context)
@@ -1983,11 +1973,13 @@ pub fn loaded_begin_request(
     context: &MemoryRunContext,
     loaded_expert_blocks: usize,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } =
-        loaded_safety_check(provider_id, spec, contract, context, loaded_expert_blocks)
-    {
-        return Err(CoreError::Unsupported(reason));
-    }
+    mlx_gen::request_scope::admit(loaded_safety_check(
+        provider_id,
+        spec,
+        contract,
+        context,
+        loaded_expert_blocks,
+    ))?;
     begin_request(provider_id, spec, contract, context)
 }
 
@@ -1998,9 +1990,7 @@ fn begin_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
+    mlx_gen::request_scope::admit(safety_check(spec, contract, context))?;
     let route = match context.mode.as_key() {
         "video_to_video" => BerniniMemoryRoute::Clip,
         "reference_to_video" => BerniniMemoryRoute::Images,
@@ -2045,13 +2035,8 @@ fn begin_with_cleanup(
         },
     )?;
     config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
+    config.transformer_window =
+        mlx_gen::request_scope::selected_transformer_window(contract, context);
     Ok(Some(Box::new(BerniniMemoryRequestScope {
         inner: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
         provider_id,
@@ -2363,25 +2348,14 @@ pub(crate) fn attention_budget(req: &GenerationRequest) -> mlx_gen::attention::A
 /// [`TRANSFORMER_WINDOW_SIZES`] — is a typed rejection rather than a silently narrowed (or silently
 /// *widened*) execution.
 pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Result<Option<usize>> {
-    let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
-        return Ok(None);
-    };
-    let component = memory
-        .transformer_window_component
-        .unwrap_or(TRANSFORMER_WINDOW_COMPONENT);
-    if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
-        return Err(mlx_gen::Error::Unsupported(format!(
-            "bernini implements only the {TRANSFORMER_WINDOW_COMPONENT:?} transformer window \
-             component, got {component:?}"
-        )));
-    }
-    let size = memory
-        .transformer_window_size
-        .unwrap_or(TRANSFORMER_WINDOW_SIZE);
-    validate_window(size).map_err(|error| {
-        mlx_gen::Error::Unsupported(format!("bernini transformer window rejected: {error}"))
-    })?;
-    Ok(Some(size as usize))
+    mlx_gen::request_scope::requested_transformer_window(
+        "bernini",
+        req.memory,
+        TRANSFORMER_WINDOW_COMPONENT,
+        TRANSFORMER_WINDOW_COMPONENTS,
+        TRANSFORMER_WINDOW_SIZE,
+        validate_window,
+    )
 }
 
 /// Rung 2: the decode tiling for this request.
@@ -2392,18 +2366,16 @@ pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Resul
 /// one thing, the tile edge, and the harness must compare against the composition this extends
 /// rather than against an untiled decode that never shipped.
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<TilingConfig>> {
-    let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
-        return Ok(None);
-    };
-    let edge = memory.decode_tile_edge.unwrap_or(DECODE_TILE_EDGE);
-    let overlap = memory.decode_overlap.unwrap_or(DECODE_OVERLAP);
-    validate_decode(Some(edge), Some(overlap)).map_err(|error| {
-        mlx_gen::Error::Unsupported(format!("bernini decode tiling rejected: {error}"))
-    })?;
-    Ok(Some(TilingConfig::spatial_only(
-        edge as i32,
-        overlap as i32,
-    )))
+    mlx_gen::request_scope::requested_decode_tiling(
+        req.memory,
+        DECODE_TILE_EDGE,
+        DECODE_OVERLAP,
+        |edge, overlap| {
+            validate_decode(Some(edge), Some(overlap)).map_err(|error| {
+                mlx_gen::Error::Unsupported(format!("bernini decode tiling rejected: {error}"))
+            })
+        },
+    )
 }
 
 /// Rung 1 has **no request-side resolver**, so it is deliberately declared `Missing`.

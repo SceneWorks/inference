@@ -50,8 +50,9 @@ zip = { version = "9", default-features = false }
 [target.'cfg(windows)'.dependencies]
 # Stable std does not expose durable Windows file IDs/change time. Prepared File identities use the
 # same handle metadata as candle-gen's sidecar cache so same-size replacement cannot alias a pin.
-# Iris training transport sockets plus opt-in H3 process RSS telemetry.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_SystemInformation"] }
+# The Iris TCP transport sockets and the opt-in H3 process RSS telemetry moved to the sibling
+# `sceneworks-gen-core-dist` / `sceneworks-gen-core-telemetry` crates with their FFI (sc-27316).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # Self-removing fixture roots for the test suites (sc-17755).

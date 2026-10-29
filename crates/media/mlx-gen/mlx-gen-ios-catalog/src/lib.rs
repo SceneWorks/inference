@@ -335,7 +335,7 @@ pub fn sana_load_spec(source: WeightsSource) -> LoadSpec {
 #[cfg(test)]
 mod tests {
     use mlx_gen::gen_core::{
-        MemoryNumericTier, MemorySelection, MemoryStrategy, MemoryStrategyParameters, WeightsSource,
+        MemorySelection, MemoryStrategy, MemoryStrategyParameters, WeightsSource,
     };
     use mlx_gen_sana::pipeline::DecodeTilingSource;
 
@@ -629,11 +629,7 @@ mod tests {
                     decode_overlap: memory.decode_overlap,
                     ..Default::default()
                 },
-                tier: MemoryNumericTier {
-                    precision: spec.precision,
-                    quant: spec.quantize,
-                    component_precision_floors: &[],
-                },
+                tier: mlx_gen::request_scope::loaded_tier(&spec),
             };
             contract
                 .validate_selection(&selection)

@@ -19,6 +19,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
+use candle_gen::attention::repeat_kv;
 use candle_gen::attention::AttentionPlan;
 use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
 use candle_gen::candle_core::{DType, Device, Tensor, D};
@@ -920,18 +921,6 @@ impl Rope {
     }
 }
 
-/// `[B, KV, N, hd]` → `[B, KV·rep, N, hd]`, head `h` reading kv head `h / rep` (torch's
-/// `repeat_interleave` / SDPA `enable_gqa` layout).
-fn repeat_kv(x: Tensor, rep: usize) -> Result<Tensor> {
-    if rep == 1 {
-        return Ok(x);
-    }
-    let (b, kv, n, d) = x.dims4()?;
-    Ok(x.unsqueeze(2)?
-        .expand((b, kv, rep, n, d))?
-        .reshape((b, kv * rep, n, d))?)
-}
-
 /// Grouped-query SDPA over `[B, N, heads, head_dim]` q and `[B, N, kv_heads, head_dim]` k/v, in the
 /// compute dtype; returns `[B, N, heads·head_dim]`. `mask` is additive `[B|1, 1, N, N]` f32. The
 /// scores run through the shared i32-overflow-safe query-row chunking (a 2048² render's trunk
@@ -954,8 +943,8 @@ pub fn attention(
             .contiguous()?)
     };
     let q = t(q)?;
-    let k = repeat_kv(t(k)?, h / kv)?;
-    let v = repeat_kv(t(v)?, h / kv)?;
+    let k = repeat_kv(&t(k)?, h / kv)?;
+    let v = repeat_kv(&t(v)?, h / kv)?;
     let mask = mask.map(|m| to(m, kernel)).transpose()?;
     let scale = 1.0 / (d as f64).sqrt();
     // Under autograd (training) the fused `softmax_last_dim` (no backward) is replaced by the
@@ -1173,7 +1162,7 @@ mod tests {
             .unwrap()
             .reshape((1, 2, 1, 1))
             .unwrap();
-        let r = repeat_kv(k, 2).unwrap().flatten_all().unwrap();
+        let r = repeat_kv(&k, 2).unwrap().flatten_all().unwrap();
         assert_eq!(r.to_vec1::<f32>().unwrap(), [0.0, 0.0, 1.0, 1.0]);
     }
 

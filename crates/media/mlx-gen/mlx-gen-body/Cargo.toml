@@ -11,5 +11,9 @@ mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 
+[dev-dependencies]
+# Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
+mlx-gen = { path = "..", features = ["test-support"] }
+
 [features]
 model-inference-proof = ["mlx-gen/model-inference-proof"]

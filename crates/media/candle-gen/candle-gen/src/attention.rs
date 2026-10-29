@@ -81,6 +81,33 @@ pub use gen_core::attention_budget::{
     AttentionBudget, AttentionPlan, CONSTRAINED_ATTN_SCORES_BUDGET,
 };
 
+/// Repeat each kv head `groups` times consecutively along the head axis of a `[B, Hkv, S, D]` tensor
+/// (`→ [B, Hkv·groups, S, D]`), so query head `i` reads kv head `i / groups` — the GQA key/value
+/// broadcast (torch `repeat_interleave` / SDPA `enable_gqa`). `groups == 1` returns `x` unchanged. Pure
+/// data movement: the shared home of the per-provider copies (sc-27283).
+pub fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
+    if groups == 1 {
+        return Ok(x.clone());
+    }
+    let (b, hkv, s, d) = x.dims4()?;
+    x.unsqueeze(2)?
+        .expand((b, hkv, groups, s, d))?
+        .contiguous()?
+        .reshape((b, hkv * groups, s, d))
+}
+
+/// [`repeat_kv`] for the sequence-major `[B, S, Hkv, D]` layout (`→ [B, S, Hkv·groups, D]`).
+pub fn repeat_kv_bshd(x: &Tensor, groups: usize) -> Result<Tensor> {
+    if groups == 1 {
+        return Ok(x.clone());
+    }
+    let (b, s, hkv, d) = x.dims4()?;
+    x.unsqueeze(3)?
+        .expand((b, s, hkv, groups, d))?
+        .contiguous()?
+        .reshape((b, s, hkv * groups, d))
+}
+
 /// Max elements in a single attention scores tensor before the query rows are chunked. candle CUDA
 /// kernels index elements with **i32**, so a scores/probs tensor exceeding `i32::MAX` (~2.147e9)
 /// silently corrupts its tail. 1.0e9 keeps each chunk well under the limit while leaving every render

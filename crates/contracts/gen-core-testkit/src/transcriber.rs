@@ -214,18 +214,12 @@ pub fn check_transcriber_registry(
     registry: &gen_core::ProviderRegistry,
     t: &dyn Transcriber,
 ) -> Result<(), String> {
-    let id = t.descriptor().id;
-    if registry
-        .transcribers()
-        .any(|registration| (registration.descriptor)().id == id)
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "registry[{id}]: descriptor id not found in the explicit provider registry (gen-core {})",
-            gen_core::VERSION
-        ))
-    }
+    crate::check_registry_ids(
+        registry
+            .transcribers()
+            .map(|registration| (registration.descriptor)().id),
+        t.descriptor().id,
+    )
 }
 
 /// Run the full transcriber conformance suite against a freshly-`make`d transcriber. Panics with
@@ -248,14 +242,12 @@ pub fn transcriber_conformance(
         .into_iter()
         .filter_map(|f| f(t, profile).err())
         .collect();
-    if !failures.is_empty() {
-        panic!(
-            "gen-core transcriber conformance FAILED for `{}` (gen-core {}):\n  - {}",
-            t.descriptor().id,
-            gen_core::VERSION,
-            failures.join("\n  - ")
-        );
-    }
+    crate::panic_on_failures(
+        "gen-core transcriber conformance",
+        t.descriptor().id,
+        None,
+        &failures,
+    );
 }
 
 #[cfg(test)]

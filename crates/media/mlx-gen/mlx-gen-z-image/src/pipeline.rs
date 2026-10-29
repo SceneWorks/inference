@@ -19,7 +19,7 @@ use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::{TextTokenizer, TokenizerOutput};
 use mlx_gen::{
     run_flow_sampler_with_latent_hook, CancelFlag, Error, FlowMatchEuler, GenerationRequest, Image,
-    LatentDecoder, PreviewSink, Progress, Result, TimestepConvention,
+    LatentDecoder, PreviewSink, Progress, Result, SamplerRun, TimestepConvention,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Array, Dtype};
@@ -173,13 +173,15 @@ pub fn denoise_with_progress_and_preview(
     let sigmas = &scheduler.sigmas[start..];
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     run_flow_sampler_with_latent_hook(
-        sampler_name,
+        SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::OneMinusSigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
@@ -313,13 +315,15 @@ pub fn denoise_cfg_with_progress_and_preview(
     let sigmas = &scheduler.sigmas[start..];
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     run_flow_sampler_with_latent_hook(
-        sampler_name,
+        SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::OneMinusSigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
@@ -430,13 +434,15 @@ pub fn denoise_control_with_progress_and_preview(
     let sigmas = &scheduler.sigmas[start..];
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     run_flow_sampler_with_latent_hook(
-        sampler_name,
+        SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::OneMinusSigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )
@@ -567,13 +573,15 @@ pub fn denoise_control_cfg_with_progress_and_preview(
     let sigmas = &scheduler.sigmas[start..];
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
     run_flow_sampler_with_latent_hook(
-        sampler_name,
+        SamplerRun {
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        },
         TimestepConvention::OneMinusSigma,
-        sigmas,
         latents,
-        seed,
-        cancel,
-        on_progress,
         |latents, sigma| crate::preview::emit_preview(preview, &previews, sigmas, sigma, latents),
         predict,
     )

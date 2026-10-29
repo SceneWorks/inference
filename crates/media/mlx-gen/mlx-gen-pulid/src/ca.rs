@@ -16,15 +16,11 @@ use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionBudget, AttentionPlan};
-use mlx_gen::weights::Weights;
+use mlx_gen::weights::{join, Weights};
 use mlx_gen::{CancelFlag, Result};
 use mlx_gen_flux::transformer::DitImageInjector;
 
 const EPS: f32 = 1e-5;
-
-fn join(p: &str, leaf: &str) -> String {
-    format!("{p}.{leaf}")
-}
 
 /// Cross-attention block: q from `latents` (image tokens, dim=3072), k/v from `x` (id_embedding,
 /// kv_dim=2048). All linears bias-free.

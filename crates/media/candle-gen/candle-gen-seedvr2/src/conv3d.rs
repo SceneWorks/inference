@@ -120,12 +120,8 @@ pub struct CausalConv3d {
     kt: usize,
     st: usize,
     sh: usize,
-    #[allow(dead_code)]
-    sw: usize,
     pt: usize,
     ph: usize,
-    #[allow(dead_code)]
-    pw: usize,
     use_padding_causal: bool,
 }
 
@@ -152,10 +148,8 @@ impl CausalConv3d {
             kt,
             st: stride.0,
             sh: stride.1,
-            sw: stride.2,
             pt: padding.0,
             ph: padding.1,
-            pw: padding.2,
             use_padding_causal,
         })
     }
@@ -243,10 +237,8 @@ mod tests {
             kt,
             st,
             sh: 1,
-            sw: 1,
             pt,
             ph,
-            pw: ph,
             use_padding_causal: upc,
         }
     }

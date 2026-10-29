@@ -43,7 +43,7 @@
 //! inference-only (no training code), and the paper states only that the VAE stage-I uses `U(0,1)`
 //! (epic sc-14034 GAP 6, re-confirmed against the vendored source). Per the epic decision, this
 //! trainer **defaults to the z-image trainer's schedule** — `sigmoid(randn)` with the same
-//! `timestep_type` / `timestep_bias` knobs (the private `sample_sigma`) — and this choice is
+//! `timestep_type` / `timestep_bias` knobs (the shared `vocab::sample_timestep`) — and this choice is
 //! recorded here, in
 //! the PR, and on the story. The sampled `σ` is fed to the DiT directly (it is the scheduler sigma
 //! where `σ = 1` is noise); the static schedule shift is a *sampling-time* schedule warp and is
@@ -69,10 +69,15 @@ use mlx_gen::train::perceptual::{
 };
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::vocab::{
+    normalize_cfg, sample_timestep, validate_sampling_vocab, validate_steps_and_optimizer,
+    TIMESTEP_TYPES,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
-    TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
+    WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::{multiply, subtract};
@@ -488,30 +493,6 @@ mlx_gen::register_trainer! {
     pub(crate) const REGISTRATION = trainer_descriptor => load_trainer
 }
 
-/// Recognized `timestep_type` values [`sample_sigma`] branches on plus the `sigmoid` default it
-/// falls back to. Any other string would silently sample sigmoid — rejected in [`validate_request`].
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values plus the neutral default.
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` select MAE, `mse`/`l2` the MSE default.
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
-
-/// Normalize a free-form config string the way the trainer's parsers do (trim, lowercase,
-/// `-`/space → `_`) so validation accepts exactly the spellings the run would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
 /// Capability-free training-request validation, factored out so it can be unit-tested without loaded
 /// weights. Rejects an empty dataset, zero rank, **zero steps** (a 0-step run would fall through to
 /// the save and write a no-op `B = 0` identity adapter), an unsupported optimizer, and an
@@ -543,42 +524,8 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
                 .into(),
         );
     }
-    if req.config.steps == 0 {
-        return Err("mage_flow_base trainer: steps must be > 0".into());
-    }
-    if !TrainOptimizer::is_supported(&req.config.optimizer) {
-        return Err(format!(
-            "mage_flow_base trainer: optimizer '{}' is not available on MLX training (supported: \
-             adamw, adam, rose, prodigy)",
-            req.config.optimizer
-        )
-        .into());
-    }
-    if !TIMESTEP_TYPES.contains(&normalize_cfg(&req.config.timestep_type).as_str()) {
-        return Err(format!(
-            "mage_flow_base trainer: timestep_type '{}' is not recognized (supported: {})",
-            req.config.timestep_type,
-            TIMESTEP_TYPES.join(", ")
-        )
-        .into());
-    }
-    if !TIMESTEP_BIASES.contains(&normalize_cfg(&req.config.timestep_bias).as_str()) {
-        return Err(format!(
-            "mage_flow_base trainer: timestep_bias '{}' is not recognized (supported: {})",
-            req.config.timestep_bias,
-            TIMESTEP_BIASES.join(", ")
-        )
-        .into());
-    }
-    if !LOSS_TYPES.contains(&normalize_cfg(&req.config.loss_type).as_str()) {
-        return Err(format!(
-            "mage_flow_base trainer: loss_type '{}' is not recognized (supported: {})",
-            req.config.loss_type,
-            LOSS_TYPES.join(", ")
-        )
-        .into());
-    }
-    Ok(())
+    validate_steps_and_optimizer("mage_flow_base trainer", &req.config)?;
+    validate_sampling_vocab("mage_flow_base trainer", &req.config, &TIMESTEP_TYPES)
 }
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
@@ -628,10 +575,23 @@ impl Trainer for MageFlowTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -663,6 +623,7 @@ impl MageFlowTrainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         self.validate(req)?;
         let cfg = &req.config;
@@ -900,11 +861,18 @@ impl MageFlowTrainer {
                             image,
                         }),
                         Err(mlx_gen::Error::Canceled) => break,
-                        Err(e) => eprintln!(
-                            "[sc-14055] {MODEL_ID} preview sample failed at step {step} (prompt \
-                             {}): {e} — skipping this preview, training continues",
-                            i + 1
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[sc-14055] {MODEL_ID} preview sample failed at step {step} \
+                                 (prompt {}): {e} — skipping this preview, training continues",
+                                i + 1
+                            );
+                            warnings.push(gen_core::train::preview_sample_failed(
+                                step,
+                                i as u32 + 1,
+                                &e,
+                            ));
+                        }
                     }
                 }
             }
@@ -1128,7 +1096,7 @@ impl MageFlowTrainer {
                 break;
             }
             let sample = &cache[step_cache_index(&schedule, step)];
-            let sigma = sample_sigma(
+            let sigma = sample_timestep(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
                 cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
@@ -1434,13 +1402,7 @@ fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// Resize a center-cropped square core [`Image`] to `edge × edge` and normalise to the reference's
@@ -1477,34 +1439,6 @@ fn encode_caption(text_encoder: &MageTextEncoder, caption: &str) -> Result<(Arra
     let hidden = conditioning.txt.shape()[1];
     let txt = conditioning.txt.reshape(&[1, txt_tokens, hidden])?;
     Ok((txt, txt_tokens))
-}
-
-/// Sample a normalised flow-match `σ ∈ [1e-3, 1−1e-3]` — a faithful port of the z-image trainer's
-/// `sample_sigma` (the epic's documented default for Mage's unpublished main-training distribution):
-/// `sigmoid(randn)` by default, `uniform` for linear, `(uniform + sigmoid(randn))/2` for weighted;
-/// bias `high` → `√σ`, `low` → `σ²`. Deterministic in `seed`.
-fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let ttype = normalize_cfg(timestep_type);
-    let t = match ttype.as_str() {
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            let k2 = random::key(seed.wrapping_add(0x9E37_79B9))?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
-    };
-    let t = match normalize_cfg(timestep_bias).as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    Ok(t.clamp(1e-3, 1.0 - 1e-3))
 }
 
 /// The per-step loss breakdown [`compute_loss_grads`] returns (epic 2123 E8).
@@ -1575,7 +1509,7 @@ fn run_train_step(
 ) -> Result<(StepLosses, LoraParams)> {
     let picked = step_sample(perceptual, step, schedule);
     let sample = &cache[picked.entry];
-    let mut sigma = sample_sigma(
+    let mut sigma = sample_timestep(
         &cfg.timestep_type,
         &cfg.timestep_bias,
         cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
@@ -1835,8 +1769,8 @@ mod tests {
             ("uniform", "high_noise"),
             ("weighted", "low_noise"),
         ] {
-            let a = sample_sigma(ty, bias, 42).unwrap();
-            let b = sample_sigma(ty, bias, 42).unwrap();
+            let a = sample_timestep(ty, bias, 42).unwrap();
+            let b = sample_timestep(ty, bias, 42).unwrap();
             assert_eq!(a, b, "same seed must be deterministic");
             assert!(
                 (1e-3..=1.0 - 1e-3).contains(&a),
@@ -1844,9 +1778,9 @@ mod tests {
             );
         }
         // The bias tilts the distribution: high → √σ (larger), low → σ² (smaller), from the same draw.
-        let hi = sample_sigma("uniform", "high_noise", 7).unwrap();
-        let lo = sample_sigma("uniform", "low_noise", 7).unwrap();
-        let base = sample_sigma("uniform", "balanced", 7).unwrap();
+        let hi = sample_timestep("uniform", "high_noise", 7).unwrap();
+        let lo = sample_timestep("uniform", "low_noise", 7).unwrap();
+        let base = sample_timestep("uniform", "balanced", 7).unwrap();
         assert!(
             hi >= base - 1e-6 && lo <= base + 1e-6,
             "hi {hi} base {base} lo {lo}"
@@ -2996,7 +2930,7 @@ mod depth_anchoring_tests {
         assert_eq!(off.aux, None);
 
         let sample = &cache[0];
-        let sigma = sample_sigma(
+        let sigma = sample_timestep(
             &cfg.timestep_type,
             &cfg.timestep_bias,
             cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),

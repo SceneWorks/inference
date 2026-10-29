@@ -456,16 +456,17 @@ class DiagnosticBatchTests(unittest.TestCase):
 
     def test_causal_controls_are_existing_unmodified_explicit_cpu_tests(self):
         candle = (ROOT / "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs").read_text(encoding="utf-8")
-        mlx = (ROOT / "crates/media/mlx-gen/mlx-gen-moss-image/src/transformer.rs").read_text(encoding="utf-8")
         for name in profile.CAUSAL_TESTS["candle"]:
             function = name.split("::")[-1]
             self.assertIn(f"fn {function}()", candle)
             body = candle.split(f"fn {function}()", 1)[1].split("\n#[test]", 1)[0]
             self.assertIn("native_graph_cases(Device::Cpu)", body)
         for name in profile.CAUSAL_TESTS["mlx"]:
-            function = name.split("::")[-1]
+            # sc-27444: each `transformer::<module>` test module lives in `src/transformer/<module>.rs`.
+            module, function = name.split("::")[-2:]
+            mlx = (ROOT / f"crates/media/mlx-gen/mlx-gen-moss-image/src/transformer/{module}.rs").read_text(encoding="utf-8")
             self.assertIn(f"fn {function}()", mlx)
-            body = mlx.split(f"fn {function}()", 1)[1].split("\n    #[test]", 1)[0]
+            body = mlx.split(f"fn {function}()", 1)[1].split("\n#[test]", 1)[0]
             self.assertIn("let _device = crate::cpu_test_device();", body)
         for name in profile.MASK_TESTS:
             self.assertIn("fn " + name.split("::")[-1] + "()", (ROOT / "crates/contracts/gen-core/src/train/subject_mask/tests.rs").read_text(encoding="utf-8"))

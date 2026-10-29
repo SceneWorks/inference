@@ -40,9 +40,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use mlx_rs::ops::{abs, max, mean, subtract};
+use mlx_rs::ops::{abs, mean, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::{max_abs_diff, peak_rel};
 use mlx_gen::weights::Weights;
 use mlx_gen_mochi::{
     load_transformer_weights, quantize_transformer_map, MochiDitConfig, MochiLinear, MochiQuant,
@@ -75,21 +76,6 @@ const SLICE_KEY: &str = "transformer_blocks.0.attn1.to_q";
 /// two packed-load routes still agree **bit-exact** with each other — only the vs-golden compare
 /// uses this tolerance.
 const MOCHI_QUANT_GOLDEN_ULP_TOL: f32 = 16.0 * f32::EPSILON;
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
-}
-
-/// `max|got − want|` over f32-cast arrays — `0.0` means bit-exact.
-fn max_abs_diff(got: &Array, want: &Array) -> f32 {
-    let got = got.as_dtype(Dtype::Float32).unwrap();
-    let want = want.as_dtype(Dtype::Float32).unwrap();
-    max_abs(&subtract(&got, &want).unwrap())
-}
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    max_abs_diff(got, want) / max_abs(&want.as_dtype(Dtype::Float32).unwrap()).max(1e-12)
-}
 
 fn mean_rel(got: &Array, want: &Array) -> f32 {
     let got = got.as_dtype(Dtype::Float32).unwrap();

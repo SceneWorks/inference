@@ -68,10 +68,12 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
+use mlx_gen::train::vocab::{sample_timestep, validate_common_request};
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Error, LoadSpec, Modality, NetworkType, Precision, Progress,
-    Result, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
-    TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
+    Result, SamplerRun, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
+    WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -108,23 +110,6 @@ const TRAINER_ENCODER_BITS: i32 = 8;
 /// sigmoid `to_gate` and the SwiGLU FFN are reachable as explicit targets but are not in the default
 /// set (the standard PEFT attention surface).
 const DEFAULT_TARGET_MODULES: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
-
-/// Recognized `timestep_type` values [`sample_sigma`] branches on (plus the `sigmoid` default).
-const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "linear", "uniform", "weighted"];
-/// Recognized `timestep_bias` values [`sample_sigma`] branches on (plus the neutral default).
-const TIMESTEP_BIASES: [&str; 9] = [
-    "balanced",
-    "none",
-    "neutral",
-    "high",
-    "high_noise",
-    "favor_high_noise",
-    "low",
-    "low_noise",
-    "favor_low_noise",
-];
-/// Recognized `loss_type` values — `mae`/`l1` → MAE, `mse`/`l2` → the MSE default.
-const LOSS_TYPES: [&str; 4] = ["mse", "l2", "mae", "l1"];
 
 /// `(x_t, target)` for a single sample at flow-match `t`: `x_t = (1−t)·x0 + t·noise`,
 /// `target = noise − x0` (the velocity the **raw** Krea DiT output is regressed onto; the DiT timestep
@@ -261,75 +246,18 @@ mlx_gen::register_trainer! {
     pub(crate) const TRAINER_REGISTRATION = trainer_descriptor => load_trainer
 }
 
-/// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,
-/// `-`/space → `_`) so validation accepts exactly the spellings the run would.
-fn normalize_cfg(s: &str) -> String {
-    s.trim().to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
 /// Capability-free training-request validation, factored out so it can be unit-tested without a loaded
 /// trainer. Rejects an empty dataset, zero rank, **zero steps** (a 0-step run would write a no-op
 /// `B = 0` identity adapter), an unsupported optimizer, and an unrecognized
 /// `timestep_type`/`timestep_bias`/`loss_type`. `gradient_checkpointing` is a supported toggle (the
 /// checkpointed DiT forward + the OOM preflight guard are wired in [`KreaRawTrainer::train_impl`]).
 fn validate_request(req: &TrainingRequest) -> Result<()> {
-    let cfg = &req.config;
-    if req.items.is_empty() {
-        return Err("krea trainer: dataset is empty".into());
-    }
-    if cfg.rank == 0 {
-        return Err("krea trainer: rank must be > 0".into());
-    }
-    if cfg.steps == 0 {
-        return Err("krea trainer: steps must be > 0".into());
-    }
-    if !TrainOptimizer::is_supported(&cfg.optimizer) {
-        return Err(format!(
-            "krea trainer: optimizer '{}' is not available on MLX training (supported: adamw, adam, \
-             rose, prodigy)",
-            cfg.optimizer
-        )
-        .into());
-    }
-    if !TIMESTEP_TYPES.contains(&normalize_cfg(&cfg.timestep_type).as_str()) {
-        return Err(format!(
-            "krea trainer: timestep_type '{}' is not recognized (supported: {})",
-            cfg.timestep_type,
-            TIMESTEP_TYPES.join(", ")
-        )
-        .into());
-    }
-    if !TIMESTEP_BIASES.contains(&normalize_cfg(&cfg.timestep_bias).as_str()) {
-        return Err(format!(
-            "krea trainer: timestep_bias '{}' is not recognized (supported: {})",
-            cfg.timestep_bias,
-            TIMESTEP_BIASES.join(", ")
-        )
-        .into());
-    }
-    if !LOSS_TYPES.contains(&normalize_cfg(&cfg.loss_type).as_str()) {
-        return Err(format!(
-            "krea trainer: loss_type '{}' is not recognized (supported: {})",
-            cfg.loss_type,
-            LOSS_TYPES.join(", ")
-        )
-        .into());
-    }
-    Ok(())
+    validate_common_request("krea trainer", req)
 }
 
 /// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-    // request (typed `Unsupported`) rather than silently training a plain adapter.
-    gen_core::train::validate_control_request(descriptor, req)?;
-    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-    gen_core::train::validate_full_finetune_request(descriptor, req)?;
-    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
-    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-    gen_core::train::validate_training_techniques(descriptor, req)?;
-    gen_core::train::validate_edit_request(descriptor, req)?;
+    mlx_gen::train::vocab::validate_shared_floors(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }
@@ -359,10 +287,23 @@ impl Trainer for KreaRawTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 
@@ -373,6 +314,7 @@ impl KreaRawTrainer {
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
+        warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
         validate_request(req)?;
         let cfg = &req.config;
@@ -652,7 +594,7 @@ impl KreaRawTrainer {
             let picked = step_sample(aux_driver.as_mut(), step, &schedule);
             let entry = picked.entry;
             let (x0, context, mask_weight) = &cache[entry];
-            let mut t = sample_sigma(
+            let mut t = sample_timestep(
                 &cfg.timestep_type,
                 &cfg.timestep_bias,
                 cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
@@ -776,11 +718,19 @@ impl KreaRawTrainer {
                             prompt: prompt.clone(),
                             image,
                         }),
-                        Err(e) => eprintln!(
-                            "[sc-5637] {KREA_2_RAW_TRAINER_ID} preview sample failed at step {step} \
-                             (prompt {}): {e} — skipping this preview, training continues",
-                            i + 1
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "[sc-5637] {KREA_2_RAW_TRAINER_ID} preview sample failed at step \
+                                 {step} (prompt {}): {e} — skipping this preview, training \
+                                 continues",
+                                i + 1
+                            );
+                            warnings.push(gen_core::train::preview_sample_failed(
+                                step,
+                                i as u32 + 1,
+                                &e,
+                            ));
+                        }
                     }
                 }
             }
@@ -1045,13 +995,7 @@ fn decode_image(path: &Path) -> Result<Image> {
         &[path]
     )
     .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    let rgb = dynimg.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    Ok(Image {
-        width,
-        height,
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynimg.to_rgb8().into())
 }
 
 /// Encode a center-cropped square image into a Krea training latent `[1, 16, edge/8, edge/8]` — the
@@ -1074,38 +1018,6 @@ fn encode_caption(
 ) -> Result<Array> {
     let (ids, attn) = tokenizer.encode_prompt(caption)?;
     encoder.forward(&ids, &attn)
-}
-
-/// Sample a normalized flow-match timestep (interpolation coefficient) `t ∈ [1e-3, 1−1e-3]` — a
-/// faithful port of the SceneWorks `sample_training_timestep` (identical to the Lens / Z-Image
-/// trainers): `sigmoid(randn)` by default, `uniform` for linear, `(uniform + sigmoid(randn))/2` for
-/// weighted; bias `high` → `√t`, `low` → `t²`. Deterministic in `seed`.
-fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f32> {
-    let k1 = random::key(seed)?;
-    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let ttype = timestep_type.trim().to_ascii_lowercase().replace('-', "_");
-    let t = match ttype.as_str() {
-        "linear" | "uniform" => {
-            random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>()
-        }
-        "weighted" => {
-            let k2 = random::key(seed ^ 0x9E37_79B9)?;
-            let base = random::uniform::<_, f32>(0.0f32, 1.0f32, &[1], Some(&k1))?.item::<f32>();
-            let center = sigmoid(random::normal::<f32>(&[1], None, None, Some(&k2))?.item::<f32>());
-            (base + center) / 2.0
-        }
-        _ => sigmoid(random::normal::<f32>(&[1], None, None, Some(&k1))?.item::<f32>()),
-    };
-    let bias = timestep_bias
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '-'], "_");
-    let t = match bias.as_str() {
-        "high" | "high_noise" | "favor_high_noise" => t.sqrt(),
-        "low" | "low_noise" | "favor_low_noise" => t * t,
-        _ => t,
-    };
-    Ok(t.clamp(1e-3, 1.0 - 1e-3))
 }
 
 /// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr), run the
@@ -1278,13 +1190,15 @@ fn render_sample(
     // F-077: honor the training request's cancel per denoise step. Previously a fresh
     // `CancelFlag::new()` here meant the preview render could never be cancelled mid-denoise.
     let lat = run_flow_sampler(
-        None,
+        SamplerRun {
+            sampler_name: None,
+            sigmas: &sigmas,
+            seed,
+            cancel,
+            on_progress: &mut |_: Progress| {},
+        },
         TimestepConvention::Sigma,
-        &sigmas,
         noise,
-        seed,
-        cancel,
-        &mut |_: Progress| {},
         |x, timestep| {
             let tt = Array::from_slice(&[timestep], &[1]);
             let v_cond = dit.forward_prepared(x, &tt, &prep_pos)?;
@@ -1519,8 +1433,8 @@ mod tests {
     fn sample_sigma_is_deterministic_and_in_range() {
         for kind in ["sigmoid", "linear", "weighted"] {
             for bias in ["balanced", "high", "low"] {
-                let a = sample_sigma(kind, bias, 42).unwrap();
-                let b = sample_sigma(kind, bias, 42).unwrap();
+                let a = sample_timestep(kind, bias, 42).unwrap();
+                let b = sample_timestep(kind, bias, 42).unwrap();
                 assert_eq!(a, b, "{kind}/{bias} must be deterministic in seed");
                 assert!(
                     (1e-3..=1.0 - 1e-3).contains(&a),
@@ -1529,8 +1443,8 @@ mod tests {
             }
         }
         assert!(
-            sample_sigma("sigmoid", "high", 7).unwrap()
-                > sample_sigma("sigmoid", "low", 7).unwrap()
+            sample_timestep("sigmoid", "high", 7).unwrap()
+                > sample_timestep("sigmoid", "low", 7).unwrap()
         );
     }
 

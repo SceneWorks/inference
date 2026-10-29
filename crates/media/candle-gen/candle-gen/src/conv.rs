@@ -163,6 +163,7 @@ pub fn budgeted_conv2d(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::tensor_max_abs_diff as max_abs_diff;
     use candle_core::Device;
 
     fn fill(shape: (usize, usize, usize, usize), seed: usize) -> Tensor {
@@ -171,20 +172,6 @@ mod tests {
             .map(|i| (((i * 37 + seed * 11) % 97) as f32 / 97.0) - 0.5)
             .collect();
         Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
-    }
-
-    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-        assert_eq!(a.dims(), b.dims());
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
     }
 
     /// Every conv shape the Qwen-Image 2.1 VAE runs (3×3/p1/s1 resnets and upsamplers, the

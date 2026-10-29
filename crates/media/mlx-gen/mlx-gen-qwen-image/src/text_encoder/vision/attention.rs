@@ -6,11 +6,11 @@
 //! MMDiT's interleaved-complex RoPE — they are NOT interchangeable. Computed in f32 then cast back,
 //! matching the fork.
 
-use mlx_rs::fast::scaled_dot_product_attention;
-use mlx_rs::ops::{add, concatenate_axis, multiply, split};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::ops::split;
+use mlx_rs::Array;
 
-use mlx_gen::nn::linear;
+use mlx_gen::attention::windowed_sdpa;
+use mlx_gen::nn::{apply_rope_rotate_half_f32, linear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -51,47 +51,13 @@ impl VisionAttention {
             // [seq, 1, h, hd] → [h, seq, hd]
             Ok(p.reshape(&[seq, h, hd])?.transpose_axes(&[1, 0, 2])?)
         };
-        let q = apply_rope(&to_heads(&parts[0])?, cos, sin)?;
-        let k = apply_rope(&to_heads(&parts[1])?, cos, sin)?;
+        let q = apply_rope_rotate_half_f32(&to_heads(&parts[0])?, cos, sin)?;
+        let k = apply_rope_rotate_half_f32(&to_heads(&parts[1])?, cos, sin)?;
         let v = to_heads(&parts[2])?;
 
-        let attn = if cu.len() > 2 {
-            // block-diagonal: SDPA per window, then concat back over the sequence axis.
-            let mut outs = Vec::with_capacity(cu.len() - 1);
-            for i in 0..cu.len() - 1 {
-                let (off, len) = (cu[i], cu[i + 1] - cu[i]);
-                let idx = Array::from_slice(&(off..off + len).collect::<Vec<i32>>(), &[len]);
-                let qc = q.take_axis(&idx, 1)?.reshape(&[1, h, len, hd])?;
-                let kc = k.take_axis(&idx, 1)?.reshape(&[1, h, len, hd])?;
-                let vc = v.take_axis(&idx, 1)?.reshape(&[1, h, len, hd])?;
-                let o = scaled_dot_product_attention(&qc, &kc, &vc, self.scale, None, None)?;
-                outs.push(o.reshape(&[h, len, hd])?);
-            }
-            let refs: Vec<&Array> = outs.iter().collect();
-            concatenate_axis(&refs, 1)? // [h, seq, hd]
-        } else {
-            let q4 = q.reshape(&[1, h, seq, hd])?;
-            let k4 = k.reshape(&[1, h, seq, hd])?;
-            let v4 = v.reshape(&[1, h, seq, hd])?;
-            scaled_dot_product_attention(&q4, &k4, &v4, self.scale, None, None)?
-                .reshape(&[h, seq, hd])?
-        };
+        let attn = windowed_sdpa(&q, &k, &v, cu, self.scale)?; // [h, seq, hd]
 
         let out = attn.transpose_axes(&[1, 0, 2])?.reshape(&[seq, h * hd])?;
         linear(&out, &self.proj_w, &self.proj_b)
     }
-}
-
-/// `rotate_half` RoPE in f32: `x·cos + rotate_half(x)·sin`, `rotate_half(x) = [-x2, x1]` (split on
-/// the head dim). `x`: `[h, seq, hd]`; `cos`/`sin`: `[seq, hd]` → broadcast over heads.
-fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let orig = x.dtype();
-    let xf = x.as_dtype(Dtype::Float32)?;
-    let cos = cos.expand_dims(0)?.as_dtype(Dtype::Float32)?; // [1, seq, hd]
-    let sin = sin.expand_dims(0)?.as_dtype(Dtype::Float32)?;
-    let axis = (xf.shape().len() - 1) as i32;
-    let halves = split(&xf, 2, axis)?;
-    let rotated = concatenate_axis(&[&halves[1].negative()?, &halves[0]], axis)?;
-    let out = add(&multiply(&xf, &cos)?, &multiply(&rotated, &sin)?)?;
-    Ok(out.as_dtype(orig)?)
 }

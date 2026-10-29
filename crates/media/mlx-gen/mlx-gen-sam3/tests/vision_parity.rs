@@ -7,21 +7,14 @@
 //!   SAM3_VISION_FIXTURE=scripts/spikes/sam3_oracle/vision_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration vision_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::cosine;
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::{Sam3VisionConfig, Sam3VisionEncoder};
-use mlx_rs::ops::{abs, maximum, multiply, sqrt, subtract, sum};
+use mlx_rs::ops::{abs, maximum, subtract};
 use mlx_rs::Array;
 
 fn scalar_f32(a: &Array) -> f32 {
     a.as_dtype(mlx_rs::Dtype::Float32).unwrap().item::<f32>()
-}
-
-/// Cosine similarity between two arrays (flattened).
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let dot = scalar_f32(&sum(multiply(a, b).unwrap(), None).unwrap());
-    let na = scalar_f32(&sqrt(sum(multiply(a, a).unwrap(), None).unwrap()).unwrap());
-    let nb = scalar_f32(&sqrt(sum(multiply(b, b).unwrap(), None).unwrap()).unwrap());
-    dot / (na * nb)
 }
 
 #[test]

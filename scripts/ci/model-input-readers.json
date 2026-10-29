@@ -1228,12 +1228,6 @@
         "reader-binding"
       ]
     },
-    "crates/media/mlx-gen/mlx-gen-boogu/src/convert.rs::write_quantized_config::std::fs::read_to_string@16466": {
-      "role": "artifact-input",
-      "grades": [
-        "reader-binding"
-      ]
-    },
     "crates/media/mlx-gen/mlx-gen-flux/src/artifact_inventory.rs::quant_marker_at::std::fs::read@16685": {
       "role": "artifact-input",
       "grades": [

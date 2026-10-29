@@ -28,19 +28,16 @@
 //! request boundary. Building `Unsupported` inside the closure too doubled the prefix into
 //! `unsupported: unsupported: …` — the same secondary defect SC-20569 fixed in mlx-gen-sensenova.
 
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, MemoryBehaviorFixture,
+    standard_memory_strategy_safety_check, ArtifactSeal, Error as CoreError, MemoryBehaviorFixture,
     MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency,
-    MemoryFormulaKind, MemoryMode, MemoryNumericTier, MemoryOptimizationAuthority,
-    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, Result as CoreResult,
+    MemoryFormulaKind, MemoryMode, MemoryOptimizationAuthority, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, Result as CoreResult,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
-use sha2::{Digest, Sha256};
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "pulid-flux-dev-q4-mlx-shared-ladder-2026-08-04-v1";
@@ -119,27 +116,11 @@ fn identity_paths(spec: &LoadSpec) -> CoreResult<Vec<PathBuf>> {
     ])
 }
 
-fn hash(path: &Path) -> CoreResult<String> {
-    let mut file = File::open(path).map_err(|error| {
-        CoreError::Unsupported(format!("pulid_flux: open {}: {error}", path.display()))
-    })?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0; 1024 * 1024];
-    loop {
-        let n = file.read(&mut buffer).map_err(|error| {
-            CoreError::Unsupported(format!("pulid_flux: hash {}: {error}", path.display()))
-        })?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buffer[..n]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
-
 #[derive(Clone)]
 pub(crate) struct IdentityArtifactInventory {
-    files: Vec<(PathBuf, PathBuf, String)>,
+    /// Each identity artifact's configured path and its shared [`ArtifactSeal`], whose content
+    /// digest was proven once at admission.
+    files: Vec<(PathBuf, ArtifactSeal)>,
     bytes: u64,
     exact_calibration: bool,
 }
@@ -153,23 +134,16 @@ impl IdentityArtifactInventory {
         self.exact_calibration
     }
 
+    /// Cheap replacement check of every admitted artifact: entry, parent chain, resolution and
+    /// target (including `ctime`, which any content write moves). Content is not re-read.
     pub(crate) fn ensure_unchanged(&self) -> CoreResult<()> {
-        for (path, admitted_path, expected) in &self.files {
-            let current_path = path.canonicalize().map_err(|error| {
+        for (path, seal) in &self.files {
+            seal.ensure_unchanged().map_err(|error| {
                 CoreError::Unsupported(format!(
-                    "pulid_flux: resolve {} after admission: {error}",
+                    "pulid_flux: pinned identity artifact changed after admission: {}: {error}",
                     path.display()
                 ))
             })?;
-            if current_path != *admitted_path
-                || !admitted_path.is_file()
-                || hash(admitted_path)? != *expected
-            {
-                return Err(CoreError::Unsupported(format!(
-                    "pulid_flux: pinned identity artifact changed after admission: {}",
-                    path.display()
-                )));
-            }
         }
         Ok(())
     }
@@ -207,28 +181,31 @@ pub(crate) fn admitted_identity_inventory(
         .zip(EXPECTED.iter().copied())
         .zip(IDENTITY_MATERIALIZED_AS_F32)
         .map(|((path, expected), upcast_to_f32)| {
-            let admitted_path = path.canonicalize().map_err(|error| {
+            let seal = ArtifactSeal::pin(&path).map_err(|error| {
                 CoreError::Unsupported(format!(
-                    "pulid_flux: resolve {} during admission: {error}",
+                    "pulid_flux: pin {} during admission: {error}",
                     path.display()
                 ))
             })?;
-            let admitted_hash = hash(&admitted_path)?;
-            Ok((path, admitted_path, admitted_hash, expected, upcast_to_f32))
+            Ok((path, seal, expected, upcast_to_f32))
         })
         .collect::<CoreResult<Vec<_>>>()?;
-    for (_, admitted_path, admitted_hash, expected, upcast_to_f32) in &files {
-        exact_calibration &= admitted_hash == expected;
-        bytes = bytes.saturating_add(materialized_identity_bytes(admitted_path, *upcast_to_f32)?);
+    for (_, seal, expected, upcast_to_f32) in &files {
+        exact_calibration &= seal.content_sha256_hex() == *expected;
+        bytes = bytes.saturating_add(materialized_identity_bytes(
+            seal.canonical_target_path(),
+            *upcast_to_f32,
+        )?);
     }
     let inventory = IdentityArtifactInventory {
         files: files
             .into_iter()
-            .map(|(path, admitted_path, admitted_hash, _, _)| (path, admitted_path, admitted_hash))
+            .map(|(path, seal, _, _)| (path, seal))
             .collect(),
         bytes,
         exact_calibration,
     };
+    // Header reads above must not have raced a replacement of the sealed files.
     inventory.ensure_unchanged()?;
     Ok(inventory)
 }
@@ -390,11 +367,7 @@ pub fn safety_check(
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(mlx_gen::request_scope::loaded_tier(spec)),
         Some(&route),
     )
 }
@@ -410,11 +383,7 @@ pub fn registered_fixture(
     let context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        },
+        mlx_gen::request_scope::loaded_tier(spec),
         MemoryBehaviorRoute {
             mode: MemoryMode::ImageToImage,
             reference_count: 1,
@@ -463,36 +432,28 @@ fn begin_with(
     // The one place a refused route becomes a TYPED error. `MemorySafetyDecision::Reject` carries an
     // already-rendered string, so the route gate deliberately hands back plain reasons (see
     // `safety_check`) and the `unsupported: ` prefix is applied exactly once, here.
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        crate::pulid_flux::MODEL_ID,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        false,
-        57,
-        |_pid, edge, overlap| {
-            if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
-                Ok(())
-            } else {
-                Err(CoreError::Unsupported(format!(
-                    "pulid_flux: decode tile {edge}/{overlap} is outside the production domain"
-                )))
-            }
-        },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            crate::pulid_flux::MODEL_ID,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            false,
+            57,
+            |_pid, edge, overlap| {
+                if DECODE_TILE_EDGES.contains(&edge) && overlap == DECODE_OVERLAP {
+                    Ok(())
+                } else {
+                    Err(CoreError::Unsupported(format!(
+                        "pulid_flux: decode tile {edge}/{overlap} is outside the production domain"
+                    )))
+                }
+            },
+        )?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 #[cfg(test)]
@@ -651,11 +612,7 @@ mod tests {
         mlx_gen::gen_core::standard_memory_behavior_context(
             contract,
             strategy,
-            MemoryNumericTier {
-                precision: spec.precision,
-                quant: spec.quantize,
-                component_precision_floors: &[],
-            },
+            mlx_gen::request_scope::loaded_tier(spec),
             identity_route(),
         )
         .unwrap()

@@ -72,8 +72,8 @@
 //! | module | port of |
 //! | --- | --- |
 //! | [`rope`] | `Qwen3VLTextRotaryEmbedding` — interleaved 3-axis M-RoPE |
-//! | [`attention`] | `Qwen3VLTextAttention` (as re-bound by `qwen3_patch_forward`) |
-//! | [`mlp`] | `Qwen3VLTextMLP` — SwiGLU |
+//! | [`Qwen3VlAttention`] (core `text_decoder`) | `Qwen3VLTextAttention` (as re-bound by `qwen3_patch_forward`) |
+//! | [`Qwen3VlMlp`] (core `SwiGluMlp`) | `Qwen3VLTextMLP` — SwiGLU |
 //! | [`layer`] | `Qwen3VLTextDecoderLayer` |
 //! | [`encoder`] | `Qwen3VLTextModel.forward` (patched, `cu_seqlens`-packed) |
 //! | [`prompt`] | `PROMPT_TEMPLATE` + the truncation/`drop_idx` policy |
@@ -96,16 +96,14 @@
 //! deepstack [5, 11, 17]` is exactly Mage's published `vision_config` (it is already reused that way
 //! by `mlx-gen-krea`, whose Qwen3-VL-4B is the same tower).
 
-pub mod attention;
 pub mod encode;
 pub mod encoder;
 pub mod layer;
 pub mod load;
-pub mod mlp;
 pub mod prompt;
 pub mod rope;
 
-pub use attention::Qwen3VlAttention;
+// The attention and SwiGLU MLP halves of the decoder block are the shared core modules (sc-27326).
 pub use encode::{Conditioning, MageTextEncoder};
 pub use encoder::{cu_seqlens_from_lens, Qwen3VlTextEncoder};
 pub use layer::Qwen3VlDecoderLayer;
@@ -114,18 +112,12 @@ pub use load::{
     load_tokenizer_dir, mage_vision_config, verify_text_config, COMPONENT_DIR, LM_PREFIX,
     QUANT_GROUP_SIZE,
 };
-pub use mlp::Qwen3VlMlp;
+pub use mlx_gen::nn::SwiGluMlp as Qwen3VlMlp;
+pub use mlx_gen::text_decoder::Qwen3TextAttention as Qwen3VlAttention;
 pub use prompt::{edit_body, PromptKind, EDIT_IMAGE_PLACEHOLDER};
 pub use rope::{mrope_cos_sin, MRopePositions};
 
 pub(crate) use load::{embedding, lin};
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix (so a flat test fixture and a
-/// real `model.language_model.layers.{i}` tree both resolve without a stray leading dot).
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;

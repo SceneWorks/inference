@@ -16,11 +16,9 @@ pub fn latent_dims(width: u32, height: u32) -> (usize, usize) {
     ((height / 16) as usize, (width / 16) as usize)
 }
 
-/// Image (= packed token) sequence length `(H/16)·(W/16)` (1024² → 4096).
-pub fn image_seq_len(width: u32, height: u32) -> usize {
-    let (h, w) = latent_dims(width, height);
-    h * w
-}
+/// Image (= packed token) sequence length `(H/16)·(W/16)` (1024² → 4096) — gen-core's shared
+/// definition (identical for every valid `>= 16` dim; sc-27383).
+pub use candle_gen::gen_core::sampling::image_seq_len;
 
 /// Deterministic, launch-portable packed initial noise `[1, seq, 128]` (sc-3673 parity): N(0,1) from
 /// a fixed-algorithm CPU RNG seeded by `seed`, sampled in `[1, 128, lat_h, lat_w]` order then packed
@@ -107,6 +105,12 @@ pub fn prepare_text_ids(seq: usize) -> Vec<[i64; 4]> {
 
 /// The FLUX.2 empirical-mu shift for `image_seq_len` and `num_steps`, ported from gen-core's
 /// `compute_mu`. Piecewise-linear in `num_steps` below seq 4300, linear-in-seq above.
+///
+/// Deliberately **not** gen-core's `compute_mu` (sc-27383): this port evaluates the fit in f64 and
+/// casts once, while gen-core (and therefore the MLX twin, `mlx-gen-flux2`) evaluates it in f32. The
+/// two differ by an ulp of `mu` for roughly 40% of (resolution, steps) combinations, so switching
+/// would move every affected Candle FLUX.2 render. Unifying is a numerics decision that needs a
+/// real-weight re-baseline, not a dedup.
 pub fn compute_mu(seq_len: usize, num_steps: usize) -> f32 {
     // Empirical-mu constants (from gen-core's `compute_mu`); computed in f64 to carry their full
     // precision, cast to f32 at the end.
@@ -125,29 +129,11 @@ pub fn compute_mu(seq_len: usize, num_steps: usize) -> f32 {
     mu as f32
 }
 
-/// The exponential time-shift `e / (e + (1/σ − 1))` with `e = exp(mu)` — the FLUX.2 sigma warp.
-fn time_shift_exponential(mu: f32, sigma: f32) -> f32 {
-    let e = mu.exp();
-    e / (e + (1.0 / sigma - 1.0))
-}
-
 /// Build the descending sigma schedule of length `num_steps + 1`: `num_steps` linspace points from
-/// `1.0` to `1/num_steps` warped by `time_shift_exponential`, then a trailing `0.0`.
-pub fn build_sigmas(num_steps: usize, mu: f32) -> Vec<f32> {
-    let n = num_steps as f32;
-    let (start, end) = (1.0f32, 1.0f32 / n);
-    let mut sigmas = Vec::with_capacity(num_steps + 1);
-    for i in 0..num_steps {
-        let t = if num_steps == 1 {
-            start
-        } else {
-            start + (end - start) * (i as f32) / (n - 1.0)
-        };
-        sigmas.push(time_shift_exponential(mu, t));
-    }
-    sigmas.push(0.0);
-    sigmas
-}
+/// `1.0` to `1/num_steps` warped by the exponential time-shift `e / (e + (1/σ − 1))`, `e = exp(mu)`,
+/// then a trailing `0.0` — gen-core's shared `build_flow_sigmas` (bit-identical for `num_steps >= 1`,
+/// which every caller validates; sc-27383).
+pub use candle_gen::gen_core::sampling::build_flow_sigmas as build_sigmas;
 
 /// The native flow-match sigma schedule for a render (length `steps+1`, descending, trailing `0.0`).
 /// The empirical-mu shift is fit from the image sequence length via [`compute_mu`]. This is the N1
@@ -246,6 +232,43 @@ mod tests {
         for w in sigmas.windows(2) {
             assert!(w[0] > w[1], "sigmas must strictly descend: {sigmas:?}");
         }
+    }
+
+    /// sc-27383: the Candle FLUX.2 `compute_mu` is pinned as the **f64** evaluation of the fit (cast
+    /// once), and it really does differ from gen-core's f32 `compute_mu` on part of the domain — so
+    /// replacing it with the shared one would move renders, which is why it stays local.
+    #[test]
+    fn compute_mu_is_the_f64_fit_and_differs_from_the_f32_shared_one() {
+        let f64_fit = |seq_len: usize, num_steps: usize| -> f32 {
+            let seq = seq_len as f64;
+            let m_200 = 0.000_169_27_f64 * seq + 0.456_666_66_f64;
+            if seq_len > 4300 {
+                return m_200 as f32;
+            }
+            let m_10 = 8.738_095_24e-5_f64 * seq + 1.898_333_33_f64;
+            let a = (m_200 - m_10) / 190.0;
+            (a * num_steps as f64 + (m_200 - 200.0 * a)) as f32
+        };
+        let mut differs = 0;
+        for side in (256u32..=2048).step_by(64) {
+            let seq = image_seq_len(side, side);
+            for steps in [1usize, 4, 8, 20, 28, 50] {
+                let mu = compute_mu(seq, steps);
+                assert_eq!(
+                    mu.to_bits(),
+                    f64_fit(seq, steps).to_bits(),
+                    "{side}² × {steps}"
+                );
+                if mu.to_bits() != candle_gen::gen_core::sampling::compute_mu(seq, steps).to_bits()
+                {
+                    differs += 1;
+                }
+            }
+        }
+        assert!(
+            differs > 0,
+            "the f64 fit must be a real divergence, else unify"
+        );
     }
 
     #[test]

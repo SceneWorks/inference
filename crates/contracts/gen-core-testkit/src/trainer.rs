@@ -844,18 +844,12 @@ pub fn check_trainer_registry(
     registry: &gen_core::ProviderRegistry,
     t: &dyn Trainer,
 ) -> Result<(), String> {
-    let id = t.descriptor().id;
-    if registry
-        .trainers()
-        .any(|registration| (registration.descriptor)().id == id)
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "registry[{id}]: descriptor id not found in the explicit provider registry (gen-core {})",
-            gen_core::VERSION
-        ))
-    }
+    crate::check_registry_ids(
+        registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id),
+        t.descriptor().id,
+    )
 }
 
 /// Run the full trainer conformance suite. `make` constructs a fresh trainer (it is invoked several
@@ -899,13 +893,7 @@ pub fn trainer_conformance(make: impl Fn() -> Box<dyn Trainer>, profile: &Traine
         failures.push(e);
     }
 
-    if !failures.is_empty() {
-        panic!(
-            "gen-core trainer conformance FAILED for `{id}` (gen-core {}):\n  - {}",
-            gen_core::VERSION,
-            failures.join("\n  - ")
-        );
-    }
+    crate::panic_on_failures("gen-core trainer conformance", id, None, &failures);
 }
 
 #[cfg(test)]

@@ -50,8 +50,12 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress,
-    WeightsSource,
+    GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress, WeightsSource,
+};
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::{
+    correlation, downsample_box, downsample_box_raw, env_u32, mean_abs_delta, one_image,
+    preview_strip_sheet,
 };
 use candle_gen_sensenova::preview::project_running_image;
 
@@ -77,17 +81,6 @@ fn required_path(name: &str) -> PathBuf {
     path
 }
 
-fn env_u32(name: &str, fallback: u32) -> u32 {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            value
-                .parse()
-                .unwrap_or_else(|_| panic!("{name} must parse as an integer, got {value:?}"))
-        })
-        .unwrap_or(fallback)
-}
-
 fn artifact_dir() -> PathBuf {
     required_path("SENSENOVA_PREVIEW_ARTIFACT_DIR")
 }
@@ -103,29 +96,16 @@ enum Event {
 }
 
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(format!("{name}.png"));
-    image::save_buffer(&path, pixels, width, height, image::ExtendedColorType::Rgb8)
-        .expect("save a PNG");
+    let path = artifact_dir().join(format!("{name}.png"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  saved {}", path.display());
 }
 
 /// Write the frames side by side as one strip, plus each frame individually — the artifact the epic
 /// asks to be reviewed directly. One strip **per route**.
 fn save_strip(frames: &[PreviewFrame], name: &str) {
-    let (w, h) = (
-        frames[0].image.width as usize,
-        frames[0].image.height as usize,
-    );
-    let strip_w = w * frames.len();
-    let mut strip = vec![0u8; strip_w * h * 3];
-    for (i, frame) in frames.iter().enumerate() {
-        for y in 0..h {
-            let src = &frame.image.pixels[y * w * 3..(y + 1) * w * 3];
-            let x0 = (y * strip_w + i * w) * 3;
-            strip[x0..x0 + w * 3].copy_from_slice(src);
-        }
+    let (strip, width, height) = preview_strip_sheet(frames);
+    for frame in frames {
         save_png(
             &frame.image.pixels,
             frame.image.width,
@@ -133,65 +113,7 @@ fn save_strip(frames: &[PreviewFrame], name: &str) {
             &format!("{name}_frame{:02}", frame.current),
         );
     }
-    save_png(&strip, strip_w as u32, h as u32, &format!("{name}_strip"));
-}
-
-fn downsample_raw(pixels: &[u8], width: u32, height: u32, w: u32, h: u32) -> Vec<u8> {
-    let mut out = vec![0u8; (w * h * 3) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let (y0, y1) = (
-                y * height / h,
-                ((y + 1) * height / h).max(y * height / h + 1),
-            );
-            let (x0, x1) = (x * width / w, ((x + 1) * width / w).max(x * width / w + 1));
-            for channel in 0..3usize {
-                let mut sum = 0u32;
-                let mut count = 0u32;
-                for sy in y0..y1.min(height) {
-                    for sx in x0..x1.min(width) {
-                        sum += pixels[((sy * width + sx) as usize) * 3 + channel] as u32;
-                        count += 1;
-                    }
-                }
-                out[((y * w + x) as usize) * 3 + channel] = (sum / count.max(1)) as u8;
-            }
-        }
-    }
-    out
-}
-
-fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
-    downsample_raw(&img.pixels, img.width, img.height, w, h)
-}
-
-fn mean_abs_delta(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs() as f64)
-        .sum::<f64>()
-        / a.len() as f64
-}
-
-fn correlation(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len());
-    let n = a.len() as f64;
-    let (mean_a, mean_b) = (
-        a.iter().map(|v| *v as f64).sum::<f64>() / n,
-        b.iter().map(|v| *v as f64).sum::<f64>() / n,
-    );
-    let (mut cov, mut va, mut vb) = (0.0, 0.0, 0.0);
-    for (x, y) in a.iter().zip(b) {
-        let (dx, dy) = (*x as f64 - mean_a, *y as f64 - mean_b);
-        cov += dx * dy;
-        va += dx * dx;
-        vb += dy * dy;
-    }
-    if va <= f64::EPSILON || vb <= f64::EPSILON {
-        return 0.0;
-    }
-    cov / (va.sqrt() * vb.sqrt())
+    save_png(&strip, width, height, &format!("{name}_strip"));
 }
 
 /// The fraction of an RGB8 frame sitting on a rail (0 or 255).
@@ -423,7 +345,7 @@ fn assert_the_strip_converges(
     );
 
     // ── Convergence on the finished render ────────────────────────────────────────────────────────
-    let target = downsample(final_image, edge, edge);
+    let target = downsample_box(final_image, edge, edge);
     let distances: Vec<f64> = frames
         .iter()
         .map(|f| mean_abs_delta(&f.image.pixels, &target))
@@ -450,12 +372,12 @@ fn assert_the_strip_converges(
     // Correlation over a coarse thumbnail is what "the preview looks like the image" means for a
     // decorative frame: absolute distance can only ever say "closer".
     let coarse = 8u32;
-    let coarse_target = downsample(final_image, coarse, coarse);
+    let coarse_target = downsample_box(final_image, coarse, coarse);
     let correlations: Vec<f64> = frames
         .iter()
         .map(|f| {
             correlation(
-                &downsample_raw(
+                &downsample_box_raw(
                     &f.image.pixels,
                     f.image.width,
                     f.image.height,
@@ -503,14 +425,6 @@ fn assert_the_strip_converges(
         contrasts.windows(2).all(|p| p[1] > p[0]),
         "{label}: contrast about the fit intercept must grow at every step: {contrasts:?}"
     );
-}
-
-fn one_image(out: GenerationOutput) -> Image {
-    let GenerationOutput::Images(mut images) = out else {
-        panic!("expected GenerationOutput::Images");
-    };
-    assert_eq!(images.len(), 1);
-    images.pop().expect("one image")
 }
 
 fn request(steps: u32, size: u32, guidance: f32) -> GenerationRequest {

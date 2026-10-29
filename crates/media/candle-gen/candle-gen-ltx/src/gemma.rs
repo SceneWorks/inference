@@ -16,6 +16,7 @@ use candle_gen::candle_nn::{ops::rms_norm as candle_rms_norm, ops::softmax_last_
 
 use crate::config::GemmaConfig;
 use crate::quant::{qembedding, qlinear, QLinear};
+use candle_gen::attention::repeat_kv;
 
 /// Finite large-negative mask value (bf16 min, as f32) — used instead of -∞ so an all-masked row
 /// (a left-padding query position) softmaxes to a finite uniform vector rather than NaN. Those
@@ -140,16 +141,6 @@ impl GemmaEncoder {
         ))
     }
 
-    fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
-        if n_rep == 1 {
-            return Ok(x.clone());
-        }
-        let (b, kv, l, d) = x.dims4()?;
-        x.unsqueeze(2)?
-            .broadcast_as((b, kv, n_rep, l, d))?
-            .reshape((b, kv * n_rep, l, d))
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn attn(
         &self,
@@ -182,8 +173,8 @@ impl GemmaEncoder {
         let q = Self::apply_rope(&q, cos, sin)?;
         let k = Self::apply_rope(&k, cos, sin)?;
         // GQA + attention in f32.
-        let k = Self::repeat_kv(&k, h / kv)?;
-        let v = Self::repeat_kv(&v, h / kv)?;
+        let k = repeat_kv(&k, h / kv)?;
+        let v = repeat_kv(&v, h / kv)?;
         let qf = q.to_dtype(DType::F32)?.contiguous()?;
         let kf = k.to_dtype(DType::F32)?.contiguous()?;
         let vf = v.to_dtype(DType::F32)?.contiguous()?;

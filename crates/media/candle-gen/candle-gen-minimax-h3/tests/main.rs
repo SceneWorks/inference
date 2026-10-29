@@ -67,9 +67,6 @@ mod ref2va_checkpoint;
 #[path = "ref2va_conditioning.rs"]
 mod ref2va_conditioning;
 
-#[path = "ref2va_cross_backend.rs"]
-mod ref2va_cross_backend;
-
 #[path = "turbo_lora.rs"]
 mod turbo_lora;
 

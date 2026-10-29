@@ -856,10 +856,12 @@ fn validate_route(
             "{provider}: request crossed the admitted route/mode/reference/PiD/geometry identity"
         )));
     }
-    match gen_core::standard_memory_strategy_safety_check(contract, context, Some(numeric), None) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    candle_gen::request_scope::admit(gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(numeric),
+        None,
+    ))
 }
 
 pub(crate) fn safety_check(
@@ -868,12 +870,7 @@ pub(crate) fn safety_check(
     numeric: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match validate_route(provider, contract, numeric, context) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(validate_route(provider, contract, numeric, context))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1269,26 +1266,7 @@ impl MemoryRequestScope for BooguRequestScope {
         Ok(())
     }
 
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.enter_phase(phase)
-    }
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.leave_phase(phase)
-    }
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: gen_core::MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.core.configure_decode(edge, overlap, geometry)
-    }
-    fn configure_attention(&mut self, chunk: u32) -> gen_core::Result<()> {
-        self.core.configure_attention(chunk)
-    }
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
-        self.core.materialize_transformer_window(first, count)
-    }
+    candle_gen::gen_core::delegate_memory_request_scope!(core);
     fn finish(&mut self, outcome: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
         self.core.finish(outcome)?;
         if let (Some(admission), Some(token)) = (&self.admission, self.token) {
@@ -1371,9 +1349,7 @@ pub fn registered_safety_check(
 ) -> MemorySafetyDecision {
     match registered_numeric_tier(&contract.provider_id, spec, contract) {
         Ok(numeric) => safety_check(&contract.provider_id, contract, numeric, context),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 

@@ -198,31 +198,21 @@ pub(crate) fn install_variant(host: &mut QwenImage21Transformer, spec: &LoadSpec
 }
 
 pub(crate) fn retirement_boundary() {
-    // Exact mlx-rs48ff5e7 vendored mlx-c stream.h/stream.cpp ABI. The loaded
-    // library/source identity is separately captured as MLXv0.32.0 in the lane.
+    // Bound through mlx-sys's bindgen declarations of the linked mlx-c `stream.h`, so the
+    // signatures track the pinned workspace revision instead of a hand-copied ABI.
     // This boundary is test-only: alternate-overlay construction and the
     // separate conditioning/velocity diagnostic's explicit phase retirement.
     assert!(mlx_rs::task_local_default_stream().is_none());
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CStream {
-        ctx: *mut std::ffi::c_void,
-    }
-    extern "C" {
-        fn mlx_default_gpu_stream_new() -> CStream;
-        fn mlx_synchronize(stream: CStream) -> i32;
-        fn mlx_stream_free(stream: CStream) -> i32;
-    }
     // SAFETY: the owned handle comes from the matching linked mlx-c library,
     // is synchronized before being freed once, and is never shared with threads.
     let (sync, free) = unsafe {
-        let stream = mlx_default_gpu_stream_new();
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
         assert!(
             !stream.ctx.is_null(),
             "materialization stream creation failed"
         );
-        let sync = mlx_synchronize(stream);
-        (sync, mlx_stream_free(stream))
+        let sync = mlx_sys::mlx_synchronize(stream);
+        (sync, mlx_sys::mlx_stream_free(stream))
     };
     assert_eq!(sync, 0, "materialization synchronization failed");
     assert_eq!(free, 0, "materialization stream release failed");
@@ -233,44 +223,17 @@ pub(crate) fn f32_values(array: &Array) -> Result<Vec<f32>> {
     // Same-dtype cast and reshape can both preserve strides. Request a logical
     // row-contiguous copy explicitly through the pinned mlx-c API before export.
     let source = array.as_dtype(Dtype::Float32)?;
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Handle {
-        ctx: *mut std::ffi::c_void,
-    }
-    extern "C" {
-        fn mlx_array_new() -> Handle;
-        fn mlx_array_free(array: Handle) -> i32;
-        fn mlx_contiguous(
-            out: *mut Handle,
-            array: Handle,
-            allow_col_major: bool,
-            stream: Handle,
-        ) -> i32;
-    }
     let stream = mlx_rs::Stream::task_local_or_default();
-    // SAFETY: these are the exact single-pointer mlx-c handles; from_ptr below
-    // transfers the independently created output handle to Array's normal Drop.
-    let mut output = unsafe { mlx_array_new() };
-    let rc = unsafe {
-        mlx_contiguous(
-            &mut output,
-            Handle {
-                ctx: source.as_ptr().ctx,
-            },
-            false,
-            Handle {
-                ctx: stream.as_ptr().ctx,
-            },
-        )
-    };
+    // SAFETY: mlx-sys's bindgen declarations of the linked mlx-c `array.h`/`ops.h`; from_ptr
+    // below transfers the independently created output handle to Array's normal Drop.
+    let mut output = unsafe { mlx_sys::mlx_array_new() };
+    let rc =
+        unsafe { mlx_sys::mlx_contiguous(&mut output, source.as_ptr(), false, stream.as_ptr()) };
     if rc != 0 {
-        assert_eq!(unsafe { mlx_array_free(output) }, 0);
+        assert_eq!(unsafe { mlx_sys::mlx_array_free(output) }, 0);
         return Err("logical contiguous CPU export failed".into());
     }
-    let mut typed_output = source.as_ptr();
-    typed_output.ctx = output.ctx;
-    let a = unsafe { Array::from_ptr(typed_output) };
+    let a = unsafe { Array::from_ptr(output) };
     eval([&a])?;
     Ok(a.as_slice::<f32>().to_vec())
 }

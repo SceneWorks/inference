@@ -17,14 +17,11 @@
 //! unreachable for Large-Turbo and Medium even though [`crate::block_stream::Sd3BlockStream`] is
 //! arch-parametric and materializes each variant's own topology.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::{BufReader, Read};
-use std::os::unix::fs::MetadataExt;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
+use mlx_gen::gen_core::{ArtifactSeal, ResolvedFileIdentity};
 use mlx_gen::{Error, LoadSpec, Quant, Result, WeightsSource};
-use sha2::{Digest, Sha256};
 
 pub const CALIBRATED_REVISION: &str = "ceddf0a7fdf2064ea28e2213e3b84e4afa170a0f";
 
@@ -98,7 +95,7 @@ fn turnkey_path_tier(provider_id: &str, root: &Path) -> Option<Option<Quant>> {
 }
 
 /// The packed tier the transformer on disk actually is, read from the `quantization` manifest the
-/// converter writes into `transformer/config.json` (`crate::convert::write_quantized_config`) and
+/// converter writes into `transformer/config.json` (`mlx_gen::quant::write_quantized_config`) and
 /// cross-checked against the packed triples in the safetensors headers.
 ///
 /// Header-only: `safetensors_header_shapes` reads the JSON header and never the weight body, so this
@@ -360,69 +357,25 @@ fn expected_sha256<'a>(relative: &str, blob: &'a str) -> &'a str {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Identity {
-    canonical: PathBuf,
-    device: u64,
-    inode: u64,
-    size: u64,
-    mtime: i64,
-    mtime_ns: i64,
-    ctime: i64,
-    ctime_ns: i64,
-}
+type Identity = ResolvedFileIdentity;
 
 fn identity(path: &Path) -> Result<Identity> {
-    let canonical = std::fs::canonicalize(path)?;
-    let metadata = std::fs::metadata(&canonical)?;
-    Ok(Identity {
-        canonical,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        size: metadata.size(),
-        mtime: metadata.mtime(),
-        mtime_ns: metadata.mtime_nsec(),
-        ctime: metadata.ctime(),
-        ctime_ns: metadata.ctime_nsec(),
-    })
+    Ok(ResolvedFileIdentity::capture(path)?)
 }
 
-fn digest_cache() -> &'static Mutex<HashMap<Identity, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<Identity, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
+/// Whole-file SHA-256 of `path`, through the shared [`ArtifactSeal`] (once per file identity,
+/// single-flight across concurrent loads). `id` is the identity the caller already pinned; a seal
+/// of a different object means the file changed between the two observations.
 fn sha256(path: &Path, id: &Identity) -> Result<String> {
-    if let Some(value) = digest_cache()
-        .lock()
-        .map_err(|_| Error::Msg("sd3 artifact digest cache poisoned".to_owned()))?
-        .get(id)
-        .cloned()
+    let seal = ArtifactSeal::pin(path)?;
+    if seal.canonical_target_path() != id.canonical_path
+        || seal.target_fingerprint() != &id.fingerprint
     {
-        return Ok(value);
-    }
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-    let mut hash = Sha256::new();
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-    }
-    let value = format!("{:x}", hash.finalize());
-    if identity(path).ok().as_ref() != Some(id) {
         return Err(Error::Unsupported(
             "sd3 calibrated artifact changed while it was hashed".to_owned(),
         ));
     }
-    digest_cache()
-        .lock()
-        .map_err(|_| Error::Msg("sd3 artifact digest cache poisoned".to_owned()))?
-        .insert(id.clone(), value.clone());
-    Ok(value)
+    Ok(seal.content_sha256_hex())
 }
 
 fn visible_files(root: &Path) -> Result<BTreeSet<String>> {

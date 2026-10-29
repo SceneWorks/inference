@@ -1145,12 +1145,12 @@ pub(crate) fn admission_safety_check(
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    match validate_context(provider_id, contract, context, loaded_quant) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(validate_context(
+        provider_id,
+        contract,
+        context,
+        loaded_quant,
+    ))
 }
 
 pub(crate) fn safety_check(
@@ -1179,16 +1179,9 @@ pub(crate) fn snapshot_quant_tier(
         WeightsSource::Dir(root) => root,
         WeightsSource::File(_) => return Ok(None),
     };
-    crate::pipeline::packed_config_at(root, "transformer")
-        .map_err(gen_core::Error::backend)?
-        .map(|packed| match packed.bits {
-            4 => Ok(Quant::Q4),
-            8 => Ok(Quant::Q8),
-            bits => Err(gen_core::Error::Unsupported(format!(
-                "{provider_id}: transformer declares unsupported packed quantization width {bits}"
-            ))),
-        })
-        .transpose()
+    let packed =
+        crate::pipeline::packed_config_at(root, "transformer").map_err(gen_core::Error::backend)?;
+    candle_gen::quant::packed_quant_tier(packed, provider_id, "transformer")
 }
 
 pub(crate) fn registered_safety_check(
@@ -1198,9 +1191,7 @@ pub(crate) fn registered_safety_check(
 ) -> MemorySafetyDecision {
     match snapshot_quant_tier(spec, &contract.provider_id) {
         Ok(quant) => admission_safety_check(&contract.provider_id, contract, context, quant),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 

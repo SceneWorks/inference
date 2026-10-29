@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 116
+EXPECTED_MEMBER_COUNT = 118
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -29,6 +29,8 @@ INTERNAL_PACKAGES = {
     "mlx-llm",
     "candle-llm",
     "sceneworks-gen-core",
+    "sceneworks-gen-core-dist",
+    "sceneworks-gen-core-telemetry",
     "sceneworks-gen-core-testkit",
     "runtime-catalog",
     "runtime-macos",
@@ -186,6 +188,37 @@ DELETED_ENV_SIDE_CHANNELS = (
     "MOSS_TTS_REP_PENALTY",
     "MOSS_TTS_MIN_FRAMES",
 )
+
+# Every process-environment variable production `crates/**/src/**` code (outside `#[cfg(test)]`)
+# reads by literal name, through `env::var` / `env::var_os` or gen-core's `env_flag` (sc-27313). An
+# env var that changes numerics, shapes or routing sits outside the request and the provider contract,
+# so two workers with different environments render differently for the same request; adding one is a
+# deliberate edit here, not an incidental `env::var` call. Boolean knobs parse through
+# `gen_core::env_flag` (`1`/`true`/`yes`/`on`), never presence (`var_os(..).is_some()`).
+PRODUCTION_ENV_READS = frozenset({
+    # Platform / device / process plumbing.
+    "CANDLE_LLM_DEVICE", "CUDA_PATH", "CUDA_VISIBLE_DEVICES", "HOME", "LOCALAPPDATA", "SystemRoot",
+    "XDG_CACHE_HOME", "SCENEWORKS_ROOT",
+    # Memory-budget / attention-budget / token-cap overrides.
+    "LTX_MAX_LATENT_TOKENS", "SEEDVR2_BUDGET_GIB", "WAN_ATTN_SCORES_BUDGET", "MLX_SDPA_BLOCKS",
+    "SDXL_PREDICTION_BUDGET_BYTES", "MLX_GEN_SANA_DECODE_TILE", "ANIMA_SPLIT_FILES",
+    # Numeric / behaviour A/B toggles (boolean ones go through `env_flag`).
+    "FLUX2_IMG_GUIDANCE", "PID_PIXEL_POS_ABS", "SCAIL2_COMPUTE_BF16", "SDXL_LORA_VENDORED",
+    "SVD_FORCE_BF16", "SVD_FORCE_F16", "WAN_ATTN_SOFTMAX_BF16",
+    # Calibration / measurement / proof harness inputs and CI provenance.
+    "MEMORY_EXPECTED_ABI", "MEMORY_EXPECTED_FINGERPRINT", "MODEL_INFERENCE_CASE_FQN", "GITHUB_SHA",
+    "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "MOSS_CPU_RECEIPT_PATH", "MOSS_CUDA_UNIT_EXPECTED_GPU_UUID",
+    "MOSS_PORTABLE_EXCHANGE_INPUT", "MOSS_PORTABLE_EXCHANGE_OUTPUT", "SDXL_PREDICTION_SNAPSHOTS",
+    "SDXL_LDM_CHECKPOINT", "SDXL_TOKENIZER_ROOT", "SDXL_GOLDEN_WRITE",
+    "QWEN_IMAGE_2_1_LORA_PHASE", "QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS",
+    "QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS_OUT",
+    # Subprocess capture markers set by a parent test harness for its own child.
+    "IOS_CAPTURE_IN_CHILD", "IOS_CAPTURE_PERMIT_CPU_CHILD", "IRIS_STREAM_CPU_CHILD",
+    "SDXL_IOS_QUANTUM_CPU_BODY_DONE", "SDXL_IOS_QUANTUM_CPU_CHILD",
+    # Debug output only (never numerics).
+    "MOSS_CODEC_DEBUG", "MOSS_TTSD_CODEC_DEBUG", "PID_CAPTURE_LATENT", "SDXL_VAE_TRACE_TILE",
+    "SVD_DEBUG", "ZIMAGE_PRINT_ANCHOR", "ZIMAGE_PROOF_PRINT_ONLY",
+})
 
 # The crate that owns the shared PiD decode seam and, since sc-15775, the shared per-route decode
 # domain. A direct dependency on it is what makes a provider PiD-eligible.
@@ -1116,6 +1149,130 @@ def check_ios_host_shared_workspace(root: Path) -> None:
 
 
 
+# sc-27276: a member that names a `[workspace.dependencies]` package must inherit it
+# (`{ workspace = true, ... }`) instead of re-declaring a version or path, or the workspace pin
+# silently stops being the single source. Only these deliberate version splits may stay inline:
+INLINE_VERSION_SPLITS = {
+    # The intentional 0.21/0.22 split `check_graph` pins: the 0.21 users stay inline.
+    "tokenizers": "0.21",
+    # The workspace pin is 0.4 (gen-core, the MLX crates and Candle's own `ug` dependency resolve
+    # 0.4.5); the Candle providers need 0.7 and declare it inline until the pin is unified.
+    "safetensors": "0.7",
+}
+# Exact (manifest, key) entries that cannot inherit: the CLIP certificate's vendored regex is a
+# path + exact-version pin (see REGEX_CERTIFICATE_PACKAGES).
+INLINE_DEPENDENCY_EXCEPTIONS = {
+    ("crates/media/mlx-gen/mlx-gen-sdxl/Cargo.toml", "regex"),
+}
+
+
+def _manifest_dependency_tables(manifest: dict) -> list[tuple[str, dict]]:
+    sections = ("dependencies", "dev-dependencies", "build-dependencies")
+    tables = [(section, manifest.get(section, {})) for section in sections]
+    for target, body in manifest.get("target", {}).items():
+        tables.extend((f"target.{target}.{section}", body.get(section, {})) for section in sections)
+    return tables
+
+
+def workspace_dependency_inheritance_errors(
+    workspace_dependencies: dict, manifests: dict[str, dict]
+) -> list[str]:
+    """Inline declarations of a workspace-declared dependency, keyed by repo-relative manifest."""
+    errors = []
+    for relative, manifest in sorted(manifests.items()):
+        for section, table in _manifest_dependency_tables(manifest):
+            for key, spec in table.items():
+                package = spec.get("package", key) if isinstance(spec, dict) else key
+                if key not in workspace_dependencies and package not in workspace_dependencies:
+                    continue
+                if isinstance(spec, dict) and spec.get("workspace") is True:
+                    continue
+                if isinstance(spec, dict) and package != key:
+                    # A renamed dependency cannot inherit (inheritance cannot rename the key).
+                    continue
+                if isinstance(spec, dict) and spec.get("path") == ".":
+                    # A crate's dev-dependency on itself to enable test-only features.
+                    continue
+                if (relative, key) in INLINE_DEPENDENCY_EXCEPTIONS:
+                    continue
+                version = spec if isinstance(spec, str) else spec.get("version")
+                if INLINE_VERSION_SPLITS.get(package) == version and "path" not in spec:
+                    continue
+                errors.append(
+                    f"{relative} [{section}] {key} re-declares a [workspace.dependencies] entry; "
+                    "use `{ workspace = true }` (add features/optional beside it)"
+                )
+    return errors
+
+
+def check_workspace_dependency_inheritance(metadata: dict, root: Path) -> None:
+    workspace_dependencies = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))[
+        "workspace"
+    ]["dependencies"]
+    packages = {package["id"]: package for package in metadata["packages"]}
+    manifests = {}
+    for member_id in metadata["workspace_members"]:
+        path = Path(packages[member_id]["manifest_path"]).resolve()
+        if root.resolve() / "crates" not in path.parents:
+            continue  # the ios-host device harness keeps its own reviewed manifest
+        manifests[path.relative_to(root.resolve()).as_posix()] = tomllib.loads(
+            path.read_text(encoding="utf-8")
+        )
+    errors = workspace_dependency_inheritance_errors(workspace_dependencies, manifests)
+    if errors:
+        fail("; ".join(errors))
+
+
+# sc-27415: provider crates may depend on sibling providers (the lateral tier documented in
+# docs/architecture/inference-rearchitecture.md), but only on the same backend, and nothing below
+# the composition roots may depend on a catalog or bundle. Cargo already rejects cycles among
+# normal dependencies.
+PROVIDER_PREFIXES = ("mlx-gen-", "candle-gen-", "candle-audio-")
+
+
+def _is_provider(name: str) -> bool:
+    return name.startswith(PROVIDER_PREFIXES) and not name.endswith("-catalog")
+
+
+def _backend(name: str) -> str | None:
+    if name.startswith("mlx-"):
+        return "mlx"
+    if name.startswith("candle-"):
+        return "candle"
+    return None
+
+
+def provider_tier_edge_errors(metadata: dict) -> list[str]:
+    packages = {package["id"]: package for package in metadata["packages"]}
+    members = [packages[member_id] for member_id in metadata["workspace_members"]]
+    member_names = {package["name"] for package in members}
+    composition = {
+        package["name"]
+        for package in members
+        if package["name"].endswith("-catalog") or "/crates/bundles/" in package["manifest_path"]
+    }
+    errors = []
+    for package in members:
+        name = package["name"]
+        if not _is_provider(name):
+            continue
+        for dependency in package["dependencies"]:
+            target = dependency["name"]
+            if dependency.get("kind") is not None or target not in member_names:
+                continue
+            if target in composition:
+                errors.append(f"provider {name} depends on composition root {target}")
+            elif _backend(target) is not None and _backend(target) != _backend(name):
+                errors.append(f"provider {name} depends across backends on {target}")
+    return errors
+
+
+def check_provider_tier_edges(metadata: dict) -> None:
+    errors = provider_tier_edge_errors(metadata)
+    if errors:
+        fail("; ".join(errors))
+
+
 # Published upstream lockfiles are retained as archive/source provenance, NOT independent
 # active workspace locks. Register only these exact excluded package paths and versions;
 # arbitrary nested locks, including any other vendor lock, remain errors.
@@ -2033,6 +2190,50 @@ def check_rust_sources(root: Path) -> None:
     if violations:
         joined = "\n  ".join(violations)
         fail(f"inference source must not reference HF caches or deleted env side channels:\n  {joined}")
+
+
+def check_production_env_reads(root: Path, *, reject_stale: bool = False) -> None:
+    """Fail on a production `src/` read of a process-environment variable that is not in
+    PRODUCTION_ENV_READS (sc-27313). `#[cfg(test)]` blocks and `#[cfg(test)] mod name;` files are test
+    code and exempt; only literal names are matched. With `reject_stale` (the real tree), an allowlist
+    entry no production code reads any more is also a failure, so the list names exactly the knobs
+    that exist."""
+    crates = root / "crates"
+    if not crates.is_dir():
+        return
+    read = re.compile(r"\b(?:env::var(?:_os)?|env_flag)\s*\(\s*\"([A-Za-z0-9_]+)\"\s*\)")
+    test_only = _test_only_files(root)
+    violations: list[str] = []
+    seen: set[str] = set()
+    for path in sorted(crates.rglob("*.rs")):
+        relative = path.relative_to(root)
+        if "src" not in relative.parts or path in test_only:
+            continue
+        if not SOURCE_LINT_IGNORED_PARTS.isdisjoint(relative.parts):
+            continue
+        text = path.read_text(encoding="utf-8")
+        code = strip_rust_comments(text)
+        spans = _cfg_test_spans(code)
+        for match in read.finditer(code):
+            name = match.group(1)
+            if any(start <= match.start() < end for start, end in spans):
+                continue
+            seen.add(name)
+            if name in PRODUCTION_ENV_READS:
+                continue
+            violations.append(f"{relative}:{_line_of(code, match.start())}: {name}")
+    if reject_stale:
+        violations.extend(
+            f"PRODUCTION_ENV_READS lists {name!r}, which no production code reads any more"
+            for name in sorted(PRODUCTION_ENV_READS - seen)
+        )
+    if violations:
+        joined = "\n  ".join(violations)
+        fail(
+            "production env reads and PRODUCTION_ENV_READS disagree; inference takes its inputs from "
+            "the request/provider contract — add a deliberate knob to the allowlist, or drop an "
+            f"entry nothing reads:\n  {joined}"
+        )
 
 
 def check_pid_decode_route_adoption(metadata: dict, root: Path) -> None:
@@ -3424,8 +3625,11 @@ def main() -> int:
         metadata = cargo_metadata(args.offline)
         check_graph(metadata)
         check_network_clients(metadata)
+        check_workspace_dependency_inheritance(metadata, ROOT)
+        check_provider_tier_edges(metadata)
         check_ios_graph(args.offline)
         check_rust_sources(ROOT)
+        check_production_env_reads(ROOT, reject_stale=True)
         check_pid_decode_route_adoption(metadata, ROOT)
         check_snapshot_path_derivation(ROOT)
         check_audio_hub_layout_derivation(ROOT)
@@ -3439,8 +3643,9 @@ def main() -> int:
     print(
         "workspace gate: OK "
         f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
-        "intentional tokenizer split, no network clients, no trainers in the iOS graph, "
-        "no HF-cache references, "
+        "intentional tokenizer split, inherited workspace dependencies, same-backend provider "
+        "edges, no network clients, no trainers in the iOS graph, "
+        "no HF-cache references, only listed production env reads, "
         "no $HOME-derived snapshot paths, no audio hub-layout re-derivations, "
         "no unguarded test temp roots, "
         "no raw candle-gen mmap sites outside the loader seam, "

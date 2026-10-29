@@ -22,7 +22,7 @@ use mlx_gen_flux::T5TextEncoder;
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{MochiConfig, MochiSplitModel, MochiVaeConfig};
+use crate::config::{MochiSplitModel, MochiVaeConfig};
 use crate::text_encoder::{encode_prompt, load_t5_encoder};
 use crate::tokenizer::{load_tokenizer, MochiTokenizer};
 use crate::transformer::{
@@ -96,9 +96,6 @@ pub struct Mochi {
     t5: T5TextEncoder,
     transformer: MochiTransformer3DModel,
     vae: MochiVaeDecoder,
-    /// T5 conditioning geometry (documentation / text_len policy).
-    #[allow(dead_code)]
-    config: MochiConfig,
     vae_config: MochiVaeConfig,
 }
 
@@ -151,7 +148,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let vae_root = resolve_component_root(&root, "vae");
     let te_root = resolve_component_root(&root, "text_encoder");
 
-    let config = MochiConfig::from_model_dir(&root)?;
     let vae_config = MochiVaeConfig::from_model_dir(&vae_root)?;
     let dit_cfg = MochiDitConfig {
         quantization: quant,
@@ -185,7 +181,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         t5,
         transformer,
         vae,
-        config,
         vae_config,
     }))
 }

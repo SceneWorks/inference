@@ -65,10 +65,6 @@ const SIDECAR_EXTENSIONS: [&str; 2] = ["json", "jinja"];
 /// Directory-root files that are *not* sidecars (upstream `_ASSET_GLOB_EXCLUDES`).
 const SIDECAR_EXCLUDES: [&str; 2] = ["config.json", "tokenizer.json"];
 
-/// Same bound `crate::weightsmeta::safetensors_path_tensor_headers` uses: a header larger than this
-/// is a corrupt/mis-detected file (e.g. an AppleDouble `._` sidecar), not a real checkpoint.
-const MAX_HEADER_SIZE: u64 = 100_000_000;
-
 // =================================================================================================
 // GemmaAssets
 // =================================================================================================
@@ -370,31 +366,16 @@ impl SafetensorsHeader {
     /// tensor locations. Weight tensors are deliberately not indexed: a 686-entry index costs
     /// nothing to skip and this type must never tempt a caller into a whole-file read.
     fn read(file: &mut std::fs::File, file_len: u64, path: &Path) -> Result<Self> {
-        let mut prefix = [0u8; 8];
-        file.read_exact(&mut prefix).map_err(|e| {
-            Error::Msg(format!(
-                "gemma assets: {} is too short for a safetensors header length: {e}",
-                path.display()
-            ))
-        })?;
-        let header_len = u64::from_le_bytes(prefix);
-        if header_len > MAX_HEADER_SIZE {
-            return Err(Error::Msg(format!(
-                "gemma assets: safetensors header in {} exceeds the {MAX_HEADER_SIZE}-byte maximum",
-                path.display()
-            )));
-        }
-        let data_base = 8u64
-            .checked_add(header_len)
-            .filter(|b| *b <= file_len)
-            .ok_or_else(|| {
-                Error::Msg(format!(
-                    "gemma assets: safetensors header in {} extends past the end of the file",
+        // The crate-wide bounded header read (sc-27314: one ceiling for every header reader).
+        let (header, data_base) = crate::weightsmeta::read_safetensors_header(file, file_len, path)
+            .map_err(|error| match error {
+                Error::Msg(message) => Error::Msg(format!("gemma assets: {message}")),
+                Error::Io(error) => Error::Msg(format!(
+                    "gemma assets: {} is too short for a safetensors header: {error}",
                     path.display()
-                ))
+                )),
+                other => other,
             })?;
-        let mut header = vec![0u8; header_len as usize];
-        file.read_exact(&mut header)?;
         let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
             .map_err(|e| {
                 Error::Msg(format!(

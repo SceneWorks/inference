@@ -27,12 +27,5 @@ pub use mlx_gen::nn::TextRope;
 /// the checkpoint. `ENCODER_CONTRACT.qk_norm_eps` in `lib.rs` publishes the same number.
 pub(crate) const QK_NORM_EPS: f32 = 1e-6;
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix (so flat fixtures and
-/// real `layers.{i}` trees both resolve without a stray leading dot).
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;

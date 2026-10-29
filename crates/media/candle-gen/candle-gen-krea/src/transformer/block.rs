@@ -15,6 +15,7 @@ use super::rope::apply_interleaved_rope;
 use crate::loader::{linear_detect, linear_detect_planned, rms_scale, rms_scale_weight, Weights};
 use crate::nvfp4_dit::{BlockLeaf, DitPlan};
 use crate::quant::QLinear;
+use candle_gen::attention::repeat_kv_bshd;
 #[cfg(test)]
 use candle_gen::gen_core::attention_budget::AttentionBudget;
 use candle_gen::gen_core::attention_budget::AttentionPlan;
@@ -37,19 +38,6 @@ fn join(prefix: &str, name: &str) -> String {
     } else {
         format!("{prefix}.{name}")
     }
-}
-
-/// Repeat each kv head `groups` times consecutively ([b,s,hkv,hd] → [b,s,hkv·groups,hd]) —
-/// `repeat_interleave` over the head axis, matching the reference `enable_gqa`.
-fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let (b, s, hkv, hd) = x.dims4()?;
-    x.unsqueeze(3)?
-        .expand((b, s, hkv, groups, hd))?
-        .contiguous()?
-        .reshape((b, s, hkv * groups, hd))
 }
 
 /// Bidirectional, unmasked scaled-dot-product attention. `q`/`k`/`v`: `[b, h, s, hd]`.
@@ -307,8 +295,8 @@ impl GatedAttention {
         };
 
         let groups = nh / nkv;
-        let k = repeat_kv(&k, groups)?;
-        let v = repeat_kv(&v, groups)?;
+        let k = repeat_kv_bshd(&k, groups)?;
+        let v = repeat_kv_bshd(&v, groups)?;
 
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;

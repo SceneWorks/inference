@@ -13,9 +13,10 @@
 //!   SAM3_GEOMETRY_E2E_FIXTURE=scripts/spikes/sam3_oracle/geometry_e2e_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration geometry_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{iou, max_abs_diff};
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::{Sam3GeometryConfig, Sam3GeometryEncoder, Sam3ImageSegmenter};
-use mlx_rs::ops::{abs, max, multiply, subtract, sum};
+use mlx_rs::ops::{multiply, sum};
 use mlx_rs::Array;
 
 fn f32_of(a: &Array) -> f32 {
@@ -27,25 +28,6 @@ fn cosine(a: &Array, b: &Array) -> f32 {
     let na = f32_of(&sum(multiply(a, a).unwrap(), None).unwrap()).sqrt();
     let nb = f32_of(&sum(multiply(b, b).unwrap(), None).unwrap()).sqrt();
     dot / (na * nb)
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    f32_of(&max(abs(subtract(a, b).unwrap()).unwrap(), None).unwrap())
-}
-
-/// IoU of two binary `[h, w]` masks (uint8 0/1).
-fn iou(a: &Array, b: &Array) -> f32 {
-    let af = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-    let bf = b.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-    let inter = f32_of(&sum(multiply(&af, &bf).unwrap(), None).unwrap());
-    let sa = f32_of(&sum(&af, None).unwrap());
-    let sb = f32_of(&sum(&bf, None).unwrap());
-    let union = sa + sb - inter;
-    if union <= 0.0 {
-        1.0
-    } else {
-        inter / union
-    }
 }
 
 #[test]

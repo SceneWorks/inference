@@ -52,6 +52,7 @@
 use mlx_rs::ops::{add, divide, mean_axes, multiply, subtract, var_axes};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::scalar;
 use mlx_gen::gen_core::ltx_checkpoint::{
     upsampled_latent_frames, LatentUpsamplerConfig, LatentUpsamplerMode, LtxCheckpointMetadata,
 };
@@ -63,10 +64,6 @@ use mlx_gen::{Error, Result};
 const GROUPS: i32 = 32;
 /// `GroupNorm3d` epsilon (`GroupNorm3d.__init__(eps=1e-5)`).
 const NORM_EPS: f32 = 1e-5;
-
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
 
 /// A bias-carrying conv whose on-disk weight is **PyTorch** layout; transposed to MLX `[O,…,I]` at
 /// load. Stride 1, padding 1 (kernel 3, "same"), matching every conv in the upsampler.

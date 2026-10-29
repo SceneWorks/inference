@@ -18,10 +18,12 @@
 //! architecture-specific `MROPE_SECTION` / `mrope_section` value and pass it in.
 
 use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::rotary_emb::rope;
 
 /// HF half-split RoPE table (θ over `head_dim`), built once for the max sequence length (f32). The
 /// plain 1-D RoPE the **text** path uses (Qwen3-VL's MRoPE sections all index the same sequential text
 /// position when there are no image tokens).
+#[derive(Debug, Clone)]
 pub struct Rotary {
     cos: Tensor,
     sin: Tensor,
@@ -46,24 +48,64 @@ impl Rotary {
         })
     }
 
+    /// Wrap tables a tower builds its own way (a different `inv_freq` precision, YaRN scaling, …) so it
+    /// shares [`Self::apply`] / [`Self::apply_at`] (sc-27284). `cos`/`sin` are `[max_seq, head_dim/2]`.
+    pub fn from_tables(cos: Tensor, sin: Tensor) -> Self {
+        Self { cos, sin }
+    }
+
     /// The plain 1-D RoPE `(cos, sin)` `[seq, head_dim/2]` for the text path (sequential positions).
     pub fn text(&self, seq: usize) -> Result<(Tensor, Tensor)> {
         Ok((self.cos.narrow(0, 0, seq)?, self.sin.narrow(0, 0, seq)?))
     }
+
+    /// Cast both tables to `dtype` (computed in f32 first, so the cast is the only rounding) — for a
+    /// tower whose rope kernel wants the compute dtype throughout (sc-27284).
+    pub fn to_dtype(&self, dtype: DType) -> Result<Self> {
+        Ok(Self {
+            cos: self.cos.to_dtype(dtype)?,
+            sin: self.sin.to_dtype(dtype)?,
+        })
+    }
+
+    /// Move both tables to `device` (a CPU-staged quantize path).
+    pub fn to_device(&self, device: &Device) -> Result<Self> {
+        Ok(Self {
+            cos: self.cos.to_device(device)?,
+            sin: self.sin.to_device(device)?,
+        })
+    }
+
+    /// The device the tables live on.
+    pub fn device(&self) -> &Device {
+        self.cos.device()
+    }
+
+    /// Rows of the precomputed tables — the max sequence length this table was sized for.
+    pub fn max_seq(&self) -> Result<usize> {
+        self.cos.dim(0)
+    }
+
+    /// Rotate `q`/`k` (`[B, H, S, D]`) at sequential positions `0..S` with candle's half-split `rope`.
+    pub fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.apply_at(q, k, 0)
+    }
+
+    /// [`Self::apply`] at positions `offset..offset + S` (an incremental decode step).
+    pub fn apply_at(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
+        let seq = q.dim(2)?;
+        let cos = self.cos.narrow(0, offset, seq)?;
+        let sin = self.sin.narrow(0, offset, seq)?;
+        Ok((
+            rope(&q.contiguous()?, &cos, &sin)?,
+            rope(&k.contiguous()?, &cos, &sin)?,
+        ))
+    }
 }
 
-/// Repeat each kv head `groups` times along the head axis (`[B,nkv,S,D] → [B,nkv·groups,S,D]`) — the GQA
-/// key/value broadcast the Qwen3-VL text tower's attention needs (32 query / 8 kv heads).
-pub fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let (b, nkv, s, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, nkv, groups, s, d))?
-        .contiguous()?
-        .reshape((b, nkv * groups, s, d))
-}
+/// The GQA key/value broadcast the Qwen3-VL text tower's attention needs (32 query / 8 kv heads),
+/// re-exported from its shared home in [`crate::attention`] (sc-27283).
+pub use crate::attention::repeat_kv;
 
 /// Slice `[1, s, d]` along the sequence axis (axis 1) to `[start, end)`.
 pub fn slice_seq(x: &Tensor, start: usize, end: usize) -> Result<Tensor> {

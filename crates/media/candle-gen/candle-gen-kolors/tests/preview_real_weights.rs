@@ -28,12 +28,16 @@
 //! still reports SUCCESS, and a skipped gate is indistinguishable in a log from one that proved
 //! something. Asking for `--ignored` is already the opt-in.
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress,
-    WeightsSource,
+    GenerationRequest, Image, LoadSpec, PreviewFrame, Progress, WeightsSource,
+};
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
+use candle_gen::testkit::{
+    collecting_sink, correlation, downsample_nearest, downsample_nearest_raw, env_path_opt,
+    mean_abs_delta, one_image, preview_strip_sheet, required_path,
 };
 
 const PROMPT: &str =
@@ -52,31 +56,9 @@ const SEED: u64 = 16954;
 const SDXL_FAMILY_VAE_SHA256: &str =
     "bcb60880a46b63dea58e9bc591abe15f8350bde47b405f9c38f4be70c6161e68";
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var(name).ok().map(PathBuf::from)
-}
-
-/// An input a row cannot run without. Missing means **fail**, not skip.
-fn required_path(name: &str) -> PathBuf {
-    env_path(name).unwrap_or_else(|| {
-        panic!(
-            "{name} must be set for this row — skipping it would report success while proving \
-             nothing"
-        )
-    })
-}
-
 fn artifact_dir() -> PathBuf {
-    env_path("KOLORS_PREVIEW_ARTIFACT_DIR")
+    env_path_opt("KOLORS_PREVIEW_ARTIFACT_DIR")
         .unwrap_or_else(|| std::env::temp_dir().join("kolors_preview_sc16954"))
-}
-
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash the file");
-    format!("{:x}", hasher.finalize())
 }
 
 // ── Provenance ────────────────────────────────────────────────────────────────────────────────────
@@ -101,7 +83,7 @@ fn the_kolors_vae_is_the_sdxl_fit_vae() {
 
     let path = &files[0];
     let size = std::fs::metadata(path).expect("stat the vae").len();
-    let digest = sha256_of(path);
+    let digest = sha256_file(path);
     eprintln!("  kolors vae: {digest}  {size} bytes  {}", path.display());
     assert_eq!(size, 167_335_342, "kolors VAE size moved");
     assert_eq!(
@@ -121,95 +103,15 @@ fn the_kolors_vae_is_the_sdxl_fit_vae() {
 
 // ── Frame analysis helpers (same measurements as the SDXL harness) ────────────────────────────────
 
-fn mean_abs_delta(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len(), "compared buffers must match in length");
-    a.iter()
-        .zip(b)
-        .map(|(&x, &y)| (x as f64 - y as f64).abs())
-        .sum::<f64>()
-        / a.len() as f64
-}
-
-fn correlation(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len());
-    let n = a.len() as f64;
-    let (ma, mb) = (
-        a.iter().map(|&v| v as f64).sum::<f64>() / n,
-        b.iter().map(|&v| v as f64).sum::<f64>() / n,
-    );
-    let mut num = 0.0;
-    let (mut da, mut db) = (0.0, 0.0);
-    for (&x, &y) in a.iter().zip(b) {
-        let (dx, dy) = (x as f64 - ma, y as f64 - mb);
-        num += dx * dy;
-        da += dx * dx;
-        db += dy * dy;
-    }
-    if da == 0.0 || db == 0.0 {
-        return 0.0;
-    }
-    num / (da.sqrt() * db.sqrt())
-}
-
-fn downsample_raw(pixels: &[u8], src_w: u32, src_h: u32, w: u32, h: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity((w * h * 3) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let sx = (x as u64 * src_w as u64 / w as u64) as u32;
-            let sy = (y as u64 * src_h as u64 / h as u64) as u32;
-            let idx = ((sy * src_w + sx) * 3) as usize;
-            out.extend_from_slice(&pixels[idx..idx + 3]);
-        }
-    }
-    out
-}
-
-fn downsample(img: &Image, w: u32, h: u32) -> Vec<u8> {
-    downsample_raw(&img.pixels, img.width, img.height, w, h)
-}
-
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(name);
-    let buf: image::RgbImage = image::ImageBuffer::from_raw(width, height, pixels.to_vec())
-        .expect("frame buffer matches its dimensions");
-    buf.save(&path)
-        .unwrap_or_else(|e| panic!("save {path:?}: {e}"));
+    let path = artifact_dir().join(name);
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  wrote {}", path.display());
 }
 
 fn save_strip(frames: &[PreviewFrame], name: &str) {
-    assert!(!frames.is_empty(), "an empty strip cannot be written");
-    let (fw, fh) = (frames[0].image.width, frames[0].image.height);
-    let total_w = fw * frames.len() as u32;
-    let mut sheet = vec![0u8; (total_w * fh * 3) as usize];
-    for (i, frame) in frames.iter().enumerate() {
-        let x0 = i as u32 * fw;
-        for y in 0..fh {
-            for x in 0..fw {
-                let src = ((y * fw + x) * 3) as usize;
-                let dst = (((y * total_w) + x0 + x) * 3) as usize;
-                sheet[dst..dst + 3].copy_from_slice(&frame.image.pixels[src..src + 3]);
-            }
-        }
-    }
-    save_png(&sheet, total_w, fh, name);
-}
-
-fn one_image(out: GenerationOutput) -> Image {
-    let GenerationOutput::Images(mut images) = out else {
-        panic!("expected GenerationOutput::Images");
-    };
-    assert_eq!(images.len(), 1, "these rows render a single image");
-    images.pop().expect("one image")
-}
-
-fn collecting_sink() -> (PreviewSink, Arc<Mutex<Vec<PreviewFrame>>>) {
-    let frames = Arc::new(Mutex::new(Vec::new()));
-    let captured = Arc::clone(&frames);
-    let sink = PreviewSink::new(move |frame| candle_gen::lock_recover(&captured).push(frame));
-    (sink, frames)
+    let (sheet, width, height) = preview_strip_sheet(frames);
+    save_png(&sheet, width, height, name);
 }
 
 fn assert_the_strip_converges(
@@ -255,7 +157,7 @@ fn assert_the_strip_converges(
     }
 
     let (lw, lh) = (width / 8, height / 8);
-    let target = downsample(final_image, lw, lh);
+    let target = downsample_nearest(final_image, lw, lh);
     let distances: Vec<f64> = frames
         .iter()
         .map(|f| mean_abs_delta(&f.image.pixels, &target))
@@ -277,12 +179,12 @@ fn assert_the_strip_converges(
     );
 
     let coarse = 16u32;
-    let coarse_target = downsample(final_image, coarse, coarse);
+    let coarse_target = downsample_nearest(final_image, coarse, coarse);
     let correlations: Vec<f64> = frames
         .iter()
         .map(|f| {
             correlation(
-                &downsample_raw(
+                &downsample_nearest_raw(
                     &f.image.pixels,
                     f.image.width,
                     f.image.height,

@@ -157,7 +157,7 @@ pub enum LoraCoverage {
 
 /// The actual load policy, also frozen into configured-overlay semantic facts.
 pub(crate) fn configured_lora_coverage() -> LoraCoverage {
-    if std::env::var_os("SDXL_LORA_VENDORED").is_some() {
+    if mlx_gen::gen_core::env_flag("SDXL_LORA_VENDORED") {
         LoraCoverage::Vendored
     } else {
         LoraCoverage::Complete

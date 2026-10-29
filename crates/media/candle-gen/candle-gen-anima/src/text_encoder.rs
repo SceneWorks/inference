@@ -25,22 +25,11 @@ use candle_gen::Result;
 use crate::config::Qwen3Config;
 use crate::nn::{apply_rope_half, lin, rms_norm, sdpa};
 use crate::rope::text_rope;
+use candle_gen::attention::repeat_kv;
 
 /// Additive causal-mask fill (a large finite negative — avoids `-inf` propagation through the softmax
 /// kernel; every causal row keeps its on-diagonal 0, so no row is fully masked).
 const MASK_NEG: f32 = -1e30;
-
-/// Expand `[b, hkv, s, d]` → `[b, hkv·groups, s, d]` (GQA): repeat each KV head `groups` times
-/// consecutively so query head `i` reads KV head `i / groups`.
-fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let (b, hkv, s, d) = x.dims4()?;
-    Ok(x.unsqueeze(2)?
-        .broadcast_as((b, hkv, groups, s, d))?
-        .reshape((b, hkv * groups, s, d))?)
-}
 
 /// One Qwen3 decoder layer: pre-RMSNorm GQA self-attn + pre-RMSNorm SwiGLU MLP (both residual).
 struct DecoderLayer {

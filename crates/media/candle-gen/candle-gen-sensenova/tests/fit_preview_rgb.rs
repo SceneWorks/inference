@@ -50,13 +50,14 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::gen_core::{CancelFlag, Image, PreviewFrame, PreviewSink, Progress};
+use candle_gen::gen_core::{CancelFlag, Image, PreviewSink, Progress};
 use candle_gen::preview::PreviewHook;
+use candle_gen::testkit::collecting_sink;
+use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::sha256_file;
 use candle_gen_sensenova::{load_understanding_for_diagnostics, tensor_to_image, T2iOptions};
-use sha2::{Digest, Sha256};
 
 /// Four diverse prompt/seed renders whose pooled pixels determine the coefficients.
 const FIT_CORPUS: [(&str, u64); 4] = [
@@ -147,13 +148,6 @@ fn env_f32(name: &str, fallback: f32) -> f32 {
 
 fn artifact_dir() -> PathBuf {
     required_path("SENSENOVA_PREVIEW_ARTIFACT_DIR")
-}
-
-fn sha256_of(path: &Path) -> String {
-    let mut file = std::fs::File::open(path).expect("open for hashing");
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).expect("hash");
-    format!("{:x}", hasher.finalize())
 }
 
 /// The `*.safetensors` shards under a SenseNova snapshot tier, excluding the optional distill LoRA —
@@ -409,11 +403,8 @@ fn analytic_projection(pair: &Pair, coef: &[[f64; 3]; DIM]) -> Vec<u8> {
 }
 
 fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let dir = artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create the artifact dir");
-    let path = dir.join(format!("{name}.png"));
-    image::save_buffer(&path, pixels, width, height, image::ExtendedColorType::Rgb8)
-        .expect("save a PNG");
+    let path = artifact_dir().join(format!("{name}.png"));
+    save_rgb8_png(&path, pixels, width, height);
     eprintln!("  saved {}", path.display());
 }
 
@@ -421,13 +412,6 @@ fn inert_hook(sink: &PreviewSink) -> PreviewHook<'_> {
     PreviewHook::new(sink, |_: &Tensor| {
         panic!("an inert preview sink must not invoke projection")
     })
-}
-
-fn collecting_sink() -> (PreviewSink, Arc<Mutex<Vec<PreviewFrame>>>) {
-    let frames = Arc::new(Mutex::new(Vec::new()));
-    let captured = Arc::clone(&frames);
-    let sink = PreviewSink::new(move |frame| candle_gen::lock_recover(&captured).push(frame));
-    (sink, frames)
 }
 
 /// **SenseNova-U1 ships no autoencoder** — the structural fact that makes this a Tier 2 fit rather
@@ -494,7 +478,7 @@ fn the_snapshot_ships_no_autoencoder() {
             "provenance: {} — {} bytes, SHA-256 {}",
             file.display(),
             std::fs::metadata(file).expect("metadata").len(),
-            sha256_of(file)
+            sha256_file(file)
         );
     }
 }

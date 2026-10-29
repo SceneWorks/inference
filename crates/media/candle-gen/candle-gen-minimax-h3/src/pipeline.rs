@@ -70,7 +70,7 @@ use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
 pub const SPATIAL_STRIDE: u32 = candle_gen::gen_core::h3_memory::SPATIAL_STRIDE;
 
 /// Short edge the released checkpoint generates on by default.
-pub const CANVAS_SHORT_EDGE: u32 = 768;
+pub const CANVAS_SHORT_EDGE: u32 = candle_gen::gen_core::h3_memory::CANVAS_SHORT_EDGE;
 
 /// Area budget of the released checkpoint's canvas, `768 · 1344` = 1 032 192 px.
 ///

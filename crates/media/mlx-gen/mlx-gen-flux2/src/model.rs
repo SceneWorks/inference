@@ -21,7 +21,7 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, run_flow_sampler_with_latent_hook, CancelFlag, Error, GenerationOutput,
     GenerationRequest, Generator, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
-    Precision, Progress, Residency, Result, TimestepConvention, WeightsSource,
+    Precision, Progress, Residency, Result, SamplerRun, TimestepConvention, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
@@ -585,6 +585,8 @@ pub struct Flux2 {
 
 impl Flux2 {
     /// Construct a weightless instance for validation tests (no tokenizer, loader closures that error).
+    /// In-crate tests only: unlike `Flux1::new_for_tests`, no other crate consumes this fixture.
+    #[cfg(test)]
     pub fn new_for_tests(variant: Flux2Variant) -> Self {
         let loaded_spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         Self {
@@ -1063,9 +1065,7 @@ impl Generator for Flux2 {
 }
 
 fn request_stages_residency(default: bool, req: &GenerationRequest) -> bool {
-    req.memory
-        .as_ref()
-        .map_or(default, |memory| memory.stage_residency)
+    mlx_gen::request_scope::requested_stage_residency(req.memory, default)
 }
 
 /// Bind the requested block execution to the admitted load shape before any component work.
@@ -1483,13 +1483,15 @@ impl Flux2 {
                     mlx_gen::sc20686::mark_denoise();
                     let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
                     let final_latents = run_flow_sampler_with_latent_hook(
-                        sampler_name,
+                        SamplerRun {
+                            sampler_name,
+                            sigmas: denoise_sigmas,
+                            seed,
+                            cancel: &req.cancel,
+                            on_progress,
+                        },
                         TimestepConvention::Sigma,
-                        denoise_sigmas,
                         latents,
-                        seed,
-                        &req.cancel,
-                        on_progress,
                         |latents, sigma| {
                             crate::preview::emit_flux_preview(
                                 &req.preview,
@@ -4321,8 +4323,10 @@ mod tests {
         assert_eq!(actual, expected);
 
         let runtime = [
-            include_str!("text_encoder/attention.rs"),
-            include_str!("text_encoder/mlp.rs"),
+            // The decoder block's projections are constructed by the shared core block
+            // (sc-27326), which this crate's layer loads through its `lin`.
+            include_str!("../../src/text_decoder.rs"),
+            include_str!("text_encoder/layer.rs"),
             include_str!("text_encoder/encoder.rs"),
             include_str!("text_encoder/mod.rs"),
         ]

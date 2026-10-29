@@ -93,13 +93,7 @@ struct TransformerAssets {
 }
 
 fn checked_sum(label: &str, values: impl IntoIterator<Item = u64>) -> gen_core::Result<u64> {
-    values.into_iter().try_fold(0_u64, |total, value| {
-        total.checked_add(value).ok_or_else(|| {
-            gen_core::Error::Msg(format!(
-                "{MODEL_ID}: {label} resident byte total overflows u64"
-            ))
-        })
-    })
+    gen_core::checked_byte_total(MODEL_ID, &format!("{label} resident"), values)
 }
 
 fn tensor_elements(
@@ -615,13 +609,7 @@ const fn policy_label(policy: OffloadPolicy) -> &'static str {
 /// every selector the registry may hand it; [`production_calibration_fingerprint`] refuses the
 /// tiers this family does not ship rather than relying on this label to be partial.
 const fn tier_label(quant: Option<Quant>) -> &'static str {
-    match quant {
-        None => "bf16",
-        Some(Quant::Q4) => "q4",
-        Some(Quant::Q8) => "q8",
-        Some(Quant::Nvfp4) => "nvfp4",
-        Some(Quant::Fp8Rowwise) => "fp8r",
-    }
+    Quant::tier_label(quant)
 }
 
 /// **The production calibration TABLE, keyed on `(tier, offload_policy)` — not the binding.**
@@ -932,27 +920,13 @@ fn registered_tier(
 }
 
 fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<()> {
-    let edge = edge.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires a tile-edge cap"
-        ))
-    })?;
-    let overlap = overlap.ok_or_else(|| {
-        gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires a tile overlap"
-        ))
-    })?;
-    if !DECODE_TILE_EDGES.contains(&edge) {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: decode tile-edge cap {edge} is outside the production domain {DECODE_TILE_EDGES:?}"
-        )));
-    }
-    if overlap != DECODE_OVERLAP {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: decode overlap {overlap} is not the production overlap {DECODE_OVERLAP}"
-        )));
-    }
-    Ok(())
+    gen_core::validate_bounded_decode_params(
+        MODEL_ID,
+        DECODE_TILE_EDGES,
+        DECODE_OVERLAP,
+        edge,
+        overlap,
+    )
 }
 
 pub(crate) fn safety_check(
@@ -1013,9 +987,7 @@ pub(crate) fn registered_safety_check(
 ) -> MemorySafetyDecision {
     match registered_tier(spec, contract) {
         Ok(tier) => safety_check(contract, tier, context),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 
@@ -1097,35 +1069,7 @@ impl MemoryRequestScope for WanMemoryRequestScope {
         self.inner.configure_request(request)
     }
 
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.enter_phase(phase)
-    }
-
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.leave_phase(phase)
-    }
-
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        geometry: gen_core::MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.inner.configure_decode(tile_edge, overlap, geometry)
-    }
-
-    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
-        self.inner.configure_attention(chunk_size)
-    }
-
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> gen_core::Result<()> {
-        self.inner
-            .materialize_transformer_window(first_block, block_count)
-    }
+    candle_gen::gen_core::delegate_memory_request_scope!(inner);
 
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         self.inner.finish(outcome)

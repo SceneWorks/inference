@@ -8,22 +8,15 @@
 //!
 //! Run: `cargo test -p mlx-gen-sensenova --test integration model_realweight:: -- --ignored --nocapture`
 
-use std::path::PathBuf;
-
+use mlx_gen::testing::require_env_path;
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
 
-fn snapshot_dir() -> PathBuf {
-    PathBuf::from(std::env::var("SENSENOVA_SNAPSHOT").expect(
-        "set SENSENOVA_SNAPSHOT to the SenseNova-U1-8B-MoT snapshot dir; inference never self-fetches or derives a cache location (epic 13657)",
-    ))
-}
-
 #[test]
 #[ignore = "needs the local 35GB checkpoint; run with --ignored"]
 fn registry_load_and_generate() {
-    let snap = snapshot_dir();
+    let snap = require_env_path("SENSENOVA_SNAPSHOT", "the SenseNova-U1-8B-MoT snapshot dir");
     if !snap.exists() {
         eprintln!("skipping: snapshot missing at {}", snap.display());
         crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in registry_load_and_generate; see preceding skip diagnostic");

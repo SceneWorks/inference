@@ -708,7 +708,6 @@ impl MMAttention {
         let txt_mean = (txt_acc * (1.0 / nwin as f64))?.reshape((lt, h * hd))?;
         let txt_out = self.out_txt.forward(&txt_mean)?.reshape((1, lt, txt_dim))?;
 
-        let _ = self.window; // window used via cache; kept for parity with the reference config
         Ok((vid_out, txt_out))
     }
 
@@ -1024,17 +1023,9 @@ impl Seedvr2Transformer {
 mod quant_tests {
     use super::*;
 
-    /// Cosine similarity of two flattened tensors.
+    /// Cosine similarity over all elements (f64), the quant-parity metric.
     fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (p, r) in a.iter().zip(b.iter()) {
-            dot += (*p as f64) * (*r as f64);
-            na += (*p as f64) * (*p as f64);
-            nb += (*r as f64) * (*r as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
+        candle_gen::testkit::tensor_cosine(a, b) as f32
     }
 
     /// A `[out,in]` `Linear` with `in_dim` a multiple of the 32-wide block quantizes and forwards

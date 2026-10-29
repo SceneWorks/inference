@@ -62,11 +62,5 @@ pub(crate) fn load_weight(w: &Weights, prefix: &str, dtype: Dtype) -> Result<Arr
     Ok(w.require(&format!("{prefix}.weight"))?.as_dtype(dtype)?)
 }
 
-/// Join a module prefix with a leaf name.
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;

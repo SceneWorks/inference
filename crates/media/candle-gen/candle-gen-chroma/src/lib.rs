@@ -135,9 +135,7 @@ impl Generator for ChromaGenerator {
         if let Some(receipt) = &self.load_receipt {
             if let Err(error) = receipt.ensure_unchanged() {
                 self.memory_admission.clear_approval();
-                return gen_core::MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                };
+                return gen_core::MemorySafetyDecision::rejected(error);
             }
         }
         if context.use_pid
@@ -160,17 +158,12 @@ impl Generator for ChromaGenerator {
             context,
             self.load_receipt.as_ref().and_then(|receipt| receipt.tier),
         ) {
-            Ok(()) => match self.memory_admission.approve(context) {
-                Ok(()) => gen_core::MemorySafetyDecision::Accept,
-                Err(error) => gen_core::MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                },
-            },
+            Ok(()) => gen_core::MemorySafetyDecision::from_validation(
+                self.memory_admission.approve(context),
+            ),
             Err(error) => {
                 self.memory_admission.clear_approval();
-                gen_core::MemorySafetyDecision::Reject {
-                    reason: error.to_string(),
-                }
+                gen_core::MemorySafetyDecision::rejected(error)
             }
         }
     }

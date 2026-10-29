@@ -16,7 +16,7 @@ use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
-    TrainingRequest,
+    TrainingReport, TrainingRequest,
 };
 use candle_gen::gen_core::{
     self, safetensors_file_metadata, safetensors_path_tensor_headers, CancelFlag, Image, LoadSpec,
@@ -1825,6 +1825,17 @@ impl Trainer for LtxTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.train_with_report(req, on_progress)
+            .map(|report| report.output)
+    }
+
+    /// The primary entry point (sc-27451): a preview sample that fails to render is reported as a
+    /// [`gen_core::train::PREVIEW_SAMPLE_FAILED`] warning instead of only on stderr.
+    fn train_with_report(
+        &mut self,
+        req: &TrainingRequest,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         if matches!(self.route, TrainingRoute::Ltx25 { .. }) {
@@ -1833,7 +1844,9 @@ impl Trainer for LtxTrainer {
         }
         gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
-        run_flow_match_training(self, req, on_progress).map_err(Into::into)
+        let mut warnings = Vec::new();
+        let output = run_flow_match_training(self, req, on_progress, &mut warnings)?;
+        Ok(TrainingReport { output, warnings })
     }
 }
 

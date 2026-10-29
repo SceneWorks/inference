@@ -24,6 +24,7 @@ use mlx_gen::{
     TrainingRequest, WeightsSource,
 };
 
+use mlx_gen::testing::save_png;
 use mlx_gen_anima::config::Variant;
 use mlx_gen_anima::pipeline::{AnimaPipeline, GenOptions};
 use mlx_gen_anima::training::load_trainer_base;
@@ -234,12 +235,6 @@ fn generate(
     pipeline
         .generate(prompt, "", Variant::Base, &opts, &cancel, &mut noop)
         .expect("generate")
-}
-
-fn save_png(img: &mlx_gen::media::Image, path: &PathBuf) {
-    let buf =
-        image::RgbImage::from_raw(img.width, img.height, img.pixels.clone()).expect("rgb buffer");
-    buf.save(path).expect("save png");
 }
 
 /// Mean absolute per-channel pixel difference (0..255) between two equal-size RGB images.
@@ -745,15 +740,15 @@ fn train_emits_in_training_previews() {
     };
     let (first, last) = (p0(first_step), p0(last_step));
     let (mf, ml) = (magenta_score(first), magenta_score(last));
-    save_png(first, &out_dir().join("preview_first.png"));
-    save_png(last, &out_dir().join("preview_last.png"));
+    save_png(first, out_dir().join("preview_first.png"));
+    save_png(last, out_dir().join("preview_last.png"));
 
     let base =
         AnimaPipeline::from_source(&WeightsSource::Dir(split_files().unwrap()), Variant::Base)
             .expect("base pipeline");
     let img_base = generate(&base, &prompt0, 1234, cfg_preview_steps());
     let mb = magenta_score(&img_base);
-    save_png(&img_base, &out_dir().join("preview_base.png"));
+    save_png(&img_base, out_dir().join("preview_base.png"));
 
     eprintln!(
         "[sc-10641] {} previews across {} cadences; prompt0 magenta: base {mb:.1}, first(step {first_step}) {mf:.1} → last(step {last_step}) {ml:.1}",

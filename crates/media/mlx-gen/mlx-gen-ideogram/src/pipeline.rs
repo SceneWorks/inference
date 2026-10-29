@@ -37,7 +37,7 @@ use crate::config::{Ideogram4DitConfig, MAX_TEXT_TOKENS};
 use crate::loader::{
     load_text_encoder, load_tokenizer, load_transformer, load_unconditional_transformer, load_vae,
 };
-use crate::scheduler::{make_step_intervals, LogitNormalSchedule};
+use crate::scheduler::{make_step_intervals, preset_mu_std, LogitNormalSchedule};
 use crate::text_encoder::Ideogram4TextEncoder;
 use crate::transformer::Ideogram4Transformer;
 
@@ -53,18 +53,6 @@ const OUTPUT_IMAGE_INDICATOR: i32 = 2;
 /// final `POLISH_STEPS` low-noise steps (the rest use the base guidance, typically 7.0).
 const POLISH_STEPS: usize = 3;
 const POLISH_GUIDANCE: f32 = 3.0;
-/// Ideogram 4 reference scheduler presets — `(mu, std)` are tuned PER step-count (the V4 presets),
-/// not constants: TURBO_12 `(0.5, 1.75)`, DEFAULT_20 `(0.0, 1.75)`, QUALITY_48 `(0.0, 1.5)`. An
-/// arbitrary step count picks the nearest preset. The earlier hardcoded `std=1.0` starved the
-/// low-noise detail steps and smeared every render.
-fn preset_mu_std(num_steps: usize) -> (f64, f64) {
-    match num_steps {
-        s if s <= 15 => (0.5, 1.75), // V4_TURBO_12
-        s if s <= 33 => (0.0, 1.75), // V4_DEFAULT_20
-        _ => (0.0, 1.5),             // V4_QUALITY_48
-    }
-}
-
 /// Edit (img2img / mask inpaint) conditioning prepared **once per request** (seed-independent) by
 /// [`Ideogram4Pipeline::prepare_edit`]: the BN-normalized packed source latent `[1, num_img, 128]`,
 /// an optional latent-grid inpaint mask `[1, num_img, 1]` (1 = repaint, 0 = keep), and the img2img

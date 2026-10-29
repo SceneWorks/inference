@@ -1939,7 +1939,7 @@ fn ios_pricing_equals_the_checked_quanta_on_the_production_path() {
     use crate::ios_pricing::{
         fold, ios_quantum_phase, price_quanta, snapshot_facts, AnimaPricingWork,
     };
-    use mlx_gen::gen_core::{MemoryNumericTier, MemoryStrategy};
+    use mlx_gen::gen_core::MemoryStrategy;
     use mlx_gen::ios_pricing::IosPhase;
     use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy};
 
@@ -1953,11 +1953,7 @@ fn ios_pricing_equals_the_checked_quanta_on_the_production_path() {
         .with_load_shape(LoadShape::DeferredMaterialization);
     let generator = crate::model::load_turbo(&spec).unwrap();
     let contract = crate::memory_strategy::memory_strategy_contract("anima_turbo", &spec).unwrap();
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let tier = mlx_gen::request_scope::loaded_tier(&spec);
     let prompt = "a silver-haired girl";
     let tokenizers = crate::tokenizer::AnimaTokenizers::load().unwrap();
     let qwen_tokens = tokenizers
@@ -2140,9 +2136,7 @@ fn reachable_sizes_prediction() {
         return;
     }
     use crate::ios_pricing::{fold, ios_pricing, price_quanta, snapshot_facts, AnimaPricingWork};
-    use mlx_gen::gen_core::{
-        MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryStrategy, MemoryStrategySupport,
-    };
+    use mlx_gen::gen_core::{MemoryGeometry, MemoryMode, MemoryStrategy, MemoryStrategySupport};
     use mlx_gen::ios_pricing::IosPricingRequest;
     use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, Quant};
 
@@ -2185,11 +2179,7 @@ fn reachable_sizes_prediction() {
             Some(&MemoryStrategySupport::Implemented),
             "rung 4 is implemented on the iOS load"
         );
-        let tier = MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        };
+        let tier = mlx_gen::request_scope::loaded_tier(&spec);
         let deepest = MemoryStrategy::ALL
             .into_iter()
             .filter(|s| {

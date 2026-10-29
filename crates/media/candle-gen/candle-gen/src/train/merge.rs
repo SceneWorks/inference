@@ -351,37 +351,18 @@ pub fn has_diff_patch_keys(path: &Path) -> Result<bool> {
 }
 
 /// Read only the safetensors header of `path` and return its tensor names (the JSON object keys, minus
-/// the reserved `__metadata__` entry). Never touches the tensor data bytes: reads the 8-byte
-/// little-endian header length, then exactly that many JSON bytes, then deserializes just that slice.
-/// Malformed / truncated files surface as a clean `Err` (no panic), consistent with the crate's error
-/// style.
+/// the reserved `__metadata__` entry). Never touches the tensor data bytes: the length prefix and the
+/// header go through gen-core's one bounded header reader
+/// ([`wmeta::read_safetensors_header`], capped at [`wmeta::MAX_SAFETENSORS_HEADER`]), then just that
+/// slice is deserialized. Malformed / truncated files surface as a clean `Err` (no panic).
 fn read_safetensors_header_keys(path: &Path) -> Result<Vec<String>> {
-    use std::io::Read;
-
-    // Cap mirrors safetensors' own `MAX_HEADER_SIZE` (100 MB) so a corrupt length can't request a
-    // multi-GB allocation.
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
-
     let mut file = std::fs::File::open(path)
         .map_err(|e| CandleError::Msg(format!("open adapter {}: {e}", path.display())))?;
-
-    let mut len_buf = [0u8; 8];
-    file.read_exact(&mut len_buf).map_err(|e| {
-        CandleError::Msg(format!(
-            "read adapter header length {}: {e}",
-            path.display()
-        ))
-    })?;
-    let header_len = u64::from_le_bytes(len_buf);
-    if header_len > MAX_HEADER_SIZE {
-        return Err(CandleError::Msg(format!(
-            "adapter {} header length {header_len} exceeds max {MAX_HEADER_SIZE}",
-            path.display()
-        )));
-    }
-
-    let mut header = vec![0u8; header_len as usize];
-    file.read_exact(&mut header)
+    let file_len = file
+        .metadata()
+        .map_err(|e| CandleError::Msg(format!("stat adapter {}: {e}", path.display())))?
+        .len();
+    let (header, _) = wmeta::read_safetensors_header(&mut file, file_len, path)
         .map_err(|e| CandleError::Msg(format!("read adapter header {}: {e}", path.display())))?;
 
     // The header is a JSON object mapping tensor name -> {dtype, shape, offsets}, plus an optional

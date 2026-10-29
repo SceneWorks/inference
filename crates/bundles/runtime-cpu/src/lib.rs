@@ -76,6 +76,21 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     }
 }
 
+/// Complete weights-free memory-contract surface for capability generation and reconciliation.
+/// On CPU the Candle catalog appends the same contract-only registrations the CUDA catalog owns,
+/// so this bundle exposes the surface exactly as `runtime-cuda` does (sc-27274).
+pub fn memory_contract_surface_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    #[cfg(feature = "media")]
+    {
+        candle_gen_catalog::memory_contract_surface_registry()
+    }
+
+    #[cfg(not(feature = "media"))]
+    {
+        gen_core::ProviderRegistryBuilder::new().build()
+    }
+}
+
 /// The bundle's explicit audio lane (sc-12835): the complete Candle audio catalog from the audio
 /// composition root, plus the lane's snapshot preparer carried **in the lane** so audio model
 /// snapshots are prepared through the same registry shape on every platform. Since sc-12836 the
@@ -141,6 +156,19 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "media")]
+    #[test]
+    fn every_registered_contract_surface_publishes_honest_facts() {
+        let registry = super::memory_contract_surface_registry()
+            .expect("the CPU bundle composes a contract-surface registry");
+        let coverage =
+            gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry, None);
+        assert!(
+            coverage.surfaces_checked > 0,
+            "the CPU bundle must publish contract surfaces for the facts walk to check"
+        );
+    }
+
     /// SceneWorks reaches SheetSage2 transcription only through this bundle (sc-23002): the crate is
     /// re-exported beside `candle_audio_yue2`, the whole recording → transcription → review → cover
     /// path is public with the signatures a consumer calls, the cover closure is authorized for

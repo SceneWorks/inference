@@ -80,13 +80,9 @@ pub fn assign_source_ids(n: usize, max_trained: f64, interpolate: bool) -> Vec<f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::testing::max_abs_diff;
     use mlx_gen_wan::{rope_apply, RopeTable};
     use mlx_rs::ops::sum;
-
-    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-        let d = subtract(a, b).unwrap().abs().unwrap();
-        mlx_rs::ops::max(&d, None).unwrap().item::<f32>()
-    }
 
     #[test]
     fn source_id_zero_is_identity() {

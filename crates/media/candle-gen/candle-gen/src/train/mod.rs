@@ -38,6 +38,7 @@ pub mod lora;
 /// merge-report machinery the provider crates' `adapters.rs` hand-copied around the [`lora`] delta
 /// reconstruction. Family-specific key→module resolution stays in each crate.
 pub mod merge;
+pub mod merge_dit;
 pub mod optim;
 // The shared decoded-x0 perceptual auxiliary-loss path (epic 2123 E8) — Candle twin of
 // `mlx_gen::train::perceptual`.

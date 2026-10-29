@@ -6,10 +6,10 @@
 //! and the finished-state guard for every lifecycle hook.
 
 use crate::gen_core::{
-    Error, GenerationMemory, GenerationRequest, LoadShape, MemoryDecodeArtifactIdentity,
+    Error, GenerationMemory, GenerationRequest, LoadShape, LoadSpec, MemoryDecodeArtifactIdentity,
     MemoryDecodeGeometryPolicy, MemoryDecodePolicyQuery, MemoryDecodeQualityDisposition,
-    MemoryGeometry, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemoryRunOutcome, MemoryStrategy, Result,
+    MemoryGeometry, MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, Result,
 };
 use std::cell::RefCell;
 
@@ -521,6 +521,244 @@ impl Drop for MlxRequestScopeCore {
             let _ = self.cleanup_pending();
         }
     }
+}
+
+/// The numeric tier a loader runs for `spec` when the provider declares no component precision
+/// floors: the spec's precision and load-time quantization, exactly as requested.
+///
+/// Shared by every provider whose tier is a pure function of the spec (sc-27257). That includes the
+/// convert-at-install families (Anima), whose worker records the packed on-disk tier in
+/// `LoadSpec::quantize` for the resolved directory, and the whole-pipeline-tier families (Qwen-Image
+/// 2.1, Iris, FLUX 3), for which no component is resident above the selected width. A provider that
+/// reads packed bits off disk itself, or publishes component floors, keeps its own resolver.
+pub fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    }
+}
+
+/// The rung-4 window cadence this request admits: the selected `transformer_window_size` when the
+/// contract engages [`MemoryStrategy::BoundedTransformerResidency`] for the selected strategy,
+/// otherwise `None`.
+///
+/// Contract-aware `engages` rather than an ordinal or equality compare, so a provider exclusion or
+/// realization prerequisite moves the window with it (sc-27325).
+pub fn selected_transformer_window(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> Option<u32> {
+    contract
+        .engages(
+            context.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .then_some(context.selection.parameters.transformer_window_size)
+        .flatten()
+}
+
+/// The one place a provider's refused safety decision becomes a typed error, shared with every
+/// backend. Providers whose scope is not built by [`MlxRequestScopeCore::begin`] call this first,
+/// before any other fallible admission step.
+pub use crate::gen_core::admit_memory_safety as admit;
+
+// ── Request-side resolution shared by the adopting providers (sc-27257) ──────────────────────────
+
+/// Rung 3's plan for a provider whose only bounded-attention lever is the constrained score budget.
+///
+/// An unselected request returns the exact historical unbounded, uncancellable plan; a request that
+/// chunks attention gets [`AttentionBudget::CONSTRAINED`](crate::attention::AttentionBudget) with
+/// the request's cancel flag threaded through, so a per-chunk `eval` observes a cancel promptly.
+pub fn constrained_attention_plan(req: &GenerationRequest) -> crate::attention::AttentionPlan<'_> {
+    match req.memory {
+        Some(memory) if memory.chunk_attention => crate::attention::AttentionPlan::budgeted(
+            crate::attention::AttentionBudget::CONSTRAINED,
+        )
+        .with_cancel(&req.cancel),
+        _ => crate::attention::AttentionPlan::UNBOUNDED,
+    }
+}
+
+/// Rung 1: whether a request's memory block stages component residency. `default_staged` is the
+/// load-time verdict a request that names nothing keeps.
+pub fn requested_stage_residency(memory: Option<GenerationMemory>, default_staged: bool) -> bool {
+    memory.map_or(default_staged, |memory| memory.stage_residency)
+}
+
+/// Rung 2: the spatial decode tiling a request's memory block selects, or `None` for the
+/// single-pass decode.
+///
+/// An unnamed edge or overlap takes the provider's published default. `validate` sees the resolved
+/// pair before a tiling is returned, so the provider's own domain check (or a cancel check) runs on
+/// the production render path and not only at admission.
+pub fn requested_decode_tiling(
+    memory: Option<GenerationMemory>,
+    default_edge: u32,
+    default_overlap: u32,
+    validate: impl FnOnce(u32, u32) -> crate::Result<()>,
+) -> crate::Result<Option<crate::TilingConfig>> {
+    let Some(memory) = memory.filter(|memory| memory.tile_vae_decode) else {
+        return Ok(None);
+    };
+    let edge = memory.decode_tile_edge.unwrap_or(default_edge);
+    let overlap = memory.decode_overlap.unwrap_or(default_overlap);
+    validate(edge, overlap)?;
+    Ok(Some(crate::TilingConfig::spatial_only(
+        edge as i32,
+        overlap as i32,
+    )))
+}
+
+/// Rung 4: the window cadence a request's memory block selects, or `None` for the resident stack.
+///
+/// A component outside `components`, or a cadence `validate_size` refuses, is a typed rejection
+/// rather than a silently narrowed (or silently *widened*) execution. An unnamed component takes
+/// `default_component`, an unnamed size `default_size`.
+pub fn requested_transformer_window(
+    provider_id: &str,
+    memory: Option<GenerationMemory>,
+    default_component: crate::gen_core::TransformerComponent,
+    components: &[crate::gen_core::TransformerComponent],
+    default_size: u32,
+    validate_size: impl FnOnce(u32) -> Result<()>,
+) -> crate::Result<Option<usize>> {
+    let Some(memory) = memory.filter(|memory| memory.stream_transformer_blocks) else {
+        return Ok(None);
+    };
+    let component = memory
+        .transformer_window_component
+        .unwrap_or(default_component);
+    if !components.contains(&component) {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id} implements only the {default_component:?} transformer window \
+             component, got {component:?}"
+        )));
+    }
+    let size = memory.transformer_window_size.unwrap_or(default_size);
+    validate_size(size).map_err(|error| {
+        crate::Error::Unsupported(format!(
+            "{provider_id} transformer window rejected: {error}"
+        ))
+    })?;
+    Ok(Some(size as usize))
+}
+
+/// Refuse a rung-4 cadence outside the calibrated `sizes` domain.
+///
+/// The shared `validate_selection` already refuses an out-of-domain window at admission, so this is
+/// defense in depth for the render path: *executing* at a wider cadence than the declared domain
+/// **under**-predicts peak, and a harness that hand-builds a [`GenerationMemory`] never crosses
+/// admission.
+pub fn validate_calibrated_window(provider_id: &str, size: u32, sizes: &[u32]) -> Result<()> {
+    if !sizes.contains(&size) {
+        return Err(Error::Unsupported(format!(
+            "{provider_id} transformer window {size} is outside the calibrated domain {sizes:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `contract` publishes sealed geometry-quality rows for rung 2, i.e. whether a bounded
+/// decode must go through [`geometry_decode_tiling`] rather than a route-blind domain.
+pub fn has_decode_geometry_table(contract: &MemoryProviderContract) -> bool {
+    contract
+        .capability(MemoryStrategy::BoundedDecode)
+        .is_some_and(|capability| !capability.parameters.decode_geometry_policies.is_empty())
+}
+
+/// Record the single-pass decode decision for a request that did not select rung 2.
+pub fn record_dense_decode() {
+    crate::diagnostics::record_geometry_decode_decision(
+        crate::diagnostics::DecodePolicyDisposition::Unchanged,
+        crate::diagnostics::DecodePathDisposition::Dense,
+        None,
+    );
+}
+
+/// Resolve a geometry-aware bounded decode: the exact tile pair `memory` names, authorized by the
+/// request-scoped production-latent quality row, recorded, and returned as a spatial tiling.
+///
+/// A missing edge or overlap is a typed refusal — a geometry row admits exact coordinates only.
+pub fn geometry_decode_tiling(
+    provider_id: &'static str,
+    req: &GenerationRequest,
+    memory: GenerationMemory,
+) -> crate::Result<crate::TilingConfig> {
+    let edge = memory.decode_tile_edge.ok_or_else(|| {
+        crate::Error::Unsupported(format!(
+            "{provider_id}: geometry-aware bounded decode requires an exact tile edge"
+        ))
+    })?;
+    let overlap = memory.decode_overlap.ok_or_else(|| {
+        crate::Error::Unsupported(format!(
+            "{provider_id}: geometry-aware bounded decode requires an exact overlap"
+        ))
+    })?;
+    let evidence = validate_geometry_decode_authorization(provider_id, req, edge, overlap)?;
+    crate::diagnostics::record_geometry_decode_decision(
+        crate::diagnostics::DecodePolicyDisposition::GeometryTiled,
+        crate::diagnostics::DecodePathDisposition::Tiled,
+        Some(&evidence),
+    );
+    Ok(crate::TilingConfig::spatial_only(
+        edge as i32,
+        overlap as i32,
+    ))
+}
+
+/// Record one whole-render overlay component that no published rung bounds, skipping a zero: the
+/// shared validator refuses a declared component with zero bytes, and a component that measured zero
+/// is not evidence of residency anyway.
+pub fn push_unbounded_overlay(
+    into: &mut Vec<crate::gen_core::MemoryResidentComponent>,
+    id: &str,
+    kind: crate::gen_core::MemoryComponentKind,
+    resident_bytes: u64,
+) {
+    if resident_bytes == 0 {
+        return;
+    }
+    into.push(crate::gen_core::MemoryResidentComponent {
+        id: id.to_owned(),
+        kind,
+        resident_bytes,
+        bounded_by: None,
+        residency: crate::gen_core::MemoryComponentResidency::WholeRender,
+    });
+}
+
+impl MlxRequestScopeCore {
+    /// The admission skeleton every adopting provider shares (sc-27257, sc-27325, sc-27341).
+    ///
+    /// `safety` is the provider's own safety-check decision, computed by the caller. A rejection
+    /// becomes the one typed [`Error::Unsupported`] (the decision carries an already-rendered
+    /// reason), and `configure` is not run. Otherwise `configure` builds the provider's
+    /// [`MlxRequestScopeConfig`] — its decode validator, stack depth and rung parameters stay
+    /// provider-owned — and the core is wrapped with `cleanup`.
+    ///
+    /// The ordering is the historical per-provider one: safety first, then any fallible
+    /// configuration (route tables, layer counts), then construction.
+    pub fn begin(
+        safety: MemorySafetyDecision,
+        cleanup: MlxScopeCleanup,
+        configure: impl FnOnce() -> Result<MlxRequestScopeConfig>,
+    ) -> Result<Self> {
+        admit(safety)?;
+        Ok(Self::with_cleanup(configure()?, cleanup))
+    }
+}
+
+/// [`MlxRequestScopeCore::begin`] for a provider whose request scope is the shared core itself, boxed
+/// in the shape `begin_memory_strategy_request` returns.
+pub fn begin_scope(
+    safety: MemorySafetyDecision,
+    cleanup: MlxScopeCleanup,
+    configure: impl FnOnce() -> Result<MlxRequestScopeConfig>,
+) -> Result<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    Ok(Some(Box::new(MlxRequestScopeCore::begin(
+        safety, cleanup, configure,
+    )?)))
 }
 
 #[cfg(test)]
@@ -1043,8 +1281,10 @@ mod tests {
                 "LtxConfig::video_only_defaults().num_layers",
             ),
         ] {
+            // `begin_scope` is the shared admission skeleton that constructs the core (sc-27257).
             assert!(
-                source.contains("request_scope::MlxRequestScopeCore::"),
+                source.contains("request_scope::MlxRequestScopeCore::")
+                    || source.contains("request_scope::begin_scope("),
                 "{name} bypassed MlxRequestScopeCore"
             );
             assert!(
@@ -1061,5 +1301,43 @@ mod tests {
                 "{name} stopped deriving its block count from model config"
             );
         }
+    }
+
+    #[test]
+    fn begin_refuses_a_rejected_safety_decision_without_building_a_config() {
+        let built = Cell::new(false);
+        let result = MlxRequestScopeCore::begin(
+            MemorySafetyDecision::Reject {
+                reason: "fixture: refused".into(),
+            },
+            MlxScopeCleanup::None,
+            || {
+                built.set(true);
+                Ok(config(20))
+            },
+        );
+        match result {
+            Err(Error::Unsupported(reason)) => assert_eq!(reason, "fixture: refused"),
+            Err(other) => panic!("expected the typed rejection, got {other:?}"),
+            Ok(_) => panic!("a rejected safety decision must not open a scope"),
+        }
+        assert!(!built.get(), "configuration must not run after a rejection");
+    }
+
+    #[test]
+    fn begin_scope_opens_the_configured_core_on_an_accepted_decision() {
+        let mut scope = begin_scope(MemorySafetyDecision::Accept, MlxScopeCleanup::None, || {
+            Ok(config(20))
+        })
+        .unwrap()
+        .expect("an accepted decision opens a scope");
+        let mut request = GenerationRequest {
+            width: 64,
+            height: 64,
+            count: 1,
+            ..Default::default()
+        };
+        scope.configure_request(&mut request).unwrap();
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
     }
 }

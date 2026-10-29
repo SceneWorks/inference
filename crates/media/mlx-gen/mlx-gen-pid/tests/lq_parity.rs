@@ -4,17 +4,9 @@
 //! upsample). Gates: (1) the LQ projection feature sets (conv stack + heads), (2) an isolated
 //! sigma-gate I/O (exp(log_alpha)·σ broadcast + sigmoid), (3) the full gate-injected forward.
 
+use mlx_gen::testing::{max_abs, max_abs_diff};
 use mlx_gen::weights::Weights;
 use mlx_gen_pid::{ConvPadding, PidConfig, PidNet};
-use mlx_rs::ops::{abs, max, subtract};
-use mlx_rs::Array;
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
-}
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    max_abs(&subtract(a, b).unwrap())
-}
 
 /// The tiny config baked into `dump_pid_lq.py`.
 fn tiny_cfg() -> PidConfig {

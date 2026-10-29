@@ -935,12 +935,7 @@ pub fn production_calibration_fingerprint(
     tier: Option<Quant>,
 ) -> Option<String> {
     let route = route_identity(provider_id).ok()?.provider.replace('_', "-");
-    let tier = match tier {
-        None => "bf16",
-        Some(Quant::Q4) => "q4",
-        Some(Quant::Q8) => "q8",
-        Some(_) => return None,
-    };
+    let tier = Quant::affine_tier_label(tier)?;
     Some(format!("{route}-{tier}-cuda-{CANDLE_LADDER_REVISION}"))
 }
 
@@ -1295,12 +1290,7 @@ pub(crate) fn safety_check(
     context: &MemoryRunContext,
     tier: Option<Quant>,
 ) -> MemorySafetyDecision {
-    match validate_context(provider_id, contract, context, tier) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(validate_context(provider_id, contract, context, tier))
 }
 
 pub(crate) fn registered_safety_check(
@@ -1310,9 +1300,7 @@ pub(crate) fn registered_safety_check(
 ) -> MemorySafetyDecision {
     match registered_tier_and_contract(spec, contract) {
         Ok(tier) => safety_check(&contract.provider_id, contract, context, tier),
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     }
 }
 
@@ -1598,35 +1586,7 @@ impl MemoryRequestScope for ChromaMemoryScope {
         self.admission.configure(self.token, request)
     }
 
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.enter_phase(phase)
-    }
-
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.leave_phase(phase)
-    }
-
-    fn configure_decode(
-        &mut self,
-        tile_edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.core.configure_decode(tile_edge, overlap, geometry)
-    }
-
-    fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
-        self.core.configure_attention(chunk_size)
-    }
-
-    fn materialize_transformer_window(
-        &mut self,
-        first_block: u32,
-        block_count: u32,
-    ) -> gen_core::Result<()> {
-        self.core
-            .materialize_transformer_window(first_block, block_count)
-    }
+    candle_gen::gen_core::delegate_memory_request_scope!(core);
 
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         self.core.finish(outcome)?;

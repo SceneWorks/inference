@@ -33,6 +33,7 @@ use std::sync::Mutex;
 use mlx_rs::ops::{add, concatenate_axis, divide, mean_axes, multiply, pad, subtract, sum_axes};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::array::{scalar, slice_range};
 use mlx_gen::nn::{conv3d, silu};
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{CancelFlag, Error, Result};
@@ -46,25 +47,15 @@ const DEC_NORM_EPS: f32 = 1e-8;
 /// Encoder `PixelNorm` epsilon (`get_norm_layer(..., eps=1e-6)`).
 const ENC_NORM_EPS: f32 = 1e-6;
 
-fn scalar(v: f32) -> Array {
-    Array::from_slice(&[v], &[1])
-}
-
 /// Load a conv weight+bias (`{prefix}.weight`, `{prefix}.bias`) cast to f32. The on-disk tensors are
 /// already MLX conv layout `[O, kt, kh, kw, I]`, so no transpose is needed.
 fn f32(w: &Weights, key: &str) -> Result<Array> {
     to_dtype(w.require(key)?, Dtype::Float32)
 }
 
-/// Slice `x` along `axis` to `[start, end)`.
-fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), axis)?)
-}
-
 /// Temporal slice `x[:, :, start:end]` (axis 2).
 fn slice_t(x: &Array, start: i32, end: i32) -> Result<Array> {
-    slice_axis(x, 2, start, end)
+    slice_range(x, 2, start, end)
 }
 
 /// `x / sqrt(mean(x² over C, axis 1, keepdims) + eps)` — LTX PixelNorm (no √C scale, no γ).
@@ -521,7 +512,7 @@ impl VideoEncoder {
 
 /// Channel slice `x[:, start:end]` (axis 1).
 fn slice_c(x: &Array, start: i32, end: i32) -> Result<Array> {
-    slice_axis(x, 1, start, end)
+    slice_range(x, 1, start, end)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -959,7 +950,7 @@ mod tests {
 
     /// `a[:, :, :, :, 0..width]` — a left-hand spatial crop on the W axis.
     fn crop_w(a: &Array, width: i32) -> Array {
-        contiguous(&slice_axis(a, 4, 0, width).unwrap()).unwrap()
+        contiguous(&slice_range(a, 4, 0, width).unwrap()).unwrap()
     }
 
     fn max_abs_delta(left: &Array, right: &Array) -> f32 {

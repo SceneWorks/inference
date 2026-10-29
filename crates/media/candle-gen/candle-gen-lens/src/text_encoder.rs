@@ -36,6 +36,7 @@
 //! Blackwell sm_120 at our pin (sc-7702). The quant is lossy (Q4 "coherent", Q8 near-lossless); both
 //! are parity-gated against the bf16 floor.
 
+use candle_gen::attention::repeat_kv;
 use candle_gen::candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_gen::candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_gen::candle_nn::{
@@ -43,6 +44,7 @@ use candle_gen::candle_nn::{
     Linear, Module, RmsNorm, VarBuilder,
 };
 use candle_gen::gen_core::CancelFlag;
+use candle_gen::grounding::Rotary;
 use candle_gen::quant as shared;
 use candle_gen::CandleError;
 use candle_llm::decode::{
@@ -129,12 +131,6 @@ impl Config {
 
 // --- RoPE (YaRN) ------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct RotaryEmbedding {
-    cos: Tensor,
-    sin: Tensor,
-}
-
 // YaRN inverse frequencies + attention scaling (mscale), matching HF `_compute_yarn_parameters`:
 // high-frequency dims keep the original frequency (extrapolate), low-frequency dims are interpolated
 // by 1/factor, with a linear ramp between correction dims derived from beta_fast/beta_slow.
@@ -168,52 +164,29 @@ fn yarn_inv_freq(cfg: &Config, s: &RopeScaling) -> (Vec<f32>, f32) {
     (inv_freq, attn_scale)
 }
 
-impl RotaryEmbedding {
-    fn new(cfg: &Config, dev: &Device, dtype: DType) -> Result<Self> {
-        let dim = cfg.head_dim;
-        let max_pos = cfg.max_position_embeddings;
-        let (inv_freq, attn_scale) = match &cfg.rope_scaling {
-            Some(s) if s.rope_type == "yarn" => yarn_inv_freq(cfg, s),
-            _ => (
-                (0..dim / 2)
-                    .map(|i| 1f32 / (cfg.rope_theta as f32).powf(2.0 * i as f32 / dim as f32))
-                    .collect::<Vec<f32>>(),
-                1f32,
-            ),
-        };
-        let inv_freq = Tensor::new(inv_freq, dev)?;
-        let t = Tensor::arange(0u32, max_pos as u32, dev)?
-            .to_dtype(DType::F32)?
-            .reshape((max_pos, 1))?;
-        let freqs = t.matmul(&inv_freq.reshape((1, dim / 2))?)?;
-        // Fold the YaRN attention scaling (mscale) into the cos/sin tables.
-        let cos = (freqs.cos()? * attn_scale as f64)?.to_dtype(dtype)?;
-        let sin = (freqs.sin()? * attn_scale as f64)?.to_dtype(dtype)?;
-        Ok(Self { cos, sin })
-    }
-
-    /// Apply rotary embeddings to `q`/`k` (`[b, heads, seq, head_dim]`) at absolute position 0
-    /// (encoder-only: a single full-sequence pass).
-    fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (_b, _h, seq_len, _d) = q.dims4()?;
-        self.apply_at(q, k, 0, seq_len)
-    }
-
-    /// Apply rotary embeddings to `q`/`k` (`[b, heads, t, head_dim]`) at **absolute** positions
-    /// `position..position+t` (the incremental-decode variant; `apply` is `position = 0`).
-    fn apply_at(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        position: usize,
-        t: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let cos = self.cos.narrow(0, position, t)?;
-        let sin = self.sin.narrow(0, position, t)?;
-        let q = candle_gen::candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k = candle_gen::candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q, k))
-    }
+/// The gpt-oss RoPE tables (YaRN frequencies with the attention scaling folded in), wrapped in the
+/// shared [`Rotary`] so the half-split application is shared (sc-27284).
+fn rotary_embedding(cfg: &Config, dev: &Device, dtype: DType) -> Result<Rotary> {
+    let dim = cfg.head_dim;
+    let max_pos = cfg.max_position_embeddings;
+    let (inv_freq, attn_scale) = match &cfg.rope_scaling {
+        Some(s) if s.rope_type == "yarn" => yarn_inv_freq(cfg, s),
+        _ => (
+            (0..dim / 2)
+                .map(|i| 1f32 / (cfg.rope_theta as f32).powf(2.0 * i as f32 / dim as f32))
+                .collect::<Vec<f32>>(),
+            1f32,
+        ),
+    };
+    let inv_freq = Tensor::new(inv_freq, dev)?;
+    let t = Tensor::arange(0u32, max_pos as u32, dev)?
+        .to_dtype(DType::F32)?
+        .reshape((max_pos, 1))?;
+    let freqs = t.matmul(&inv_freq.reshape((1, dim / 2))?)?;
+    // Fold the YaRN attention scaling (mscale) into the cos/sin tables.
+    let cos = (freqs.cos()? * attn_scale as f64)?.to_dtype(dtype)?;
+    let sin = (freqs.sin()? * attn_scale as f64)?.to_dtype(dtype)?;
+    Ok(Rotary::from_tables(cos, sin))
 }
 
 /// A per-layer key/value cache for incremental decode (sc-5118). Stores the **post-RoPE K** and **V**
@@ -292,7 +265,7 @@ impl Attention {
         })
     }
 
-    fn forward(&self, xs: &Tensor, rotary: &RotaryEmbedding, mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
         let (b, seq_len, _) = xs.dims3()?;
         let q = __model_proof_output!(self.q_proj.forward(xs))?;
         let k = __model_proof_output!(self.k_proj.forward(xs))?;
@@ -309,8 +282,8 @@ impl Attention {
             .transpose(1, 2)?;
 
         let (q, k) = rotary.apply(&q, &k)?;
-        let k = repeat_kv(k, self.num_heads / self.num_kv_heads)?;
-        let v = repeat_kv(v, self.num_heads / self.num_kv_heads)?;
+        let k = repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
+        let v = repeat_kv(&v, self.num_heads / self.num_kv_heads)?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
@@ -344,7 +317,7 @@ impl Attention {
     fn forward_cached(
         &self,
         xs: &Tensor,
-        rotary: &RotaryEmbedding,
+        rotary: &Rotary,
         position: usize,
         cache: &mut KvCache,
         sliding_window: Option<usize>,
@@ -361,7 +334,7 @@ impl Attention {
             .reshape((b, t, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let (q, k) = rotary.apply_at(&q, &k, position, t)?;
+        let (q, k) = rotary.apply_at(&q, &k, position)?;
         cache.append(&k, &v)?;
         // Decode (t == 1) on a sliding layer attends exactly the last `window` keys → evict the stale
         // key BEFORE attending. A prefill (t > 1) instead carries the sliding mask, then evicts AFTER
@@ -373,8 +346,8 @@ impl Attention {
             }
         }
         let n_rep = self.num_heads / self.num_kv_heads;
-        let k_all = repeat_kv(cache.k.clone().unwrap(), n_rep)?;
-        let v_all = repeat_kv(cache.v.clone().unwrap(), n_rep)?;
+        let k_all = repeat_kv(cache.k.as_ref().unwrap(), n_rep)?;
+        let v_all = repeat_kv(cache.v.as_ref().unwrap(), n_rep)?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let scores = (q
@@ -405,16 +378,6 @@ impl Attention {
         }
         __model_proof_output!(self.o_proj.forward(&out))
     }
-}
-
-fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        return Ok(x);
-    }
-    let (b, n_kv, s, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, n_kv, n_rep, s, d))?
-        .reshape((b, n_kv * n_rep, s, d))
 }
 
 // Additive causal mask, optionally sliding-window-limited, for an encoder pass (absolute offset 0).
@@ -882,7 +845,7 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&self, xs: &Tensor, rotary: &RotaryEmbedding, mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, rotary: &Rotary, mask: &Tensor) -> Result<Tensor> {
         let residual = xs;
         let h = __model_proof_output!(self.input_layernorm.forward(xs))?;
         let h = self.self_attn.forward(&h, rotary, mask)?;
@@ -899,7 +862,7 @@ impl DecoderLayer {
     fn forward_cached(
         &self,
         xs: &Tensor,
-        rotary: &RotaryEmbedding,
+        rotary: &Rotary,
         position: usize,
         cache: &mut KvCache,
         mask: Option<&Tensor>,
@@ -938,7 +901,7 @@ pub struct GptOssTextEncoder {
     embed_tokens: Embedding,
     layers: EncoderLayers,
     norm: RmsNorm,
-    rotary: RotaryEmbedding,
+    rotary: Rotary,
     sliding_window: usize,
     device: Device,
     dtype: DType,
@@ -1004,7 +967,7 @@ impl GptOssTextEncoder {
     ) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary = RotaryEmbedding::new(cfg, vb.device(), vb.dtype())?;
+        let rotary = rotary_embedding(cfg, vb.device(), vb.dtype())?;
         let vb_l = vb_m.pp("layers");
         let layers = match streamed {
             Some(streamed) => EncoderLayers::Streamed(streamed),
@@ -1163,7 +1126,7 @@ pub struct LensReasonerModel {
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear, // [vocab, hidden], no bias
-    rotary: RotaryEmbedding,
+    rotary: Rotary,
     device: Device,
     dtype: DType,
 }
@@ -1174,7 +1137,7 @@ impl LensReasonerModel {
     pub fn new(cfg: &Config, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary = RotaryEmbedding::new(cfg, vb.device(), vb.dtype())?;
+        let rotary = rotary_embedding(cfg, vb.device(), vb.dtype())?;
         let vb_l = vb_m.pp("layers");
         let layers = (0..cfg.num_hidden_layers)
             .map(|i| DecoderLayer::new(cfg, i, vb_l.pp(i), quant, None))
@@ -1489,7 +1452,7 @@ mod tests {
             Tensor::ones(cfg.hidden_size, DType::F32, &device).unwrap(),
             cfg.rms_norm_eps,
         );
-        let rotary = RotaryEmbedding::new(&cfg, &device, DType::F32).unwrap();
+        let rotary = rotary_embedding(&cfg, &device, DType::F32).unwrap();
         GptOssTextEncoder {
             embed_tokens,
             layers: EncoderLayers::Streamed(StreamedLayers {

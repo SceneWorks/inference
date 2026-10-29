@@ -96,30 +96,55 @@ pub fn byte_checksum(a: &Array, stream: StreamOrDevice) -> Result<u64> {
 /// buffers on the CPU stream, and probing the GPU would put Metal work into a process that pinned
 /// itself off it (the CPU-pinned test children, sc-25690).
 pub fn verify_gpu_view<'a>(arrays: impl IntoIterator<Item = (&'a str, &'a Array)>) -> Result<()> {
+    verify_gpu_view_observed(arrays, |_, _| {})
+}
+
+/// [`verify_gpu_view`] with a per-array progress observer: `on_stage(stage, array)` is called with
+/// stage 4 before the CPU reference read, 5 before each GPU read, and 6 after it. The hook only
+/// observes (mlx-gen forwards it to its physical-iOS load-stage diagnostics); it never changes the
+/// verification.
+pub fn verify_gpu_view_observed<'a>(
+    arrays: impl IntoIterator<Item = (&'a str, &'a Array)>,
+    on_stage: impl FnMut(u64, &Array),
+) -> Result<()> {
     if mlx_rs::Device::try_default()? == mlx_rs::Device::cpu() {
         return Ok(());
     }
-    verify_gpu_view_with(
+    verify_gpu_view_observed_with(
         arrays,
         |a| byte_checksum(a, StreamOrDevice::gpu()),
         std::thread::sleep,
+        on_stage,
     )
 }
 
 /// [`verify_gpu_view`] with the GPU read and the wait injectable — the seam the tests drive a
 /// divergence through, since a real one cannot be provoked on demand.
+#[cfg(test)]
 pub(crate) fn verify_gpu_view_with<'a>(
+    arrays: impl IntoIterator<Item = (&'a str, &'a Array)>,
+    gpu_checksum: impl FnMut(&Array) -> Result<u64>,
+    sleep: impl FnMut(Duration),
+) -> Result<()> {
+    verify_gpu_view_observed_with(arrays, gpu_checksum, sleep, |_, _| {})
+}
+
+fn verify_gpu_view_observed_with<'a>(
     arrays: impl IntoIterator<Item = (&'a str, &'a Array)>,
     mut gpu_checksum: impl FnMut(&Array) -> Result<u64>,
     mut sleep: impl FnMut(Duration),
+    mut on_stage: impl FnMut(u64, &Array),
 ) -> Result<()> {
     for (name, a) in arrays {
         // The reference. MLX's CPU reduce accumulates `uint32` through `int32_t` (wrapping in
         // practice; the 8 MiB agreement test below is what pins that across a pin bump).
+        on_stage(4, a);
         let cpu = byte_checksum(a, StreamOrDevice::cpu())?;
         let mut attempt = 0u32;
         loop {
+            on_stage(5, a);
             let gpu = gpu_checksum(a)?;
+            on_stage(6, a);
             if gpu == cpu {
                 break;
             }

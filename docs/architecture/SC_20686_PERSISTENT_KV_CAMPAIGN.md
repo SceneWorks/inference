@@ -5,6 +5,12 @@ The campaign has two measurement lanes, selected by the safety policy's backend.
 product path. The **CUDA lane** (`linux-cuda`/`windows-cuda` → `candle-cuda`) measures the Candle
 providers. One sealed bundle is exactly one lane; see [Metal lane](#metal-mlx-lane) below.
 
+On the CUDA lane the Candle observer is measurement tooling, compiled only with the non-default
+`campaign-observer` feature of `candle-gen-flux2` and `candle-gen-wan` (sc-27288 / sc-27296). Build
+the campaign entrypoints with it, e.g.
+`cargo build --locked --release -p candle-gen-wan --features campaign-observer,cuda --example wan-txt2video`;
+a default build carries an inert hook stub and refuses `--sc20686-events`.
+
 The campaign adapter runs the one registered FLUX.2 Klein edit route and all five registered Wan
 routes on both lanes (plus the MLX-only FLUX.2 Klein kv-edit route on the Metal lane). For every normal and cancellation arm it creates a private `events.jsonl` file, passes that
 path to the product entrypoint with `--sc20686-events`, and seals the exact event transcript as a

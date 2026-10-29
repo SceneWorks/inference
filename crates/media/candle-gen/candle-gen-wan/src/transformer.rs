@@ -86,15 +86,7 @@ fn wan_self_attn_budget() -> usize {
 fn wan_self_attn_bf16_softmax() -> bool {
     use std::sync::OnceLock;
     static BF16: OnceLock<bool> = OnceLock::new();
-    *BF16.get_or_init(|| {
-        std::env::var("WAN_ATTN_SOFTMAX_BF16")
-            .ok()
-            .map(|v| {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false)
-    })
+    *BF16.get_or_init(|| candle_gen::gen_core::env_flag("WAN_ATTN_SOFTMAX_BF16"))
 }
 
 /// Scaled-dot-product attention. `q,k,v`: `[B, H, S*, d]`; softmax upcast to f32 (bf16 under the

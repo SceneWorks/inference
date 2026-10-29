@@ -17,42 +17,9 @@
 
 use std::path::Path;
 
-use candle_gen::candle_core::{DType, Tensor};
+use crate::support::{cosine, iou, max_abs_diff};
 use candle_gen::default_device;
 use candle_gen_sam3::{Sam3GeometryConfig, Sam3GeometryEncoder, Sam3ImageSegmenter, Weights};
-
-fn sum_scalar(t: Tensor) -> f32 {
-    t.sum_all().unwrap().to_scalar::<f32>().unwrap()
-}
-
-fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-    let a = a.flatten_all().unwrap();
-    let b = b.flatten_all().unwrap();
-    let dot = sum_scalar((&a * &b).unwrap());
-    let na = sum_scalar((&a * &a).unwrap()).sqrt();
-    let nb = sum_scalar((&b * &b).unwrap()).sqrt();
-    dot / (na * nb)
-}
-
-fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-    let d = (a.flatten_all().unwrap() - b.flatten_all().unwrap()).unwrap();
-    d.abs().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap()
-}
-
-/// IoU of two binary `[h, w]` masks.
-fn iou(a: &Tensor, b: &Tensor) -> f32 {
-    let af = a.to_dtype(DType::F32).unwrap();
-    let bf = b.to_dtype(DType::F32).unwrap();
-    let inter = sum_scalar((&af * &bf).unwrap());
-    let sa = sum_scalar(af);
-    let sb = sum_scalar(bf);
-    let union = sa + sb - inter;
-    if union <= 0.0 {
-        1.0
-    } else {
-        inter / union
-    }
-}
 
 fn load_weights(path: &str, device: &candle_gen::candle_core::Device) -> Weights {
     let wp = Path::new(path);

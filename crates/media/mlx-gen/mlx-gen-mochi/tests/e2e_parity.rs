@@ -28,9 +28,10 @@
 //!
 //! Run: `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test integration e2e_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, add, max, mean, multiply, split, subtract};
+use mlx_rs::ops::{abs, add, mean, multiply, split, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::{max_abs, peak_rel, require_env_path};
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
 use mlx_gen_mochi::pipeline::{decode_to_frames, denoise, to_uint8_frames};
@@ -48,23 +49,8 @@ const E2E_GOLDEN: &str = concat!(
     "/../tools/golden/mochi_e2e_golden.safetensors"
 );
 
-fn snapshot_dir() -> std::path::PathBuf {
-    std::env::var("MOCHI_SNAPSHOT")
-        .expect("set MOCHI_SNAPSHOT to the mochi-1-preview snapshot dir")
-        .into()
-}
-
 fn f32(x: &Array) -> Array {
     x.as_dtype(Dtype::Float32).unwrap()
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max(abs(a).unwrap(), None).unwrap().item::<f32>()
-}
-
-/// `max|got − want| / max|want|` — peak relative error (the repo convention).
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    max_abs(&subtract(f32(got), f32(want)).unwrap()) / max_abs(&f32(want)).max(1e-12)
 }
 
 /// `mean|got − want| / mean|want|` — mean relative error.
@@ -90,7 +76,7 @@ fn px_gt8(got: &Array, want: &Array) -> f32 {
 #[test]
 #[ignore = "needs $MOCHI_SNAPSHOT (bf16 DiT + VAE shards) + tools/golden/mochi_{dit,e2e}_golden.safetensors"]
 fn e2e_final_latents_match_golden() {
-    let root = snapshot_dir();
+    let root = require_env_path("MOCHI_SNAPSHOT", "the mochi-1-preview snapshot dir");
     let dit_g = Weights::from_file(DIT_GOLDEN).expect("dit golden");
     let e2e_g = Weights::from_file(E2E_GOLDEN).expect("e2e golden");
 

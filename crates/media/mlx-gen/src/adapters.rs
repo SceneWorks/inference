@@ -41,6 +41,40 @@ pub fn validate_lokr_metadata_scale(alpha: f32, rank: f32) -> Result<()> {
     Ok(())
 }
 
+/// Read a LoRA `.alpha` scalar tensor. Adapter files are external input, so this never panics: an
+/// unreadable or empty tensor (a truncated file, sc-11129) and a NaN/inf value (which would turn the
+/// `alpha / rank · scale` fold into a NaN residual) are typed errors naming `label` (the tensor key
+/// or adapter path). The one shared reader for every provider's LoRA installer.
+pub fn read_scalar_alpha(a: &Array, label: &str) -> Result<f32> {
+    // An empty array has no data buffer to read, so name it before the slice read does.
+    if a.size() == 0 {
+        return Err(crate::Error::Msg(format!(
+            "{label}: empty .alpha tensor (malformed adapter file)"
+        )));
+    }
+    let alpha = a
+        .as_dtype(Dtype::Float32)?
+        .try_as_slice::<f32>()
+        .map_err(|e| {
+            crate::Error::Msg(format!(
+                "{label}: .alpha is not a readable scalar array: {e}"
+            ))
+        })?
+        .first()
+        .copied()
+        .ok_or_else(|| {
+            crate::Error::Msg(format!(
+                "{label}: empty .alpha tensor (malformed adapter file)"
+            ))
+        })?;
+    if !alpha.is_finite() {
+        return Err(crate::Error::Msg(format!(
+            "{label}: .alpha {alpha} is not finite"
+        )));
+    }
+    Ok(alpha)
+}
+
 /// Reconstruct a LoKr weight delta `ΔW = (alpha/rank) · kron(w1, w2)`, reshaped to the
 /// base weight's logical `[out, in]` and cast to `out_dtype`. Each Kronecker factor is either
 /// full (`w1` / `w2`) or a low-rank product (`w1_a @ w1_b` / `w2_a @ w2_b`). Mirrors
@@ -958,6 +992,30 @@ impl AdaptableLinear {
         Ok(())
     }
 
+    /// Whether this Linear's logical in-features ([`base_shape`](Self::base_shape)`[1]`) are a
+    /// multiple of `group_size` (default [`DEFAULT_GROUP_SIZE`](crate::quant::DEFAULT_GROUP_SIZE)),
+    /// i.e. whether [`quantize_if_aligned`](Self::quantize_if_aligned) would (or did) pack it.
+    /// Quantization-count diagnostics use this so they agree with the quantize predicate (sc-27320).
+    pub fn is_quant_aligned(&self, group_size: Option<i32>) -> bool {
+        crate::quant::is_quant_aligned(
+            self.base_shape()[1],
+            group_size.unwrap_or(crate::quant::DEFAULT_GROUP_SIZE),
+        )
+    }
+
+    /// Quantize the base to `bits` **iff** it is still dense and its in-features divide the group
+    /// size ([`is_quant_aligned`](Self::is_quant_aligned)); otherwise leave it untouched. Returns
+    /// whether it quantized. The shared form of the "quantize iff divisible" predicate the per-model
+    /// quantize cascades each re-implemented (sc-27320); the packing itself is
+    /// [`quantize`](Self::quantize), so the bytes are unchanged.
+    pub fn quantize_if_aligned(&mut self, bits: i32, group_size: Option<i32>) -> Result<bool> {
+        if !matches!(self.base, LinearBase::Dense(_)) || !self.is_quant_aligned(group_size) {
+            return Ok(false);
+        }
+        self.quantize(bits, group_size)?;
+        Ok(true)
+    }
+
     /// Accumulate the adapter stack over an already-computed base output, in the **host's** dtype
     /// (sc-15265). Two rules, both about the host staying the host:
     ///
@@ -1375,6 +1433,59 @@ pub fn install_adapter(
 mod tests {
     use super::*;
     use mlx_rs::ops::{all_close, array_eq};
+
+    #[test]
+    fn read_scalar_alpha_errors_on_empty_or_non_finite_and_reads_bf16() {
+        // sc-11129: a size-0 `.alpha` from a malformed/truncated adapter file must produce
+        // a TYPED error, not the `as_slice()[0]` panic that would abort the worker. (safetensors
+        // cannot serialize an empty array, so exercise the reader on the in-memory empty tensor —
+        // the exact value a truncated file would deserialize to.)
+        let empty = Array::from_slice::<f32>(&[], &[0]);
+        let err = read_scalar_alpha(&empty, "k.alpha").expect_err("an empty .alpha must error");
+        assert!(
+            matches!(&err, crate::Error::Msg(m) if m.contains("k.alpha") && m.contains("empty")),
+            "expected a typed Msg error, got {err:?}"
+        );
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = read_scalar_alpha(&Array::from_slice(&[bad], &[1]), "k.alpha")
+                .expect_err("a non-finite .alpha must error");
+            assert!(
+                matches!(&err, crate::Error::Msg(m) if m.contains("not finite")),
+                "{bad}: {err:?}"
+            );
+        }
+        // Happy path: a well-formed bf16 scalar still reads its value.
+        let good = Array::from_slice(&[8.0f32], &[1])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        assert_eq!(read_scalar_alpha(&good, "k.alpha").unwrap(), 8.0);
+    }
+
+    /// sc-27320: `quantize_if_aligned` packs a dense base only when its in-features divide the
+    /// group, reports whether it did, and leaves an already-packed base alone; `is_quant_aligned`
+    /// agrees with it. (Load/quantize only — no forward.)
+    #[test]
+    fn quantize_if_aligned_packs_only_dense_aligned_bases() {
+        let mut aligned = AdaptableLinear::dense(Array::zeros::<f32>(&[4, 64]).unwrap(), None);
+        assert!(aligned.is_quant_aligned(None));
+        assert!(aligned.quantize_if_aligned(8, None).unwrap());
+        assert!(aligned.is_quantized());
+        assert_eq!(aligned.base_shape(), vec![4, 64]);
+        assert!(
+            aligned.is_quant_aligned(None),
+            "a packed base keeps its logical in-features"
+        );
+        assert!(
+            !aligned.quantize_if_aligned(8, None).unwrap(),
+            "an already-packed base is left untouched"
+        );
+
+        let mut misaligned = AdaptableLinear::dense(Array::zeros::<f32>(&[4, 48]).unwrap(), None);
+        assert!(!misaligned.is_quant_aligned(None));
+        assert!(!misaligned.quantize_if_aligned(8, None).unwrap());
+        assert!(!misaligned.is_quantized());
+        assert!(misaligned.is_quant_aligned(Some(16)));
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum ResidualPayloadKind {

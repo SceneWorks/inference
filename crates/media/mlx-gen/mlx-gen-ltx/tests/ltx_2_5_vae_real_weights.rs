@@ -24,9 +24,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mlx_rs::memory::{get_peak_memory, reset_peak_memory};
-use mlx_rs::ops::{abs, max as max_op, mean, multiply, subtract};
+use mlx_rs::ops::{mean, multiply, subtract};
 use mlx_rs::Array;
 
+use mlx_gen::testing::max_abs;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::audio_vae::AudioDecoder;
 use mlx_gen_ltx::config::{AudioVaeConfig, LatentLogVar, LtxVaeConfig, VocoderConfig};
@@ -119,10 +120,6 @@ fn psnr_db(got: &Array, want: &Array) -> f32 {
         .item::<f32>();
     // Peak-to-peak of a [-1, 1] signal is 2.
     20.0 * (2.0f32).log10() - 10.0 * mse.max(1e-20).log10()
-}
-
-fn max_abs(a: &Array) -> f32 {
-    max_op(abs(a).unwrap(), None).unwrap().item::<f32>()
 }
 
 #[test]

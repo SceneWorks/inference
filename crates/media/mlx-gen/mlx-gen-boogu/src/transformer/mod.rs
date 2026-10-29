@@ -29,7 +29,7 @@ pub mod rope;
 use std::cell::RefCell;
 
 use mlx_rs::fast::{layer_norm, rms_norm};
-use mlx_rs::ops::{concatenate_axis, cos, exp, multiply, sin, sum};
+use mlx_rs::ops::{concatenate_axis, multiply, sum};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -379,7 +379,11 @@ impl BooguTransformer {
         )?;
         // Sinusoid in f32 (the reference builds it in f32), then cast to the model dtype like the
         // reference's `timestep_proj.to(dtype)` before the embedder MLP.
-        let proj = sinusoidal_timestep(&scaled, 256)?.as_dtype(self.caption_norm.dtype())?; // [1, 256]
+        // diffusers `get_timestep_embedding(x, 256, flip_sin_to_cos=True, downscale_freq_shift=0,
+        // max_period=10000)` → `[cos, sin]`, the exponent built on-device (sc-27334: the shared core
+        // helper is the identical op sequence, pinned by `timestep_sincos_matches_prior_sinusoid`).
+        let proj = mlx_gen::nn::timestep_sincos(&scaled, 256, 10_000.0, 0.0)?
+            .as_dtype(self.caption_norm.dtype())?; // [1, 256]
         let t = self.time_lin1.forward(&proj)?;
         let t = silu(&t)?;
         let t = self.time_lin2.forward(&t)?; // [1, 1024]
@@ -472,39 +476,18 @@ impl BooguTransformer {
 
 // ── Shared helpers ──────────────────────────────────────────────────────────────────────────
 
-/// Join a module prefix with a leaf name, tolerating an empty prefix.
-pub(crate) fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;
 
-/// Slice `[b, L, ...]` along the sequence axis (axis 1) to `[start, end)`.
+/// Slice `[b, L, ...]` along the sequence axis (axis 1) to `[start, end)` — the shared core
+/// [`mlx_gen::array::slice_range`] (sc-27448).
 pub(crate) fn slice_axis1(x: &Array, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
+    mlx_gen::array::slice_range(x, 1, start, end)
 }
 
 // The GQA `repeat_interleave` that used to live here is now `mlx_gen::qkv::repeat_kv` (SC-18319,
 // knob 10) — the identical `expand_dims → broadcast_to → reshape`, parameterized by which of the two
 // layouts the stream is in.
-
-/// diffusers `get_timestep_embedding(x, dim, flip_sin_to_cos=True, downscale_freq_shift=0,
-/// max_period=10000)`: `freq_i = 10000^(−i/half)`, `emb = x·freq`, `concat([cos, sin], -1)` (cos
-/// first). `x`: `[N]` → `[N, dim]`. `ln(10000)` in f64 to match `math.log` rounding.
-fn sinusoidal_timestep(x: &Array, dim: i32) -> Result<Array> {
-    let half = dim / 2;
-    let arange: Vec<f32> = (0..half).map(|i| i as f32).collect();
-    let arange = Array::from_slice(&arange, &[half]);
-    let neg_ln = -(10000f64.ln()) as f32;
-    let exponent = mlx_rs::ops::divide(&multiply(&arange, scalar(neg_ln))?, scalar(half as f32))?;
-    let freqs = exp(&exponent)?; // [half]
-    let axis = x.shape().len() as i32;
-    let emb = multiply(&x.expand_dims(axis)?, &freqs)?; // [N, half]
-    Ok(concatenate_axis(&[&cos(&emb)?, &sin(&emb)?], -1)?)
-}
 
 /// `c (h p1) (w p2) -> (h w) (p1 p2 c)` with batch: `[1, C, H, W] → [1, (H/p)(W/p), p·p·C]`.
 fn patchify(latent: &Array, p: i32) -> Result<Array> {
@@ -529,6 +512,7 @@ mod tests {
     use std::cell::Cell;
 
     use mlx_gen::diagnostics::{self, CacheDisposition, DiagnosticCounter};
+    use mlx_rs::ops::{cos, exp, sin};
 
     use super::*;
 
@@ -604,6 +588,37 @@ mod tests {
             disposition: CacheDisposition::Miss,
             count: 4,
         }));
+    }
+
+    /// The pre-sc-27334 boogu-local sinusoid, kept verbatim as the reference for the migration to
+    /// the shared [`mlx_gen::nn::timestep_sincos`].
+    ///
+    /// diffusers `get_timestep_embedding(x, dim, flip_sin_to_cos=True, downscale_freq_shift=0,
+    /// max_period=10000)`: `freq_i = 10000^(−i/half)`, `emb = x·freq`, `concat([cos, sin], -1)` (cos
+    /// first). `x`: `[N]` → `[N, dim]`. `ln(10000)` in f64 to match `math.log` rounding.
+    fn prior_sinusoidal_timestep(x: &Array, dim: i32) -> Result<Array> {
+        let half = dim / 2;
+        let arange: Vec<f32> = (0..half).map(|i| i as f32).collect();
+        let arange = Array::from_slice(&arange, &[half]);
+        let neg_ln = -(10000f64.ln()) as f32;
+        let exponent =
+            mlx_rs::ops::divide(&multiply(&arange, scalar(neg_ln))?, scalar(half as f32))?;
+        let freqs = exp(&exponent)?; // [half]
+        let axis = x.shape().len() as i32;
+        let emb = multiply(&x.expand_dims(axis)?, &freqs)?; // [N, half]
+        Ok(concatenate_axis(&[&cos(&emb)?, &sin(&emb)?], -1)?)
+    }
+
+    /// sc-27334: the shared core timestep sinusoid is bit-identical (`max|Δ| == 0`) to the boogu
+    /// body it replaced, for the 1-D f32 `[N]` timesteps `timestep_embed` passes.
+    #[test]
+    fn timestep_sincos_matches_prior_sinusoid() {
+        let x = Array::from_slice(&[0.0f32, 0.25, 1.0, 37.5, 999.0], &[5]);
+        let prior = prior_sinusoidal_timestep(&x, 256).unwrap();
+        let shared = mlx_gen::nn::timestep_sincos(&x, 256, 10_000.0, 0.0).unwrap();
+        assert_eq!(prior.shape(), shared.shape());
+        assert_eq!(prior.dtype(), shared.dtype());
+        assert_eq!(prior.as_slice::<f32>(), shared.as_slice::<f32>());
     }
 
     /// sc-21687: capacity is a hard bound and overflow evicts insertion order, not access order.

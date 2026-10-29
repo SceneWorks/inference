@@ -198,16 +198,9 @@ impl Generator for Sd3Generator {
             )
         }) {
             self.memory_admission.clear();
-            return gen_core::MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            };
+            return gen_core::MemorySafetyDecision::rejected(error);
         }
-        match self.memory_admission.approve(context) {
-            Ok(()) => gen_core::MemorySafetyDecision::Accept,
-            Err(error) => gen_core::MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            },
-        }
+        gen_core::MemorySafetyDecision::from_validation(self.memory_admission.approve(context))
     }
 
     fn begin_memory_strategy_request(

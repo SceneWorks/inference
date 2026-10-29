@@ -23,44 +23,31 @@ use candle_gen::candle_nn::{Activation, RmsNorm, VarBuilder};
 use candle_transformers::models::z_image::text_encoder::TextEncoderConfig;
 
 use crate::quant::{QEmbedding, QLinear};
+use candle_gen::attention::repeat_kv;
+use candle_gen::grounding::Rotary;
 
-// ==================== Rotary Embedding (copied verbatim — no weights) ====================
+// ==================== Rotary Embedding (no weights) ====================
 
-#[derive(Debug, Clone)]
-struct RotaryEmbedding {
-    sin: Tensor,
-    cos: Tensor,
-}
-
-impl RotaryEmbedding {
-    fn new(dtype: DType, cfg: &TextEncoderConfig, dev: &Device) -> Result<Self> {
-        let dim = cfg.head_dim;
-        let max_seq_len = cfg.max_position_embeddings;
-        let inv_freq: Vec<_> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
-            .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        Ok(Self {
-            sin: freqs.sin()?.to_dtype(dtype)?,
-            cos: freqs.cos()?.to_dtype(dtype)?,
-        })
-    }
-
-    /// Apply RoPE (q, k shape: B x H x L x D).
-    fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
-        let (_, _, seq_len, _) = q.dims4()?;
-        let cos = self.cos.narrow(0, offset, seq_len)?;
-        let sin = self.sin.narrow(0, offset, seq_len)?;
-        let q_embed = candle_gen::candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = candle_gen::candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q_embed, k_embed))
-    }
+/// The text tower's RoPE tables. `inv_freq` is derived in **f64** (`rope_theta.powf(i / dim)` then
+/// cast) — unlike [`Rotary::new`]'s f32 power — so the tables are built here and only the application
+/// is shared (sc-27284).
+fn rotary_embedding(dtype: DType, cfg: &TextEncoderConfig, dev: &Device) -> Result<Rotary> {
+    let dim = cfg.head_dim;
+    let max_seq_len = cfg.max_position_embeddings;
+    let inv_freq: Vec<_> = (0..dim)
+        .step_by(2)
+        .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
+        .collect();
+    let inv_freq_len = inv_freq.len();
+    let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
+    let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+        .to_dtype(DType::F32)?
+        .reshape((max_seq_len, 1))?;
+    let freqs = t.matmul(&inv_freq)?;
+    Ok(Rotary::from_tables(
+        freqs.cos()?.to_dtype(dtype)?,
+        freqs.sin()?.to_dtype(dtype)?,
+    ))
 }
 
 // ==================== MLP (packed seam) ====================
@@ -108,16 +95,6 @@ impl Mlp {
 
 // ==================== Attention (packed seam) ====================
 
-fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        Ok(x)
-    } else {
-        let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
-        x.unsqueeze(2)?
-            .broadcast_as((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
-            .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
-    }
-}
 struct Attention {
     q_proj: QLinear,
     k_proj: QLinear,
@@ -130,15 +107,11 @@ struct Attention {
     num_kv_groups: usize,
     head_dim: usize,
     hidden_size: usize,
-    rotary_emb: Arc<RotaryEmbedding>,
+    rotary_emb: Arc<Rotary>,
 }
 
 impl Attention {
-    fn new(
-        cfg: &TextEncoderConfig,
-        rotary_emb: Arc<RotaryEmbedding>,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn new(cfg: &TextEncoderConfig, rotary_emb: Arc<Rotary>, vb: VarBuilder) -> Result<Self> {
         let head_dim = cfg.head_dim;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
@@ -211,10 +184,10 @@ impl Attention {
         let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
         let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
 
-        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+        let (q, k) = self.rotary_emb.apply_at(&q, &k, offset)?;
 
-        let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
+        let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
@@ -238,7 +211,7 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(cfg: &TextEncoderConfig, rotary: Arc<RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &TextEncoderConfig, rotary: Arc<Rotary>, vb: VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(cfg, rotary, vb.pp("self_attn"))?;
         let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
         let ln1 = candle_gen::candle_nn::rms_norm(
@@ -290,7 +263,7 @@ impl ZImageTextEncoder {
         let embed_tokens =
             QEmbedding::detect(&vb_model, "embed_tokens", cfg.vocab_size, cfg.hidden_size)?;
 
-        let rotary = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
+        let rotary = Arc::new(rotary_embedding(vb.dtype(), cfg, vb.device())?);
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_layers = vb_model.pp("layers");

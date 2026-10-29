@@ -183,7 +183,7 @@ const PIXEL_POS_TRAIN_MAX: f64 = 3840.0;
 /// fixtures and every in-distribution decode stay byte-identical. `PID_PIXEL_POS_ABS=1` forces the
 /// raw-absolute reference behavior (the pre-fix path) for A/B.
 fn pixel_pos_axis_scale(n: i32) -> f64 {
-    if std::env::var("PID_PIXEL_POS_ABS").is_ok_and(|v| v == "1") {
+    if mlx_gen::gen_core::env_flag("PID_PIXEL_POS_ABS") {
         return 1.0;
     }
     let n = n as f64;

@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core;
 use candle_gen::gen_core::iris::train::dist::{
-    chunk_rows, Collective, DistError, DistPlan, Partition, ReduceOp, TcpCollective, World,
+    chunk_rows, Collective, DistError, DistPlan, Partition, ReduceOp, World,
 };
 use candle_gen::{CandleError as Error, Result};
+use gen_core_dist::TcpCollective;
 
 use super::optim::Tensors;
 

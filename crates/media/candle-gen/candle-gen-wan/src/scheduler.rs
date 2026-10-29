@@ -1,7 +1,8 @@
 //! Flow-match sampling for Wan: the **`UniPCMultistepScheduler`** (the checkpoint default —
 //! `solver_order=2`, `solver_type="bh2"`, `predict_x0=true`, `use_flow_sigmas`, `final_sigmas_type="zero"`,
-//! `lower_order_final`) and a plain flow-match **Euler** fallback. Ported from diffusers
-//! `scheduling_unipc_multistep.py`.
+//! `lower_order_final`), the flow-SNR **DPM-Solver++(2M)** multistep (sc-27309, ported from
+//! `mlx-gen-wan`'s `FlowDpmpp2m`), and a plain flow-match **Euler** fallback. UniPC is ported from
+//! diffusers `scheduling_unipc_multistep.py`.
 //!
 //! Sigmas: `σ_k = flow_shift·s / (1 + (flow_shift−1)·s)` over `s = linspace(1, 1/N, steps+1)[:-1]`,
 //! with a tiny `σ_0 -= 1e-6` to keep `log(1−σ_0)` finite, then a terminal `0`. The DiT timestep at
@@ -15,22 +16,39 @@ use crate::config::{FLOW_SHIFT, NUM_TRAIN_TIMESTEPS};
 pub enum Sampler {
     UniPC,
     Euler,
+    /// DPM-Solver++(2M) in Wan's own flow log-SNR `λ = log((1−σ)/σ)` — NOT gen-core's VE-space
+    /// `dpmpp_2m` (`λ = −ln σ`), which would diverge from the MLX twin.
+    Dpmpp2m,
 }
 
 impl Sampler {
     /// Map a curated sampler name (epic 7114) to Wan's native integrator. The curated `uni_pc` and the
     /// legacy `unipc` spelling both select Wan's OWN native diffusers FLOW-SNR UniPC multistep — NOT
-    /// gen-core's VE-space `uni_pc` solver, which would diverge from Wan's parity. `euler` is flow Euler.
-    /// Any unknown name falls back to the UniPC default (N3 — never hard-fail over a sampling knob).
+    /// gen-core's VE-space `uni_pc` solver, which would diverge from Wan's parity. `euler` is flow Euler;
+    /// the curated `dpmpp_2m` and legacy `dpmpp2m` select the native flow-SNR DPM-Solver++(2M) (the
+    /// MLX twin's menu, sc-27309). Any unknown name falls back to the UniPC default (N3 — never
+    /// hard-fail over a sampling knob).
     pub fn parse(name: Option<&str>) -> Self {
         match name {
             Some("euler") => Sampler::Euler,
+            Some("dpmpp_2m" | "dpmpp2m") => Sampler::Dpmpp2m,
             _ => Sampler::UniPC, // "uni_pc" (curated) / "unipc" (legacy) / default / anything else
         }
     }
 }
 
 const SOLVER_ORDER: usize = 2;
+
+/// Flow log-SNR `λ(σ) = log((1−σ)/σ)`, with ±∞ at the σ=1 / σ=0 boundaries (matching `torch.log`).
+fn log_snr(sigma: f64) -> f64 {
+    if sigma >= 1.0 {
+        return f64::NEG_INFINITY;
+    }
+    if sigma <= 0.0 {
+        return f64::INFINITY;
+    }
+    ((1.0 - sigma) / sigma).ln()
+}
 
 /// The Wan flow-match σ schedule (f64): `σ_k = shift·s/(1+(shift−1)·s)` over
 /// `s = linspace(1, 1/N, steps+1)[:-1]`, with the `σ_0 -= 1e-6` guard (keeps `log(1−σ_0)` finite for
@@ -72,6 +90,8 @@ pub struct FlowScheduler {
     this_order: usize,
     lower_order_nums: usize,
     step_index: usize,
+    // DPM-Solver++(2M) state: the previous step's x0 prediction.
+    prev_x0: Option<Tensor>,
 }
 
 impl FlowScheduler {
@@ -85,6 +105,7 @@ impl FlowScheduler {
             this_order: 1,
             lower_order_nums: 0,
             step_index: 0,
+            prev_x0: None,
         }
     }
 
@@ -107,7 +128,42 @@ impl FlowScheduler {
                 Ok(next)
             }
             Sampler::UniPC => self.unipc_step(v, sample),
+            Sampler::Dpmpp2m => self.dpmpp_2m_step(v, sample),
         }
+    }
+
+    /// DPM-Solver++(2M) over the flow log-SNR, with `lower_order_final`: first order on the first step,
+    /// and on the last step of a short (< 15 step) schedule; the terminal `σ = 0` step returns the x0
+    /// prediction. Coefficients in f64 — the same recurrence as `mlx-gen-wan`'s `FlowDpmpp2m`.
+    fn dpmpp_2m_step(&mut self, v: &Tensor, sample: &Tensor) -> Result<Tensor> {
+        let i = self.step_index;
+        let (sigma_cur, sigma_next) = (self.sigmas[i], self.sigmas[i + 1]);
+        // convert_model_output (flow predict_x0): x0 = sample − σ·v.
+        let x0 = (sample - v.affine(sigma_cur, 0.0)?)?;
+        let num_steps = self.num_steps();
+        let first_order = i + 1 == num_steps && num_steps < 15;
+        let next = match &self.prev_x0 {
+            _ if sigma_next == 0.0 => x0.clone(),
+            Some(prev_x0) if !first_order => {
+                let lambda_prev = log_snr(self.sigmas[i - 1]);
+                let lambda_cur = log_snr(sigma_cur);
+                let h = log_snr(sigma_next) - lambda_cur;
+                let r0 = (lambda_cur - lambda_prev) / h;
+                let alpha_e = (1.0 - sigma_next) * (-h).exp_m1();
+                // D1 = (x0 − prev_x0)/r0; x_next = (σ_next/σ_cur)·x − α·e·x0 − ½·α·e·D1.
+                let d1 = (&x0 - prev_x0)?.affine(1.0 / r0, 0.0)?;
+                ((sample.affine(sigma_next / sigma_cur, 0.0)? - x0.affine(alpha_e, 0.0)?)?
+                    - d1.affine(0.5 * alpha_e, 0.0)?)?
+            }
+            _ => {
+                let h = log_snr(sigma_next) - log_snr(sigma_cur);
+                let alpha_e = (1.0 - sigma_next) * (-h).exp_m1();
+                (sample.affine(sigma_next / sigma_cur, 0.0)? - x0.affine(alpha_e, 0.0)?)?
+            }
+        };
+        self.prev_x0 = Some(x0);
+        self.step_index += 1;
+        Ok(next)
     }
 
     fn unipc_step(&mut self, v: &Tensor, sample: &Tensor) -> Result<Tensor> {
@@ -218,7 +274,49 @@ pub fn flow_shift(req_shift: Option<f32>) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::Sampler;
+    use super::{FlowScheduler, Sampler};
+    use candle_gen::candle_core::{Device, Tensor};
+
+    #[test]
+    fn dpmpp_2m_parses_from_the_curated_and_legacy_names() {
+        assert_eq!(Sampler::parse(Some("dpmpp_2m")), Sampler::Dpmpp2m);
+        assert_eq!(Sampler::parse(Some("dpmpp2m")), Sampler::Dpmpp2m);
+    }
+
+    /// On a straight rectified-flow path (`x_σ = (1−σ)·x0 + σ·ε`, constant velocity `ε − x0`) every
+    /// DPM-Solver++(2M) update is exact — the first-order step lands on `(1−σ_next)·x0 + σ_next·ε`
+    /// and the second-order correction `D1` vanishes — so each step must track the analytic path and
+    /// the terminal step must return `x0`. Pure scheduler arithmetic on host tensors.
+    #[test]
+    fn dpmpp_2m_tracks_a_straight_flow_path_exactly() {
+        let dev = Device::Cpu;
+        let x0 = Tensor::new(&[0.25f32, -1.5, 3.0], &dev).unwrap();
+        let eps = Tensor::new(&[1.0f32, 0.5, -2.0], &dev).unwrap();
+        let v = (&eps - &x0).unwrap();
+        for steps in [4usize, 20] {
+            let mut sched = FlowScheduler::new(Sampler::Dpmpp2m, steps, 5.0);
+            let path = |sigma: f64| {
+                (x0.affine(1.0 - sigma, 0.0).unwrap() + eps.affine(sigma, 0.0).unwrap()).unwrap()
+            };
+            let mut x = path(sched.sigmas[0]);
+            for i in 0..steps {
+                x = sched.step(&v, &x).unwrap();
+                let expected = path(sched.sigmas[i + 1]);
+                let err = (&x - &expected)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max(0)
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(
+                    err < 1e-5,
+                    "steps {steps}, step {i}: off the flow path by {err}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parse_maps_curated_and_legacy_names() {

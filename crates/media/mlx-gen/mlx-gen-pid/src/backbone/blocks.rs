@@ -341,14 +341,9 @@ impl PiTBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::{abs, max, subtract};
-    use mlx_rs::Dtype;
+    use mlx_gen::testing::max_abs_diff;
 
-    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-        max(abs(subtract(a, b).unwrap()).unwrap(), None)
-            .unwrap()
-            .item::<f32>()
-    }
+    use mlx_rs::Dtype;
 
     /// F-152: the strided split that drops `flash_sdpa`'s zero-pad head_dim tail (axis 3) is
     /// element-identical to the old arange `take_axis` gather.

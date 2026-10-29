@@ -285,16 +285,9 @@ pub(crate) fn upsample_nearest2d_nhwc(x: &Tensor, factor: usize) -> Result<Tenso
 mod tests {
     use super::*;
 
+    /// Cosine similarity over all elements (f64), the quant-parity metric.
     fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (p, q) in a.iter().zip(&b) {
-            dot += (*p as f64) * (*q as f64);
-            na += (*p as f64) * (*p as f64);
-            nb += (*q as f64) * (*q as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
+        candle_gen::testkit::tensor_cosine(a, b) as f32
     }
 
     fn dense(w: &Tensor, b: Option<&Tensor>) -> Linear {

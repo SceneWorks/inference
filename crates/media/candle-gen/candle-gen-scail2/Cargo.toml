@@ -33,7 +33,7 @@ metal = ["candle-gen/metal", "candle-gen-wan/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-wan/cuda"]
 
 [dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 tempfile = { workspace = true }
 # Device-level load/steady/overall peak sampler for the exact shared-package CUDA gate.

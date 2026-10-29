@@ -1,15 +1,14 @@
 //! Exact, estimate-backed Resident memory authority for the public SVD-XT image-to-video route.
 
 use std::cell::RefCell;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use mlx_gen::gen_core::{
     self, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
     MemoryContractSurfaceSelector, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier,
+    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyCapability, MemoryStrategySupport, Precision,
     ResidentOnlyMemoryContractRegistration, ResidentRequestMemory, WeightsSource,
 };
@@ -57,7 +56,6 @@ enum Component {
 struct SealedFile {
     relative: &'static str,
     pin: gen_core::PinnedWeightsFile,
-    digest: String,
     resident_bytes: u64,
 }
 
@@ -69,20 +67,6 @@ pub struct PreparedSvdMemory {
     tier: MemoryNumericTier,
     root: PathBuf,
     files: Vec<SealedFile>,
-}
-
-fn sha256_file(path: &Path) -> gen_core::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn tensor_inventory(root: &Path) -> gen_core::Result<Vec<String>> {
@@ -252,7 +236,9 @@ impl PreparedSvdMemory {
                     crate::MODEL_ID
                 )));
             }
-            let digest = sha256_file(&path)?;
+            // The pin's acquisition-time digest: hashed once per file identity (and shared with
+            // the prepare-time pin), never re-read here.
+            let digest = pin.content_sha256_hex();
             identity.update(relative.as_bytes());
             identity.update(digest.as_bytes());
             identity.update(resident_bytes.to_le_bytes());
@@ -264,7 +250,6 @@ impl PreparedSvdMemory {
             files.push(SealedFile {
                 relative,
                 pin,
-                digest,
                 resident_bytes,
             });
         }
@@ -282,18 +267,19 @@ impl PreparedSvdMemory {
             component_precision_floors: &[],
         };
         let contract = build_contract(spec, facts);
-        let prepared = Self {
+        Ok(Self {
             contract,
             artifact_identity,
             revision,
             tier,
             root: root.to_path_buf(),
             files,
-        };
-        prepared.ensure_unchanged()?;
-        Ok(prepared)
+        })
     }
 
+    /// Cheap admission re-check: tensor inventory, each sealed file's replacement-sensitive pin
+    /// (entry, parent chain, resolution and target, including `ctime`), and header geometry. The
+    /// content digest was proven once when the file was sealed; a content write moves the pin.
     pub fn ensure_unchanged(&self) -> gen_core::Result<()> {
         if tensor_inventory(&self.root)?
             != EXPECTED_TENSOR_INVENTORY
@@ -309,13 +295,6 @@ impl PreparedSvdMemory {
         for file in &self.files {
             file.pin.ensure_unchanged()?;
             let path = self.root.join(file.relative);
-            if sha256_file(&path)? != file.digest {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{}: {} changed after admission",
-                    crate::MODEL_ID,
-                    file.relative
-                )));
-            }
             let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
             let width = SELECTED_FILES
                 .iter()
@@ -638,27 +617,19 @@ fn validate_context(
             crate::MODEL_ID
         )));
     }
-    match gen_core::standard_memory_strategy_safety_check(
+    mlx_gen::request_scope::admit(gen_core::standard_memory_strategy_safety_check(
         &prepared.contract,
         context,
         Some(prepared.tier),
         None,
-    ) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    ))
 }
 
 pub fn safety_check(
     prepared: &PreparedSvdMemory,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match validate_context(prepared, context) {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(validate_context(prepared, context))
 }
 
 thread_local! {
@@ -724,26 +695,7 @@ impl MemoryRequestScope for SvdRequestScope {
         Ok(())
     }
 
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.enter_phase(phase)
-    }
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.core.leave_phase(phase)
-    }
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.core.configure_decode(edge, overlap, geometry)
-    }
-    fn configure_attention(&mut self, size: u32) -> gen_core::Result<()> {
-        self.core.configure_attention(size)
-    }
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
-        self.core.materialize_transformer_window(first, count)
-    }
+    mlx_gen::gen_core::delegate_memory_request_scope!(core);
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         let result = self.core.finish(outcome);
         if self.armed {
@@ -793,9 +745,7 @@ pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
                 crate::MODEL_ID
             ),
         },
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Err(error) => MemorySafetyDecision::rejected(error),
     },
 };
 

@@ -668,8 +668,8 @@ pub fn tile_finalize_bytes(out_h: u64, out_w: u64) -> u64 {
 #[cfg(test)]
 mod reachable_sizes {
     use mlx_gen::gen_core::{
-        LoadSpec, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryStrategy,
-        MemoryStrategySupport, OffloadPolicy, WeightsSource,
+        LoadSpec, MemoryGeometry, MemoryMode, MemoryStrategy, MemoryStrategySupport, OffloadPolicy,
+        WeightsSource,
     };
     use mlx_gen::ios_pricing::IosPricingRequest;
     use mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES;
@@ -701,11 +701,7 @@ mod reachable_sizes {
                     .with_offload_policy(OffloadPolicy::Sequential);
                 let contract =
                     crate::memory_strategy::memory_strategy_contract(provider, &spec).unwrap();
-                let numeric = MemoryNumericTier {
-                    precision: spec.precision,
-                    quant: spec.quantize,
-                    component_precision_floors: &[],
-                };
+                let numeric = mlx_gen::request_scope::loaded_tier(&spec);
                 let deepest = MemoryStrategy::ALL
                     .into_iter()
                     .rev()

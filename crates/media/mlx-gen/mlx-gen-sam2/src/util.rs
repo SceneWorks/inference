@@ -20,15 +20,8 @@ pub(crate) fn argmax_f32(values: &[f32]) -> usize {
         .unwrap_or(0)
 }
 
-/// Join a weight-key `prefix` and `leaf` with a `.` (no leading dot when `prefix` is empty). The
-/// `tree_flatten`-style key builder every SAM2 module's `from_weights` uses (F-171).
-pub(crate) fn join(prefix: &str, leaf: &str) -> String {
-    if prefix.is_empty() {
-        leaf.to_string()
-    } else {
-        format!("{prefix}.{leaf}")
-    }
-}
+// The `{prefix}.{leaf}` key builder is the shared core helper (sc-27429).
+pub(crate) use mlx_gen::weights::join;
 
 /// `x[:, start..end, ...]` — take the contiguous `start..end` index range along axis 1. The single
 /// take-range helper behind the SAM2 token / mask / IoU slices (F-171).

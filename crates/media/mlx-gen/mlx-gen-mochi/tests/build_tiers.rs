@@ -13,13 +13,8 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::require_env_path;
 use mlx_gen_mochi::{convert_and_assemble, stage_shared_components, MochiConvertOpts};
-
-fn snapshot_dir() -> PathBuf {
-    std::env::var("MOCHI_SNAPSHOT")
-        .expect("set MOCHI_SNAPSHOT to the mochi-1-preview snapshot dir")
-        .into()
-}
 
 fn out_root() -> PathBuf {
     std::env::var("MOCHI_TIERS_OUT")
@@ -50,7 +45,7 @@ fn gib(bytes: u64) -> f64 {
 #[test]
 #[ignore = "builds the q4/q8/bf16 Mochi tiers from ~tens-of-GB $MOCHI_SNAPSHOT"]
 fn build_all_tiers() {
-    let src = snapshot_dir();
+    let src = require_env_path("MOCHI_SNAPSHOT", "the mochi-1-preview snapshot dir");
     let root = out_root();
     assert!(src.is_dir(), "snapshot missing: {}", src.display());
     std::fs::create_dir_all(&root).unwrap();

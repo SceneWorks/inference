@@ -189,14 +189,15 @@ pub struct WorkloadCase {
     pub tiled_decode_control: TiledDecodeControl,
 }
 
+// Wan's and Qwen-Image's RoPE rotation is core's shared `rope_rotate` glue (sc-27453).
 const WAN_P1_COMPILE_OPERATIONS: &[&str] = &[
-    "wan::rope::rope_rotate",
+    "mlx_gen::nn::rope_rotate",
     "wan::transformer::gated",
     "wan::transformer::gelu_ffn",
     "wan::transformer::modulate",
 ];
 const QWEN_P1_COMPILE_OPERATIONS: &[&str] = &[
-    "qwen_image::attention::rope_rotate",
+    "mlx_gen::nn::rope_rotate",
     "qwen_image::block::gated",
     "qwen_image::block::modulate",
     "qwen_image::feed_forward::gelu_ffn",
@@ -3148,7 +3149,7 @@ mod tests {
             .diagnostics
             .retain(|record| {
                 !(record.domain == "compile"
-                    && record.site == "qwen_image::attention::rope_rotate"
+                    && record.site == "mlx_gen::nn::rope_rotate"
                     && record.outcome == "retained_hit")
             });
         assert!(missing_operation

@@ -32,9 +32,10 @@
 //!
 //! Run: `LTX_BASE_DIR=… LTX_GEMMA_DIR=… cargo test -p mlx-gen-ltx --test integration e2e_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, gt, max as max_op, subtract, sum};
+use mlx_rs::ops::{abs, gt, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::config::{LtxConfig, LtxVaeConfig, SplitModel};
 use mlx_gen_ltx::pipeline::{
@@ -97,12 +98,6 @@ fn gemma_dir() -> std::path::PathBuf {
 
 fn f32(x: &Array) -> Array {
     x.as_dtype(Dtype::Float32).unwrap()
-}
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(f32(got), f32(want)).unwrap()).unwrap();
-    let denom = max_op(abs(f32(want)).unwrap(), None).unwrap().item::<f32>();
-    max_op(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 
 fn mean_rel(got: &Array, want: &Array) -> f32 {

@@ -243,10 +243,10 @@ pub use decoder::ViT3dDecoder;
 pub use denoise::{
     adaln_schedule, align_num_frames, audio_latent_num_frames, denoise_av, rope_clocks_agree,
     shift_sigma, video_latent_num_frames, DenoiseModality, JointGeometry, JointSchedule, JointStep,
-    JointVelocity, PackedLayout, RowClass, SigmaSchedule, AUDIO_LATENTS_PER_SECOND,
-    AUDIO_SIGMA_SHIFT, AUDIO_TAG, KEYFRAME_NOISE_AUG, LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS,
-    MINIMAX_H3_FPS, MIN_INFERENCE_STEPS, NUM_ROW_CLASSES, REFERENCE_AUDIO_TIMESTEP,
-    ROPE_UNITS_PER_SECOND, TEXT_TAG, VIDEO_SIGMA_SHIFT, VIDEO_TAG,
+    JointVelocity, PackedLayout, RowClass, SigmaSchedule, SigmaScheduleStep,
+    AUDIO_LATENTS_PER_SECOND, AUDIO_SIGMA_SHIFT, AUDIO_TAG, KEYFRAME_NOISE_AUG, LEGAL_FRAME_COUNTS,
+    MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS, MIN_INFERENCE_STEPS, NUM_ROW_CLASSES,
+    REFERENCE_AUDIO_TIMESTEP, ROPE_UNITS_PER_SECOND, TEXT_TAG, VIDEO_SIGMA_SHIFT, VIDEO_TAG,
 };
 pub use dit::{
     detect, AdaLayerNormOut, AdaLnCache, AdaLnModulation, AdaLnProjection, AdaLnResidency,

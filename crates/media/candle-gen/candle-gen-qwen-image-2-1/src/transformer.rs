@@ -1597,6 +1597,7 @@ pub struct JointPrelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigFile;
 
     /// The joint sequence is long enough at the SHIPPED sizes that the F-003 i32-overflow guard is
     /// load-bearing, so every SDPA call here must carry the budget rather than the un-chunked

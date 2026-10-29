@@ -46,7 +46,7 @@ const RETENTION_MEMORY_AUDIT_SCHEMA_VERSION: &str = "sceneworks.mlx-retention-me
 /// deliberately appears twice because its matching-dtype and strong-f32-literal policies own
 /// separate compiler handles. The audit executes this exact handle multiset twice in one child
 /// process: one miss and one hit per entry.
-const RETAINED_COMPILE_HANDLES: [&str; 25] = [
+const RETAINED_COMPILE_HANDLES: [&str; 21] = [
     "mlx_gen::nn::gated",
     "mlx_gen::nn::rope_rotate",
     "mlx_gen::nn::modulate",
@@ -55,20 +55,16 @@ const RETAINED_COMPILE_HANDLES: [&str; 25] = [
     "mlx_gen::nn::gelu_quick",
     "flux::transformer::gelu_ffn",
     "flux2::transformer::swiglu",
-    "ltx::rope::rope_rotate",
     "ltx::transformer::modulate",
     "ltx::transformer::gated",
     "ltx::transformer::gelu_ffn",
-    "qwen_image::attention::rope_rotate",
     "qwen_image::block::modulate",
     "qwen_image::block::gated",
     "qwen_image::feed_forward::gelu_ffn",
     "sdxl::silu_glue",
-    "wan::rope::rope_rotate",
     "wan::transformer::modulate",
     "wan::transformer::gated",
     "wan::transformer::gelu_ffn",
-    "z_image::attention::rope_rotate",
     "z_image::control_transformer::add_hint",
     "z_image::feed_forward::swiglu",
     "z_image::transformer_block::gated",
@@ -290,12 +286,8 @@ fn exercise_retained_compile_inventory(input: &mlx_rs::Array) -> Result<(), Stri
         .map_err(|error| format!("audit Flux retained handles: {error}"))?;
     runtime_macos::providers::flux2::transformer::exercise_retained_compile_inventory(input)
         .map_err(|error| format!("audit Flux2 retained handles: {error}"))?;
-    runtime_macos::providers::ltx::rope::exercise_retained_compile_inventory(input)
-        .map_err(|error| format!("audit LTX RoPE retained handles: {error}"))?;
     runtime_macos::providers::ltx::transformer::exercise_retained_compile_inventory(input)
         .map_err(|error| format!("audit LTX transformer retained handles: {error}"))?;
-    runtime_macos::providers::qwen_image::transformer::attention::exercise_retained_compile_inventory(input)
-        .map_err(|error| format!("audit Qwen attention retained handles: {error}"))?;
     runtime_macos::providers::qwen_image::transformer::block::exercise_retained_compile_inventory(
         input,
     )
@@ -304,12 +296,8 @@ fn exercise_retained_compile_inventory(input: &mlx_rs::Array) -> Result<(), Stri
         .map_err(|error| format!("audit Qwen FFN retained handles: {error}"))?;
     runtime_macos::providers::sdxl::exercise_retained_compile_inventory(input)
         .map_err(|error| format!("audit SDXL retained handles: {error}"))?;
-    runtime_macos::providers::wan::rope::exercise_retained_compile_inventory(input)
-        .map_err(|error| format!("audit Wan RoPE retained handles: {error}"))?;
     runtime_macos::providers::wan::transformer::exercise_retained_compile_inventory(input)
         .map_err(|error| format!("audit Wan transformer retained handles: {error}"))?;
-    runtime_macos::providers::z_image::attention::exercise_retained_compile_inventory(input)
-        .map_err(|error| format!("audit Z-Image attention retained handles: {error}"))?;
     runtime_macos::providers::z_image::control_transformer::exercise_retained_compile_inventory(
         input,
     )
@@ -352,7 +340,7 @@ fn run_retention_memory_child() -> Result<(), String> {
     drop(compile_guard);
 
     // The audit helpers evaluate and drop every output before returning. This releases the final
-    // request-owned tensor before allocator/cache sampling while the 25 retained compiler handles
+    // request-owned tensor before allocator/cache sampling while the 21 retained compiler handles
     // remain alive in their thread-local owners.
     drop(input);
     // MLX's completed default Metal command buffer keeps shallow references to its most recent
@@ -2043,16 +2031,16 @@ mod tests {
             .contains("exact full-inventory miss/hit"));
 
         let expected = expected_retention_diagnostics();
-        assert_eq!(RETAINED_COMPILE_HANDLES.len(), 25);
+        assert_eq!(RETAINED_COMPILE_HANDLES.len(), 21);
         assert_eq!(
             RETAINED_COMPILE_HANDLES
                 .iter()
                 .copied()
                 .collect::<BTreeSet<_>>()
                 .len(),
-            24
+            20
         );
-        assert_eq!(expected.len(), 49);
+        assert_eq!(expected.len(), 41);
         assert_eq!(
             expected
                 .get(&(
@@ -2077,7 +2065,7 @@ mod tests {
                     None,
                 ))
                 .copied(),
-            Some(50)
+            Some(42)
         );
     }
 
@@ -2132,6 +2120,11 @@ mod tests {
                 }
             }
         }
+        // `mlx_gen::nn::DitCompileGlue::new` is one source constructor per handle *kind*, instantiated
+        // once per family that declares a `DitGlue` (sc-27339): count its handles per instantiation.
+        let dit_glue_families = source.matches("DitGlue::new(").count();
+        let per_family = runtime_macos::media::nn::DIT_GLUE_RETAINED_HANDLES;
+        let constructor_count = constructor_count - per_family + dit_glue_families * per_family;
         assert_eq!(
             constructor_count,
             RETAINED_COMPILE_HANDLES.len(),

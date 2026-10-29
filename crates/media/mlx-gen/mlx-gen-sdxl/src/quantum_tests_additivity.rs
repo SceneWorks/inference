@@ -1699,7 +1699,7 @@ fn acceleration_transitions_bind_actual_model_epsilon_and_factory() {
         let sigmas = [sigma,sigma,0.0,0.0];
         let cancel = mlx_gen::CancelFlag::default();
         let x = rnd(&[1,LATENT,LATENT,4],9,1.0);
-        let (result,observation) = observe_actual_marks(|| mlx_gen::run_curated_sampler(Some("euler"),&ms,&sigmas,x,7,&cancel,&mut |_|{},|xin,_| Ok(xin.as_dtype(crate::model::DTYPE)?)));
+        let (result,observation) = observe_actual_marks(|| mlx_gen::run_curated_sampler(mlx_gen::SamplerRun{sampler_name:Some("euler"),sigmas:&sigmas,seed:7,cancel:&cancel,on_progress:&mut |_|{}},&ms,x,|xin,_| Ok(xin.as_dtype(crate::model::DTYPE)?)));
         let result = result?;
         let updates = observation.metadata.iter().filter(|m|m.provider=="curated"&&m.kind=="solver_update").collect::<Vec<_>>();
         assert!(updates.len()==3&&updates.last().is_some_and(|m|m.fields.get("terminal_alias")==Some(&1))&&result.shape()==[1,LATENT,LATENT,4],"actual repeated and leading-terminal native driver branches");
@@ -1728,7 +1728,7 @@ fn actual_serial_owner_preserves_seed_retention_and_error_scopes() {
         let predictions=Rc::new(RefCell::new(0usize));
         let run=|cancel:&mlx_gen::CancelFlag| {
             let x=draw()?;
-            mlx_gen::run_curated_sampler(Some("euler"),&ms,&[2.0,1.0,0.0],x,7,cancel,&mut |_|{},|xin,_| {
+            mlx_gen::run_curated_sampler(mlx_gen::SamplerRun{sampler_name:Some("euler"),sigmas:&[2.0,1.0,0.0],seed:7,cancel,on_progress:&mut |_|{}},&ms,x,|xin,_| {
                 *predictions.borrow_mut()+=1;
                 Ok(xin.as_dtype(crate::model::DTYPE)?)
             })

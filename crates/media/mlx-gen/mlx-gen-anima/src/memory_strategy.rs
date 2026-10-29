@@ -104,11 +104,11 @@ use mlx_gen::gen_core::{
     adapter_stack_resident_bytes, standard_memory_strategy_safety_check, AdapterResidencyMode,
     Error as CoreError, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
     MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
-    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
-    Result as CoreResult, TransformerComponent,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryParameterRanges,
+    MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
+    TransformerComponent,
 };
 // Aliased so the module docs' `GenerationMemory` intra-doc links keep their explicit targets.
 use mlx_gen::gen_core::GenerationMemory as RequestMemory;
@@ -563,13 +563,7 @@ fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> CoreResult<()> {
 /// rather than through a validated `MemorySelection`, which is precisely the path admission does not
 /// see.
 fn validate_window(size: u32) -> CoreResult<()> {
-    if !TRANSFORMER_WINDOW_SIZES.contains(&size) {
-        return Err(CoreError::Unsupported(format!(
-            "anima transformer window {size} is outside the calibrated domain \
-             {TRANSFORMER_WINDOW_SIZES:?}"
-        )));
-    }
-    Ok(())
+    mlx_gen::request_scope::validate_calibrated_window("anima", size, TRANSFORMER_WINDOW_SIZES)
 }
 
 /// The provider safety check every Anima variant shares: the calibration handshake and tier match,
@@ -636,23 +630,9 @@ pub(crate) fn safety_check(
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(loaded_tier(spec)),
+        Some(mlx_gen::request_scope::loaded_tier(spec)),
         Some(&route_gate),
     )
-}
-
-/// The numeric tier this generator actually runs.
-///
-/// Anima is convert-at-install: the SceneWorks worker packs the DiT on-device and the loader
-/// packed-detects the tier off the on-disk `{base}.scales`, so `LoadSpec::quantize` is the recorded
-/// tier for the resolved directory rather than a load-time transform request. `precision` is
-/// pinned to bf16 by `load_variant`.
-fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    }
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -671,7 +651,7 @@ pub(crate) fn registered_valid_fixture(
     let context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        loaded_tier(spec),
+        mlx_gen::request_scope::loaded_tier(spec),
         MemoryBehaviorRoute {
             mode: MemoryMode::TextToImage,
             reference_count: 0,
@@ -722,48 +702,34 @@ fn begin_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
-    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        provider_id,
-        context.geometry,
-        contract.generation_memory(&context.selection),
-        context.use_pid,
-        DitConfig::anima().num_layers,
-        move |use_pid, edge, overlap| {
-            if use_pid {
-                return Err(CoreError::Unsupported(format!(
-                    "{provider_id}: anima has no PiD decoder"
-                )));
-            }
-            validate_decode(Some(edge), Some(overlap))
-        },
-    )?;
-    config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
-    config.transformer_window = contract
-        .engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        )
-        .then_some(context.selection.parameters.transformer_window_size)
-        .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    mlx_gen::request_scope::begin_scope(safety_check(spec, contract, context), cleanup, move || {
+        let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            provider_id,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            context.use_pid,
+            DitConfig::anima().num_layers,
+            move |use_pid, edge, overlap| {
+                if use_pid {
+                    return Err(CoreError::Unsupported(format!(
+                        "{provider_id}: anima has no PiD decoder"
+                    )));
+                }
+                validate_decode(Some(edge), Some(overlap))
+            },
+        )?;
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+        config.transformer_window =
+            mlx_gen::request_scope::selected_transformer_window(contract, context);
+        Ok(config)
+    })
 }
 
 // ── Request-side resolution: the shared `GenerationMemory` signal → this provider's levers ────────
 
-/// Rung 3: the bounded-attention plan for this request. Cancellation is threaded so a per-chunk
-/// `eval` observes a cancel promptly rather than at the next step boundary.
-pub(crate) fn attention_plan(req: &GenerationRequest) -> mlx_gen::attention::AttentionPlan<'_> {
-    if chunks_attention(req.memory) {
-        attention_plan_for(req.memory).with_cancel(&req.cancel)
-    } else {
-        attention_plan_for(req.memory)
-    }
-}
+/// Rung 3: the shared constrained-budget plan (an unselected request keeps the exact historical
+/// unbounded, uncancellable plan).
+pub(crate) use mlx_gen::request_scope::constrained_attention_plan as attention_plan;
 
 /// Whether a request's memory block chunks attention (rung 3).
 fn chunks_attention(memory: Option<RequestMemory>) -> bool {
@@ -795,25 +761,14 @@ pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Resul
 pub(crate) fn transformer_window_size_for(
     memory: Option<RequestMemory>,
 ) -> mlx_gen::Result<Option<usize>> {
-    let Some(memory) = memory.filter(|memory| memory.stream_transformer_blocks) else {
-        return Ok(None);
-    };
-    let component = memory
-        .transformer_window_component
-        .unwrap_or(TRANSFORMER_WINDOW_COMPONENT);
-    if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
-        return Err(mlx_gen::Error::Unsupported(format!(
-            "anima implements only the {TRANSFORMER_WINDOW_COMPONENT:?} transformer window \
-             component, got {component:?}"
-        )));
-    }
-    let size = memory
-        .transformer_window_size
-        .unwrap_or(TRANSFORMER_WINDOW_SIZE);
-    validate_window(size).map_err(|error| {
-        mlx_gen::Error::Unsupported(format!("anima transformer window rejected: {error}"))
-    })?;
-    Ok(Some(size as usize))
+    mlx_gen::request_scope::requested_transformer_window(
+        "anima",
+        memory,
+        TRANSFORMER_WINDOW_COMPONENT,
+        TRANSFORMER_WINDOW_COMPONENTS,
+        TRANSFORMER_WINDOW_SIZE,
+        validate_window,
+    )
 }
 
 /// Rung 2: the decode tiling for this request, or `None` for the single-pass decode.
@@ -825,18 +780,16 @@ pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<T
 pub(crate) fn decode_tiling_for(
     memory: Option<RequestMemory>,
 ) -> mlx_gen::Result<Option<TilingConfig>> {
-    let Some(memory) = memory.filter(|memory| memory.tile_vae_decode) else {
-        return Ok(None);
-    };
-    let edge = memory.decode_tile_edge.unwrap_or(DECODE_TILE_EDGE);
-    let overlap = memory.decode_overlap.unwrap_or(DECODE_OVERLAP);
-    validate_decode(Some(edge), Some(overlap)).map_err(|error| {
-        mlx_gen::Error::Unsupported(format!("anima decode tiling rejected: {error}"))
-    })?;
-    Ok(Some(TilingConfig::spatial_only(
-        edge as i32,
-        overlap as i32,
-    )))
+    mlx_gen::request_scope::requested_decode_tiling(
+        memory,
+        DECODE_TILE_EDGE,
+        DECODE_OVERLAP,
+        |edge, overlap| {
+            validate_decode(Some(edge), Some(overlap)).map_err(|error| {
+                mlx_gen::Error::Unsupported(format!("anima decode tiling rejected: {error}"))
+            })
+        },
+    )
 }
 
 /// Rung 1: whether this request stages its component residency.
@@ -846,7 +799,7 @@ pub(crate) fn stage_residency(req: &GenerationRequest, default_staged: bool) -> 
 
 /// [`stage_residency`] for a request's memory block.
 pub(crate) fn stage_residency_for(memory: Option<RequestMemory>, default_staged: bool) -> bool {
-    memory.map_or(default_staged, |memory| memory.stage_residency)
+    mlx_gen::request_scope::requested_stage_residency(memory, default_staged)
 }
 
 /// The strategy parameters this provider accepts, for a caller that wants the whole domain in one

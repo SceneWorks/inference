@@ -20,6 +20,9 @@ const _: fn() = || {
 
 // --- generated modules (do not edit) ---
 
+#[allow(dead_code)]
+mod support;
+
 #[path = "cuda_hires_smoke.rs"]
 mod cuda_hires_smoke;
 

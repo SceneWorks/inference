@@ -48,9 +48,9 @@
 
 use mlx_gen::gen_core::{
     standard_memory_behavior_context, Error, LoadShape, LoadSpec, MemoryBehaviorRoute,
-    MemoryBudget, MemoryMode, MemoryNumericTier, MemoryOptimizationAuthority,
-    MemoryProviderContract, MemorySafetyDecision, MemorySelection, MemoryStrategy,
-    MemoryStrategyParameters, ProviderRegistry, Result, WeightsSource,
+    MemoryBudget, MemoryMode, MemoryOptimizationAuthority, MemoryProviderContract,
+    MemorySafetyDecision, MemorySelection, MemoryStrategy, MemoryStrategyParameters,
+    ProviderRegistry, Result, WeightsSource,
 };
 
 use crate::{IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY};
@@ -189,15 +189,6 @@ pub fn anima_host_request_peak(
     })
 }
 
-/// The tier an Anima load runs, as its safety check compares it.
-fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
-    MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    }
-}
-
 /// PLANNING decision for `selection` at `image_edge`² under `budget`: would the host-derived bound
 /// fit? This never admits a load (see [`crate::ios_admission::admit`]); it ranks what to try and
 /// capture first.
@@ -235,7 +226,7 @@ pub fn anima_turbo_planning_decision(
     let mut context = standard_memory_behavior_context(
         contract,
         selection.strategy,
-        loaded_tier(spec),
+        mlx_gen::request_scope::loaded_tier(spec),
         MemoryBehaviorRoute {
             mode: MemoryMode::TextToImage,
             reference_count: 0,
@@ -283,7 +274,7 @@ fn candidate_selections(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
 ) -> Vec<MemorySelection> {
-    let tier = loaded_tier(spec);
+    let tier = mlx_gen::request_scope::loaded_tier(spec);
     let mut candidates = Vec::new();
     for strategy in MemoryStrategy::ALL {
         let Ok(representative) = contract.representative_selection(strategy, tier, false) else {
@@ -456,7 +447,11 @@ mod tests {
         let spec = spec();
         let contract = contract(&registry, &spec);
         let resident = contract
-            .representative_selection(MemoryStrategy::Resident, loaded_tier(&spec), false)
+            .representative_selection(
+                MemoryStrategy::Resident,
+                mlx_gen::request_scope::loaded_tier(&spec),
+                false,
+            )
             .expect("resident is always a selection");
 
         let decision = anima_turbo_planning_decision(

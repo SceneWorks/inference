@@ -25,6 +25,9 @@
 //! Divergence (deliberate, typed): upstream silently disables the loss when the teacher fails to
 //! load (`available = False`); natively a missing or mismatched teacher resource is a refusal.
 
+use std::path::{Path, PathBuf};
+
+use super::TRAINER_ID;
 use crate::{Error, Result};
 
 /// `LoadSpec::components` key of the REPA teacher resource directory.
@@ -669,6 +672,55 @@ pub fn resize_host(
         }
     }
     out
+}
+
+/// The safetensors file of a provisioned teacher resource: [`TEACHER_WEIGHTS_FILE`] inside a
+/// directory, or the file itself.
+pub fn teacher_file(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join(TEACHER_WEIGHTS_FILE)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Resolve the frozen REPA teacher a run reads: `repa.teacher_weights` (never a URL — nothing is
+/// downloaded during training) or the staged `TEACHER_COMPONENT`, which must agree when both are
+/// given, and whose [`teacher_file`] must exist.
+pub fn resolve_teacher_path(component: &Option<PathBuf>, repa: &RepaPlan) -> Result<PathBuf> {
+    let path = match (&repa.teacher_weights, component) {
+        (Some(w), _) if w.contains("://") => {
+            return Err(Error::Unsupported(format!(
+                "{TRAINER_ID} trainer: repa.teacher_weights {w:?} is a URL; the teacher is a \
+                 provisioned resource (nothing is downloaded during training)"
+            )))
+        }
+        (Some(w), Some(c)) if Path::new(w) != c.as_path() => {
+            return Err(Error::Msg(format!(
+                "{TRAINER_ID} trainer: repa.teacher_weights {w:?} and the '{TEACHER_COMPONENT}' \
+                 component {} name different teachers",
+                c.display()
+            )))
+        }
+        (Some(w), _) => PathBuf::from(w),
+        (None, Some(c)) => c.clone(),
+        (None, None) => {
+            return Err(Error::Msg(format!(
+                "{TRAINER_ID} trainer: repa.weight > 0 needs the frozen {} teacher — stage it as \
+                 the '{TEACHER_COMPONENT}' component (facebook/dinov2-base @ {} for the release \
+                 teacher dinov2_vitb14)",
+                repa.teacher.entrypoint, DINOV2_BASE_HF_REVISION
+            )))
+        }
+    };
+    let file = teacher_file(&path);
+    if !file.is_file() {
+        return Err(Error::Msg(format!(
+            "{TRAINER_ID} trainer: the REPA teacher resource {} is missing",
+            file.display()
+        )));
+    }
+    Ok(path)
 }
 
 #[cfg(test)]

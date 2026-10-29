@@ -179,20 +179,6 @@ impl DiT {
             )),
         }
     }
-    #[allow(dead_code)]
-    pub(crate) fn forward(
-        &self,
-        x: &Tensor,
-        t: &Tensor,
-        cap_feats: &Tensor,
-        cap_mask: &Tensor,
-    ) -> candle_gen::candle_core::Result<Tensor> {
-        match self {
-            Self::Dense(m) => m.forward(x, t, cap_feats, cap_mask),
-            Self::Packed(m) => m.forward(x, t, cap_feats, cap_mask),
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn forward_with_attention_plan(
         &self,
@@ -212,7 +198,7 @@ impl DiT {
         )
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn forward_with_memory(
         &self,
         x: &Tensor,

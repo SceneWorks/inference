@@ -12,41 +12,11 @@
 
 use std::path::Path;
 
+use crate::support::{cosine, max_abs_diff};
 use candle_gen::candle_core::Tensor;
 use candle_gen::candle_nn::ops::sigmoid;
 use candle_gen::default_device;
 use candle_gen_sam3::{Sam3Detector, Sam3DetrConfig, Weights};
-
-fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-    let a = a.flatten_all().unwrap();
-    let b = b.flatten_all().unwrap();
-    let dot = (&a * &b)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    let na = (&a * &a)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-        .sqrt();
-    let nb = (&b * &b)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-        .sqrt();
-    dot / (na * nb)
-}
-
-fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-    let d = (a.flatten_all().unwrap() - b.flatten_all().unwrap()).unwrap();
-    d.abs().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap()
-}
 
 /// instances = #{ sigmoid(logits)·sigmoid(presence) > 0.5 }.
 fn instances(logits: &Tensor, presence: &Tensor) -> usize {

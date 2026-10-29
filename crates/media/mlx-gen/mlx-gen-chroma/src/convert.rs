@@ -123,17 +123,12 @@ pub(crate) fn is_vae_target(base: &str) -> bool {
 /// transformer as sharded `diffusion_pytorch_model-0000N-of-0000M.safetensors`; the shard keys are
 /// disjoint, so we merge them (a duplicate key across shards is a corrupt snapshot → error).
 fn load_component_map(dir: &Path) -> Result<HashMap<String, Array>> {
-    let w = Weights::from_dir(dir)?;
     let mut map: HashMap<String, Array> = HashMap::new();
-    for k in w.keys().map(str::to_string).collect::<Vec<_>>() {
-        let v = w.get(&k).expect("listed key").clone();
-        if map.insert(k.clone(), v).is_some() {
-            return Err(Error::Msg(format!(
-                "chroma convert: duplicate key `{k}` across shards in {}",
-                dir.display()
-            )));
-        }
-    }
+    mlx_gen::quant::merge_weights_unique(
+        &mut map,
+        &Weights::from_dir(dir)?,
+        &format!("chroma convert: shards in {}", dir.display()),
+    )?;
     Ok(map)
 }
 

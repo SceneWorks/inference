@@ -48,7 +48,7 @@
 //!   predict closure* blended into one velocity (`v_uncond + g·(v_cond − v_uncond)`); no fused
 //!   `[2, …]` batch is ever the running latent, so there is no unconditional half to project.
 //! * **The control context never reaches the preview.** `crate::control` VAE-encodes the pose skeleton
-//!   once into a constant 33-channel context and injects it *inside* `forward_control`. It is a closure
+//!   once into a constant 33-channel context and injects it *inside* `forward_control_prepared`. It is a closure
 //!   capture, never part of the tensor the loop integrates — which is this story's "control routes
 //!   project target tokens only" criterion, closed structurally rather than by a guard.
 //! * **img2img sees only the target.** `crate::edit` blends the VAE-encoded source into `x_t` *before*
@@ -640,7 +640,7 @@ mod tests {
     }
 
     /// The control hazard in this family's shape: `crate::control` concatenates a constant 33-channel
-    /// context onto the DiT input *inside* `forward_control` and returns a 16-channel velocity. Driven
+    /// context onto the DiT input *inside* `forward_control_prepared` and returns a 16-channel velocity. Driven
     /// through the real sampler with a closure that does exactly that — the shape that WOULD leak if a
     /// route handed the joint tensor to the loop.
     #[test]

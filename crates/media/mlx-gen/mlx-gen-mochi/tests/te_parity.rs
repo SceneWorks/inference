@@ -13,9 +13,9 @@
 
 use mlx_gen::tokenizer::to_arrays;
 use mlx_gen::weights::Weights;
-use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::{peak_rel, require_env_path};
 use mlx_gen_mochi::{encode_prompt, load_t5_encoder, load_tokenizer};
 
 /// The exact prompt the A1 dump harness (`tools/dump_mochi_golden.py`) blessed the golden with.
@@ -27,21 +27,6 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/mochi_te_golden.safetensors"
 );
-
-fn snapshot_dir() -> std::path::PathBuf {
-    std::env::var("MOCHI_SNAPSHOT")
-        .expect("set MOCHI_SNAPSHOT to the mochi-1-preview snapshot dir")
-        .into()
-}
-
-/// `max|got − want| / max|want|` — the repo's peak relative error (see LTX `te_parity`).
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let got = got.as_dtype(Dtype::Float32).unwrap();
-    let want = want.as_dtype(Dtype::Float32).unwrap();
-    let diff = abs(subtract(&got, &want).unwrap()).unwrap();
-    let denom = max(abs(&want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
-}
 
 /// Peak relative error over the **real (unmasked) token rows only** — zero out padded positions in
 /// both tensors via `mask [1, L]` before comparing. Padded rows carry near-zero signal and are masked
@@ -121,7 +106,7 @@ fn long_prompt_reserves_the_final_slot_for_eos() {
 #[test]
 #[ignore = "needs $MOCHI_SNAPSHOT (fp32 T5-XXL shards, ~20 GB) + tools/golden/mochi_te_golden.safetensors"]
 fn t5_encode_matches_golden() {
-    let root = snapshot_dir();
+    let root = require_env_path("MOCHI_SNAPSHOT", "the mochi-1-preview snapshot dir");
     let tok = load_tokenizer().unwrap();
     let t5 = load_t5_encoder(&root).expect("load T5-XXL encoder");
     let g = Weights::from_file(GOLDEN).expect("te golden");

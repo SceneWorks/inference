@@ -8,8 +8,8 @@ use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
-    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
     MemoryStructuralResidentEvidence, MemoryWindowMaterialization, Precision, Quant,
     ResidentOnlyMemoryContractRegistration, ResidentRequestMemory, WeightsSource,
@@ -67,13 +67,8 @@ const WEIGHTS_FREE_CALIBRATION_FINGERPRINT: &str = "scail2-14b-candle-weights-fr
 /// because the manifest ships ONE repository to both lanes and the two hold those bytes
 /// differently — see `CALIBRATION_BACKEND`.
 pub fn production_calibration_fingerprint(artifact_tier: MemoryNumericTier) -> Option<String> {
-    let tier = match artifact_tier.quant {
-        None => "bf16",
-        Some(gen_core::Quant::Q4) => "q4",
-        Some(gen_core::Quant::Q8) => "q8",
-        // No SCAIL-2 artifact can prove any other packing, so there is no cell to name.
-        Some(_) => return None,
-    };
+    // No SCAIL-2 artifact can prove any other packing, so there is no cell to name.
+    let tier = gen_core::Quant::affine_tier_label(artifact_tier.quant)?;
     Some(format!(
         "scail2-14b-{tier}-{CALIBRATION_BACKEND}-{CALIBRATION_LOAD_COMPOSITION}-v1"
     ))
@@ -399,12 +394,11 @@ impl ArtifactReceipt {
 
 /// The snapshot subdirectory the manifest ships each tier of `SceneWorks/scail2-mlx` under.
 const fn tier_directory(packed: Option<Quant>) -> &'static str {
-    match packed {
-        None => "bf16",
-        Some(Quant::Q4) => "q4",
-        Some(Quant::Q8) => "q8",
-        // Unreachable: `ArtifactReceipt::capture` refuses every other marker before this is asked.
-        Some(_) => "unsupported",
+    // `None` is unreachable: `ArtifactReceipt::capture` refuses every other marker before this is
+    // asked.
+    match Quant::affine_tier_label(packed) {
+        Some(directory) => directory,
+        None => "unsupported",
     }
 }
 
@@ -780,26 +774,8 @@ impl MemoryRequestScope for Scail2MemoryScope<'_> {
         self.inner.configure_request(request)?;
         validate_request_identity(self.memory, &self.context, request)
     }
-    fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.enter_phase(phase)
-    }
-    fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
-        self.inner.leave_phase(phase)
-    }
-    fn configure_decode(
-        &mut self,
-        edge: u32,
-        overlap: u32,
-        geometry: MemoryGeometry,
-    ) -> gen_core::Result<()> {
-        self.inner.configure_decode(edge, overlap, geometry)
-    }
-    fn configure_attention(&mut self, size: u32) -> gen_core::Result<()> {
-        self.inner.configure_attention(size)
-    }
-    fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
-        self.inner.materialize_transformer_window(first, count)
-    }
+
+    candle_gen::gen_core::delegate_memory_request_scope!(inner);
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         let result = self.inner.finish(outcome);
         *self
@@ -1074,27 +1050,25 @@ fn validate_route(
             "{PROVIDER_ID}: requires the exact one-character animation/replacement Resident route"
         )));
     }
-    match gen_core::standard_memory_strategy_safety_check(contract, context, Some(tier), None) {
-        MemorySafetyDecision::Accept => Ok(()),
-        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
-    }
+    candle_gen::request_scope::admit(gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(tier),
+        None,
+    ))
 }
 
 pub(crate) fn safety_check(
     memory: &PreparedMemory,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match memory
-        .artifact
-        .ensure_unchanged()
-        .and_then(|_| validate_context_identity(memory, context))
-        .and_then(|_| validate_route(&memory.contract, memory.tier, context))
-    {
-        Ok(()) => MemorySafetyDecision::Accept,
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
-    }
+    MemorySafetyDecision::from_validation(
+        memory
+            .artifact
+            .ensure_unchanged()
+            .and_then(|_| validate_context_identity(memory, context))
+            .and_then(|_| validate_route(&memory.contract, memory.tier, context)),
+    )
 }
 
 /// A declared geometry backed by exactly `width * height * 3` RGB8 bytes.
@@ -1185,17 +1159,11 @@ pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
                 "{PROVIDER_ID}: caller contract does not match the sealed load receipt"
             ),
         },
-        Ok(prepared) => match validate_context_identity(&prepared, context)
-            .and_then(|_| validate_route(&prepared.contract, prepared.tier, context))
-        {
-            Ok(()) => MemorySafetyDecision::Accept,
-            Err(error) => MemorySafetyDecision::Reject {
-                reason: error.to_string(),
-            },
-        },
-        Err(error) => MemorySafetyDecision::Reject {
-            reason: error.to_string(),
-        },
+        Ok(prepared) => MemorySafetyDecision::from_validation(
+            validate_context_identity(&prepared, context)
+                .and_then(|_| validate_route(&prepared.contract, prepared.tier, context)),
+        ),
+        Err(error) => MemorySafetyDecision::rejected(error),
     },
 };
 

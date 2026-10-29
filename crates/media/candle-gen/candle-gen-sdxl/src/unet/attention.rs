@@ -807,8 +807,6 @@ impl Module for AttentionBlock {
             crate::request_attention_budget(),
         )?;
 
-        // TODO: revert the call to force_contiguous once the three matmul kernels have been
-        // adapted to handle layout with some dims set to 1.
         let xs = xs.to_dtype(in_dtype)?;
         let xs = xs.transpose(1, 2)?.contiguous()?;
         let xs = xs.flatten_from(D::Minus2)?;

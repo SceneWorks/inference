@@ -36,6 +36,7 @@ use crate::common::{
     assert_close, batched_nchw, device, errors, fixture_at, fixtures, host_f32, host_i32, ids_of,
     Fixture,
 };
+use candle_gen::testkit::sha256_file;
 
 fn env_dir(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
@@ -43,23 +44,6 @@ fn env_dir(name: &str) -> PathBuf {
 
 fn package() -> PathBuf {
     env_dir("FLUX3_PACKAGE_DIR")
-}
-
-/// Lower-case hex SHA-256 of a file, streamed.
-fn sha256_hex(path: &std::path::Path) -> String {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 8 << 20];
-    loop {
-        let n = file.read(&mut buf).unwrap();
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 fn golden() -> Fixture {
@@ -108,12 +92,12 @@ fn real_package_config_is_the_release() {
     assert_eq!(config.text_encoder.window_max_length(), 4096);
     assert_eq!(config.sampler.steps, 16);
     assert_eq!(
-        sha256_hex(&package().join("model.safetensors")),
+        sha256_file(&package().join("model.safetensors")),
         DISTILLED_DIT_SHA256,
         "model.safetensors is not the pinned revision's"
     );
     assert_eq!(
-        sha256_hex(&package().join("ae.safetensors")),
+        sha256_file(&package().join("ae.safetensors")),
         DISTILLED_AUTOENCODER_SHA256,
         "ae.safetensors is not the pinned revision's"
     );
