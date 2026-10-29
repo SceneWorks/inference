@@ -2739,7 +2739,7 @@ jobs:
   # it is a specific question a scheduled run would answer that a triggered one would not.
   #
   # What actually holds the sweep together between dispatches is CI, not the clock: the decision rule
-  # and the recorded evidence are covered by seven NON-ignored tests in `generate_smoke.rs` that need
+  # and the recorded evidence are covered by seven NON-ignored tests in `generate_smoke/` that need
   # no weights and run in every `cargo test` — `the_s18_verdict_rule_distinguishes_its_outcomes`,
   # `the_recorded_s18_sweep_is_what_the_docs_claim`, `the_withdrawn_s18_claims_do_not_survive_in_crate_prose`,
   # `the_s18_bounded_dose_ladder_spans_thirteen_ten_and_five_rolls`,

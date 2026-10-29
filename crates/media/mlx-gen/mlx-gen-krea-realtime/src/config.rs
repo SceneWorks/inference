@@ -88,7 +88,7 @@ impl KvCacheQuant {
     /// deltas positive), resolvably so on row C (+2.79 against a 2·SEM of 0.80). The other rows
     /// only had the power to exclude regressions above 1.87–5.79/255, so the honest reading is one
     /// effect of roughly **+2/255** across the bounded rows rather than one bad row. Against a
-    /// `DRIFT_BUDGET` of 8/255 (the sweep's, in `tests/generate_smoke.rs`) that is a quarter of the
+    /// `DRIFT_BUDGET` of 8/255 (the sweep's, in `tests/generate_smoke/drift.rs`) that is a quarter of the
     /// budget, bought for a 0.76–0.86× peak.
     ///
     /// So this is a **trade with a measured price**, not a free saving. It is worth taking when the
