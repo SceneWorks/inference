@@ -45452,6 +45452,60 @@
     "package": "candle-gen-krea",
     "target": "candle_gen_krea",
     "target_kind": "lib",
+    "fqn": "train_dit::tests::frozen_caption_lifecycle_and_live_input_guard",
+    "source": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_krea",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "CPU synthetic/committed Krea projection/DiT/TE/control/train/perceptual/native-file fixtures; crates/media/candle-gen/candle-gen-krea/src/train_dit.rs::train_dit::tests::frozen_caption_lifecycle_and_live_input_guard",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs::train_dit::tests::frozen_caption_lifecycle_and_live_input_guard",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs::train_dit::tests::frozen_caption_lifecycle_and_live_input_guard/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs::train_dit::tests::frozen_caption_lifecycle_and_live_input_guard",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "candle_gen_krea",
+    "target_kind": "lib",
     "fqn": "train_dit::tests::prepared_control_accepts_a_normalizable_sampler_dtype_and_binds_model_dtype",
     "source": "crates/media/candle-gen/candle-gen-krea/src/train_dit.rs",
     "cargo_target_metadata": {

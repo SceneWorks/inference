@@ -5,7 +5,7 @@
 //! loop into a reusable [`ControlTrainer`] so a caller other than the example binary — the SceneWorks
 //! ControlNet Training Studio worker driver (epic 10159 B2 / sc-10163) — can drive a run and stream
 //! its progress. The numerics are unchanged: every step still routes through
-//! [`control_loss_grads`] and [`probe_forward`], so a run built here is bit-for-bit the run the
+//! [`crate::control::control_loss_grads`] and [`crate::control::probe_forward`], so a run built here is bit-for-bit the run the
 //! `krea-control-train` example produced (which now wraps this).
 //!
 //! **Seam.** The trainer owns the *optimization* concern only — the two optimizer groups (the run-3
@@ -32,8 +32,11 @@ use candle_gen::train::flow_match::{
 use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
 use candle_gen::{CandleError, Result};
 
-use crate::control::{control_loss_grads, probe_forward, ControlBranch};
+use crate::control::{
+    control_loss_grads_conditioning, probe_forward_conditioning, ControlBranch, ControlConditioning,
+};
 use crate::train_dit::KreaTrainDit;
+use crate::train_dit::{PreparedCaption, PreparedControlConditioning};
 
 /// One pre-encoded training example, CPU-resident: the VAE-encoded target latent `x0`, the
 /// VAE-encoded pose-skeleton control latent `ctrl`, and the caption embedding stack `cap` (the
@@ -184,13 +187,73 @@ const TELEMETRY_EVERY: u32 = 50;
 /// it silently treats as sigmoid, so the trainer rejects unknown values instead).
 const TIMESTEP_TYPES: [&str; 4] = ["sigmoid", "uniform", "linear", "weighted"];
 
+enum SampleConditioning {
+    Raw(Tensor),
+    Prepared(PreparedCaption),
+}
+
+struct TrainingSample {
+    x0: Tensor,
+    control: Tensor,
+    conditioning: SampleConditioning,
+}
+
+impl TrainingSample {
+    fn prepare_control(
+        &self,
+        dit: &KreaTrainDit,
+        device: &Device,
+    ) -> Result<Option<PreparedControlConditioning>> {
+        match &self.conditioning {
+            SampleConditioning::Prepared(caption) if !self.control.track_op() => {
+                let control = self.control.to_device(device)?;
+                Ok(Some(dit.prepare_control_from_caption(caption, &control)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn with_conditioning<T>(
+        &self,
+        dit: &KreaTrainDit,
+        device: &Device,
+        active: Option<&PreparedControlConditioning>,
+        f: impl FnOnce(ControlConditioning<'_>) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(active) = active {
+            return f(ControlConditioning::Prepared(active));
+        }
+        if let Some(prepared) = self.prepare_control(dit, device)? {
+            return f(ControlConditioning::Prepared(&prepared));
+        }
+        match &self.conditioning {
+            SampleConditioning::Raw(caption) => {
+                let control = self.control.to_device(device)?;
+                let context = caption.to_device(device)?.unsqueeze(0)?;
+                f(ControlConditioning::Raw {
+                    context: &context,
+                    control: &control,
+                })
+            }
+            _ => Err(CandleError::Msg(
+                "krea control: tracked control requires live conditioning".into(),
+            )),
+        }
+    }
+}
+
 /// Drives control-branch training over a fixed set of pre-encoded [`ControlSample`]s against a frozen
 /// [`KreaTrainDit`] base. Construct with [`ControlTrainer::new`], then either [`run`](Self::run) to
 /// completion (streaming [`TrainEvent`]s) or single-step with [`step`](Self::step).
 pub struct ControlTrainer {
     dit: KreaTrainDit,
     branch: ControlBranch,
-    samples: Vec<ControlSample>,
+    samples: Vec<TrainingSample>,
+    // One active item/bucket bounds expanded control-token residency independently
+    // of dataset size; successive updates on that item reuse its frozen projection.
+    active_conditioning: Option<(usize, PreparedControlConditioning)>,
+    preparation_builds: u64,
+    preparation_hits: u64,
     cfg: ControlTrainConfig,
     device: Device,
     /// All trainable branch vars (for accumulate/scale/clip over the combined gradient store).
@@ -214,7 +277,7 @@ impl ControlTrainer {
     /// resume point (0 for a fresh branch, the checkpoint's step when resuming). Checkpoints land in
     /// `out_dir`.
     pub fn new(
-        dit: KreaTrainDit,
+        mut dit: KreaTrainDit,
         branch: ControlBranch,
         samples: Vec<ControlSample>,
         cfg: ControlTrainConfig,
@@ -241,6 +304,44 @@ impl ControlTrainer {
         }
         std::fs::create_dir_all(&out_dir)
             .map_err(|e| CandleError::Msg(format!("create out dir {}: {e}", out_dir.display())))?;
+        // The base is owned by this job; only the branch's independent Vars are trained.
+        // Prepare the frozen base once, and retain dataset conditioning on CPU to keep
+        // VRAM independent of dataset size. Raw caption stacks are consumed/released;
+        // control latents remain compact until the active item's embedding is needed.
+        dit.prepare_training_projections()?;
+        let prepare_start = Instant::now();
+        let mut captions = std::collections::HashMap::new();
+        let samples: Vec<_> = samples
+            .into_iter()
+            .map(|sample| -> Result<TrainingSample> {
+                let id = sample.cap.id();
+                if let std::collections::hash_map::Entry::Vacant(slot) = captions.entry(id) {
+                    let context = sample.cap.to_device(&device)?.unsqueeze(0)?;
+                    slot.insert(
+                        dit.prepare_caption(&context)?
+                            .map(|caption| caption.to_storage_device(&Device::Cpu))
+                            .transpose()?,
+                    );
+                }
+                let conditioning = match &captions[&id] {
+                    Some(prepared) if !sample.ctrl.track_op() => {
+                        SampleConditioning::Prepared(prepared.clone())
+                    }
+                    _ => SampleConditioning::Raw(sample.cap),
+                };
+                Ok(TrainingSample {
+                    x0: sample.x0,
+                    control: sample.ctrl,
+                    conditioning,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let caption_bytes: usize = captions
+            .values()
+            .flatten()
+            .map(PreparedCaption::resident_bytes)
+            .sum();
+        eprintln!("krea control training: prepared {} unique captions, {caption_bytes} CPU bytes in {:?}; one active control item bounds device residency", captions.len(), prepare_start.elapsed());
         let vars = branch.vars();
         // Two optimizer groups (run-3 fix): the branch-block bodies at the full lr with no decay, and
         // the injection projections at a reduced lr WITH decoupled weight decay — magnitude control on
@@ -259,6 +360,9 @@ impl ControlTrainer {
             dit,
             branch,
             samples,
+            active_conditioning: None,
+            preparation_builds: 0,
+            preparation_hits: 0,
             cfg,
             device,
             vars,
@@ -290,6 +394,11 @@ impl ControlTrainer {
         self.step
     }
 
+    /// Frozen control-item builds and reuse hits, for the run's throughput evidence.
+    pub fn preparation_stats(&self) -> (u64, u64) {
+        (self.preparation_builds, self.preparation_hits)
+    }
+
     /// Run one optimizer update: `batch` accumulated micro-steps, averaged + clipped gradients, warmup
     /// LR, both optimizer groups stepped. Advances the internal step counter and returns its
     /// [`StepReport`]. A caller stepping manually should inspect [`StepReport::loss`] for a non-finite
@@ -302,10 +411,20 @@ impl ControlTrainer {
             let micro = self.step * self.cfg.batch + j;
             // The cache is CPU-resident (dataset-size-independent VRAM); copy this sample's tensors to
             // the device for the micro-step only — they drop at the end of the iteration.
-            let s = &self.samples[self.sample_index(micro)];
+            let index = self.sample_index(micro);
+            if self.active_conditioning.as_ref().map(|(key, _)| *key) != Some(index) {
+                self.active_conditioning = None;
+                if let Some(prepared) =
+                    self.samples[index].prepare_control(&self.dit, &self.device)?
+                {
+                    self.active_conditioning = Some((index, prepared));
+                    self.preparation_builds += 1;
+                }
+            } else {
+                self.preparation_hits += 1;
+            }
+            let s = &self.samples[index];
             let x0 = s.x0.to_device(&self.device)?;
-            let ctrl = s.ctrl.to_device(&self.device)?;
-            let cap = s.cap.to_device(&self.device)?;
             let sigma = sample_unit_timestep(
                 &self.cfg.timestep_type,
                 "none",
@@ -316,17 +435,23 @@ impl ControlTrainer {
                 flow_match::noise_seed(self.cfg.seed, micro),
                 &self.device,
             )?;
-            let (loss, grads) = control_loss_grads(
+            let (loss, grads) = s.with_conditioning(
                 &self.dit,
-                &self.branch,
-                &x0,
-                &ctrl,
-                &cap,
-                sigma,
-                &noise,
-                self.cfg.mae,
-                self.cfg.compute_dtype,
-                self.cfg.grad_checkpoint,
+                &self.device,
+                self.active_conditioning.as_ref().map(|(_, value)| value),
+                |conditioning| {
+                    control_loss_grads_conditioning(
+                        &self.dit,
+                        &self.branch,
+                        &x0,
+                        conditioning,
+                        sigma,
+                        &noise,
+                        self.cfg.mae,
+                        self.cfg.compute_dtype,
+                        self.cfg.grad_checkpoint,
+                    )
+                },
             )?;
             loss_sum += loss;
             accumulate_grads(&mut acc, grads, &self.vars)?;
@@ -365,8 +490,6 @@ impl ControlTrainer {
     pub fn probe(&self) -> Result<(Vec<f64>, Vec<f64>)> {
         let s = &self.samples[0];
         let x0 = s.x0.to_device(&self.device)?;
-        let ctrl = s.ctrl.to_device(&self.device)?;
-        let cap = s.cap.to_device(&self.device)?.unsqueeze(0)?;
         let sigma = 0.5f32;
         let noise = sample_noise(
             x0.dims(),
@@ -375,7 +498,17 @@ impl ControlTrainer {
         )?;
         let (x_t, _) = flow_match::build_batch(&x0, &noise, sigma as f64)?;
         let t = Tensor::from_vec(vec![sigma], (1,), &self.device)?;
-        let (rep, _, _) = probe_forward(&self.dit, &self.branch, &x_t, &t, &cap, &ctrl, 1.0)?;
+        let (rep, _, _) = s.with_conditioning(
+            &self.dit,
+            &self.device,
+            self.active_conditioning
+                .as_ref()
+                .filter(|(index, _)| *index == 0)
+                .map(|(_, value)| value),
+            |conditioning| {
+                probe_forward_conditioning(&self.dit, &self.branch, &x_t, &t, conditioning, 1.0)
+            },
+        )?;
         let ratio = |num: f64, den: f64| (num / (den + 1e-9) * 1e4).round() / 1e4;
         let pre = rep.iter().map(|(p, _, m)| ratio(*p, *m)).collect();
         let post = rep.iter().map(|(_, q, m)| ratio(*q, *m)).collect();
@@ -473,6 +606,7 @@ impl ControlTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::control_loss_grads;
     use crate::loader::Weights;
     use crate::testfix::{randn_seeded, tiny_batch_seeded, tiny_dit_seeded};
     use rand::{rngs::StdRng, SeedableRng};
@@ -543,8 +677,30 @@ mod tests {
         }
         assert_eq!(counts, [3, 1, 3, 1]);
         // Both latent sizes reach the loss within the epoch; every update stays finite.
+        let mut previous = None;
         for _ in 0..8 {
+            let index = tr.sample_index(tr.step);
             let rep = tr.step().unwrap();
+            let (key, active) = tr
+                .active_conditioning
+                .as_ref()
+                .expect("frozen control prepared");
+            assert_eq!(*key, index);
+            let identity = active.ctrl_tokens.id();
+            if let Some((previous_index, previous_identity)) = previous {
+                if index == previous_index {
+                    assert_eq!(
+                        identity, previous_identity,
+                        "repeat item reuses frozen control tokens"
+                    );
+                } else {
+                    assert_ne!(
+                        identity, previous_identity,
+                        "changed item/bucket invalidates active preparation"
+                    );
+                }
+            }
+            previous = Some((index, identity));
             assert!(
                 rep.loss.is_finite(),
                 "non-finite loss at update {}",

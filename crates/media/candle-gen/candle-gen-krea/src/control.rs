@@ -747,12 +747,33 @@ pub fn probe_forward(
     ctrl_latent: &Tensor,
     control_scale: f64,
 ) -> Result<(Vec<(f64, f64, f64)>, Tensor, Tensor)> {
+    probe_forward_conditioning(
+        dit,
+        branch,
+        latent,
+        timestep,
+        ControlConditioning::Raw {
+            context,
+            control: ctrl_latent,
+        },
+        control_scale,
+    )
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn probe_forward_conditioning(
+    dit: &KreaTrainDit,
+    branch: &ControlBranch,
+    latent: &Tensor,
+    timestep: &Tensor,
+    conditioning: ControlConditioning<'_>,
+    control_scale: f64,
+) -> Result<(Vec<(f64, f64, f64)>, Tensor, Tensor)> {
     let norm = |t: &Tensor| -> Result<f64> {
         let sq = t.detach().to_dtype(DType::F32)?.sqr()?.sum_all()?;
         Ok((sq.to_scalar::<f32>()? as f64).sqrt())
     };
-    let (combined, ctx) = dit.forward_pre_main(latent, timestep, context)?;
-    let ctrl_tokens = dit.embed_latent(ctrl_latent)?;
+    let (combined, ctx, ctrl_tokens) = conditioning.pre_main(dit, latent, timestep)?;
     let residuals = branch.residuals_mode(&combined, &ctrl_tokens, &ctx, true)?;
 
     let mut report = Vec::with_capacity(residuals.len());
@@ -781,6 +802,34 @@ pub fn probe_forward(
     }
     let v_base = dit.velocity_out(&xb, &ctx)?;
     Ok((report, v_branched, v_base))
+}
+
+pub(crate) enum ControlConditioning<'a> {
+    Raw {
+        context: &'a Tensor,
+        control: &'a Tensor,
+    },
+    Prepared(&'a crate::train_dit::PreparedControlConditioning),
+}
+
+impl ControlConditioning<'_> {
+    fn pre_main(
+        &self,
+        dit: &KreaTrainDit,
+        latent: &Tensor,
+        timestep: &Tensor,
+    ) -> Result<(Tensor, MainCtx, Tensor)> {
+        match self {
+            Self::Raw { context, control } => {
+                let (combined, ctx) = dit.forward_pre_main(latent, timestep, context)?;
+                Ok((combined, ctx, dit.embed_latent(control)?))
+            }
+            Self::Prepared(prepared) => {
+                let (combined, ctx) = dit.forward_pre_main_prepared(latent, timestep, prepared)?;
+                Ok((combined, ctx, prepared.ctrl_tokens.clone()))
+            }
+        }
+    }
 }
 
 /// One training micro-step's forward + backward at flow-match `sigma`: build the noised latent, run
@@ -812,14 +861,49 @@ pub fn control_loss_grads(
     compute_dtype: DType,
     use_checkpoint: bool,
 ) -> Result<(f32, GradStore)> {
+    let context = cap.unsqueeze(0)?;
+    control_loss_grads_conditioning(
+        dit,
+        branch,
+        x0,
+        ControlConditioning::Raw {
+            context: &context,
+            control: ctrl_latent,
+        },
+        sigma,
+        noise,
+        mae,
+        compute_dtype,
+        use_checkpoint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn control_loss_grads_conditioning(
+    dit: &KreaTrainDit,
+    branch: &ControlBranch,
+    x0: &Tensor,
+    conditioning: ControlConditioning<'_>,
+    sigma: f32,
+    noise: &Tensor,
+    mae: bool,
+    compute_dtype: DType,
+    use_checkpoint: bool,
+) -> Result<(f32, GradStore)> {
     let device = x0.device();
     let (x_t, target) = flow_match::build_batch(x0, noise, sigma as f64)?;
     let x_t = x_t.to_dtype(compute_dtype)?;
-    let context = cap.unsqueeze(0)?; // (L, n, d) -> (1, L, n, d)
     let t = Tensor::from_vec(vec![sigma], (1,), device)?;
 
     if !use_checkpoint {
-        let v = forward_with_control(dit, branch, &x_t, &t, &context, ctrl_latent, 1.0)?;
+        let v = match &conditioning {
+            ControlConditioning::Raw { context, control } => {
+                forward_with_control(dit, branch, &x_t, &t, context, control, 1.0)?
+            }
+            ControlConditioning::Prepared(prepared) => {
+                forward_with_prepared_control(dit, branch, &x_t, &t, prepared, 1.0)?
+            }
+        };
         let loss = velocity_loss(&v, &target, mae)?;
         let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
         let grads = loss.backward()?;
@@ -827,8 +911,7 @@ pub fn control_loss_grads(
     }
 
     // Frozen pre-main + control embedding (no Vars upstream → the detached seed boundary).
-    let (combined, ctx) = dit.forward_pre_main(&x_t, &t, &context)?;
-    let ctrl_tokens = dit.embed_latent(ctrl_latent)?;
+    let (combined, ctx, ctrl_tokens) = conditioning.pre_main(dit, &x_t, &t)?;
     let branch_input = {
         let txt = combined.narrow(1, 0, ctx.cap_len)?;
         let img = (combined.narrow(1, ctx.cap_len, ctx.img_len)? + &ctrl_tokens)?;
@@ -1171,7 +1254,7 @@ mod tests {
     fn dense_and_checkpoint_grads_match_control() {
         let dev = Device::Cpu;
         let tmp = tempfile::tempdir().unwrap();
-        let (dit, c, path) = tiny_dit(&tmp);
+        let (mut dit, c, path) = tiny_dit(&tmp);
         let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
         let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
         nudge_vars(&branch, &dev);
@@ -1197,6 +1280,40 @@ mod tests {
         };
         let (loss_d, g_d) = run(false);
         let (loss_c, g_c) = run(true);
+        dit.prepare_training_projections().unwrap();
+        let prepared = dit
+            .prepare_control_conditioning(&cap.unsqueeze(0).unwrap(), &ctrl)
+            .unwrap();
+        for checkpoint in [false, true] {
+            let (loss, gradients) = control_loss_grads_conditioning(
+                &dit,
+                &branch,
+                &x0,
+                ControlConditioning::Prepared(&prepared),
+                0.5,
+                &noise,
+                false,
+                DType::F32,
+                checkpoint,
+            )
+            .unwrap();
+            assert!(
+                (loss_d - loss).abs() < 1e-4,
+                "prepared control loss parity checkpoint={checkpoint}"
+            );
+            for (idx, var) in vars.iter().enumerate() {
+                let difference = (g_d.get(var.as_tensor()).unwrap()
+                    - gradients.get(var.as_tensor()).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_vec0::<f32>()
+                .unwrap();
+                assert!(difference < 1e-4, "prepared control var {idx} gradient parity checkpoint={checkpoint}: {difference}");
+            }
+        }
 
         assert!(
             (loss_d - loss_c).abs() < 1e-4,
