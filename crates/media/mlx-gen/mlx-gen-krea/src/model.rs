@@ -2186,26 +2186,50 @@ mod tests {
             .unwrap_or(body)
     }
 
+    /// The source text of the production `fn {name}(` (its first definition in `model.rs`), up to
+    /// the next method at its indent.
+    fn fn_source(name: &str) -> &'static str {
+        let body = include_str!("model.rs");
+        let start = body
+            .find(&format!("    fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name}"));
+        let rest = &body[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map(|at| at + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
     /// Conditioning: the fault fires at the conditioning phase's EXIT — after `encode_contexts` has
-    /// produced (and, when armed, evaluated) the contexts, and before the heavy phase begins.
+    /// produced (and, when armed, evaluated) the contexts, and before the heavy phase begins. Since
+    /// sc-27336 the encode is the `encode_phase` stage the phase-A closure calls.
     #[test]
     fn the_conditioning_calibration_fault_fires_after_the_encode_and_before_the_heavy_phase() {
-        let body = generate_impl_source();
-        let encode = body
-            .find("self.encode_contexts(")
-            .expect("generate_impl must encode the contexts");
-        let fault = body
-            .find("MemoryPhase::Conditioning")
-            .expect("generate_impl must carry a Conditioning calibration fault");
-        let heavy = body
+        let generate = fn_source("generate_impl");
+        let phase_a = generate
+            .find("self.encode_phase(")
+            .expect("phase A must run the encode stage");
+        let heavy = generate
             .find("// Phase B: heavy render components")
             .expect("phase B marker");
+        assert!(
+            phase_a < heavy,
+            "the encode stage (and its Conditioning fault) must run in the text-encode phase"
+        );
+        let encode_phase = fn_source("encode_phase");
+        let encode = encode_phase
+            .find("self.encode_contexts(")
+            .expect("encode_phase must encode the contexts");
+        let fault = encode_phase
+            .find("MemoryPhase::Conditioning")
+            .expect("encode_phase must carry a Conditioning calibration fault");
         assert!(
             encode < fault,
             "the Conditioning fault must FOLLOW the text encode, not precede it"
         );
         assert!(
-            fault < heavy,
+            !fn_source("render_phase").contains("MemoryPhase::Conditioning"),
             "the Conditioning fault must fire in the text-encode phase, not after it"
         );
     }
@@ -2231,18 +2255,28 @@ mod tests {
     /// / `decode_exit_fault` read exactly those two fields, so replacing
     /// `req.memory.unwrap_or_default()` with `Default::default()` (or hardcoding the id) makes every
     /// render-side hook unreachable — and would leave the ordering tests above green. Pinned as
-    /// source text because driving the real render needs the Krea 2 snapshot.
+    /// source text because driving the real render needs the Krea 2 snapshot. Since sc-27336 both
+    /// render dispatches (multi-phase + single-phase) build their options through the one
+    /// `turbo_options` literal.
     #[test]
     fn every_turbo_options_threads_the_request_scoped_memory_and_provider_id() {
         let body = generate_impl_source();
-        let mut count = 0usize;
-        let mut rest = body;
-        while let Some(at) = rest.find("TurboOptions {") {
-            let tail = &rest[at..];
-            let region = tail
-                .split_once("};")
-                .expect("TurboOptions literal must be terminated")
-                .0;
+        let literals: Vec<&str> = body
+            .match_indices("TurboOptions {")
+            .filter(|(at, _)| !body[..*at].ends_with("-> "))
+            .map(|(at, _)| {
+                body[at..]
+                    .split_once("\n        }")
+                    .expect("TurboOptions literal must be terminated")
+                    .0
+            })
+            .collect();
+        assert_eq!(
+            literals.len(),
+            1,
+            "one TurboOptions literal: `turbo_options`"
+        );
+        for region in literals {
             assert!(
                 region.contains("memory: req.memory.unwrap_or_default(),"),
                 "a TurboOptions literal drops the request-scoped memory: {region}"
@@ -2251,13 +2285,13 @@ mod tests {
                 region.contains("provider_id: self.descriptor.id,"),
                 "a TurboOptions literal drops the provider id: {region}"
             );
-            count += 1;
-            rest = &tail["TurboOptions {".len()..];
         }
-        assert_eq!(
-            count, 2,
-            "generate_impl builds one TurboOptions per render dispatch (multi-phase + single-phase)"
-        );
+        for dispatch in ["render_phase", "render_multiphase"] {
+            assert!(
+                fn_source(dispatch).contains("self.turbo_options("),
+                "{dispatch} must build its options through `turbo_options`"
+            );
+        }
     }
 
     #[test]
