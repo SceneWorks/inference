@@ -54,9 +54,8 @@ use std::path::Path;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost};
 use mlx_gen::gen_core::{self, BucketSchedule};
-use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint;
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, save_lokr, LoraParams, TrainAdapter,
@@ -69,6 +68,7 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
+use mlx_gen::train::trainer_loop::SAMPLE_PROMPT_CAP;
 use mlx_gen::train::vocab::{
     clamp_unit_timestep, normalize_cfg, sample_unit_timestep, validate_common_request,
 };
@@ -106,11 +106,6 @@ const SAVE_DTYPE: Dtype = Dtype::Bfloat16;
 /// ComfyUI adapter key prefix the official Anima LoRAs (and the sc-10521 inference loader) use —
 /// `diffusion_model.blocks.*` for the DiT, `diffusion_model.llm_adapter.blocks.*` for the conditioner.
 const KEY_PREFIX: &str = "diffusion_model.";
-
-/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-10641), matching
-/// z-image's cap; extra prompts beyond this are ignored (a preview is a quick convergence check, not a
-/// full sweep, and each one is an inference denoise on the live 2B DiT).
-const SAMPLE_PROMPT_CAP: usize = 4;
 
 // ==================================================================================================
 // Flow-match batch construction
@@ -981,18 +976,6 @@ fn intermediate_filename(file_name: &str, step: u32) -> String {
         .unwrap_or("safetensors");
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("adapter");
     format!("{stem}-step{step}.{ext}")
-}
-
-/// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
-fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = mlx_gen::gen_core::__model_input_result!(
-        image::open(path),
-        "crates/media/mlx-gen/mlx-gen-anima/src/training.rs::decode_image/image::open",
-        Reference,
-        &[path]
-    )
-    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    Ok(dynimg.to_rgb8().into())
 }
 
 /// Sample a normalised flow-match base timestep `σ ∈ [1e-3, 1−1e-3]` (a faithful port of the

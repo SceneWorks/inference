@@ -75,28 +75,32 @@ use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
 use mlx_gen::train::lora::{
-    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
-    build_lora_targets, factorization, LoraParams, TrainAdapter,
+    build_lokr_targets, build_lora_targets, factorization, LoraParams, TrainAdapter,
 };
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, step_sample, AuxDriver, Parameterization, PerceptualPath, StepPlan,
+    combine_step_loss, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
-use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::tae::TinyDecoderSpec;
-use mlx_gen::train::vocab::{normalize_cfg, sample_timestep, validate_common_request};
+use mlx_gen::train::trainer_loop::{
+    adapter_optimizer, adapter_stem, build_adapter, cache_items, draw_flow_step, ensure_cached,
+    flow_velocity_batch, largest_edge, mae_loss, render_preview_prompts, resolve_compute_dtype,
+    resolve_suffix_targets, run_train_loop, AdapterSaver, CheckpointAt, LoopStart, LossTypeFold,
+    PreviewLog, PreviewSink, TrainLoopFamily, SAMPLE_PROMPT_CAP,
+};
+use mlx_gen::train::vocab::validate_common_request;
 use mlx_gen::{
     CancelFlag, Error, Image, LoadSpec, Modality, NetworkType, Precision, Progress, Result,
     RgbaImage, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
     TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
-use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
+use mlx_rs::ops::{concatenate_axis, subtract};
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
-use mlx_rs::{random, Array, Dtype};
+use mlx_rs::{Array, Dtype};
 
 use crate::config::{
     SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
@@ -133,9 +137,6 @@ pub const TRAINER_ID: &str = "qwen_image_2_1";
 /// The LoKr delta-reconstruction dtype — what the shared inference loader reconstructs LyCORIS
 /// deltas at (bf16), so a trained LoKr round-trips through the sc-24156 apply path.
 const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
-
-/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence.
-const SAMPLE_PROMPT_CAP: usize = 4;
 
 /// Provenance + licence stamped into every saved adapter's `__metadata__` (final and
 /// intermediate, LoRA and LoKr), alongside the shared `networkType`/`rank`/`alpha` reload contract.
@@ -930,40 +931,17 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
-/// `bf16`/`bfloat16` → bf16 mixed precision (the default); anything else → f32 (the contract's
-/// "unrecognized values mean f32").
-fn resolve_compute_dtype(train_dtype: &str) -> Dtype {
-    let t = train_dtype.trim();
-    if t.eq_ignore_ascii_case("bf16") || t.eq_ignore_ascii_case("bfloat16") {
-        Dtype::Bfloat16
-    } else {
-        Dtype::Float32
-    }
-}
-
 /// Resolve the config's target-module *suffixes* to full dotted paths on the sc-24156 host. The
 /// DEFAULT (empty `lora_target_modules`) is every [`BLOCK_ADAPTER_TARGETS`] Linear of every
 /// transformer block; an explicit list suffix-matches anywhere — PEFT's `target_modules` rule —
 /// including the [`GLOBAL_ADAPTER_TARGETS`](crate::GLOBAL_ADAPTER_TARGETS).
 fn resolve_target_paths(transformer: &QwenImage21Transformer, cfg: &TrainingConfig) -> Vec<String> {
-    let default = cfg.lora_target_modules.is_empty();
-    let suffixes: Vec<String> = if default {
-        BLOCK_ADAPTER_TARGETS
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        cfg.lora_target_modules.clone()
-    };
-    AdaptableHost::adaptable_paths(transformer)
-        .into_iter()
-        .filter(|path| {
-            (!default || path.starts_with("transformer_blocks."))
-                && suffixes
-                    .iter()
-                    .any(|s| path == s || path.ends_with(&format!(".{s}")))
-        })
-        .collect()
+    resolve_suffix_targets(
+        AdaptableHost::adaptable_paths(transformer),
+        cfg,
+        &BLOCK_ADAPTER_TARGETS,
+        Some("transformer_blocks."),
+    )
 }
 
 /// Split the trainable factors by transformer block for the gradient-checkpointed forward: per
@@ -1025,19 +1003,6 @@ fn block_trainables(
         });
     }
     Ok(out)
-}
-
-/// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
-fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = mlx_gen::gen_core::__model_input_reader!(
-image::open(path),
-"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::decode_image::image::open@51854",
-Reference,
-path,
-|__model_input_path| image::open(__model_input_path)
-)
-    .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    Ok(dynimg.to_rgb8().into())
 }
 
 /// Decode a reference image file as RGBA8 — upstream's `img.convert("RGBA")`: an RGB file is the
@@ -1435,19 +1400,9 @@ fn caption_tokens(tokenizer: &TextTokenizer, drop: usize, caption: &str) -> Resu
     Ok(tokens.ids.len().saturating_sub(drop) as u64)
 }
 
-/// `(x_t, target)` for one sample at flow-match `t`: `x_t = (1−t)·x0 + t·noise`,
-/// `target = noise − x0` (the velocity the DiT predicts; see the module docs).
-fn build_batch(x0: &Array, noise: &Array, t: f32) -> Result<(Array, Array)> {
-    let one_minus = Array::from_slice(&[1.0 - t], &[1]);
-    let s = Array::from_slice(&[t], &[1]);
-    let x_t = add(&multiply(x0, &one_minus)?, &multiply(noise, &s)?)?;
-    let target = subtract(noise, x0)?;
-    Ok((x_t, target))
-}
-
 #[cfg(test)]
 pub(crate) fn diagnostic_midpoint_batch(x0: &Array, noise: &Array) -> Result<(Array, Array)> {
-    build_batch(x0, noise, 0.5)
+    flow_velocity_batch(x0, noise, 0.5)
 }
 
 /// The per-step inputs of one loss evaluation.
@@ -1559,7 +1514,7 @@ fn compute_step_loss_grads(
     step: &StepInputs<'_>,
     aux: Option<AuxStep<'_>>,
 ) -> Result<(StepLosses, LoraParams)> {
-    let (x_t_f32, target) = build_batch(step.x0, step.noise, step.t)?;
+    let (x_t_f32, target) = flow_velocity_batch(step.x0, step.noise, step.t)?;
     let mask_weight = step.mask_weight.cloned();
     let x_t = x_t_f32.as_dtype(spec.dtype)?;
     let (diffusion_on, aux_on) = match &aux {
@@ -1723,26 +1678,11 @@ fn run_train_step(
     perceptual: Option<&mut AuxDriver>,
     step: u32,
 ) -> Result<(StepLosses, LoraParams)> {
-    let sample = step_sample(perceptual, step, schedule);
-    let item = &cache[sample.entry];
-    let mut t = sample_timestep(
-        &cfg.timestep_type,
-        &cfg.timestep_bias,
-        cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-    )?;
-    let noise = random::normal::<f32>(
-        item.x0.shape(),
-        None,
-        None,
-        Some(&random::key(
-            cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-        )?),
-    )?;
-    let planned = sample.plan(t)?;
-    if let Some(p) = &planned {
-        t = p.plan.noise_level;
-    }
-    let aux = planned.as_ref().map(|p| AuxStep {
+    let draw = draw_flow_step(perceptual, step, schedule, cfg, |entry| {
+        cache[entry].x0.shape()
+    })?;
+    let item = &cache[draw.entry];
+    let aux = draw.aux.as_ref().map(|p| AuxStep {
         path: p.path,
         plan: &p.plan,
         entry: p.entry,
@@ -1756,8 +1696,8 @@ fn run_train_step(
             text: &item.text,
             layout: &item.layout,
             references: &item.references,
-            noise: &noise,
-            t,
+            noise: &draw.noise,
+            t: draw.t,
             mask_weight: item.mask_weight.as_ref(),
         },
         aux,
@@ -1925,17 +1865,184 @@ impl Trainer for QwenImage21Trainer {
     }
 }
 
+/// The request-derived setup every phase of one [`QwenImage21Trainer::train_impl`] run reads.
+struct RunPlan<'r> {
+    req: &'r TrainingRequest,
+    /// Whether this is an edit-pair run (sc-24161).
+    edit: bool,
+    /// The vision tower geometry an edit run loads (`None` for text-to-image).
+    vision: Option<VisionConfig>,
+    target_paths: Vec<String>,
+    compute_dtype: Dtype,
+    /// bf16 mixed precision: the folded LoRA residual joins the bf16 activation stream (else every
+    /// adapted Linear silently re-promotes the chain to f32). f32 → no cast.
+    lora_dtype: Option<Dtype>,
+    checkpointed: bool,
+    sampling_requested: bool,
+    /// The capped preview prompts (empty when sampling is off).
+    sample_prompts: Vec<String>,
+    /// sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+    /// off). Every item trains at each edge; the preflight and the previews size for the largest
+    /// (epic 2123 E7).
+    edges: Vec<u32>,
+    edge: u32,
+}
+
+/// The resume admission (sc-24163): the run's adapter stem, its dataset fingerprint, and the
+/// snapshot it continues from (already identity- and mode-checked).
+struct ResumeAdmission {
+    stem: String,
+    fingerprint: String,
+    resume_from: Option<(PathBuf, u32)>,
+}
+
+/// Every caption the run needs, encoded once: one `Vec` of per-edge branches per item (in `edges`
+/// order), the preview prompts' branches and the shared empty negative.
+type EncodedCaptions = (
+    Vec<Vec<JointBranch>>,
+    Vec<(String, JointBranch)>,
+    Option<JointBranch>,
+);
+
 impl QwenImage21Trainer {
-    /// The rich-`Result` body behind [`Trainer::train`].
+    /// The rich-`Result` body behind [`Trainer::train`]: plan → preflight → resume admission →
+    /// captions → latents → DiT → the shared [`run_train_loop`] over [`QwenLoop`], one heavy
+    /// component resident at a time.
     fn train_impl(
         &mut self,
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
         warnings: &mut Vec<gen_core::GenerationWarning>,
     ) -> Result<TrainingOutput> {
+        let plan = self.plan_run(req)?;
+        let cfg = &req.config;
+        on_progress(TrainingProgress::Preparing);
+
+        // --- preflight: the derived peak against this device, before any weight is read ---
+        let pool_bound = self.preflight(&plan)?;
+        training_memory_trace("pool_bound", None, Some(pool_bound.effective));
+        let pool = pool_bound.effective;
+
+        // --- resume admission, before any model loads ---
+        let admission = self.admit_resume(&plan)?;
+
+        // --- 1. captions: the Qwen3-VL tower, encoded ONCE, then dropped ---
+        on_progress(TrainingProgress::LoadingModel);
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let (branches, sample_caps, sample_neg) = self.encode_captions(&plan)?;
+        training_memory_trace("caption_tower_dropped_before_clear", None, Some(pool));
+        mlx_rs::memory::clear_cache();
+        training_memory_trace("caption_cache_cleared", None, Some(pool));
+
+        // --- 2. latents: the VAE encodes each image ONCE; the encoder half is then dropped ---
+        let (cache, vae, perceptual) =
+            self.cache_latents(&plan, branches, !sample_caps.is_empty(), pool, on_progress)?;
+
+        // --- 3. the dense DiT, at the training compute dtype ---
+        let mut transformer = loader::load_transformer(&self.root)?;
+        if transformer.is_quantized() {
+            return Err(quantized_base_refusal("the loaded DiT is packed"));
+        }
+        if transformer.compute_dtype() != plan.compute_dtype {
+            transformer.cast_weights(plan.compute_dtype)?;
+        }
+        training_memory_trace("dit_loaded", None, Some(pool));
+
+        // --- adapter targets + params (LoRA or LoKr) + optimizer ---
+        let (adapter, params) = build_adapter(&mut transformer, &plan.target_paths, cfg)?;
+        let blocks = if plan.checkpointed {
+            Some(block_trainables(
+                &mut transformer,
+                &plan.target_paths,
+                &params,
+                cfg,
+            )?)
+        } else {
+            None
+        };
+        let mae = mae_loss(&cfg.loss_type, LossTypeFold::Normalized);
+        let opt = adapter_optimizer(cfg)?;
+        let accum = cfg.gradient_accumulation.max(1);
+        let identity = checkpoint::ResumeIdentity {
+            config: cfg,
+            request_fingerprint: &admission.fingerprint,
+        };
+        let start = resume_admitted(&admission, identity, opt, params)?;
+
+        // Provenance + licence on every saved adapter; an edit adapter is also marked as one.
+        let provenance: Vec<(&str, &str)> = ADAPTER_PROVENANCE
+            .iter()
+            .copied()
+            .chain(plan.edit.then_some(EDIT_ADAPTER_MARKER))
+            .collect();
+        let spec = LossSpec {
+            adapter: &adapter,
+            alpha: cfg.alpha,
+            rank: cfg.rank as f32,
+            mae,
+            dtype: plan.compute_dtype,
+            lora_dtype: plan.lora_dtype,
+            checkpoint: blocks.as_deref(),
+        };
+
+        // --- train loop ---
+        // sc-2127: which cached (item, bucket) entry each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule = BucketSchedule::new(
+            cache.len() / plan.edges.len(),
+            &cfg.training_buckets(),
+            cfg.seed,
+        );
+        // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
+        // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
+        // replay.
+        let aux = match perceptual {
+            Some(path) => Some(aux_driver(
+                path,
+                &cache,
+                &schedule,
+                accum,
+                &Default::default(),
+            )?),
+            None => None,
+        };
+        let mut family = QwenLoop {
+            transformer: &mut transformer,
+            req,
+            saver: AdapterSaver {
+                adapter: &adapter,
+                cfg,
+                provenance: &provenance,
+            },
+            spec: &spec,
+            identity,
+            cache: &cache,
+            schedule: &schedule,
+            aux,
+            vae: vae.as_ref(),
+            scheduler: &self.scheduler,
+            sample_caps: &sample_caps,
+            sample_neg: sample_neg.as_ref(),
+            edit: plan.edit,
+            edge: plan.edge,
+            pool,
+        };
+        run_train_loop(
+            &mut family,
+            req,
+            &admission.stem,
+            start,
+            on_progress,
+            warnings,
+        )
+    }
+
+    /// The run's floors and request-derived setup. Edit mode is a different training input, so
+    /// its floor is re-checked here rather than trusted to a prior `validate` call.
+    fn plan_run<'r>(&self, req: &'r TrainingRequest) -> Result<RunPlan<'r>> {
         validate_request(req)?;
-        // Edit mode is a different training input, so its floor is re-checked here rather than
-        // trusted to a prior `validate` call.
         gen_core::train::validate_edit_request(&self.descriptor, req)?;
         let edit = req.items.iter().any(TrainingItem::is_edit_pair);
         let vision = if edit {
@@ -1954,10 +2061,6 @@ impl QwenImage21Trainer {
             .into());
         }
         let compute_dtype = resolve_compute_dtype(&cfg.train_dtype);
-        // bf16 mixed precision: the folded LoRA residual joins the bf16 activation stream (else
-        // every adapted Linear silently re-promotes the chain to f32). f32 → no cast.
-        let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
-        let checkpointed = cfg.gradient_checkpointing;
         let sampling_requested = cfg.sample_every > 0 && !cfg.sample_prompts.is_empty();
         let sample_prompts: Vec<String> = if sampling_requested {
             cfg.sample_prompts
@@ -1968,17 +2071,30 @@ impl QwenImage21Trainer {
         } else {
             Vec::new()
         };
-
-        on_progress(TrainingProgress::Preparing);
-        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
-        // off). Every item trains at each edge; the preflight and the previews size for the
-        // largest (epic 2123 E7).
         let edges = bucket_edges(cfg);
-        let edge = edges.iter().copied().max().unwrap_or(0);
+        let edge = largest_edge(&edges);
+        Ok(RunPlan {
+            req,
+            edit,
+            vision,
+            target_paths,
+            compute_dtype,
+            lora_dtype: (compute_dtype != Dtype::Float32).then_some(compute_dtype),
+            checkpointed: cfg.gradient_checkpointing,
+            sampling_requested,
+            sample_prompts,
+            edges,
+            edge,
+        })
+    }
 
-        // --- preflight: the derived peak against this device, before any weight is read ---
+    /// The derived peak of every prompt the run encodes (dataset items, previews and the empty
+    /// negative) against this device's budget, refused before any weight is read; then the pool
+    /// bound for the rest of the run.
+    fn preflight(&mut self, plan: &RunPlan<'_>) -> Result<TrainingPoolBound> {
+        let (req, cfg, edge) = (plan.req, &plan.req.config, plan.edge);
         // Edit previews condition on the first item's references (see `render_sample`).
-        let sample_reference_paths: &[PathBuf] = if edit {
+        let sample_reference_paths: &[PathBuf] = if plan.edit {
             &req.items[0].reference_image_paths
         } else {
             &[]
@@ -1987,7 +2103,7 @@ impl QwenImage21Trainer {
         let (mut reference_tokens, mut largest_reference_tokens, mut reference_cache_tokens) =
             (0u64, 0u64, 0u64);
         let (largest_target_tokens, target_cache_tokens) =
-            bucketed_target_tokens(&req.items, &edges)?;
+            bucketed_target_tokens(&req.items, &plan.edges)?;
         let mut prefix_scores = 0u64;
         let mut largest_prefix_call = 0u64;
         let mut prompts: Vec<PreflightPrompt<'_>> = Vec::new();
@@ -2001,15 +2117,15 @@ impl QwenImage21Trainer {
         }
         // Previews render square at `edge²`, the positive prompts and the empty negative alike.
         prompts.extend(
-            sample_prompts
+            plan.sample_prompts
                 .iter()
                 .map(|prompt| (prompt.as_str(), sample_reference_paths, (edge, edge), false)),
         );
-        if sampling_requested {
+        if plan.sampling_requested {
             prompts.push(("", sample_reference_paths, (edge, edge), false));
         }
         for (text, reference_paths, size, cached) in prompts {
-            let tokens = match vision.as_ref() {
+            let tokens = match plan.vision.as_ref() {
                 Some(vision) => {
                     let (text_tokens, sum, largest) = edit_prompt_tokens(
                         &self.tokenizer,
@@ -2046,7 +2162,7 @@ impl QwenImage21Trainer {
             longest = longest.max(tokens);
         }
         let (trainable_params, lokr_delta_elements) =
-            adapter_elements(&mut self.probe, &target_paths, cfg)?;
+            adapter_elements(&mut self.probe, &plan.target_paths, cfg)?;
         let shape = TrainingShape {
             edge,
             target_tokens: largest_target_tokens,
@@ -2058,7 +2174,7 @@ impl QwenImage21Trainer {
             prefix_scores,
             largest_prefix_call,
             items: req.items.len() as u64,
-            compute_width: if compute_dtype == Dtype::Float32 {
+            compute_width: if plan.compute_dtype == Dtype::Float32 {
                 4
             } else {
                 2
@@ -2066,15 +2182,31 @@ impl QwenImage21Trainer {
             trainable_params,
             optimizer_state_per_param: optimizer_state_per_param(&cfg.optimizer),
             lokr_delta_elements,
-            checkpointed,
-            sampling: sampling_requested,
+            checkpointed: plan.checkpointed,
+            sampling: plan.sampling_requested,
             aux_model_bytes: perceptual_footprint_bytes(
                 cfg,
                 edge,
                 largest_target_tokens,
-                req.items.len() * edges.len(),
+                req.items.len() * plan.edges.len(),
             ),
         };
+        self.check_preflight_shape(&shape, cfg)
+    }
+
+    /// Refuse `shape` against the device budget, then bound MLX's freed-buffer pool for the rest
+    /// of the run to the derived working set above the DiT. Unbounded, the allocator pools every
+    /// freed buffer up to ~0.95 x the device's recommended working set, so the process footprint
+    /// the OS sees climbs to that pool line whatever the run needs (the first real-weight edit run
+    /// crossed the evidence lane's 100 GB phys_footprint ceiling). The render path bounds the pool
+    /// per request the same way (`memory_strategy::AllocatorBounds`, sc-24114); training bounds
+    /// ONLY the cache, never MLX's memory limit, so a figure the derived model rounds can never
+    /// throttle a step.
+    fn check_preflight_shape(
+        &self,
+        shape: &TrainingShape,
+        cfg: &TrainingConfig,
+    ) -> Result<TrainingPoolBound> {
         let budget = self
             .memory_budget_override
             .unwrap_or_else(device_budget_bytes);
@@ -2082,60 +2214,37 @@ impl QwenImage21Trainer {
             eprintln!(
                 "training-shape {shape:?} facts {:#?} footprint {:?}",
                 self.facts,
-                training_footprint(&self.facts, &shape)
+                training_footprint(&self.facts, shape)
             );
         }
-        let derived = training_footprint(&self.facts, &shape);
+        let derived = training_footprint(&self.facts, shape);
+        let above_dit = derived
+            .train_phase
+            .saturating_sub(self.facts.dit_elements * shape.compute_width)
+            .max(1 << 30);
         training_memory_trace(
             "preflight",
             Some(derived),
-            Some(
-                usize::try_from(
-                    derived
-                        .train_phase
-                        .saturating_sub(self.facts.dit_elements * shape.compute_width)
-                        .max(1 << 30),
-                )
-                .unwrap_or(usize::MAX),
-            ),
+            Some(usize::try_from(above_dit).unwrap_or(usize::MAX)),
         );
         check_training_footprint_with(
             &self.facts,
-            &shape,
+            shape,
             budget,
             &gen_core::train::enabled_aux_losses(cfg),
         )?;
-        // Bound MLX's freed-buffer pool for the rest of the run to the derived working set above
-        // the DiT. Unbounded, the allocator pools every freed buffer up to ~0.95 x the device's
-        // recommended working set, so the process footprint the OS sees climbs to that pool line
-        // whatever the run needs (the first real-weight edit run crossed the evidence lane's
-        // 100 GB phys_footprint ceiling). The render path bounds the pool per request the same way
-        // (`memory_strategy::AllocatorBounds`, sc-24114); training bounds ONLY the cache, never
-        // MLX's memory limit, so a figure the derived model rounds can never throttle a step.
-        let _pool = TrainingPoolBound::enter(
-            derived
-                .train_phase
-                .saturating_sub(self.facts.dit_elements * shape.compute_width)
-                .max(1 << 30),
-        );
-        training_memory_trace("pool_bound", None, Some(_pool.effective));
+        Ok(TrainingPoolBound::enter(above_dit))
+    }
 
-        // --- resume admission, before any model loads ---
-        // The run's identity (sc-24163): its training config and its dataset fingerprint (item
-        // order, captions, image / ordered reference paths and contents). Every resume bundle
-        // records it, and a resume whose config, dataset or training mode changed is refused HERE —
-        // from the snapshot's metadata alone, right after the preflight, as the candle twin does —
-        // so a refused resume never pays the text-encoder / VAE caching pass.
-        let stem = Path::new(&req.file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("lora")
-            .to_string();
+    /// The run's identity (sc-24163): its training config and its dataset fingerprint (item
+    /// order, captions, image / ordered reference paths and contents). Every resume bundle
+    /// records it, and a resume whose config, dataset or training mode changed is refused HERE —
+    /// from the snapshot's metadata alone, right after the preflight, as the candle twin does —
+    /// so a refused resume never pays the text-encoder / VAE caching pass.
+    fn admit_resume(&self, plan: &RunPlan<'_>) -> Result<ResumeAdmission> {
+        let (req, cfg) = (plan.req, &plan.req.config);
+        let stem = adapter_stem(&req.file_name, "lora");
         let fingerprint = checkpoint::request_fingerprint(req)?;
-        let identity = checkpoint::ResumeIdentity {
-            config: cfg,
-            request_fingerprint: &fingerprint,
-        };
         let resume_from = if cfg.resume {
             checkpoint::find_latest_resume(&req.output_dir, &stem)
         } else {
@@ -2145,7 +2254,10 @@ impl QwenImage21Trainer {
             let meta = gen_core::weightsmeta::safetensors_file_metadata(
                 req.output_dir.join(checkpoint_filename(&stem, *step)),
             )?;
-            check_resumed_mode(meta.get(EDIT_ADAPTER_MARKER.0).map(String::as_str), edit)?;
+            check_resumed_mode(
+                meta.get(EDIT_ADAPTER_MARKER.0).map(String::as_str),
+                plan.edit,
+            )?;
             checkpoint::check_resume_fingerprints(
                 &gen_core::weightsmeta::safetensors_file_metadata(snapshot)?
                     .into_iter()
@@ -2154,82 +2266,94 @@ impl QwenImage21Trainer {
                 &fingerprint,
             )?;
         }
+        Ok(ResumeAdmission {
+            stem,
+            fingerprint,
+            resume_from,
+        })
+    }
 
-        // --- 1. captions: the Qwen3-VL tower, encoded ONCE, then dropped ---
-        // Every prompt goes through the render path's own assembly: references preprocessed by
-        // `prepare_conditioning_references`, the (image-conditioned, for edit) template encoded by
-        // `encode_conditioning`, then `joint_branch` → the text rows + joint layout the DiT sees.
-        // A captioned item has no references, so this is the text-to-image conditioning exactly.
-        // An edit run loads the vision tower too (its references are vision context).
-        on_progress(TrainingProgress::LoadingModel);
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let (branches, sample_caps, sample_neg) = {
-            let encoder: QwenImage21TextEncoder =
-                loader::load_text_encoder_from(&self.root.join("text_encoder"), vision.as_ref())?;
-            // Previews render square (`render_sample`), so their branches assemble at `edge²`.
-            let encode = |prompt: &str, references: &[PreparedReference]| {
-                encode_branch(
-                    &encoder,
-                    &self.tokenizer,
-                    self.drop_count,
-                    prompt,
-                    references,
-                    (edge, edge),
-                )
-            };
-            // One `Vec` of per-edge branches per item (sc-2127), in `edges` order.
-            let mut branches: Vec<Vec<JointBranch>> = Vec::with_capacity(req.items.len());
-            let mut sample_references = Vec::new();
-            for (i, item) in req.items.iter().enumerate() {
-                if req.cancel.is_cancelled() {
-                    return Err(Error::Canceled);
-                }
-                let (item_edges, references) =
-                    item_branches(&encoder, &self.tokenizer, self.drop_count, item, &edges)?;
-                branches.push(item_edges);
-                if i == 0 && edit && sampling_requested {
-                    sample_references = references;
-                }
-            }
-            let mut sample_caps: Vec<(String, JointBranch)> =
-                Vec::with_capacity(sample_prompts.len());
-            for prompt in &sample_prompts {
-                sample_caps.push((prompt.clone(), encode(prompt, &sample_references)?));
-            }
-            let sample_neg = if sample_caps.is_empty() {
-                None
-            } else {
-                Some(encode("", &sample_references)?)
-            };
-            (branches, sample_caps, sample_neg)
-            // `encoder` drops here: every caption is cached, the tower is idle from now on.
+    /// Every prompt goes through the render path's own assembly: references preprocessed by
+    /// `prepare_conditioning_references`, the (image-conditioned, for edit) template encoded by
+    /// `encode_conditioning`, then `joint_branch` → the text rows + joint layout the DiT sees.
+    /// A captioned item has no references, so this is the text-to-image conditioning exactly.
+    /// An edit run loads the vision tower too (its references are vision context). The tower
+    /// drops on return: every caption is cached, it is idle from then on.
+    fn encode_captions(&self, plan: &RunPlan<'_>) -> Result<EncodedCaptions> {
+        let req = plan.req;
+        let encoder: QwenImage21TextEncoder =
+            loader::load_text_encoder_from(&self.root.join("text_encoder"), plan.vision.as_ref())?;
+        // Previews render square (`render_sample`), so their branches assemble at `edge²`.
+        let encode = |prompt: &str, references: &[PreparedReference]| {
+            encode_branch(
+                &encoder,
+                &self.tokenizer,
+                self.drop_count,
+                prompt,
+                references,
+                (plan.edge, plan.edge),
+            )
         };
-        training_memory_trace(
-            "caption_tower_dropped_before_clear",
-            None,
-            Some(_pool.effective),
-        );
-        mlx_rs::memory::clear_cache();
-        training_memory_trace("caption_cache_cleared", None, Some(_pool.effective));
-
-        // --- 2. latents: the VAE encodes each image ONCE; the encoder half is then dropped ---
-        let mut vae = loader::load_vae(&self.root)?;
-        let total = req.items.len() as u32;
-        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). An item's bucket entries
-        // share its text rows and reference latents (refcounted clones).
-        let mut cache: Vec<CachedItem> = Vec::with_capacity(req.items.len() * edges.len());
-        for (i, (item, per_edge)) in req.items.iter().zip(branches).enumerate() {
+        // One `Vec` of per-edge branches per item (sc-2127), in `edges` order.
+        let mut branches: Vec<Vec<JointBranch>> = Vec::with_capacity(req.items.len());
+        let mut sample_references = Vec::new();
+        for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
-                break;
+                return Err(Error::Canceled);
             }
-            on_progress(TrainingProgress::Caching {
-                current: i as u32 + 1,
-                total,
-            });
-            let targets = encode_item_targets(&vae, item, &edges, cfg.subject_mask_loss.as_ref())?;
-            let references = encode_item_references(&vae, vision.as_ref(), item)?;
+            let (item_edges, references) = item_branches(
+                &encoder,
+                &self.tokenizer,
+                self.drop_count,
+                item,
+                &plan.edges,
+            )?;
+            branches.push(item_edges);
+            if i == 0 && plan.edit && plan.sampling_requested {
+                sample_references = references;
+            }
+        }
+        let mut sample_caps: Vec<(String, JointBranch)> =
+            Vec::with_capacity(plan.sample_prompts.len());
+        for prompt in &plan.sample_prompts {
+            sample_caps.push((prompt.clone(), encode(prompt, &sample_references)?));
+        }
+        let sample_neg = if sample_caps.is_empty() {
+            None
+        } else {
+            Some(encode("", &sample_references)?)
+        };
+        Ok((branches, sample_caps, sample_neg))
+    }
+
+    /// The VAE encodes each item's target (per bucket edge) and references ONCE, then its encoder
+    /// half drops (the decoder stays only when previews render); the frozen aux models load and
+    /// take the job's subject masks. Item-major: `cache[item * edges.len() + bucket]` (sc-2127) —
+    /// an item's bucket entries share its text rows and reference latents (refcounted clones).
+    #[allow(clippy::type_complexity)]
+    fn cache_latents(
+        &self,
+        plan: &RunPlan<'_>,
+        branches: Vec<Vec<JointBranch>>,
+        previews: bool,
+        pool: usize,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> Result<(
+        Vec<CachedItem>,
+        Option<QwenImage21Vae>,
+        Option<PerceptualPath>,
+    )> {
+        let (req, cfg) = (plan.req, &plan.req.config);
+        let mut vae = loader::load_vae(&self.root)?;
+        let mut cache: Vec<CachedItem> = Vec::with_capacity(req.items.len() * plan.edges.len());
+        let mut branches = branches.into_iter();
+        cache_items(req, on_progress, |item| {
+            let per_edge = branches
+                .next()
+                .expect("one encoded branch set per dataset item");
+            let targets =
+                encode_item_targets(&vae, item, &plan.edges, cfg.subject_mask_loss.as_ref())?;
+            let references = encode_item_references(&vae, plan.vision.as_ref(), item)?;
             eval(
                 targets
                     .iter()
@@ -2245,15 +2369,11 @@ impl QwenImage21Trainer {
                     references: references.clone(),
                 });
             }
-        }
-        if cache.is_empty() {
-            if req.cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            return Err(format!("{TRAINER_ID} trainer: no usable dataset items").into());
-        }
+            Ok(())
+        })?;
+        ensure_cached(cache.len(), &req.cancel, &format!("{TRAINER_ID} trainer"))?;
         vae.drop_encoder();
-        let vae: Option<QwenImage21Vae> = (!sample_caps.is_empty()).then_some(vae);
+        let vae: Option<QwenImage21Vae> = previews.then_some(vae);
         // Epic 2123 depth anchoring: load the frozen TAEQI2.1 decoder + aux models (small — they
         // stay resident through training; priced in the preflight's train phase); the `AuxDriver`
         // computes each (item, bucket) entry's reference ONCE, before the loop. A missing
@@ -2267,7 +2387,7 @@ impl QwenImage21Trainer {
                     &format!("{TRAINER_ID} trainer"),
                     &req.items,
                     cfg,
-                    edges.len(),
+                    plan.edges.len(),
                     |item| {
                         if item.is_edit_pair() {
                             CropBox::full
@@ -2278,298 +2398,184 @@ impl QwenImage21Trainer {
                 )?,
             );
         }
-        training_memory_trace(
-            "vae_encoder_dropped_before_clear",
-            None,
-            Some(_pool.effective),
-        );
+        training_memory_trace("vae_encoder_dropped_before_clear", None, Some(pool));
         mlx_rs::memory::clear_cache();
-        training_memory_trace("latent_cache_cleared", None, Some(_pool.effective));
+        training_memory_trace("latent_cache_cleared", None, Some(pool));
         // Cancelled during caching: nothing has trained, so write nothing (and skip the DiT load).
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        Ok((cache, vae, perceptual))
+    }
+}
 
-        // --- 3. the dense DiT, at the training compute dtype ---
-        let mut transformer = loader::load_transformer(&self.root)?;
-        if transformer.is_quantized() {
-            return Err(quantized_base_refusal("the loaded DiT is packed"));
-        }
-        if transformer.compute_dtype() != compute_dtype {
-            transformer.cast_weights(compute_dtype)?;
-        }
-        training_memory_trace("dit_loaded", None, Some(_pool.effective));
+/// Continue from the snapshot admitted by [`QwenImage21Trainer::admit_resume`] (identity + mode
+/// already checked; `load_resume_with_identity` re-checks the identity against the bundle it
+/// restores), else a fresh start.
+fn resume_admitted(
+    admission: &ResumeAdmission,
+    identity: checkpoint::ResumeIdentity<'_>,
+    mut opt: TrainOptimizer,
+    params: LoraParams,
+) -> Result<LoopStart> {
+    let Some((snapshot, _)) = &admission.resume_from else {
+        return Ok(LoopStart::fresh(opt, params));
+    };
+    let (loaded, meta) = checkpoint::load_resume_with_identity(snapshot, &mut opt, identity)?;
+    check_resumed_params(&params, &loaded)?;
+    Ok(LoopStart {
+        opt,
+        params: loaded,
+        start_step: meta.step,
+        update_idx: meta.update_idx,
+    })
+}
 
-        // --- adapter targets + params (LoRA or LoKr) + optimizer ---
-        let rank = cfg.rank as f32;
-        let alpha = cfg.alpha;
-        let (adapter, mut params) = match cfg.network_type {
-            NetworkType::Lora => {
-                let (targets, params) =
-                    build_lora_targets(&mut transformer, &target_paths, cfg.rank as i32, cfg.seed)?;
-                (TrainAdapter::Lora { targets }, params)
-            }
-            NetworkType::Lokr => {
-                let (targets, params) = build_lokr_targets(
-                    &mut transformer,
-                    &target_paths,
-                    cfg.rank as i32,
-                    cfg.decompose_factor,
-                    cfg.seed,
-                )?;
-                (TrainAdapter::Lokr { targets }, params)
-            }
-        };
-        let blocks = if checkpointed {
-            Some(block_trainables(
-                &mut transformer,
-                &target_paths,
-                &params,
-                cfg,
-            )?)
-        } else {
-            None
-        };
-        let mae = matches!(normalize_cfg(&cfg.loss_type).as_str(), "mae" | "l1");
-        // AdamW with wd = 0 is Adam, so the one optimizer covers both choices.
-        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
-            0.0
-        } else {
-            cfg.weight_decay
-        };
-        let mut opt = TrainOptimizer::from_config(&cfg.optimizer, cfg.learning_rate, weight_decay)?;
-        let accum = cfg.gradient_accumulation.max(1);
-        let (total_updates, warmup_updates) =
-            schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
+/// Qwen-Image 2.1's [`TrainLoopFamily`]: [`run_train_step`] over the joint sequence, the adapter
+/// checkpoints (resume bundles only on update boundaries), the memory-trace stage marks, and the
+/// (edit-conditioned) previews.
+struct QwenLoop<'a> {
+    transformer: &'a mut QwenImage21Transformer,
+    req: &'a TrainingRequest,
+    saver: AdapterSaver<'a>,
+    spec: &'a LossSpec<'a>,
+    identity: checkpoint::ResumeIdentity<'a>,
+    cache: &'a [CachedItem],
+    schedule: &'a BucketSchedule,
+    aux: Option<AuxDriver>,
+    vae: Option<&'a QwenImage21Vae>,
+    scheduler: &'a SchedulerConfig,
+    sample_caps: &'a [(String, JointBranch)],
+    sample_neg: Option<&'a JointBranch>,
+    edit: bool,
+    edge: u32,
+    /// The run's effective pool bound, recorded by every memory-trace stage.
+    pool: usize,
+}
 
-        // --- resume: continue from the snapshot admitted above (identity + mode already checked;
-        // `load_resume_with_identity` re-checks the identity against the bundle it restores) ---
-        let mut update_idx: u32 = 0;
-        let mut start_step: u32 = 0;
-        if let Some((snapshot, _)) = &resume_from {
-            let (loaded, meta) =
-                checkpoint::load_resume_with_identity(snapshot, &mut opt, identity)?;
-            check_resumed_params(&params, &loaded)?;
-            params = loaded;
-            start_step = meta.step;
-            update_idx = meta.update_idx;
-        }
-
-        // Provenance + licence on every saved adapter; an edit adapter is also marked as one.
-        let provenance: Vec<(&str, &str)> = ADAPTER_PROVENANCE
-            .iter()
-            .copied()
-            .chain(edit.then_some(EDIT_ADAPTER_MARKER))
-            .collect();
-
-        let spec = LossSpec {
-            adapter: &adapter,
-            alpha,
-            rank,
-            mae,
-            dtype: compute_dtype,
-            lora_dtype,
-            checkpoint: blocks.as_deref(),
-        };
-
-        // --- train loop ---
-        // sc-2127: which cached (item, bucket) entry each step trains on (round-robin over items
-        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
-        let schedule =
-            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
-        // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
-        // replay.
-        let mut aux_driver = match perceptual {
-            Some(path) => Some(aux_driver(
-                path,
-                &cache,
-                &schedule,
-                accum,
-                &Default::default(),
-            )?),
-            None => None,
-        };
-        let mut accumulated: Option<LoraParams> = None;
-        let mut last_loss = 0.0f32;
-        let mut steps_run = start_step;
-        for step in start_step + 1..=cfg.steps {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            training_memory_trace(&format!("step_{step}_begin"), None, Some(_pool.effective));
-            let (losses, grads) = run_train_step(
-                &mut transformer,
-                &params,
-                &spec,
-                cfg,
-                &cache,
-                &schedule,
-                aux_driver.as_mut(),
-                step,
-            )?;
-            last_loss = losses.total;
-            training_memory_trace(
-                &format!("step_{step}_gradients_returned"),
-                None,
-                Some(_pool.effective),
-            );
-            steps_run = step;
-            accumulate_grads(&mut accumulated, grads)?;
-
-            if step % accum == 0 || step == cfg.steps {
-                let mult =
-                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
-                opt.set_lr_scaled(mult);
-                // The final update can fire with fewer than `accum` grads; divide by the actual
-                // in-window count.
-                let window = if step % accum == 0 {
-                    accum
-                } else {
-                    step % accum
-                };
-                let avg = average_grads(
-                    accumulated
-                        .take()
-                        .expect("an update fires only after accumulation"),
-                    window,
-                )?;
-                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
-                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
-                update_idx += 1;
-            }
-
-            training_memory_trace(
-                &format!("step_{step}_before_progress"),
-                None,
-                Some(_pool.effective),
-            );
-            on_progress(TrainingProgress::Training {
-                step,
-                total: cfg.steps,
-                loss: last_loss,
-            });
-
-            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
-                std::fs::create_dir_all(&req.output_dir)?;
-                let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
-                adapter.save_with_meta(
-                    &params,
-                    alpha,
-                    rank,
-                    cfg.decompose_factor,
-                    "",
-                    &provenance,
-                    &ckpt,
-                )?;
-                // The resume bundle holds the factors + optimizer state, not the in-flight
-                // gradient-accumulation buffer, so it is written only on an optimizer-update
-                // boundary: resuming from it is then exact. A `save_every` that lands inside an
-                // accumulation window still writes the adapter checkpoint above, and the run
-                // resumes from the latest boundary snapshot instead of silently dropping the
-                // partial window's gradients.
-                if step % accum == 0 {
-                    checkpoint::save_resume_with_identity(
-                        &req.output_dir,
-                        &stem,
-                        step,
-                        update_idx,
-                        &opt,
-                        &params,
-                        identity,
-                    )?;
-                }
-                on_progress(TrainingProgress::Checkpoint { step });
-            }
-
-            // Periodic best-effort previews. The current factors install as CONCRETE adapters
-            // (evaluated arrays outside any trace), so the render builds no autograd graph; the
-            // next step's traced `loss_fn` re-installs them. A failure never aborts training.
-            if let (Some(vae), true) = (vae.as_ref(), step % cfg.sample_every.max(1) == 0) {
-                adapter.install_as(
-                    &mut transformer,
-                    &params,
-                    alpha,
-                    rank,
-                    lora_dtype,
-                    LOKR_DTYPE,
-                )?;
-                let total = sample_caps.len() as u32;
-                // Edit previews condition on the first item's cached reference latents.
-                let sample_reference_latents: &[Array] =
-                    if edit { &cache[0].references } else { &[] };
-                for (i, (prompt, pos)) in sample_caps.iter().enumerate() {
-                    if req.cancel.is_cancelled() {
-                        break;
-                    }
-                    let sample_seed = cfg
-                        .seed
-                        .wrapping_add(step as u64)
-                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
-                        .wrapping_add(i as u64);
-                    match render_sample(
-                        &transformer,
-                        vae,
-                        &self.scheduler,
-                        pos,
-                        sample_neg.as_ref(),
-                        sample_reference_latents,
-                        sample_seed,
-                        edge,
-                        cfg.sample_steps as usize,
-                        cfg.sample_guidance_scale,
-                        &req.cancel,
-                    ) {
-                        Ok(image) => on_progress(TrainingProgress::Sample {
-                            step,
-                            index: i as u32 + 1,
-                            total,
-                            prompt: prompt.clone(),
-                            image,
-                        }),
-                        Err(Error::Canceled) => break,
-                        Err(e) => {
-                            eprintln!(
-                                "[sc-24159] {TRAINER_ID} preview sample failed at step {step} \
-                                 (prompt {}): {e} — skipping this preview, training continues",
-                                i + 1
-                            );
-                            warnings.push(gen_core::train::preview_sample_failed(
-                                step,
-                                i as u32 + 1,
-                                &e,
-                            ));
-                        }
-                    }
-                }
-                mlx_rs::memory::clear_cache();
-            }
-        }
-
-        // Cancelled before a single step completed: the factors are still the no-op init. Surface
-        // the cancellation rather than writing a valid-looking identity adapter.
-        if steps_run == 0 {
-            return Err(Error::Canceled);
-        }
-
-        // --- save the final adapter (PEFT keys + reload contract + provenance/licence) ---
-        on_progress(TrainingProgress::Saving);
-        std::fs::create_dir_all(&req.output_dir)?;
-        let adapter_path = req.output_dir.join(&req.file_name);
-        adapter.save_with_meta(
-            &params,
-            alpha,
-            rank,
-            cfg.decompose_factor,
-            "",
-            &provenance,
-            &adapter_path,
+impl TrainLoopFamily for QwenLoop<'_> {
+    fn micro_step(&mut self, step: u32, params: &LoraParams) -> Result<(f32, LoraParams)> {
+        let (losses, grads) = run_train_step(
+            self.transformer,
+            params,
+            self.spec,
+            &self.req.config,
+            self.cache,
+            self.schedule,
+            self.aux.as_mut(),
+            step,
         )?;
-        Ok(TrainingOutput {
-            adapter_path,
-            steps: steps_run,
-            final_loss: last_loss,
-        })
+        Ok((losses.total, grads))
+    }
+
+    fn begin_step(&mut self, step: u32) {
+        training_memory_trace(&format!("step_{step}_begin"), None, Some(self.pool));
+    }
+
+    fn after_micro_step(&mut self, step: u32) {
+        training_memory_trace(
+            &format!("step_{step}_gradients_returned"),
+            None,
+            Some(self.pool),
+        );
+    }
+
+    fn before_progress(&mut self, step: u32) {
+        training_memory_trace(
+            &format!("step_{step}_before_progress"),
+            None,
+            Some(self.pool),
+        );
+    }
+
+    /// The adapter checkpoint, then — only on an optimizer-update boundary — the resume bundle.
+    /// The bundle holds the factors + optimizer state, not the in-flight gradient-accumulation
+    /// buffer, so resuming from it is then exact. A `save_every` that lands inside an
+    /// accumulation window still writes the adapter checkpoint, and the run resumes from the
+    /// latest boundary snapshot instead of silently dropping the partial window's gradients.
+    fn save_checkpoint(&mut self, at: CheckpointAt<'_>) -> Result<()> {
+        self.saver.save_checkpoint_adapter(&at)?;
+        if at.step.is_multiple_of(at.accum) {
+            checkpoint::save_resume_with_identity(
+                at.output_dir,
+                at.stem,
+                at.step,
+                at.update_idx,
+                at.opt,
+                at.params,
+                self.identity,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn previews_enabled(&self) -> bool {
+        self.vae.is_some()
+    }
+
+    /// Periodic best-effort previews. The current factors install as CONCRETE adapters
+    /// (evaluated arrays outside any trace), so the render builds no autograd graph; the next
+    /// step's traced `loss_fn` re-installs them. A failure never aborts training.
+    fn render_previews(
+        &mut self,
+        step: u32,
+        params: &LoraParams,
+        sink: &mut PreviewSink<'_>,
+    ) -> Result<()> {
+        let cfg = &self.req.config;
+        let vae = self.vae.expect("previews render only with a resident VAE");
+        self.saver.adapter.install_as(
+            self.transformer,
+            params,
+            cfg.alpha,
+            cfg.rank as f32,
+            self.spec.lora_dtype,
+            LOKR_DTYPE,
+        )?;
+        // Edit previews condition on the first item's cached reference latents.
+        let sample_reference_latents: &[Array] = if self.edit {
+            &self.cache[0].references
+        } else {
+            &[]
+        };
+        let dit: &QwenImage21Transformer = self.transformer;
+        render_preview_prompts(
+            sink,
+            step,
+            cfg.seed,
+            &self.req.cancel,
+            self.sample_caps,
+            |(prompt, _)| prompt,
+            &PreviewLog {
+                tag: "[sc-24159]",
+                trainer: TRAINER_ID,
+                what: "preview sample",
+                canceled_stops: true,
+                report_failures: true,
+            },
+            |(_, pos), sample_seed| {
+                render_sample(
+                    dit,
+                    vae,
+                    self.scheduler,
+                    pos,
+                    self.sample_neg,
+                    sample_reference_latents,
+                    sample_seed,
+                    self.edge,
+                    cfg.sample_steps as usize,
+                    cfg.sample_guidance_scale,
+                    &self.req.cancel,
+                )
+            },
+        );
+        mlx_rs::memory::clear_cache();
+        Ok(())
+    }
+
+    fn save_final(&mut self, params: &LoraParams) -> Result<PathBuf> {
+        // PEFT keys + reload contract + provenance/licence.
+        self.saver.save_final(self.req, params)
     }
 }
 
@@ -2580,8 +2586,11 @@ mod lokr_rounding;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::train::vocab::sample_timestep;
     use mlx_gen::WeightsSource;
+    use mlx_rs::ops::multiply;
     use mlx_rs::optimizers::clip_grad_norm;
+    use mlx_rs::random;
 
     use crate::transformer::Segment;
 
@@ -2732,7 +2741,7 @@ mod tests {
     fn build_batch_is_the_flow_match_velocity_with_no_sign_flip() {
         let x0 = Array::from_slice(&[2.0f32, 4.0, 6.0], &[1, 3, 1]);
         let noise = Array::from_slice(&[1.0f32, 1.0, 1.0], &[1, 3, 1]);
-        let (x_t, target) = build_batch(&x0, &noise, 0.25).unwrap();
+        let (x_t, target) = flow_velocity_batch(&x0, &noise, 0.25).unwrap();
         assert_eq!(target.as_slice::<f32>(), &[-1.0, -3.0, -5.0]);
         for (got, want) in x_t.as_slice::<f32>().iter().zip([1.75f32, 3.25, 4.75]) {
             assert!((got - want).abs() < 1e-6, "x_t {got} != {want}");
@@ -4552,7 +4561,7 @@ mod tests {
                         .item::<f32>();
                     assert_eq!(error, 0.0, "trained raw master changed through export");
                 }
-                let (x_t, _) = build_batch(&batch.x0, &batch.noise, 0.5).unwrap();
+                let (x_t, _) = flow_velocity_batch(&batch.x0, &batch.noise, 0.5).unwrap();
                 let images = joint_images(&batch.references, &x_t);
                 for bits in [4, 8] {
                     let mut direct = fully_packable_dit();
@@ -4738,7 +4747,7 @@ mod tests {
                         LOKR_DTYPE,
                     )
                     .unwrap();
-                let (x_t, _) = build_batch(&batch.x0, &batch.noise, 0.5).unwrap();
+                let (x_t, _) = flow_velocity_batch(&batch.x0, &batch.noise, 0.5).unwrap();
                 let x_t = x_t.as_dtype(Dtype::Bfloat16).unwrap();
                 let images = joint_images(&batch.references, &x_t);
                 let before = dit
@@ -5374,8 +5383,11 @@ mod depth_anchoring_tests {
     use crate::transformer::Segment;
     use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule};
     use mlx_gen::train::tae::{synthetic_tiny_decoder_weights, TinyDecoder};
+    use mlx_gen::train::vocab::sample_timestep;
     use mlx_gen_depth::anchor::{synthetic_weights, tiny_config, DepthAnchorLoss};
     use mlx_gen_depth::DepthAnythingV2;
+    use mlx_rs::ops::multiply;
+    use mlx_rs::random;
 
     fn tiny_snapshot() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot")
@@ -5646,7 +5658,7 @@ mod depth_anchoring_tests {
         f.adapter
             .install_as(&mut f.dit, &f.params, 4.0, 4.0, None, LOKR_DTYPE)
             .unwrap();
-        let (x_t, _) = build_batch(&item.x0, &noise, t).unwrap();
+        let (x_t, _) = flow_velocity_batch(&item.x0, &noise, t).unwrap();
         let v = f
             .dit
             .forward_joint(
@@ -5838,7 +5850,7 @@ mod depth_anchoring_tests {
             Some(&random::key(off_cfg.seed.wrapping_add(1).wrapping_mul(2) + 1).unwrap()),
         )
         .unwrap();
-        let (x_t, target) = build_batch(&item.x0, &noise, t).unwrap();
+        let (x_t, target) = flow_velocity_batch(&item.x0, &noise, t).unwrap();
         let (text, layout, references) = (item.text.clone(), &item.layout, &item.references);
         let dit = &mut f.dit;
         let adapter = &f.adapter;

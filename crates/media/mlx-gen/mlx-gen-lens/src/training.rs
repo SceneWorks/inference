@@ -7,7 +7,8 @@
 //! `Module` system (hand-rolled `&self` forwards over raw `Array`s), so training uses the **functional
 //! autograd**: the trainable factors live OUTSIDE the model in a [`LoraParams`] map, re-injected each
 //! step into the target [`AdaptableLinear`](mlx_gen::adapters::AdaptableLinear)s via the shared core
-//! seam ([`mlx_gen::train::lora`]), stepped with `keyed_value_and_grad` + the core [`TrainOptimizer`] +
+//! seam ([`mlx_gen::train::lora`]), stepped with `keyed_value_and_grad` + the core
+//! [`TrainOptimizer`](mlx_gen::TrainOptimizer) +
 //! `clip_grad_norm`. The injection mirrors the inference reload op-for-op, so the trained adapter
 //! round-trips through [`apply_lens_adapters`](crate::adapters::apply_lens_adapters) (sc-3174)
 //! bit-for-bit.
@@ -56,36 +57,37 @@
 //!     latent caching — converting the otherwise-uncatchable SIGKILL into a recommendation to enable
 //!     the toggle. The default-off functional path is unaffected.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
-use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
-use mlx_gen::train::lora::{
-    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
-    build_lora_targets, LoraParams, TrainAdapter,
-};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, step_sample, AuxDriver, Parameterization, PerceptualPath, StepPlan,
+    combine_step_loss, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
-use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::tae::TinyDecoderSpec;
-use mlx_gen::train::vocab::{sample_timestep, validate_common_request};
+use mlx_gen::train::trainer_loop::{
+    adapter_optimizer, adapter_stem, block_local_targets, build_adapter, cache_items,
+    draw_flow_step, encode_preview_prompts, ensure_cached, flow_velocity_batch, largest_edge,
+    mae_loss, render_preview_prompts, resolve_suffix_targets, run_train_loop, train_dtype_is_bf16,
+    AdapterSaver, CheckpointAt, LoopStart, LossTypeFold, PreviewLog, PreviewSink, TrainLoopFamily,
+};
+use mlx_gen::train::vocab::validate_common_request;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    Error, LoadSpec, Modality, NetworkType, Precision, Quant, Result, TrainOptimizer, Trainer,
-    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport,
-    TrainingRequest, WeightsSource,
+    Error, LoadSpec, Modality, NetworkType, Precision, Quant, Result, Trainer, TrainerDescriptor,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
+    WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
-use mlx_rs::ops::{add, multiply, ones, split_sections, subtract};
+use mlx_rs::ops::{ones, split_sections, subtract};
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
-use mlx_rs::{random, Array, Dtype};
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen_flux2::{load_vae, pack_latents, patchify_latents, preprocess_ref_image, Flux2Vae};
 
@@ -100,9 +102,6 @@ use crate::text_encoder::encoder::LensTextEncoder;
 /// reconstruct at the same dtype so the trained LoKr round-trips through `apply_lens_adapters`.
 const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
 
-/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637).
-const SAMPLE_PROMPT_CAP: usize = 4;
-
 /// The gpt-oss encoder is loaded Q8 for the trainer (~12 GB vs ~40 GB dense bf16): it is frozen and
 /// used only to cache caption features once, then dropped. Q8 is the Lens inference default (sc-3172),
 /// so the cached features match the deployed encode path.
@@ -112,17 +111,6 @@ const TRAINER_ENCODER_QUANT: Option<Quant> = Some(Quant::Q8);
 /// dual-stream joint-attention projections. `to_out` is an `nn.ModuleList([Linear, Identity])`, so the
 /// trainable Linear is `to_out.0` (sc-2218); `img_qkv`/`txt_qkv` are the fused per-stream QKV.
 const DEFAULT_TARGET_MODULES: [&str; 4] = ["img_qkv", "txt_qkv", "to_out.0", "to_add_out"];
-
-/// `(x_t, target)` for a single sample at flow-match `t`: `x_t = (1−t)·x0 + t·noise`,
-/// `target = noise − x0` (the velocity the **raw** Lens DiT output is regressed onto; the transformer
-/// timestep is `t` itself, fed by the caller — see the module docs for the sign vs Z-Image).
-fn build_batch(x0: &Array, noise: &Array, t: f32) -> Result<(Array, Array)> {
-    let one_minus = Array::from_slice(&[1.0 - t], &[1]);
-    let s = Array::from_slice(&[t], &[1]);
-    let x_t = add(&multiply(x0, &one_minus)?, &multiply(noise, &s)?)?;
-    let target = subtract(noise, x0)?;
-    Ok((x_t, target))
-}
 
 /// The production [`Trainer`] for the base `microsoft/Lens` DiT: a frozen base (gpt-oss encoder + Lens
 /// MMDiT + Flux.2 VAE + tokenizer) that caches a captioned dataset to VAE-latents/caption-features,
@@ -315,6 +303,7 @@ impl Trainer for LensTrainer {
 impl LensTrainer {
     /// The rich-`Result` body behind [`Trainer::train`]; the trait wrapper bridges its tail into
     /// [`gen_core::Error`] (epic 3720), keeping `?` on `mlx_rs`/family helpers transparent here.
+    /// Setup → cache → adapter → the shared [`run_train_loop`] over [`LensLoop`].
     fn train_impl(
         &mut self,
         req: &TrainingRequest,
@@ -332,15 +321,125 @@ impl LensTrainer {
             )
             .into());
         }
+        let want_bf16 = self.check_train_dtype(cfg)?;
+        let compute_dtype = self.dtype;
+        // bf16 mixed precision: cast the folded LoRA residual to the activation dtype so the adapted
+        // Linear stays bf16 (else it silently re-promotes the chain to f32). f32 → no cast.
+        let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
 
-        // The DiT compute dtype is fixed at load (`spec.precision`); the Lens DiT has no
-        // cast-after-load, so `train_dtype` is *enforced* against it (never a silent no-op). The
-        // common case (TrainingConfig default bf16 + LoadSpec default Bf16) matches, so this only fires
-        // on an explicit f32-vs-bf16 mismatch — telling the caller to load at the matching precision.
-        let want_bf16 = {
-            let t = cfg.train_dtype.trim();
-            t.eq_ignore_ascii_case("bf16") || t.eq_ignore_ascii_case("bfloat16")
+        on_progress(TrainingProgress::Preparing);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). The pre-flight guard and the preview render use the largest (epic 2123 E7); each
+        // cached latent carries its OWN grid (see `latent_grid`) for the DiT's img ids.
+        let edges = bucket_edges(cfg);
+        let edge = largest_edge(&edges);
+        preflight(req, &edges, edge, want_bf16)?;
+
+        // Epic 2123 depth anchoring: load the frozen decoder + aux models before the caching pass,
+        // so a missing/corrupt aux checkpoint fails fast.
+        let mut perceptual = load_perceptual_path(cfg)?;
+
+        // --- prepare → load → cache: VAE-latents + 4-layer caption features into memory ---
+        on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
+        let cache = self.cache_dataset(req, &edges, compute_dtype, on_progress)?;
+
+        // Epic 2123 E8: each (item, bucket) entry's perceptual reference is computed exactly once
+        // per job, by the `AuxDriver` before the loop.
+        if let Some(path) = perceptual.as_mut() {
+            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+            // cropped like the image and resampled onto its decoded size.
+            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "lens trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
+        }
+        let sample_caps = self.encode_previews(req, compute_dtype)?;
+
+        // Every caption is cached now — free the 20 B-param encoder and evict its buffers before the
+        // train loop, reclaiming that resident for the DiT working set.
+        self.encoder = None;
+        mlx_rs::memory::clear_cache();
+
+        // --- adapter targets + params (LoRA or LoKr) + optimizer ---
+        let (adapter, params) = build_adapter(&mut self.transformer, &target_paths, cfg)?;
+        let mae = mae_loss(&cfg.loss_type, LossTypeFold::Lowercase);
+
+        // sc-5170 — gradient checkpointing. Collect, per block, the adapter-routable LOCAL paths
+        // trained on it (e.g. `"attn.img_qkv"`), in trained-file order — the factors a checkpoint
+        // segment threads as explicit inputs. Every Lens adapter target lives in a block, so this
+        // covers the whole trainable surface.
+        let block_locals = block_local_targets(
+            &target_paths,
+            "transformer_blocks.",
+            self.transformer.cfg.num_layers,
+        );
+        // Opt-in OPTION (the SceneWorks "Gradient Checkpointing" toggle), never auto-forced — a run
+        // that would OOM is caught instead by the pre-flight guard above, which recommends this flag
+        // rather than silently changing the user's training dynamics. LoRA only — LoKr (a captured-
+        // param Kronecker reconstruction) falls back to the dense path.
+        let use_checkpoint =
+            matches!(adapter, TrainAdapter::Lora { .. }) && cfg.gradient_checkpointing;
+        // SDPA-segment checkpointing is ALWAYS on in training (LoRA and LoKr): numerically identical
+        // to the retained backward (same decomposed attention, recomputed) and removes the dominant
+        // seq² per-block retention. When whole-block checkpointing is on, the per-block SDPA flag goes
+        // OFF (the block recompute already covers attention; nesting would recompute it twice).
+        self.transformer.set_sdpa_checkpoint(!use_checkpoint);
+
+        let opt = adapter_optimizer(cfg)?;
+        let accum = cfg.gradient_accumulation.max(1);
+        let stem = adapter_stem(&req.file_name, "lora");
+        // --- resume (F-125): continue from the latest snapshot of THIS adapter in output_dir, if any ---
+        let start =
+            LoopStart::fresh(opt, params).resume_latest(cfg, &req.output_dir, &stem, |meta| {
+                eprintln!(
+                    "[F-125] resuming from step {} (optimizer update {})",
+                    meta.step, meta.update_idx
+                )
+            })?;
+
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items for
+        // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
+        // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
+        // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
+        // replay.
+        let aux = match perceptual {
+            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, &req.cancel)?),
+            None => None,
         };
+        let mut family = LensLoop {
+            transformer: &mut self.transformer,
+            vae: &self.vae,
+            req,
+            saver: AdapterSaver {
+                adapter: &adapter,
+                cfg,
+                provenance: &[],
+            },
+            cache: &cache,
+            schedule: &schedule,
+            aux,
+            mae,
+            compute_dtype,
+            lora_dtype,
+            checkpoint_blocks: use_checkpoint.then_some(block_locals.as_slice()),
+            sample_caps: &sample_caps,
+            edge,
+        };
+        run_train_loop(&mut family, req, &stem, start, on_progress, warnings)
+    }
+
+    /// The DiT compute dtype is fixed at load (`spec.precision`); the Lens DiT has no
+    /// cast-after-load, so `train_dtype` is *enforced* against it (never a silent no-op). The
+    /// common case (TrainingConfig default bf16 + LoadSpec default Bf16) matches, so this only fires
+    /// on an explicit f32-vs-bf16 mismatch — telling the caller to load at the matching precision.
+    /// Returns whether the run trains bf16.
+    fn check_train_dtype(&self, cfg: &TrainingConfig) -> Result<bool> {
+        let want_bf16 = train_dtype_is_bf16(&cfg.train_dtype);
         let loaded_bf16 = self.dtype == Dtype::Bfloat16;
         if want_bf16 != loaded_bf16 {
             return Err(format!(
@@ -356,51 +455,21 @@ impl LensTrainer {
             )
             .into());
         }
-        let compute_dtype = self.dtype;
-        // bf16 mixed precision: cast the folded LoRA residual to the activation dtype so the adapted
-        // Linear stays bf16 (else it silently re-promotes the chain to f32). f32 → no cast.
-        let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
+        Ok(want_bf16)
+    }
 
-        on_progress(TrainingProgress::Preparing);
-        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
-        // off). The pre-flight guard and the preview render use the largest (epic 2123 E7); each
-        // cached latent carries its OWN grid (see `latent_grid`) for the DiT's img ids.
-        let edges = bucket_edges(cfg);
-        let edge = preflight_edge(&edges);
-
-        // sc-5170 — fail-fast pre-flight memory guard. The dense (non-block-checkpointed) first step
-        // materializes the whole forward graph in one MLX `eval`; at high resolution that working set
-        // can exceed unified memory and the OS hard-kills the worker with an UNCATCHABLE SIGKILL (no
-        // in-process error — the run just appears to hang at the last cached latent). We cannot catch
-        // that kill, so we predict it and refuse up front with a catchable, actionable error BEFORE
-        // the (minutes-long) latent caching, UNLESS the run will block-checkpoint (LoRA + the toggle).
-        // LoKr always takes the dense path (no clean thread-as-input form), so it is guarded
-        // regardless of the toggle.
-        let will_checkpoint =
-            matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
-        // Epic 2123 E7: the training-time aux models (TAEF2 + Depth-Anything-V2) count against the
-        // budget on BOTH paths; one cached reference per (item, bucket) entry, sized at the largest
-        // edge. A checkpointed run with no aux models stays unguarded (see the guard).
-        let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len());
-        preflight_memory_guard(cfg, edge, want_bf16, aux_gb, will_checkpoint)?;
-
-        // Epic 2123 depth anchoring: load the frozen decoder + aux models before the caching pass,
-        // so a missing/corrupt aux checkpoint fails fast.
-        let mut perceptual = load_perceptual_path(cfg)?;
-
-        // --- prepare → load → cache: VAE-latents + 4-layer caption features into memory ---
-        on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
-        let total = req.items.len() as u32;
-        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). See [`CacheEntry`].
+    /// The caching pass: per item, its caption features + mask once and one packed latent per
+    /// bucket edge. Item-major: `cache[item * edges.len() + bucket]` (sc-2127). See [`CacheEntry`].
+    fn cache_dataset(
+        &self,
+        req: &TrainingRequest,
+        edges: &[u32],
+        compute_dtype: Dtype,
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> Result<Vec<CacheEntry>> {
+        let cfg = &req.config;
         let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
-        for (i, item) in req.items.iter().enumerate() {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            on_progress(TrainingProgress::Caching {
-                current: i as u32 + 1,
-                total,
-            });
+        cache_items(req, on_progress, |item| {
             let img = center_crop_square(&decode_image(&item.image_path)?);
             // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
             let subject_mask = PreparedSubjectMask::load_if_enabled(
@@ -423,7 +492,7 @@ impl LensTrainer {
             // latent per bucket edge, each tagged with its own grid side and (sc-24828) paired with
             // its own packed subject-mask weight.
             for (&edge, (x0, mask_weight)) in edges.iter().zip(encode_buckets(
-                &edges,
+                edges,
                 subject_mask.as_ref(),
                 |edge| encode_latents(&self.vae, &img, edge), // [1, seq, 128]
             )?) {
@@ -435,324 +504,170 @@ impl LensTrainer {
                     mask_weight,
                 ));
             }
-        }
-        if cache.is_empty() {
-            // A cancel mid-cache is a genuine cancellation → typed `Error::Canceled`; an empty cache
-            // with no cancel is a real "no usable dataset items" error.
-            if req.cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            return Err("lens trainer: no usable dataset items".into());
-        }
+            Ok(())
+        })?;
+        // A cancel mid-cache is a genuine cancellation → typed `Error::Canceled`; an empty cache
+        // with no cancel is a real "no usable dataset items" error.
+        ensure_cached(cache.len(), &req.cancel, "lens trainer")?;
+        Ok(cache)
+    }
 
-        // Epic 2123 E8: each (item, bucket) entry's perceptual reference is computed exactly once
-        // per job, by the `AuxDriver` before the loop.
-        if let Some(path) = perceptual.as_mut() {
-            // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
-            // cropped like the image and resampled onto its decoded size.
-            path.attach_subject_masks(mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
-                "lens trainer",
-                &req.items,
-                cfg,
-                edges.len(),
-                CropBox::center_square,
-            )?);
-        }
-
-        // sc-5637 — pre-encode the preview-sample prompts into the conditioning batch the preview
-        // render expects, while the 20 B-param encoder is still resident (freed just below). The
-        // trainer is the third producer of Lens conditioning (beside the registry and the struct API),
-        // so it routes through the SAME `assemble_conditioning` gate rather than hand-rolling the
-        // batching (sc-17616): above guidance 1.0 that yields the joint CFG batch (`[2, …]` = positive
-        // then empty-negative — the trainer always uses the empty negative, i.e. zero features + zero
-        // mask), and at guidance 1.0 the combine reduces to `cond` and `render_sample` runs a B=1
-        // forward, so the uncond half is not batched at all.
-        let sample_caps: Vec<(String, Vec<Array>, Array)> = if cfg.sample_every > 0
-            && !cfg.sample_prompts.is_empty()
-            && !req.cancel.is_cancelled()
-        {
+    /// sc-5637 — pre-encode the preview-sample prompts into the conditioning batch the preview
+    /// render expects, while the 20 B-param encoder is still resident (freed by the caller). The
+    /// trainer is the third producer of Lens conditioning (beside the registry and the struct API),
+    /// so it routes through the SAME `assemble_conditioning` gate rather than hand-rolling the
+    /// batching (sc-17616): above guidance 1.0 that yields the joint CFG batch (`[2, …]` = positive
+    /// then empty-negative — the trainer always uses the empty negative, i.e. zero features + zero
+    /// mask), and at guidance 1.0 the combine reduces to `cond` and `render_sample` runs a B=1
+    /// forward, so the uncond half is not batched at all.
+    fn encode_previews(
+        &self,
+        req: &TrainingRequest,
+        compute_dtype: Dtype,
+    ) -> Result<Vec<SamplePrompt>> {
+        let cfg = &req.config;
+        encode_preview_prompts(cfg, &req.cancel, |prompt| {
             let encoder = self.encoder.as_ref().ok_or_else(|| {
                 Error::Msg("lens trainer: text encoder already freed (sample pre-encode)".into())
             })?;
-            let mut caps = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
-            for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
-                let positive = encode_caption(&self.tokenizer, encoder, prompt, compute_dtype)?;
-                let (features, mask) = assemble_conditioning(
-                    positive,
-                    cfg.sample_guidance_scale,
-                    compute_dtype,
-                    || Ok(None), // the trainer's preview negative is always empty
-                )?;
-                let mut to_eval: Vec<&Array> = Vec::with_capacity(features.len() + 1);
-                to_eval.push(&mask);
-                to_eval.extend(features.iter());
-                eval(to_eval)?;
-                caps.push((prompt.clone(), features, mask));
-            }
-            caps
-        } else {
-            Vec::new()
-        };
-        let sampling_enabled = !sample_caps.is_empty();
-
-        // Every caption is cached now — free the 20 B-param encoder and evict its buffers before the
-        // train loop, reclaiming that resident for the DiT working set.
-        self.encoder = None;
-        mlx_rs::memory::clear_cache();
-
-        // --- adapter targets + params (LoRA or LoKr) + optimizer ---
-        let rank = cfg.rank as f32;
-        let (adapter, mut params) = match cfg.network_type {
-            NetworkType::Lora => {
-                let (targets, params) = build_lora_targets(
-                    &mut self.transformer,
-                    &target_paths,
-                    cfg.rank as i32,
-                    cfg.seed,
-                )?;
-                (TrainAdapter::Lora { targets }, params)
-            }
-            NetworkType::Lokr => {
-                let (targets, params) = build_lokr_targets(
-                    &mut self.transformer,
-                    &target_paths,
-                    cfg.rank as i32,
-                    cfg.decompose_factor,
-                    cfg.seed,
-                )?;
-                (TrainAdapter::Lokr { targets }, params)
-            }
-        };
-        let alpha = cfg.alpha;
-        let mae = {
-            let lt = cfg.loss_type.to_ascii_lowercase();
-            lt == "mae" || lt == "l1"
-        };
-
-        // sc-5170 — gradient checkpointing. Collect, per block, the adapter-routable LOCAL paths
-        // trained on it (e.g. `"attn.img_qkv"`), in trained-file order — the factors a checkpoint
-        // segment threads as explicit inputs. Every Lens adapter target lives in a block, so this
-        // covers the whole trainable surface.
-        let n_layers = self.transformer.cfg.num_layers;
-        let mut block_local_targets: Vec<Vec<String>> = vec![Vec::new(); n_layers];
-        for path in &target_paths {
-            if let Some((idx, local)) = path
-                .strip_prefix("transformer_blocks.")
-                .and_then(|rest| rest.split_once('.'))
-            {
-                if let Ok(i) = idx.parse::<usize>() {
-                    if i < n_layers {
-                        block_local_targets[i].push(local.to_string());
-                    }
-                }
-            }
-        }
-        // Opt-in OPTION (the SceneWorks "Gradient Checkpointing" toggle), never auto-forced — a run
-        // that would OOM is caught instead by the pre-flight guard above, which recommends this flag
-        // rather than silently changing the user's training dynamics. LoRA only — LoKr (a captured-
-        // param Kronecker reconstruction) falls back to the dense path.
-        let use_checkpoint =
-            matches!(adapter, TrainAdapter::Lora { .. }) && cfg.gradient_checkpointing;
-        let checkpoint_blocks: Option<&[Vec<String>]> = if use_checkpoint {
-            Some(&block_local_targets)
-        } else {
-            None
-        };
-        // SDPA-segment checkpointing is ALWAYS on in training (LoRA and LoKr): numerically identical
-        // to the retained backward (same decomposed attention, recomputed) and removes the dominant
-        // seq² per-block retention. When whole-block checkpointing is on, the per-block SDPA flag goes
-        // OFF (the block recompute already covers attention; nesting would recompute it twice).
-        self.transformer.set_sdpa_checkpoint(!use_checkpoint);
-
-        // AdamW with wd=0 is identical to Adam, so the one optimizer covers both choices.
-        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
-            0.0
-        } else {
-            cfg.weight_decay
-        };
-        let mut opt = TrainOptimizer::from_config(&cfg.optimizer, cfg.learning_rate, weight_decay)?;
-
-        let accum = cfg.gradient_accumulation.max(1);
-        let (total_updates, warmup_updates) =
-            schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
-        let stem = Path::new(&req.file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("lora")
-            .to_string();
-
-        // --- resume (F-125): continue from the latest snapshot of THIS adapter in output_dir, if any ---
-        let mut update_idx: u32 = 0;
-        let mut start_step: u32 = 0;
-        if cfg.resume {
-            if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
-                let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut opt)?;
-                params = loaded;
-                start_step = meta.step;
-                update_idx = meta.update_idx;
-                eprintln!(
-                    "[F-125] resuming from step {start_step} (optimizer update {update_idx})"
-                );
-            }
-        }
-
-        // --- train loop ---
-        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items for
-        // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
-        let schedule =
-            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
-        // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
-        // replay.
-        let mut aux_driver = match perceptual {
-            Some(path) => Some(aux_driver(path, &cache, &schedule, accum, &req.cancel)?),
-            None => None,
-        };
-        let mut accumulated: Option<LoraParams> = None;
-        let mut last_loss = 0.0f32;
-        let mut steps_run = start_step;
-        for step in start_step + 1..=cfg.steps {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            let (losses, grads) = run_train_step(
-                &mut self.transformer,
-                &params,
-                &adapter,
-                cfg,
-                &cache,
-                &schedule,
-                aux_driver.as_mut(),
-                step,
-                mae,
+            let positive = encode_caption(&self.tokenizer, encoder, prompt, compute_dtype)?;
+            let (features, mask) = assemble_conditioning(
+                positive,
+                cfg.sample_guidance_scale,
                 compute_dtype,
-                lora_dtype,
-                checkpoint_blocks,
+                || Ok(None), // the trainer's preview negative is always empty
             )?;
-            last_loss = losses.total;
-            steps_run = step;
-            accumulate_grads(&mut accumulated, grads)?;
-
-            if step % accum == 0 || step == cfg.steps {
-                let mult =
-                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
-                opt.set_lr_scaled(mult);
-                // The final update can fire with fewer than `accum` grads when `steps` isn't a
-                // multiple of the accumulation; dividing by `accum` would down-scale that step. Divide
-                // by the actual in-window count instead (F-069).
-                let window = if step % accum == 0 {
-                    accum
-                } else {
-                    step % accum
-                };
-                let avg = average_grads(
-                    accumulated
-                        .take()
-                        .expect("an update fires only after accumulation"),
-                    window,
-                )?;
-                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
-                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
-                update_idx += 1;
-            }
-
-            on_progress(TrainingProgress::Training {
-                step,
-                total: cfg.steps,
-                loss: last_loss,
-            });
-
-            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
-                std::fs::create_dir_all(&req.output_dir)?;
-                let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
-                adapter.save(&params, alpha, rank, cfg.decompose_factor, "", &ckpt)?;
-                checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
-                on_progress(TrainingProgress::Checkpoint { step });
-            }
-
-            // sc-5637 — periodic best-effort previews from the in-progress adapter (mirrors z-image).
-            // Install the current factors as concrete adapters for the forward-only render; the next
-            // step's traced `loss_fn` re-installs them. A render failure must NOT abort the long
-            // training run — log and continue.
-            if sampling_enabled && step % cfg.sample_every == 0 {
-                adapter.install_as(
-                    &mut self.transformer,
-                    &params,
-                    alpha,
-                    rank,
-                    lora_dtype,
-                    LOKR_DTYPE,
-                )?;
-                let total = sample_caps.len() as u32;
-                for (i, (prompt, features, mask)) in sample_caps.iter().enumerate() {
-                    if req.cancel.is_cancelled() {
-                        break;
-                    }
-                    let sample_seed = cfg
-                        .seed
-                        .wrapping_add(step as u64)
-                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
-                        .wrapping_add(i as u64);
-                    match crate::pipeline::render_sample(
-                        &self.transformer,
-                        &self.vae,
-                        features,
-                        mask,
-                        sample_seed,
-                        edge,
-                        cfg.sample_steps.max(1) as usize,
-                        cfg.sample_guidance_scale,
-                        compute_dtype,
-                        &req.cancel,
-                    ) {
-                        Ok(image) => on_progress(TrainingProgress::Sample {
-                            step,
-                            index: i as u32 + 1,
-                            total,
-                            prompt: prompt.clone(),
-                            image,
-                        }),
-                        Err(e) => {
-                            eprintln!(
-                                "[sc-5637] {MODEL_ID_BASE} preview sample failed at step {step} \
-                                 (prompt {}): {e} — skipping this preview, training continues",
-                                i + 1
-                            );
-                            warnings.push(gen_core::train::preview_sample_failed(
-                                step,
-                                i as u32 + 1,
-                                &e,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Cancelled before a single step completed (`steps == 0` is rejected by `validate`): the
-        // factors are still the `B = 0` no-op init. Surface the cancellation rather than writing a
-        // valid-looking identity adapter as a trained artifact.
-        if steps_run == 0 {
-            return Err(Error::Canceled);
-        }
-
-        // --- save final adapter (the diffusers/PEFT format `apply_lens_adapters` loads, sc-3174) ---
-        on_progress(TrainingProgress::Saving);
-        std::fs::create_dir_all(&req.output_dir)?;
-        let adapter_path = req.output_dir.join(&req.file_name);
-        adapter.save(
-            &params,
-            alpha,
-            rank,
-            cfg.decompose_factor,
-            "",
-            &adapter_path,
-        )?;
-        Ok(TrainingOutput {
-            adapter_path,
-            steps: steps_run,
-            final_loss: last_loss,
+            let mut to_eval: Vec<&Array> = Vec::with_capacity(features.len() + 1);
+            to_eval.push(&mask);
+            to_eval.extend(features.iter());
+            eval(to_eval)?;
+            Ok((features, mask))
         })
+    }
+}
+
+/// One pre-encoded preview prompt: the prompt and its conditioning batch (features + mask).
+type SamplePrompt = (String, (Vec<Array>, Array));
+
+/// sc-5170 — fail-fast pre-flight memory guard. The dense (non-block-checkpointed) first step
+/// materializes the whole forward graph in one MLX `eval`; at high resolution that working set
+/// can exceed unified memory and the OS hard-kills the worker with an UNCATCHABLE SIGKILL (no
+/// in-process error — the run just appears to hang at the last cached latent). We cannot catch
+/// that kill, so we predict it and refuse up front with a catchable, actionable error BEFORE
+/// the (minutes-long) latent caching, UNLESS the run will block-checkpoint (LoRA + the toggle).
+/// LoKr always takes the dense path (no clean thread-as-input form), so it is guarded
+/// regardless of the toggle.
+fn preflight(req: &TrainingRequest, edges: &[u32], edge: u32, want_bf16: bool) -> Result<()> {
+    let cfg = &req.config;
+    let will_checkpoint =
+        matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
+    // Epic 2123 E7: the training-time aux models (TAEF2 + Depth-Anything-V2) count against the
+    // budget on BOTH paths; one cached reference per (item, bucket) entry, sized at the largest
+    // edge. A checkpointed run with no aux models stays unguarded (see the guard).
+    let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len());
+    preflight_memory_guard(cfg, edge, want_bf16, aux_gb, will_checkpoint)
+}
+
+/// Lens's [`TrainLoopFamily`]: the step's loss through [`compute_step_loss_grads`], the adapter
+/// checkpoints, and the conditioning-batch previews.
+struct LensLoop<'a> {
+    transformer: &'a mut LensTransformer,
+    vae: &'a Flux2Vae,
+    req: &'a TrainingRequest,
+    saver: AdapterSaver<'a>,
+    cache: &'a [CacheEntry],
+    schedule: &'a BucketSchedule,
+    aux: Option<AuxDriver>,
+    mae: bool,
+    compute_dtype: Dtype,
+    lora_dtype: Option<Dtype>,
+    checkpoint_blocks: Option<&'a [Vec<String>]>,
+    sample_caps: &'a [SamplePrompt],
+    edge: u32,
+}
+
+impl TrainLoopFamily for LensLoop<'_> {
+    fn micro_step(&mut self, step: u32, params: &LoraParams) -> Result<(f32, LoraParams)> {
+        let (losses, grads) = run_train_step(
+            self.transformer,
+            params,
+            self.saver.adapter,
+            &self.req.config,
+            self.cache,
+            self.schedule,
+            self.aux.as_mut(),
+            step,
+            self.mae,
+            self.compute_dtype,
+            self.lora_dtype,
+            self.checkpoint_blocks,
+        )?;
+        Ok((losses.total, grads))
+    }
+
+    fn save_checkpoint(&mut self, at: CheckpointAt<'_>) -> Result<()> {
+        self.saver.save_checkpoint(&at)
+    }
+
+    fn previews_enabled(&self) -> bool {
+        !self.sample_caps.is_empty()
+    }
+
+    /// sc-5637 — periodic best-effort previews from the in-progress adapter (mirrors z-image).
+    /// Install the current factors as concrete adapters for the forward-only render; the next
+    /// step's traced `loss_fn` re-installs them. A render failure must NOT abort the long
+    /// training run — log and continue.
+    fn render_previews(
+        &mut self,
+        step: u32,
+        params: &LoraParams,
+        sink: &mut PreviewSink<'_>,
+    ) -> Result<()> {
+        let cfg = &self.req.config;
+        self.saver.adapter.install_as(
+            self.transformer,
+            params,
+            cfg.alpha,
+            cfg.rank as f32,
+            self.lora_dtype,
+            LOKR_DTYPE,
+        )?;
+        let dit: &LensTransformer = self.transformer;
+        render_preview_prompts(
+            sink,
+            step,
+            cfg.seed,
+            &self.req.cancel,
+            self.sample_caps,
+            |(prompt, _)| prompt,
+            &PreviewLog {
+                tag: "[sc-5637]",
+                trainer: MODEL_ID_BASE,
+                what: "preview sample",
+                canceled_stops: false,
+                report_failures: true,
+            },
+            |(_, (features, mask)), sample_seed| {
+                crate::pipeline::render_sample(
+                    dit,
+                    self.vae,
+                    features,
+                    mask,
+                    sample_seed,
+                    self.edge,
+                    cfg.sample_steps.max(1) as usize,
+                    cfg.sample_guidance_scale,
+                    self.compute_dtype,
+                    &self.req.cancel,
+                )
+            },
+        );
+        Ok(())
+    }
+
+    fn save_final(&mut self, params: &LoraParams) -> Result<PathBuf> {
+        // The diffusers/PEFT format `apply_lens_adapters` loads (sc-3174).
+        self.saver.save_final(self.req, params)
     }
 }
 
@@ -796,13 +711,6 @@ fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
 /// enforces the measured anchors; refit both tuples if the sweep prints materially different numbers.
 const PREFLIGHT_F32: (f64, f64, f64) = (15.43, 6.618e-3, 1.308e-7);
 const PREFLIGHT_BF16: (f64, f64, f64) = (7.875, 3.266e-3, 7.666e-8);
-
-/// The edge the pre-flight guard (and the preview render) sizes for: the LARGEST bucket edge (epic
-/// 2123 E7) — the dense first step's working set is set by the biggest latent the run will ever train
-/// on, whichever bucket the schedule happens to draw first.
-fn preflight_edge(edges: &[u32]) -> u32 {
-    edges.iter().copied().max().unwrap_or(0)
-}
 
 /// The Lens latent grid side for a training `edge`: a cell maps to a 16×16 pixel tile (Flux.2 8× VAE ∘
 /// 2× DiT patchify), so an `edge`-square image packs to `[1, grid², 128]` and the DiT's img ids span a
@@ -903,34 +811,12 @@ fn check_preflight_budget_with_aux(
 /// paths by matching them against every adapter-routable module on the DiT — the same suffix-match
 /// PEFT's `LoraConfig(target_modules=…)` does (`transformer_blocks.{i}.attn.{suffix}`).
 fn resolve_target_paths(transformer: &LensTransformer, cfg: &TrainingConfig) -> Vec<String> {
-    let suffixes: Vec<String> = if cfg.lora_target_modules.is_empty() {
-        DEFAULT_TARGET_MODULES
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        cfg.lora_target_modules.clone()
-    };
-    AdaptableHost::adaptable_paths(transformer)
-        .into_iter()
-        .filter(|path| {
-            suffixes
-                .iter()
-                .any(|s| path == s || path.ends_with(&format!(".{s}")))
-        })
-        .collect()
-}
-
-/// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
-fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = mlx_gen::gen_core::__model_input_result!(
-        image::open(path),
-        "crates/media/mlx-gen/mlx-gen-lens/src/training.rs::decode_image/image::open",
-        Reference,
-        &[path]
+    resolve_suffix_targets(
+        AdaptableHost::adaptable_paths(transformer),
+        cfg,
+        &DEFAULT_TARGET_MODULES,
+        None,
     )
-    .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    Ok(dynimg.to_rgb8().into())
 }
 
 /// Encode a center-cropped square image into a Lens training latent `[1, latent·latent, 128]` — the
@@ -1138,7 +1024,9 @@ fn compute_step_loss_grads(
     checkpoint_blocks: Option<&[Vec<String>]>,
     aux: Option<AuxStep<'_>>,
 ) -> Result<(StepLosses, LoraParams)> {
-    let (x_t_f32, target) = build_batch(x0, noise, t)?;
+    // `target = noise − x0`, the velocity the **raw** Lens DiT output is regressed onto (the
+    // transformer timestep is `t` itself — see the module docs for the sign vs Z-Image).
+    let (x_t_f32, target) = flow_velocity_batch(x0, noise, t)?;
     let mask_weight = mask_weight.cloned();
     let x_t = x_t_f32.as_dtype(dtype)?; // no-op in f32 mode
     let (diffusion_on, aux_on) = match &aux {
@@ -1289,31 +1177,16 @@ fn run_train_step(
     lora_dtype: Option<Dtype>,
     checkpoint_blocks: Option<&[Vec<String>]>,
 ) -> Result<(StepLosses, LoraParams)> {
-    let sample = step_sample(perceptual, step, schedule);
-    let entry = sample.entry;
-    let (x0, features, mask, latent, mask_weight) = &cache[entry];
-    let mut t = sample_timestep(
-        &cfg.timestep_type,
-        &cfg.timestep_bias,
-        cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-    )?;
-    let noise = random::normal::<f32>(
-        x0.shape(),
-        None,
-        None,
-        Some(&random::key(
-            cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-        )?),
-    )?;
-    let planned = sample.plan(t)?;
-    if let Some(p) = &planned {
-        t = p.plan.noise_level;
-    }
-    let aux = planned.as_ref().map(|p| AuxStep {
+    let draw = draw_flow_step(perceptual, step, schedule, cfg, |entry| {
+        cache[entry].0.shape()
+    })?;
+    let (x0, features, mask, latent, mask_weight) = &cache[draw.entry];
+    let aux = draw.aux.as_ref().map(|p| AuxStep {
         path: p.path,
         plan: &p.plan,
         entry: p.entry,
     });
+    let (t, noise) = (draw.t, &draw.noise);
     compute_step_loss_grads(
         transformer,
         params,
@@ -1324,7 +1197,7 @@ fn run_train_step(
         features,
         mask,
         t,
-        &noise,
+        noise,
         mae,
         mask_weight.as_ref(),
         dtype,
@@ -1379,6 +1252,7 @@ mod first_step_repro {
     use super::*;
     use mlx_gen::train::lora::build_lora_targets;
     use mlx_rs::memory::{clear_cache, get_active_memory, get_peak_memory, reset_peak_memory};
+    use mlx_rs::random;
     use std::path::PathBuf;
 
     /// The base Lens snapshot root from the required `LENS_SNAPSHOT` env var. sc-13668: there is no
@@ -1922,7 +1796,11 @@ mod preflight_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::train::lora::build_lora_targets;
+    use mlx_gen::train::vocab::sample_timestep;
     use mlx_gen::CancelFlag;
+    use mlx_rs::ops::multiply;
+    use mlx_rs::random;
     use std::path::PathBuf;
 
     /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
@@ -2291,16 +2169,16 @@ mod tests {
             resolution: 512,
             ..base_config()
         };
-        assert_eq!(preflight_edge(&bucket_edges(&cfg)), 512);
+        assert_eq!(largest_edge(&bucket_edges(&cfg)), 512);
         // Buckets [512, 1024] with `resolution` 512: the guard must size for 1024 (epic 2123 E7).
         cfg.resolution_buckets = vec![rb(512, 16), rb(1024, 1)];
         let edges = bucket_edges(&cfg);
         assert_eq!(edges, vec![512, 1024]);
-        assert_eq!(preflight_edge(&edges), 1024);
+        assert_eq!(largest_edge(&edges), 1024);
         // A 24 GB-class budget (safe ≈ 20.4 GB): dense bf16 fits 512 (~11.5 GB) but not 1024
         // (~22.8 GB) — so the bucketed run is refused even though `resolution` alone would pass.
         assert!(check_preflight_budget(512, true, 24.0).is_ok());
-        assert!(check_preflight_budget(preflight_edge(&edges), true, 24.0).is_err());
+        assert!(check_preflight_budget(largest_edge(&edges), true, 24.0).is_err());
     }
 
     #[test]
@@ -2404,7 +2282,7 @@ mod tests {
         let x0 = Array::from_slice(&[2.0f32, 4.0, 6.0], &[1, 3, 1]);
         let noise = Array::from_slice(&[1.0f32, 1.0, 1.0], &[1, 3, 1]);
         let t = 0.25f32;
-        let (x_t, target) = build_batch(&x0, &noise, t).unwrap();
+        let (x_t, target) = flow_velocity_batch(&x0, &noise, t).unwrap();
         // target = noise − x0 = [-1, -3, -5]
         assert_eq!(target.as_slice::<f32>(), &[-1.0, -3.0, -5.0]);
         // x_t = 0.75·x0 + 0.25·noise = [1.75, 3.25, 4.75]
@@ -2442,7 +2320,11 @@ mod tests {
 #[cfg(test)]
 mod depth_anchoring_tests {
     use super::*;
+    use mlx_gen::train::lora::build_lora_targets;
     use mlx_gen::train::perceptual::AuxLossSchedule;
+    use mlx_gen::train::vocab::sample_timestep;
+    use mlx_rs::ops::multiply;
+    use mlx_rs::random;
     use std::collections::HashMap;
 
     fn tiny_dit() -> LensTransformer {
@@ -2739,7 +2621,7 @@ mod depth_anchoring_tests {
         f.adapter
             .install_as(&mut f.dit, &f.params, 4.0, 4.0, None, LOKR_DTYPE)
             .unwrap();
-        let (x_t, _) = build_batch(x0, &noise, t).unwrap();
+        let (x_t, _) = flow_velocity_batch(x0, &noise, t).unwrap();
         let v = f
             .dit
             .forward(
@@ -2921,7 +2803,7 @@ mod depth_anchoring_tests {
             Some(&random::key(off_cfg.seed.wrapping_add(1).wrapping_mul(2) + 1).unwrap()),
         )
         .unwrap();
-        let (x_t, target) = build_batch(x0, &noise, t).unwrap();
+        let (x_t, target) = flow_velocity_batch(x0, &noise, t).unwrap();
         let timestep = Array::from_slice(&[t], &[1]);
         let (feats, mask, g) = (feats.clone(), mask.clone(), *g);
         let dit = &mut f.dit;

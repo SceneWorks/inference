@@ -1546,11 +1546,112 @@
         "reader-binding"
       ]
     },
-    "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::decode_image::image::open@51854": {
+    "crates/media/mlx-gen/src/train/dataset.rs::decode_image/image::open": {
       "role": "reference",
       "grades": [
         "reader-binding"
-      ]
+      ],
+      "grade_ceiling": "reader-binding",
+      "physical_api": "image::open",
+      "function": "decode_image",
+      "source": "crates/media/mlx-gen/src/train/dataset.rs",
+      "source_sha256": "9e101161654de7a3675effc7614e0a3febc7858411ff8e369b922605a6d6f885",
+      "function_byte_span": [
+        889,
+        1251
+      ],
+      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
+      "function_sha256": "7ec5a79173222eb6590ff83ef52846830cf861487fa8e18fd3fc9912b58755c6",
+      "function_lines": [
+        17,
+        26
+      ],
+      "hook_byte_span": [
+        958,
+        1137
+      ],
+      "hook_sha256": "352079b3084addff930578b076e7a4512d0d58409a29ab0961b47a41fc52c550",
+      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
+      "registered_identity": {
+        "package": "mlx-gen-z-image",
+        "target": "integration",
+        "target_kind": "test",
+        "fqn": "trainer_e2e::z_image_trainer_emits_preview_samples",
+        "source": "crates/media/mlx-gen/mlx-gen-z-image/tests/trainer_e2e.rs"
+      },
+      "additional_registered_identities": [
+        {
+          "package": "mlx-gen-z-image",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "trainer_conformance::z_image_turbo_trainer_satisfies_gen_core_contract",
+          "source": "crates/media/mlx-gen/mlx-gen-z-image/tests/trainer_conformance.rs"
+        },
+        {
+          "package": "mlx-gen-lens",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "trainer_e2e::lens_trainer_emits_preview_samples",
+          "source": "crates/media/mlx-gen/mlx-gen-lens/tests/trainer_e2e.rs"
+        },
+        {
+          "package": "mlx-gen-anima",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "training::train_emits_in_training_previews",
+          "source": "crates/media/mlx-gen/mlx-gen-anima/tests/training.rs"
+        },
+        {
+          "package": "mlx-gen-ltx",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "trainer_e2e::ltx_trainer_emits_preview_samples",
+          "source": "crates/media/mlx-gen/mlx-gen-ltx/tests/trainer_e2e.rs"
+        },
+        {
+          "package": "mlx-gen-krea",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "trainer_real_weights::short_train_checkpointed_produces_loadable_adapter",
+          "source": "crates/media/mlx-gen/mlx-gen-krea/tests/trainer_real_weights.rs"
+        },
+        {
+          "package": "mlx-gen-sd3",
+          "target": "mlx_gen_sd3",
+          "target_kind": "lib",
+          "fqn": "training::real_weight_repro::medium_training_smoke_round_trip",
+          "source": "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs"
+        },
+        {
+          "package": "mlx-gen-wan",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "trainer_e2e::wan_i2v_a14b_trainer_gradient_checkpointing",
+          "source": "crates/media/mlx-gen/mlx-gen-wan/tests/trainer_e2e.rs"
+        },
+        {
+          "package": "mlx-gen-mage",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "trainer_e2e::mage_lokr_trains_writes_adapter_and_reloads",
+          "source": "crates/media/mlx-gen/mlx-gen-mage/tests/trainer_e2e.rs"
+        },
+        {
+          "package": "mlx-gen-sdxl",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "trainer_e2e::sdxl_resume_matches_uninterrupted",
+          "source": "crates/media/mlx-gen/mlx-gen-sdxl/tests/trainer_e2e.rs"
+        },
+        {
+          "package": "mlx-gen-kolors",
+          "target": "integration",
+          "target_kind": "test",
+          "fqn": "trainer_e2e::kolors_trainer_trains_and_writes_lora_that_reloads",
+          "source": "crates/media/mlx-gen/mlx-gen-kolors/tests/trainer_e2e.rs"
+        }
+      ],
+      "source_scope_note": "The named function performs this physical read; every MLX family trainer's dataset items (krea, lens, z-image, mage, qwen-image-2-1, sd3, wan, ltx, anima, sdxl/kolors) decode through this one shared site (sc-27332)"
     },
     "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::decode_reference::image::open@52482": {
       "role": "reference",
@@ -1916,346 +2017,6 @@
         "source": "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs"
       },
       "additional_registered_identities": [],
-      "source_scope_note": "The named function performs this physical read"
-    },
-    "crates/media/mlx-gen/mlx-gen-z-image/src/training.rs::decode_image/image::open": {
-      "role": "reference",
-      "grades": [
-        "reader-binding"
-      ],
-      "grade_ceiling": "reader-binding",
-      "physical_api": "image::open",
-      "function": "decode_image",
-      "source": "crates/media/mlx-gen/mlx-gen-z-image/src/training.rs",
-      "source_sha256": "adc2a14d837d642f1ffa7d4f09b66ec9035b7d27970977484d7ead69dc455859",
-      "function_byte_span": [
-        57850,
-        58377
-      ],
-      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "82da6861849510bdd1cd0ef05479c599f44e52f18aa565d9ca93f69011f1586c",
-      "function_lines": [
-        1199,
-        1214
-      ],
-      "hook_byte_span": [
-        57915,
-        58114
-      ],
-      "hook_sha256": "7a12686b11ab707e667d38afa2ffd4712a1e8c796e6250b515f7e788531172e1",
-      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
-      "registered_identity": {
-        "package": "mlx-gen-z-image",
-        "target": "integration",
-        "target_kind": "test",
-        "fqn": "trainer_e2e::z_image_trainer_emits_preview_samples",
-        "source": "crates/media/mlx-gen/mlx-gen-z-image/tests/trainer_e2e.rs"
-      },
-      "additional_registered_identities": [
-        {
-          "package": "mlx-gen-z-image",
-          "target": "integration",
-          "target_kind": "test",
-          "fqn": "trainer_conformance::z_image_turbo_trainer_satisfies_gen_core_contract",
-          "source": "crates/media/mlx-gen/mlx-gen-z-image/tests/trainer_conformance.rs"
-        }
-      ],
-      "source_scope_note": "The named function performs this physical read"
-    },
-    "crates/media/mlx-gen/mlx-gen-lens/src/training.rs::decode_image/image::open": {
-      "role": "reference",
-      "grades": [
-        "reader-binding"
-      ],
-      "grade_ceiling": "reader-binding",
-      "physical_api": "image::open",
-      "function": "decode_image",
-      "source": "crates/media/mlx-gen/mlx-gen-lens/src/training.rs",
-      "source_sha256": "b2e83f80ab4995f672eb56f88da7935bd6684e0f190e2111cc89f06835abfb85",
-      "function_byte_span": [
-        49098,
-        49613
-      ],
-      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "80a22ce0fb0e697a69d61974547eced31bd1e225402addb359b0f5e2662a75f8",
-      "function_lines": [
-        977,
-        992
-      ],
-      "hook_byte_span": [
-        49163,
-        49359
-      ],
-      "hook_sha256": "642d9adc8d75441cdc9a914fcd875424251cbd745b75400316bf8a1800b3473e",
-      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
-      "registered_identity": {
-        "package": "mlx-gen-lens",
-        "target": "integration",
-        "target_kind": "test",
-        "fqn": "trainer_e2e::lens_trainer_emits_preview_samples",
-        "source": "crates/media/mlx-gen/mlx-gen-lens/tests/trainer_e2e.rs"
-      },
-      "additional_registered_identities": [],
-      "source_scope_note": "The named function performs this physical read"
-    },
-    "crates/media/mlx-gen/mlx-gen-anima/src/training.rs::decode_image/image::open": {
-      "role": "reference",
-      "grades": [
-        "reader-binding"
-      ],
-      "grade_ceiling": "reader-binding",
-      "physical_api": "image::open",
-      "function": "decode_image",
-      "source": "crates/media/mlx-gen/mlx-gen-anima/src/training.rs",
-      "source_sha256": "2c7cfc03450f604f449e155e4c15c995ad84df94ccdbb1b66445c2e5d36f6796",
-      "function_byte_span": [
-        52617,
-        53142
-      ],
-      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "b62c43bf61fd2f3764be500755b43fb77990715ca344753fe026085662081d76",
-      "function_lines": [
-        1035,
-        1050
-      ],
-      "hook_byte_span": [
-        52682,
-        52879
-      ],
-      "hook_sha256": "fe2e8de0bb302f20cfa3dcc83844f347defdc5924754df5d3960962303291573",
-      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
-      "registered_identity": {
-        "package": "mlx-gen-anima",
-        "target": "integration",
-        "target_kind": "test",
-        "fqn": "training::train_emits_in_training_previews",
-        "source": "crates/media/mlx-gen/mlx-gen-anima/tests/training.rs"
-      },
-      "additional_registered_identities": [],
-      "source_scope_note": "The named function performs this physical read"
-    },
-    "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::decode_image/image::open": {
-      "role": "reference",
-      "grades": [
-        "reader-binding"
-      ],
-      "grade_ceiling": "reader-binding",
-      "physical_api": "image::open",
-      "function": "decode_image",
-      "source": "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs",
-      "source_sha256": "68193202ba36aecf6a2b151aa69d901e248b0d04f78a4618c49d6f99ab611303",
-      "function_byte_span": [
-        191711,
-        192234
-      ],
-      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "c8dc256c4a78c574f26fe9c5192b6f631310d30c28019b873b37b541532debb2",
-      "function_lines": [
-        4660,
-        4675
-      ],
-      "hook_byte_span": [
-        191776,
-        191971
-      ],
-      "hook_sha256": "92abcb8e48312123d4e278ba01f4773131cc23ee2bba06470d0f94ddc175d71e",
-      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
-      "registered_identity": {
-        "package": "mlx-gen-ltx",
-        "target": "integration",
-        "target_kind": "test",
-        "fqn": "trainer_e2e::ltx_trainer_emits_preview_samples",
-        "source": "crates/media/mlx-gen/mlx-gen-ltx/tests/trainer_e2e.rs"
-      },
-      "additional_registered_identities": [],
-      "source_scope_note": "The named function performs this physical read"
-    },
-    "crates/media/mlx-gen/mlx-gen-krea/src/training.rs::decode_image/image::open": {
-      "role": "reference",
-      "grades": [
-        "reader-binding"
-      ],
-      "grade_ceiling": "reader-binding",
-      "physical_api": "image::open",
-      "function": "decode_image",
-      "source": "crates/media/mlx-gen/mlx-gen-krea/src/training.rs",
-      "source_sha256": "8a0df37e3339341035cdea5b7cf5c7f0d55b6a5ec08734e513e0210674c4bebd",
-      "function_byte_span": [
-        49377,
-        49892
-      ],
-      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "a8df09bb72330a697409f4d89e88ada1f1af73830c221a516503a3f54f00f789",
-      "function_lines": [
-        1040,
-        1055
-      ],
-      "hook_byte_span": [
-        49442,
-        49638
-      ],
-      "hook_sha256": "8d00c8f5ab73e249a9a1365e9fbc0f3f76a14c67f36299a7f3878446f52e9731",
-      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
-      "registered_identity": {
-        "package": "mlx-gen-krea",
-        "target": "integration",
-        "target_kind": "test",
-        "fqn": "trainer_real_weights::short_train_checkpointed_produces_loadable_adapter",
-        "source": "crates/media/mlx-gen/mlx-gen-krea/tests/trainer_real_weights.rs"
-      },
-      "additional_registered_identities": [],
-      "source_scope_note": "The named function performs this physical read"
-    },
-    "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs::decode_image/image::open": {
-      "role": "reference",
-      "grades": [
-        "reader-binding"
-      ],
-      "grade_ceiling": "reader-binding",
-      "physical_api": "image::open",
-      "function": "decode_image",
-      "source": "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs",
-      "source_sha256": "5e87f2a1a7217720de5b8200b02a4064a62bcae66bece022fdf462358c52c93d",
-      "function_byte_span": [
-        46559,
-        47073
-      ],
-      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "676d099221104b8ad24cf652e6d2d66dbc9f6985cc1e731f798727e746cb36e1",
-      "function_lines": [
-        956,
-        971
-      ],
-      "hook_byte_span": [
-        46624,
-        46819
-      ],
-      "hook_sha256": "ba406b8833d492d0428d1c99c2bd302f7b2dc9b7abf1102932d36b6373b26fde",
-      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
-      "registered_identity": {
-        "package": "mlx-gen-sd3",
-        "target": "mlx_gen_sd3",
-        "target_kind": "lib",
-        "fqn": "training::real_weight_repro::medium_training_smoke_round_trip",
-        "source": "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs"
-      },
-      "additional_registered_identities": [],
-      "source_scope_note": "The named function performs this physical read"
-    },
-    "crates/media/mlx-gen/mlx-gen-wan/src/training.rs::decode_image/image::open": {
-      "role": "reference",
-      "grades": [
-        "reader-binding"
-      ],
-      "grade_ceiling": "reader-binding",
-      "physical_api": "image::open",
-      "function": "decode_image",
-      "source": "crates/media/mlx-gen/mlx-gen-wan/src/training.rs",
-      "source_sha256": "343e484621d09ea0665f2a756f546b26228e226dbbd959ac8b99fc9368cab158",
-      "function_byte_span": [
-        75979,
-        76502
-      ],
-      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "87a149ad85a835ffa30a718e1ef88b7a4ed6aca8a257b5b8e4cfd94059722529",
-      "function_lines": [
-        1648,
-        1663
-      ],
-      "hook_byte_span": [
-        76044,
-        76239
-      ],
-      "hook_sha256": "544c1cbd1623b02d619db144ace01ca3f983d0bb9af24ef93dde6f38f265e400",
-      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
-      "registered_identity": {
-        "package": "mlx-gen-wan",
-        "target": "integration",
-        "target_kind": "test",
-        "fqn": "trainer_e2e::wan_i2v_a14b_trainer_gradient_checkpointing",
-        "source": "crates/media/mlx-gen/mlx-gen-wan/tests/trainer_e2e.rs"
-      },
-      "additional_registered_identities": [],
-      "source_scope_note": "The named function performs this physical read"
-    },
-    "crates/media/mlx-gen/mlx-gen-mage/src/training.rs::decode_image/image::open": {
-      "role": "reference",
-      "grades": [
-        "reader-binding"
-      ],
-      "grade_ceiling": "reader-binding",
-      "physical_api": "image::open",
-      "function": "decode_image",
-      "source": "crates/media/mlx-gen/mlx-gen-mage/src/training.rs",
-      "source_sha256": "8797e0e3a147eff8ac116e5a2150bf58bbcbd35a69edafd321ab70f9b128ba97",
-      "function_byte_span": [
-        70621,
-        71145
-      ],
-      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "2bd202ce5c41b8feb6fcb11e750dacfa323aceaa2cb5805c906dfaa91d46ba79",
-      "function_lines": [
-        1429,
-        1444
-      ],
-      "hook_byte_span": [
-        70686,
-        70882
-      ],
-      "hook_sha256": "31ca860a050c59ce8e91b64072d5325a765ff92479e111f8f50f4d5b19a479bb",
-      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
-      "registered_identity": {
-        "package": "mlx-gen-mage",
-        "target": "integration",
-        "target_kind": "test",
-        "fqn": "trainer_e2e::mage_lokr_trains_writes_adapter_and_reloads",
-        "source": "crates/media/mlx-gen/mlx-gen-mage/tests/trainer_e2e.rs"
-      },
-      "additional_registered_identities": [],
-      "source_scope_note": "The named function performs this physical read"
-    },
-    "crates/media/mlx-gen/mlx-gen-sdxl/src/training/family.rs::decode_image/image::open": {
-      "role": "reference",
-      "grades": [
-        "reader-binding"
-      ],
-      "grade_ceiling": "reader-binding",
-      "physical_api": "image::open",
-      "function": "decode_image",
-      "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/training/family.rs",
-      "source_sha256": "038e1749e5d382f4e1f48ebb3d94a6c034a53397f57d4c85d475e955af77d597",
-      "function_byte_span": [
-        30401,
-        30964
-      ],
-      "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "b3c06d6b980611051c8fba038c78aa72bb41ea5bbe22943a4e9f043cffb28e42",
-      "function_lines": [
-        695,
-        710
-      ],
-      "hook_byte_span": [
-        30482,
-        30685
-      ],
-      "hook_sha256": "3085ac0265f491a3cb6d50e8282055b85f95358d20eb6fe5feebe9ef54481401",
-      "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
-      "registered_identity": {
-        "package": "mlx-gen-sdxl",
-        "target": "integration",
-        "target_kind": "test",
-        "fqn": "trainer_e2e::sdxl_resume_matches_uninterrupted",
-        "source": "crates/media/mlx-gen/mlx-gen-sdxl/tests/trainer_e2e.rs"
-      },
-      "additional_registered_identities": [
-        {
-          "package": "mlx-gen-kolors",
-          "target": "integration",
-          "target_kind": "test",
-          "fqn": "trainer_e2e::kolors_trainer_trains_and_writes_lora_that_reloads",
-          "source": "crates/media/mlx-gen/mlx-gen-kolors/tests/trainer_e2e.rs"
-        }
-      ],
       "source_scope_note": "The named function performs this physical read"
     },
     "crates/contracts/gen-core/src/iris/restoration_train.rs::decode/image::open": {

@@ -63,7 +63,7 @@ use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -894,18 +894,6 @@ fn resolve_target_paths(transformer: &Sd3Transformer, cfg: &TrainingConfig) -> V
                     .any(|s| path == s || path.ends_with(&format!(".{s}")))
         })
         .collect()
-}
-
-/// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
-fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = mlx_gen::gen_core::__model_input_result!(
-        image::open(path),
-        "crates/media/mlx-gen/mlx-gen-sd3/src/training.rs::decode_image/image::open",
-        Reference,
-        &[path]
-    )
-    .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    Ok(dynimg.to_rgb8().into())
 }
 
 /// Encode a center-cropped square image into an SD3.5 training latent `[1, 16, edge/8, edge/8]` — the

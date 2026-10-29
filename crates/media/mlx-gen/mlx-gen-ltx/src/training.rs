@@ -44,7 +44,7 @@ use std::rc::Rc;
 
 use mlx_gen::media::Image;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
 use mlx_gen::train::lora::{accumulate_grads, adapter_optimizer_update, average_grads, LoraParams};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
@@ -54,6 +54,7 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::{TaehvConfig, TaehvDecoder};
+use mlx_gen::train::trainer_loop::SAMPLE_PROMPT_CAP;
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
     gen_core, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
@@ -98,8 +99,6 @@ pub use validation::*;
 /// attended with `mask=None`, matching the reference `Modality(context_mask=None)`).
 const MAX_PROMPT_TOKENS: usize = 128;
 
-/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637).
-const SAMPLE_PROMPT_CAP: usize = 4;
 const LTX25_VIDEO_LATENT_CHANNELS: i32 = 128;
 const LTX25_AUDIO_FLAT_CHANNELS: i32 = 128;
 
@@ -2308,18 +2307,6 @@ fn save_lora(
     meta.insert("lora_alpha".to_string(), alpha.to_string());
     Array::save_safetensors(entries, Some(&meta), path)?;
     Ok(())
-}
-
-/// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
-fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = mlx_gen::gen_core::__model_input_result!(
-        image::open(path),
-        "crates/media/mlx-gen/mlx-gen-ltx/src/training.rs::decode_image/image::open",
-        Reference,
-        &[path]
-    )
-    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    Ok(dynimg.to_rgb8().into())
 }
 
 // ===========================================================================================

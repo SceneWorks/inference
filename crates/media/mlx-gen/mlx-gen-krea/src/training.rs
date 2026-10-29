@@ -9,7 +9,8 @@
 //! training uses the **functional autograd**: the trainable factors live OUTSIDE the model in a
 //! [`LoraParams`] map, re-injected each step into the target
 //! [`AdaptableLinear`](mlx_gen::adapters::AdaptableLinear)s via the shared core seam
-//! ([`mlx_gen::train::lora`]), stepped with `keyed_value_and_grad` + the core [`TrainOptimizer`] +
+//! ([`mlx_gen::train::lora`]), stepped with `keyed_value_and_grad` + the core
+//! [`TrainOptimizer`](mlx_gen::TrainOptimizer) +
 //! `clip_grad_norm`. The injection mirrors the inference reload op-for-op, so the trained adapter
 //! round-trips through the sc-7578 apply path bit-for-bit.
 //!
@@ -48,36 +49,36 @@
 //!   budget, returns a catchable, actionable error BEFORE the (minutes-long) latent caching — converting
 //!   the otherwise-uncatchable SIGKILL into a recommendation to enable the toggle.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::media::Image;
-use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
-use mlx_gen::train::lora::{
-    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
-    build_lora_targets, LoraParams, TrainAdapter,
-};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, step_sample, AuxDriver, Parameterization, PerceptualPath, StepPlan,
+    combine_step_loss, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
-use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
-use mlx_gen::train::vocab::{sample_timestep, validate_common_request};
+use mlx_gen::train::trainer_loop::{
+    adapter_optimizer, adapter_stem, block_local_targets, build_adapter, cache_items,
+    draw_flow_step, encode_preview_prompts, ensure_cached, flow_velocity_batch, largest_edge,
+    mae_loss, render_preview_prompts, resolve_suffix_targets, run_train_loop, train_dtype_is_bf16,
+    AdapterSaver, CheckpointAt, LoopStart, LossTypeFold, PreviewLog, PreviewSink, TrainLoopFamily,
+};
+use mlx_gen::train::vocab::validate_common_request;
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Error, LoadSpec, Modality, NetworkType, Precision, Progress,
-    Result, SamplerRun, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor,
-    TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
-    WeightsSource,
+    Result, SamplerRun, TimestepConvention, Trainer, TrainerDescriptor, TrainingConfig,
+    TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest, WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
-use mlx_rs::ops::{add, multiply, subtract};
+use mlx_rs::ops::subtract;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -97,9 +98,6 @@ pub const KREA_2_RAW_TRAINER_ID: &str = "krea_2_raw";
 /// trained LoKr round-trips through the apply path. bf16 — the family compute dtype.
 const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
 
-/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637).
-const SAMPLE_PROMPT_CAP: usize = 4;
-
 /// The Qwen3-VL-4B condition encoder is loaded Q8 for the trainer (~4.5 GB vs ~8 GB dense bf16): it is
 /// frozen and used only to cache caption features once, then dropped before the train loop. Q8 also
 /// matches the published Turbo TE (the turnkey packs it Q8/Q4), so the cached features match deployment.
@@ -110,17 +108,6 @@ const TRAINER_ENCODER_BITS: i32 = 8;
 /// sigmoid `to_gate` and the SwiGLU FFN are reachable as explicit targets but are not in the default
 /// set (the standard PEFT attention surface).
 const DEFAULT_TARGET_MODULES: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
-
-/// `(x_t, target)` for a single sample at flow-match `t`: `x_t = (1−t)·x0 + t·noise`,
-/// `target = noise − x0` (the velocity the **raw** Krea DiT output is regressed onto; the DiT timestep
-/// is `t` itself, fed by the caller — see the module docs for the sign vs Z-Image).
-fn build_batch(x0: &Array, noise: &Array, t: f32) -> Result<(Array, Array)> {
-    let one_minus = Array::from_slice(&[1.0 - t], &[1]);
-    let s = Array::from_slice(&[t], &[1]);
-    let x_t = add(&multiply(x0, &one_minus)?, &multiply(noise, &s)?)?;
-    let target = subtract(noise, x0)?;
-    Ok((x_t, target))
-}
 
 /// The production [`Trainer`] for the base `krea/Krea-2-Raw` DiT: a frozen base (Qwen3-VL-4B encoder +
 /// single-stream DiT + Qwen-Image VAE + tokenizer) that caches a captioned dataset to
@@ -307,9 +294,17 @@ impl Trainer for KreaRawTrainer {
     }
 }
 
+/// One cached (item, bucket) entry: clean latent, caption features, and (subject-masked loss,
+/// sc-24828) that bucket's latent loss-weight map — `None` when the technique is off.
+type CacheEntry = (Array, Array, Option<Array>);
+
+/// One pre-encoded preview prompt and its positive context.
+type SamplePrompt = (String, Array);
+
 impl KreaRawTrainer {
     /// The rich-`Result` body behind [`Trainer::train`]; the trait wrapper bridges its tail into
     /// [`gen_core::Error`] (epic 3720), keeping `?` on `mlx_rs`/family helpers transparent here.
+    /// Setup → cache → adapter → the shared [`run_train_loop`] over [`KreaLoop`].
     fn train_impl(
         &mut self,
         req: &TrainingRequest,
@@ -327,29 +322,7 @@ impl KreaRawTrainer {
             )
             .into());
         }
-
-        // The DiT compute dtype is fixed at load (`spec.precision`); enforce `train_dtype` against it
-        // (never a silent no-op). The common case (TrainingConfig default bf16 + LoadSpec default Bf16)
-        // matches, so this only fires on an explicit f32-vs-bf16 mismatch.
-        let want_bf16 = {
-            let t = cfg.train_dtype.trim();
-            t.eq_ignore_ascii_case("bf16") || t.eq_ignore_ascii_case("bfloat16")
-        };
-        let loaded_bf16 = self.dtype == Dtype::Bfloat16;
-        if want_bf16 != loaded_bf16 {
-            return Err(format!(
-                "krea trainer: train_dtype '{}' does not match the loaded precision ({}). Load the \
-                 trainer with {} to train at that dtype.",
-                cfg.train_dtype,
-                if loaded_bf16 { "bf16" } else { "f32" },
-                if want_bf16 {
-                    "Precision::Bf16"
-                } else {
-                    "Precision::Fp32"
-                }
-            )
-            .into());
-        }
+        let want_bf16 = self.check_train_dtype(cfg)?;
         let compute_dtype = self.dtype;
         // bf16 mixed precision: cast the folded LoRA residual to the activation dtype so the adapted
         // Linear stays bf16 (else it silently re-promotes the chain to f32). f32 → no cast.
@@ -359,22 +332,8 @@ impl KreaRawTrainer {
         // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
         // off). The pre-flight guard and the preview render use the largest (epic 2123 E7).
         let edges = bucket_edges(cfg);
-        let edge = preflight_edge(&edges);
-
-        // sc-7577 — fail-fast pre-flight memory guard (the z-image/Lens analog). The dense
-        // (non-block-checkpointed) first step materializes the whole forward graph in one MLX `eval`;
-        // at high resolution that working set can exceed unified memory and the OS hard-kills the
-        // worker with an UNCATCHABLE SIGKILL. We predict it and refuse up front with a catchable,
-        // actionable error BEFORE the (minutes-long) latent caching, UNLESS the run will
-        // block-checkpoint (LoRA + the toggle). LoKr always takes the dense path, so it is guarded.
-        let will_checkpoint =
-            matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
-        // Epic 2123 E7 (sc-24830): the aux-loss models (TAEW2.1 + every enabled arm) count
-        // against the budget on BOTH paths — a checkpointed depth job must not skip admission.
-        let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len());
-        if !will_checkpoint || aux_gb > 0.0 {
-            preflight_memory_guard(cfg, edge, want_bf16, aux_gb, will_checkpoint)?;
-        }
+        let edge = largest_edge(&edges);
+        preflight(req, &edges, edge, want_bf16)?;
 
         // Epic 2123 depth anchoring (sc-24830): load the frozen TAEW2.1 decoder +
         // Depth-Anything-V2 before the caching pass, so a missing checkpoint fails fast.
@@ -382,81 +341,8 @@ impl KreaRawTrainer {
 
         // --- prepare → load → cache: VAE-latents + caption features into memory ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
-        let total = req.items.len() as u32;
-        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). Each entry: clean latent,
-        // caption features, and (subject-masked loss, sc-24828) that bucket's latent loss-weight
-        // map — `None` when the technique is off.
-        let mut cache: Vec<(Array, Array, Option<Array>)> =
-            Vec::with_capacity(req.items.len() * edges.len());
-        for (i, item) in req.items.iter().enumerate() {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            on_progress(TrainingProgress::Caching {
-                current: i as u32 + 1,
-                total,
-            });
-            let img = center_crop_square(&decode_image(&item.image_path)?);
-            // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
-            let mask = PreparedSubjectMask::load_if_enabled(
-                "krea trainer",
-                item,
-                cfg.subject_mask_loss.as_ref(),
-            )?;
-            let encoder = self.encoder.as_ref().ok_or_else(|| {
-                Error::Msg(
-                    "krea trainer: text encoder already freed (caching after train loop)".into(),
-                )
-            })?;
-            let context = encode_caption(&self.tokenizer, encoder, &item.caption)?;
-            eval([&context])?;
-            // The caption context is resolution-independent: encode it once, then one latent per
-            // bucket edge (the DiT derives its patch grid / RoPE from the latent's own shape).
-            for (x0, mask_weight) in encode_buckets(&edges, mask.as_ref(), |edge| {
-                encode_latents(&self.vae, &img, edge) // [1, 16, edge/8, edge/8]
-            })? {
-                cache.push((x0, context.clone(), mask_weight));
-            }
-        }
-        if cache.is_empty() {
-            if req.cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            return Err("krea trainer: no usable dataset items".into());
-        }
-
-        // sc-5637 — pre-encode the preview-sample prompts (positive context per prompt) + one shared
-        // empty-prompt (unconditional) context for the CFG preview, while the encoder is still resident.
-        let sample_caps: Vec<(String, Array)> = if cfg.sample_every > 0
-            && !cfg.sample_prompts.is_empty()
-            && !req.cancel.is_cancelled()
-        {
-            let encoder = self.encoder.as_ref().ok_or_else(|| {
-                Error::Msg("krea trainer: text encoder already freed (sample pre-encode)".into())
-            })?;
-            let mut caps = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
-            for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
-                let ctx = encode_caption(&self.tokenizer, encoder, prompt)?;
-                eval([&ctx])?;
-                caps.push((prompt.clone(), ctx));
-            }
-            caps
-        } else {
-            Vec::new()
-        };
-        let sample_neg: Option<Array> = if !sample_caps.is_empty() {
-            let encoder = self.encoder.as_ref().ok_or_else(|| {
-                Error::Msg(
-                    "krea trainer: text encoder already freed (sample neg pre-encode)".into(),
-                )
-            })?;
-            let neg = encode_caption(&self.tokenizer, encoder, "")?;
-            eval([&neg])?;
-            Some(neg)
-        } else {
-            None
-        };
-        let sampling_enabled = !sample_caps.is_empty();
+        let cache = self.cache_dataset(req, &edges, on_progress)?;
+        let (sample_caps, sample_neg) = self.encode_previews(req)?;
 
         // Every caption is cached now — free the 4 B-param encoder and evict its buffers before the
         // train loop, reclaiming that resident for the DiT working set.
@@ -480,99 +366,39 @@ impl KreaRawTrainer {
         }
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
-        let rank = cfg.rank as f32;
-        let (adapter, mut params) = match cfg.network_type {
-            NetworkType::Lora => {
-                let (targets, params) = build_lora_targets(
-                    &mut self.transformer,
-                    &target_paths,
-                    cfg.rank as i32,
-                    cfg.seed,
-                )?;
-                (TrainAdapter::Lora { targets }, params)
-            }
-            NetworkType::Lokr => {
-                let (targets, params) = build_lokr_targets(
-                    &mut self.transformer,
-                    &target_paths,
-                    cfg.rank as i32,
-                    cfg.decompose_factor,
-                    cfg.seed,
-                )?;
-                (TrainAdapter::Lokr { targets }, params)
-            }
-        };
-        let alpha = cfg.alpha;
-        let mae = {
-            let lt = cfg.loss_type.to_ascii_lowercase();
-            lt == "mae" || lt == "l1"
-        };
+        let (adapter, params) = build_adapter(&mut self.transformer, &target_paths, cfg)?;
+        let mae = mae_loss(&cfg.loss_type, LossTypeFold::Lowercase);
 
         // sc-7577 — gradient checkpointing. Collect, per single-stream block, the adapter-routable
         // LOCAL paths trained on it (e.g. `"attn.to_q"`), in trained-file order — the factors a
         // checkpoint segment threads as explicit inputs. Only `transformer_blocks.*` targets are
         // checkpointed; any text-fusion / global targets train dense through `self`.
-        let n_layers = self.transformer.num_blocks();
-        let mut block_local_targets: Vec<Vec<String>> = vec![Vec::new(); n_layers];
-        for path in &target_paths {
-            if let Some((idx, local)) = path
-                .strip_prefix("transformer_blocks.")
-                .and_then(|rest| rest.split_once('.'))
-            {
-                if let Ok(i) = idx.parse::<usize>() {
-                    if i < n_layers {
-                        block_local_targets[i].push(local.to_string());
-                    }
-                }
-            }
-        }
+        let block_locals = block_local_targets(
+            &target_paths,
+            "transformer_blocks.",
+            self.transformer.num_blocks(),
+        );
         // Opt-in OPTION (the SceneWorks "Gradient Checkpointing" toggle), never auto-forced — a run that
         // would OOM is caught instead by the pre-flight guard above. LoRA only — LoKr falls back to the
         // dense path.
         let use_checkpoint =
             matches!(adapter, TrainAdapter::Lora { .. }) && cfg.gradient_checkpointing;
-        let checkpoint_blocks: Option<&[Vec<String>]> = if use_checkpoint {
-            Some(&block_local_targets)
-        } else {
-            None
-        };
         // SDPA-segment checkpointing is ALWAYS on in training. When whole-block checkpointing is on, the
         // per-block SDPA flag goes OFF (the block recompute already covers attention).
         self.transformer.set_sdpa_checkpoint(!use_checkpoint);
 
-        // AdamW with wd=0 is identical to Adam, so the one optimizer covers both choices.
-        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
-            0.0
-        } else {
-            cfg.weight_decay
-        };
-        let mut opt = TrainOptimizer::from_config(&cfg.optimizer, cfg.learning_rate, weight_decay)?;
-
+        let opt = adapter_optimizer(cfg)?;
         let accum = cfg.gradient_accumulation.max(1);
-        let (total_updates, warmup_updates) =
-            schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
-        let stem = Path::new(&req.file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("lora")
-            .to_string();
-
+        let stem = adapter_stem(&req.file_name, "lora");
         // --- resume (F-125): continue from the latest snapshot of THIS adapter in output_dir, if any ---
-        let mut update_idx: u32 = 0;
-        let mut start_step: u32 = 0;
-        if cfg.resume {
-            if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
-                let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut opt)?;
-                params = loaded;
-                start_step = meta.step;
-                update_idx = meta.update_idx;
+        let start =
+            LoopStart::fresh(opt, params).resume_latest(cfg, &req.output_dir, &stem, |meta| {
                 eprintln!(
-                    "[F-125] resuming from step {start_step} (optimizer update {update_idx})"
-                );
-            }
-        }
+                    "[F-125] resuming from step {} (optimizer update {})",
+                    meta.step, meta.update_idx
+                )
+            })?;
 
-        // --- train loop ---
         // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items for
         // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
@@ -580,186 +406,257 @@ impl KreaRawTrainer {
         // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
         // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
         // replay.
-        let mut aux_driver = match perceptual {
+        let aux = match perceptual {
             Some(path) => Some(aux_driver(path, &cache, &schedule, accum, &req.cancel)?),
             None => None,
         };
-        let mut accumulated: Option<LoraParams> = None;
-        let mut last_loss = 0.0f32;
-        let mut steps_run = start_step;
-        for step in start_step + 1..=cfg.steps {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            let picked = step_sample(aux_driver.as_mut(), step, &schedule);
-            let entry = picked.entry;
-            let (x0, context, mask_weight) = &cache[entry];
-            let mut t = sample_timestep(
-                &cfg.timestep_type,
-                &cfg.timestep_bias,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-            )?;
-            let noise = random::normal::<f32>(
-                x0.shape(),
-                None,
-                None,
-                Some(&random::key(
-                    cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-                )?),
-            )?;
-            // Epic 2123 E8: plan the step's loss terms; an aux-only step trains at the noise level
-            // remapped into the loss window.
-            let planned = picked.plan(t)?;
-            if let Some(p) = &planned {
-                t = p.plan.noise_level;
-            }
-            let aux = planned.as_ref().map(|p| AuxStep {
-                path: p.path,
-                plan: &p.plan,
-                image: p.entry,
-            });
-            let (losses, grads) = compute_step_loss_grads(
-                &mut self.transformer,
-                &params,
-                &adapter,
-                alpha,
-                rank,
-                x0,
-                context,
-                t,
-                &noise,
-                mae,
-                mask_weight.as_ref(),
-                compute_dtype,
-                lora_dtype,
-                checkpoint_blocks,
-                aux,
-            )?;
-            last_loss = losses.total;
-            steps_run = step;
-            accumulate_grads(&mut accumulated, grads)?;
+        let mut family = KreaLoop {
+            transformer: &mut self.transformer,
+            vae: &self.vae,
+            req,
+            saver: AdapterSaver {
+                adapter: &adapter,
+                cfg,
+                provenance: &[],
+            },
+            cache: &cache,
+            schedule: &schedule,
+            aux,
+            mae,
+            compute_dtype,
+            lora_dtype,
+            checkpoint_blocks: use_checkpoint.then_some(block_locals.as_slice()),
+            sample_caps: &sample_caps,
+            sample_neg: sample_neg.as_ref(),
+            edge,
+        };
+        run_train_loop(&mut family, req, &stem, start, on_progress, warnings)
+    }
 
-            if step % accum == 0 || step == cfg.steps {
-                let mult =
-                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
-                opt.set_lr_scaled(mult);
-                // The final update can fire with fewer than `accum` grads when `steps` isn't a multiple
-                // of the accumulation; divide by the actual in-window count instead.
-                let window = if step % accum == 0 {
-                    accum
+    /// The DiT compute dtype is fixed at load (`spec.precision`); enforce `train_dtype` against it
+    /// (never a silent no-op). The common case (TrainingConfig default bf16 + LoadSpec default Bf16)
+    /// matches, so this only fires on an explicit f32-vs-bf16 mismatch. Returns whether the run
+    /// trains bf16.
+    fn check_train_dtype(&self, cfg: &TrainingConfig) -> Result<bool> {
+        let want_bf16 = train_dtype_is_bf16(&cfg.train_dtype);
+        let loaded_bf16 = self.dtype == Dtype::Bfloat16;
+        if want_bf16 != loaded_bf16 {
+            return Err(format!(
+                "krea trainer: train_dtype '{}' does not match the loaded precision ({}). Load the \
+                 trainer with {} to train at that dtype.",
+                cfg.train_dtype,
+                if loaded_bf16 { "bf16" } else { "f32" },
+                if want_bf16 {
+                    "Precision::Bf16"
                 } else {
-                    step % accum
-                };
-                let avg = average_grads(
-                    accumulated
-                        .take()
-                        .expect("an update fires only after accumulation"),
-                    window,
-                )?;
-                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
-                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
-                update_idx += 1;
-            }
-
-            on_progress(TrainingProgress::Training {
-                step,
-                total: cfg.steps,
-                loss: last_loss,
-            });
-
-            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
-                std::fs::create_dir_all(&req.output_dir)?;
-                let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
-                adapter.save(&params, alpha, rank, cfg.decompose_factor, "", &ckpt)?;
-                checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
-                on_progress(TrainingProgress::Checkpoint { step });
-            }
-
-            // sc-5637 — periodic best-effort previews from the in-progress adapter. Install the current
-            // factors as concrete adapters for the forward-only render; the next step's traced `loss_fn`
-            // re-installs them. A render failure must NOT abort the long training run — log and continue.
-            if sampling_enabled && step % cfg.sample_every == 0 {
-                adapter.install_as(
-                    &mut self.transformer,
-                    &params,
-                    alpha,
-                    rank,
-                    lora_dtype,
-                    LOKR_DTYPE,
-                )?;
-                let neg = sample_neg
-                    .as_ref()
-                    .expect("neg context pre-encoded when sampling");
-                let total = sample_caps.len() as u32;
-                for (i, (prompt, ctx_pos)) in sample_caps.iter().enumerate() {
-                    if req.cancel.is_cancelled() {
-                        break;
-                    }
-                    let sample_seed = cfg
-                        .seed
-                        .wrapping_add(step as u64)
-                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
-                        .wrapping_add(i as u64);
-                    match render_sample(
-                        &self.transformer,
-                        &self.vae,
-                        ctx_pos,
-                        neg,
-                        sample_seed,
-                        edge,
-                        cfg.sample_steps.max(1) as usize,
-                        cfg.sample_guidance_scale,
-                        &req.cancel,
-                    ) {
-                        Ok(image) => on_progress(TrainingProgress::Sample {
-                            step,
-                            index: i as u32 + 1,
-                            total,
-                            prompt: prompt.clone(),
-                            image,
-                        }),
-                        Err(e) => {
-                            eprintln!(
-                                "[sc-5637] {KREA_2_RAW_TRAINER_ID} preview sample failed at step \
-                                 {step} (prompt {}): {e} — skipping this preview, training \
-                                 continues",
-                                i + 1
-                            );
-                            warnings.push(gen_core::train::preview_sample_failed(
-                                step,
-                                i as u32 + 1,
-                                &e,
-                            ));
-                        }
-                    }
+                    "Precision::Fp32"
                 }
+            )
+            .into());
+        }
+        Ok(want_bf16)
+    }
+
+    /// The caching pass: per item, its caption context once and one latent per bucket edge.
+    /// Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
+    fn cache_dataset(
+        &self,
+        req: &TrainingRequest,
+        edges: &[u32],
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> Result<Vec<CacheEntry>> {
+        let cfg = &req.config;
+        let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
+        cache_items(req, on_progress, |item| {
+            let img = center_crop_square(&decode_image(&item.image_path)?);
+            // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
+            let mask = PreparedSubjectMask::load_if_enabled(
+                "krea trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+            )?;
+            let encoder = self.encoder.as_ref().ok_or_else(|| {
+                Error::Msg(
+                    "krea trainer: text encoder already freed (caching after train loop)".into(),
+                )
+            })?;
+            let context = encode_caption(&self.tokenizer, encoder, &item.caption)?;
+            eval([&context])?;
+            // The caption context is resolution-independent: encode it once, then one latent per
+            // bucket edge (the DiT derives its patch grid / RoPE from the latent's own shape).
+            for (x0, mask_weight) in encode_buckets(edges, mask.as_ref(), |edge| {
+                encode_latents(&self.vae, &img, edge) // [1, 16, edge/8, edge/8]
+            })? {
+                cache.push((x0, context.clone(), mask_weight));
             }
-        }
+            Ok(())
+        })?;
+        ensure_cached(cache.len(), &req.cancel, "krea trainer")?;
+        Ok(cache)
+    }
 
-        // Cancelled before a single step completed (`steps == 0` is rejected by `validate`): the factors
-        // are still the `B = 0` no-op init. Surface the cancellation rather than writing a valid-looking
-        // identity adapter as a trained artifact.
-        if steps_run == 0 {
-            return Err(Error::Canceled);
-        }
+    /// sc-5637 — pre-encode the preview-sample prompts (positive context per prompt) + one shared
+    /// empty-prompt (unconditional) context for the CFG preview, while the encoder is still resident.
+    fn encode_previews(&self, req: &TrainingRequest) -> Result<(Vec<SamplePrompt>, Option<Array>)> {
+        let sample_caps = encode_preview_prompts(&req.config, &req.cancel, |prompt| {
+            let encoder = self.encoder.as_ref().ok_or_else(|| {
+                Error::Msg("krea trainer: text encoder already freed (sample pre-encode)".into())
+            })?;
+            let ctx = encode_caption(&self.tokenizer, encoder, prompt)?;
+            eval([&ctx])?;
+            Ok(ctx)
+        })?;
+        let sample_neg: Option<Array> = if !sample_caps.is_empty() {
+            let encoder = self.encoder.as_ref().ok_or_else(|| {
+                Error::Msg(
+                    "krea trainer: text encoder already freed (sample neg pre-encode)".into(),
+                )
+            })?;
+            let neg = encode_caption(&self.tokenizer, encoder, "")?;
+            eval([&neg])?;
+            Some(neg)
+        } else {
+            None
+        };
+        Ok((sample_caps, sample_neg))
+    }
+}
 
-        // --- save final adapter (the diffusers/PEFT format the sc-7578 apply path loads) ---
-        on_progress(TrainingProgress::Saving);
-        std::fs::create_dir_all(&req.output_dir)?;
-        let adapter_path = req.output_dir.join(&req.file_name);
-        adapter.save(
-            &params,
-            alpha,
-            rank,
-            cfg.decompose_factor,
-            "",
-            &adapter_path,
+/// sc-7577 — fail-fast pre-flight memory guard (the z-image/Lens analog). The dense
+/// (non-block-checkpointed) first step materializes the whole forward graph in one MLX `eval`;
+/// at high resolution that working set can exceed unified memory and the OS hard-kills the
+/// worker with an UNCATCHABLE SIGKILL. We predict it and refuse up front with a catchable,
+/// actionable error BEFORE the (minutes-long) latent caching, UNLESS the run will
+/// block-checkpoint (LoRA + the toggle). LoKr always takes the dense path, so it is guarded.
+fn preflight(req: &TrainingRequest, edges: &[u32], edge: u32, want_bf16: bool) -> Result<()> {
+    let cfg = &req.config;
+    let will_checkpoint =
+        matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
+    // Epic 2123 E7 (sc-24830): the aux-loss models (TAEW2.1 + every enabled arm) count
+    // against the budget on BOTH paths — a checkpointed depth job must not skip admission.
+    let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len());
+    if !will_checkpoint || aux_gb > 0.0 {
+        preflight_memory_guard(cfg, edge, want_bf16, aux_gb, will_checkpoint)?;
+    }
+    Ok(())
+}
+
+/// Krea's [`TrainLoopFamily`]: the step's loss through [`compute_step_loss_grads`], the
+/// adapter checkpoints, and the Raw-DiT CFG previews.
+struct KreaLoop<'a> {
+    transformer: &'a mut Krea2Transformer,
+    vae: &'a QwenVae,
+    req: &'a TrainingRequest,
+    saver: AdapterSaver<'a>,
+    cache: &'a [CacheEntry],
+    schedule: &'a BucketSchedule,
+    aux: Option<AuxDriver>,
+    mae: bool,
+    compute_dtype: Dtype,
+    lora_dtype: Option<Dtype>,
+    checkpoint_blocks: Option<&'a [Vec<String>]>,
+    sample_caps: &'a [SamplePrompt],
+    sample_neg: Option<&'a Array>,
+    edge: u32,
+}
+
+impl TrainLoopFamily for KreaLoop<'_> {
+    fn micro_step(&mut self, step: u32, params: &LoraParams) -> Result<(f32, LoraParams)> {
+        let cfg = &self.req.config;
+        let cache = self.cache;
+        let draw = draw_flow_step(self.aux.as_mut(), step, self.schedule, cfg, |entry| {
+            cache[entry].0.shape()
+        })?;
+        let (x0, context, mask_weight) = &cache[draw.entry];
+        let aux = draw.aux.as_ref().map(|p| AuxStep {
+            path: p.path,
+            plan: &p.plan,
+            image: p.entry,
+        });
+        let (losses, grads) = compute_step_loss_grads(
+            self.transformer,
+            params,
+            self.saver.adapter,
+            cfg.alpha,
+            cfg.rank as f32,
+            x0,
+            context,
+            draw.t,
+            &draw.noise,
+            self.mae,
+            mask_weight.as_ref(),
+            self.compute_dtype,
+            self.lora_dtype,
+            self.checkpoint_blocks,
+            aux,
         )?;
-        Ok(TrainingOutput {
-            adapter_path,
-            steps: steps_run,
-            final_loss: last_loss,
-        })
+        Ok((losses.total, grads))
+    }
+
+    fn save_checkpoint(&mut self, at: CheckpointAt<'_>) -> Result<()> {
+        self.saver.save_checkpoint(&at)
+    }
+
+    fn previews_enabled(&self) -> bool {
+        !self.sample_caps.is_empty()
+    }
+
+    /// sc-5637 — periodic best-effort previews from the in-progress adapter. Install the current
+    /// factors as concrete adapters for the forward-only render; the next step's traced `loss_fn`
+    /// re-installs them. A render failure must NOT abort the long training run — log and continue.
+    fn render_previews(
+        &mut self,
+        step: u32,
+        params: &LoraParams,
+        sink: &mut PreviewSink<'_>,
+    ) -> Result<()> {
+        let cfg = &self.req.config;
+        self.saver.adapter.install_as(
+            self.transformer,
+            params,
+            cfg.alpha,
+            cfg.rank as f32,
+            self.lora_dtype,
+            LOKR_DTYPE,
+        )?;
+        let neg = self
+            .sample_neg
+            .expect("neg context pre-encoded when sampling");
+        let dit: &Krea2Transformer = self.transformer;
+        render_preview_prompts(
+            sink,
+            step,
+            cfg.seed,
+            &self.req.cancel,
+            self.sample_caps,
+            |(prompt, _)| prompt,
+            &PreviewLog {
+                tag: "[sc-5637]",
+                trainer: KREA_2_RAW_TRAINER_ID,
+                what: "preview sample",
+                canceled_stops: false,
+                report_failures: true,
+            },
+            |(_, ctx_pos), sample_seed| {
+                render_sample(
+                    dit,
+                    self.vae,
+                    ctx_pos,
+                    neg,
+                    sample_seed,
+                    self.edge,
+                    cfg.sample_steps.max(1) as usize,
+                    cfg.sample_guidance_scale,
+                    &self.req.cancel,
+                )
+            },
+        );
+        Ok(())
+    }
+
+    fn save_final(&mut self, params: &LoraParams) -> Result<PathBuf> {
+        // The diffusers/PEFT format the sc-7578 apply path loads.
+        self.saver.save_final(self.req, params)
     }
 }
 
@@ -867,13 +764,6 @@ fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
 const PREFLIGHT_F32: (f64, f64, f64) = (48.0, 1.20e-2, 3.0e-7);
 const PREFLIGHT_BF16: (f64, f64, f64) = (24.0, 6.0e-3, 1.5e-7);
 
-/// The edge the pre-flight guard (and the preview render) sizes for: the LARGEST bucket edge (epic
-/// 2123 E7) — the dense first step's working set is set by the biggest latent the run will ever train
-/// on, whichever bucket the schedule happens to draw first.
-fn preflight_edge(edges: &[u32]) -> u32 {
-    edges.iter().copied().max().unwrap_or(0)
-}
-
 /// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
 /// SIGKILLed), returning a catchable, actionable error instead. The budget is MLX's own reported memory
 /// limit (≈ the device's recommended working set). Only consulted when gradient checkpointing is OFF.
@@ -966,36 +856,12 @@ fn check_preflight_budget_extra(
 /// `transformer_blocks` (the main denoiser); an explicit `lora_target_modules` matches anywhere
 /// (incl. the `text_fusion` aggregator and the global projections).
 fn resolve_target_paths(transformer: &Krea2Transformer, cfg: &TrainingConfig) -> Vec<String> {
-    let default = cfg.lora_target_modules.is_empty();
-    let suffixes: Vec<String> = if default {
-        DEFAULT_TARGET_MODULES
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        cfg.lora_target_modules.clone()
-    };
-    AdaptableHost::adaptable_paths(transformer)
-        .into_iter()
-        .filter(|path| {
-            (!default || path.starts_with("transformer_blocks."))
-                && suffixes
-                    .iter()
-                    .any(|s| path == s || path.ends_with(&format!(".{s}")))
-        })
-        .collect()
-}
-
-/// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
-fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = mlx_gen::gen_core::__model_input_result!(
-        image::open(path),
-        "crates/media/mlx-gen/mlx-gen-krea/src/training.rs::decode_image/image::open",
-        Reference,
-        &[path]
+    resolve_suffix_targets(
+        AdaptableHost::adaptable_paths(transformer),
+        cfg,
+        &DEFAULT_TARGET_MODULES,
+        Some("transformer_blocks."),
     )
-    .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    Ok(dynimg.to_rgb8().into())
 }
 
 /// Encode a center-cropped square image into a Krea training latent `[1, 16, edge/8, edge/8]` — the
@@ -1095,7 +961,9 @@ fn compute_step_loss_grads(
         Some(a) => (a.plan.diffusion, !a.plan.aux.is_empty()),
         None => (true, false),
     };
-    let (x_t, target) = build_batch(x0, noise, t)?;
+    // `target = noise − x0`, the velocity the **raw** Krea DiT output is regressed onto (the DiT
+    // timestep is `t` itself — see the module docs for the sign vs Z-Image).
+    let (x_t, target) = flow_velocity_batch(x0, noise, t)?;
     let x_t_f32 = x_t.clone();
     let mask_weight = mask_weight.cloned();
     let x_t = x_t.as_dtype(dtype)?; // no-op in f32 mode
@@ -1249,7 +1117,10 @@ fn encode_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::train::lora::build_lora_targets;
+    use mlx_gen::train::vocab::sample_timestep;
     use mlx_gen::CancelFlag;
+    use mlx_rs::ops::multiply;
     use std::path::PathBuf;
 
     /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
@@ -1421,7 +1292,7 @@ mod tests {
         // x_t = (1−t)·x0 + t·noise. Timestep `t` is passed straight to the DiT.
         let x0 = Array::from_slice(&[2.0f32, 4.0, 6.0], &[1, 3, 1]);
         let noise = Array::from_slice(&[1.0f32, 1.0, 1.0], &[1, 3, 1]);
-        let (x_t, target) = build_batch(&x0, &noise, 0.25).unwrap();
+        let (x_t, target) = flow_velocity_batch(&x0, &noise, 0.25).unwrap();
         assert_eq!(target.as_slice::<f32>(), &[-1.0, -3.0, -5.0]); // noise − x0
         let xt = x_t.as_slice::<f32>();
         for (got, want) in xt.iter().zip([1.75f32, 3.25, 4.75].iter()) {
@@ -1489,16 +1360,16 @@ mod tests {
             resolution: 512,
             ..base_config()
         };
-        assert_eq!(preflight_edge(&bucket_edges(&cfg)), 512);
+        assert_eq!(largest_edge(&bucket_edges(&cfg)), 512);
         // Buckets [512, 1024] with `resolution` 512: the guard must size for 1024 (epic 2123 E7).
         cfg.resolution_buckets = vec![rb(512, 16), rb(1024, 1)];
         let edges = bucket_edges(&cfg);
         assert_eq!(edges, vec![512, 1024]);
-        assert_eq!(preflight_edge(&edges), 1024);
+        assert_eq!(largest_edge(&edges), 1024);
         // A 48 GB-class budget (safe ≈ 40.8 GB): dense bf16 fits 512 (~31 GB) but not 1024 (~52 GB) —
         // so the bucketed run is refused even though `resolution` alone would pass.
         assert!(check_preflight_budget(512, true, 48.0).is_ok());
-        assert!(check_preflight_budget(preflight_edge(&edges), true, 48.0).is_err());
+        assert!(check_preflight_budget(largest_edge(&edges), true, 48.0).is_err());
     }
 
     #[test]
@@ -1672,6 +1543,7 @@ mod tests {
 #[cfg(test)]
 mod real_weight_repro {
     use super::*;
+    use mlx_gen::train::lora::build_lora_targets;
     use std::path::PathBuf;
 
     /// The base `krea/Krea-2-Raw` snapshot root from the required `KREA_RAW_DIR` env var. sc-13668:
@@ -1699,20 +1571,11 @@ mod real_weight_repro {
 
     /// Per-block LOCAL LoRA target paths (mirrors `train_impl`), for driving the checkpointed path.
     fn block_local_targets(dit: &Krea2Transformer, target_paths: &[String]) -> Vec<Vec<String>> {
-        let mut out: Vec<Vec<String>> = vec![Vec::new(); dit.num_blocks()];
-        for path in target_paths {
-            if let Some((idx, local)) = path
-                .strip_prefix("transformer_blocks.")
-                .and_then(|rest| rest.split_once('.'))
-            {
-                if let Ok(i) = idx.parse::<usize>() {
-                    if i < out.len() {
-                        out[i].push(local.to_string());
-                    }
-                }
-            }
-        }
-        out
+        mlx_gen::train::trainer_loop::block_local_targets(
+            target_paths,
+            "transformer_blocks.",
+            dit.num_blocks(),
+        )
     }
 
     fn max_rel_diff(ga: &LoraParams, gb: &LoraParams) -> f32 {
@@ -1836,6 +1699,7 @@ mod real_weight_repro {
 #[cfg(test)]
 mod depth_anchoring_tests {
     use super::*;
+    use mlx_gen::train::lora::build_lora_targets;
     use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule};
     use mlx_gen::train::taehv::{synthetic_taehv_weights, TaehvDecoder};
     use mlx_gen::weights::Weights;
@@ -2062,7 +1926,7 @@ mod depth_anchoring_tests {
         let mut f = fixture();
         let (off, g_off) = step(&mut f, 0.5, false, None);
         assert_eq!(off.aux, None);
-        let (x_t, target) = build_batch(&f.x0, &f.noise, 0.5).unwrap();
+        let (x_t, target) = flow_velocity_batch(&f.x0, &f.noise, 0.5).unwrap();
         let timestep = Array::from_slice(&[0.5f32], &[1]);
         let context = f.context.clone();
         let dit = &mut f.dit;
