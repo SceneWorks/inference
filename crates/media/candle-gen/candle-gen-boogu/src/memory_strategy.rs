@@ -581,8 +581,8 @@ fn projected_component(
 }
 
 fn recursive_files(root: &Path) -> gen_core::Result<Vec<PathBuf>> {
-    // Shared policy (sc-27253): sorted, de-duplicated absolute paths; symlinks must resolve to
-    // regular files and special files are refused.
+    // Shared policy (sc-27253): sorted, de-duplicated absolute paths; directory symlinks are
+    // followed (cycles and dangling links refused) and special files are refused.
     let files = gen_core::snapshot_inventory::collect_regular_files(
         "boogu",
         root,

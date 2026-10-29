@@ -2,7 +2,7 @@
 //!
 //! Seven Candle providers (sdxl, sd3, sana, kolors, boogu, ideogram, chroma) each carried a private
 //! recursive walker, a streaming SHA-256, a length-framed digest update, and a hex encoder. The
-//! walkers had drifted: one followed directory symlinks out of the snapshot root, one pushed a
+//! walkers had drifted: one followed directory symlinks, another refused them, one pushed a
 //! symlink to a directory (or a dangling one) as a file, one ran its hidden/partial-download name
 //! check only on regular files so a symlinked `*.incomplete` passed (every Hugging Face cache entry
 //! is a symlink), some skipped FIFOs and sockets while others refused them, and only one knew the
@@ -12,15 +12,20 @@
 //!
 //! - The `root` itself may be a regular file (a one-file artifact) or a directory; a symlinked root is
 //!   followed, because it is the caller's chosen path.
-//! - Below the root, a symlink must resolve to a **regular file**. Symlinks to directories and
-//!   dangling links are refused, so a walk never leaves the snapshot through a link.
+//! - Below the root, a symlink to a regular file is collected (the Hugging Face cache layout) and a
+//!   symlink to a directory is followed (e.g. a shared `vae/` linked into a snapshot). A dangling
+//!   link is refused, and so is a directory link that resolves to a directory already on the
+//!   current descent (a cycle), so a walk always terminates.
 //! - Directories are recursed (whatever their name).
 //! - Special files (FIFOs, sockets, devices) are refused, never silently skipped.
 //! - With [`InventoryPolicy::reject_markers`], a hidden (leading `.`) or partial-download
 //!   ([`PARTIAL_DOWNLOAD_SUFFIXES`]) **file name** is refused whether the entry is a regular file or a
 //!   symlink. Exact-inventory providers that compare against an expected file set instead (sd3, sana)
 //!   leave it off: a stray marker already fails their set comparison as an extra entry.
-//! - The result is the sorted, de-duplicated list of absolute lexical paths (not canonicalized).
+//! - The result is the sorted, de-duplicated list of absolute lexical paths (not canonicalized):
+//!   a file reached through a directory link is named by its path under the link, never by the
+//!   link target, so a receipt keyed on the root-relative path is the same whether a component
+//!   directory is real or linked to identical content.
 //!
 //! The hashing helpers are byte-for-byte the per-crate copies they replace, so every receipt and
 //! fingerprint digest computed through them is unchanged.
@@ -76,7 +81,8 @@ pub fn collect_regular_files(
     if metadata.is_file() {
         push_file(label, root, policy, &mut files)?;
     } else if metadata.is_dir() {
-        visit(label, &root, policy, &mut files)?;
+        let mut descent = vec![std::fs::canonicalize(&root)?];
+        visit(label, &root, policy, &mut descent, &mut files)?;
     } else {
         return Err(Error::Unsupported(format!(
             "{label}: artifact source is neither a file nor a directory: {}",
@@ -88,7 +94,15 @@ pub fn collect_regular_files(
     Ok(files)
 }
 
-fn visit(label: &str, dir: &Path, policy: InventoryPolicy, files: &mut Vec<PathBuf>) -> Result<()> {
+/// Recurse into `dir`, whose canonical path is the last entry of `descent` (the canonical paths of
+/// every directory from the root down to `dir`), so a link back into the descent is a cycle.
+fn visit(
+    label: &str,
+    dir: &Path,
+    policy: InventoryPolicy,
+    descent: &mut Vec<PathBuf>,
+    files: &mut Vec<PathBuf>,
+) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         let metadata = std::fs::symlink_metadata(&path)?;
@@ -96,19 +110,22 @@ fn visit(label: &str, dir: &Path, policy: InventoryPolicy, files: &mut Vec<PathB
             // `metadata` follows the link; a dangling link surfaces as this error, not a skip.
             let target = std::fs::metadata(&path).map_err(|error| {
                 Error::Unsupported(format!(
-                    "{label}: symlink does not resolve to a file: {}: {error}",
+                    "{label}: symlink does not resolve: {}: {error}",
                     path.display()
                 ))
             })?;
-            if !target.is_file() {
+            if target.is_file() {
+                push_file(label, path, policy, files)?;
+            } else if target.is_dir() {
+                descend(label, path, policy, descent, files)?;
+            } else {
                 return Err(Error::Unsupported(format!(
-                    "{label}: symlink must resolve directly to a regular file: {}",
+                    "{label}: symlink resolves to a special file: {}",
                     path.display()
                 )));
             }
-            push_file(label, path, policy, files)?;
         } else if metadata.is_dir() {
-            visit(label, &path, policy, files)?;
+            descend(label, path, policy, descent, files)?;
         } else if metadata.is_file() {
             push_file(label, path, policy, files)?;
         } else {
@@ -119,6 +136,29 @@ fn visit(label: &str, dir: &Path, policy: InventoryPolicy, files: &mut Vec<PathB
         }
     }
     Ok(())
+}
+
+/// Visit the sub-directory `path` (real or linked) under its lexical path, refusing it when its
+/// canonical path is already on the current descent.
+fn descend(
+    label: &str,
+    path: PathBuf,
+    policy: InventoryPolicy,
+    descent: &mut Vec<PathBuf>,
+    files: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let canonical = std::fs::canonicalize(&path)?;
+    if descent.contains(&canonical) {
+        return Err(Error::Unsupported(format!(
+            "{label}: directory symlink cycle: {} resolves to {}, which encloses it",
+            path.display(),
+            canonical.display()
+        )));
+    }
+    descent.push(canonical);
+    let visited = visit(label, &path, policy, descent, files);
+    descent.pop();
+    visited
 }
 
 fn push_file(
@@ -273,24 +313,129 @@ mod tests {
         );
     }
 
+    /// Root-relative names joined with their content digest, the shape a receipt keys on.
+    fn keyed_digests(root: &Path, files: &[PathBuf]) -> Vec<(String, [u8; 32])> {
+        names(root, files)
+            .into_iter()
+            .zip(files.iter().map(|path| sha256_file(path).unwrap()))
+            .collect()
+    }
+
     #[cfg(unix)]
     #[test]
-    fn directory_and_dangling_symlinks_are_refused() {
+    fn directory_symlinks_are_followed_under_their_lexical_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let outside = tmp.path().join("outside");
+        let shared = tmp.path().join("shared-vae");
+        std::fs::create_dir_all(shared.join("nested")).unwrap();
+        std::fs::write(shared.join("config.json"), b"{}").unwrap();
+        std::fs::write(shared.join("nested/weights.safetensors"), b"w").unwrap();
+
+        let linked = std::path::absolute(tmp.path().join("linked")).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join("model_index.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&shared, linked.join("vae")).unwrap();
+
+        let real = std::path::absolute(tmp.path().join("real")).unwrap();
+        std::fs::create_dir_all(real.join("vae/nested")).unwrap();
+        std::fs::write(real.join("model_index.json"), b"{}").unwrap();
+        std::fs::write(real.join("vae/config.json"), b"{}").unwrap();
+        std::fs::write(real.join("vae/nested/weights.safetensors"), b"w").unwrap();
+
+        for policy in [InventoryPolicy::STRUCTURAL, InventoryPolicy::REJECT_MARKERS] {
+            let through_link = collect_regular_files("t", &linked, policy).unwrap();
+            assert!(through_link.iter().all(|path| path.starts_with(&linked)));
+            assert_eq!(
+                names(&linked, &through_link),
+                [
+                    "model_index.json",
+                    "vae/config.json",
+                    "vae/nested/weights.safetensors"
+                ]
+            );
+            let direct = collect_regular_files("t", &real, policy).unwrap();
+            assert_eq!(
+                keyed_digests(&linked, &through_link),
+                keyed_digests(&real, &direct),
+                "a linked component directory inventories like the real one"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn markers_below_a_directory_symlink_are_still_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
         let snapshot = tmp.path().join("snapshot");
-        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
         std::fs::create_dir_all(&snapshot).unwrap();
-        std::fs::write(outside.join("weights.safetensors"), b"w").unwrap();
-        std::os::unix::fs::symlink(&outside, snapshot.join("linked")).unwrap();
+        std::fs::write(shared.join("weights.safetensors.incomplete"), b"w").unwrap();
+        std::os::unix::fs::symlink(&shared, snapshot.join("vae")).unwrap();
+        assert!(collect_regular_files("t", &snapshot, InventoryPolicy::REJECT_MARKERS).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlinks_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("ok.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("missing"), snapshot.join("vae")).unwrap();
         for policy in [InventoryPolicy::STRUCTURAL, InventoryPolicy::REJECT_MARKERS] {
-            assert!(collect_regular_files("t", &snapshot, policy).is_err());
+            let error = collect_regular_files("t", &snapshot, policy).unwrap_err();
+            assert!(
+                matches!(&error, Error::Unsupported(message) if message.contains("does not resolve")),
+                "{error}"
+            );
         }
-        std::fs::remove_file(snapshot.join("linked")).unwrap();
-        std::os::unix::fs::symlink(tmp.path().join("missing"), snapshot.join("dangling")).unwrap();
-        for policy in [InventoryPolicy::STRUCTURAL, InventoryPolicy::REJECT_MARKERS] {
-            assert!(collect_regular_files("t", &snapshot, policy).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlink_cycles_are_refused_not_followed_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join("snapshot");
+        std::fs::create_dir_all(snapshot.join("a/b")).unwrap();
+        std::fs::write(snapshot.join("a/b/w.safetensors"), b"w").unwrap();
+        // A link back to the root, and a link back to an intermediate directory.
+        for (link, target) in [
+            ("a/b/root", snapshot.clone()),
+            ("a/b/up", snapshot.join("a")),
+        ] {
+            std::os::unix::fs::symlink(&target, snapshot.join(link)).unwrap();
+            for policy in [InventoryPolicy::STRUCTURAL, InventoryPolicy::REJECT_MARKERS] {
+                let error = collect_regular_files("t", &snapshot, policy).unwrap_err();
+                assert!(
+                    matches!(&error, Error::Unsupported(message) if message.contains("cycle")),
+                    "{error}"
+                );
+            }
+            std::fs::remove_file(snapshot.join(link)).unwrap();
         }
+        // The same root reached through a linked root is still a cycle.
+        let linked_root = tmp.path().join("linked-root");
+        std::os::unix::fs::symlink(&snapshot, &linked_root).unwrap();
+        std::os::unix::fs::symlink(&snapshot, snapshot.join("a/again")).unwrap();
+        assert!(collect_regular_files("t", &linked_root, InventoryPolicy::STRUCTURAL).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_links_to_one_shared_directory_are_not_a_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let snapshot = tmp.path().join("snapshot");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(shared.join("w.safetensors"), b"w").unwrap();
+        std::os::unix::fs::symlink(&shared, snapshot.join("text_encoder")).unwrap();
+        std::os::unix::fs::symlink(&shared, snapshot.join("text_encoder_2")).unwrap();
+        let files = collect_regular_files("t", &snapshot, InventoryPolicy::STRUCTURAL).unwrap();
+        assert_eq!(
+            names(&snapshot, &files),
+            ["text_encoder/w.safetensors", "text_encoder_2/w.safetensors"]
+        );
     }
 
     #[cfg(unix)]
