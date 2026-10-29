@@ -1,13 +1,29 @@
-//! Dataset preparation helpers for training (sc-3043) — family-agnostic and dependency-free.
+//! Dataset preparation helpers for training (sc-3043) — family-agnostic.
 //!
-//! These operate on the core [`Image`] (decoded RGB8) so the core crate needs no image-decode
-//! dependency: the family trainer (which already links the `image` crate for output encoding)
-//! decodes the file into an [`Image`], then this module center-crops to a square and the family's
-//! own `preprocess_init_image` resizes/normalises into the VAE input. Resolution is bucketed to a
-//! multiple of 32 (the latent grid must tile cleanly), mirroring the Python kernel's
-//! `bucket_resolution`.
+//! These operate on the core [`Image`] (decoded RGB8): [`decode_image`] reads a dataset file into
+//! an [`Image`] (the one model-input reader site every MLX trainer shares, sc-27332), then this
+//! module center-crops to a square and the family's own `preprocess_init_image` resizes/normalises
+//! into the VAE input. Resolution is bucketed to a multiple of 32 (the latent grid must tile
+//! cleanly), mirroring the Python kernel's `bucket_resolution`.
+
+use std::path::Path;
 
 use crate::media::Image;
+use crate::{Error, Result};
+
+/// Decode a dataset image file (PNG/JPEG/…) into the core RGB8 [`Image`] — the reader every MLX
+/// family trainer routes its training items through (sc-27332). The successful read is recorded as
+/// a `Reference` model input under this site's registered reader identity.
+pub fn decode_image(path: &Path) -> Result<Image> {
+    let dynimg = gen_core::__model_input_result!(
+        image::open(path),
+        "crates/media/mlx-gen/src/train/dataset.rs::decode_image/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    Ok(dynimg.to_rgb8().into())
+}
 
 /// Floor `resolution` to a multiple of 32 (the training-resolution bucket). Mirrors the Python
 /// `bucket_resolution`: `0` → the `512` default; otherwise `(res/32)*32`, with a 32-px floor so a

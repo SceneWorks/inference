@@ -504,6 +504,20 @@ fn host_pixels(image: &gen_core::Image) -> Result<Array> {
         &[1, image.height as i32, image.width as i32, 3],
     ))
 }
+
+/// The pinned base a run trains against, admitted by [`admit_base`].
+struct AdmittedBase {
+    cfg: gen_core::flux3::Flux3Config,
+    resources: GenerationResources,
+    /// The pinned resources' observed digests at admission.
+    artifacts: BTreeMap<String, String>,
+}
+
+/// The run: base admission → dataset decode → run plan + identity (and resume admission) →
+/// frozen caching → the DiT + LoRA init → the shared source controller (`controller::run`,
+/// which owns the step / checkpoint / export loop for both backends). FLUX3 does not drive the
+/// MLX family loop (`mlx_gen::train::trainer_loop`): its loop is the backend-neutral source
+/// controller, shared with the Candle trainer, so it is split into its phases here instead.
 fn execute(
     spec: &LoadSpec,
     req: &TrainingRequest,
@@ -513,12 +527,64 @@ fn execute(
     let opts = TrainingOptions::parse(req).map_err(Error::from)?;
     on_progress(TrainingProgress::Preparing);
     check(&req.cancel)?;
+    let base = admit_base(spec, req)?;
+    let targets =
+        lora_targets(&base.cfg.dit, &req.config.lora_target_modules).map_err(Error::from)?;
+    let pixels = decode_pixels(req, &opts)?;
+    let (plan, identity) = plan_run(req, &opts, &base, &targets, &pixels)?;
+    on_progress(TrainingProgress::LoadingModel);
+    check(&req.cancel)?;
+    let dtype = match opts.precision {
+        TrainingPrecision::F32 => Dtype::Float32,
+        TrainingPrecision::Bf16 => Dtype::Bfloat16,
+    };
+    let examples = cache_examples(req, &opts, &base, dtype, &pixels, on_progress)?;
+    drop(pixels);
+    check(&req.cancel)?;
+    if gen_core::train::resume::request_fingerprint(req).map_err(Error::from)? != identity.dataset
+        || identity::observe_pinned_resources(&base.resources, &req.cancel).map_err(Error::from)?
+            != identity.artifacts
+    {
+        return Err(invalid(
+            "dataset/base/component bytes changed during frozen caching; refusing training",
+        ));
+    }
+    let dit = crate::model::load_dit(
+        &base.resources.package_dir.join(DIT_WEIGHTS_FILE),
+        &base.cfg,
+        dtype,
+    )?;
+    let graph = TrainingGraph::new(
+        dit,
+        req.config.rank as usize,
+        req.config.alpha as f64,
+        &req.config.lora_target_modules,
+    )?;
+    let params = init_lora_params(&graph, req)?;
+    let mut session = MlxSession::new(
+        graph,
+        params,
+        SourceAdamW::new(req.config.learning_rate, req.config.weight_decay)?,
+        examples,
+        SessionPolicy {
+            options: opts,
+            identity,
+            seed: req.config.seed,
+            accumulation: req.config.gradient_accumulation,
+        },
+    )?;
+    let output = controller::run(&mut session, req, &plan, on_progress).map_err(Error::from)?;
+    check(&req.cancel)?;
+    Ok(output)
+}
+
+/// Header authority before any encoder, autoencoder or dataset work: the strict resolver's
+/// `ref_time_in` pair decides the mode, the base (CFG) route must match it, and the FULL dense
+/// inventory of the package's own DiT file is checked before anything is decoded or loaded.
+fn admit_base(spec: &LoadSpec, req: &TrainingRequest) -> Result<AdmittedBase> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(invalid("base directory required"));
     };
-    // Header authority before any encoder, autoencoder or dataset work: the strict resolver's
-    // `ref_time_in` pair decides the mode, the base (CFG) route must match it, and the FULL dense
-    // inventory of the package's own DiT file is checked before anything is decoded or loaded.
     let cfg = gen_core::flux3::resolve_checkpoint(root).map_err(Error::from)?;
     cfg.validate_route(BASE_MODEL_ID).map_err(Error::from)?;
     let storage = NativeDitStorage::from_package(root).map_err(Error::from)?;
@@ -539,9 +605,19 @@ fn execute(
         GenerationResources::from_spec(spec, &cfg, BASE_MODEL_ID).map_err(Error::from)?;
     let artifacts =
         identity::observe_pinned_resources(&resources, &req.cancel).map_err(Error::from)?;
-    let targets = lora_targets(&cfg.dit, &req.config.lora_target_modules).map_err(Error::from)?;
-    let pixels = req
-        .items
+    Ok(AdmittedBase {
+        cfg,
+        resources,
+        artifacts,
+    })
+}
+
+/// Every item's target (and paired reference) pixels, decoded and preprocessed once.
+fn decode_pixels(
+    req: &TrainingRequest,
+    opts: &TrainingOptions,
+) -> Result<Vec<preprocess::PreparedPair>> {
+    req.items
         .iter()
         .enumerate()
         .map(|(index, item)| {
@@ -559,7 +635,18 @@ fn execute(
             )
             .map_err(Error::from)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
+
+/// The source controller's run plan (sampler, LR schedule, clip norm) and the run's resume
+/// identity; a requested resume must find a compatible saved state, never silently restart.
+fn plan_run(
+    req: &TrainingRequest,
+    opts: &TrainingOptions,
+    base: &AdmittedBase,
+    targets: &[gen_core::flux3::training::LoraTarget],
+    pixels: &[preprocess::PreparedPair],
+) -> Result<(RunPlan, ResumeIdentity)> {
     let geometry = pixels
         .iter()
         .map(|p| p.geometry.clone())
@@ -577,8 +664,16 @@ fn execute(
         sampler,
         max_grad_norm: opts.max_grad_norm,
     };
-    let identity = identity::build(req, &cfg, &opts, artifacts, &targets, &geometry, "mlx")
-        .map_err(Error::from)?;
+    let identity = identity::build(
+        req,
+        &base.cfg,
+        opts,
+        base.artifacts.clone(),
+        targets,
+        &geometry,
+        "mlx",
+    )
+    .map_err(Error::from)?;
     if req.config.resume {
         controller::find_resume(
             &req.output_dir,
@@ -594,12 +689,22 @@ fn execute(
             invalid("resume requested but no compatible saved state exists; refusing restart")
         })?;
     }
-    on_progress(TrainingProgress::LoadingModel);
-    check(&req.cancel)?;
-    let dtype = match opts.precision {
-        TrainingPrecision::F32 => Dtype::Float32,
-        TrainingPrecision::Bf16 => Dtype::Bfloat16,
-    };
+    Ok((plan, identity))
+}
+
+/// The frozen caching pass: load the frozen autoencoder + text teacher at `dtype`, assemble the
+/// caption windows (padded to one length when batching), then encode every item's latent,
+/// reference and caption (memoized per `(caption, window)`), plus the matched-window empty
+/// caption when caption dropout is on. Both frozen models drop on return (teacher first).
+fn cache_examples(
+    req: &TrainingRequest,
+    opts: &TrainingOptions,
+    base: &AdmittedBase,
+    dtype: Dtype,
+    pixels: &[preprocess::PreparedPair],
+    on_progress: &mut dyn FnMut(TrainingProgress),
+) -> Result<Vec<CachedExample>> {
+    let (cfg, resources) = (&base.cfg, &base.resources);
     let encoder = FrozenTrainingEncoder::from_weights(
         &Weights::from_file(&resources.autoencoder_file)?,
         dtype,
@@ -611,34 +716,12 @@ fn execute(
         dtype,
         opts.max_sequence_length,
     )?;
-    let mut windows = req
-        .items
-        .iter()
-        .map(|item| teacher.window(&item.caption))
-        .collect::<Result<Vec<_>>>()?;
-    if req.config.batch_size > 1 {
-        let length = windows
-            .iter()
-            .map(|w| w.length())
-            .max()
-            .ok_or_else(|| invalid("empty caption windows"))?;
-        for window in &mut windows {
-            let truncated = window.truncated_tokens;
-            *window = assemble_window(
-                &window.input_ids[..window.real],
-                teacher.pad_id(),
-                length,
-                opts.max_sequence_length,
-            )
-            .map_err(Error::from)?;
-            window.truncated_tokens = truncated;
-        }
-    }
+    let windows = caption_windows(req, opts, &teacher)?;
     let empty = teacher.window("")?;
     let mut empties: BTreeMap<usize, Array> = BTreeMap::new();
     let mut captions: BTreeMap<(String, usize), Array> = BTreeMap::new();
     let mut examples = Vec::new();
-    for (index, ((item, pair), window)) in req.items.iter().zip(&pixels).zip(windows).enumerate() {
+    for (index, ((item, pair), window)) in req.items.iter().zip(pixels).zip(windows).enumerate() {
         check(&req.cancel)?;
         let (latent, grid) = encoder.encode(&host_pixels(&pair.target)?)?;
         let reference = pair
@@ -708,23 +791,45 @@ fn execute(
     }
     drop(teacher);
     drop(encoder);
-    drop(pixels);
-    check(&req.cancel)?;
-    if gen_core::train::resume::request_fingerprint(req).map_err(Error::from)? != identity.dataset
-        || identity::observe_pinned_resources(&resources, &req.cancel).map_err(Error::from)?
-            != identity.artifacts
-    {
-        return Err(invalid(
-            "dataset/base/component bytes changed during frozen caching; refusing training",
-        ));
+    Ok(examples)
+}
+
+/// Every item's caption window; with `batch_size > 1` all are re-assembled to the longest one's
+/// length (keeping each window's truncation count).
+fn caption_windows(
+    req: &TrainingRequest,
+    opts: &TrainingOptions,
+    teacher: &Flux3TextEncoder,
+) -> Result<Vec<gen_core::flux3::TextWindow>> {
+    let mut windows = req
+        .items
+        .iter()
+        .map(|item| teacher.window(&item.caption))
+        .collect::<Result<Vec<_>>>()?;
+    if req.config.batch_size > 1 {
+        let length = windows
+            .iter()
+            .map(|w| w.length())
+            .max()
+            .ok_or_else(|| invalid("empty caption windows"))?;
+        for window in &mut windows {
+            let truncated = window.truncated_tokens;
+            *window = assemble_window(
+                &window.input_ids[..window.real],
+                teacher.pad_id(),
+                length,
+                opts.max_sequence_length,
+            )
+            .map_err(Error::from)?;
+            window.truncated_tokens = truncated;
+        }
     }
-    let dit = crate::model::load_dit(&resources.package_dir.join(DIT_WEIGHTS_FILE), &cfg, dtype)?;
-    let graph = TrainingGraph::new(
-        dit,
-        req.config.rank as usize,
-        req.config.alpha as f64,
-        &req.config.lora_target_modules,
-    )?;
+    Ok(windows)
+}
+
+/// The source LoRA init: per target (in graph order, each with its own keyed stream), `A` drawn
+/// `N(0, 1) / rank` and `B = 0`.
+fn init_lora_params(graph: &TrainingGraph, req: &TrainingRequest) -> Result<LoraParams> {
     let mut params = LoraParams::new();
     for (index, target) in graph.targets.iter().enumerate() {
         check(&req.cancel)?;
@@ -742,21 +847,7 @@ fn execute(
             Array::zeros::<f32>(&[target.output as i32, rank as i32])?,
         );
     }
-    let mut session = MlxSession::new(
-        graph,
-        params,
-        SourceAdamW::new(req.config.learning_rate, req.config.weight_decay)?,
-        examples,
-        SessionPolicy {
-            options: opts,
-            identity,
-            seed: req.config.seed,
-            accumulation: req.config.gradient_accumulation,
-        },
-    )?;
-    let output = controller::run(&mut session, req, &plan, on_progress).map_err(Error::from)?;
-    check(&req.cancel)?;
-    Ok(output)
+    Ok(params)
 }
 
 #[cfg(test)]

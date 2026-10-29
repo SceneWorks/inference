@@ -56,34 +56,35 @@ use std::rc::Rc;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
-use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
-use mlx_gen::train::lora::{
-    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
-    build_lora_targets, LoraParams, TrainAdapter,
-};
+use mlx_gen::train::checkpoint;
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
+use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
-    combine_step_loss, step_sample, AuxDriver, AuxModelFootprint, Parameterization, PerceptualPath,
-    StepPlan, X0Decoder,
+    combine_step_loss, AuxDriver, AuxModelFootprint, Parameterization, PerceptualPath, StepPlan,
+    X0Decoder,
 };
-use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
+use mlx_gen::train::trainer_loop::{
+    adapter_optimizer, adapter_stem, build_adapter, cache_items, draw_flow_step,
+    encode_preview_prompts, ensure_cached, flow_step_noise, flow_velocity_batch, largest_edge,
+    mae_loss, render_preview_prompts, resolve_compute_dtype, resolve_suffix_targets,
+    run_train_loop, AdapterSaver, CheckpointAt, LoopStart, LossTypeFold, PreviewLog, PreviewSink,
+    TrainLoopFamily,
+};
 use mlx_gen::train::vocab::{
-    normalize_cfg, sample_timestep, validate_sampling_vocab, validate_steps_and_optimizer,
-    TIMESTEP_TYPES,
+    validate_sampling_vocab, validate_steps_and_optimizer, TIMESTEP_TYPES,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
-    TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
-    WeightsSource,
+    LoadSpec, Modality, Result, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
+    TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest, WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
-use mlx_rs::ops::{multiply, subtract};
+use mlx_rs::ops::subtract;
 use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
-use mlx_rs::{random, Array, Dtype};
+use mlx_rs::{Array, Dtype};
 
 use crate::config::{MageFlowConfig, FAMILY, VAE_DOWNSAMPLE_FACTOR};
 use crate::latent::GsKey;
@@ -113,9 +114,6 @@ const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
 /// `family` / `baseModel` stamp, which SceneWorks' `detect_metadata_family` reads first.
 const ADAPTER_PROVENANCE: [(&str, &str); 2] = [("family", FAMILY), ("baseModel", MODEL_ID)];
 
-/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence.
-const SAMPLE_PROMPT_CAP: usize = 4;
-
 /// `(x_t, target, timestep)` for a single sample at flow-match `sigma`:
 /// `x_t = (1−σ)·x0 + σ·noise`, `target = noise − x0`, `timestep = σ`.
 ///
@@ -126,10 +124,7 @@ const SAMPLE_PROMPT_CAP: usize = 4;
 /// f32 so the target/interpolant stay f32 regardless of the cached latent dtype (master-weights).
 fn build_batch(x0: &Array, noise: &Array, sigma: f32) -> Result<(Array, Array, f32)> {
     let x0 = x0.as_dtype(Dtype::Float32)?;
-    let one_minus = Array::from_slice(&[1.0 - sigma], &[1]);
-    let s = Array::from_slice(&[sigma], &[1]);
-    let x_t = mlx_rs::ops::add(&multiply(&x0, &one_minus)?, &multiply(noise, &s)?)?;
-    let target = subtract(noise, &x0)?;
+    let (x_t, target) = flow_velocity_batch(&x0, noise, sigma)?;
     Ok((x_t, target, sigma))
 }
 
@@ -182,7 +177,7 @@ fn step_cache_index(schedule: &BucketSchedule, step: u32) -> usize {
 /// One pre-encoded preview-sample prompt — `(prompt, txt embedding [1, tokens, hidden], token count)`.
 /// Encoded during the dataset-caching pass, while the Qwen encoder is still resident, and reused at
 /// every [`TrainingConfig::sample_every`] cadence by both train paths.
-type SamplePrompt = (String, Array, i32);
+type SamplePrompt = (String, (Array, i32));
 
 /// The base components a Mage-Flow training run trains against — the LoRA/LoKr adapter path (frozen
 /// DiT + injected factors) and the full base fine-tune path (every DiT weight trainable, sc-14056).
@@ -600,25 +595,17 @@ impl MageFlowTrainer {
     /// base fine-tune path frees it); a typed error rather than a panic if that invariant is ever
     /// violated (F-008).
     fn transformer_ref(&self) -> Result<&MageTransformer> {
-        self.transformer.as_ref().ok_or_else(|| {
-            mlx_gen::Error::Msg(
-                "mage_flow_base trainer: DiT was freed (only the full fine-tune path frees it)"
-                    .into(),
-            )
-        })
+        frozen_dit_ref(&self.transformer)
     }
 
     /// `&mut` sibling of [`transformer_ref`](Self::transformer_ref).
     fn transformer_mut(&mut self) -> Result<&mut MageTransformer> {
-        self.transformer.as_mut().ok_or_else(|| {
-            mlx_gen::Error::Msg(
-                "mage_flow_base trainer: DiT was freed (only the full fine-tune path frees it)"
-                    .into(),
-            )
-        })
+        frozen_dit_mut(&mut self.transformer)
     }
 
-    /// The rich-`Result` body behind [`Trainer::train`].
+    /// The rich-`Result` body behind [`Trainer::train`]: setup → cache → adapter → the shared
+    /// [`run_train_loop`] over [`MageAdapterLoop`] (the full base fine-tune dispatches to
+    /// [`train_full_impl`](Self::train_full_impl)).
     fn train_impl(
         &mut self,
         req: &TrainingRequest,
@@ -634,7 +621,7 @@ impl MageFlowTrainer {
         // subset of Mage's 16× stride, so the latent tiles cleanly). `patch_size == 1`, so each
         // sample's token count is exactly its latent grid. Previews render at the largest edge.
         let edges = bucket_edges(cfg);
-        let preview_edge = edges.iter().copied().max().unwrap_or(0);
+        let preview_edge = largest_edge(&edges);
 
         let compute_dtype = resolve_compute_dtype(&cfg.train_dtype);
 
@@ -679,65 +666,20 @@ impl MageFlowTrainer {
 
         // --- adapter targets + params (LoRA or LoKr) + optimizer ---
         let target_paths = resolve_target_paths(self.transformer_ref()?, cfg);
-        let rank = cfg.rank as f32;
-        let (adapter, mut params) = match cfg.network_type {
-            NetworkType::Lora => {
-                let (targets, params) = build_lora_targets(
-                    self.transformer_mut()?,
-                    &target_paths,
-                    cfg.rank as i32,
-                    cfg.seed,
-                )?;
-                (TrainAdapter::Lora { targets }, params)
-            }
-            NetworkType::Lokr => {
-                let (targets, params) = build_lokr_targets(
-                    self.transformer_mut()?,
-                    &target_paths,
-                    cfg.rank as i32,
-                    cfg.decompose_factor,
-                    cfg.seed,
-                )?;
-                (TrainAdapter::Lokr { targets }, params)
-            }
-        };
-        let alpha = cfg.alpha;
-        let mae = {
-            let lt = normalize_cfg(&cfg.loss_type);
-            lt == "mae" || lt == "l1"
-        };
-
-        // AdamW with wd=0 is identical to Adam, so one optimizer covers both choices.
-        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
-            0.0
-        } else {
-            cfg.weight_decay
-        };
-        let mut opt = TrainOptimizer::from_config(&cfg.optimizer, cfg.learning_rate, weight_decay)?;
-
+        let (adapter, params) = build_adapter(self.transformer_mut()?, &target_paths, cfg)?;
+        let mae = mae_loss(&cfg.loss_type, LossTypeFold::Normalized);
+        let opt = adapter_optimizer(cfg)?;
         let accum = cfg.gradient_accumulation.max(1);
-        let (total_updates, warmup_updates) =
-            schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
-        let stem = Path::new(&req.file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("lora")
-            .to_string();
-
+        let stem = adapter_stem(&req.file_name, "lora");
         // --- resume: continue from the latest snapshot of THIS adapter in output_dir, if any ---
-        let mut update_idx: u32 = 0;
-        let mut start_step: u32 = 0;
-        if cfg.resume {
-            if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
-                let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut opt)?;
-                params = loaded;
-                start_step = meta.step;
-                update_idx = meta.update_idx;
-                eprintln!("[sc-14055] resuming from step {start_step} (update {update_idx})");
-            }
-        }
+        let start =
+            LoopStart::fresh(opt, params).resume_latest(cfg, &req.output_dir, &stem, |meta| {
+                eprintln!(
+                    "[sc-14055] resuming from step {} (update {})",
+                    meta.step, meta.update_idx
+                )
+            })?;
 
-        // --- train loop ---
         // sc-2127: which cached (item, bucket) sample each step trains on (round-robin over items for
         // a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
         let schedule =
@@ -745,163 +687,28 @@ impl MageFlowTrainer {
         // Epic 2123 E8: every entry's perceptual reference built once; the alternation interleaves
         // optimizer windows over the schedule's epochs (sc-2124) — a pure function of the step, so
         // a resumed run needs no replay.
-        let mut aux_driver = match perceptual {
+        let aux = match perceptual {
             Some(path) => Some(aux_driver(path, &cache, &schedule, accum, &req.cancel)?),
             None => None,
         };
-        let mut accumulated: Option<LoraParams> = None;
-        let mut last_loss = 0.0f32;
-        let mut steps_run = start_step;
-        for step in start_step + 1..=cfg.steps {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            let (losses, grads) = run_train_step(
-                self.transformer.as_mut().ok_or_else(|| {
-                    mlx_gen::Error::Msg("mage_flow_base trainer: DiT was freed".into())
-                })?,
-                &params,
-                &adapter,
+        let mut family = MageAdapterLoop {
+            transformer: &mut self.transformer,
+            vae: &self.vae,
+            req,
+            saver: AdapterSaver {
+                adapter: &adapter,
                 cfg,
-                &cache,
-                &schedule,
-                aux_driver.as_mut(),
-                step,
-                mae,
-                compute_dtype,
-            )?;
-            last_loss = losses.total;
-            steps_run = step;
-            accumulate_grads(&mut accumulated, grads)?;
-
-            if step % accum == 0 || step == cfg.steps {
-                let mult =
-                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
-                opt.set_lr_scaled(mult);
-                // The final update can fire with fewer than `accum` grads when `steps` isn't a
-                // multiple of the accumulation; divide by the actual in-window count.
-                let window = if step % accum == 0 {
-                    accum
-                } else {
-                    step % accum
-                };
-                let avg = average_grads(
-                    accumulated
-                        .take()
-                        .expect("an update fires only after accumulation"),
-                    window,
-                )?;
-                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
-                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
-                update_idx += 1;
-            }
-
-            on_progress(TrainingProgress::Training {
-                step,
-                total: cfg.steps,
-                loss: last_loss,
-            });
-
-            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
-                std::fs::create_dir_all(&req.output_dir)?;
-                let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
-                adapter.save_with_meta(
-                    &params,
-                    alpha,
-                    rank,
-                    cfg.decompose_factor,
-                    "",
-                    &ADAPTER_PROVENANCE,
-                    &ckpt,
-                )?;
-                checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
-                on_progress(TrainingProgress::Checkpoint { step });
-            }
-
-            // Periodic preview samples from the in-progress adapter (installed exactly as a train
-            // step installs it; the next step's traced loss re-installs, so no teardown is needed).
-            if cfg.sample_every > 0 && !sample_caps.is_empty() && step % cfg.sample_every == 0 {
-                let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
-                adapter.install_as(
-                    self.transformer_mut()?,
-                    &params,
-                    alpha,
-                    rank,
-                    lora_dtype,
-                    LOKR_DTYPE,
-                )?;
-                let transformer = self.transformer_ref()?;
-                let total = sample_caps.len() as u32;
-                for (i, (prompt, txt, txt_tokens)) in sample_caps.iter().enumerate() {
-                    if req.cancel.is_cancelled() {
-                        break;
-                    }
-                    let sample_seed = cfg
-                        .seed
-                        .wrapping_add(step as u64)
-                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
-                        .wrapping_add(i as u64);
-                    // Previews are best-effort: a render failure must NOT abort the long-running
-                    // training run — log it and keep training.
-                    match render_sample(
-                        transformer,
-                        &self.vae,
-                        txt,
-                        *txt_tokens,
-                        preview_edge,
-                        cfg.sample_steps.max(1) as usize,
-                        cfg.sample_guidance_scale,
-                        sample_seed as i64,
-                    ) {
-                        Ok(image) => on_progress(TrainingProgress::Sample {
-                            step,
-                            index: i as u32 + 1,
-                            total,
-                            prompt: prompt.clone(),
-                            image,
-                        }),
-                        Err(mlx_gen::Error::Canceled) => break,
-                        Err(e) => {
-                            eprintln!(
-                                "[sc-14055] {MODEL_ID} preview sample failed at step {step} \
-                                 (prompt {}): {e} — skipping this preview, training continues",
-                                i + 1
-                            );
-                            warnings.push(gen_core::train::preview_sample_failed(
-                                step,
-                                i as u32 + 1,
-                                &e,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Cancelled before completing a single step: the LoRA factors are still `B = 0`, a no-op
-        // adapter. Surface the cancellation rather than writing a valid-looking identity adapter.
-        if steps_run == 0 {
-            return Err(mlx_gen::Error::Canceled);
-        }
-
-        // --- save final adapter (PEFT keys + alpha/rank + family provenance into __metadata__) ---
-        on_progress(TrainingProgress::Saving);
-        std::fs::create_dir_all(&req.output_dir)?;
-        let adapter_path = req.output_dir.join(&req.file_name);
-        adapter.save_with_meta(
-            &params,
-            alpha,
-            rank,
-            cfg.decompose_factor,
-            "",
-            &ADAPTER_PROVENANCE,
-            &adapter_path,
-        )?;
-        Ok(TrainingOutput {
-            adapter_path,
-            steps: steps_run,
-            final_loss: last_loss,
-        })
+                provenance: &ADAPTER_PROVENANCE,
+            },
+            cache: &cache,
+            schedule: &schedule,
+            aux,
+            mae,
+            compute_dtype,
+            sample_caps: &sample_caps,
+            preview_edge,
+        };
+        run_train_loop(&mut family, req, &stem, start, on_progress, warnings)
     }
 
     /// Cache the whole dataset (Mage-VAE latents + Qwen3-VL prompt embeddings) into memory, pre-encode
@@ -918,16 +725,8 @@ impl MageFlowTrainer {
     ) -> Result<(Vec<CachedSample>, Vec<SamplePrompt>)> {
         let cfg = &req.config;
         on_progress(TrainingProgress::LoadingModel);
-        let total = req.items.len() as u32;
         let mut cache: Vec<CachedSample> = Vec::with_capacity(req.items.len() * edges.len());
-        for (i, item) in req.items.iter().enumerate() {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            on_progress(TrainingProgress::Caching {
-                current: i as u32 + 1,
-                total,
-            });
+        cache_items(req, on_progress, |item| {
             let img = center_crop_square(&decode_image(&item.image_path)?);
             // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
             let mask = PreparedSubjectMask::load_if_enabled(
@@ -960,37 +759,24 @@ impl MageFlowTrainer {
                     mask_weight,
                 });
             }
-        }
-        if cache.is_empty() {
-            // Disambiguate cancel-during-caching (typed `Canceled`) from a genuinely unusable dataset.
-            if req.cancel.is_cancelled() {
-                return Err(mlx_gen::Error::Canceled);
-            }
-            return Err("mage_flow_base trainer: no usable dataset items".into());
-        }
+            Ok(())
+        })?;
+        // Disambiguate cancel-during-caching (typed `Canceled`) from a genuinely unusable dataset.
+        ensure_cached(cache.len(), &req.cancel, "mage_flow_base trainer")?;
 
         // Pre-encode the preview-sample prompts while the encoder is still resident (freed just
         // below). Each `sample_every` cadence reuses these to render previews from the in-progress
         // model. Skipped when sampling is off (the default) or the run is already cancelled.
-        let sample_caps: Vec<SamplePrompt> = if cfg.sample_every > 0
-            && !cfg.sample_prompts.is_empty()
-            && !req.cancel.is_cancelled()
-        {
+        let sample_caps: Vec<SamplePrompt> = encode_preview_prompts(cfg, &req.cancel, |prompt| {
             let text_encoder = self.text_encoder.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "mage_flow_base trainer: text encoder already freed (sample pre-encode)".into(),
                 )
             })?;
-            let mut caps = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
-            for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
-                let (txt, txt_tokens) = encode_caption(text_encoder, prompt)?;
-                eval([&txt])?;
-                caps.push((prompt.clone(), txt, txt_tokens));
-            }
-            caps
-        } else {
-            Vec::new()
-        };
+            let (txt, txt_tokens) = encode_caption(text_encoder, prompt)?;
+            eval([&txt])?;
+            Ok((txt, txt_tokens))
+        })?;
 
         // Every prompt is now encoded; drop the Qwen encoder and evict its buffers before the loop.
         self.text_encoder = None;
@@ -1039,7 +825,7 @@ impl MageFlowTrainer {
         // config), so a corrupt or partially-remapped checkpoint has already failed loudly before this
         // point — and reconstructing a second full model here purely to re-validate would transiently
         // double the resident weights, the single largest term in this path's peak.
-        let (mut params, dit_cfg) = load_master_weights(&transformer_dir)?;
+        let (params, dit_cfg) = load_master_weights(&transformer_dir)?;
         // The msrope table is a weight-independent constant (built from `dit_cfg`); build it once and
         // derive each step's pack context from it, so the per-step in-trace reconstruction never
         // recomputes it.
@@ -1048,209 +834,310 @@ impl MageFlowTrainer {
         // Cache the dataset + drop the text encoder (shared with the LoRA path).
         let (cache, sample_caps) = self.prepare_caches(req, edges, on_progress)?;
 
-        let mae = {
-            let lt = normalize_cfg(&cfg.loss_type);
-            lt == "mae" || lt == "l1"
-        };
-        // AdamW with wd=0 is identical to Adam, so one optimizer covers both choices.
-        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
-            0.0
-        } else {
-            cfg.weight_decay
-        };
-        let mut opt = TrainOptimizer::from_config(&cfg.optimizer, cfg.learning_rate, weight_decay)?;
-        let accum = cfg.gradient_accumulation.max(1);
-        let (total_updates, warmup_updates) =
-            schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
-        let stem = Path::new(&req.file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("finetune")
-            .to_string();
+        let mae = mae_loss(&cfg.loss_type, LossTypeFold::Normalized);
+        let opt = adapter_optimizer(cfg)?;
+        let stem = adapter_stem(&req.file_name, "finetune");
 
         // --- resume: continue from the latest full-state snapshot of THIS run (heavy — the snapshot is
         // the whole state dict + optimizer state, via the shared param-map-generic resume machinery). ---
-        let mut update_idx: u32 = 0;
-        let mut start_step: u32 = 0;
-        if cfg.resume {
-            if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
-                let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut opt)?;
-                params = loaded;
-                start_step = meta.step;
-                update_idx = meta.update_idx;
+        let start =
+            LoopStart::fresh(opt, params).resume_latest(cfg, &req.output_dir, &stem, |meta| {
                 eprintln!(
-                    "[sc-14056] full fine-tune resuming from step {start_step} (update {update_idx})"
-                );
-            }
-        }
+                    "[sc-14056] full fine-tune resuming from step {} (update {})",
+                    meta.step, meta.update_idx
+                )
+            })?;
 
-        // --- train loop ---
         // sc-2127: the same bucket schedule as the adapter path.
         let schedule =
             BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
-        let mut accumulated: Option<LoraParams> = None;
-        let mut last_loss = 0.0f32;
-        let mut steps_run = start_step;
-        for step in start_step + 1..=cfg.steps {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            let sample = &cache[step_cache_index(&schedule, step)];
-            let sigma = sample_timestep(
-                &cfg.timestep_type,
-                &cfg.timestep_bias,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-            )?;
-            let noise = random::normal::<f32>(
-                sample.latent_tokens.shape(),
-                None,
-                None,
-                Some(&random::key(
-                    cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-                )?),
-            )?;
-            // One packed segment: this sample's own latent grid + its caption tokens (native-res
-            // per-sample; the grid is the sample's bucket, sc-2127).
-            let ctx = PackContext::new(sample_layout(sample)?, &rope)?;
-            let (loss, grads) = compute_full_loss_grads(
-                &dit_cfg,
-                &params,
-                sample,
-                &ctx,
-                sigma,
-                &noise,
-                mae,
-                compute_dtype,
-            )?;
-            last_loss = loss;
-            steps_run = step;
-            accumulate_grads(&mut accumulated, grads)?;
-
-            if step % accum == 0 || step == cfg.steps {
-                let mult =
-                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
-                opt.set_lr_scaled(mult);
-                let window = if step % accum == 0 {
-                    accum
-                } else {
-                    step % accum
-                };
-                let avg = average_grads(
-                    accumulated
-                        .take()
-                        .expect("an update fires only after accumulation"),
-                    window,
-                )?;
-                let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                let clipped: LoraParams = clipped
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into_owned()))
-                    .collect();
-                opt.step(&mut params, &clipped)?;
-                eval(params.values())?;
-                update_idx += 1;
-            }
-
-            on_progress(TrainingProgress::Training {
-                step,
-                total: cfg.steps,
-                loss: last_loss,
-            });
-
-            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
-                // A full-tune intermediate checkpoint is a whole reloadable transformer dir (heavy).
-                let ckpt_dir = req.output_dir.join(format!("{stem}-step{step:06}"));
-                save_full_checkpoint(&params, &transformer_dir, &ckpt_dir)?;
-                checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
-                on_progress(TrainingProgress::Checkpoint { step });
-            }
-
-            // Periodic preview samples from the in-progress weights (reconstruct a bf16 model from the
-            // current masters). Best-effort: a render failure must not abort the run.
-            if cfg.sample_every > 0 && !sample_caps.is_empty() && step % cfg.sample_every == 0 {
-                match params_to_weights(&params, Dtype::Bfloat16)
-                    .map_err(mlx_gen::Error::from)
-                    .and_then(|w| MageTransformer::from_weights(&w, dit_cfg.clone()))
-                {
-                    Ok(model) => {
-                        let total = sample_caps.len() as u32;
-                        for (i, (prompt, txt, txt_tokens)) in sample_caps.iter().enumerate() {
-                            if req.cancel.is_cancelled() {
-                                break;
-                            }
-                            let sample_seed = cfg
-                                .seed
-                                .wrapping_add(step as u64)
-                                .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
-                                .wrapping_add(i as u64);
-                            match render_sample(
-                                &model,
-                                &self.vae,
-                                txt,
-                                *txt_tokens,
-                                preview_edge,
-                                cfg.sample_steps.max(1) as usize,
-                                cfg.sample_guidance_scale,
-                                sample_seed as i64,
-                            ) {
-                                Ok(image) => on_progress(TrainingProgress::Sample {
-                                    step,
-                                    index: i as u32 + 1,
-                                    total,
-                                    prompt: prompt.clone(),
-                                    image,
-                                }),
-                                Err(mlx_gen::Error::Canceled) => break,
-                                Err(e) => eprintln!(
-                                    "[sc-14056] {MODEL_ID} full-tune preview failed at step {step} \
-                                     (prompt {}): {e} — skipping this preview, training continues",
-                                    i + 1
-                                ),
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!(
-                        "[sc-14056] {MODEL_ID} full-tune preview reconstruct failed at step {step}: \
-                         {e} — skipping this cadence, training continues"
-                    ),
-                }
-            }
-
-            // Release the step's transient buffers to the OS before the next iteration. The full-tune
-            // step allocates a whole dense retained graph plus (on the bf16 path) a fresh reconstructed
-            // model each step; MLX pools freed buffers rather than returning them, so without this the
-            // pool grows unbounded across steps and a multi-billion-parameter run spills to swap. This
-            // is unique to the full path — the LoRA path's frozen base and tiny adapter don't churn.
-            mlx_rs::memory::clear_cache();
-        }
-
-        // Cancelled before completing a single step: nothing was trained — surface the cancellation
-        // rather than writing a byte-for-byte copy of the base checkpoint as a "fine-tune".
-        if steps_run == 0 {
-            return Err(mlx_gen::Error::Canceled);
-        }
-
-        // --- save the final full checkpoint (bf16) as a reloadable transformer dir ---
-        on_progress(TrainingProgress::Saving);
-        let weights_path = save_full_checkpoint(&params, &transformer_dir, &req.output_dir)?;
-        Ok(TrainingOutput {
-            adapter_path: weights_path,
-            steps: steps_run,
-            final_loss: last_loss,
-        })
+        let mut family = MageFullLoop {
+            dit_cfg: &dit_cfg,
+            rope: &rope,
+            transformer_dir: &transformer_dir,
+            vae: &self.vae,
+            req,
+            cache: &cache,
+            schedule: &schedule,
+            mae,
+            compute_dtype,
+            sample_caps: &sample_caps,
+            preview_edge,
+        };
+        // A full-tune run reports preview failures on stderr only (no run warnings).
+        run_train_loop(&mut family, req, &stem, start, on_progress, &mut Vec::new())
     }
 }
 
-/// Resolve the training compute dtype from the config's free-form `train_dtype`: `bf16` (the published
-/// checkpoint's dtype and the ecosystem-standard mixed precision — the trainable factors / loss /
-/// grads / optimizer stay f32, the master-weights pattern) or `f32`. Unrecognized / empty means f32,
-/// which widens the bf16 base losslessly rather than silently narrowing. Shared by both train paths.
-fn resolve_compute_dtype(train_dtype: &str) -> Dtype {
-    let t = train_dtype.trim();
-    if t.eq_ignore_ascii_case("bf16") || t.eq_ignore_ascii_case("bfloat16") {
-        Dtype::Bfloat16
-    } else {
-        Dtype::Float32
+/// The frozen DiT the LoRA/LoKr path adapts, or a typed error when the full fine-tune freed it.
+fn frozen_dit_ref(transformer: &Option<MageTransformer>) -> Result<&MageTransformer> {
+    transformer.as_ref().ok_or_else(|| {
+        mlx_gen::Error::Msg(
+            "mage_flow_base trainer: DiT was freed (only the full fine-tune path frees it)".into(),
+        )
+    })
+}
+
+/// `&mut` sibling of [`frozen_dit_ref`].
+fn frozen_dit_mut(transformer: &mut Option<MageTransformer>) -> Result<&mut MageTransformer> {
+    transformer.as_mut().ok_or_else(|| {
+        mlx_gen::Error::Msg(
+            "mage_flow_base trainer: DiT was freed (only the full fine-tune path frees it)".into(),
+        )
+    })
+}
+
+/// The preview walk's log policy for `what` (`"preview sample"` on the adapter path, reported as a
+/// run warning; `"full-tune preview"` on the full path, stderr only).
+fn preview_log(
+    tag: &'static str,
+    what: &'static str,
+    report_failures: bool,
+) -> PreviewLog<'static> {
+    PreviewLog {
+        tag,
+        trainer: MODEL_ID,
+        what,
+        canceled_stops: true,
+        report_failures,
+    }
+}
+
+/// Render one cadence's previews from `transformer` (the in-progress model) per `log`.
+#[allow(clippy::too_many_arguments)]
+fn render_previews_with(
+    transformer: &MageTransformer,
+    vae: &MageVae,
+    req: &TrainingRequest,
+    step: u32,
+    sample_caps: &[SamplePrompt],
+    preview_edge: u32,
+    log: &PreviewLog<'_>,
+    sink: &mut PreviewSink<'_>,
+) {
+    let cfg = &req.config;
+    render_preview_prompts(
+        sink,
+        step,
+        cfg.seed,
+        &req.cancel,
+        sample_caps,
+        |(prompt, _)| prompt,
+        log,
+        |(_, (txt, txt_tokens)), sample_seed| {
+            render_sample(
+                transformer,
+                vae,
+                txt,
+                *txt_tokens,
+                preview_edge,
+                cfg.sample_steps.max(1) as usize,
+                cfg.sample_guidance_scale,
+                sample_seed as i64,
+            )
+        },
+    );
+}
+
+/// The LoRA/LoKr path's [`TrainLoopFamily`]: [`run_train_step`] on the frozen DiT, the adapter
+/// checkpoints (with the family provenance), and the adapter previews.
+struct MageAdapterLoop<'a> {
+    transformer: &'a mut Option<MageTransformer>,
+    vae: &'a MageVae,
+    req: &'a TrainingRequest,
+    saver: AdapterSaver<'a>,
+    cache: &'a [CachedSample],
+    schedule: &'a BucketSchedule,
+    aux: Option<AuxDriver>,
+    mae: bool,
+    compute_dtype: Dtype,
+    sample_caps: &'a [SamplePrompt],
+    preview_edge: u32,
+}
+
+impl TrainLoopFamily for MageAdapterLoop<'_> {
+    fn micro_step(&mut self, step: u32, params: &LoraParams) -> Result<(f32, LoraParams)> {
+        let (losses, grads) = run_train_step(
+            self.transformer.as_mut().ok_or_else(|| {
+                mlx_gen::Error::Msg("mage_flow_base trainer: DiT was freed".into())
+            })?,
+            params,
+            self.saver.adapter,
+            &self.req.config,
+            self.cache,
+            self.schedule,
+            self.aux.as_mut(),
+            step,
+            self.mae,
+            self.compute_dtype,
+        )?;
+        Ok((losses.total, grads))
+    }
+
+    fn save_checkpoint(&mut self, at: CheckpointAt<'_>) -> Result<()> {
+        self.saver.save_checkpoint(&at)
+    }
+
+    fn previews_enabled(&self) -> bool {
+        !self.sample_caps.is_empty()
+    }
+
+    /// Periodic preview samples from the in-progress adapter (installed exactly as a train step
+    /// installs it; the next step's traced loss re-installs, so no teardown is needed). Previews
+    /// are best-effort: a render failure must NOT abort the long-running training run.
+    fn render_previews(
+        &mut self,
+        step: u32,
+        params: &LoraParams,
+        sink: &mut PreviewSink<'_>,
+    ) -> Result<()> {
+        let cfg = &self.req.config;
+        let lora_dtype = (self.compute_dtype != Dtype::Float32).then_some(self.compute_dtype);
+        self.saver.adapter.install_as(
+            frozen_dit_mut(self.transformer)?,
+            params,
+            cfg.alpha,
+            cfg.rank as f32,
+            lora_dtype,
+            LOKR_DTYPE,
+        )?;
+        render_previews_with(
+            frozen_dit_ref(self.transformer)?,
+            self.vae,
+            self.req,
+            step,
+            self.sample_caps,
+            self.preview_edge,
+            &preview_log("[sc-14055]", "preview sample", true),
+            sink,
+        );
+        Ok(())
+    }
+
+    fn save_final(&mut self, params: &LoraParams) -> Result<PathBuf> {
+        // PEFT keys + alpha/rank + family provenance into __metadata__.
+        self.saver.save_final(self.req, params)
+    }
+}
+
+/// The full base fine-tune's [`TrainLoopFamily`]: [`compute_full_loss_grads`] over the f32 master
+/// map, a clip-then-step update, whole-transformer-dir checkpoints, previews from a reconstructed
+/// bf16 model, and a per-step cache release.
+struct MageFullLoop<'a> {
+    dit_cfg: &'a MageFlowConfig,
+    rope: &'a MsRope,
+    transformer_dir: &'a Path,
+    vae: &'a MageVae,
+    req: &'a TrainingRequest,
+    cache: &'a [CachedSample],
+    schedule: &'a BucketSchedule,
+    mae: bool,
+    compute_dtype: Dtype,
+    sample_caps: &'a [SamplePrompt],
+    preview_edge: u32,
+}
+
+impl TrainLoopFamily for MageFullLoop<'_> {
+    fn micro_step(&mut self, step: u32, params: &LoraParams) -> Result<(f32, LoraParams)> {
+        let sample = &self.cache[step_cache_index(self.schedule, step)];
+        let (sigma, noise) = flow_step_noise(&self.req.config, step, sample.latent_tokens.shape())?;
+        // One packed segment: this sample's own latent grid + its caption tokens (native-res
+        // per-sample; the grid is the sample's bucket, sc-2127).
+        let ctx = PackContext::new(sample_layout(sample)?, self.rope)?;
+        compute_full_loss_grads(
+            self.dit_cfg,
+            params,
+            sample,
+            &ctx,
+            sigma,
+            &noise,
+            self.mae,
+            self.compute_dtype,
+        )
+    }
+
+    /// Clip to unit global norm, then step — no gradient/weight noise on the full path.
+    fn optimizer_update(
+        &mut self,
+        opt: &mut TrainOptimizer,
+        params: &mut LoraParams,
+        avg: &LoraParams,
+        _cfg: &TrainingConfig,
+        _update_idx: u32,
+    ) -> Result<()> {
+        let (clipped, _norm) = clip_grad_norm(avg, 1.0)?;
+        let clipped: LoraParams = clipped
+            .into_iter()
+            .map(|(k, v)| (k, v.into_owned()))
+            .collect();
+        opt.step(params, &clipped)?;
+        eval(params.values())?;
+        Ok(())
+    }
+
+    /// A full-tune intermediate checkpoint is a whole reloadable transformer dir (heavy), then the
+    /// resume bundle.
+    fn save_checkpoint(&mut self, at: CheckpointAt<'_>) -> Result<()> {
+        let ckpt_dir = at
+            .output_dir
+            .join(format!("{}-step{:06}", at.stem, at.step));
+        save_full_checkpoint(at.params, self.transformer_dir, &ckpt_dir)?;
+        checkpoint::save_resume(
+            at.output_dir,
+            at.stem,
+            at.step,
+            at.update_idx,
+            at.opt,
+            at.params,
+        )
+    }
+
+    fn previews_enabled(&self) -> bool {
+        !self.sample_caps.is_empty()
+    }
+
+    /// Periodic preview samples from the in-progress weights (reconstruct a bf16 model from the
+    /// current masters). Best-effort: a render failure must not abort the run.
+    fn render_previews(
+        &mut self,
+        step: u32,
+        params: &LoraParams,
+        sink: &mut PreviewSink<'_>,
+    ) -> Result<()> {
+        match params_to_weights(params, Dtype::Bfloat16)
+            .map_err(mlx_gen::Error::from)
+            .and_then(|w| MageTransformer::from_weights(&w, self.dit_cfg.clone()))
+        {
+            Ok(model) => render_previews_with(
+                &model,
+                self.vae,
+                self.req,
+                step,
+                self.sample_caps,
+                self.preview_edge,
+                &preview_log("[sc-14056]", "full-tune preview", false),
+                sink,
+            ),
+            Err(e) => eprintln!(
+                "[sc-14056] {MODEL_ID} full-tune preview reconstruct failed at step {step}: \
+                 {e} — skipping this cadence, training continues"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Release the step's transient buffers to the OS before the next iteration. The full-tune
+    /// step allocates a whole dense retained graph plus (on the bf16 path) a fresh reconstructed
+    /// model each step; MLX pools freed buffers rather than returning them, so without this the
+    /// pool grows unbounded across steps and a multi-billion-parameter run spills to swap. This
+    /// is unique to the full path — the LoRA path's frozen base and tiny adapter don't churn.
+    fn end_step(&mut self) {
+        mlx_rs::memory::clear_cache();
+    }
+
+    /// The final full checkpoint (bf16) as a reloadable transformer dir.
+    fn save_final(&mut self, params: &LoraParams) -> Result<PathBuf> {
+        save_full_checkpoint(params, self.transformer_dir, &self.req.output_dir)
     }
 }
 
@@ -1375,34 +1262,12 @@ fn save_full_checkpoint(
 /// `add_*_proj`/`to_add_out`, the FFN `net.0.proj`/`net.2`, the modulation `img_mod.1`/`txt_mod.1`,
 /// or the global `img_in`/`txt_in`).
 fn resolve_target_paths(transformer: &MageTransformer, cfg: &TrainingConfig) -> Vec<String> {
-    let suffixes: Vec<String> = if cfg.lora_target_modules.is_empty() {
-        ["to_q", "to_k", "to_v", "to_out.0"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        cfg.lora_target_modules.clone()
-    };
-    AdaptableHost::adaptable_paths(transformer)
-        .into_iter()
-        .filter(|path| {
-            suffixes
-                .iter()
-                .any(|s| path == s || path.ends_with(&format!(".{s}")))
-        })
-        .collect()
-}
-
-/// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
-fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = mlx_gen::gen_core::__model_input_result!(
-        image::open(path),
-        "crates/media/mlx-gen/mlx-gen-mage/src/training.rs::decode_image/image::open",
-        Reference,
-        &[path]
+    resolve_suffix_targets(
+        AdaptableHost::adaptable_paths(transformer),
+        cfg,
+        &["to_q", "to_k", "to_v", "to_out.0"],
+        None,
     )
-    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    Ok(dynimg.to_rgb8().into())
 }
 
 /// Resize a center-cropped square core [`Image`] to `edge × edge` and normalise to the reference's
@@ -1507,26 +1372,11 @@ fn run_train_step(
     mae: bool,
     dtype: Dtype,
 ) -> Result<(StepLosses, LoraParams)> {
-    let picked = step_sample(perceptual, step, schedule);
-    let sample = &cache[picked.entry];
-    let mut sigma = sample_timestep(
-        &cfg.timestep_type,
-        &cfg.timestep_bias,
-        cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-    )?;
-    let noise = random::normal::<f32>(
-        sample.latent_tokens.shape(),
-        None,
-        None,
-        Some(&random::key(
-            cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-        )?),
-    )?;
-    let planned = picked.plan(sigma)?;
-    if let Some(p) = &planned {
-        sigma = p.plan.noise_level;
-    }
-    let aux = planned.as_ref().map(|p| AuxStep {
+    let draw = draw_flow_step(perceptual, step, schedule, cfg, |entry| {
+        cache[entry].latent_tokens.shape()
+    })?;
+    let sample = &cache[draw.entry];
+    let aux = draw.aux.as_ref().map(|p| AuxStep {
         path: p.path,
         plan: &p.plan,
         entry: p.entry,
@@ -1538,8 +1388,8 @@ fn run_train_step(
         cfg.alpha,
         cfg.rank as f32,
         sample,
-        sigma,
-        &noise,
+        draw.t,
+        &draw.noise,
         mae,
         dtype,
         aux,
@@ -1711,7 +1561,11 @@ fn encode_buckets(
 mod tests {
     use super::*;
     use crate::config::LATENT_CHANNELS;
+    use mlx_gen::train::lora::build_lora_targets;
+    use mlx_gen::train::vocab::sample_timestep;
     use mlx_gen::{CancelFlag, TrainingItem};
+    use mlx_rs::ops::multiply;
+    use mlx_rs::random;
 
     fn base_request(
         tmp: &tempfile::TempDir,
@@ -2682,6 +2536,9 @@ mod tests {
 mod depth_anchoring_tests {
     use super::*;
     use mlx_gen::gen_core::train::{AuxLossSchedule, DepthModelSize};
+    use mlx_gen::train::lora::build_lora_targets;
+    use mlx_gen::train::vocab::sample_timestep;
+    use mlx_rs::random;
 
     fn fixture_model() -> (MageTransformer, MageFlowConfig) {
         let fx = Weights::from_file(concat!(

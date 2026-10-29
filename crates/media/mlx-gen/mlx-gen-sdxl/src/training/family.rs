@@ -31,7 +31,7 @@ use std::path::Path;
 
 use mlx_gen::gen_core::BucketSchedule;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -43,6 +43,7 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::tae::TinyDecoderSpec;
+use mlx_gen::train::trainer_loop::SAMPLE_PROMPT_CAP;
 use mlx_gen::{
     Image, NetworkType, Result, TrainOptimizer, TrainingConfig, TrainingOutput, TrainingProgress,
     TrainingRequest,
@@ -60,9 +61,6 @@ use crate::vae::Autoencoder;
 /// The SDXL-family reconstructs its LoKr delta at **f32** (the f32-everywhere merge path); training
 /// must match so the adapter round-trips through the inference loader. Shared by both families.
 const LOKR_DTYPE: Dtype = Dtype::Float32;
-
-/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637).
-const SAMPLE_PROMPT_CAP: usize = 4;
 
 /// PEFT save-key prefix for the LoRA adapter — what `peft.save_pretrained()` / the SceneWorks
 /// backends emit, and what the SDXL loader's PEFT key classifier (`adapters::classify_key`) expects.
@@ -689,18 +687,6 @@ pub(crate) fn run_train_step<H: SdxlFamilyHooks>(
         checkpoint_targets,
         aux,
     )
-}
-
-/// Decode a dataset image file (PNG/JPEG) into the core RGB8 [`Image`](mlx_gen::media::Image).
-fn decode_image(path: &Path) -> Result<mlx_gen::media::Image> {
-    let dynimg = mlx_gen::gen_core::__model_input_result!(
-        image::open(path),
-        "crates/media/mlx-gen/mlx-gen-sdxl/src/training/family.rs::decode_image/image::open",
-        Reference,
-        &[path]
-    )
-    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    Ok(dynimg.to_rgb8().into())
 }
 
 /// The subject-masked loss weight (sc-24828) for one cached latent whose shape is the family's

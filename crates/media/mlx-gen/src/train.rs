@@ -14,6 +14,7 @@ pub mod optim;
 pub mod perceptual;
 pub mod tae;
 pub mod taehv;
+pub mod trainer_loop;
 pub mod vae_anchor;
 pub mod vocab;
 

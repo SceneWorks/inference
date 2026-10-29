@@ -46,7 +46,7 @@ use mlx_gen::gen_core::BucketSchedule;
 use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint;
-use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
 use mlx_gen::train::lora::{
     accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
     build_lora_targets, LoraParams, TrainAdapter,
@@ -58,6 +58,7 @@ use mlx_gen::train::perceptual::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
+use mlx_gen::train::trainer_loop::SAMPLE_PROMPT_CAP;
 use mlx_gen::train::vocab::sample_timestep;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -86,9 +87,6 @@ use crate::vae22::Wan22Vae;
 /// Wan reconstructs its LoKr delta at **f32** (the f32 merge path, `merge_one_lokr`); training matches
 /// so the adapter round-trips.
 const LOKR_DTYPE: Dtype = Dtype::Float32;
-
-/// Max preview-sample prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-5637).
-const SAMPLE_PROMPT_CAP: usize = 4;
 
 /// The reference attention LoRA targets `to_q/to_k/to_v/to_out.0` in Wan's **native** naming: the
 /// self/cross-attention `q/k/v/o`. Suffix-matched against the per-block adaptable surface.
@@ -1641,18 +1639,6 @@ fn preflight_projection(cfg: &WanModelConfig, edges: &[u32], n_experts: usize) -
         edge,
         projected_dense_peak_gb(tokens, cfg.dim, cfg.num_layers, n_experts),
     )
-}
-
-/// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
-fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = mlx_gen::gen_core::__model_input_result!(
-        image::open(path),
-        "crates/media/mlx-gen/mlx-gen-wan/src/training.rs::decode_image/image::open",
-        Reference,
-        &[path]
-    )
-    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
-    Ok(dynimg.to_rgb8().into())
 }
 
 /// One item's cached latents, one per bucket edge in `edges` order (the item-major layout
