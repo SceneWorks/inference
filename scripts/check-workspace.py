@@ -2703,6 +2703,57 @@ def check_test_temp_dir_guards(root: Path) -> None:
         )
 
 
+# sc-27279: raw `MmapedSafetensors::new/multi` / `VarBuilder::from_mmaped_safetensors` sites in
+# candle-gen production sources must go through the audited seam in `candle-gen/src/loader.rs`
+# (`mmap_var_builder` / `mmap_safetensors` / `mmap_safetensors_multi`), so the `unsafe` mmap and its
+# SAFETY invariant are stated once. Header-only probes read with `gen_core`'s capped header reader
+# instead of mapping at all. Test code (`#[cfg(test)]` items and `tests/` targets) is out of scope.
+CANDLE_GEN_RAW_MMAP_ROOT = Path("crates/media/candle-gen")
+CANDLE_GEN_RAW_MMAP_SEAM = Path("crates/media/candle-gen/candle-gen/src/loader.rs")
+RAW_MMAP_SITE = re.compile(
+    r"\bMmapedSafetensors\s*::\s*(?:new|multi)\s*\(|\bfrom_mmaped_safetensors\s*\("
+)
+
+
+def candle_gen_raw_mmap_sites(root: Path) -> list[str]:
+    """Production (non-test) raw mmap call sites under candle-gen, outside the loader seam."""
+    base = root / CANDLE_GEN_RAW_MMAP_ROOT
+    if not base.is_dir():
+        return []
+    test_only = _test_only_files(base)
+    sites: list[str] = []
+    for path in sorted(base.rglob("*.rs")):
+        relative = path.relative_to(root)
+        parts = path.relative_to(base).parts
+        if (
+            relative == CANDLE_GEN_RAW_MMAP_SEAM
+            or path in test_only
+            or "src" not in parts
+            or not SOURCE_LINT_IGNORED_PARTS.isdisjoint(parts)
+            or not TEST_TARGET_DIRS.isdisjoint(parts)
+        ):
+            continue
+        raw = path.read_text(encoding="utf-8")
+        text = strip_rust_comments(_blank_spans(raw, _cfg_test_spans(raw)), strip_literals=True)
+        for match in RAW_MMAP_SITE.finditer(text):
+            sites.append(f"{relative}:{_line_of(text, match.start())}")
+    return sites
+
+
+def check_candle_gen_raw_mmap_seam(root: Path) -> None:
+    """Fail when candle-gen production code maps safetensors outside the loader seam (sc-27279)."""
+    sites = candle_gen_raw_mmap_sites(root)
+    if sites:
+        joined = "\n  ".join(sites)
+        fail(
+            "candle-gen production code maps safetensors outside the audited loader seam "
+            "(sc-27279). Map weights through "
+            "`candle_gen::loader::{mmap_var_builder, mmap_safetensors, mmap_safetensors_multi}` "
+            "(or read headers with `gen_core::safetensors_path_tensor_headers`) instead of a raw "
+            "`unsafe` `MmapedSafetensors::new/multi` / `from_mmaped_safetensors` site:\n  " + joined
+        )
+
+
 def _rust_const_declarations(source: str) -> dict[str, str]:
     """Map every visibility-carrying ``const`` in a Rust source to its value text.
 
@@ -3583,6 +3634,7 @@ def main() -> int:
         check_snapshot_path_derivation(ROOT)
         check_audio_hub_layout_derivation(ROOT)
         check_test_temp_dir_guards(ROOT)
+        check_candle_gen_raw_mmap_seam(ROOT)
         check_cross_backend_geometry(metadata, ROOT)
     except (AssertionError, json.JSONDecodeError) as error:
         print(f"workspace gate: FAIL: {error}", file=sys.stderr)
@@ -3596,6 +3648,7 @@ def main() -> int:
         "no HF-cache references, only listed production env reads, "
         "no $HOME-derived snapshot paths, no audio hub-layout re-derivations, "
         "no unguarded test temp roots, "
+        "no raw candle-gen mmap sites outside the loader seam, "
         "no cross-backend geometry drift)"
     )
     return 0

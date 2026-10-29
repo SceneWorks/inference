@@ -432,13 +432,16 @@ fn validate_against_base(
             base_transformer_dir.display()
         )));
     }
-    // SAFETY: mmap of read-only weight files (header parse only; we never `.load` the bodies here).
-    let base_st = unsafe { MmapedSafetensors::multi(&shards)? };
-    let base: HashMap<String, Vec<usize>> = base_st
-        .tensors()
-        .into_iter()
-        .map(|(name, view)| (name, view.shape().to_vec()))
-        .collect();
+    // Header-only (capped read, no mmap): names + shapes, later shards winning a duplicated key as
+    // the former multi-file mapping's enumeration did.
+    let mut base: HashMap<String, Vec<usize>> = HashMap::new();
+    for shard in &shards {
+        for header in candle_gen::gen_core::safetensors_path_tensor_headers(shard)
+            .map_err(|e| Error::Msg(format!("read header {}: {e}", shard.display())))?
+        {
+            base.insert(header.name, header.shape);
+        }
+    }
 
     let mut missing: Vec<&String> = base.keys().filter(|k| !produced.contains_key(*k)).collect();
     let mut extra: Vec<&String> = produced.keys().filter(|k| !base.contains_key(*k)).collect();
@@ -552,8 +555,7 @@ pub fn convert_and_assemble(
         )));
     }
 
-    // SAFETY: mmap of a read-only weight file; standard candle loading path.
-    let src = unsafe { MmapedSafetensors::new(source)? };
+    let src = candle_gen::mmap_safetensors(source)?;
     let produced = build_target_state_dict(&src)?;
     validate_against_base(&produced, &base_transformer)?;
 

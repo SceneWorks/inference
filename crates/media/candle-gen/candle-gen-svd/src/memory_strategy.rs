@@ -1,7 +1,6 @@
 //! Exact, estimate-backed Resident authority for SceneWorks' public Candle SVD-XT route.
 
 use std::cell::RefCell;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -74,17 +73,9 @@ pub struct PreparedSvdMemory {
 }
 
 fn sha256_file(path: &Path) -> gen_core::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(gen_core::snapshot_inventory::hex_lower(
+        &gen_core::snapshot_inventory::sha256_file(path)?,
+    ))
 }
 
 fn tensor_inventory(root: &Path) -> gen_core::Result<Vec<String>> {

@@ -1,12 +1,11 @@
 //! Request-authoritative Candle/CUDA memory contract for dense SANA Base and Sprint.
 
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
+use candle_gen::gen_core::snapshot_inventory::hex_lower;
 use candle_gen::gen_core::{
     self, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
@@ -225,25 +224,14 @@ fn validate_immutable_root(variant: SanaVariant, root: &Path) -> gen_core::Resul
     }
 }
 
+/// The shared snapshot-inventory policy (sc-27253). No marker refusal: the exact-inventory set
+/// comparison already fails a stray partial-download file as an extra entry.
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>) -> gen_core::Result<()> {
-    let metadata = std::fs::symlink_metadata(root)?;
-    if metadata.file_type().is_symlink() || metadata.is_file() {
-        if !std::fs::metadata(root)?.is_file() {
-            return Err(gen_core::Error::Unsupported(format!(
-                "non-file snapshot entry {}",
-                root.display()
-            )));
-        }
-        out.push(std::path::absolute(root)?);
-        return Ok(());
-    }
-    let mut entries = std::fs::read_dir(root)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.sort();
-    for entry in entries {
-        collect_files(&entry, out)?;
-    }
+    out.extend(gen_core::snapshot_inventory::collect_regular_files(
+        "sana",
+        root,
+        gen_core::snapshot_inventory::InventoryPolicy::STRUCTURAL,
+    )?);
     Ok(())
 }
 
@@ -339,24 +327,6 @@ fn validate_loader_tensor_formats(variant: SanaVariant, root: &Path) -> gen_core
     selected_component_bytes(variant, root).map(|_| ())
 }
 
-pub(crate) fn sha256_file(path: &Path) -> gen_core::Result<[u8; 32]> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buffer[..n]);
-    }
-    Ok(digest.finalize().into())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 /// Whether this load can actually execute [`MemoryStrategy::BoundedTransformerResidency`].
 ///
 /// Block windowing runs through [`crate::transformer::SanaTransformer::from_files_windowed`], which
@@ -392,7 +362,10 @@ fn build_contract(
     Ok(assemble_contract(
         variant,
         spec,
-        format!("{PHYSICAL_RECEIPT_PREFIX}{}", hex(&assembly.finalize())),
+        format!(
+            "{PHYSICAL_RECEIPT_PREFIX}{}",
+            hex_lower(&assembly.finalize())
+        ),
         Some(MemoryCalibrationIdentity::new(
             production_calibration_fingerprint(variant),
             spec.load_shape,

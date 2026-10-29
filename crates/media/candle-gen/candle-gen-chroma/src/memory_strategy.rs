@@ -1,12 +1,13 @@
 //! Exact request-scoped Candle/CUDA memory contract for Chroma1 HD/Base/Flash (SC-20788).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
+use candle_gen::gen_core::snapshot_inventory::{
+    collect_regular_files, hex_lower, sha256_file, update_framed, InventoryPolicy,
+};
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
@@ -401,81 +402,22 @@ impl ChromaLoadReceipt {
             );
             update_framed(&mut digest, &adapter.file.sha256);
         }
-        let mut encoded = String::with_capacity(ADAPTER_OVERLAY_PREFIX.len() + 64);
-        encoded.push_str(ADAPTER_OVERLAY_PREFIX);
-        for byte in digest.finalize() {
-            write!(&mut encoded, "{byte:02x}").expect("writing hexadecimal to String cannot fail");
-        }
-        Some(encoded)
+        Some(format!(
+            "{ADAPTER_OVERLAY_PREFIX}{}",
+            hex_lower(&digest.finalize())
+        ))
     }
-}
-
-fn update_framed(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update((bytes.len() as u64).to_le_bytes());
-    digest.update(bytes);
 }
 
 fn recursive_artifact_files(root: &Path) -> gen_core::Result<Vec<PathBuf>> {
-    fn visit(root: &Path, files: &mut Vec<PathBuf>) -> gen_core::Result<()> {
-        for entry in std::fs::read_dir(root)? {
-            let path = entry?.path();
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() {
-                let target = std::fs::metadata(&path)?;
-                if target.is_file() {
-                    files.push(std::path::absolute(path)?);
-                    continue;
-                }
-                return Err(gen_core::Error::Unsupported(format!(
-                    "chroma: artifact symlinks must resolve directly to files: {}",
-                    path.display()
-                )));
-            }
-            if metadata.is_dir() {
-                visit(&path, files)?;
-            } else if metadata.is_file() {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default();
-                if name.starts_with('.')
-                    || [".part", ".tmp", ".lock", ".incomplete"]
-                        .iter()
-                        .any(|suffix| name.ends_with(suffix))
-                {
-                    return Err(gen_core::Error::Unsupported(format!(
-                        "chroma: incomplete/hidden artifact marker is forbidden: {}",
-                        path.display()
-                    )));
-                }
-                files.push(std::path::absolute(path)?);
-            }
-        }
-        Ok(())
-    }
-    let mut files = Vec::new();
-    visit(root, &mut files)?;
-    files.sort();
+    // Shared policy (sc-27253): the marker check now also covers symlinked entries.
+    let files = collect_regular_files("chroma", root, InventoryPolicy::REJECT_MARKERS)?;
     if files.is_empty() {
         return Err(gen_core::Error::Unsupported(
             "chroma: empty artifact inventory".into(),
         ));
     }
     Ok(files)
-}
-
-fn sha256_file(path: &Path) -> gen_core::Result<[u8; 32]> {
-    let mut file = std::fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(digest.finalize().into())
 }
 
 fn direct_safetensors_inventory(dir: &Path) -> gen_core::Result<Vec<PathBuf>> {

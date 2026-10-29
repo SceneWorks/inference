@@ -69,8 +69,7 @@ impl Weights {
             )));
         }
         validate_unique_tensor_names(&files)?;
-        // SAFETY: read-only mmap of weight files; the standard candle loading path.
-        let st = unsafe { MmapedSafetensors::multi(&files)? };
+        let st = candle_gen::mmap_safetensors_multi(&files)?;
         Ok(Self {
             st,
             device: device.clone(),
@@ -115,14 +114,15 @@ impl Weights {
     }
 }
 
-/// Validate shard keys through their mmaped safetensors headers before constructing the combined
-/// loader. A duplicate is a malformed or polluted checkpoint, never an ordering policy.
+/// Validate shard keys through their safetensors headers (capped read, no mmap) before
+/// constructing the combined loader. A duplicate is a malformed or polluted checkpoint, never an
+/// ordering policy.
 fn validate_unique_tensor_names(files: &[PathBuf]) -> Result<()> {
     let mut owners: HashMap<String, &Path> = HashMap::new();
     for file in files {
-        // SAFETY: read-only mmap used only to inspect this process-owned weight file's header.
-        let shard = unsafe { MmapedSafetensors::new(file)? };
-        for (name, _) in shard.tensors() {
+        let headers = candle_gen::gen_core::safetensors_path_tensor_headers(file)
+            .map_err(|e| Error::Msg(format!("ideogram: read header {}: {e}", file.display())))?;
+        for name in headers.into_iter().map(|header| header.name) {
             if let Some(first_file) = owners.insert(name.clone(), file.as_path()) {
                 return Err(Error::Msg(format!(
                     "ideogram: duplicate tensor key {name:?} in {} and {}: each tensor must live in \

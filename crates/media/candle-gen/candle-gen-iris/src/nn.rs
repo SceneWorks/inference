@@ -362,52 +362,16 @@ pub fn safetensors_keys(file: &Path) -> Result<BTreeSet<String>> {
 /// The tensor names and shapes in a `.safetensors` header (`__metadata__` excluded), read without
 /// touching the tensor bytes.
 pub fn safetensors_shapes(file: &Path) -> Result<BTreeMap<String, Vec<usize>>> {
-    use std::io::Read;
-    let read_err = |e: std::io::Error| Error::Msg(format!("iris: reading {}: {e}", file.display()));
-    let mut f = std::fs::File::open(file).map_err(read_err)?;
-    let mut len = [0u8; 8];
-    f.read_exact(&mut len).map_err(read_err)?;
-    let len = u64::from_le_bytes(len);
-    if len > 100 * 1024 * 1024 {
-        return Err(Error::Msg(format!(
-            "iris: {} has an implausible {len}-byte safetensors header",
-            file.display()
-        )));
-    }
-    let mut header = vec![0u8; len as usize];
-    f.read_exact(&mut header).map_err(read_err)?;
-    let value: serde_json::Value = serde_json::from_slice(&header).map_err(|e| {
-        Error::Msg(format!(
-            "iris: {} has a malformed safetensors header: {e}",
-            file.display()
-        ))
-    })?;
-    let map = value.as_object().ok_or_else(|| {
-        Error::Msg(format!(
-            "iris: {} safetensors header is not an object",
-            file.display()
-        ))
-    })?;
-    map.iter()
-        .filter(|(k, _)| k.as_str() != "__metadata__")
-        .map(|(k, v)| {
-            let shape = v
-                .get("shape")
-                .and_then(|s| s.as_array())
-                .and_then(|dims| {
-                    dims.iter()
-                        .map(|d| d.as_u64().map(|d| d as usize))
-                        .collect::<Option<Vec<_>>>()
-                })
-                .ok_or_else(|| {
-                    Error::Msg(format!(
-                        "iris: {} header entry `{k}` has no valid shape",
-                        file.display()
-                    ))
-                })?;
-            Ok((k.clone(), shape))
-        })
-        .collect()
+    // gen-core's capped, validated header reader (sc-27387): it also checks dtypes and payload
+    // offsets, which the former hand-rolled parser skipped.
+    Ok(
+        candle_gen::gen_core::safetensors_file_tensor_locations(file)
+            .map_err(|e| Error::Msg(format!("iris: reading {}: {e}", file.display())))?
+            .tensors
+            .into_iter()
+            .map(|location| (location.header.name, location.header.shape))
+            .collect(),
+    )
 }
 
 /// The eligibility and padding granularity of a quantized backbone projection (sc-26266): the MLX

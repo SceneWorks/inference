@@ -920,13 +920,10 @@ fn packed_component(root: &std::path::Path, component: &str) -> Result<bool> {
         if path.extension().and_then(|value| value.to_str()) != Some("safetensors") {
             continue;
         }
-        // SAFETY: header-only, read-only mapping of a process-owned checkpoint file.
-        let tensors =
-            unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(&path)? };
-        if tensors
-            .tensors()
-            .into_iter()
-            .any(|(name, _)| name.ends_with(".scales"))
+        // Capped header-only read (no mmap): tensor names only.
+        if candle_gen::gen_core::safetensors_path_tensor_headers(&path)?
+            .iter()
+            .any(|header| header.name.ends_with(".scales"))
         {
             return Ok(true);
         }

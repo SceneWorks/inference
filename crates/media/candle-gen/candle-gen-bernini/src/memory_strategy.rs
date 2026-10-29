@@ -10,7 +10,6 @@
 use candle_gen::candle_core::Device;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use candle_gen::gen_core::weightsmeta::{Dtype, SafetensorsTensorHeader};
@@ -1099,13 +1098,9 @@ struct AdapterLoadReceipt {
 
 impl AdapterLoadReceipt {
     fn identity(&self) -> String {
-        let path_hex = self
-            .canonical_path
-            .to_string_lossy()
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let path_hex = gen_core::snapshot_inventory::hex_lower(
+            self.canonical_path.to_string_lossy().as_bytes(),
+        );
         let pass_scales = self.pass_scale_bits.as_ref().map_or_else(
             || "none".to_owned(),
             |bits| {
@@ -1117,7 +1112,7 @@ impl AdapterLoadReceipt {
         );
         format!(
             "artifact=safetensors;path_hex={path_hex};digest=sha256:{};kind={:?};scale_bits={:08x};pass_scale_bits={pass_scales};expert={:?};artifact_bytes={};applied_f32_bytes={};stable=true",
-            self.digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            gen_core::snapshot_inventory::hex_lower(&self.digest),
             self.kind,
             self.scale_bits,
             self.expert,
@@ -1147,24 +1142,27 @@ fn read_adapter_receipt(
             adapter.path.display()
         ))
     })?;
+    // Stream the artifact through SHA-256 once with a fixed buffer (sc-27292): no whole-file buffer,
+    // so admission/pricing no longer holds 2x the adapter in host RAM.
     let before = std::fs::metadata(&canonical_path)?;
-    let mut file = File::open(&canonical_path)?;
-    let opened = file.metadata()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let opened = File::open(&canonical_path)?.metadata()?;
+    let (digest, hashed_bytes) =
+        gen_core::snapshot_inventory::sha256_file_counted(&canonical_path)?;
     let after = std::fs::metadata(&canonical_path)?;
-    if bytes.is_empty()
+    if hashed_bytes == 0
         || before.len() != opened.len()
         || opened.len() != after.len()
         || before.modified().ok() != after.modified().ok()
-        || u64::try_from(bytes.len()).ok() != Some(after.len())
+        || hashed_bytes != after.len()
     {
         return Err(gen_core::Error::Unsupported(format!(
             "Bernini adapter {} changed while its load receipt was read",
             canonical_path.display()
         )));
     }
-    safetensors::SafeTensors::deserialize(&bytes).map_err(|error| {
+    // Structural validation from the capped header alone: every tensor's payload must be in-bounds,
+    // contiguous and fully owned, which is what a full `SafeTensors::deserialize` established.
+    gen_core::safetensors_file_tensor_locations(&canonical_path).map_err(|error| {
         gen_core::Error::Unsupported(format!(
             "Bernini adapter {} is not loadable safetensors: {error}",
             canonical_path.display()
@@ -1179,8 +1177,8 @@ fn read_adapter_receipt(
                 gen_core::Error::Msg("Bernini adapter retained F32 bytes overflow".into())
             })
         })?;
-    let verified_again = std::fs::read(&canonical_path)?;
-    if verified_again != bytes {
+    if gen_core::snapshot_inventory::sha256_file_counted(&canonical_path)? != (digest, hashed_bytes)
+    {
         return Err(gen_core::Error::Unsupported(format!(
             "Bernini adapter {} changed during its post-read stability check",
             canonical_path.display()
@@ -1199,7 +1197,7 @@ fn read_adapter_receipt(
     }
     Ok(AdapterLoadReceipt {
         canonical_path,
-        digest: Sha256::digest(&bytes).into(),
+        digest,
         kind: adapter.kind,
         scale_bits: adapter.scale.to_bits(),
         pass_scale_bits: adapter
@@ -1207,8 +1205,7 @@ fn read_adapter_receipt(
             .as_ref()
             .map(|scales| scales.iter().map(|scale| scale.to_bits()).collect()),
         expert: adapter.moe_expert,
-        artifact_bytes: u64::try_from(bytes.len())
-            .map_err(|_| gen_core::Error::Msg("Bernini adapter artifact bytes overflow".into()))?,
+        artifact_bytes: hashed_bytes,
         applied_f32_bytes,
     })
 }

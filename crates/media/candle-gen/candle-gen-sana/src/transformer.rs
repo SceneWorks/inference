@@ -799,7 +799,7 @@ impl SanaTransformer {
         let digests = pins
             .iter()
             .map(|pin| {
-                pin.read_unchanged(crate::memory_strategy::sha256_file)
+                pin.read_unchanged(candle_gen::gen_core::snapshot_inventory::sha256_file)
                     .map_err(candle_gen::CandleError::from)
             })
             .collect::<candle_gen::Result<Vec<_>>>()?;
@@ -999,7 +999,7 @@ impl SanaTransformer {
                     pin.ensure_unchanged()
                         .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                     let current = pin
-                        .read_unchanged(crate::memory_strategy::sha256_file)
+                        .read_unchanged(candle_gen::gen_core::snapshot_inventory::sha256_file)
                         .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                     if current != *digest {
                         return Err(candle_gen::candle_core::Error::Msg(format!(

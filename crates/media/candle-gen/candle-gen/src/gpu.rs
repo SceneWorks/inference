@@ -132,11 +132,11 @@ pub fn nvidia_smi_rendered_free_gib() -> Option<f64> {
 }
 
 /// Effective allocation headroom for Candle on the rendered GPU: physical driver-free memory plus
-/// bytes reserved by this process's default async pool that are no longer live and can be reused.
+/// bytes reserved by this process's current async pool that are no longer live and can be reused.
 ///
 /// Dropping a sequential phase returns its allocations to cudarc's in-process pool, not to the
 /// driver. Consequently `nvidia-smi memory.free` alone undercounts what the following VAE allocation
-/// can use and may reject a viable tile after a large UNet drop. The default pool reports both
+/// can use and may reject a viable tile after a large UNet drop. The current pool reports both
 /// `RESERVED_MEM_CURRENT` and `USED_MEM_CURRENT`; their difference is already owned by this process
 /// and immediately reusable without another physical allocation.
 ///
@@ -145,7 +145,7 @@ pub fn nvidia_smi_rendered_free_gib() -> Option<f64> {
 /// remapping, matching Candle's `default_device`.
 pub fn rendered_effective_free_gib() -> Option<f64> {
     nvidia_smi_rendered_free_gib()
-        .map(|driver_free| effective_free_gib(driver_free, cuda_default_pool_reusable_gib()))
+        .map(|driver_free| effective_free_gib(driver_free, cuda_current_pool_reusable_gib()))
 }
 
 fn effective_free_gib(driver_free_gib: f64, reusable_pool_gib: Option<f64>) -> f64 {
@@ -153,49 +153,15 @@ fn effective_free_gib(driver_free_gib: f64, reusable_pool_gib: Option<f64>) -> f
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_default_pool_reusable_gib() -> Option<f64> {
-    use std::ffi::c_void;
-
-    use candle_core::cuda::cudarc::driver::sys;
-
-    unsafe fn read_attr(pool: sys::CUmemoryPool, attr: sys::CUmemPool_attribute) -> Option<u64> {
-        let mut value = 0u64;
-        if unsafe {
-            sys::cuMemPoolGetAttribute(pool, attr, (&mut value as *mut u64).cast::<c_void>())
-        } == sys::CUresult::CUDA_SUCCESS
-        {
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    unsafe {
-        if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
-            return None;
-        }
-        let mut device: sys::CUdevice = 0;
-        if sys::cuDeviceGet(&mut device, 0) != sys::CUresult::CUDA_SUCCESS {
-            return None;
-        }
-        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-        if sys::cuDeviceGetDefaultMemPool(&mut pool, device) != sys::CUresult::CUDA_SUCCESS {
-            return None;
-        }
-        let reserved = read_attr(
-            pool,
-            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
-        )?;
-        let used = read_attr(
-            pool,
-            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
-        )?;
-        Some(reserved.saturating_sub(used) as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
+fn cuda_current_pool_reusable_gib() -> Option<f64> {
+    // The pool candle actually allocates from (cuda_mempool trap 1); in production no custom pool is
+    // installed, so this is the default async pool (sc-27280).
+    let pool = crate::cuda_mempool::MemPool::device_current(0)?;
+    Some(pool.reserved()?.saturating_sub(pool.used()?) as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 #[cfg(not(feature = "cuda"))]
-fn cuda_default_pool_reusable_gib() -> Option<f64> {
+fn cuda_current_pool_reusable_gib() -> Option<f64> {
     None
 }
 
@@ -230,38 +196,35 @@ fn parse_rendered_ordinal(raw: Option<&str>) -> Option<usize> {
 /// fails (e.g. `gpu` is out of range), or the value is missing. Reuses [`parse_min_mib_line_gib`] — with
 /// `-i` the output is a single line, so its "MIN across lines" is just that one device's value.
 fn query_free_gib_for(gpu: usize) -> Option<f64> {
-    let exe = resolve_nvidia_smi()?;
-    let out = Command::new(exe)
-        .args([
-            "--query-gpu=memory.free",
-            "--format=csv,noheader,nounits",
-            "-i",
-            &gpu.to_string(),
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_min_mib_line_gib(&String::from_utf8_lossy(&out.stdout))
+    parse_min_mib_line_gib(&query_gpu_field("memory.free", Some(gpu))?)
 }
 
 /// Run the trusted-absolute `nvidia-smi` for a single `--query-gpu=<field>` (one MiB value per line,
 /// one line per GPU) and reduce to the MIN across GPUs in GiB. Shared by the total and free probes so
 /// the trusted-path resolution + parsing lives in exactly one place.
 fn query_min_gib(field: &str) -> Option<f64> {
+    parse_min_mib_line_gib(&query_gpu_field(field, None)?)
+}
+
+/// The one `nvidia-smi --query-gpu=<field> --format=csv,noheader,nounits [-i <gpu>]` spawn (sc-27374):
+/// the trusted absolute executable, the query, and the exit-status check. Returns stdout (lossy UTF-8)
+/// on success; `None` when no trusted `nvidia-smi` exists, the spawn fails, or it exits nonzero.
+/// Callers own the parsing. Shared with `testkit::used_mib`.
+pub(crate) fn query_gpu_field(field: &str, gpu: Option<usize>) -> Option<String> {
     let exe = resolve_nvidia_smi()?;
-    let out = Command::new(exe)
-        .args([
-            &format!("--query-gpu={field}"),
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()?;
+    let mut command = Command::new(exe);
+    command.args([
+        &format!("--query-gpu={field}"),
+        "--format=csv,noheader,nounits",
+    ]);
+    if let Some(gpu) = gpu {
+        command.args(["-i", &gpu.to_string()]);
+    }
+    let out = command.output().ok()?;
     if !out.status.success() {
         return None;
     }
-    parse_min_mib_line_gib(&String::from_utf8_lossy(&out.stdout))
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Parse `--query-gpu=<memory field> --format=csv,noheader,nounits` output (one MiB value per line,

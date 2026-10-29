@@ -377,40 +377,13 @@ fn tier_for(root: &Path) -> gen_core::Result<MemoryNumericTier> {
     })
 }
 
+/// The shared snapshot-inventory policy (sc-27253), refusing hidden/partial-download markers.
 fn collect_files(path: &Path, out: &mut Vec<PathBuf>) -> gen_core::Result<()> {
-    let path = std::path::absolute(path)?;
-    let metadata = std::fs::metadata(&path)?;
-    if metadata.is_file() {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        if name.starts_with('.')
-            || [".part", ".tmp", ".lock", ".incomplete"]
-                .iter()
-                .any(|suffix| name.ends_with(suffix))
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "sdxl: refusing incomplete or hidden artifact {}",
-                path.display()
-            )));
-        }
-        out.push(path);
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "sdxl: artifact source is neither a file nor directory: {}",
-            path.display()
-        )));
-    }
-    let mut children = std::fs::read_dir(&path)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()?;
-    children.sort();
-    for child in children {
-        collect_files(&child, out)?;
-    }
+    out.extend(gen_core::snapshot_inventory::collect_regular_files(
+        "sdxl",
+        path,
+        gen_core::snapshot_inventory::InventoryPolicy::REJECT_MARKERS,
+    )?);
     Ok(())
 }
 

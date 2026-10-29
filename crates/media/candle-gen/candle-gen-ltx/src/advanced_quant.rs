@@ -75,8 +75,9 @@ pub fn inspect_transformer_source(
     path: &Path,
     mode: Ltx25QuantMode,
 ) -> Result<TransformerSourceInspection> {
-    // SAFETY: standard read-only safetensors mmap; no tensor is materialized by this inspection.
-    let st = unsafe { MmapedSafetensors::new(path)? };
+    // Not header-only: the ConvRot branch reads the small `.comfy_quant` descriptor payloads, so this
+    // maps the file through the audited loader seam rather than a header-only reader.
+    let st = candle_gen::mmap_safetensors(path)?;
     let tensors = st.tensors();
     let has_mlx = tensors.iter().any(|(name, _)| name.ends_with(".scales"));
     let has_i8 = tensors
@@ -312,8 +313,8 @@ impl AdvancedQuantSource {
                         "LTX INT8-ConvRot could not construct a live cuBLASLt IGEMM context",
                     ));
                 }
-                // SAFETY: standard read-only checkpoint mmap.
-                let st = unsafe { MmapedSafetensors::new(path)? };
+                // Live weight backing: mapped through the audited loader seam (see its SAFETY doc).
+                let st = candle_gen::mmap_safetensors(path)?;
                 AdvancedBackend::ConvRot { st, context }
             }
             Ltx25QuantMode::Nvfp4 => {

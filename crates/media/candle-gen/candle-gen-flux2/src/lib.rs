@@ -753,13 +753,10 @@ impl Pipeline {
     /// - **no quant** (small fixtures only): build dense on-device.
     fn load_comfyui_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
         dit_file.read_unchanged(|dit_path| {
-            // SAFETY: read-only mmap of the pinned weight file; every tensor is remapped/materialized
-            // before the post-read fingerprint check runs.
-            let mmap =
-                unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(dit_path) }
-                    .map_err(|e| {
-                    CandleError::Msg(format!("flux2 comfyui: mmap {}: {e}", dit_path.display()))
-                })?;
+            // Every tensor is remapped/materialized before the post-read fingerprint check runs.
+            let mmap = candle_gen::mmap_safetensors(dit_path).map_err(|e| {
+                CandleError::Msg(format!("flux2 comfyui: mmap {}: {e}", dit_path.display()))
+            })?;
             #[cfg(test)]
             run_comfyui_dit_load_test_hook(&mmap)?;
             let map = convert::build_comfyui_dit_map(&mmap, self.dtype)?;

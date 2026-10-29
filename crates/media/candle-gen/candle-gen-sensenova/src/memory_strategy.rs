@@ -358,18 +358,20 @@ fn is_backbone_linear(base: &str) -> bool {
 fn detect_checkpoint_quantization(
     files: &[(PathBuf, gen_core::PinnedWeightsFile)],
 ) -> gen_core::Result<Option<u8>> {
-    let paths = files.iter().map(|(path, _)| path).collect::<Vec<_>>();
-    // SAFETY: read-only mappings held only for this header scan; the retained pins reject mutation.
-    let tensors = unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::multi(&paths) }
-        .map_err(gen_core::Error::backend)?;
-    let views = tensors.tensors();
+    // Capped header reads (no mmap); the retained pins reject mutation. Shards are concatenated in
+    // order, exactly as the previous multi-file mapping enumerated them.
+    let mut views = Vec::new();
+    for (path, _) in files {
+        views.extend(gen_core::safetensors_path_tensor_headers(path)?);
+    }
     let names = views
         .iter()
-        .map(|(name, _)| name.as_str())
+        .map(|view| view.name.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     let mut detected = None;
     let mut projections = 0_usize;
-    for (name, weight) in &views {
+    for weight in &views {
+        let name = &weight.name;
         let Some(base) = name.strip_suffix(".weight") else {
             continue;
         };
@@ -388,31 +390,29 @@ fn detect_checkpoint_quantization(
             }
             let scales = views
                 .iter()
-                .find(|(candidate, _)| candidate == &scales_name)
-                .map(|(_, view)| view)
+                .find(|candidate| candidate.name == scales_name)
                 .expect("name set came from views");
             let biases = views
                 .iter()
-                .find(|(candidate, _)| candidate == &biases_name)
-                .map(|(_, view)| view)
+                .find(|candidate| candidate.name == biases_name)
                 .expect("bias name was checked above");
-            if weight.dtype() != safetensors_candle::Dtype::U32
-                || scales.dtype() != safetensors_candle::Dtype::BF16
-                || biases.dtype() != safetensors_candle::Dtype::BF16
+            if weight.dtype != gen_core::weightsmeta::Dtype::U32
+                || scales.dtype != gen_core::weightsmeta::Dtype::BF16
+                || biases.dtype != gen_core::weightsmeta::Dtype::BF16
             {
                 return Err(gen_core::Error::Unsupported(format!(
                     "sensenova: packed projection {base} must use U32 codes with BF16 scales/biases, got {:?}/{:?}/{:?}",
-                    weight.dtype(),
-                    scales.dtype(),
-                    biases.dtype()
+                    weight.dtype,
+                    scales.dtype,
+                    biases.dtype
                 )));
             }
-            let [out_features, lanes] = weight.shape() else {
+            let [out_features, lanes] = weight.shape.as_slice() else {
                 return Err(gen_core::Error::Unsupported(format!(
                     "sensenova: packed projection {base}.weight is not rank two"
                 )));
             };
-            let [scale_rows, groups] = scales.shape() else {
+            let [scale_rows, groups] = scales.shape.as_slice() else {
                 return Err(gen_core::Error::Unsupported(format!(
                     "sensenova: packed projection {base}.scales is not rank two"
                 )));
@@ -422,7 +422,7 @@ fn detect_checkpoint_quantization(
                     "sensenova: packed projection {base} carries incompatible weight/scales shapes"
                 )));
             }
-            if biases.shape() != scales.shape() {
+            if biases.shape != scales.shape {
                 return Err(gen_core::Error::Unsupported(format!(
                     "sensenova: packed projection {base} carries incompatible scales/biases shapes"
                 )));
@@ -451,10 +451,10 @@ fn detect_checkpoint_quantization(
                     "sensenova: dense projection {base} has affine biases without scales"
                 )));
             }
-            if weight.dtype() != safetensors_candle::Dtype::BF16 {
+            if weight.dtype != gen_core::weightsmeta::Dtype::BF16 {
                 return Err(gen_core::Error::Unsupported(format!(
                     "sensenova: dense bf16 projection {base}.weight must use BF16, got {:?}",
-                    weight.dtype()
+                    weight.dtype
                 )));
             }
             None

@@ -201,10 +201,7 @@ impl Weights {
                 }?;
                 (st, Some(sidecars))
             }
-            None => {
-                // SAFETY: read-only mmap of weight files; the standard dense loading path.
-                (unsafe { MmapedSafetensors::multi(&files)? }, None)
-            }
+            None => (candle_gen::mmap_safetensors_multi(&files)?, None),
         };
         Ok(Self {
             st,
@@ -230,8 +227,7 @@ impl Weights {
     pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
             .map_err(|error| Error::Msg(error.to_string()))?;
-        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-        let st = unsafe { MmapedSafetensors::new(pinned_source.loader_path())? };
+        let st = candle_gen::mmap_safetensors(pinned_source.loader_path())?;
         Ok(Self {
             st,
             pinned_source: Some(pinned_source),
@@ -258,8 +254,7 @@ impl Weights {
     pub fn from_convrot_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
             .map_err(|error| Error::Msg(error.to_string()))?;
-        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-        let st = unsafe { MmapedSafetensors::new(pinned_source.loader_path())? };
+        let st = candle_gen::mmap_safetensors(pinned_source.loader_path())?;
         validate_convrot_descriptors(&st)?;
         let native_prefix = detect_native_prefix(&st);
         Ok(Self {
@@ -386,8 +381,7 @@ impl Weights {
         pinned_source
             .ensure_unchanged()
             .map_err(|error| Error::Msg(error.to_string()))?;
-        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-        let st = unsafe { MmapedSafetensors::new(pinned_source.loader_path())? };
+        let st = candle_gen::mmap_safetensors(pinned_source.loader_path())?;
         let native_prefix = detect_native_prefix(&st);
         let mapping = KreaNativeToDiffusersMapping::new(&native_prefix, shapes);
         let logical_plan = plan_logical_weights(pinned_source.loader_path(), &mapping, &residency)

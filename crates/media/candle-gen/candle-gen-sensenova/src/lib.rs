@@ -601,8 +601,7 @@ fn checkpoint_dtype(files: &[PathBuf]) -> DType {
 /// does, rather than publishing an activation width for a snapshot it never looked into.
 pub(crate) fn probe_checkpoint_dtype(files: &[PathBuf]) -> Option<DType> {
     const PROBE_KEY: &str = "language_model.model.norm.weight";
-    // SAFETY: read-only mmap of weight files; the standard candle loading path.
-    unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::multi(files) }
+    candle_gen::mmap_safetensors_multi(files)
         .ok()
         .and_then(|st| st.load(PROBE_KEY, &Device::Cpu).ok())
         .map(|t| t.dtype())

@@ -7,6 +7,7 @@ use crate::{
 };
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::snapshot_inventory::hex_lower as hex;
 use candle_gen::gen_core::{
     moss_image::*,
     moss_image_edit::*,
@@ -67,9 +68,6 @@ fn pin(spec: &LoadSpec, path: &Path, digest: &str) -> Result<PinnedWeightsFile> 
     }
     pin.verify_unchanged()?;
     Ok(pin)
-}
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn authenticated_bytes(pin: &PinnedWeightsFile, digest: &str) -> Result<Vec<u8>> {
     pin.read_unchanged(|path| {

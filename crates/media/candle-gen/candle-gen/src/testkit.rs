@@ -1235,7 +1235,6 @@ mod gpu_peak {
     //! otherwise-idle GPU (the harness prints the pre-decode `baseline` so you can confirm nothing else
     //! was resident).
 
-    use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};
@@ -1275,20 +1274,7 @@ mod gpu_peak {
     /// Device-level used VRAM (MiB) for GPU ordinal `gpu` via `nvidia-smi`, or `None` if the query
     /// fails.
     pub fn used_mib(gpu: usize) -> Option<u64> {
-        let exe = crate::gpu::resolve_nvidia_smi()?;
-        let out = Command::new(exe)
-            .args([
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-                "-i",
-                &gpu.to_string(),
-            ])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&out.stdout)
+        crate::gpu::query_gpu_field("memory.used", Some(gpu))?
             .lines()
             .next()?
             .trim()

@@ -59,8 +59,7 @@ impl Weights {
     pub fn from_dir(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let files = candle_gen::sorted_safetensors(dir, "boogu")
             .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
-        // SAFETY: read-only mmap of weight files; the standard candle loading path.
-        let st = unsafe { MmapedSafetensors::multi(&files)? };
+        let st = candle_gen::mmap_safetensors_multi(&files)?;
         Ok(Self {
             storage: WeightStorage::Mmap(st),
             device: device.clone(),
@@ -72,8 +71,7 @@ impl Weights {
     /// Mmap one explicitly selected safetensors file. Its sibling `config.json`, when present,
     /// carries the same packed-triple metadata as a component directory.
     pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
-        // SAFETY: read-only mmap of the caller-validated weight file.
-        let st = unsafe { MmapedSafetensors::multi(&[path.to_path_buf()])? };
+        let st = candle_gen::mmap_safetensors_multi(&[path])?;
         Ok(Self {
             storage: WeightStorage::Mmap(st),
             device: device.clone(),

@@ -102,9 +102,7 @@ pub(crate) fn training_adapter_bytes(file: Option<&Path>, dtype: DType) -> Resul
         return Ok(0);
     };
     // Only the header is needed (shapes), so map rather than buffer the file.
-    // SAFETY: read-only mapping of a file the job owns for the run; the same pattern as
-    // `candle_gen::weights`.
-    let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(file) }
+    let st = candle_gen::mmap_safetensors(file)
         .map_err(|e| CandleError::Msg(format!("read training adapter {}: {e}", file.display())))?;
     Ok(st
         .tensors()
