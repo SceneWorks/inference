@@ -50,3 +50,8 @@ pub mod vae_anchor;
 // TAESD-family tiny differentiable x0 decoders for the perceptual path.
 pub mod tae;
 pub mod taehv;
+
+/// Differentiable normalization with explicit reference casting order.
+pub mod norm;
+/// Run-owned frozen same-input projection packing.
+pub mod projection;

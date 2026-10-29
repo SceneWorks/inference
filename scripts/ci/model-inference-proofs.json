@@ -279137,5 +279137,59 @@
       "requirements": []
     },
     "required_cuda_physical_index": 1
+  },
+  {
+    "package": "candle-gen",
+    "target": "candle_gen",
+    "target_kind": "lib",
+    "fqn": "train::projection::tests::packed_base_preserves_independent_adapter_gradients_and_updates",
+    "source": "crates/media/candle-gen/candle-gen/src/train/projection.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::packed_base_preserves_independent_adapter_gradients_and_updates; deterministic f32 CPU weights; input [2,3,4], widths [6,2], rank2, scale0.5, mixed biases, live Var update and additive stack",
+    "configuration_source": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::packed_base_preserves_independent_adapter_gradients_and_updates",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::packed_base_preserves_independent_adapter_gradients_and_updates/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::packed_base_preserves_independent_adapter_gradients_and_updates",
+      "requirements": []
+    }
   }
 ]

@@ -175,10 +175,7 @@ impl AdditiveResidual {
         match self {
             AdditiveResidual::Lora { a, b, .. } => {
                 let xd = x.dtype();
-                let r = x
-                    .broadcast_matmul(&a.to_dtype(xd)?)?
-                    .broadcast_matmul(&b.to_dtype(xd)?)?;
-                r * scale
+                super::projection::scaled_lora(x, &a.to_dtype(xd)?, &b.to_dtype(xd)?, scale)
             }
             AdditiveResidual::LokrStructured { factors, .. } => factors.residual(x)? * scale,
         }
@@ -544,9 +541,22 @@ impl Adapter {
     }
 }
 
-impl Module for LoraLinear {
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let y = self.base.forward(x)?;
+impl LoraLinear {
+    /// Dense base inspection without dequantizing packed weights.
+    pub fn dense_base(&self) -> Option<&Linear> {
+        match &self.base {
+            LoraBase::Dense(base) => Some(base),
+            LoraBase::Packed(_) => None,
+        }
+    }
+
+    pub(crate) fn replace_dense_base(&mut self, base: Linear) {
+        self.base = LoraBase::Dense(base);
+    }
+
+    /// Apply live adapters to an externally computed frozen base output.
+    /// No factor cast or transpose is cached across optimizer steps.
+    pub fn apply_residuals(&self, x: &Tensor, y: Tensor) -> candle_core::Result<Tensor> {
         let mut y = match &self.adapter {
             None => y,
             Some(Adapter::Lora { scale, .. }) if *scale == 0.0 => y,
@@ -557,8 +567,8 @@ impl Module for LoraLinear {
                 let xd = x.dtype();
                 let down = down.to_dtype(xd)?;
                 let up = up.to_dtype(xd)?;
-                let lora = x.broadcast_matmul(&down.t()?)?.broadcast_matmul(&up.t()?)?;
-                let residual = (lora * *scale)?.to_dtype(y.dtype())?;
+                let residual = super::projection::scaled_lora(x, &down.t()?, &up.t()?, *scale)?
+                    .to_dtype(y.dtype())?;
                 (y + residual)?
             }
             Some(Adapter::Lokr { scale, .. }) if *scale == 0.0 => y,
@@ -595,6 +605,12 @@ impl Module for LoraLinear {
             y = (y + residual)?;
         }
         Ok(y)
+    }
+}
+
+impl Module for LoraLinear {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        self.apply_residuals(x, self.base.forward(x)?)
     }
 }
 
