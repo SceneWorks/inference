@@ -79,7 +79,7 @@ METAL_MODEL_TESTS = (
 )
 METAL_DEVICE_MARKER = "MOSS_METAL_DEFAULT_DEVICE_AND_STREAM=gpu"
 DIAGNOSTIC_BASELINES = ("training_memory::tests::audit_workspace_is_charged_in_checkpoint_and_host_domains",)
-FRACTION_TESTS = tuple("train::memory_budget_tests::" + name for name in (
+FRACTION_TESTS = tuple("train::config::memory_budget_tests::" + name for name in (
     "fraction_uses_selected_total_not_free_or_safety_and_intersects_bytes",
     "fraction_invalid_values_and_sub_byte_caps_refuse_without_fallback",
     "fraction_cap_rounds_down_exactly_even_at_u64_max"))
@@ -218,7 +218,7 @@ def mutations(backend: str) -> list[dict]:
                        "old": ".and_then(|n| n.checked_add(source_staging))",
                        "new": ".and_then(|n| n.checked_add(5_362_224_248))", "test": STAGING_TEST,
                        "panic": "private fixture source staging ignored"})
-        result.append({"id": "positive-budget-error", "path": "crates/contracts/gen-core/src/train.rs",
+        result.append({"id": "positive-budget-error", "path": "crates/contracts/gen-core/src/train/config.rs",
                        "old": '"training memory budget must be positive"',
                        "new": '"mutated positive-budget refusal"', "test": ZERO_TEST,
                        "panic": "zero override must produce the typed positive-budget refusal"})
