@@ -1356,8 +1356,10 @@ class RunGraph:
         text = re.sub(r'\$\{\{.*?\}\}', UNKNOWN, text, flags=re.S)
         # Static dirname-of-current-source is a local source edge, not a dynamic filename.
         if base is not None:
-            text = re.sub(r'\$\(dirname\s+(?:--\s+)?[\'"]?(?:\$0|\$\{BASH_SOURCE\[0\]\})[\'"]?\)', str(base), text)
-            text = re.sub(r'\$\(cd\s+[\'"]?' + re.escape(str(base)) + r'[\'"]?\s*&&\s*pwd\)', str(base), text)
+            # A repository path is literal data, not a regex replacement template:
+            # Windows backslashes (notably C:\Users) must survive unchanged.
+            text = re.sub(r'\$\(dirname\s+(?:--\s+)?[\'"]?(?:\$0|\$\{BASH_SOURCE\[0\]\})[\'"]?\)', lambda _: str(base), text)
+            text = re.sub(r'\$\(cd\s+[\'"]?' + re.escape(str(base)) + r'[\'"]?\s*&&\s*pwd\)', lambda _: str(base), text)
         # Extract balanced command substitutions, respecting single quotes and escaped ticks.
         def substitutions(source):
             output = []

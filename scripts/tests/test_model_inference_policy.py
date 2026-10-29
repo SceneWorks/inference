@@ -132,6 +132,16 @@ class WorkflowExecutionGraph(unittest.TestCase):
     def errors(self, workflow):
         return policy.workflow_errors(workflow, 'renamable.yml', self.root)
 
+    def test_static_source_directory_keeps_windows_backslashes_literal(self):
+        base = Path(r'C:\Users\Michael\repo\scripts')
+        for expression in ('$(dirname "$0")', '$(dirname "${BASH_SOURCE[0]}")',
+                           '$(cd "$(dirname "$0")" && pwd)'):
+            with self.subTest(expression=expression):
+                graph = policy.RunGraph(self.root)
+                with patch.object(graph, 'command') as command:
+                    graph.shell('echo "' + expression + '"', base=base)
+                self.assertEqual(command.call_args.args[0], ['echo', str(base)])
+
     def test_reviewed_storage_action_and_node_test_require_the_complete_exact_source(self):
         workflow = self.workflow('node --test scripts/runner-storage-cleanup.test.mjs')
         workflow['jobs']['execute']['steps'].append(
