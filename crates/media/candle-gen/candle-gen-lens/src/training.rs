@@ -685,6 +685,31 @@ impl FlowMatchTrainer for LensTrainer {
         Ok((cache, (), sample_plan))
     }
 
+    fn prepare_training(
+        &self,
+        dit: &mut Self::Dit,
+        cache: &mut [Self::Cached],
+        _aux: &mut Self::Aux,
+        _req: &TrainingRequest,
+        _device: &Device,
+    ) -> Result<()> {
+        let mut captions = std::collections::HashMap::<Vec<_>, Vec<Tensor>>::new();
+        for (_, features, (h, w), _) in cache {
+            let key = features.iter().map(Tensor::id).collect::<Vec<_>>();
+            let projected = match captions.get(&key) {
+                Some(projected) => projected.clone(),
+                None => {
+                    let projected = dit.prepare_training_features(features)?;
+                    captions.insert(key, projected.clone());
+                    projected
+                }
+            };
+            dit.prepare_training_geometry(projected[0].dim(1)?, 1, *h, *w)?;
+            *features = projected;
+        }
+        Ok(())
+    }
+
     fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<LensTransformerTrain> {
         let compute_dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
         Ok(LensTransformerTrain::new(
