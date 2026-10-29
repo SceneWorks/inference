@@ -318,7 +318,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 992
+              "line": 993
             }
           ],
           "creation": [
@@ -337,7 +337,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::reference_forward",
-              "line": 1309
+              "line": 1591
             }
           ],
           "reads": [
@@ -379,7 +379,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 992
+              "line": 993
             }
           ],
           "creation": [
@@ -432,9 +432,9 @@
           "family": "wan",
           "creation": [
             {
-              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "sc20686::register_cross_kv_set",
-              "line": 928
+              "line": 57
             }
           ],
           "reads": [
@@ -446,9 +446,9 @@
           ],
           "release": [
             {
-              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "CacheSetGuard",
-              "line": 897
+              "line": 25
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
@@ -466,9 +466,9 @@
           "route": "wan2_2_ti2v_5b",
           "activation": [
             {
-              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model/ti2v.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 524
+              "line": 220
             }
           ],
           "product_residency": "sequential",
@@ -481,9 +481,9 @@
           "family": "wan",
           "creation": [
             {
-              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "sc20686::register_cross_kv_set",
-              "line": 928
+              "line": 57
             }
           ],
           "reads": [
@@ -495,9 +495,9 @@
           ],
           "release": [
             {
-              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "CacheSetGuard",
-              "line": 897
+              "line": 25
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
@@ -515,9 +515,9 @@
           "route": "wan2_2_t2v_14b",
           "activation": [
             {
-              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model/a14b_generate.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1512
+              "line": 27
             }
           ],
           "product_residency": "sequential",
@@ -539,9 +539,9 @@
           "family": "wan",
           "creation": [
             {
-              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "sc20686::register_cross_kv_set",
-              "line": 928
+              "line": 57
             }
           ],
           "reads": [
@@ -553,9 +553,9 @@
           ],
           "release": [
             {
-              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
               "symbol": "CacheSetGuard",
-              "line": 897
+              "line": 25
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
@@ -573,9 +573,9 @@
           "route": "wan2_2_i2v_14b",
           "activation": [
             {
-              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model/a14b_generate.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1512
+              "line": 27
             }
           ],
           "product_residency": "sequential",

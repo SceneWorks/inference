@@ -1372,7 +1372,7 @@
         "reader-binding"
       ]
     },
-    "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760": {
+    "crates/media/mlx-gen/mlx-gen-ltx/src/model/load.rs::resolve_gemma_quant::std::fs::read_to_string@3041": {
       "role": "artifact-input",
       "grades": [
         "reader-binding"
@@ -1408,13 +1408,13 @@
         "reader-binding"
       ]
     },
-    "crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy.rs::resolved_dit_config::std::fs::read_to_string@76461": {
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy/contract.rs::resolved_dit_config::std::fs::read_to_string@19222": {
       "role": "artifact-input",
       "grades": [
         "reader-binding"
       ]
     },
-    "crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy.rs::vae_config::std::fs::read_to_string@78050": {
+    "crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy/contract.rs::vae_config::std::fs::read_to_string@21099": {
       "role": "artifact-input",
       "grades": [
         "reader-binding"

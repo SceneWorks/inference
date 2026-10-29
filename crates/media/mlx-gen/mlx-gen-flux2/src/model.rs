@@ -19,11 +19,12 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, run_flow_sampler_with_latent_hook, CancelFlag, Error, GenerationOutput,
-    GenerationRequest, Generator, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
-    Precision, Progress, Residency, Result, SamplerRun, TimestepConvention, WeightsSource,
+    default_seed, run_flow_sampler_with_latent_hook, CancelFlag, Error, FlowMatchEuler,
+    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, ModelDescriptor,
+    OffloadPolicy, Precision, Progress, Residency, Result, SamplerRun, TimestepConvention,
+    WeightsSource,
 };
-use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
@@ -1149,8 +1150,9 @@ impl Flux2 {
         // Resolve an omitted seed exactly once, then share it with both the autoregressive caption
         // sampler and diffusion. Calling `default_seed` independently in those phases makes a
         // request irreproducible and lets its provenance name only one of two actual seeds.
+        let base_seed = req.seed.unwrap_or_else(default_seed);
         let mut resolved_req = req.clone();
-        resolved_req.seed = Some(req.seed.unwrap_or_else(default_seed));
+        resolved_req.seed = Some(base_seed);
         let req = &resolved_req;
         let tokenizer = self
             .tokenizer
@@ -1161,12 +1163,8 @@ impl Flux2 {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let base_seed = req.seed.expect("request seed was resolved above");
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
-        // dev is guidance-DISTILLED: the scale is an embedded scalar fed into the transformer's
-        // guidance embedder (single forward), NOT a true-CFG dual-forward over a negative prompt.
-        let embedded_guidance = self.variant.uses_embedded_guidance().then_some(guidance);
 
         // Request-selected staging (or the Sequential load default) loads the text encoder
         // (+ dev vision tower/projector), runs any caption upsample + the prompt encode, materializes,
@@ -1182,24 +1180,7 @@ impl Flux2 {
             req.use_pid,
             on_progress,
             // ── Phase A: (dev) caption upsample → prompt encode (+ base true-CFG negative).
-            |text: &Flux2TextOwned| {
-                // FLUX.2-dev caption upsampling (sc-6030): optionally rewrite the prompt with the
-                // Mistral3 multimodal LLM (using any reference images) before encoding, gated on
-                // `enhance_prompt`. A no-op (returns `req.prompt`) for klein, gate off, or any failure.
-                let prompt = self.maybe_upsample(tokenizer, text, req)?;
-                if req.cancel.is_cancelled() {
-                    return Err(Error::Canceled);
-                }
-                let (prompt_embeds, text_ids) =
-                    self.encode(tokenizer, &text.text_encoder, &prompt)?;
-                // Classifier-free dual-forward only for the non-embedded-guidance path at guidance >1;
-                // dev routes its scale through the embedded guidance embedder instead, so it never takes
-                // a negative pass, and distilled klein runs at guidance 1.0 (also no negative).
-                let negative = encode_cfg_negative_with(self.variant, guidance, req, |negative| {
-                    self.encode(tokenizer, &text.text_encoder, negative)
-                })?;
-                Ok((prompt_embeds, text_ids, negative))
-            },
+            |text: &Flux2TextOwned| self.encode_text_phase(tokenizer, text, req, guidance),
             // Materialize the (TE-dependent) embeds while the encoder is still alive (Sequential only) —
             // MLX is lazy, so an un-evaluated embed keeps the encoder referenced and the drop would free
             // nothing. `text_ids` are host-derived position ids (TE-independent), so evaling the embeds
@@ -1215,336 +1196,533 @@ impl Flux2 {
                 Ok(())
             },
             // ── Phase B: reference/img2img conditioning (VAE) + denoise + decode from the heavy bundle.
-            |heavy, (prompt_embeds, text_ids, negative), on_progress| {
-                let transformer = &heavy.transformer;
-                let vae = &heavy.vae;
-
-                // Edit: build the reference-image conditioning from one `Reference` or one
-                // `MultiReference` (sc-2645). The transformer sees the joint sequence
-                // `[txt, target, ref0, ref1, …]`; its output keeps the leading `target_seq` image tokens.
-                let reference = if self.variant.is_edit() {
-                    let images = self.collect_edit_references(req)?;
-                    Some(self.encode_references(
-                        vae,
-                        &images,
-                        req.width,
-                        req.height,
-                        &req.cancel,
-                    )?)
-                } else {
-                    None
-                };
-
-                // img2img (txt2img variant): a single `Reference` init image seeds the latents via the
-                // noise blend at `sigmas[start_step]`, with the denoise loop starting at `start_step`
-                // (= the fork's `_prepare_img2img_latents` + `Config.init_time_step`). The edit variant
-                // consumes its `Reference` above (token concat), so img2img is txt2img-only.
-                let img2img = if self.variant.is_edit() {
-                    None
-                } else {
-                    self.resolve_reference(req)?
-                };
-                let start_step = match &img2img {
-                    Some((_, strength)) => init_time_step(steps, *strength),
-                    None => 0,
-                };
-
-                let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref())?;
-                let lat_h = (req.height / 16) as usize;
-                let lat_w = (req.width / 16) as usize;
-                let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
-                let in_channels = self.config.in_channels as i32;
-
-                // The img2img clean init latents are seed-independent — encode once, blend with per-seed
-                // noise below. `None` for pure txt2img (or strength ≤ 0, where `start_step == 0`).
-                let clean_init = match &img2img {
-                    Some((image, _)) if start_step > 0 => {
-                        Some(self.encode_init_latents(vae, image, req.width, req.height)?)
-                    }
-                    _ => None,
-                };
-
-                // sc-6266: a multi-reference edit concatenates each reference's latent tokens onto the
-                // joint `[txt, target, ref…]` DiT sequence, making the denoise activation-bound — a
-                // 2-reference 1024² edit peaks ~104 GB, over the 96 GB budget (sc-6124). Above the
-                // single-reference ceiling, bound the per-step activation high-water with
-                // a per-block evaluation cadence (bit-exact, so the edit's pixels are unchanged).
-                // Shorter sequences (T2I, single-reference edit, pose) stay on `MemoryConfig::OFF` →
-                // the shipped forward is byte-identical. Env-overridable (`MemoryConfig::from_env`)
-                // so a deployment can tune chunking without a recompile.
-                //
-                // sc-18317: the request's typed execution selections are overlaid LAST, so epic
-                // 18304's planner outranks both the sequence-length gate and the environment for the
-                // two knobs it selects — while a request that selects neither leaves this route
-                // byte-for-byte as it was. The values are already domain-admitted by the shared
-                // request floor against `chunk::EXECUTION_SURFACE`, so nothing is re-derived here.
-                let total_seq = prompt_embeds.shape()[1] as usize
-                    + lat_h * lat_w
-                    + reference
-                        .as_ref()
-                        .map(|(r, _)| r.shape()[1] as usize)
-                        .unwrap_or(0);
-                let mem = MemoryConfig::with_request(
-                    MemoryConfig::from_env(if total_seq > LONG_SEQ_TOKEN_THRESHOLD {
-                        MemoryConfig::LONG_SEQ
-                    } else {
-                        MemoryConfig::OFF
-                    }),
-                    req.memory.as_ref(),
-                );
-
-                // For an edit, the transformer's image input/ids are `[target, ref]` (or `[target]` only
-                // on a cached KV step); its output keeps the image stream, of which we take the leading
-                // `target_seq` tokens. txt2img has no ref, so the concat + slice are no-ops.
-                // `include_ref=false` drops the reference tokens (the 9b-kv cached step); `cache` threads
-                // the per-seed KV cache through the transformer.
-                let run = |latents: &Array,
-                           embeds: &Array,
-                           ids: &Array,
-                           ts: f32,
-                           include_ref: bool,
-                           cache: Option<&Flux2KvCache>|
-                 -> Result<Array> {
-                    let target_seq = latents.shape()[1];
-                    let _sc20686 = mlx_gen::sc20686::reference_forward(
-                        include_ref && cache.is_none() && reference.is_some(),
-                    );
-                    let (hidden, img_ids) = match (&reference, include_ref) {
-                        (Some((ref_lat, ref_ids)), true) => (
-                            concatenate_axis(&[latents, ref_lat], 1)?,
-                            concatenate_axis(&[&latent_ids, ref_ids], 1)?,
-                        ),
-                        _ => (latents.clone(), latent_ids.clone()),
-                    };
-                    let out = transformer.forward_with_mem(
-                        &Flux2ForwardInputs {
-                            hidden_states: &hidden,
-                            encoder_hidden_states: embeds,
-                            img_ids: &img_ids,
-                            txt_ids: ids,
-                            timestep: ts,
-                            guidance: embedded_guidance,
-                        },
-                        cache,
-                        &mem,
-                        if self.variant.is_dev() {
-                            mlx_gen::attention::AttentionPlan::UNBOUNDED
-                        } else {
-                            crate::memory_strategy::attention_plan(req)
-                        },
-                        transformer_window.map(|size| (size, &req.cancel)),
-                    )?;
-                    let idx =
-                        Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
-                    Ok(out.take_axis(&idx, 1)?)
-                };
-
-                // 9b-kv edit: cache reference K/V on step 0, reuse on steps 1+ (the ~2.4× speedup). The
-                // edit path always has a reference, so `num_ref > 0`.
-                let kv_enabled = self.variant.is_kv() && reference.is_some();
-                let num_ref = reference
-                    .as_ref()
-                    .map(|(r, _)| r.shape()[1] as usize)
-                    .unwrap_or(0);
-                // SC-20686 Metal lane (no-op unless a campaign is armed): the kv edit caches the
-                // reference K/V of every double AND single layer; the non-kv edit's recomputed
-                // reference slice is observed at the double-stream boundary the Candle lane uses.
-                if reference.is_some() && mlx_gen::sc20686::active() {
-                    mlx_gen::sc20686::bind_geometry(
-                        mlx_gen::sc20686::KvGeometry {
-                            layers: if kv_enabled {
-                                (self.config.num_double_layers + self.config.num_single_layers)
-                                    as u32
-                            } else {
-                                self.config.num_double_layers as u32
-                            },
-                            heads: self.config.num_heads as u32,
-                            head_dimension: self.config.head_dim as u32,
-                            sq: (lat_h * lat_w) as u64,
-                            skv: num_ref as u64,
-                        },
-                        None,
-                        "joint-unmasked",
-                        "flux2-4-axis",
-                    );
-                }
-
-                // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine,
-                // SwiGLU, gated residual, RoPE rotation) through `mx.compile`. Under MLX 0.32 bf16 is
-                // exact to eager and f32 stays within the established ULP contract; compile_parity.rs
-                // gates the composed forward. Scoped to this render by the RAII guard (F-007): the
-                // render thread's prior setting is restored on drop.
-                let _compile_glue = crate::transformer::CompileGlueGuard::enable();
-
-                // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): when
-                // `req.use_pid` is set and the model was loaded with `LoadSpec::pid`, mint a
-                // per-generation decoder that super-resolves the packed latent 4× in place of the VAE.
-                // Errors if requested-but-not-loaded; `None` (the default) → the byte-exact VAE path. One
-                // decoder serves the whole count loop. When `pid_capture_sigma` asks for an early exit,
-                // stop the denoise at the achieved-σ step and hand PiD the partially-denoised packed
-                // latent (FLUX.2 is `vp_frame=false`, so the schedule σ *is* the degrade σ — flow-match
-                // identity); the packed-128ch BN seam below is unchanged. `start_step` is the img2img
-                // noise-blend offset (0 for txt2img), matching the schedule slice fed to the solver.
-                let (capture_sigma, keep) =
-                    flow_capture_for_request(req, &sched.sigmas, start_step);
-                let pid_decoder = resolve_pid_decoder_at_sigma(
-                    heavy.pid.as_ref(),
-                    req,
-                    base_seed,
-                    self.descriptor.id,
-                    capture_sigma,
-                )?;
-
-                // Image-guidance CFG on the reference condition (sc-8273/sc-8278): the identity-strength
-                // lever, off by default so the shipped render is byte-identical. On the klein/dev EDIT
-                // path identity rides ENTIRELY on the concatenated reference tokens; a strong prompt
-                // drowns them (sc-8234). With `s > 1` the denoise extrapolates the with-reference
-                // velocity against the reference-dropped (image-unconditional) velocity:
-                // `v = v_img0 + s·(v_ref − v_img0)`, reusing the `include_ref=false` forward (non-kv
-                // path). `req.image_guidance` wins; `FLUX2_IMG_GUIDANCE` is a debug fallback only (F-087).
-                // Scoped to the non-kv edit path; the kv variant rejects `image_guidance` in
-                // `validate_impl`. The env debug override skips `validate_request`, so filter a
-                // non-finite value here (F-036).
-                let img_guidance_debug = std::env::var("FLUX2_IMG_GUIDANCE")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<f32>().ok())
-                    .filter(|v| v.is_finite());
-                let img_guidance: Option<f32> = req
-                    .image_guidance
-                    .or(img_guidance_debug)
-                    .filter(|s| *s > 1.0 && reference.is_some());
-
-                let sampler_name = req.sampler.as_deref();
-                let mut images = Vec::with_capacity(req.count as usize);
-                for i in 0..req.count {
-                    let seed = base_seed.wrapping_add(i as u64);
-                    let noise = create_noise(seed, req.width, req.height, self.config.in_channels)?;
-                    // img2img: `(1-σ)·clean + σ·noise` at `σ = sigmas[start_step]`; txt2img: pure noise.
-                    let latents = match &clean_init {
-                        Some(clean) => {
-                            add_noise_by_interpolation(clean, &noise, sched.sigmas[start_step])?
-                        }
-                        None => noise,
-                    };
-                    // Fresh caches per seed — the cached reference K/V depend on the step-0 target
-                    // latents — and one cache per CFG branch: the unmasked joint attention makes the
-                    // reference K/V prompt-dependent, so the negative pass must never overwrite the
-                    // positive slots (see `Flux2KvCfgCaches`).
-                    let mut kv_caches = kv_enabled.then(|| {
-                        Flux2KvCfgCaches::new(
-                            self.config.num_double_layers,
-                            self.config.num_single_layers,
-                            negative.is_some(),
-                            num_ref,
-                        )
-                    });
-                    // The curated unified-framework solver owns the loop (epic 7114 P3). KV step role:
-                    // the first executed forward extracts each branch's reference K/V (the full `[txt,
-                    // target, ref]` pass); later forwards run `[txt, target]` and splice that branch's
-                    // cached ref K/V back in. A multi-eval solver still extracts once.
-                    // FLUX.2 feeds `sigma · 1000` as the transformer timestep (Sigma convention).
-                    let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-                        let ts = sigma * 1000.0;
-                        if let Some(caches) = kv_caches.as_mut() {
-                            return caches.velocity(guidance, |branch, include_ref, cache| {
-                                let (embeds, ids) = match (branch, &negative) {
-                                    (CfgBranch::Negative, Some((neg_embeds, neg_ids))) => {
-                                        (neg_embeds, neg_ids)
-                                    }
-                                    _ => (&prompt_embeds, &text_ids),
-                                };
-                                run(latents, embeds, ids, ts, include_ref, Some(cache))
-                            });
-                        }
-                        let v = run(latents, &prompt_embeds, &text_ids, ts, true, None)?;
-                        // sc-8273 spike: image-guidance CFG (non-kv edit only — the ref-dropped forward
-                        // must run without a KV cache in play). Recompute this step with the reference
-                        // tokens dropped, then extrapolate toward the with-reference prediction.
-                        let v = match img_guidance {
-                            Some(s) => {
-                                let v_img0 =
-                                    run(latents, &prompt_embeds, &text_ids, ts, false, None)?;
-                                add(&v_img0, &multiply(&subtract(&v, &v_img0)?, scalar(s))?)?
-                            }
-                            None => v,
-                        };
-                        match &negative {
-                            Some((neg_embeds, neg_ids)) => {
-                                let vn = run(latents, neg_embeds, neg_ids, ts, true, None)?;
-                                // noise = neg + guidance·(pos − neg)
-                                Ok(add(&vn, &multiply(&subtract(&v, &vn)?, scalar(guidance))?)?)
-                            }
-                            None => Ok(v),
-                        }
-                    };
-                    // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress live in
-                    // `run_flow_sampler`. img2img slices the schedule from `start_step`.
-                    let denoise_sigmas = &sched.sigmas[start_step..keep];
-                    mlx_gen::sc20686::mark_denoise();
-                    let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
-                    let final_latents = run_flow_sampler_with_latent_hook(
-                        SamplerRun {
-                            sampler_name,
-                            sigmas: denoise_sigmas,
-                            seed,
-                            cancel: &req.cancel,
-                            on_progress,
-                        },
-                        TimestepConvention::Sigma,
-                        latents,
-                        |latents, sigma| {
-                            crate::preview::emit_flux_preview(
-                                &req.preview,
-                                &previews,
-                                denoise_sigmas,
-                                sigma,
-                                latents,
-                                lat_h as i32,
-                                lat_w as i32,
-                                vae,
-                            );
-                        },
-                        predict,
-                    )?;
-                    // SC-20686: return the denoise's freed transients (a KV edit's reference-K/V
-                    // build is ~26 GiB at 768x512 with two references) to the OS before the VAE
-                    // decode, so the decode's working set does not stack on the pooled denoise
-                    // (D run 37041026188: 58.1 GiB at decode, 50.2 GiB during denoise).
-                    mlx_rs::transforms::eval([&final_latents])?;
-                    mlx_gen::memory_probe::clear_cache();
-                    on_progress(Progress::Decoding);
-                    let packed =
-                        final_latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
-                    let nchw = match &pid_decoder {
-                        // PiD: `packed` (NHWC [1,h,w,128]) is already the BN-normalized packed latent the
-                        // student trained on — the exact tensor `decode_packed_latents` BN-de-normalizes
-                        // (sc-7847). Hand it over as NCHW [1,128,h,w]; the student returns [1,3,4H,4W].
-                        Some(d) => {
-                            mlx_gen::ensure_decoder_layout(
-                                self.descriptor.denoiser_output_latent_space,
-                                d,
-                            )?;
-                            d.decode(&packed.transpose_axes(&[0, 3, 1, 2])?)?
-                        }
-                        // Native VAE: BN-de-normalize + 2×2-unpatchify + decode → NHWC [1,H,W,3] → NCHW.
-                        None => match (!self.variant.is_dev())
-                            .then(|| crate::memory_strategy::decode_tiling(req))
-                            .transpose()?
-                            .flatten()
-                        {
-                            Some(tiling) => vae
-                                .decode_packed_latents_tiled(&packed, &tiling, Some(&req.cancel))?
-                                .transpose_axes(&[0, 3, 1, 2])?,
-                            None => vae
-                                .decode_packed_latents(&packed)?
-                                .transpose_axes(&[0, 3, 1, 2])?,
-                        },
-                    };
-                    images.push(decoded_to_image(&nchw)?);
-                }
-                Ok(GenerationOutput::Images(images))
+            |heavy, encoded, on_progress| {
+                self.render_phase(
+                    heavy,
+                    encoded,
+                    Flux2RenderRequest {
+                        req,
+                        base_seed,
+                        steps,
+                        guidance,
+                        transformer_window,
+                    },
+                    on_progress,
+                )
             },
         )
+    }
+
+    /// Phase A: (dev) caption upsample → prompt encode (+ base true-CFG negative).
+    fn encode_text_phase(
+        &self,
+        tokenizer: &TextTokenizer,
+        text: &Flux2TextOwned,
+        req: &GenerationRequest,
+        guidance: f32,
+    ) -> Result<Flux2Encoded> {
+        // FLUX.2-dev caption upsampling (sc-6030): optionally rewrite the prompt with the Mistral3
+        // multimodal LLM (using any reference images) before encoding, gated on `enhance_prompt`. A
+        // no-op (returns `req.prompt`) for klein, gate off, or any failure.
+        let prompt = self.maybe_upsample(tokenizer, text, req)?;
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let (prompt_embeds, text_ids) = self.encode(tokenizer, &text.text_encoder, &prompt)?;
+        // Classifier-free dual-forward only for the non-embedded-guidance path at guidance >1; dev
+        // routes its scale through the embedded guidance embedder instead, so it never takes a
+        // negative pass, and distilled klein runs at guidance 1.0 (also no negative).
+        let negative = encode_cfg_negative_with(self.variant, guidance, req, |negative| {
+            self.encode(tokenizer, &text.text_encoder, negative)
+        })?;
+        Ok((prompt_embeds, text_ids, negative))
+    }
+
+    /// Phase B: the reference / img2img conditioning (VAE), the per-request forward plan, then
+    /// every image's denoise + decode from the heavy bundle.
+    fn render_phase(
+        &self,
+        heavy: &Flux2HeavyOwned,
+        (prompt_embeds, text_ids, negative): Flux2Encoded,
+        request: Flux2RenderRequest<'_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let req = request.req;
+        let vae = &heavy.vae;
+        let cond = self.prepare_conditioning(vae, req, request.steps)?;
+        let mem = self.memory_config(&prompt_embeds, &cond, req);
+        let render = Flux2Render {
+            model: self,
+            transformer: &heavy.transformer,
+            reference: cond.reference.as_ref(),
+            latent_ids: &cond.latent_ids,
+            mem: &mem,
+            // dev is guidance-DISTILLED: the scale is an embedded scalar fed into the transformer's
+            // guidance embedder (single forward), NOT a true-CFG dual-forward over a negative prompt.
+            embedded_guidance: self
+                .variant
+                .uses_embedded_guidance()
+                .then_some(request.guidance),
+            req,
+            transformer_window: request.transformer_window,
+        };
+        self.bind_kv_geometry(&cond);
+
+        // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine,
+        // SwiGLU, gated residual, RoPE rotation) through `mx.compile`. Under MLX 0.32 bf16 is exact
+        // to eager and f32 stays within the established ULP contract; compile_parity.rs gates the
+        // composed forward. Scoped to this render by the RAII guard (F-007): the render thread's
+        // prior setting is restored on drop.
+        let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+
+        // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): when
+        // `req.use_pid` is set and the model was loaded with `LoadSpec::pid`, mint a per-generation
+        // decoder that super-resolves the packed latent 4× in place of the VAE. Errors if
+        // requested-but-not-loaded; `None` (the default) → the byte-exact VAE path. One decoder serves
+        // the whole count loop. When `pid_capture_sigma` asks for an early exit, stop the denoise at
+        // the achieved-σ step and hand PiD the partially-denoised packed latent (FLUX.2 is
+        // `vp_frame=false`, so the schedule σ *is* the degrade σ — flow-match identity); the
+        // packed-128ch BN seam below is unchanged. `start_step` is the img2img noise-blend offset (0
+        // for txt2img), matching the schedule slice fed to the solver.
+        let (capture_sigma, keep) =
+            flow_capture_for_request(req, &cond.sched.sigmas, cond.start_step);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            heavy.pid.as_ref(),
+            req,
+            request.base_seed,
+            self.descriptor.id,
+            capture_sigma,
+        )?;
+        let img_guidance = image_guidance(req, cond.reference.is_some());
+
+        let mut images = Vec::with_capacity(req.count as usize);
+        for i in 0..req.count {
+            let seed = request.base_seed.wrapping_add(i as u64);
+            let noise = create_noise(seed, req.width, req.height, self.config.in_channels)?;
+            // img2img: `(1-σ)·clean + σ·noise` at `σ = sigmas[start_step]`; txt2img: pure noise.
+            let latents = match &cond.clean_init {
+                Some(clean) => {
+                    add_noise_by_interpolation(clean, &noise, cond.sched.sigmas[cond.start_step])?
+                }
+                None => noise,
+            };
+            // The KV caches live to the end of the image, through its decode, as the inline loop
+            // held them.
+            let (final_latents, _kv_caches) = render.denoise(
+                latents,
+                seed,
+                &cond.sched.sigmas[cond.start_step..keep],
+                Flux2Guidance {
+                    prompt: (&prompt_embeds, &text_ids),
+                    negative: negative.as_ref(),
+                    guidance: request.guidance,
+                    image_guidance: img_guidance,
+                },
+                (cond.lat_h, cond.lat_w),
+                vae,
+                on_progress,
+            )?;
+            images.push(self.decode_image(
+                vae,
+                &final_latents,
+                pid_decoder.as_ref(),
+                (cond.lat_h, cond.lat_w),
+                req,
+                on_progress,
+            )?);
+        }
+        Ok(GenerationOutput::Images(images))
+    }
+
+    /// The seed-independent conditioning: the edit's reference tokens or the txt2img variant's
+    /// img2img init, the schedule and the latent grid.
+    fn prepare_conditioning(
+        &self,
+        vae: &Flux2Vae,
+        req: &GenerationRequest,
+        steps: usize,
+    ) -> Result<Flux2Conditioning> {
+        // Edit: build the reference-image conditioning from one `Reference` or one `MultiReference`
+        // (sc-2645). The transformer sees the joint sequence `[txt, target, ref0, ref1, …]`; its
+        // output keeps the leading `target_seq` image tokens.
+        let reference = if self.variant.is_edit() {
+            let images = self.collect_edit_references(req)?;
+            Some(self.encode_references(vae, &images, req.width, req.height, &req.cancel)?)
+        } else {
+            None
+        };
+
+        // img2img (txt2img variant): a single `Reference` init image seeds the latents via the noise
+        // blend at `sigmas[start_step]`, with the denoise loop starting at `start_step` (= the fork's
+        // `_prepare_img2img_latents` + `Config.init_time_step`). The edit variant consumes its
+        // `Reference` above (token concat), so img2img is txt2img-only.
+        let img2img = if self.variant.is_edit() {
+            None
+        } else {
+            self.resolve_reference(req)?
+        };
+        let start_step = match &img2img {
+            Some((_, strength)) => init_time_step(steps, *strength),
+            None => 0,
+        };
+
+        let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref())?;
+        let lat_h = (req.height / 16) as usize;
+        let lat_w = (req.width / 16) as usize;
+        let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
+
+        // The img2img clean init latents are seed-independent — encode once, blend with per-seed
+        // noise below. `None` for pure txt2img (or strength ≤ 0, where `start_step == 0`).
+        let clean_init = match &img2img {
+            Some((image, _)) if start_step > 0 => {
+                Some(self.encode_init_latents(vae, image, req.width, req.height)?)
+            }
+            _ => None,
+        };
+        Ok(Flux2Conditioning {
+            reference,
+            start_step,
+            sched,
+            lat_h,
+            lat_w,
+            latent_ids,
+            clean_init,
+        })
+    }
+
+    /// sc-6266: a multi-reference edit concatenates each reference's latent tokens onto the joint
+    /// `[txt, target, ref…]` DiT sequence, making the denoise activation-bound — a 2-reference 1024²
+    /// edit peaks ~104 GB, over the 96 GB budget (sc-6124). Above the single-reference ceiling,
+    /// bound the per-step activation high-water with a per-block evaluation cadence (bit-exact, so
+    /// the edit's pixels are unchanged). Shorter sequences (T2I, single-reference edit, pose) stay
+    /// on `MemoryConfig::OFF` → the shipped forward is byte-identical. Env-overridable
+    /// (`MemoryConfig::from_env`) so a deployment can tune chunking without a recompile.
+    ///
+    /// sc-18317: the request's typed execution selections are overlaid LAST, so epic 18304's
+    /// planner outranks both the sequence-length gate and the environment for the two knobs it
+    /// selects — while a request that selects neither leaves this route byte-for-byte as it was.
+    /// The values are already domain-admitted by the shared request floor against
+    /// `chunk::EXECUTION_SURFACE`, so nothing is re-derived here.
+    fn memory_config(
+        &self,
+        prompt_embeds: &Array,
+        cond: &Flux2Conditioning,
+        req: &GenerationRequest,
+    ) -> MemoryConfig {
+        let total_seq = prompt_embeds.shape()[1] as usize
+            + cond.lat_h * cond.lat_w
+            + cond
+                .reference
+                .as_ref()
+                .map(|(r, _)| r.shape()[1] as usize)
+                .unwrap_or(0);
+        MemoryConfig::with_request(
+            MemoryConfig::from_env(if total_seq > LONG_SEQ_TOKEN_THRESHOLD {
+                MemoryConfig::LONG_SEQ
+            } else {
+                MemoryConfig::OFF
+            }),
+            req.memory.as_ref(),
+        )
+    }
+
+    /// SC-20686 Metal lane (no-op unless a campaign is armed): the kv edit caches the reference K/V
+    /// of every double AND single layer; the non-kv edit's recomputed reference slice is observed
+    /// at the double-stream boundary the Candle lane uses.
+    fn bind_kv_geometry(&self, cond: &Flux2Conditioning) {
+        let Some((reference, _)) = &cond.reference else {
+            return;
+        };
+        if !mlx_gen::sc20686::active() {
+            return;
+        }
+        mlx_gen::sc20686::bind_geometry(
+            mlx_gen::sc20686::KvGeometry {
+                layers: if self.variant.is_kv() {
+                    (self.config.num_double_layers + self.config.num_single_layers) as u32
+                } else {
+                    self.config.num_double_layers as u32
+                },
+                heads: self.config.num_heads as u32,
+                head_dimension: self.config.head_dim as u32,
+                sq: (cond.lat_h * cond.lat_w) as u64,
+                skv: reference.shape()[1] as u64,
+            },
+            None,
+            "joint-unmasked",
+            "flux2-4-axis",
+        );
+    }
+
+    /// Decode one image's final packed latent (after returning the denoise's freed transients to
+    /// the OS): through the PiD student when one was minted, else the native VAE (tiled when the
+    /// request's decode rung asks, never on dev).
+    fn decode_image(
+        &self,
+        vae: &Flux2Vae,
+        final_latents: &Array,
+        pid_decoder: Option<&PidDecoder>,
+        (lat_h, lat_w): (usize, usize),
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<mlx_gen::media::Image> {
+        // SC-20686: return the denoise's freed transients (a KV edit's reference-K/V build is ~26
+        // GiB at 768x512 with two references) to the OS before the VAE decode, so the decode's
+        // working set does not stack on the pooled denoise (D run 37041026188: 58.1 GiB at decode,
+        // 50.2 GiB during denoise).
+        mlx_rs::transforms::eval([final_latents])?;
+        mlx_gen::memory_probe::clear_cache();
+        on_progress(Progress::Decoding);
+        let packed = final_latents.reshape(&[
+            1,
+            lat_h as i32,
+            lat_w as i32,
+            self.config.in_channels as i32,
+        ])?;
+        let nchw = match pid_decoder {
+            // PiD: `packed` (NHWC [1,h,w,128]) is already the BN-normalized packed latent the
+            // student trained on — the exact tensor `decode_packed_latents` BN-de-normalizes
+            // (sc-7847). Hand it over as NCHW [1,128,h,w]; the student returns [1,3,4H,4W].
+            Some(d) => {
+                mlx_gen::ensure_decoder_layout(self.descriptor.denoiser_output_latent_space, d)?;
+                d.decode(&packed.transpose_axes(&[0, 3, 1, 2])?)?
+            }
+            // Native VAE: BN-de-normalize + 2×2-unpatchify + decode → NHWC [1,H,W,3] → NCHW.
+            None => match (!self.variant.is_dev())
+                .then(|| crate::memory_strategy::decode_tiling(req))
+                .transpose()?
+                .flatten()
+            {
+                Some(tiling) => vae
+                    .decode_packed_latents_tiled(&packed, &tiling, Some(&req.cancel))?
+                    .transpose_axes(&[0, 3, 1, 2])?,
+                None => vae
+                    .decode_packed_latents(&packed)?
+                    .transpose_axes(&[0, 3, 1, 2])?,
+            },
+        };
+        decoded_to_image(&nchw)
+    }
+}
+
+/// The text phase's output: the prompt embeds + ids and the true-CFG negative's.
+type Flux2Encoded = (Array, Array, Option<(Array, Array)>);
+
+/// The request knobs the render phase reads, resolved once before the residency lifecycle.
+#[derive(Clone, Copy)]
+struct Flux2RenderRequest<'r> {
+    req: &'r GenerationRequest,
+    base_seed: u64,
+    steps: usize,
+    guidance: f32,
+    transformer_window: Option<usize>,
+}
+
+/// The render phase's seed-independent conditioning.
+struct Flux2Conditioning {
+    /// The edit's reference latent tokens + ids; `None` off the edit variants.
+    reference: Option<(Array, Array)>,
+    /// The img2img noise-blend offset into the schedule (0 for txt2img).
+    start_step: usize,
+    sched: FlowMatchEuler,
+    lat_h: usize,
+    lat_w: usize,
+    latent_ids: Array,
+    /// The img2img clean init latents; `None` for txt2img (or strength ≤ 0).
+    clean_init: Option<Array>,
+}
+
+/// One denoise's guidance inputs.
+#[derive(Clone, Copy)]
+struct Flux2Guidance<'a> {
+    prompt: (&'a Array, &'a Array),
+    negative: Option<&'a (Array, Array)>,
+    guidance: f32,
+    image_guidance: Option<f32>,
+}
+
+/// Image-guidance CFG on the reference condition (sc-8273/sc-8278): the identity-strength lever,
+/// off by default so the shipped render is byte-identical. On the klein/dev EDIT path identity rides
+/// ENTIRELY on the concatenated reference tokens; a strong prompt drowns them (sc-8234). With
+/// `s > 1` the denoise extrapolates the with-reference velocity against the reference-dropped
+/// (image-unconditional) velocity: `v = v_img0 + s·(v_ref − v_img0)`, reusing the
+/// `include_ref=false` forward (non-kv path). `req.image_guidance` wins; `FLUX2_IMG_GUIDANCE` is a
+/// debug fallback only (F-087). Scoped to the non-kv edit path; the kv variant rejects
+/// `image_guidance` in `validate_impl`. The env debug override skips `validate_request`, so a
+/// non-finite value is filtered here (F-036).
+fn image_guidance(req: &GenerationRequest, has_reference: bool) -> Option<f32> {
+    let img_guidance_debug = std::env::var("FLUX2_IMG_GUIDANCE")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite());
+    req.image_guidance
+        .or(img_guidance_debug)
+        .filter(|s| *s > 1.0 && has_reference)
+}
+
+/// The per-request transformer forward over the joint `[txt, target, ref…]` sequence.
+struct Flux2Render<'a> {
+    model: &'a Flux2,
+    transformer: &'a Flux2Transformer,
+    reference: Option<&'a (Array, Array)>,
+    latent_ids: &'a Array,
+    mem: &'a MemoryConfig,
+    embedded_guidance: Option<f32>,
+    req: &'a GenerationRequest,
+    transformer_window: Option<usize>,
+}
+
+impl Flux2Render<'_> {
+    /// For an edit, the transformer's image input/ids are `[target, ref]` (or `[target]` only on a
+    /// cached KV step); its output keeps the image stream, of which we take the leading
+    /// `target_seq` tokens. txt2img has no ref, so the concat + slice are no-ops.
+    /// `include_ref=false` drops the reference tokens (the 9b-kv cached step); `cache` threads the
+    /// per-seed KV cache through the transformer.
+    fn forward(
+        &self,
+        latents: &Array,
+        embeds: &Array,
+        ids: &Array,
+        ts: f32,
+        include_ref: bool,
+        cache: Option<&Flux2KvCache>,
+    ) -> Result<Array> {
+        let target_seq = latents.shape()[1];
+        let _sc20686 = mlx_gen::sc20686::reference_forward(
+            include_ref && cache.is_none() && self.reference.is_some(),
+        );
+        let (hidden, img_ids) = match (self.reference, include_ref) {
+            (Some((ref_lat, ref_ids)), true) => (
+                concatenate_axis(&[latents, ref_lat], 1)?,
+                concatenate_axis(&[self.latent_ids, ref_ids], 1)?,
+            ),
+            _ => (latents.clone(), self.latent_ids.clone()),
+        };
+        let out = self.transformer.forward_with_mem(
+            &Flux2ForwardInputs {
+                hidden_states: &hidden,
+                encoder_hidden_states: embeds,
+                img_ids: &img_ids,
+                txt_ids: ids,
+                timestep: ts,
+                guidance: self.embedded_guidance,
+            },
+            cache,
+            self.mem,
+            if self.model.variant.is_dev() {
+                mlx_gen::attention::AttentionPlan::UNBOUNDED
+            } else {
+                crate::memory_strategy::attention_plan(self.req)
+            },
+            self.transformer_window.map(|size| (size, &self.req.cancel)),
+        )?;
+        let idx = Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
+        Ok(out.take_axis(&idx, 1)?)
+    }
+
+    /// One image's denoise over `denoise_sigmas` (the img2img slice from `start_step`, truncated
+    /// at the PiD capture). 9b-kv edit: cache reference K/V on step 0, reuse on steps 1+ (the ~2.4×
+    /// speedup).
+    #[allow(clippy::too_many_arguments)]
+    fn denoise(
+        &self,
+        latents: Array,
+        seed: u64,
+        denoise_sigmas: &[f32],
+        g: Flux2Guidance<'_>,
+        (lat_h, lat_w): (usize, usize),
+        vae: &Flux2Vae,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(Array, Option<Flux2KvCfgCaches>)> {
+        let config = &self.model.config;
+        let req = self.req;
+        // The edit path always has a reference, so `num_ref > 0`.
+        let kv_enabled = self.model.variant.is_kv() && self.reference.is_some();
+        let num_ref = self
+            .reference
+            .map(|(r, _)| r.shape()[1] as usize)
+            .unwrap_or(0);
+        let (prompt_embeds, text_ids) = g.prompt;
+        // Fresh caches per seed — the cached reference K/V depend on the step-0 target latents —
+        // and one cache per CFG branch: the unmasked joint attention makes the reference K/V
+        // prompt-dependent, so the negative pass must never overwrite the positive slots (see
+        // `Flux2KvCfgCaches`).
+        let mut kv_caches = kv_enabled.then(|| {
+            Flux2KvCfgCaches::new(
+                config.num_double_layers,
+                config.num_single_layers,
+                g.negative.is_some(),
+                num_ref,
+            )
+        });
+        // The curated unified-framework solver owns the loop (epic 7114 P3). KV step role: the
+        // first executed forward extracts each branch's reference K/V (the full `[txt, target,
+        // ref]` pass); later forwards run `[txt, target]` and splice that branch's cached ref K/V
+        // back in. A multi-eval solver still extracts once. FLUX.2 feeds `sigma · 1000` as the
+        // transformer timestep (Sigma convention).
+        let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+            let ts = sigma * 1000.0;
+            if let Some(caches) = kv_caches.as_mut() {
+                return caches.velocity(g.guidance, |branch, include_ref, cache| {
+                    let (embeds, ids) = match (branch, g.negative) {
+                        (CfgBranch::Negative, Some((neg_embeds, neg_ids))) => (neg_embeds, neg_ids),
+                        _ => (prompt_embeds, text_ids),
+                    };
+                    self.forward(latents, embeds, ids, ts, include_ref, Some(cache))
+                });
+            }
+            let v = self.forward(latents, prompt_embeds, text_ids, ts, true, None)?;
+            // sc-8273 spike: image-guidance CFG (non-kv edit only — the ref-dropped forward must run
+            // without a KV cache in play). Recompute this step with the reference tokens dropped,
+            // then extrapolate toward the with-reference prediction.
+            let v = match g.image_guidance {
+                Some(s) => {
+                    let v_img0 = self.forward(latents, prompt_embeds, text_ids, ts, false, None)?;
+                    add(&v_img0, &multiply(&subtract(&v, &v_img0)?, scalar(s))?)?
+                }
+                None => v,
+            };
+            match g.negative {
+                Some((neg_embeds, neg_ids)) => {
+                    let vn = self.forward(latents, neg_embeds, neg_ids, ts, true, None)?;
+                    // noise = neg + guidance·(pos − neg)
+                    Ok(add(
+                        &vn,
+                        &multiply(&subtract(&v, &vn)?, scalar(g.guidance))?,
+                    )?)
+                }
+                None => Ok(v),
+            }
+        };
+        // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress live in
+        // `run_flow_sampler`. img2img slices the schedule from `start_step`.
+        mlx_gen::sc20686::mark_denoise();
+        let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+        let final_latents = run_flow_sampler_with_latent_hook(
+            SamplerRun {
+                sampler_name: req.sampler.as_deref(),
+                sigmas: denoise_sigmas,
+                seed,
+                cancel: &req.cancel,
+                on_progress,
+            },
+            TimestepConvention::Sigma,
+            latents,
+            |latents, sigma| {
+                crate::preview::emit_flux_preview(
+                    &req.preview,
+                    &previews,
+                    denoise_sigmas,
+                    sigma,
+                    latents,
+                    lat_h as i32,
+                    lat_w as i32,
+                    vae,
+                );
+            },
+            predict,
+        )?;
+        Ok((final_latents, kv_caches))
     }
 }
 

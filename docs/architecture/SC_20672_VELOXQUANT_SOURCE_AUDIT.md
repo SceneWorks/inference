@@ -60,7 +60,7 @@ Persistent media caches are deliberately not folded into that LLM trait:
 | --- | --- | --- |
 | `mlx-gen-krea-realtime/src/causal.rs::CausalKvCache` | Retains dense or group-affine packed post-RoPE K/raw V; packed reads dequantize the window before dense SDPA. | Real resident storage and lifecycle baseline; **not** compressed-domain attention. |
 | `mlx-gen-flux2/src/kv_cache.rs::Flux2KvCache::apply` | Extracts and splices reference-image K/V per layer. | Persistent reference-cache seam, separate adapter required. |
-| `mlx-gen-wan/src/pipeline.rs::build_cache` | Evaluates per-block text cross-K/V once per generate. | Persistent text-cache seam, separate adapter required. |
+| `mlx-gen-wan/src/pipeline/denoise.rs::build_cache` | Evaluates per-block text cross-K/V once per generate. | Persistent text-cache seam, separate adapter required. |
 
 The current pmetal MLX SDPA wrapper also has a correctness mitigation for
 multi-head power-of-two head dimensions when `q_len > 8`: it chunks prefill

@@ -438,8 +438,8 @@ impl FluxTransformer {
         attention: AttentionPlan<'_>,
         window: Option<crate::block_stream::FluxBlockWindow<'_>>,
     ) -> Result<Array> {
-        let mut hidden = self.x_embedder.forward(hidden_states)?;
-        let mut encoder = self.context_embedder.forward(prompt_embeds)?;
+        let hidden = self.x_embedder.forward(hidden_states)?;
+        let encoder = self.context_embedder.forward(prompt_embeds)?;
         let text_embeddings = self.time_text_embed.forward(
             sigma * 1000.0,
             pooled_prompt_embeds,
@@ -450,63 +450,16 @@ impl FluxTransformer {
             (height / 16) as usize,
             (width / 16) as usize,
         )?;
-
-        // ControlNet residual injection interval (diffusers `FluxTransformer2DModel`):
-        // `interval = ceil(num_double_blocks / num_control_residuals)`, and after base double block `i`
-        // we add `controlnet_block_samples[i / interval]` (scaled). The Shakker Union-Pro-2.0 ships 6
-        // control double blocks → interval `ceil(19/6) = 4`. An empty residual slice is treated as
-        // "no control" (the `pub` entry guards against `len()-1` underflow). The few residuals are
-        // pre-scaled once before the 19-block loop rather than per block.
-        let control = control.filter(|(res, _)| !res.is_empty());
-        let scaled_control = match control {
-            Some((res, scale)) => {
-                let s = scalar(scale);
-                let interval = control_residual_interval(self.blocks.len(), res.len());
-                Some((
-                    res.iter()
-                        .map(|r| Ok(multiply(r, &s)?))
-                        .collect::<Result<Vec<_>>>()?,
-                    interval,
-                ))
-            }
-            None => None,
+        let scaled_control = self.scale_control(control)?;
+        let stage = BlockStage {
+            text_embeddings: &text_embeddings,
+            rope: &rope,
+            injector,
+            attention,
         };
 
-        match window {
-            None => {
-                if self.block_stream.is_some() && self.blocks.is_empty() {
-                    return Err(mlx_gen::Error::Unsupported(
-                        "flux1: a deferred transformer requires an explicit block window"
-                            .to_owned(),
-                    ));
-                }
-                for (i, block) in self.blocks.iter().enumerate() {
-                    // The image-query (XLabs IP-Adapter) seam is consulted inside the block's
-                    // attention; the post-block residual seam (PuLID) is consulted just below. With
-                    // `injector = None` both are inert and this is byte-identical to the plain path.
-                    let (e, h) = block.forward_with_ip(
-                        &hidden,
-                        &encoder,
-                        &text_embeddings,
-                        &rope,
-                        injector.map(|inj| (inj, i)),
-                        attention,
-                    )?;
-                    encoder = e;
-                    hidden = h;
-                    if let Some(inj) = injector {
-                        if let Some(r) = inj.after_double(i, &hidden)? {
-                            hidden = add(&hidden, &r)?;
-                        }
-                    }
-                    // Fun-Controlnet-Union residual (sc-8238), added AFTER the identity injector so
-                    // the two compose.
-                    if let Some((res, interval)) = &scaled_control {
-                        let idx = (i / interval).min(res.len() - 1);
-                        hidden = add(&hidden, &res[idx])?;
-                    }
-                }
-            }
+        let (encoder, hidden) = match window {
+            None => self.joint_blocks_resident(&stage, encoder, hidden, scaled_control.as_ref())?,
             Some(window) => {
                 if scaled_control.is_some() {
                     return Err(mlx_gen::Error::Unsupported(
@@ -514,75 +467,9 @@ impl FluxTransformer {
                             .to_owned(),
                     ));
                 }
-                if !self.blocks.is_empty() || !self.single_blocks.is_empty() {
-                    return Err(mlx_gen::Error::Msg(
-                        "flux1: deferred transformer retained resident blocks".to_owned(),
-                    ));
-                }
-                let source = self.block_stream.as_ref().ok_or_else(|| {
-                    mlx_gen::Error::Unsupported(
-                        "flux1: no verified snapshot-backed block stream".to_owned(),
-                    )
-                })?;
-                if window.joint.n_blocks() != source.joint_blocks()
-                    || window.single.n_blocks() != source.single_blocks()
-                {
-                    return Err(mlx_gen::Error::Msg(
-                        "flux1: joint/single block plan depth mismatch".to_owned(),
-                    ));
-                }
-                let active_joint_window = Cell::new((0usize, 0usize));
-                let result = mlx_gen::block_residency::run_windowed(
-                    &window.joint,
-                    window.cancel,
-                    (encoder, hidden),
-                    || source.open(),
-                    |(mut encoder, mut hidden), view, range| {
-                        let (start, end) = (range.start, range.end);
-                        active_joint_window.set((start, end));
-                        for i in range {
-                            let block = source.materialize_joint(view, i)?;
-                            crate::block_stream::calibration_stream_fault(
-                                window.calibration_stream_fault,
-                                i,
-                            )?;
-                            (encoder, hidden) = block.forward_with_ip(
-                                &hidden,
-                                &encoder,
-                                &text_embeddings,
-                                &rope,
-                                injector.map(|inj| (inj, i)),
-                                attention,
-                            )
-                            .map_err(|error| {
-                                mlx_gen::Error::Msg(format!(
-                                    "flux1 block stream: joint window {start}..{end} block {i} forward: {error}"
-                                ))
-                            })?;
-                            if let Some(inj) = injector {
-                                if let Some(r) = inj.after_double(i, &hidden)? {
-                                    hidden = add(&hidden, &r)?;
-                                }
-                            }
-                        }
-                        Ok((encoder, hidden))
-                    },
-                    |(encoder, hidden)| {
-                        let (start, end) = active_joint_window.get();
-                        mlx_rs::transforms::eval([encoder, hidden]).map_err(|error| {
-                            mlx_gen::Error::Msg(format!(
-                                "flux1 block stream: joint window {start}..{end} eval: {error}"
-                            ))
-                        })?;
-                        source.verify_materialized_window()
-                    },
-                );
-                // `run_windowed` has already released the active view and cleared MLX's allocator
-                // cache on every success/error/cancel edge before this final integrity check.
-                source.verify_materialized_window()?;
-                (encoder, hidden) = result?;
+                self.joint_blocks_streamed(&stage, window, encoder, hidden)?
             }
-        }
+        };
 
         let txt_seq = encoder.shape()[1];
         let img_seq = hidden.shape()[1];
@@ -594,78 +481,220 @@ impl FluxTransformer {
         // out of the single-block loop alongside `img_idx` (F-017) instead of rebuilding it per
         // injected block.
         let txt_idx = Array::from_slice(&(0..txt_seq).collect::<Vec<i32>>(), &[txt_seq]);
-        let mut joint = concatenate_axis(&[&encoder, &hidden], 1)?;
+        let joint = concatenate_axis(&[&encoder, &hidden], 1)?;
         // The Shakker Union-Pro-2.0 checkpoint has 0 control SINGLE blocks, so there is no
         // single-stream control residual (diffusers `controlnet_single_block_samples = None`); the
-        // single-block injector seam below is the identity path, unchanged.
-        match window {
-            None => {
-                for (i, block) in self.single_blocks.iter().enumerate() {
-                    joint = block.forward(&joint, &text_embeddings, &rope, attention)?;
-                    if let Some(inj) = injector {
-                        if inj.injects_after_single(i) {
-                            let img = joint.take_axis(&img_idx, 1)?;
-                            if let Some(r) = inj.after_single(i, &img)? {
-                                let txt = joint.take_axis(&txt_idx, 1)?;
-                                joint = concatenate_axis(&[&txt, &add(&img, &r)?], 1)?;
-                            }
-                        }
-                    }
-                }
-            }
-            Some(window) => {
-                let source = self.block_stream.as_ref().ok_or_else(|| {
-                    mlx_gen::Error::Unsupported(
-                        "flux1: no verified snapshot-backed block stream".to_owned(),
-                    )
-                })?;
-                let active_single_window = Cell::new((0usize, 0usize));
-                let result = mlx_gen::block_residency::run_windowed(
-                    &window.single,
-                    window.cancel,
-                    joint,
-                    || source.open(),
-                    |mut joint, view, range| {
-                        let (start, end) = (range.start, range.end);
-                        active_single_window.set((start, end));
-                        for i in range {
-                            let block = source.materialize_single(view, i)?;
-                            joint = block
-                                .forward(&joint, &text_embeddings, &rope, attention)
-                                .map_err(|error| {
-                                    mlx_gen::Error::Msg(format!(
-                                        "flux1 block stream: single window {start}..{end} block {i} forward: {error}"
-                                    ))
-                                })?;
-                            if let Some(inj) = injector {
-                                if inj.injects_after_single(i) {
-                                    let img = joint.take_axis(&img_idx, 1)?;
-                                    if let Some(r) = inj.after_single(i, &img)? {
-                                        let txt = joint.take_axis(&txt_idx, 1)?;
-                                        joint = concatenate_axis(&[&txt, &add(&img, &r)?], 1)?;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(joint)
-                    },
-                    |joint: &Array| {
-                        let (start, end) = active_single_window.get();
-                        mlx_rs::transforms::eval([joint]).map_err(|error| {
-                            mlx_gen::Error::Msg(format!(
-                                "flux1 block stream: single window {start}..{end} eval: {error}"
-                            ))
-                        })?;
-                        source.verify_materialized_window()
-                    },
-                );
-                source.verify_materialized_window()?;
-                joint = result?;
-            }
-        }
+        // single-block injector seam is the identity path, unchanged.
+        let idx = (&img_idx, &txt_idx);
+        let joint = match window {
+            None => self.single_blocks_resident(&stage, joint, idx)?,
+            Some(window) => self.single_blocks_streamed(&stage, window, joint, idx)?,
+        };
         let hidden = joint.take_axis(&img_idx, 1)?;
         let hidden = self.norm_out.forward(&hidden, &text_embeddings)?;
         self.proj_out.forward(&hidden)
+    }
+
+    /// ControlNet residual injection interval (diffusers `FluxTransformer2DModel`):
+    /// `interval = ceil(num_double_blocks / num_control_residuals)`, and after base double block `i`
+    /// we add `controlnet_block_samples[i / interval]` (scaled). The Shakker Union-Pro-2.0 ships 6
+    /// control double blocks → interval `ceil(19/6) = 4`. An empty residual slice is treated as "no
+    /// control" (the `pub` entry guards against `len()-1` underflow). The few residuals are
+    /// pre-scaled once before the 19-block loop rather than per block.
+    fn scale_control(
+        &self,
+        control: Option<(&[Array], f32)>,
+    ) -> Result<Option<(Vec<Array>, usize)>> {
+        let control = control.filter(|(res, _)| !res.is_empty());
+        Ok(match control {
+            Some((res, scale)) => {
+                let s = scalar(scale);
+                let interval = control_residual_interval(self.blocks.len(), res.len());
+                Some((
+                    res.iter()
+                        .map(|r| Ok(multiply(r, &s)?))
+                        .collect::<Result<Vec<_>>>()?,
+                    interval,
+                ))
+            }
+            None => None,
+        })
+    }
+
+    /// The resident joint (double) blocks, with the per-block identity seam and the
+    /// Fun-Controlnet-Union residual (sc-8238).
+    fn joint_blocks_resident(
+        &self,
+        stage: &BlockStage<'_>,
+        mut encoder: Array,
+        mut hidden: Array,
+        scaled_control: Option<&(Vec<Array>, usize)>,
+    ) -> Result<(Array, Array)> {
+        if self.block_stream.is_some() && self.blocks.is_empty() {
+            return Err(mlx_gen::Error::Unsupported(
+                "flux1: a deferred transformer requires an explicit block window".to_owned(),
+            ));
+        }
+        for (i, block) in self.blocks.iter().enumerate() {
+            // The image-query (XLabs IP-Adapter) seam is consulted inside the block's attention;
+            // the post-block residual seam (PuLID) is consulted just below. With `injector = None`
+            // both are inert and this is byte-identical to the plain path.
+            let (e, h) = block.forward_with_ip(
+                &hidden,
+                &encoder,
+                stage.text_embeddings,
+                stage.rope,
+                stage.injector.map(|inj| (inj, i)),
+                stage.attention,
+            )?;
+            encoder = e;
+            hidden = inject_after_double(stage.injector, i, h)?;
+            // Fun-Controlnet-Union residual (sc-8238), added AFTER the identity injector so the two
+            // compose.
+            if let Some((res, interval)) = scaled_control {
+                let idx = (i / interval).min(res.len() - 1);
+                hidden = add(&hidden, &res[idx])?;
+            }
+        }
+        Ok((encoder, hidden))
+    }
+
+    /// The joint (double) blocks streamed from the verified snapshot one window at a time.
+    fn joint_blocks_streamed(
+        &self,
+        stage: &BlockStage<'_>,
+        window: crate::block_stream::FluxBlockWindow<'_>,
+        encoder: Array,
+        hidden: Array,
+    ) -> Result<(Array, Array)> {
+        if !self.blocks.is_empty() || !self.single_blocks.is_empty() {
+            return Err(mlx_gen::Error::Msg(
+                "flux1: deferred transformer retained resident blocks".to_owned(),
+            ));
+        }
+        let source = self.verified_block_stream()?;
+        if window.joint.n_blocks() != source.joint_blocks()
+            || window.single.n_blocks() != source.single_blocks()
+        {
+            return Err(mlx_gen::Error::Msg(
+                "flux1: joint/single block plan depth mismatch".to_owned(),
+            ));
+        }
+        let active_joint_window = Cell::new((0usize, 0usize));
+        let result = mlx_gen::block_residency::run_windowed(
+            &window.joint,
+            window.cancel,
+            (encoder, hidden),
+            || source.open(),
+            |(mut encoder, mut hidden), view, range| {
+                let (start, end) = (range.start, range.end);
+                active_joint_window.set((start, end));
+                for i in range {
+                    let block = source.materialize_joint(view, i)?;
+                    crate::block_stream::calibration_stream_fault(
+                        window.calibration_stream_fault,
+                        i,
+                    )?;
+                    (encoder, hidden) = block
+                        .forward_with_ip(
+                            &hidden,
+                            &encoder,
+                            stage.text_embeddings,
+                            stage.rope,
+                            stage.injector.map(|inj| (inj, i)),
+                            stage.attention,
+                        )
+                        .map_err(|error| {
+                            mlx_gen::Error::Msg(format!(
+                                "flux1 block stream: joint window {start}..{end} block {i} forward: {error}"
+                            ))
+                        })?;
+                    hidden = inject_after_double(stage.injector, i, hidden)?;
+                }
+                Ok((encoder, hidden))
+            },
+            |(encoder, hidden)| {
+                let (start, end) = active_joint_window.get();
+                mlx_rs::transforms::eval([encoder, hidden]).map_err(|error| {
+                    mlx_gen::Error::Msg(format!(
+                        "flux1 block stream: joint window {start}..{end} eval: {error}"
+                    ))
+                })?;
+                source.verify_materialized_window()
+            },
+        );
+        // `run_windowed` has already released the active view and cleared MLX's allocator cache on
+        // every success/error/cancel edge before this final integrity check.
+        source.verify_materialized_window()?;
+        result
+    }
+
+    /// The resident single-stream blocks over the joint `[txt, img]` sequence.
+    fn single_blocks_resident(
+        &self,
+        stage: &BlockStage<'_>,
+        mut joint: Array,
+        idx: (&Array, &Array),
+    ) -> Result<Array> {
+        for (i, block) in self.single_blocks.iter().enumerate() {
+            joint = block.forward(&joint, stage.text_embeddings, stage.rope, stage.attention)?;
+            joint = inject_after_single(stage.injector, i, joint, idx)?;
+        }
+        Ok(joint)
+    }
+
+    /// The single-stream blocks streamed from the verified snapshot one window at a time.
+    fn single_blocks_streamed(
+        &self,
+        stage: &BlockStage<'_>,
+        window: crate::block_stream::FluxBlockWindow<'_>,
+        joint: Array,
+        idx: (&Array, &Array),
+    ) -> Result<Array> {
+        let source = self.verified_block_stream()?;
+        let active_single_window = Cell::new((0usize, 0usize));
+        let result = mlx_gen::block_residency::run_windowed(
+            &window.single,
+            window.cancel,
+            joint,
+            || source.open(),
+            |mut joint, view, range| {
+                let (start, end) = (range.start, range.end);
+                active_single_window.set((start, end));
+                for i in range {
+                    let block = source.materialize_single(view, i)?;
+                    joint = block
+                        .forward(&joint, stage.text_embeddings, stage.rope, stage.attention)
+                        .map_err(|error| {
+                            mlx_gen::Error::Msg(format!(
+                                "flux1 block stream: single window {start}..{end} block {i} forward: {error}"
+                            ))
+                        })?;
+                    joint = inject_after_single(stage.injector, i, joint, idx)?;
+                }
+                Ok(joint)
+            },
+            |joint: &Array| {
+                let (start, end) = active_single_window.get();
+                mlx_rs::transforms::eval([joint]).map_err(|error| {
+                    mlx_gen::Error::Msg(format!(
+                        "flux1 block stream: single window {start}..{end} eval: {error}"
+                    ))
+                })?;
+                source.verify_materialized_window()
+            },
+        );
+        source.verify_materialized_window()?;
+        result
+    }
+
+    /// The snapshot-backed block stream a windowed forward reads, or the typed refusal.
+    fn verified_block_stream(&self) -> Result<&crate::block_stream::FluxBlockStream> {
+        self.block_stream.as_ref().ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "flux1: no verified snapshot-backed block stream".to_owned(),
+            )
+        })
     }
 
     /// Bisection helper (sc-2345 parity): capture the embedding-stage and first-joint-block
@@ -1606,6 +1635,48 @@ impl AdaptableHost for TimeTextEmbed {
         }
         out
     }
+}
+
+/// The per-forward inputs every joint / single block stage reads.
+struct BlockStage<'a> {
+    text_embeddings: &'a Array,
+    rope: &'a RopeTable,
+    injector: Option<&'a dyn DitImageInjector>,
+    attention: AttentionPlan<'a>,
+}
+
+/// The post-double-block residual seam (PuLID): `hidden + r` when the injector returns one.
+fn inject_after_double(
+    injector: Option<&dyn DitImageInjector>,
+    i: usize,
+    hidden: Array,
+) -> Result<Array> {
+    if let Some(inj) = injector {
+        if let Some(r) = inj.after_double(i, &hidden)? {
+            return Ok(add(&hidden, &r)?);
+        }
+    }
+    Ok(hidden)
+}
+
+/// The post-single-block residual seam: the image rows of the joint sequence plus the injector's
+/// residual, re-joined to the text rows.
+fn inject_after_single(
+    injector: Option<&dyn DitImageInjector>,
+    i: usize,
+    joint: Array,
+    (img_idx, txt_idx): (&Array, &Array),
+) -> Result<Array> {
+    if let Some(inj) = injector {
+        if inj.injects_after_single(i) {
+            let img = joint.take_axis(img_idx, 1)?;
+            if let Some(r) = inj.after_single(i, &img)? {
+                let txt = joint.take_axis(txt_idx, 1)?;
+                return Ok(concatenate_axis(&[&txt, &add(&img, &r)?], 1)?);
+            }
+        }
+    }
+    Ok(joint)
 }
 
 impl AdaptableHost for FluxTransformer {

@@ -50,28 +50,26 @@
 //! path consumes. Both reconstruct the residual at **bf16** to match the inference loader.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost};
 use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::train::checkpoint;
 use mlx_gen::train::dataset::{bucket_edges, center_crop_square, decode_image};
-use mlx_gen::train::lora::{
-    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
-    build_lora_targets, save_lokr, LoraParams, TrainAdapter,
-};
+use mlx_gen::train::lora::{save_lokr, LoraParams, TrainAdapter};
 pub use mlx_gen::train::lora::{LokrTarget, LoraTarget};
 use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::perceptual::{
     combine_step_loss, AuxDriver, Parameterization, PerceptualPath, StepPlan,
 };
-use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::train::taehv::TaehvConfig;
-use mlx_gen::train::trainer_loop::SAMPLE_PROMPT_CAP;
-use mlx_gen::train::vocab::{
-    clamp_unit_timestep, normalize_cfg, sample_unit_timestep, validate_common_request,
+use mlx_gen::train::trainer_loop::{
+    adapter_optimizer, adapter_stem, build_adapter, largest_edge, mae_loss, render_preview_prompts,
+    run_train_loop, CheckpointAt, LoopStart, LossTypeFold, PreviewLog, PreviewSink,
+    TrainLoopFamily, SAMPLE_PROMPT_CAP,
 };
+use mlx_gen::train::vocab::{clamp_unit_timestep, sample_unit_timestep, validate_common_request};
 use mlx_gen::{
     LoadSpec, Modality, NetworkType, Precision, Result, TrainOptimizer, Trainer, TrainerDescriptor,
     TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport, TrainingRequest,
@@ -227,12 +225,6 @@ fn assert_resume_surface_matches(restored: &LoraParams, expected: &LoraParams) -
 /// so a run that does not opt in (the default) behaves exactly as before.
 fn previews_enabled(cfg: &TrainingConfig, cancelled: bool) -> bool {
     cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() && !cancelled
-}
-
-/// Whether micro-step `step` (1-based) lands on the preview cadence. `sample_every == 0` never fires
-/// (also guarded upstream by [`previews_enabled`], but kept total here so the predicate is self-contained).
-fn preview_due(step: u32, sample_every: u32) -> bool {
-    sample_every > 0 && step.is_multiple_of(sample_every)
 }
 
 // ==================================================================================================
@@ -438,34 +430,13 @@ impl AnimaTrainer {
         // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
         // off). The memory pre-flight and previews size for the largest (epic 2123 E7).
         let edges = bucket_edges(cfg);
-        let preview_edge = edges.iter().copied().max().unwrap_or(0);
+        let preview_edge = largest_edge(&edges);
 
         // Anima's base is bf16 on disk (there is no dense-f32 cast path), so training runs bf16
         // mixed-precision: the frozen base + activation stream are bf16, and the trainable factors /
         // loss / grads / optimizer stay f32 (master-weights). This matches the inference dtype.
         let compute_dtype = Dtype::Bfloat16;
-
-        // sc-10576 — fail-fast pre-flight memory guard. The dense (non-block-checkpointed) first step
-        // materializes the whole DiT forward graph — at 1536² the retained per-block seq² self-attention
-        // (≈9216 image tokens) makes that working set exceed unified memory, and the OS hard-kills the
-        // worker with an UNCATCHABLE SIGKILL (the run just appears to hang at the last cached latent).
-        // We predict it and refuse up front with an actionable, catchable error — BEFORE the (minutes-
-        // long) latent caching — whenever gradient checkpointing is NOT enabled (LoRA checkpointing OR
-        // the LoKr/dense fallback). With whole-block checkpointing on, the first step fits, so skip it.
-        let will_checkpoint =
-            matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
-        // Epic 2123 E7 (sc-24830): the aux-loss models (TAEW2.1 + every enabled arm) count
-        // against the budget on BOTH paths — a checkpointed depth job must not skip admission.
-        let aux_gb = perceptual_footprint_gb(cfg, preview_edge, req.items.len() * edges.len());
-        if !will_checkpoint || aux_gb > 0.0 {
-            preflight_memory_guard(
-                cfg,
-                &edges,
-                compute_dtype == Dtype::Bfloat16,
-                aux_gb,
-                will_checkpoint,
-            )?;
-        }
+        preflight(req, &edges, preview_edge, compute_dtype)?;
 
         // Epic 2123 depth anchoring (sc-24830): load the frozen TAEW2.1 decoder +
         // Depth-Anything-V2 before the caching pass, so a missing checkpoint fails fast.
@@ -473,72 +444,15 @@ impl AnimaTrainer {
 
         // --- prepare → cache: VAE latents + (masked Qwen3 states, T5 ids) into memory ---
         on_progress(TrainingProgress::LoadingModel);
-        let total = req.items.len() as u32;
-        // (x0 latent, masked Qwen3 source_hidden, T5 query-token ids, and — subject-masked loss,
-        // sc-24828 — that bucket's latent loss-weight map, `None` when the technique is off),
-        // item-major: `cache[item * edges.len() + bucket]` (sc-2127). The conditioner inputs are
-        // encoded once per item and shared (refcounted) by every bucket entry.
-        let mut cache: Vec<(Array, Array, Array, Option<Array>)> =
-            Vec::with_capacity(req.items.len() * edges.len());
-        for (i, item) in req.items.iter().enumerate() {
-            if req.cancel.is_cancelled() {
-                break;
-            }
-            on_progress(TrainingProgress::Caching {
-                current: i as u32 + 1,
-                total,
-            });
-            let img = center_crop_square(&decode_image(&item.image_path)?);
-            // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
-            let mask = PreparedSubjectMask::load_if_enabled(
-                "anima trainer",
-                item,
-                cfg.subject_mask_loss.as_ref(),
-            )?;
-            let (source, t5_ids) = self.encode_conditioner_inputs(&item.caption)?;
-            eval([&source, &t5_ids])?;
-            for (x0, mask_weight) in encode_buckets(&edges, mask.as_ref(), |edge| {
-                let nchw = mlx_gen_qwen_image::preprocess_init_image(&img, edge, edge)?; // [1,3,edge,edge]
-                self.vae.encode(&nchw) // [1,16,1,edge/8,edge/8], normalized
-            })? {
-                cache.push((x0, source.clone(), t5_ids.clone(), mask_weight));
-            }
-        }
+        let cache = self.cache_dataset(req, &edges, on_progress)?;
         if cache.is_empty() {
             if req.cancel.is_cancelled() {
                 return Err(mlx_gen::Error::Canceled);
             }
             return Err("anima trainer: no usable dataset items".into());
         }
-
-        // sc-10641 — pre-encode the preview-sample prompts' conditioner INPUTS while the Qwen3 encoder
-        // is still resident (it is freed just below). We cache the conditioner INPUTS (masked Qwen3
-        // states + T5 ids), NOT its output: the conditioner (`llm_adapter`) is a trained target, so each
-        // preview must re-run it through the live graph to reflect its adapters (the sc-10522 trap — a
-        // cached conditioner output would render silently-inert conditioner adapters). For CFG variants
-        // (base/aesthetic) the empty-prompt uncond inputs are cached once too. Skipped when sampling is
-        // off (the default) or the run is already cancelled.
         let previews_on = previews_enabled(cfg, req.cancel.is_cancelled());
-        let sample_inputs: Vec<(String, Array, Array)> = if previews_on {
-            let mut v = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
-            for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
-                let (source, t5_ids) = self.encode_conditioner_inputs(prompt)?;
-                eval([&source, &t5_ids])?;
-                v.push((prompt.clone(), source, t5_ids));
-            }
-            v
-        } else {
-            Vec::new()
-        };
-        // Uncond (empty-prompt) conditioner inputs — cached once, only for CFG variants at guidance ≠ 1.
-        let uncond_inputs: Option<(Array, Array)> =
-            if !sample_inputs.is_empty() && self.variant.uses_cfg() {
-                let (s, ids) = self.encode_conditioner_inputs("")?;
-                eval([&s, &ids])?;
-                Some((s, ids))
-            } else {
-                None
-            };
+        let (sample_inputs, uncond_inputs) = self.encode_preview_inputs(cfg, previews_on)?;
 
         // Every caption is encoded into `cache`; the multi-GB Qwen3 encoder is now dead weight for
         // the rest of the run. Drop it and evict its buffers before the train loop.
@@ -563,107 +477,19 @@ impl AnimaTrainer {
 
         // --- adapter targets + trainable factors (LoRA or LoKr) + optimizer ---
         let target_paths = resolve_target_paths(&self.dit, &self.conditioner, cfg);
-        let rank = cfg.rank as f32;
-        let (adapter, mut params) = {
-            let mut host = AnimaAdapterHost {
+        let (adapter, params) = build_adapter(
+            &mut AnimaAdapterHost {
                 dit: &mut self.dit,
                 conditioner: &mut self.conditioner,
-            };
-            match cfg.network_type {
-                NetworkType::Lora => {
-                    let (targets, params) =
-                        build_lora_targets(&mut host, &target_paths, cfg.rank as i32, cfg.seed)?;
-                    (TrainAdapter::Lora { targets }, params)
-                }
-                NetworkType::Lokr => {
-                    let (targets, params) = build_lokr_targets(
-                        &mut host,
-                        &target_paths,
-                        cfg.rank as i32,
-                        cfg.decompose_factor,
-                        cfg.seed,
-                    )?;
-                    (TrainAdapter::Lokr { targets }, params)
-                }
-            }
-        };
-        let alpha = cfg.alpha;
-        let mae = {
-            let lt = normalize_cfg(&cfg.loss_type);
-            lt == "mae" || lt == "l1"
-        };
-
-        // sc-10576 — gradient checkpointing. Collect, per DiT block, the adapter-routable LOCAL paths
-        // trained on it (`self_attn.q_proj`, `adaln_modulation_mlp.2`, …); the 28-block DiT stack is
-        // where the first-step activation memory concentrates (its per-block seq² self-attention), so
-        // that is what we whole-block checkpoint. The 60 conditioner (`llm_adapter.*`) targets are NOT
-        // collected here — the conditioner runs UN-checkpointed inside the traced grad graph (only 512
-        // text tokens), so its factors train through ordinary autograd, and — critically — its gradient
-        // path stays live because the DiT checkpoints thread `encoder` as an explicit input (sc-10522).
-        let n_layers = self.dit.config().num_layers;
-        let block_local_targets = collect_dit_block_local_targets(&target_paths, n_layers);
-
-        // Gradient checkpointing is an OPT-IN option, never auto-forced — a run that would OOM is caught
-        // by the fail-fast pre-flight guard above (which recommends this flag) rather than silently
-        // changing the user's training dynamics. Only the LoRA path is whole-block checkpointed today;
-        // LoKr (a distinct Kronecker reconstruction) falls back to the dense path, exactly like z-image.
-        let is_lora = matches!(adapter, TrainAdapter::Lora { .. });
-        let use_checkpoint = is_lora && cfg.gradient_checkpointing;
-        let checkpoint_blocks: Option<&[Vec<String>]> = if use_checkpoint {
-            Some(&block_local_targets)
-        } else {
-            None
-        };
-        // SDPA-segment checkpointing: the conditioner is never whole-block checkpointed, so it keeps
-        // segment ckpt ON (bounds its retained attention). The DiT keeps segment ckpt ON only when
-        // whole-block checkpointing is OFF (the dense / LoKr path) — when whole-block is on, the block
-        // recompute already covers attention and nesting would recompute it twice for no memory win.
-        self.dit.set_sdpa_checkpoint(!use_checkpoint);
-        self.conditioner.set_sdpa_checkpoint(true);
-
-        // AdamW with wd=0 is identical to Adam, so the one optimizer covers both choices.
-        let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
-            0.0
-        } else {
-            cfg.weight_decay
-        };
-        let mut opt = TrainOptimizer::from_config(&cfg.optimizer, cfg.learning_rate, weight_decay)?;
-
-        let accum = cfg.gradient_accumulation.max(1);
-        let (total_updates, warmup_updates) =
-            schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
-        let stem = Path::new(&req.file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("adapter")
-            .to_string();
-
-        // sc-10642 — mid-run resume (the shared sc-9560 / F-125 engine). When `cfg.resume` is set and a
-        // prior interrupted run of THIS adapter left a snapshot in `output_dir`, restore its optimizer
-        // state + trainable factors + step/update index and continue from `start_step + 1` rather than
-        // step 0. The restored factors REPLACE the fresh `B = 0`/zeroed init built above; the fresh build
-        // still ran first so `params` carries the live model's full expected surface for the sc-10522
-        // guard. Snapshots land on optimizer-update boundaries at each `save_every`, so resume is
-        // bit-exact for `gradient_accumulation = 1` (the default) and when `save_every` is a multiple of
-        // the accumulation otherwise.
-        let mut update_idx: u32 = 0;
-        let mut start_step: u32 = 0;
-        if cfg.resume {
-            if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
-                let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut opt)?;
-                // sc-10522: the checkpoint MUST carry the full 448 DiT + 60 `llm_adapter` surface this
-                // run rebuilt, or the conditioner resumes inert. Assert against the live model's surface
-                // BEFORE swapping the factors in — a typed error, not a silent inert-conditioner resume.
-                assert_resume_surface_matches(&loaded, &params)?;
-                params = loaded;
-                start_step = meta.step;
-                update_idx = meta.update_idx;
-                eprintln!(
-                    "[sc-10642] anima resuming '{stem}' from step {start_step} (optimizer update \
-                     {update_idx})"
-                );
-            }
-        }
+            },
+            &target_paths,
+            cfg,
+        )?;
+        let block_local_targets =
+            collect_dit_block_local_targets(&target_paths, self.dit.config().num_layers);
+        let use_checkpoint = self.configure_checkpointing(&adapter, cfg);
+        let stem = adapter_stem(&req.file_name, "adapter");
+        let start = resume(req, &stem, adapter_optimizer(cfg)?, params)?;
 
         // --- train loop ---
         // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
@@ -673,212 +499,136 @@ impl AnimaTrainer {
         // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
         // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
         // replay.
-        let mut aux_driver = match perceptual {
+        let accum = cfg.gradient_accumulation.max(1);
+        let aux_driver = match perceptual {
             Some(path) => Some(aux_driver(path, &cache, &schedule, accum, &req.cancel)?),
             None => None,
         };
-        let mut accumulated: Option<LoraParams> = None;
-        let mut last_loss = 0.0f32;
-        let mut steps_run = start_step;
-        for step in start_step + 1..=cfg.steps {
+        let mut family = AnimaLoop {
+            dit: &mut self.dit,
+            conditioner: &mut self.conditioner,
+            vae: &self.vae,
+            variant: self.variant,
+            req,
+            adapter: &adapter,
+            target_paths: &target_paths,
+            cache: &cache,
+            schedule: &schedule,
+            aux_driver,
+            checkpoint_blocks: use_checkpoint.then_some(block_local_targets.as_slice()),
+            mae: mae_loss(&cfg.loss_type, LossTypeFold::Normalized),
+            compute_dtype,
+            previews_on,
+            sample_inputs: &sample_inputs,
+            uncond_inputs: uncond_inputs.as_ref(),
+            preview_edge,
+        };
+        run_train_loop(&mut family, req, &stem, start, on_progress, warnings)
+    }
+
+    /// Cache the dataset: per item, its VAE latent per bucket edge + its conditioner INPUTS (masked
+    /// Qwen3 states, T5 ids) and — subject-masked loss, sc-24828 — each bucket's latent loss-weight
+    /// map (`None` when the technique is off), item-major: `cache[item * edges.len() + bucket]`
+    /// (sc-2127). The conditioner inputs are encoded once per item and shared (refcounted) by every
+    /// bucket entry. Stops (leaving what is cached) at a cancel.
+    fn cache_dataset(
+        &self,
+        req: &TrainingRequest,
+        edges: &[u32],
+        on_progress: &mut dyn FnMut(TrainingProgress),
+    ) -> Result<Vec<CacheEntry>> {
+        let cfg = &req.config;
+        let total = req.items.len() as u32;
+        let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
+        for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let entry = step_cache_index(&schedule, step);
-            let (x0, source, t5_ids, mask_weight) = &cache[entry];
-            let mut sigma = sample_sigma(
-                &cfg.timestep_type,
-                &cfg.timestep_bias,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
+            on_progress(TrainingProgress::Caching {
+                current: i as u32 + 1,
+                total,
+            });
+            let img = center_crop_square(&decode_image(&item.image_path)?);
+            // sc-24828: the item's subject mask is read + checked once, resampled per bucket.
+            let mask = PreparedSubjectMask::load_if_enabled(
+                "anima trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
             )?;
-            let noise = random::normal::<f32>(
-                x0.shape(),
-                None,
-                None,
-                Some(&random::key(
-                    cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-                )?),
-            )?;
-            // Epic 2123 E8: plan the step's loss terms; an aux-only step trains at the (shifted) σ
-            // remapped into the loss window.
-            let planned = match aux_driver.as_mut() {
-                Some(d) => d.sample(step, &schedule).plan(sigma)?,
-                None => None,
+            let (source, t5_ids) = self.encode_conditioner_inputs(&item.caption)?;
+            eval([&source, &t5_ids])?;
+            for (x0, mask_weight) in encode_buckets(edges, mask.as_ref(), |edge| {
+                let nchw = mlx_gen_qwen_image::preprocess_init_image(&img, edge, edge)?; // [1,3,edge,edge]
+                self.vae.encode(&nchw) // [1,16,1,edge/8,edge/8], normalized
+            })? {
+                cache.push((x0, source.clone(), t5_ids.clone(), mask_weight));
+            }
+        }
+        Ok(cache)
+    }
+
+    /// sc-10641 — pre-encode the preview-sample prompts' conditioner INPUTS while the Qwen3
+    /// encoder is still resident (it is freed right after). We cache the conditioner INPUTS
+    /// (masked Qwen3 states + T5 ids), NOT its output: the conditioner (`llm_adapter`) is a trained
+    /// target, so each preview must re-run it through the live graph to reflect its adapters (the
+    /// sc-10522 trap — a cached conditioner output would render silently-inert conditioner
+    /// adapters). For CFG variants (base/aesthetic) the empty-prompt uncond inputs are cached once
+    /// too. Empty when sampling is off (the default) or the run is already cancelled.
+    #[allow(clippy::type_complexity)]
+    fn encode_preview_inputs(
+        &self,
+        cfg: &TrainingConfig,
+        previews_on: bool,
+    ) -> Result<(Vec<(String, Array, Array)>, Option<(Array, Array)>)> {
+        let sample_inputs: Vec<(String, Array, Array)> = if previews_on {
+            let mut v = Vec::with_capacity(cfg.sample_prompts.len().min(SAMPLE_PROMPT_CAP));
+            for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
+                let (source, t5_ids) = self.encode_conditioner_inputs(prompt)?;
+                eval([&source, &t5_ids])?;
+                v.push((prompt.clone(), source, t5_ids));
+            }
+            v
+        } else {
+            Vec::new()
+        };
+        // Uncond (empty-prompt) conditioner inputs — cached once, only for CFG variants at guidance ≠ 1.
+        let uncond_inputs: Option<(Array, Array)> =
+            if !sample_inputs.is_empty() && self.variant.uses_cfg() {
+                let (s, ids) = self.encode_conditioner_inputs("")?;
+                eval([&s, &ids])?;
+                Some((s, ids))
+            } else {
+                None
             };
-            if let Some(p) = &planned {
-                sigma = p.plan.noise_level;
-            }
-            let aux = planned.as_ref().map(|p| AuxStep {
-                path: p.path,
-                plan: &p.plan,
-                image: p.entry,
-            });
-            let (losses, grads) = compute_step_loss_grads(
-                &mut self.dit,
-                &mut self.conditioner,
-                &params,
-                &adapter,
-                alpha,
-                rank,
-                x0,
-                source,
-                t5_ids,
-                sigma,
-                &noise,
-                mae,
-                mask_weight.as_ref(),
-                checkpoint_blocks,
-                compute_dtype,
-                aux,
-            )?;
-            last_loss = losses.total;
-            steps_run = step;
-            accumulate_grads(&mut accumulated, grads)?;
+        Ok((sample_inputs, uncond_inputs))
+    }
 
-            if step % accum == 0 || step == cfg.steps {
-                let mult =
-                    lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
-                opt.set_lr_scaled(mult);
-                // The final update can fire with fewer than `accum` grads; divide by the actual
-                // in-window count so a short tail step isn't down-scaled.
-                let window = if step % accum == 0 {
-                    accum
-                } else {
-                    step % accum
-                };
-                let avg = average_grads(
-                    accumulated
-                        .take()
-                        .expect("an update fires only after accumulation"),
-                    window,
-                )?;
-                // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
-                adapter_optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx, cfg.seed)?;
-                update_idx += 1;
-            }
-
-            on_progress(TrainingProgress::Training {
-                step,
-                total: cfg.steps,
-                loss: last_loss,
-            });
-
-            if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
-                std::fs::create_dir_all(&req.output_dir)?;
-                let ckpt = req
-                    .output_dir
-                    .join(intermediate_filename(&req.file_name, step));
-                save_adapter(&adapter, &params, &target_paths, alpha, rank, cfg, &ckpt)?;
-                // sc-10642 — alongside the user-facing adapter checkpoint, write the resume bundle
-                // (optimizer state + raw trainable factors + `{step, update_idx, optimizer}`), so an
-                // interrupted run can continue from here with `cfg.resume` rather than restarting at 0.
-                checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
-                on_progress(TrainingProgress::Checkpoint { step });
-            }
-
-            // sc-10641 — periodic preview samples from the in-progress adapter so the user can watch the
-            // LoRA converge (the sc-5637 `TrainingProgress::Sample` contract). Install the CURRENT factors
-            // as concrete adapters for the forward-only render (the traced `loss_fn` re-installs them at
-            // the next step, so no teardown is needed), then render each cached sample prompt. The render
-            // re-runs the conditioner through the LIVE graph (`render_preview` → `conditioner.forward`),
-            // so the preview reflects the 60 `llm_adapter` conditioner adapters' training — never a cached
-            // output (sc-10522). Best-effort: a render failure logs and continues the (long) run.
-            if previews_on && preview_due(step, cfg.sample_every) {
-                let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
-                {
-                    let mut host = AnimaAdapterHost {
-                        dit: &mut self.dit,
-                        conditioner: &mut self.conditioner,
-                    };
-                    adapter.install_as(&mut host, &params, alpha, rank, lora_dtype, LOKR_DTYPE)?;
-                }
-                let guidance = if self.variant.uses_cfg() {
-                    cfg.sample_guidance_scale
-                } else {
-                    1.0 // turbo is the merged CFG-free student — a single forward, guidance inert.
-                };
-                let total = sample_inputs.len() as u32;
-                for (i, (prompt, source, t5_ids)) in sample_inputs.iter().enumerate() {
-                    if req.cancel.is_cancelled() {
-                        break;
-                    }
-                    let sample_seed = cfg
-                        .seed
-                        .wrapping_add(step as u64)
-                        .wrapping_mul(0xA24B_AED4_4AC9_5F2D)
-                        .wrapping_add(i as u64);
-                    match render_preview(
-                        &self.dit,
-                        &self.conditioner,
-                        &self.vae,
-                        source,
-                        t5_ids,
-                        uncond_inputs.as_ref(),
-                        cfg.sample_steps.max(1) as usize,
-                        guidance,
-                        preview_edge,
-                        sample_seed,
-                        compute_dtype,
-                        &req.cancel,
-                    ) {
-                        Ok(image) => on_progress(TrainingProgress::Sample {
-                            step,
-                            index: i as u32 + 1,
-                            total,
-                            prompt: prompt.clone(),
-                            image,
-                        }),
-                        // F-117: a cancelled preview denoise exits the preview loop (the outer loop's
-                        // cancel check then unwinds the run); other failures skip one preview.
-                        Err(mlx_gen::Error::Canceled) => break,
-                        Err(e) => {
-                            eprintln!(
-                                "[sc-10641] anima preview sample failed at step {step} (prompt \
-                                 {}): {e} — skipping this preview, training continues",
-                                i + 1
-                            );
-                            warnings.push(gen_core::train::preview_sample_failed(
-                                step,
-                                i as u32 + 1,
-                                &e,
-                            ));
-                        }
-                    }
-                }
-                // sc-5567 — release the preview's transient forward+VAE-decode residency before
-                // training resumes. MLX pools freed buffers, so a full `sample_steps` denoise plus
-                // VAE decode on the 2B DiT can push peak residency above the train steady state and
-                // SIGKILL a tightly-budgeted run (sc-10576 memory focus). Preview path only — the
-                // training-step working set is untouched.
-                mlx_rs::memory::clear_cache();
-            }
-        }
-
-        // Cancelled before completing a single step: the factors are still the no-op init (LoRA
-        // `B = 0` / LoKr zeroed `w1`). Surface the cancellation as the typed `Error::Canceled` rather
-        // than writing a valid-looking identity adapter and returning `Ok`.
-        if steps_run == 0 {
-            return Err(mlx_gen::Error::Canceled);
-        }
-
-        // --- save final adapter ---
-        on_progress(TrainingProgress::Saving);
-        std::fs::create_dir_all(&req.output_dir)?;
-        let adapter_path = req.output_dir.join(&req.file_name);
-        save_adapter(
-            &adapter,
-            &params,
-            &target_paths,
-            alpha,
-            rank,
-            cfg,
-            &adapter_path,
-        )?;
-        Ok(TrainingOutput {
-            adapter_path,
-            steps: steps_run,
-            final_loss: last_loss,
-        })
+    /// sc-10576 — gradient checkpointing. Returns whether the DiT stack is whole-block
+    /// checkpointed, and sets each sub-model's SDPA-segment checkpointing to match.
+    ///
+    /// The 28-block DiT stack is where the first-step activation memory concentrates (its
+    /// per-block seq² self-attention), so that is what is whole-block checkpointed. The 60
+    /// conditioner (`llm_adapter.*`) targets are NOT — the conditioner runs UN-checkpointed inside
+    /// the traced grad graph (only 512 text tokens), so its factors train through ordinary
+    /// autograd, and — critically — its gradient path stays live because the DiT checkpoints
+    /// thread `encoder` as an explicit input (sc-10522).
+    ///
+    /// Gradient checkpointing is an OPT-IN option, never auto-forced — a run that would OOM is
+    /// caught by the fail-fast pre-flight guard (which recommends this flag) rather than silently
+    /// changing the user's training dynamics. Only the LoRA path is whole-block checkpointed today;
+    /// LoKr (a distinct Kronecker reconstruction) falls back to the dense path, exactly like
+    /// z-image.
+    fn configure_checkpointing(&mut self, adapter: &TrainAdapter, cfg: &TrainingConfig) -> bool {
+        let is_lora = matches!(adapter, TrainAdapter::Lora { .. });
+        let use_checkpoint = is_lora && cfg.gradient_checkpointing;
+        // SDPA-segment checkpointing: the conditioner is never whole-block checkpointed, so it keeps
+        // segment ckpt ON (bounds its retained attention). The DiT keeps segment ckpt ON only when
+        // whole-block checkpointing is OFF (the dense / LoKr path) — when whole-block is on, the
+        // block recompute already covers attention and nesting would recompute it twice for no
+        // memory win.
+        self.dit.set_sdpa_checkpoint(!use_checkpoint);
+        self.conditioner.set_sdpa_checkpoint(true);
+        use_checkpoint
     }
 
     /// Encode a caption to the conditioner's **inputs**: the mask-multiplied Qwen3 `last_hidden_state`
@@ -898,6 +648,278 @@ impl AnimaTrainer {
         let source = multiply(&source, &mask)?;
         let t5_ids = self.tokenizers.encode_t5(caption)?; // [1, St]
         Ok((source, t5_ids))
+    }
+}
+
+/// One cached `(item, bucket)` entry: the clean latent, the conditioner inputs (masked Qwen3
+/// `source_hidden`, T5 query-token ids) and the subject-mask loss weight (sc-24828).
+type CacheEntry = (Array, Array, Array, Option<Array>);
+
+/// sc-10576 — fail-fast pre-flight memory guard. The dense (non-block-checkpointed) first step
+/// materializes the whole DiT forward graph — at 1536² the retained per-block seq² self-attention
+/// (≈9216 image tokens) makes that working set exceed unified memory, and the OS hard-kills the
+/// worker with an UNCATCHABLE SIGKILL (the run just appears to hang at the last cached latent). We
+/// predict it and refuse up front with an actionable, catchable error — BEFORE the (minutes-long)
+/// latent caching — whenever gradient checkpointing is NOT enabled (LoRA checkpointing OR the
+/// LoKr/dense fallback). With whole-block checkpointing on, the first step fits, so skip it.
+fn preflight(
+    req: &TrainingRequest,
+    edges: &[u32],
+    preview_edge: u32,
+    compute_dtype: Dtype,
+) -> Result<()> {
+    let cfg = &req.config;
+    let will_checkpoint =
+        matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
+    // Epic 2123 E7 (sc-24830): the aux-loss models (TAEW2.1 + every enabled arm) count
+    // against the budget on BOTH paths — a checkpointed depth job must not skip admission.
+    let aux_gb = perceptual_footprint_gb(cfg, preview_edge, req.items.len() * edges.len());
+    if !will_checkpoint || aux_gb > 0.0 {
+        preflight_memory_guard(
+            cfg,
+            edges,
+            compute_dtype == Dtype::Bfloat16,
+            aux_gb,
+            will_checkpoint,
+        )?;
+    }
+    Ok(())
+}
+
+/// sc-10642 — mid-run resume (the shared sc-9560 / F-125 engine). When `cfg.resume` is set and a
+/// prior interrupted run of THIS adapter left a snapshot in `output_dir`, restore its optimizer
+/// state + trainable factors + step/update index and continue from `start_step + 1` rather than
+/// step 0. The restored factors REPLACE the fresh `B = 0`/zeroed init; the fresh build still ran
+/// first so `params` carries the live model's full expected surface for the sc-10522 guard.
+/// Snapshots land on optimizer-update boundaries at each `save_every`, so resume is bit-exact for
+/// `gradient_accumulation = 1` (the default) and when `save_every` is a multiple of the
+/// accumulation otherwise.
+fn resume(
+    req: &TrainingRequest,
+    stem: &str,
+    opt: TrainOptimizer,
+    params: LoraParams,
+) -> Result<LoopStart> {
+    let mut start = LoopStart::fresh(opt, params);
+    if req.config.resume {
+        if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, stem) {
+            let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut start.opt)?;
+            // sc-10522: the checkpoint MUST carry the full 448 DiT + 60 `llm_adapter` surface this
+            // run rebuilt, or the conditioner resumes inert. Assert against the live model's
+            // surface BEFORE swapping the factors in — a typed error, not a silent inert-conditioner
+            // resume.
+            assert_resume_surface_matches(&loaded, &start.params)?;
+            start.params = loaded;
+            start.start_step = meta.step;
+            start.update_idx = meta.update_idx;
+            eprintln!(
+                "[sc-10642] anima resuming '{stem}' from step {} (optimizer update {})",
+                start.start_step, start.update_idx
+            );
+        }
+    }
+    Ok(start)
+}
+
+/// The Anima family's side of the shared trainer loop ([`run_train_loop`]): its micro-step
+/// (shift-warped σ draw, perceptual plan, the two-host loss + grads), its checkpoint/final save,
+/// and its live-graph preview renders.
+struct AnimaLoop<'a> {
+    dit: &'a mut CosmosDiT,
+    conditioner: &'a mut AnimaTextConditioner,
+    vae: &'a QwenVae,
+    variant: Variant,
+    req: &'a TrainingRequest,
+    adapter: &'a TrainAdapter,
+    target_paths: &'a [String],
+    cache: &'a [CacheEntry],
+    schedule: &'a BucketSchedule,
+    aux_driver: Option<AuxDriver>,
+    checkpoint_blocks: Option<&'a [Vec<String>]>,
+    mae: bool,
+    compute_dtype: Dtype,
+    previews_on: bool,
+    sample_inputs: &'a [(String, Array, Array)],
+    uncond_inputs: Option<&'a (Array, Array)>,
+    preview_edge: u32,
+}
+
+fn preview_prompt(input: &(String, Array, Array)) -> &str {
+    &input.0
+}
+
+impl TrainLoopFamily for AnimaLoop<'_> {
+    fn micro_step(&mut self, step: u32, params: &LoraParams) -> Result<(f32, LoraParams)> {
+        let cfg = &self.req.config;
+        let entry = step_cache_index(self.schedule, step);
+        let (x0, source, t5_ids, mask_weight) = &self.cache[entry];
+        let mut sigma = sample_sigma(
+            &cfg.timestep_type,
+            &cfg.timestep_bias,
+            cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
+        )?;
+        let noise = random::normal::<f32>(
+            x0.shape(),
+            None,
+            None,
+            Some(&random::key(
+                cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
+            )?),
+        )?;
+        // Epic 2123 E8: plan the step's loss terms; an aux-only step trains at the (shifted) σ
+        // remapped into the loss window.
+        let planned = match self.aux_driver.as_mut() {
+            Some(d) => d.sample(step, self.schedule).plan(sigma)?,
+            None => None,
+        };
+        if let Some(p) = &planned {
+            sigma = p.plan.noise_level;
+        }
+        let aux = planned.as_ref().map(|p| AuxStep {
+            path: p.path,
+            plan: &p.plan,
+            image: p.entry,
+        });
+        let (losses, grads) = compute_step_loss_grads(
+            self.dit,
+            self.conditioner,
+            params,
+            self.adapter,
+            cfg.alpha,
+            cfg.rank as f32,
+            x0,
+            source,
+            t5_ids,
+            sigma,
+            &noise,
+            self.mae,
+            mask_weight.as_ref(),
+            self.checkpoint_blocks,
+            self.compute_dtype,
+            aux,
+        )?;
+        Ok((losses.total, grads))
+    }
+
+    fn save_checkpoint(&mut self, at: CheckpointAt<'_>) -> Result<()> {
+        let cfg = &self.req.config;
+        std::fs::create_dir_all(at.output_dir)?;
+        let ckpt = at
+            .output_dir
+            .join(intermediate_filename(&self.req.file_name, at.step));
+        save_adapter(
+            self.adapter,
+            at.params,
+            self.target_paths,
+            cfg.alpha,
+            cfg.rank as f32,
+            cfg,
+            &ckpt,
+        )?;
+        // sc-10642 — alongside the user-facing adapter checkpoint, write the resume bundle
+        // (optimizer state + raw trainable factors + `{step, update_idx, optimizer}`), so an
+        // interrupted run can continue from here with `cfg.resume` rather than restarting at 0.
+        checkpoint::save_resume(
+            at.output_dir,
+            at.stem,
+            at.step,
+            at.update_idx,
+            at.opt,
+            at.params,
+        )
+    }
+
+    fn previews_enabled(&self) -> bool {
+        self.previews_on
+    }
+
+    /// sc-10641 — periodic preview samples from the in-progress adapter so the user can watch the
+    /// LoRA converge (the sc-5637 `TrainingProgress::Sample` contract). Install the CURRENT factors
+    /// as concrete adapters for the forward-only render (the traced `loss_fn` re-installs them at
+    /// the next step, so no teardown is needed), then render each cached sample prompt. The render
+    /// re-runs the conditioner through the LIVE graph (`render_preview` → `conditioner.forward`),
+    /// so the preview reflects the 60 `llm_adapter` conditioner adapters' training — never a
+    /// cached output (sc-10522). Best-effort: a render failure logs and continues the (long) run;
+    /// a cancelled preview denoise exits the preview walk (F-117).
+    fn render_previews(
+        &mut self,
+        step: u32,
+        params: &LoraParams,
+        sink: &mut PreviewSink<'_>,
+    ) -> Result<()> {
+        let cfg = &self.req.config;
+        let lora_dtype = (self.compute_dtype != Dtype::Float32).then_some(self.compute_dtype);
+        self.adapter.install_as(
+            &mut AnimaAdapterHost {
+                dit: &mut *self.dit,
+                conditioner: &mut *self.conditioner,
+            },
+            params,
+            cfg.alpha,
+            cfg.rank as f32,
+            lora_dtype,
+            LOKR_DTYPE,
+        )?;
+        let guidance = if self.variant.uses_cfg() {
+            cfg.sample_guidance_scale
+        } else {
+            1.0 // turbo is the merged CFG-free student — a single forward, guidance inert.
+        };
+        let (dit, conditioner) = (&*self.dit, &*self.conditioner);
+        render_preview_prompts(
+            sink,
+            step,
+            cfg.seed,
+            &self.req.cancel,
+            self.sample_inputs,
+            preview_prompt,
+            &PreviewLog {
+                tag: "[sc-10641]",
+                trainer: "anima",
+                what: "preview sample",
+                canceled_stops: true,
+                report_failures: true,
+            },
+            |(_, source, t5_ids), sample_seed| {
+                render_preview(
+                    dit,
+                    conditioner,
+                    self.vae,
+                    source,
+                    t5_ids,
+                    self.uncond_inputs,
+                    cfg.sample_steps.max(1) as usize,
+                    guidance,
+                    self.preview_edge,
+                    sample_seed,
+                    self.compute_dtype,
+                    &self.req.cancel,
+                )
+            },
+        );
+        // sc-5567 — release the preview's transient forward+VAE-decode residency before training
+        // resumes. MLX pools freed buffers, so a full `sample_steps` denoise plus VAE decode on the
+        // 2B DiT can push peak residency above the train steady state and SIGKILL a
+        // tightly-budgeted run (sc-10576 memory focus). Preview path only — the training-step
+        // working set is untouched.
+        mlx_rs::memory::clear_cache();
+        Ok(())
+    }
+
+    fn save_final(&mut self, params: &LoraParams) -> Result<PathBuf> {
+        let cfg = &self.req.config;
+        std::fs::create_dir_all(&self.req.output_dir)?;
+        let adapter_path = self.req.output_dir.join(&self.req.file_name);
+        save_adapter(
+            self.adapter,
+            params,
+            self.target_paths,
+            cfg.alpha,
+            cfg.rank as f32,
+            cfg,
+            &adapter_path,
+        )?;
+        Ok(adapter_path)
     }
 }
 
@@ -1426,6 +1448,7 @@ fn encode_buckets(
 mod tests {
     use super::*;
     use mlx_gen::testing::max_abs_diff;
+    use mlx_gen::train::lora::build_lora_targets;
     use mlx_gen::{TrainingItem, TrainingRequest};
     use std::path::PathBuf;
 
@@ -2341,15 +2364,6 @@ mod tests {
         );
         // The default config never opts in.
         assert!(!previews_enabled(&TrainingConfig::default(), false));
-
-        // Fires on multiples of the cadence, nowhere else.
-        let due: Vec<u32> = (1..=12).filter(|&s| preview_due(s, 5)).collect();
-        assert_eq!(due, vec![5, 10]);
-        assert!(!preview_due(1, 5) && !preview_due(7, 5) && !preview_due(11, 5));
-        assert!(
-            (1..=10).all(|s| !preview_due(s, 0)),
-            "cadence 0 never fires"
-        );
     }
 
     /// sc-10641 live-graph guard (the critical correctness point). The preview MUST re-run the
@@ -2854,6 +2868,7 @@ mod preflight_tests {
 mod depth_anchoring_tests {
     use super::*;
     use crate::config::{ConditionerConfig, DitConfig};
+    use mlx_gen::train::lora::build_lora_targets;
     use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule};
     use mlx_gen::train::taehv::{synthetic_taehv_weights, TaehvDecoder};
     use mlx_gen_depth::anchor::{synthetic_weights, tiny_config, DepthAnchorLoss};

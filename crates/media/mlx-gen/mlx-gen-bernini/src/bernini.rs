@@ -707,10 +707,52 @@ impl Bernini {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        let cfg = &self.config;
-        let task = req.video_mode.as_deref().unwrap_or("");
+        let full = self.resolve_full_request(req);
 
-        // --- Geometry + knobs ---
+        // --- Stage 1: planner (loaded → 3 streams + MAR loop → freed) ---
+        let planned = self.run_planner(req, &full, on_progress)?;
+
+        // --- Stage 2: T5 prompt encode + concat_with_zero_init for the 4 renderer streams ---
+        let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), self.config.text_len)?;
+        let (t5_pos, t5_neg) = self.encode_t5(&tokenizer, req, &full.neg)?;
+        // Residency discipline (sc-10840): the UMT5-XXL text encoder is now dropped (end of
+        // `encode_t5`) and `t5_pos`/`t5_neg` are materialized — flush its freed pages before the
+        // two ~28 GB expert loads, the same F-174/F-175 seam discipline applied at the planner drop.
+        // Byte-identical.
+        clear_cache();
+        // F-135: T5 pos/neg materialized above; honor a cancel before the two ~28 GB expert loads.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let renderer_streams =
+            renderer_streams(&t5_pos, &t5_neg, &planned.streams, planned.max_seq)?;
+
+        // --- Stage 3: load both experts, ViT-conditioned APG denoise ---
+        let key = random::key(full.seed)?;
+        let lat = latent_shape(
+            full.frames,
+            full.height,
+            full.width,
+            self.config.vae_z_dim,
+            PROVIDER_VAE_STRIDE,
+        )?;
+        let init_noise = random::normal::<f32>(&lat[..], None, None, Some(&key))?;
+        let latents = self.denoise_experts(
+            req,
+            &full,
+            &planned,
+            &renderer_streams,
+            &init_noise,
+            on_progress,
+        )?;
+
+        // --- Stage 4: z16 VAE decode → image / video ---
+        self.decode_full(req, &full, lat, &latents, on_progress)
+    }
+
+    /// The request's geometry, step count, seed, negative prompt and full-Bernini guidance mode.
+    fn resolve_full_request<'r>(&self, req: &'r GenerationRequest) -> FullRequest<'r> {
+        let cfg = &self.config;
         let frames = req
             .frames
             .map(|f| f as usize)
@@ -727,10 +769,6 @@ impl Bernini {
             (req.width, req.height),
             "bernini: off-grid request survived validate"
         );
-        let steps = req.steps.map(|s| s as usize).unwrap_or(FullDefaults::STEPS);
-        let seed = req.seed.unwrap_or(42);
-        let neg = req.negative_prompt.clone().unwrap_or_default();
-
         let has_video = req
             .conditioning
             .iter()
@@ -741,9 +779,27 @@ impl Bernini {
                 Conditioning::Reference { .. } | Conditioning::MultiReference { .. }
             )
         });
-        let mode = resolve_vit_mode(req.video_mode.as_deref(), has_video, has_image, out_video);
+        FullRequest {
+            task: req.video_mode.as_deref().unwrap_or(""),
+            frames,
+            out_video,
+            width,
+            height,
+            steps: req.steps.map(|s| s as usize).unwrap_or(FullDefaults::STEPS),
+            seed: req.seed.unwrap_or(42),
+            neg: req.negative_prompt.clone().unwrap_or_default(),
+            mode: resolve_vit_mode(req.video_mode.as_deref(), has_video, has_image, out_video),
+        }
+    }
 
-        // --- Stage 1: planner (loaded → 3 streams + MAR loop → freed) ---
+    /// Stage 1: load the planner, encode the source visuals, build the three planner streams, run
+    /// the MAR planning loop, then free the planner (and its pages) before the renderer.
+    fn run_planner(
+        &self,
+        req: &GenerationRequest,
+        full: &FullRequest<'_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<PlannerStage> {
         // F-135: sc-9093 threaded cancel into the MAR loop, both denoise loops, and VAE decode, but
         // the heavy non-loop stages between them (planner ~15 GB load, per-source ViT/VAE encodes, T5
         // encode, two sequential ~28 GB expert loads) checked nothing. Each disk load / `eval` below
@@ -754,7 +810,7 @@ impl Bernini {
         // The conditioning phase the memory contract declares (`memory_strategy.rs`:
         // `MemoryPhase::Conditioning`) opens HERE, at the planner load — not at the first
         // `Progress::Step`, which the MAR loop only reaches once the ~15 GB planner is resident
-        // (sc-22738). Everything up to and including the UMT5-XXL encode below belongs to it: this
+        // (sc-22738). Everything up to and including the UMT5-XXL encode belongs to it: this
         // engine has no single "text encoder" component, so the shared `LoadPhase::TextEncoder`
         // boundary marks the whole conditioning stage, exactly as `residency::run_two_phase` uses
         // it for the engines that do. Bernini cannot adopt that driver: it loads, uses and frees
@@ -766,81 +822,15 @@ impl Bernini {
             return Err(Error::Canceled);
         }
 
-        // Preprocess the conditioning: videos first, then images (the conversation / source_id order).
-        let mut videos: Vec<SourceVisual> = Vec::new();
-        let mut images: Vec<SourceVisual> = Vec::new();
-        let (videos_pix, images_pix) = collect_conditioning(req);
-        {
-            let vae_w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = ProviderVae::from_weights(&vae_w)?;
-            for (vi, clip) in videos_pix.iter().enumerate() {
-                let rgb: Vec<RgbImage> = clip.iter().map(to_rgb).collect::<Result<_>>()?;
-                let vit_frames = sample_vit_frames(&rgb);
-                let (vit_feat, vit_grid) = vit_encode_video(&planner, &vit_frames)?;
-                let key = random::key(seed.wrapping_add(0x51d_u64).wrapping_add(vi as u64))?;
-                let vae_latent = vae_encode_video(&vae, &rgb, cfg.vae_z_dim, &key)?;
-                let hw = (rgb[0].height() as i64, rgb[0].width() as i64);
-                videos.push(SourceVisual {
-                    vit_feat,
-                    vit_grid,
-                    vae_latent,
-                    hw,
-                });
-            }
-            for img in &images_pix {
-                let rgb = to_rgb(img)?;
-                let (vit_feat, vit_grid) = vit_encode_image(&planner, &rgb)?;
-                let vae_latent = vae_encode_image(&vae, &rgb)?;
-                images.push(SourceVisual {
-                    vit_feat,
-                    vit_grid,
-                    vae_latent,
-                    hw: (img.height as i64, img.width as i64),
-                });
-            }
-        }
-
+        let (videos, images) = self.encode_sources(&planner, req, full.seed)?;
         let gen_grid = gen_target_grid(
-            height as i64,
-            width as i64,
-            frames,
+            full.height as i64,
+            full.width as i64,
+            full.frames,
             req.fps.unwrap_or(FullDefaults::FPS),
         );
-
-        // Three streams: cond (full), imgcond (text, no input visuals), uncond (neg text, no visuals).
-        let (cond, n_query) = build_stream(
-            &planner,
-            task,
-            &req.prompt,
-            &images,
-            &videos,
-            gen_grid,
-            out_video,
-            height as i64,
-            width as i64,
-        )?;
-        let (imgcond, _) = build_stream(
-            &planner,
-            task,
-            &req.prompt,
-            &[],
-            &[],
-            gen_grid,
-            out_video,
-            height as i64,
-            width as i64,
-        )?;
-        let (uncond, _) = build_stream(
-            &planner,
-            task,
-            &neg,
-            &[],
-            &[],
-            gen_grid,
-            out_video,
-            height as i64,
-            width as i64,
-        )?;
+        let (cond, imgcond, uncond, n_query) =
+            planner_streams(&planner, req, full, &images, &videos, gen_grid)?;
 
         // MAR planning loop (seeded reveal order + per-step FM noise, injectable for parity).
         let vit_cfg = VitCfg {
@@ -854,60 +844,30 @@ impl Bernini {
         // `1..=planning_step`, the renderer denoise `planning_step+1..=total` — monotone, complete,
         // 1-based (the testkit progress contract).
         let planner_steps = vit_cfg.planning_step as u32;
-        let total = planner_steps + steps as u32;
-        if n_query > planner.knobs.num_mask_token {
-            return Err(Error::Msg(format!(
-                "bernini: gen-target needs {n_query} ViT tokens but the planner has only {} mask \
-                 tokens — lower the resolution/frames",
-                planner.knobs.num_mask_token
-            )));
-        }
-        let max_seq = planner.knobs.max_sequence_length.max(1);
-        let order = seeded_permutation(n_query, seed)?;
-        let step_noise = seeded_step_noise(
-            n_query,
-            vit_cfg.planning_step,
-            &order,
-            planner.knobs.clip_diff_in_channels,
-            seed,
-        )?;
-        let mut planner = planner;
-        let streams: SampledStreams = sample_vit_embed(
-            &planner.backbone,
-            &planner.connector,
-            &mut planner.clip_diff,
-            &cond,
-            &uncond,
-            &imgcond,
+        let total = planner_steps + full.steps as u32;
+        let (planner, max_seq, streams) = run_mar_planning(
+            planner,
+            [&cond, &uncond, &imgcond],
             &vit_cfg,
-            &order,
-            &step_noise,
-            &req.cancel,
+            n_query,
+            full.seed,
+            req,
             &mut |p| {
                 on_progress(Progress::Step {
                     current: p as u32,
                     total,
                 })
             },
-            &planner.mask_token,
         )?;
-        eval([
-            &streams.wtxt_wvit,
-            &streams.wtxt_wovit,
-            &streams.wotxt_wvit,
-            &streams.wotxt_wovit,
-        ])?;
-        // F-135: streams (and thus the per-source ViT/VAE encodes feeding them) are now materialized.
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
 
         // VAE-encoded source latents carry into the renderer; free the planner before the renderer.
         let bf16 = |a: &Array| a.as_dtype(Dtype::Bfloat16);
-        let s_wtxt_wvit = bf16(&streams.wtxt_wvit)?;
-        let s_wtxt_wovit = bf16(&streams.wtxt_wovit)?;
-        let s_wotxt_wvit = bf16(&streams.wotxt_wvit)?;
-        let s_wotxt_wovit = bf16(&streams.wotxt_wovit)?;
+        let renderer_inputs = [
+            bf16(&streams.wtxt_wvit)?,
+            bf16(&streams.wtxt_wovit)?,
+            bf16(&streams.wotxt_wvit)?,
+            bf16(&streams.wotxt_wovit)?,
+        ];
         let src_videos: Vec<Array> = videos.iter().map(|s| s.vae_latent.clone()).collect();
         let src_images: Vec<Array> = images.iter().map(|s| s.vae_latent.clone()).collect();
         drop(planner);
@@ -915,53 +875,97 @@ impl Bernini {
         // F-175): the planner (Qwen2.5-VL-7B ~15 GB bf16 / ~7.5 GB Q8 + vision/connector/clip_diff) is
         // already dropped above — return its freed unified-memory pages to the OS NOW, before the T5
         // encode and the two ~28 GB expert loads, so the freed encoder does not linger in MLX's buffer
-        // cache and inflate the resident set. The materialized `s_*` streams + `src_*` latents are live
+        // cache and inflate the resident set. The materialized streams + source latents are live
         // arrays, untouched by `clear_cache`, so this is byte-identical (a pure memory hint).
         clear_cache();
+        Ok(PlannerStage {
+            streams: renderer_inputs,
+            src_videos,
+            src_images,
+            max_seq,
+            planner_steps,
+            total,
+            _retained: (videos, images, [cond, imgcond, uncond], streams),
+        })
+    }
 
-        // --- Stage 2: T5 prompt encode + concat_with_zero_init for the 4 renderer streams ---
-        let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
-        let (t5_pos, t5_neg) = {
-            let w = Weights::from_file(self.root.join("t5_encoder.safetensors"))?;
-            let enc = Umt5Encoder::from_weights(&w, cfg)?;
-            // `encode` returns `[T, 4096]` (no batch); the planner streams are `[1, S, 4096]`, so add
-            // the batch axis for the `concat_with_zero_init` sequence-axis concat.
-            let pos = enc
-                .encode(&tokenizer, &req.prompt)?
-                .expand_dims(0)?
-                .as_dtype(Dtype::Bfloat16)?;
-            let neg = enc
-                .encode(&tokenizer, &neg)?
-                .expand_dims(0)?
-                .as_dtype(Dtype::Bfloat16)?;
-            eval([&pos, &neg])?;
-            (pos, neg)
-        };
-        // Residency discipline (sc-10840): the UMT5-XXL text encoder is now dropped (end of the block)
-        // and `t5_pos`/`t5_neg` are materialized — flush its freed pages before the two ~28 GB expert
-        // loads, the same F-174/F-175 seam discipline applied at the planner drop above. Byte-identical.
-        clear_cache();
-        // F-135: T5 pos/neg materialized above; honor a cancel before the two ~28 GB expert loads.
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled);
+    /// Preprocess the conditioning — videos first, then images (the conversation / source_id
+    /// order): each source's planner ViT features + grid and its z16 VAE latent.
+    fn encode_sources(
+        &self,
+        planner: &BerniniPlanner,
+        req: &GenerationRequest,
+        seed: u64,
+    ) -> Result<(Vec<SourceVisual>, Vec<SourceVisual>)> {
+        let mut videos: Vec<SourceVisual> = Vec::new();
+        let mut images: Vec<SourceVisual> = Vec::new();
+        let (videos_pix, images_pix) = collect_conditioning(req);
+        let vae_w = Weights::from_file(self.root.join("vae.safetensors"))?;
+        let vae = ProviderVae::from_weights(&vae_w)?;
+        for (vi, clip) in videos_pix.iter().enumerate() {
+            let rgb: Vec<RgbImage> = clip.iter().map(to_rgb).collect::<Result<_>>()?;
+            let vit_frames = sample_vit_frames(&rgb);
+            let (vit_feat, vit_grid) = vit_encode_video(planner, &vit_frames)?;
+            let key = random::key(seed.wrapping_add(0x51d_u64).wrapping_add(vi as u64))?;
+            let vae_latent = vae_encode_video(&vae, &rgb, self.config.vae_z_dim, &key)?;
+            let hw = (rgb[0].height() as i64, rgb[0].width() as i64);
+            videos.push(SourceVisual {
+                vit_feat,
+                vit_grid,
+                vae_latent,
+                hw,
+            });
         }
-        // wtxt streams prepend the positive T5; wotxt streams prepend the negative T5. The renderer's
-        // `embed_text` consumes a 2-D `[S, text_dim]` context (it pads/reshapes the batch axis itself),
-        // so drop the leading batch dim that `concat_with_zero_init` carries.
-        let drop0 = |a: Array| -> Result<Array> {
-            let s = a.shape().to_vec();
-            Ok(a.reshape(&[s[1], s[2]])?)
-        };
-        let pe_wtxt_wvit = drop0(concat_with_zero_init(&t5_pos, &s_wtxt_wvit, max_seq)?)?;
-        let pe_wtxt_wovit = drop0(concat_with_zero_init(&t5_pos, &s_wtxt_wovit, max_seq)?)?;
-        let pe_wotxt_wvit = drop0(concat_with_zero_init(&t5_neg, &s_wotxt_wvit, max_seq)?)?;
-        let pe_wotxt_wovit = drop0(concat_with_zero_init(&t5_neg, &s_wotxt_wovit, max_seq)?)?;
+        for img in &images_pix {
+            let rgb = to_rgb(img)?;
+            let (vit_feat, vit_grid) = vit_encode_image(planner, &rgb)?;
+            let vae_latent = vae_encode_image(&vae, &rgb)?;
+            images.push(SourceVisual {
+                vit_feat,
+                vit_grid,
+                vae_latent,
+                hw: (img.height as i64, img.width as i64),
+            });
+        }
+        Ok((videos, images))
+    }
 
-        // --- Stage 3: load both experts, ViT-conditioned APG denoise ---
-        let key = random::key(seed)?;
-        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, PROVIDER_VAE_STRIDE)?;
-        let init_noise = random::normal::<f32>(&lat[..], None, None, Some(&key))?;
+    /// Encode the positive and negative prompts through UMT5-XXL, materialized, with the encoder
+    /// dropped on return.
+    fn encode_t5(
+        &self,
+        tokenizer: &mlx_gen::tokenizer::TextTokenizer,
+        req: &GenerationRequest,
+        neg: &str,
+    ) -> Result<(Array, Array)> {
+        let w = Weights::from_file(self.root.join("t5_encoder.safetensors"))?;
+        let enc = Umt5Encoder::from_weights(&w, &self.config)?;
+        // `encode` returns `[T, 4096]` (no batch); the planner streams are `[1, S, 4096]`, so add
+        // the batch axis for the `concat_with_zero_init` sequence-axis concat.
+        let pos = enc
+            .encode(tokenizer, &req.prompt)?
+            .expand_dims(0)?
+            .as_dtype(Dtype::Bfloat16)?;
+        let neg = enc
+            .encode(tokenizer, neg)?
+            .expand_dims(0)?
+            .as_dtype(Dtype::Bfloat16)?;
+        eval([&pos, &neg])?;
+        Ok((pos, neg))
+    }
 
+    /// Stage 3: load each expert (rungs 3 + 4), build the ViT-conditioned experts and run the APG
+    /// denoise from `init_noise`. Both experts are dropped on return.
+    fn denoise_experts(
+        &self,
+        req: &GenerationRequest,
+        full: &FullRequest<'_>,
+        planned: &PlannerStage,
+        renderer_streams: &[Array; 4],
+        init_noise: &Array,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let cfg = &self.config;
         let base_g = VitGuidanceParams {
             omega_txt: req.guidance.unwrap_or(FullDefaults::OMEGA_TXT),
             omega_img: FullDefaults::OMEGA_IMG,
@@ -970,32 +974,8 @@ impl Bernini {
             eta: FullDefaults::ETA,
             norm_threshold: FullDefaults::NORM_THRESHOLD,
         };
+        let (trained_sources, video_srcs, image_srcs) = self.source_ids(req, planned);
 
-        // Source ids (videos first, then images — mirrors `PackedForward::build_combos`/packing_vae).
-        let (nv, ni) = (src_videos.len(), src_images.len());
-        // ADS2V is trained with its mandatory source-video/reference-video/first-image triplet;
-        // extra images interpolate over that three-source range. Keep this execution schedule in
-        // lockstep with the request receipt used for admission evidence.
-        let trained_sources = if req.video_mode.as_deref() == Some("ads2v") {
-            3.0
-        } else {
-            self.knobs.max_trained_src_id
-        };
-        let sids = assign_source_ids(nv + ni, trained_sources, self.knobs.interpolate_src_id);
-        let video_srcs: Vec<(Array, f64)> = src_videos
-            .iter()
-            .enumerate()
-            .map(|(k, v)| (v.clone(), sids[k]))
-            .collect();
-        let image_srcs: Vec<(Array, f64)> = src_images
-            .iter()
-            .enumerate()
-            .map(|(j, im)| (im.clone(), sids[nv + j]))
-            .collect();
-
-        // Load each expert and (if quantizing) quantize-then-free it before loading the next, so only
-        // one expert's bf16 transient is resident at a time (sc-5360 — `WanTransformer::quantize`
-        // eval-frees the bf16 dequant). Without quant this just loads both bf16.
         // ── Ladder rungs 3 + 4 (sc-15528) ────────────────────────────────────────────────────
         // Rung 4 is per-request: when a window is selected the expert's block stack is NEVER
         // materialized (`from_weights_deferred` holds zero blocks) and the stream rebuilds
@@ -1008,95 +988,149 @@ impl Bernini {
         let plan = window
             .map(|size| BlockPlan::new(cfg.num_layers, size))
             .transpose()?;
-        let load_expert = |name: &str| -> Result<(WanTransformer, Option<WanBlockStream>)> {
-            let path = self.root.join(name);
-            let w = Weights::from_file(&path)?;
-            if window.is_some() {
-                let dit = WanTransformer::from_weights_deferred(&w, cfg)?;
-                // No adapters can reach here (`supports_lora: false`), and the stream refuses an
-                // adapted load anyway -- Wan MERGES deltas at load, so a streamed block re-read from
-                // the snapshot would silently carry none of them.
-                let mut stream = WanBlockStream::new(WeightsSource::File(path), cfg.clone(), &[])?;
-                if let Some(q) = self.quant {
-                    // Replayed per materialized block so the streamed weights are byte-identical to
-                    // the resident ones. A pre-packed tier takes this through `cfg.quantization`
-                    // inside the block constructor instead, exactly as the resident path does.
-                    stream.set_quant_bits(q.bits());
-                }
-                stream.set_attention_budget(attn_budget);
-                Ok((dit, Some(stream)))
-            } else {
-                let mut dit = WanTransformer::from_weights(&w, cfg)?;
-                if let Some(q) = self.quant {
-                    dit.quantize(q.bits(), None)?;
-                }
-                dit.set_attention_budget(attn_budget);
-                Ok((dit, None))
-            }
-        };
         // The denoise phase (`MemoryPhase::Denoise`) opens at the expert loads, not at the first
         // renderer `Progress::Step` — which fires only once BOTH ~28 GB experts are resident
         // (sc-22738).
         on_progress(Progress::Loading(LoadPhase::Renderer));
-        let latents = {
-            let (low_dit, low_stream) = load_expert("low_noise_model.safetensors")?;
-            if req.cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let (high_dit, high_stream) = load_expert("high_noise_model.safetensors")?;
-            if req.cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let streams4 = [
-                &pe_wtxt_wvit,
-                &pe_wtxt_wovit,
-                &pe_wotxt_wvit,
-                &pe_wotxt_wovit,
-            ];
-            let low = BVitExpert::build(
-                Trunk::for_load(&low_dit, low_stream.as_ref(), plan.as_ref(), &req.cancel),
-                streams4,
-            )?;
-            let high = BVitExpert::build(
-                Trunk::for_load(&high_dit, high_stream.as_ref(), plan.as_ref(), &req.cancel),
-                streams4,
-            )?;
-            let pf = PackedForward::new(
-                cfg.dim / cfg.num_heads,
-                cfg.out_dim,
-                cfg.patch_size,
-                trained_sources,
-                self.knobs.interpolate_src_id,
-            );
-            let boundary = self.knobs.switch_dit_boundary * cfg.num_train_timesteps as f32;
-            // Renderer denoise steps continue the folded bar after the planner stage (1-based `i`
-            // from `denoise_bernini_wvitcfg`): `planning_step+1 ..= total`.
-            let mut on_step = |i: usize| {
-                on_progress(Progress::Step {
-                    current: planner_steps + i as u32,
-                    total,
-                })
-            };
-            denoise_bernini_wvitcfg(
-                &pf,
-                mode,
-                &low,
-                &high,
-                boundary,
-                cfg.num_train_timesteps,
-                steps,
-                FullDefaults::FLOW_SHIFT,
-                &init_noise,
-                &image_srcs,
-                &video_srcs,
-                &base_g,
-                FullDefaults::OMEGA_SCALE,
-                &req.cancel,
-                &mut on_step,
-            )?
+        let (low_dit, low_stream) =
+            self.load_expert("low_noise_model.safetensors", window.is_some(), attn_budget)?;
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let (high_dit, high_stream) = self.load_expert(
+            "high_noise_model.safetensors",
+            window.is_some(),
+            attn_budget,
+        )?;
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let streams4 = [
+            &renderer_streams[0],
+            &renderer_streams[1],
+            &renderer_streams[2],
+            &renderer_streams[3],
+        ];
+        let low = BVitExpert::build(
+            Trunk::for_load(&low_dit, low_stream.as_ref(), plan.as_ref(), &req.cancel),
+            streams4,
+        )?;
+        let high = BVitExpert::build(
+            Trunk::for_load(&high_dit, high_stream.as_ref(), plan.as_ref(), &req.cancel),
+            streams4,
+        )?;
+        let pf = PackedForward::new(
+            cfg.dim / cfg.num_heads,
+            cfg.out_dim,
+            cfg.patch_size,
+            trained_sources,
+            self.knobs.interpolate_src_id,
+        );
+        let boundary = self.knobs.switch_dit_boundary * cfg.num_train_timesteps as f32;
+        // Renderer denoise steps continue the folded bar after the planner stage (1-based `i`
+        // from `denoise_bernini_wvitcfg`): `planning_step+1 ..= total`.
+        let mut on_step = |i: usize| {
+            on_progress(Progress::Step {
+                current: planned.planner_steps + i as u32,
+                total: planned.total,
+            })
         };
+        denoise_bernini_wvitcfg(
+            &pf,
+            full.mode,
+            &low,
+            &high,
+            boundary,
+            cfg.num_train_timesteps,
+            full.steps,
+            FullDefaults::FLOW_SHIFT,
+            init_noise,
+            &image_srcs,
+            &video_srcs,
+            &base_g,
+            FullDefaults::OMEGA_SCALE,
+            &req.cancel,
+            &mut on_step,
+        )
+    }
 
-        // --- Stage 4: z16 VAE decode → image / video ---
+    /// Source ids (videos first, then images — mirrors `PackedForward::build_combos`/packing_vae).
+    /// ADS2V is trained with its mandatory source-video/reference-video/first-image triplet; extra
+    /// images interpolate over that three-source range. Keep this execution schedule in lockstep
+    /// with the request receipt used for admission evidence.
+    #[allow(clippy::type_complexity)]
+    fn source_ids(
+        &self,
+        req: &GenerationRequest,
+        planned: &PlannerStage,
+    ) -> (f64, Vec<(Array, f64)>, Vec<(Array, f64)>) {
+        let (nv, ni) = (planned.src_videos.len(), planned.src_images.len());
+        let trained_sources = if req.video_mode.as_deref() == Some("ads2v") {
+            3.0
+        } else {
+            self.knobs.max_trained_src_id
+        };
+        let sids = assign_source_ids(nv + ni, trained_sources, self.knobs.interpolate_src_id);
+        let video_srcs: Vec<(Array, f64)> = planned
+            .src_videos
+            .iter()
+            .enumerate()
+            .map(|(k, v)| (v.clone(), sids[k]))
+            .collect();
+        let image_srcs: Vec<(Array, f64)> = planned
+            .src_images
+            .iter()
+            .enumerate()
+            .map(|(j, im)| (im.clone(), sids[nv + j]))
+            .collect();
+        (trained_sources, video_srcs, image_srcs)
+    }
+
+    /// Load one expert and (if quantizing) quantize it before the next loads, so only one expert's
+    /// bf16 transient is resident at a time (sc-5360 — `WanTransformer::quantize` eval-frees the
+    /// bf16 dequant). Without quant this just loads bf16. A rung-4 request defers the block stack.
+    fn load_expert(
+        &self,
+        name: &str,
+        windowed: bool,
+        attn_budget: mlx_gen::attention::AttentionBudget,
+    ) -> Result<(WanTransformer, Option<WanBlockStream>)> {
+        let cfg = &self.config;
+        let path = self.root.join(name);
+        let w = Weights::from_file(&path)?;
+        if windowed {
+            let dit = WanTransformer::from_weights_deferred(&w, cfg)?;
+            // No adapters can reach here (`supports_lora: false`), and the stream refuses an
+            // adapted load anyway -- Wan MERGES deltas at load, so a streamed block re-read from
+            // the snapshot would silently carry none of them.
+            let mut stream = WanBlockStream::new(WeightsSource::File(path), cfg.clone(), &[])?;
+            if let Some(q) = self.quant {
+                // Replayed per materialized block so the streamed weights are byte-identical to
+                // the resident ones. A pre-packed tier takes this through `cfg.quantization`
+                // inside the block constructor instead, exactly as the resident path does.
+                stream.set_quant_bits(q.bits());
+            }
+            stream.set_attention_budget(attn_budget);
+            Ok((dit, Some(stream)))
+        } else {
+            let mut dit = WanTransformer::from_weights(&w, cfg)?;
+            if let Some(q) = self.quant {
+                dit.quantize(q.bits(), None)?;
+            }
+            dit.set_attention_budget(attn_budget);
+            Ok((dit, None))
+        }
+    }
+
+    /// Stage 4: the z16 VAE decode → one image, or a video.
+    fn decode_full(
+        &self,
+        req: &GenerationRequest,
+        full: &FullRequest<'_>,
+        lat: [i32; 4],
+        latents: &Array,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
         on_progress(Progress::Decoding);
         let (out_frames, out_height, out_width) = decoded_output_geometry(lat[1], lat[2], lat[3])?;
         // Ladder rung 2 (sc-15528): an explicit request geometry REPLACES the shipped `auto`
@@ -1111,11 +1145,11 @@ impl Bernini {
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = ProviderVae::from_weights(&w)?;
-            decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
+            decode_to_frames(&vae, latents, tiling.as_ref(), Some(&req.cancel))?
         };
         let images_out = frames_to_images(&frames_u8)?;
 
-        if frames == 1 {
+        if full.frames == 1 {
             let first = images_out
                 .into_iter()
                 .next()
@@ -1130,6 +1164,163 @@ impl Bernini {
             })
         }
     }
+}
+
+/// The full-Bernini request's resolved geometry and knobs (sc-27336).
+struct FullRequest<'r> {
+    task: &'r str,
+    frames: usize,
+    out_video: bool,
+    width: u32,
+    height: u32,
+    steps: usize,
+    seed: u64,
+    neg: String,
+    mode: VitMode,
+}
+
+/// What the planner stage hands the renderer: the four bf16 planner streams, the source latents,
+/// the planner's max sequence length and the folded progress bar's span. `_retained` keeps the
+/// planner-phase activations alive to the end of the request, exactly as the inline body held
+/// them (only the planner itself is freed before the renderer).
+struct PlannerStage {
+    streams: [Array; 4],
+    src_videos: Vec<Array>,
+    src_images: Vec<Array>,
+    max_seq: i32,
+    planner_steps: u32,
+    total: u32,
+    #[allow(clippy::type_complexity)]
+    _retained: (
+        Vec<SourceVisual>,
+        Vec<SourceVisual>,
+        [StreamState; 3],
+        SampledStreams,
+    ),
+}
+
+/// The three planner streams — cond (full), imgcond (text, no input visuals), uncond (negative
+/// text, no visuals) — and the gen target's ViT query count.
+fn planner_streams(
+    planner: &BerniniPlanner,
+    req: &GenerationRequest,
+    full: &FullRequest<'_>,
+    images: &[SourceVisual],
+    videos: &[SourceVisual],
+    gen_grid: [i32; 3],
+) -> Result<(StreamState, StreamState, StreamState, i32)> {
+    let (h, w) = (full.height as i64, full.width as i64);
+    let (cond, n_query) = build_stream(
+        planner,
+        full.task,
+        &req.prompt,
+        images,
+        videos,
+        gen_grid,
+        full.out_video,
+        h,
+        w,
+    )?;
+    let (imgcond, _) = build_stream(
+        planner,
+        full.task,
+        &req.prompt,
+        &[],
+        &[],
+        gen_grid,
+        full.out_video,
+        h,
+        w,
+    )?;
+    let (uncond, _) = build_stream(
+        planner,
+        full.task,
+        &full.neg,
+        &[],
+        &[],
+        gen_grid,
+        full.out_video,
+        h,
+        w,
+    )?;
+    Ok((cond, imgcond, uncond, n_query))
+}
+
+/// The MAR planning loop over `[cond, uncond, imgcond]`: the seeded reveal order and per-step FM
+/// noise, `sample_vit_embed`, then the materialized four sampled streams. Hands the planner back
+/// with its max sequence length.
+fn run_mar_planning(
+    mut planner: BerniniPlanner,
+    [cond, uncond, imgcond]: [&StreamState; 3],
+    vit_cfg: &VitCfg,
+    n_query: i32,
+    seed: u64,
+    req: &GenerationRequest,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<(BerniniPlanner, i32, SampledStreams)> {
+    if n_query > planner.knobs.num_mask_token {
+        return Err(Error::Msg(format!(
+            "bernini: gen-target needs {n_query} ViT tokens but the planner has only {} mask \
+             tokens — lower the resolution/frames",
+            planner.knobs.num_mask_token
+        )));
+    }
+    let max_seq = planner.knobs.max_sequence_length.max(1);
+    let order = seeded_permutation(n_query, seed)?;
+    let step_noise = seeded_step_noise(
+        n_query,
+        vit_cfg.planning_step,
+        &order,
+        planner.knobs.clip_diff_in_channels,
+        seed,
+    )?;
+    let streams: SampledStreams = sample_vit_embed(
+        &planner.backbone,
+        &planner.connector,
+        &mut planner.clip_diff,
+        cond,
+        uncond,
+        imgcond,
+        vit_cfg,
+        &order,
+        &step_noise,
+        &req.cancel,
+        on_step,
+        &planner.mask_token,
+    )?;
+    eval([
+        &streams.wtxt_wvit,
+        &streams.wtxt_wovit,
+        &streams.wotxt_wvit,
+        &streams.wotxt_wovit,
+    ])?;
+    // F-135: streams (and thus the per-source ViT/VAE encodes feeding them) are now materialized.
+    if req.cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    Ok((planner, max_seq, streams))
+}
+
+/// The four renderer streams: the wtxt streams prepend the positive T5, the wotxt streams the
+/// negative T5. The renderer's `embed_text` consumes a 2-D `[S, text_dim]` context (it
+/// pads/reshapes the batch axis itself), so the leading batch dim `concat_with_zero_init` carries
+/// is dropped.
+fn renderer_streams(
+    t5_pos: &Array,
+    t5_neg: &Array,
+    [s_wtxt_wvit, s_wtxt_wovit, s_wotxt_wvit, s_wotxt_wovit]: &[Array; 4],
+    max_seq: i32,
+) -> Result<[Array; 4]> {
+    let drop0 = |a: Array| -> Result<Array> {
+        let s = a.shape().to_vec();
+        Ok(a.reshape(&[s[1], s[2]])?)
+    };
+    Ok([
+        drop0(concat_with_zero_init(t5_pos, s_wtxt_wvit, max_seq)?)?,
+        drop0(concat_with_zero_init(t5_pos, s_wtxt_wovit, max_seq)?)?,
+        drop0(concat_with_zero_init(t5_neg, s_wotxt_wvit, max_seq)?)?,
+        drop0(concat_with_zero_init(t5_neg, s_wotxt_wovit, max_seq)?)?,
+    ])
 }
 
 /// Reject empty / non-`1+4k` conditioning video clips before the full pipeline dereferences

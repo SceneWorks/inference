@@ -2,7 +2,10 @@ use super::*;
 // sc-19502: the derived stage-1 step count the descriptor advertises.
 use crate::pipeline::NATIVE_STEPS;
 
-const MODEL_SRC: &str = include_str!("../model.rs");
+// The provider's source scans read the `model/` submodule that holds each route (sc-27342).
+const LOAD_SRC: &str = include_str!("load.rs");
+const GENERATE_SRC: &str = include_str!("generate.rs");
+const PROMPT_ENHANCE_SRC: &str = include_str!("prompt_enhance.rs");
 
 fn ltx25_request(prompt: &str) -> GenerationRequest {
     GenerationRequest {
@@ -32,12 +35,12 @@ fn weights_free_ltx25(variant: TransformerVariant) -> Ltx25 {
 
 #[test]
 fn ltx25_split_audio_pipeline_loads_the_vocoder_component() {
-    let start = MODEL_SRC.find("fn build_ltx25(").expect("LTX-2.5 builder");
-    let end = MODEL_SRC[start..]
+    let start = LOAD_SRC.find("fn build_ltx25(").expect("LTX-2.5 builder");
+    let end = LOAD_SRC[start..]
         .find("let spatial =")
         .map(|offset| start + offset)
         .expect("end of LTX-2.5 audio construction");
-    let wiring = &MODEL_SRC[start..end];
+    let wiring = &LOAD_SRC[start..end];
 
     assert!(wiring.contains("bundle.require(LtxComponent::AudioVae)"));
     assert!(wiring.contains("audio.with_file_name(\"vocoder.safetensors\")"));
@@ -88,13 +91,10 @@ fn ltx25_loaded_variant_narrows_steps_and_negative_conditioning() {
 /// argument or substituting a default variant makes the test fail.
 #[test]
 fn ltx25_provider_threads_dev_contexts_and_variant_to_dfr_and_iclora() {
-    let start = MODEL_SRC
+    let start = GENERATE_SRC
         .find("pub(crate) fn generate_av_from_embeddings(")
-        .expect("model.rs must define the ordinary A/V provider route");
-    let end = MODEL_SRC
-        .find("\nmlx_gen::register_generators!")
-        .expect("the provider route must precede registration");
-    let body = &MODEL_SRC[start..end];
+        .expect("model/generate.rs must define the ordinary A/V provider route");
+    let body = &GENERATE_SRC[start..];
     let dfr_start = body
         .find("&DfrComponents {")
         .expect("ordinary DFR provider route must build DfrComponents");
@@ -175,14 +175,14 @@ fn ltx25_seeded_t2v_and_i2v_enhanced_requests_equal_explicit_prompt_requests() {
 
 #[test]
 fn ltx25_production_enhancer_reaches_exact_gemma4_t2v_i2v_and_shared_decode_paths() {
-    let start = MODEL_SRC
+    let start = PROMPT_ENHANCE_SRC
         .find("fn maybe_enhance_gemma4(")
         .expect("2.5 enhancer production method");
-    let end = MODEL_SRC[start..]
+    let end = PROMPT_ENHANCE_SRC[start..]
         .find("\n}\n\n/// Prepare the actual Gemma-4 I2V prefill")
         .map(|offset| start + offset)
         .expect("enhancer method ends before I2V prefill helper");
-    let route = &MODEL_SRC[start..end];
+    let route = &PROMPT_ENHANCE_SRC[start..end];
     for required in [
         "ltx25_enhancer_turn(&req.prompt, reference.is_some())",
         "ltx25_i2v_enhancer_prefill(&model, &mm, prompt_ids, image)?",
@@ -197,14 +197,14 @@ fn ltx25_production_enhancer_reaches_exact_gemma4_t2v_i2v_and_shared_decode_path
     assert!(!route.contains("SampleParams::censored"));
     assert!(!route.contains("enhance::I2V_SYSTEM_PROMPT"));
 
-    let vision_start = MODEL_SRC
+    let vision_start = PROMPT_ENHANCE_SRC
         .find("fn ltx25_i2v_enhancer_prefill(")
         .expect("I2V enhancer prefill helper");
-    let vision_end = MODEL_SRC[vision_start..]
+    let vision_end = PROMPT_ENHANCE_SRC[vision_start..]
         .find("\n}\n\n/// Build the enhancer chat renderer")
         .map(|offset| vision_start + offset)
         .expect("vision helper ends before template helper");
-    let vision = &MODEL_SRC[vision_start..vision_end];
+    let vision = &PROMPT_ENHANCE_SRC[vision_start..vision_end];
     for required in [
         "resize_bicubic_u8(",
         "gemma4_mm::patchify(",

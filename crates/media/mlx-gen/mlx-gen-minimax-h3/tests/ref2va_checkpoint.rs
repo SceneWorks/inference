@@ -442,14 +442,26 @@ fn every_dit_load_site_is_driven_by_the_task() {
     // partitions — that is where the mapping is asserted — so scanning the whole file would count
     // the assertions as violations and make this gate unpassable for the right reasons.
     let whole = include_str!("../src/model.rs");
-    let src = whole
+    let root = whole
         .split_once("\n#[cfg(test)]\n")
         .map_or(whole, |(before, _)| before);
     assert!(
-        src.len() < whole.len(),
+        root.len() < whole.len(),
         "expected a #[cfg(test)] module in model.rs; if it moved, this scan is now reading the \
          whole file and its counts mean something different"
     );
+    // ...plus the production submodules `model.rs` was split into (sc-27342); its tests live in
+    // `model/tests.rs`, which is not scanned.
+    let src = [
+        root,
+        include_str!("../src/model/descriptor.rs"),
+        include_str!("../src/model/generate.rs"),
+        include_str!("../src/model/load.rs"),
+        include_str!("../src/model/prompt.rs"),
+        include_str!("../src/model/ref2va.rs"),
+        include_str!("../src/model/request.rs"),
+    ]
+    .concat();
 
     // There are two load sites — the `t2va`/`fl2va` arm and the `ref2va` arm — and they are
     // mutually exclusive branches of `generate`, so at most one runs per render. What matters is

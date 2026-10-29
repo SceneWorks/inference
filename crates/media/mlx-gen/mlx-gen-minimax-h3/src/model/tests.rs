@@ -2,10 +2,21 @@
 /// must not survive merely because a helper can express the selected geometry.
 #[test]
 fn render_wires_selected_patch_and_actual_reference_channels_before_conditioning() {
-    let src = include_str!("../model.rs")
-        .split("\n#[cfg(test)]\n")
-        .next()
-        .unwrap();
+    // `model.rs` up to its test module, plus the production submodules it was split into
+    // (sc-27342).
+    let src = [
+        include_str!("../model.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .unwrap(),
+        include_str!("descriptor.rs"),
+        include_str!("generate.rs"),
+        include_str!("load.rs"),
+        include_str!("prompt.rs"),
+        include_str!("ref2va.rs"),
+        include_str!("request.rs"),
+    ]
+    .concat();
     assert!(
         !src.contains("PATCH_SIZE"),
         "render conditioning cannot use the stock patch constant"
