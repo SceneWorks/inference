@@ -509,7 +509,15 @@ def f32_values(tensor: dict, name: str) -> list[float]:
 
 
 def f32_tensor(tensor: dict, name: str):
-    return _torch().tensor(f32_values(tensor, name), dtype=_torch().float32)
+    """Widen to F32 with the tensor's declared safetensors shape (never a flat view)."""
+    values = f32_values(tensor, name)
+    shape = [int(axis) for axis in tensor["shape"]]
+    count = 1
+    for axis in shape:
+        count *= axis
+    if len(values) != count:
+        raise Refusal("selected_dtype", f"{name}: {len(values)} values do not fill shape {shape}")
+    return _torch().tensor(values, dtype=_torch().float32).reshape(shape)
 
 
 def rows_i8(tensor: dict, name: str) -> list[list[int]]:
@@ -759,7 +767,7 @@ def pruned_output(case: dict, tensors: dict, ns, config: dict):
         table_tensor = tensor_at(tensors, select, "adaln_t_table")
         if table_tensor["dtype"] != "F32" or len(table_tensor["shape"]) != 2:
             raise Refusal("selected_dtype", f"{case['id']}: pruned table must be F32 [grid, rank]")
-        table = f32_tensor(table_tensor, "adaln_t_table").reshape(table_tensor["shape"][0], table_tensor["shape"][1])
+        table = f32_tensor(table_tensor, "adaln_t_table")
         times = [float(v) for v in obj(case.get("input"), f"{case['id']}.input").get("timesteps") or []]
         if not times:
             raise Refusal("input_shape", f"{case['id']}: timesteps are required")

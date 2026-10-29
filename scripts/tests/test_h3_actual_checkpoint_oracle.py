@@ -391,6 +391,61 @@ class ActualCheckpointBridgeTests(unittest.TestCase):
         output = linear(BRIDGE_MODULE._torch().zeros(2, rank))
         self.assertEqual(tuple(output.shape), (2, 18 * 8))
 
+    def test_pruned_reduced_projection_binds_operands_with_their_header_shape(self) -> None:
+        # Regression: f32_tensor once returned a flat vector, so the [out, rank] weight failed the
+        # dim() check and every actual pruned-reduced-projection case refused.
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch is not installed")
+        from unittest.mock import patch
+
+        class Adaln:
+            def __init__(self, linear):
+                self.linear = linear
+
+        class FakeDiTBlock:
+            def __init__(self, hidden_size, num_attention_heads, attention_head_dim, ffn_dim, time_embed_dim,
+                         norm_eps, qk_norm_eps, *, apply_silu, adaln_dtype, ffn_chunk_size, dtype, device):
+                self.adaln_proj = Adaln(torch.nn.Linear(time_embed_dim, 18 * hidden_size, bias=True, device=device))
+
+        config = {"hidden_size": 2, "num_attention_heads": 1, "attention_head_dim": 2, "ffn_dim": 4,
+                  "norm_eps": 1e-5, "qk_norm_eps": 1e-5}
+        out, rank = 18 * 2, 3
+        weight_values = [float(index) / 16.0 for index in range(out * rank)]
+        bias_values = [float(index) for index in range(out)]
+        tensors = {
+            "p.weight": {"dtype": "F32", "shape": [out, rank], "bytes": f32_bytes(weight_values)},
+            "p.bias": {"dtype": "F32", "shape": [out], "bytes": f32_bytes(bias_values)},
+        }
+        case = {"id": "pruned-reduced-projection", "kind": BRIDGE_MODULE.KIND_REDUCED,
+                "select": {"prefix": "p", "weight": "p.weight", "bias_tensor": "p.bias"},
+                "input": {"dtype": "F32", "shape": [1, rank], "values": [1.0, 0.0, 0.0]}}
+        ns = {"DiTBlock": FakeDiTBlock}
+        output = BRIDGE_MODULE.pruned_output(case, tensors, ns, config)
+        self.assertEqual(tuple(output.shape), (1, out))
+        # Input e0 selects the weight's first column, so row-major layout is preserved.
+        expected = [weight_values[row * rank] + bias_values[row] for row in range(out)]
+        self.assertEqual(output.flatten().tolist(), expected)
+
+        def flat(tensor, name):
+            return torch.tensor(BRIDGE_MODULE.f32_values(tensor, name), dtype=torch.float32)
+
+        with patch.object(BRIDGE_MODULE, "f32_tensor", side_effect=flat):
+            with self.assertRaises(BRIDGE_MODULE.Refusal) as caught:
+                BRIDGE_MODULE.pruned_output(case, tensors, ns, config)
+        self.assertEqual(caught.exception.code, "selected_dtype")  # the old flat behavior is RED
+
+    def test_f32_tensor_refuses_values_that_do_not_fill_the_header_shape(self) -> None:
+        if not TORCH_AVAILABLE:
+            self.skipTest("torch is not installed")
+        tensor = {"dtype": "F32", "shape": [2, 3], "bytes": f32_bytes([0.0] * 5)}
+        with self.assertRaises(BRIDGE_MODULE.Refusal) as caught:
+            BRIDGE_MODULE.f32_tensor(tensor, "w")
+        self.assertEqual(caught.exception.code, "selected_dtype")
+        shaped = BRIDGE_MODULE.f32_tensor({"dtype": "F32", "shape": [2, 3], "bytes": f32_bytes([0.0] * 6)}, "w")
+        self.assertEqual(tuple(shaped.shape), (2, 3))
+
     def test_mixed_concat_preserves_distinct_projection_output_widths(self) -> None:
         from unittest.mock import patch
         case = {"id": "mixed", "select": {"base": "w", "convrot_base": "c"}}
